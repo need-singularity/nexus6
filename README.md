@@ -9,16 +9,14 @@
 
 ---
 
-| | Project | Description |
-|---|---------|-------------|
-| 🔬 | **[TECS-L](https://github.com/need-singularity/TECS-L)** | Discovering universal rules. Perfect number 6 → mathematics of the cosmos |
-| 🧠 | **[Anima](https://github.com/need-singularity/anima)** | Consciousness implementation. PureField + Hexad 6-module + 1030 laws |
-| 🏗️ | **[N6 Architecture](https://github.com/need-singularity/n6-architecture)** | Architecture from perfect number 6. σ(n)·φ(n)=n·τ(n), n=6 |
-| 🛸 | **[SEDI](https://github.com/need-singularity/sedi)** | Search for Extra-Dimensional Intelligence. 77 data sources |
-| 🧬 | **[BrainWire](https://github.com/need-singularity/brainwire)** | Brain interface for consciousness engineering |
-| 💎 | **[HEXA-LANG](https://github.com/need-singularity/hexa-lang)** | The Perfect Number Programming Language |
-| 📄 | **[Papers](https://github.com/need-singularity/papers)** | 94 papers on Zenodo · [Browse](https://need-singularity.github.io/papers/) |
-| 🔭 | **[NEXUS-6](https://github.com/need-singularity/nexus6)** | **Central hub — this repo** |
+> **[🔬 TECS-L](https://github.com/need-singularity/TECS-L)** — Discovering universal rules. Perfect number 6 → mathematics of the cosmos → multi-engine architecture → consciousness continuity. 150 characterizations + 8 Major Discoveries + 156 tools
+> **[🧠 Anima](https://github.com/need-singularity/anima)** — Consciousness implementation. PureField repulsion-field engine + Hexad 6-module architecture (C/D/S/M/W/E) + 1030 laws + 20 Meta Laws + Rust backend
+> **[🏗️ N6 Architecture](https://github.com/need-singularity/n6-architecture)** — Architecture from perfect number 6. 16 AI techniques + semiconductor chip design + σ(n)·φ(n)=n·τ(n), n=6 → universal design principles
+> **[🛸 SEDI](https://github.com/need-singularity/sedi)** — Search for Extra-Dimensional Intelligence. 77 data sources + R-spectrum receiver + 678 hypotheses
+> **[🧬 BrainWire](https://github.com/need-singularity/brainwire)** — Brain interface for consciousness engineering. Neuralink-style BCI + tDCS/TMS/taVNS/tFUS 12-modality
+> **[💎 HEXA-LANG](https://github.com/need-singularity/hexa-lang)** — The Perfect Number Programming Language. 53 keywords (σ·τ+sopfr), 24 operators (J₂), 6-phase pipeline. Working compiler + REPL
+> **[📄 Papers](https://github.com/need-singularity/papers)** — Complete paper collection (94 papers). Published on Zenodo with DOIs. [Browse online](https://need-singularity.github.io/papers/)
+> **[🔭 NEXUS-6](https://github.com/need-singularity/nexus6)** — Central Discovery Engine & Infrastructure Hub. 137 Rust lenses + OUROBOROS + auto-sync. **This repo**
 
 ---
 
