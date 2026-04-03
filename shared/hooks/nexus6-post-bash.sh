@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # NEXUS-6 Post-Bash — python/cargo 실행 결과에서 숫자 자동 스캔
 
+# 심링크 자동 복구
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$HOOK_DIR/ensure-symlinks.sh" || exit 0
+
 INPUT=$(cat)
 CMD=$(echo "$INPUT" | jq -r '.tool_input.command // ""')
 OUTPUT=$(echo "$INPUT" | jq -r '.tool_response.stdout // ""' | head -100)

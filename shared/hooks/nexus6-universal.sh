@@ -2,6 +2,10 @@
 # NEXUS-6 Universal Hook — 모든 도구 호출 시 자동 발동
 # 숫자 데이터가 있으면 n6_check, 탐색 키워드면 scan 권고
 
+# 심링크 자동 복구
+HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$HOOK_DIR/ensure-symlinks.sh" || exit 0
+
 INPUT=$(cat)
 TOOL=$(echo "$INPUT" | jq -r '.tool_name // ""')
 TOOL_INPUT=$(echo "$INPUT" | jq -r '.tool_input // {} | tostring')
