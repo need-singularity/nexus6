@@ -10,6 +10,7 @@ pub mod cross_lenses;
 pub mod domain_combos;
 pub mod lens_trait;
 pub mod lenses;
+pub mod mirror_scan;
 pub mod n6_lenses;
 pub mod physics_deep_lenses;
 pub mod quantum_lenses;
@@ -54,12 +55,16 @@ use lenses::{
     VoidLens, WallInspectionLens, WarpLens, WaveLens, WeightFeedbackLens,
     WeightLearningLens, WormholeLens,
 };
+use mirror_scan::{
+    InfiniteCorridorResult, MirrorBallResult, MirrorReflectResult,
+    MirrorUniverseResult, SelfReflectionResult,
+};
 use shared_data::SharedData;
 
 /// The Telescope: registers all available lenses and scans data through them.
 /// Each lens is isolated via catch_unwind — a panic in one lens does not crash others.
 pub struct Telescope {
-    lenses: Vec<Box<dyn Lens>>,
+    pub(crate) lenses: Vec<Box<dyn Lens>>,
 }
 
 impl Telescope {
@@ -243,6 +248,75 @@ impl Telescope {
     /// Get the number of registered lenses.
     pub fn lens_count(&self) -> usize {
         self.lenses.len()
+    }
+
+    // ─── 거울 우주 (통합 API) ────────────────────────────────────
+
+    /// 거울 우주: 모든 렌즈가 거울이자 관찰자 — 서로를 비추면 모두가 연결됨.
+    ///
+    /// - `lens_filter`: None = 전체 (완전 미러볼), Some = 지정 렌즈만
+    /// - `max_lenses`: 전체 모드일 때 최대 수 제한
+    ///
+    /// 연결 증명, 공명 캐스케이드, 엔트로피, 지문 등 모든 분석 포함.
+    pub fn mirror_universe(
+        &self,
+        data: &[f64],
+        n: usize,
+        d: usize,
+        lens_filter: Option<&[&str]>,
+        max_lenses: Option<usize>,
+    ) -> MirrorUniverseResult {
+        mirror_scan::mirror_universe(&self.lenses, data, n, d, lens_filter, max_lenses)
+    }
+
+    /// 무한 거울 복도: 두 렌즈 간 반복 반사 → 수렴/발산/주기 감지.
+    pub fn infinite_corridor(
+        &self,
+        data: &[f64],
+        n: usize,
+        d: usize,
+        lens_a: &str,
+        lens_b: &str,
+        max_iter: usize,
+    ) -> Option<InfiniteCorridorResult> {
+        mirror_scan::infinite_corridor(&self.lenses, data, n, d, lens_a, lens_b, max_iter)
+    }
+
+    /// 자기 반사 (Narcissus): 렌즈가 자기 출력을 반복 입력 → 고정점 탐색.
+    pub fn self_reflect(
+        &self,
+        data: &[f64],
+        n: usize,
+        d: usize,
+        lens_name: &str,
+        max_iter: usize,
+    ) -> Option<SelfReflectionResult> {
+        mirror_scan::self_reflect(&self.lenses, data, n, d, lens_name, max_iter)
+    }
+
+    // ─── 하위 호환 ──────────────────────────────────────────────
+
+    /// 거울반사 (2개 렌즈). mirror_universe의 부분 호출.
+    pub fn mirror_reflect(
+        &self,
+        data: &[f64],
+        n: usize,
+        d: usize,
+        lens_a: &str,
+        lens_b: &str,
+    ) -> Option<MirrorReflectResult> {
+        mirror_scan::mirror_reflect(&self.lenses, data, n, d, lens_a, lens_b)
+    }
+
+    /// 미러볼 (N개 렌즈). mirror_universe의 전체 호출.
+    pub fn mirror_ball(
+        &self,
+        data: &[f64],
+        n: usize,
+        d: usize,
+        max_lenses: Option<usize>,
+    ) -> MirrorBallResult {
+        mirror_scan::mirror_ball(&self.lenses, data, n, d, max_lenses)
     }
 }
 
