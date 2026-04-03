@@ -33,7 +33,8 @@ def n6_check_value(nexus6, value):
     """단일 값 n6_check → (grade, constant)"""
     try:
         r = nexus6.n6_check(float(value))
-        return r.grade, r.constant
+        d = r.to_dict()
+        return d.get("grade", "ERROR"), d.get("constant_name", "")
     except Exception:
         return "ERROR", ""
 
@@ -126,7 +127,7 @@ def mode_post_edit(input_data):
     fp = input_data.get("tool_input", {}).get("file_path", "")
     if not fp or not os.path.isfile(fp):
         return None
-    if not re.search(r'\.(md|json|toml|yaml|yml|py)$', fp):
+    if not re.search(r'\.(md|json|toml|yaml|yml|py|rs|ts|js|go|c|cpp|h)$', fp):
         return None
     with open(fp) as f:
         content = f.read()
