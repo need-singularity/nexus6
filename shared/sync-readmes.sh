@@ -125,6 +125,12 @@ commit_and_push "$PARENT/hexa-lang" "hexa-lang"
 
 # Papers
 echo "[Papers]"
+
+# NEXUS-6
+echo "[NEXUS-6]"
+sync_file "$PARENT/nexus6/README.md"
+commit_and_push "$PARENT/nexus6" "nexus6"
+
 sync_file "$PARENT/papers/README.md"
 commit_and_push "$PARENT/papers" "papers"
 

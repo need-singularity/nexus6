@@ -308,6 +308,144 @@ fn count_pending() -> usize {
         .count()
 }
 
+// ═══ 성장 스캔 (리포별 .growth/scan.py 디스패치) ═══
+
+fn growth_cooldown_path() -> PathBuf {
+    let home = env::var("HOME").unwrap_or_default();
+    PathBuf::from(home).join("Dev/nexus6/shared/.growth_last_scan")
+}
+
+fn growth_registry_path() -> PathBuf {
+    let home = env::var("HOME").unwrap_or_default();
+    PathBuf::from(home).join("Dev/nexus6/shared/growth-registry.json")
+}
+
+fn is_growth_cooldown_active(cooldown_secs: u64) -> bool {
+    let path = growth_cooldown_path();
+    if let Ok(meta) = fs::metadata(&path) {
+        if let Ok(modified) = meta.modified() {
+            if let Ok(elapsed) = modified.elapsed() {
+                return elapsed.as_secs() < cooldown_secs;
+            }
+        }
+    }
+    false
+}
+
+fn touch_growth_cooldown() {
+    let path = growth_cooldown_path();
+    let _ = fs::write(&path, chrono_now());
+}
+
+fn mode_growth_scan(_input: &Value) -> Option<String> {
+    // 30분 쿨다운
+    if is_growth_cooldown_active(1800) {
+        return None;
+    }
+
+    let repo = get_repo_root()?;
+    let scan_py = repo.join(".growth/scan.py");
+    let scan_sh = repo.join(".growth/scan.sh");
+
+    let (cmd, args): (&str, Vec<&str>) = if scan_py.is_file() {
+        ("python3", vec![scan_py.to_str()?])
+    } else if scan_sh.is_file() {
+        ("bash", vec![scan_sh.to_str()?])
+    } else {
+        return None; // 이 리포에 성장 스캔 없음
+    };
+
+    touch_growth_cooldown();
+
+    let output = Command::new(cmd)
+        .args(&args)
+        .current_dir(&repo)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stdout.is_empty() {
+        return None;
+    }
+
+    // scan.py는 JSON {"opportunities": [...]} 또는 plain text 출력
+    if let Ok(parsed) = serde_json::from_str::<Value>(&stdout) {
+        let opps = parsed.get("opportunities").and_then(|v| v.as_array())?;
+        if opps.is_empty() {
+            return None;
+        }
+
+        // 레지스트리 업데이트
+        let repo_name = repo.file_name()?.to_str()?;
+        update_registry(repo_name, opps.len(), &chrono_now());
+
+        let mut lines = vec![format!("🌱 성장 기회 {}건 발견:", opps.len())];
+        for opp in opps.iter().take(5) {
+            let typ = opp.get("type").and_then(|v| v.as_str()).unwrap_or("?");
+            let desc = opp.get("description").and_then(|v| v.as_str()).unwrap_or("?");
+            let prio = opp.get("priority").and_then(|v| v.as_str()).unwrap_or("MED");
+            lines.push(format!("  [{}] {}: {}", prio, typ, desc));
+        }
+        Some(lines.join("\n"))
+    } else if !stdout.is_empty() {
+        Some(format!("🌱 {}", stdout))
+    } else {
+        None
+    }
+}
+
+fn update_registry(repo_name: &str, count: usize, timestamp: &str) {
+    let path = growth_registry_path();
+    let mut registry: Value = if path.exists() {
+        fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| json!({}))
+    } else {
+        json!({})
+    };
+
+    registry[repo_name] = json!({
+        "last_scan": timestamp,
+        "opportunities": count,
+    });
+
+    let _ = fs::write(&path, serde_json::to_string_pretty(&registry).unwrap_or_default());
+}
+
+fn mode_growth_report() -> Option<String> {
+    let path = growth_registry_path();
+    if !path.exists() {
+        return Some("🌱 성장 레지스트리 없음 — 아직 스캔 실행 안 됨".into());
+    }
+
+    let registry: Value = fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())?;
+
+    let obj = registry.as_object()?;
+    if obj.is_empty() {
+        return Some("🌱 등록된 리포 없음".into());
+    }
+
+    let mut lines = vec!["🌱 전 리포 성장 현황:".to_string()];
+    let mut total = 0usize;
+    for (repo, info) in obj {
+        let count = info.get("opportunities").and_then(|v| v.as_u64()).unwrap_or(0);
+        let ts = info.get("last_scan").and_then(|v| v.as_str()).unwrap_or("?");
+        total += count as usize;
+        let icon = if count > 0 { "🔄" } else { "✅" };
+        lines.push(format!("  {} {} — {}건 ({})", icon, repo, count, &ts[..10.min(ts.len())]));
+    }
+    lines.push(format!("  총 {}건", total));
+
+    Some(lines.join("\n"))
+}
+
 fn mode_pending() -> Option<String> {
     let path = discovery_log_path();
     if !path.exists() {
@@ -361,12 +499,21 @@ fn main() {
         }
     }
 
-    // 2. pending 모드는 stdin 불필요
-    if mode == "pending" {
-        if let Some(msg) = mode_pending() {
-            println!("{}", json!({"systemMessage": msg}));
+    // 2. stdin 불필요 모드
+    match mode {
+        "pending" => {
+            if let Some(msg) = mode_pending() {
+                println!("{}", json!({"systemMessage": msg}));
+            }
+            return;
         }
-        return;
+        "growth-report" => {
+            if let Some(msg) = mode_growth_report() {
+                println!("{}", json!({"systemMessage": msg}));
+            }
+            return;
+        }
+        _ => {}
     }
 
     // 3. stdin 읽기
@@ -386,6 +533,7 @@ fn main() {
         "post-edit" => mode_post_edit(&input),
         "post-bash" => mode_post_bash(&input),
         "agent" => mode_agent(&input),
+        "growth-scan" => mode_growth_scan(&input),
         _ => None,
     };
 
