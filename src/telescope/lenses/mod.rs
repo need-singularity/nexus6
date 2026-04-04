@@ -31,6 +31,7 @@ pub mod kernel_fusion_lens;
 pub mod batch_optimization_lens;
 pub mod isomorphism_lens;
 pub mod emergence_lens;
+pub mod singularity_cycle_lens;
 pub mod periodicity_lens;
 pub mod completeness_lens;
 pub mod surprise_lens;
