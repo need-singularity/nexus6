@@ -659,6 +659,7 @@ run_growth_loop() {
             common_sync_priority_queue 2>/dev/null || true
             common_cross_test 2>/dev/null || true
             common_live_graph 2>/dev/null || true
+            common_growth_timeline 2>/dev/null || true
         fi
 
         # 6 사이클마다 (연방 + 렌즈 + 실험)
