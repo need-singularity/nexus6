@@ -149,4 +149,94 @@ common_cross_test() {
     fi
 }
 
+# ── #15: 연결 메트릭 자동 수집 ──
+common_connection_metrics() {
+    log_info "🔗 Connection metrics"
+    local bridge_json="$HOME/Dev/nexus6/shared/bridge_state.json"
+    [ ! -f "$bridge_json" ] && return
+
+    python3 -c "
+import json, os, glob
+from datetime import datetime, timezone
+
+bridge_file = '$bridge_json'
+with open(bridge_file) as f:
+    state = json.load(f)
+
+name = '$GROWTH_NAME'
+root = '$PROJECT_ROOT'
+conn = state.get('connections', {}).get(name, {})
+
+# 6. 공유 의존성 (.shared 사용 현황)
+shared_link = f'{root}/.shared'
+shared_usage = {}
+if os.path.islink(shared_link) or os.path.isdir(shared_link):
+    shared_target = os.path.realpath(shared_link)
+    # .shared 내 파일을 프로젝트에서 참조하는지
+    for ext in ['*.py', '*.rs', '*.sh', '*.md']:
+        for src_file in glob.glob(f'{root}/src/**/{ext}', recursive=True) + glob.glob(f'{root}/scripts/**/{ext}', recursive=True):
+            try:
+                with open(src_file) as sf:
+                    content = sf.read()
+                if '.shared' in content or 'shared/' in content:
+                    shared_usage[os.path.basename(src_file)] = True
+            except: pass
+conn['shared_refs'] = len(shared_usage)
+
+# 7. 크로스 import 관계
+cross_imports = []
+for proj_dir in os.listdir(os.path.expanduser('~/Dev')):
+    if proj_dir == name: continue
+    proj_lower = proj_dir.lower().replace('-', '_')
+    # src/ 내에서 다른 프로젝트명 참조 검색
+    for ext in ['*.py', '*.rs', '*.sh']:
+        for src_file in glob.glob(f'{root}/src/**/{ext}', recursive=True):
+            try:
+                with open(src_file) as sf:
+                    if proj_lower in sf.read().lower():
+                        cross_imports.append(proj_dir)
+                        break
+            except: pass
+conn['cross_imports'] = list(set(cross_imports))
+
+# 8. 공명 쌍 (mirror 결과에서)
+mirror_file = os.path.expanduser('~/.nexus6/last_mirror.json')
+if os.path.exists(mirror_file):
+    try:
+        with open(mirror_file) as mf:
+            mirror = json.load(mf)
+        conn['mirror_harmony'] = mirror.get('harmony', 0)
+        conn['mirror_eigenvalue'] = mirror.get('eigenvalue', 0)
+    except: pass
+
+# 9. 캐스케이드 이력
+cascade_file = f'{root}/.growth/cascade_from_{name}.json'
+cascade_count = 0
+for cf in glob.glob(f'{root}/.growth/cascade_from_*.json'):
+    cascade_count += 1
+conn['cascade_received'] = cascade_count
+
+# 발견 수 (growth_state에서)
+state_file = f'{root}/.growth/growth_state.json'
+if os.path.exists(state_file):
+    try:
+        with open(state_file) as gsf:
+            gs = json.load(gsf)
+        conn['growth_cycle'] = gs.get('cycle', 0)
+        conn['federated_bonus'] = gs.get('federated_bonus', 0)
+    except: pass
+
+conn['metrics_updated'] = datetime.now(timezone.utc).isoformat()
+state['connections'][name] = conn
+with open(bridge_file, 'w') as f:
+    json.dump(state, f, indent=2)
+    f.write('\n')
+
+print(f'Metrics: shared_refs={len(shared_usage)} cross_imports={len(cross_imports)} cascade={cascade_count}')
+" 2>/dev/null | while IFS= read -r line; do
+        log_info "  $line"
+    done
+    write_growth_bus "connection_metrics" "ok" ""
+}
+
 # ── growth_advanced.sh loaded ──

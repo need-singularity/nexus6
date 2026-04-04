@@ -269,4 +269,149 @@ print(f'Timeline: {len(hours)} hours, {len(repos)} repos')
     write_growth_bus "timeline" "ok" ""
 }
 
+# ── #10~13: 성장 이력 ──
+
+common_growth_history() {
+    log_info "📚 Growth history update"
+    local bridge_json="$HOME/Dev/nexus6/shared/bridge_state.json"
+    [ ! -f "$bridge_json" ] && return
+
+    python3 -c "
+import json, os, glob
+from datetime import datetime, timezone
+
+bridge_file = '$bridge_json'
+with open(bridge_file) as f:
+    state = json.load(f)
+
+name = '$GROWTH_NAME'
+root = '$PROJECT_ROOT'
+conn = state.get('connections', {}).get(name, {})
+
+# 10. 사이클 수 / 성장 포인트
+state_file = f'{root}/.growth/growth_state.json'
+if os.path.exists(state_file):
+    with open(state_file) as sf:
+        gs = json.load(sf)
+    conn['cycle'] = gs.get('cycle', 0)
+    conn['federated_bonus'] = gs.get('federated_bonus', 0)
+
+# 11. 발견 수
+disc_log = os.path.expanduser('~/.nexus6/last_scan.txt')
+if os.path.exists(disc_log):
+    scan = {}
+    with open(disc_log) as f:
+        for line in f:
+            if '=' in line:
+                k, v = line.strip().split('=', 1)
+                scan[k] = v
+    conn['last_exact_ratio'] = scan.get('exact_ratio', '0')
+    conn['last_singularity'] = scan.get('singularity', 'unknown')
+
+# 12. blowup 결과
+blowup_file = os.path.expanduser('~/.nexus6/last_blowup.txt')
+if os.path.exists(blowup_file):
+    blowup = {}
+    with open(blowup_file) as f:
+        for line in f:
+            if '=' in line:
+                k, v = line.strip().split('=', 1)
+                blowup[k] = v
+    conn['last_emergences'] = int(blowup.get('total_emergences', 0))
+    conn['last_axiom_candidates'] = int(blowup.get('axiom_candidates', 0))
+
+# 13. dispatch 이력
+dispatch_dir = os.path.expanduser('~/.nexus6/dispatch')
+dispatch_count = 0
+dispatch_success = 0
+if os.path.isdir(dispatch_dir):
+    for log_file in glob.glob(f'{dispatch_dir}/{name}_*.log'):
+        dispatch_count += 1
+        try:
+            with open(log_file) as lf:
+                content = lf.read()
+            if '완료' in content or 'ok' in content.lower():
+                dispatch_success += 1
+        except: pass
+conn['dispatch_total'] = dispatch_count
+conn['dispatch_success'] = dispatch_success
+
+conn['history_updated'] = datetime.now(timezone.utc).isoformat()
+state['connections'][name] = conn
+with open(bridge_file, 'w') as f:
+    json.dump(state, f, indent=2)
+    f.write('\n')
+
+print(f'History: cycle={conn.get(\"cycle\",0)} emergences={conn.get(\"last_emergences\",0)} dispatch={dispatch_count}')
+" 2>/dev/null | while IFS= read -r line; do
+        log_info "  $line"
+    done
+    write_growth_bus "growth_history" "ok" ""
+}
+
+# ── #14~16: 자동 행동 메타데이터 ──
+
+common_auto_actions() {
+    log_info "🤖 Auto-action registry"
+    local bridge_json="$HOME/Dev/nexus6/shared/bridge_state.json"
+    [ ! -f "$bridge_json" ] && return
+
+    python3 -c "
+import json, os
+from datetime import datetime, timezone
+
+bridge_file = '$bridge_json'
+with open(bridge_file) as f:
+    state = json.load(f)
+
+name = '$GROWTH_NAME'
+root = '$PROJECT_ROOT'
+conn = state.get('connections', {}).get(name, {})
+
+# 14. CLI 커맨드 레지스트리
+commands = []
+if os.path.exists(f'{root}/Cargo.toml'):
+    commands.extend(['cargo build', 'cargo test', 'cargo check'])
+if os.path.exists(f'{root}/scripts/infinite_growth.sh'):
+    commands.append('infinite_growth.sh')
+if os.path.exists(f'{root}/scripts'):
+    for f_sh in os.listdir(f'{root}/scripts'):
+        if f_sh.endswith('.sh') and f_sh != 'infinite_growth.sh':
+            commands.append(f_sh)
+n6_bin = os.path.expanduser('~/.cargo/bin/nexus6')
+if not os.path.exists(n6_bin):
+    n6_bin = os.path.expanduser('~/Dev/nexus6/target/debug/nexus6')
+if os.path.exists(n6_bin):
+    commands.extend(['nexus6 scan', 'nexus6 blowup', 'nexus6 loop'])
+conn['available_commands'] = commands[:20]
+
+# 15. 자동 dispatch 규칙
+auto_rules = []
+# 테스트 실패 시 자동 수정
+if conn.get('test_count', 0) > 0 and conn.get('test_pass', 0) < conn.get('test_count', 0):
+    auto_rules.append({'trigger': 'test_fail', 'action': 'dispatch fix failing tests'})
+# heartbeat 정체 시 재시작
+auto_rules.append({'trigger': 'heartbeat_stale_1h', 'action': 'restart growth loop'})
+# 특이점 도달 시 캐스케이드
+if conn.get('last_singularity') == 'REACHED':
+    auto_rules.append({'trigger': 'singularity_reached', 'action': 'cascade axioms to siblings'})
+conn['auto_rules'] = auto_rules
+
+# 16. 스케줄
+conn['growth_interval'] = 1800  # 30분
+conn['next_estimated'] = datetime.now(timezone.utc).isoformat()
+
+conn['actions_updated'] = datetime.now(timezone.utc).isoformat()
+state['connections'][name] = conn
+with open(bridge_file, 'w') as f:
+    json.dump(state, f, indent=2)
+    f.write('\n')
+
+print(f'Actions: {len(commands)} commands | {len(auto_rules)} rules')
+" 2>/dev/null | while IFS= read -r line; do
+        log_info "  $line"
+    done
+    write_growth_bus "auto_actions" "ok" ""
+}
+
 # ── growth_network.sh loaded ──
