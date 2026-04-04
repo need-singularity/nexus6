@@ -69,6 +69,14 @@ pub struct EvolutionSection {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+pub struct LogRotationSection {
+    /// Maximum log file size in bytes before rotation (default: 1 MB).
+    pub max_bytes: Option<u64>,
+    /// Maximum number of rotated files to keep (default: 5).
+    pub max_files: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ForgeSection {
     /// Maximum candidates to consider per strategy.
     pub max_candidates: Option<usize>,
@@ -192,7 +200,7 @@ impl NexusConfig {
         self.blowup.as_ref().and_then(|s| s.max_depth).unwrap_or(6)
     }
 
-    /// Max log file size in bytes before rotation (default 1 MB).
+    /// Maximum log file size in bytes before rotation (default: 1 MB).
     pub fn log_rotation_max_bytes(&self) -> u64 {
         self.log_rotation
             .as_ref()
@@ -200,7 +208,7 @@ impl NexusConfig {
             .unwrap_or(1_048_576)
     }
 
-    /// Max number of rotated log files to keep (default 5).
+    /// Maximum number of rotated log files to keep (default: 5).
     pub fn log_rotation_max_files(&self) -> usize {
         self.log_rotation
             .as_ref()
@@ -248,7 +256,7 @@ pub fn default_config_toml() -> String {
 # similarity_threshold = 0.8
 
 [log_rotation]
-# max_bytes = 1048576    # 1 MB
+# max_bytes = 1048576   # 1 MB
 # max_files = 5
 "#
     .to_string()

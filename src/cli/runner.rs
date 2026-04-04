@@ -159,6 +159,7 @@ fn run_with_config(cmd: CliCommand, cfg: &NexusConfig) -> Result<(), String> {
         }
         CliCommand::Mega => run_mega(cfg),
         CliCommand::Report => run_report(),
+        CliCommand::Status => run_status(),
         CliCommand::Dispatch { target, prompt, parallel } => {
             run_dispatch(&target, &prompt, parallel)
         }
@@ -1638,6 +1639,150 @@ fn run_report() -> Result<(), String> {
     }
 
     println!("  └{}┘", line);
+
+    Ok(())
+}
+
+// ─── Status command helpers ────────────────────────────────────
+
+/// Extract PID from the first line of a background log file.
+/// Expects format like "PID=12345" or just a number on the first line after spawn.
+fn extract_pid_from_log(path: &str) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let first_line = content.lines().next()?;
+    // Try PID=NNN pattern first
+    if let Some(pid) = first_line.strip_prefix("PID=") {
+        return Some(pid.trim().to_string());
+    }
+    // Try extracting any number that looks like a PID
+    for word in first_line.split_whitespace() {
+        if word.chars().all(|c| c.is_ascii_digit()) && word.len() >= 2 {
+            return Some(word.to_string());
+        }
+    }
+    None
+}
+
+/// Check if a PID is alive using `kill -0` (macOS compatible, no /proc).
+fn check_pid_alive(pid: &str) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", pid])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Return the last N lines of a file.
+fn tail_lines(path: &str, n: usize) -> Vec<String> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return vec![],
+    };
+    let lines: Vec<&str> = content.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].iter().map(|l| l.to_string()).collect()
+}
+
+fn run_status() -> Result<(), String> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let nexus_dir = format!("{}/.nexus6", home);
+    let w = 72;
+    let line = "-".repeat(w);
+
+    println!("  +{}+", line);
+    println!("  | {:<w$}|", "NEXUS-6 Status");
+    println!("  +{}+", line);
+
+    // 1. Background processes from *_bg.log files
+    println!("  | {:<w$}|", "Background Processes:");
+    println!("  +{}+", line);
+    println!(
+        "  | {:<20} {:<8} {:<10} {:<w2$}|",
+        "NAME", "PID", "STATE", "LAST OUTPUT",
+        w2 = w - 20 - 8 - 10 - 1
+    );
+    println!("  +{}+", line);
+
+    let mut found_any = false;
+    if let Ok(entries) = std::fs::read_dir(&nexus_dir) {
+        let mut logs: Vec<_> = entries
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(|n| n.ends_with("_bg.log"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        logs.sort_by_key(|e| e.file_name());
+
+        for entry in &logs {
+            found_any = true;
+            let fname = entry.file_name().to_string_lossy().to_string();
+            let name = fname.trim_end_matches("_bg.log");
+            let full_path = format!("{}/{}", nexus_dir, fname);
+
+            let pid = extract_pid_from_log(&full_path).unwrap_or_else(|| "?".to_string());
+            let alive = if pid != "?" {
+                check_pid_alive(&pid)
+            } else {
+                false
+            };
+            let state = if alive { "running" } else { "stopped" };
+
+            let tail = tail_lines(&full_path, 3);
+            let last = if tail.is_empty() {
+                "(empty)".to_string()
+            } else {
+                let s = tail.last().unwrap().clone();
+                if s.len() > 30 { format!("{}...", &s[..30]) } else { s }
+            };
+
+            println!(
+                "  | {:<20} {:<8} {:<10} {:<w2$}|",
+                name, pid, state, last,
+                w2 = w - 20 - 8 - 10 - 1
+            );
+
+            // Show last 3 lines indented
+            for tl in &tail {
+                let truncated = if tl.len() > (w - 6) {
+                    format!("{}...", &tl[..w - 9])
+                } else {
+                    tl.clone()
+                };
+                println!("  |   {:<w3$}|", truncated, w3 = w - 3);
+            }
+        }
+    }
+
+    if !found_any {
+        println!("  | {:<w$}|", "(no background processes found)");
+    }
+
+    println!("  +{}+", line);
+
+    // 2. Daemon status
+    let daemon_path = format!("{}/.nexus6/daemon_status.txt", home);
+    if let Ok(daemon) = std::fs::read_to_string(&daemon_path) {
+        println!("  | {:<w$}|", "Daemon Status:");
+        for l in daemon.lines().take(5) {
+            println!("  |   {:<w3$}|", l, w3 = w - 3);
+        }
+        println!("  +{}+", line);
+    }
+
+    // 3. Last scan
+    let scan_path = format!("{}/.nexus6/last_scan.txt", home);
+    if let Ok(scan) = std::fs::read_to_string(&scan_path) {
+        println!("  | {:<w$}|", "Last Scan:");
+        for l in scan.lines().take(5) {
+            println!("  |   {:<w3$}|", l, w3 = w - 3);
+        }
+        println!("  +{}+", line);
+    }
 
     Ok(())
 }
