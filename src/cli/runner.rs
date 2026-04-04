@@ -1668,6 +1668,42 @@ fn run_loop(domain: Option<String>, cycles: usize) -> Result<(), String> {
                 if !combos.is_empty() {
                     println!("    🔮 조합 발견 {}개", combos.len());
                 }
+
+                // Mirror Delta: 이전 루프 결과와 비교하여 상전이 감지
+                let mirror_path = std::path::PathBuf::from(
+                    std::env::var("HOME").unwrap_or_else(|_| ".".to_string())
+                ).join(".nexus6").join("last_mirror.json");
+                if let Ok(prev_data) = std::fs::read_to_string(&mirror_path) {
+                    // 이전 harmony/eigenvalue 로드
+                    if let Ok(prev_vals) = serde_json::from_str::<serde_json::Value>(&prev_data) {
+                        let prev_harmony = prev_vals.get("harmony")
+                            .and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let prev_eigenvalue = prev_vals.get("eigenvalue")
+                            .and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        // 변화율 계산: 10% 이상이면 상전이
+                        let h_base = prev_harmony.abs().max(1e-6);
+                        let e_base = prev_eigenvalue.abs().max(1e-6);
+                        let h_change = (mirror_harmony - prev_harmony).abs() / h_base;
+                        let e_change = (mirror_eigenvalue - prev_eigenvalue).abs() / e_base;
+                        if h_change > 0.10 || e_change > 0.10 {
+                            println!("    ⚡ 상전이 감지! harmony Δ{:.1}% | eigenvalue Δ{:.1}%",
+                                h_change * 100.0, e_change * 100.0);
+                        } else {
+                            println!("    📊 미러 안정: harmony Δ{:.1}% | eigenvalue Δ{:.1}%",
+                                h_change * 100.0, e_change * 100.0);
+                        }
+                    }
+                }
+                // 현재 결과 저장
+                if let Some(parent) = mirror_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let save_data = serde_json::json!({
+                    "harmony": mirror_harmony,
+                    "eigenvalue": mirror_eigenvalue,
+                    "cycle": cycle
+                });
+                let _ = std::fs::write(&mirror_path, save_data.to_string());
             } else {
                 println!("    ⚠️ 렌즈 부족 ({}개) — mirror scan 스킵", max_mirror);
             }

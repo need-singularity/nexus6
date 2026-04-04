@@ -350,6 +350,30 @@ impl Telescope {
         self.lenses.len()
     }
 
+    /// Retire inactive lenses whose scan results are empty.
+    /// Returns the names of removed lenses.
+    pub fn retire_inactive(&mut self, data: &[f64], n: usize, d: usize) -> Vec<String> {
+        let shared = SharedData::compute(data, n, d);
+        let mut retired = Vec::new();
+        self.lenses.retain(|lens| {
+            let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                lens.scan(data, n, d, &shared)
+            }));
+            match result {
+                Ok(lr) if lr.is_empty() => {
+                    retired.push(lens.name().to_string());
+                    false
+                }
+                Err(_) => {
+                    retired.push(lens.name().to_string());
+                    false
+                }
+                _ => true,
+            }
+        });
+        retired
+    }
+
     // ─── 거울 우주 (통합 API) ────────────────────────────────────
 
     /// 거울 우주: 모든 렌즈가 거울이자 관찰자 — 서로를 비추면 모두가 연결됨.

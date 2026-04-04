@@ -96,6 +96,50 @@ common_nexus6_scan() {
     fi
 }
 
+# ── 공통 Phase: Blowup (창발) ──
+common_blowup() {
+    log_info "💥 Blowup (창발)"
+    if [ -f "$NEXUS6_BIN" ]; then
+        local domain="${1:-number_theory}"
+        NEXUS6_ROOT="$HOME/Dev/nexus6" "$NEXUS6_BIN" blowup "$domain" --depth 6 2>/dev/null | grep -E "따름정리|공리 후보|총 창발|깊이" | while IFS= read -r line; do
+            log_info "  $line"
+        done
+        write_growth_bus "blowup" "ok" "domain=$domain"
+    else
+        write_growth_bus "blowup" "skip" "no_binary"
+    fi
+}
+
+# ── 공통 Phase: 크로스폴리네이션 ──
+common_cross_pollinate() {
+    log_info "🌸 Cross-Pollination (프로젝트간 창발)"
+    local blowup_file="$HOME/.nexus6/last_blowup.txt"
+    if [ -f "$blowup_file" ]; then
+        local emergences
+        emergences=$(grep "total_emergences=" "$blowup_file" | cut -d= -f2)
+        if [ "${emergences:-0}" -gt 0 ]; then
+            # 다른 프로젝트에 blowup 결과 전파
+            for proj_dir in "$HOME"/Dev/*/; do
+                local proj_name
+                proj_name=$(basename "$proj_dir")
+                [ "$proj_name" = "$GROWTH_NAME" ] && continue
+                [ ! -d "$proj_dir/.growth" ] && continue
+                # 발견 이벤트 기록
+                local ts
+                ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+                printf '{"ts":"%s","from":"%s","to":"%s","emergences":%s,"type":"cross_pollinate"}\n' \
+                    "$ts" "$GROWTH_NAME" "$proj_name" "${emergences}" >> "$proj_dir/.growth/cross_pollinate.jsonl" 2>/dev/null || true
+            done
+            log_info "  ${emergences}개 창발 → 프로젝트들에 전파"
+            write_growth_bus "cross_pollinate" "ok" "emergences=$emergences"
+        else
+            log_info "  창발 없음 — skip"
+        fi
+    else
+        log_info "  blowup 결과 없음 — skip"
+    fi
+}
+
 # ── 공통 Phase: 동기화 ──
 common_sync() {
     log_info "🔄 Sync"
@@ -162,6 +206,61 @@ common_growth_bridge() {
     fi
 }
 
+# ── 공통 Phase: 휴면 프로젝트 활성화 ──
+common_seed_dormant() {
+    log_info "🌱 Dormant project seeding"
+    for proj_dir in "$HOME"/Dev/*/; do
+        local proj_name
+        proj_name=$(basename "$proj_dir")
+        [ ! -d "$proj_dir" ] && continue
+        [ ! -d "$proj_dir/.git" ] && continue
+        # .growth 디렉토리가 없으면 초기화
+        if [ ! -d "$proj_dir/.growth" ]; then
+            mkdir -p "$proj_dir/.growth/absorbed"
+            echo '{"name":"'"$proj_name"'","cycle":0,"seeded_by":"'"$GROWTH_NAME"'","seeded_at":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'"}' > "$proj_dir/.growth/growth_state.json"
+            log_info "  $proj_name: .growth 초기화"
+            write_growth_bus "seed_dormant" "ok" "project=$proj_name"
+        fi
+        # absorbed/ 가 비어있으면 시드 데이터 생성
+        local absorbed_count
+        absorbed_count=$(ls "$proj_dir/.growth/absorbed/" 2>/dev/null | wc -l | tr -d ' ')
+        if [ "${absorbed_count:-0}" -eq 0 ] && [ -d "$proj_dir/src" ] || [ -d "$proj_dir/scripts" ]; then
+            # 프로젝트 파일 요약을 absorbed에 기록
+            local ts
+            ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+            local file_count
+            file_count=$(find "$proj_dir" -not -path '*/.git/*' -not -path '*/target/*' -not -path '*/node_modules/*' -type f 2>/dev/null | wc -l | tr -d ' ')
+            echo "{\"ts\":\"$ts\",\"project\":\"$proj_name\",\"files\":$file_count,\"seeded_by\":\"$GROWTH_NAME\"}" > "$proj_dir/.growth/absorbed/seed_${GROWTH_NAME}.json" 2>/dev/null || true
+            log_info "  $proj_name: 시드 데이터 생성 (files=$file_count)"
+        fi
+    done
+}
+
+# ── 공통 Phase: 대시보드 HTML 갱신 ──
+common_update_dashboard() {
+    local cycle="$1"
+    local dash_file="$HOME/.nexus6/dashboard.html"
+    local status_file="$HOME/.nexus6/daemon_status.txt"
+    local loop_report="$HOME/.nexus6/last_loop_report.txt"
+    local ts
+    ts=$(date '+%Y-%m-%d %H:%M:%S')
+
+    cat > "$dash_file" <<DASH
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta http-equiv="refresh" content="60">
+<title>NEXUS-6 Dashboard</title>
+<style>body{background:#0a0a0a;color:#0f0;font-family:monospace;padding:20px}
+pre{background:#111;padding:15px;border:1px solid #333;overflow-x:auto}
+h1{color:#0ff}h2{color:#ff0}.ts{color:#888}</style></head>
+<body><h1>NEXUS-6 Dashboard</h1>
+<p class="ts">Updated: ${ts} | Project: ${GROWTH_NAME} | Cycle: ${cycle}</p>
+<h2>Daemon Status</h2><pre>$(cat "$status_file" 2>/dev/null || echo "No daemon running")</pre>
+<h2>Last Loop Report</h2><pre>$(cat "$loop_report" 2>/dev/null || echo "No report yet")</pre>
+<h2>Growth Bus (last 10)</h2><pre>$(tail -10 "$HOME/Dev/nexus6/shared/growth_bus.jsonl" 2>/dev/null || echo "Empty")</pre>
+</body></html>
+DASH
+}
+
 # ── 메인 루프 래퍼 ──
 # 사용법: run_growth_loop <domain_phases_func> [args...]
 # domain_phases_func: 프로젝트별 phase 함수 (각 프로젝트에서 정의)
@@ -196,9 +295,19 @@ run_growth_loop() {
 
         # 공통 phases
         common_nexus6_scan "$domain"
+        common_blowup "$domain"
+        common_cross_pollinate
         common_growth_bridge
         common_update_state "$cycle"
         common_auto_commit "$cycle" "$dry_run"
+
+        # 10 사이클마다 휴면 프로젝트 활성화
+        if [ $((cycle % 10)) -eq 0 ]; then
+            common_seed_dormant
+        fi
+
+        # 대시보드 갱신
+        common_update_dashboard "$cycle"
 
         if [ "$cycle" -lt "$max_cycles" ]; then
             log_info "💤 ${interval}s 대기..."

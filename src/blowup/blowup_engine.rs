@@ -39,8 +39,8 @@ pub struct BlowupConfig {
 impl Default for BlowupConfig {
     fn default() -> Self {
         Self {
-            max_corollaries: 36, // 6²
-            min_confidence: 0.3,
+            max_corollaries: 216, // 6³ — large enough for depth 2–3
+            min_confidence: 0.15,
             max_depth: 6, // n=6
             transfer_domains: vec![
                 "physics".into(),
@@ -114,12 +114,17 @@ impl BlowupEngine {
             }
 
             // Feed validated corollaries as new axioms for next depth
+            // Add both name and signature keys as axioms for richer next-depth exploration
             for c in &validated {
                 if c.is_axiom_candidate {
                     current_axioms.push(c.name.clone());
                 }
                 for (k, v) in &c.signature {
                     current_metrics.insert(k.clone(), *v);
+                    // Also promote signature keys as axioms so next depth has more to work with
+                    if !current_axioms.contains(k) {
+                        current_axioms.push(k.clone());
+                    }
                 }
             }
 
@@ -228,8 +233,8 @@ impl BlowupEngine {
 
         // 7. Second-order: compose pairs of generated corollaries
         let first_gen = corollaries.clone();
-        for i in 0..first_gen.len().min(12) {
-            for j in (i + 1)..first_gen.len().min(12) {
+        for i in 0..first_gen.len().min(20) {
+            for j in (i + 1)..first_gen.len().min(20) {
                 if let Some(c) = self.compose(&first_gen[i], &first_gen[j], depth) {
                     corollaries.push(c);
                 }
