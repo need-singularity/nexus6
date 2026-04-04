@@ -507,6 +507,111 @@ common_heartbeat() {
     write_growth_bus "heartbeat" "ok" "stale=$stale_count"
 }
 
+# ── 공통 Phase: Project DNA 메타데이터 수집 ──
+common_project_dna() {
+    log_info "🧬 Project DNA scan"
+    local bridge_json="$HOME/Dev/nexus6/shared/bridge_state.json"
+    [ ! -f "$bridge_json" ] && return
+
+    python3 -c "
+import json, os, subprocess, glob
+from datetime import datetime, timezone
+
+bridge_file = '$bridge_json'
+with open(bridge_file) as f:
+    state = json.load(f)
+
+name = '$GROWTH_NAME'
+root = '$PROJECT_ROOT'
+conn = state.get('connections', {}).get(name, {})
+
+# 1. 모듈 목록
+modules = []
+if os.path.exists(f'{root}/Cargo.toml'):
+    for f_rs in glob.glob(f'{root}/src/**/*.rs', recursive=True):
+        mod_name = os.path.splitext(os.path.basename(f_rs))[0]
+        if mod_name not in ('mod', 'lib', 'main'):
+            modules.append(mod_name)
+elif os.path.exists(f'{root}/src'):
+    for f_py in glob.glob(f'{root}/src/**/*.py', recursive=True):
+        mod_name = os.path.splitext(os.path.basename(f_py))[0]
+        if mod_name != '__init__':
+            modules.append(mod_name)
+conn['modules'] = modules[:50]  # 최대 50개
+conn['module_count'] = len(modules)
+
+# 2. 테스트 수
+test_count = 0
+test_pass = 0
+if os.path.exists(f'{root}/Cargo.toml'):
+    try:
+        r = subprocess.run(['$HOME/.cargo/bin/cargo', 'test', '--manifest-path', f'{root}/Cargo.toml', '--', '--quiet'],
+                          capture_output=True, text=True, timeout=30)
+        for line in r.stdout.split('\n') + r.stderr.split('\n'):
+            if 'passed' in line:
+                parts = line.split()
+                for i, p in enumerate(parts):
+                    if p == 'passed':
+                        try: test_pass = int(parts[i-1])
+                        except: pass
+                    if p == 'failed':
+                        try: test_count += int(parts[i-1])
+                        except: pass
+                test_count += test_pass
+    except: pass
+conn['test_count'] = test_count
+conn['test_pass'] = test_pass
+
+# 3. 언어 / 빌드 시스템
+lang = 'unknown'
+build = 'none'
+if os.path.exists(f'{root}/Cargo.toml'):
+    lang = 'rust'
+    build = 'cargo'
+elif os.path.exists(f'{root}/package.json'):
+    lang = 'javascript'
+    build = 'npm'
+elif os.path.exists(f'{root}/pyproject.toml') or os.path.exists(f'{root}/setup.py'):
+    lang = 'python'
+    build = 'pip'
+elif any(glob.glob(f'{root}/**/*.py', recursive=True)):
+    lang = 'python'
+    build = 'script'
+conn['language'] = lang
+conn['build_system'] = build
+
+# 4. 최근 커밋 빈도 (7일)
+try:
+    r = subprocess.run(['git', '-C', root, 'rev-list', '--count', '--since=7.days', 'HEAD'],
+                      capture_output=True, text=True, timeout=10)
+    conn['commits_7d'] = int(r.stdout.strip()) if r.stdout.strip() else 0
+except:
+    conn['commits_7d'] = 0
+
+# 5. 파일 수
+try:
+    total_files = 0
+    for dp, dn, fns in os.walk(root):
+        dn[:] = [d for d in dn if d not in ('.git', 'target', 'node_modules', '__pycache__')]
+        total_files += len(fns)
+    conn['total_files'] = total_files
+except:
+    conn['total_files'] = 0
+
+conn['dna_updated'] = datetime.now(timezone.utc).isoformat()
+
+state['connections'][name] = conn
+with open(bridge_file, 'w') as f:
+    json.dump(state, f, indent=2)
+    f.write('\n')
+
+print(f'DNA: {lang}/{build} | {len(modules)} modules | {test_pass}/{test_count} tests | {conn.get(\"commits_7d\",0)} commits/7d | {conn.get(\"total_files\",0)} files')
+" 2>/dev/null | while IFS= read -r line; do
+        log_info "  $line"
+    done
+    write_growth_bus "project_dna" "ok" "project=$GROWTH_NAME"
+}
+
 # ── 공통 Phase: 성장 포인트 연방제 ──
 common_federated_growth() {
     log_info "🤝 Federated growth"
@@ -662,8 +767,12 @@ run_growth_loop() {
             common_growth_timeline 2>/dev/null || true
         fi
 
-        # 6 사이클마다 (연방 + 렌즈 + 실험)
+        # 6 사이클마다 (DNA + 연결 + 이력 + 연방 + 렌즈 + 실험)
         if [ $((cycle % 6)) -eq 0 ]; then
+            common_project_dna
+            common_connection_metrics 2>/dev/null || true
+            common_growth_history 2>/dev/null || true
+            common_auto_actions 2>/dev/null || true
             common_federated_growth
             common_reverse_lens_sync
             common_cross_experiment 2>/dev/null || true
