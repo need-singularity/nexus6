@@ -107,6 +107,7 @@ impl Lens for RulerLens {
         let mut result = HashMap::new();
         result.insert("effective_rank".to_string(), vec![effective_rank]);
         result.insert("explained_variance_ratio".to_string(), vec![explained_ratio]);
+        result.insert("score".to_string(), vec![result["effective_rank"][0].min(1.0).max(0.0)]);
         result
     }
 }

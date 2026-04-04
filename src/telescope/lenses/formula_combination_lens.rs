@@ -89,6 +89,7 @@ impl Lens for FormulaCombinationLens {
         result.insert("power_relations".into(), vec![power_count as f64]);
         result.insert("formula_complexity".into(), vec![complexity]);
         result.insert("r_squared".into(), vec![best_r2]);
+        result.insert("score".to_string(), vec![result["linear_relations"][0].min(1.0).max(0.0)]);
         result
     }
 }

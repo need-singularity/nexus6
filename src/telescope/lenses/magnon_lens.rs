@@ -129,6 +129,7 @@ impl Lens for MagnonLens {
         result.insert("sublattice_magnetization".to_string(), magnetizations);
         result.insert("softening_proximity".to_string(), vec![softening]);
         result.insert("spin_stiffness".to_string(), stiffness_vals);
+        result.insert("score".to_string(), vec![result["magnon_frequencies"][0].min(1.0).max(0.0)]);
         result
     }
 }

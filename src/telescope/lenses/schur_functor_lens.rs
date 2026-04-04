@@ -173,6 +173,7 @@ impl Lens for SchurFunctorLens {
             }
         }
         result.insert("self_conjugate_count".to_string(), vec![self_conj_count as f64]);
+        result.insert("score".to_string(), vec![result["partition_count"][0].min(1.0).max(0.0)]);
 
         result
     }

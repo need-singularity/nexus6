@@ -161,6 +161,7 @@ impl Lens for SkyrmionLens {
         result.insert("anisotropy_strength".to_string(), vec![anisotropy]);
         result.insert("helicity".to_string(), vec![helicity]);
         result.insert("topological_density".to_string(), charge_density);
+        result.insert("score".to_string(), vec![result["topological_charge"][0].min(1.0).max(0.0)]);
         result
     }
 }

@@ -93,6 +93,7 @@ impl Lens for RatioLens {
         result.insert("ratio_match_rate".to_string(), vec![ratio_match_rate]);
         result.insert("mean_n6_matches".to_string(), vec![mean_n6_matches as f64]);
         result.insert("matched_ratios".to_string(), matched_ratios);
+        result.insert("score".to_string(), vec![result["n6_ratio_matches"][0].min(1.0).max(0.0)]);
         result
     }
 }

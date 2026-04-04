@@ -141,6 +141,7 @@ impl Lens for DispersionRelationLens {
         result.insert("kramers_kronig_error".to_string(), vec![kk_normalized]);
         result.insert("spectral_weight".to_string(), vec![spectral_weight]);
         result.insert("dispersion_slope".to_string(), vec![slope]);
+        result.insert("score".to_string(), vec![result["pole_count"][0].min(1.0).max(0.0)]);
         result
     }
 }

@@ -94,6 +94,7 @@ impl Lens for WaveLens {
         result.insert("dominant_frequency".to_string(), vec![dominant_freq]);
         result.insert("spectral_entropy".to_string(), vec![spectral_entropy]);
         result.insert("peak_count".to_string(), vec![peak_count as f64]);
+        result.insert("score".to_string(), vec![result["dominant_frequency"][0].min(1.0).max(0.0)]);
         result
     }
 }

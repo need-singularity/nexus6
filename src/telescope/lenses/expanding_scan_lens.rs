@@ -84,6 +84,7 @@ impl Lens for ExpandingScanLens {
         result.insert("critical_scale".to_string(), vec![critical_scale]);
         result.insert("density_at_scales".to_string(), density_per_scale);
         result.insert("entropy_at_scales".to_string(), entropy_per_scale);
+        result.insert("score".to_string(), vec![result["scale_transition"][0].min(1.0).max(0.0)]);
         result
     }
 }

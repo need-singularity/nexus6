@@ -136,6 +136,7 @@ impl Lens for MatroidLens {
         result.insert("num_bases".into(), vec![num_bases as f64]);
         result.insert("num_independent_sets".into(), vec![num_independent as f64]);
         result.insert("num_spanning_sets".into(), vec![num_spanning as f64]);
+        result.insert("score".to_string(), vec![result["matroid_rank"][0].min(1.0).max(0.0)]);
         result
     }
 }

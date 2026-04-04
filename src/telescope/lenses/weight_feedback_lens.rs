@@ -130,6 +130,7 @@ impl Lens for WeightFeedbackLens {
         result.insert("top_weighted_constant".into(), vec![top_idx as f64]);
         result.insert("learning_epoch".into(), vec![epoch]);
         result.insert("convergence_estimate".into(), vec![convergence_est]);
+        result.insert("score".to_string(), vec![result["weighted_phi"][0].min(1.0).max(0.0)]);
         result
     }
 }

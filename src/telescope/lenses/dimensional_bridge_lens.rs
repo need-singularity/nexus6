@@ -67,6 +67,7 @@ impl Lens for DimensionalBridgeLens {
         result.insert("bridge_strength".to_string(), vec![max_mi]);
         result.insert("dimensional_coupling".to_string(), vec![dimensional_coupling]);
         result.insert("bridge_asymmetry".to_string(), vec![bridge_asymmetry]);
+        result.insert("score".to_string(), vec![result["bridge_count"][0].min(1.0).max(0.0)]);
         result
     }
 }

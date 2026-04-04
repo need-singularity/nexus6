@@ -98,6 +98,7 @@ impl Lens for FisherGeometricLens {
         result.insert("selection_gradient".into(), vec![mean_grad]);
         result.insert("overshoot_fraction".into(), vec![overshoot_frac]);
         result.insert("n_dim".into(), vec![n_dim as f64]);
+        result.insert("score".to_string(), vec![result["mean_fitness"][0].min(1.0).max(0.0)]);
         result
     }
 }

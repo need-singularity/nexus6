@@ -157,6 +157,7 @@ impl Lens for ReconnectionLens {
         result.insert("magnetic_helicity".to_string(), vec![helicity]);
         result.insert("current_sheet_thickness".to_string(), vec![sheet_thickness]);
         result.insert("lundquist_number".to_string(), vec![lundquist]);
+        result.insert("score".to_string(), vec![result["null_point_count"][0].min(1.0).max(0.0)]);
         result
     }
 }

@@ -58,6 +58,7 @@ impl Lens for CompressionLens {
         result.insert("redundancy".into(), vec![redundancy.max(0.0)]);
         result.insert("entropy_rate".into(), vec![entropy_rate]);
         result.insert("lossless_potential".into(), vec![lossless_potential]);
+        result.insert("score".to_string(), vec![result["compression_ratio"][0].min(1.0).max(0.0)]);
         result
     }
 }

@@ -85,6 +85,7 @@ impl Lens for MoleculeLens {
         result.insert("branching_factor".into(), vec![branching]);
         result.insert("molecular_symmetry".into(), vec![sym]);
         result.insert("functional_group_count".into(), vec![functional_groups as f64]);
+        result.insert("score".to_string(), vec![result["bond_graph_density"][0].min(1.0).max(0.0)]);
         result
     }
 }

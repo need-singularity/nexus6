@@ -78,6 +78,7 @@ impl Lens for ARIMAHiddenLens {
         result.insert("arima_residual_autocorr".to_string(), residual_autocorrs);
         result.insert("arima_mean_aic".to_string(), vec![mean_aic]);
         result.insert("arima_mean_residual_acf".to_string(), vec![mean_resid_acf]);
+        result.insert("score".to_string(), vec![result["arima_best_aic"][0].min(1.0).max(0.0)]);
         result
     }
 }

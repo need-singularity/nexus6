@@ -68,6 +68,7 @@ impl Lens for WarpLens {
         result.insert("mean_warp".to_string(), vec![mean_warp]);
         result.insert("warp_anisotropy".to_string(), vec![warp_var]);
         result.insert("contraction_fraction".to_string(), vec![contraction_frac]);
+        result.insert("score".to_string(), vec![result["warp_factor"][0].min(1.0).max(0.0)]);
         result
     }
 }

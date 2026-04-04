@@ -127,6 +127,7 @@ impl Lens for KTheoryLens {
                 }
             }
             result.insert("bundle_rank".to_string(), vec![effective_rank as f64]);
+            result.insert("score".to_string(), vec![result["bott_period_2"][0].min(1.0).max(0.0)]);
         }
 
         result

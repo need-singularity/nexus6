@@ -123,6 +123,7 @@ impl Lens for FrequencyDependentLens {
         result.insert("cyclic_dominance_strength".into(), vec![cyclic_strength]);
         result.insert("frequency_variance".into(), vec![freq_variance]);
         result.insert("phenotype_frequencies".into(), freq);
+        result.insert("score".to_string(), vec![result["mean_fitness"][0].min(1.0).max(0.0)]);
         result
     }
 }

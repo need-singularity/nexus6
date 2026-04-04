@@ -153,6 +153,7 @@ impl Lens for LotkaVolterraLens {
         result.insert("is_stable".into(), vec![if is_stable { 1.0 } else { 0.0 }]);
         result.insert("max_eigenvalue".into(), vec![max_eigen]);
         result.insert("n_species".into(), vec![s as f64]);
+        result.insert("score".to_string(), vec![result["connectance"][0].min(1.0).max(0.0)]);
         result
     }
 }

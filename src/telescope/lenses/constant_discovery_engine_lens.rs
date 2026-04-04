@@ -129,6 +129,7 @@ impl Lens for ConstantDiscoveryEngineLens {
         result.insert("n6_coverage".to_string(), vec![n6_coverage]);
         result.insert("registration_ready".to_string(), vec![registration_ready]);
         result.insert("debit_credit_balance".to_string(), debit_credit_balance);
+        result.insert("score".to_string(), vec![result["total_discoveries"][0].min(1.0).max(0.0)]);
         result
     }
 }

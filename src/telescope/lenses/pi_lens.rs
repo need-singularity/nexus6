@@ -112,6 +112,7 @@ impl Lens for PiLens {
                 0.0
             };
             result.insert("buffon_estimate".to_string(), vec![buffon_estimate]);
+            result.insert("score".to_string(), vec![result["circularity"][0].min(1.0).max(0.0)]);
         }
 
         result

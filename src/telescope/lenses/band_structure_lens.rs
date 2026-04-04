@@ -116,6 +116,7 @@ impl Lens for BandStructureLens {
         result.insert("dirac_point_count".to_string(), vec![dirac_count as f64]);
         result.insert("bandwidth".to_string(), bandwidths);
         result.insert("van_hove_singularities".to_string(), van_hove);
+        result.insert("score".to_string(), vec![result["band_gaps"][0].min(1.0).max(0.0)]);
         result
     }
 }

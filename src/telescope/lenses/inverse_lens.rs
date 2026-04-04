@@ -213,6 +213,7 @@ impl Lens for UinverseLens {
         result.insert("mean_causal_depth".to_string(), vec![mean_depth]);
         result.insert("mean_reconstructability".to_string(), vec![mean_recon]);
         result.insert("max_transfer_entropy".to_string(), vec![max_te]);
+        result.insert("score".to_string(), vec![result["reconstructability"][0].min(1.0).max(0.0)]);
         result
     }
 }

@@ -76,6 +76,7 @@ impl Lens for ConcaveLens {
         result.insert("virtual_focus".to_string(), vec![virtual_focus]);
         result.insert("spread_angle".to_string(), vec![spread_angle]);
         result.insert("magnification".to_string(), vec![magnification]);
+        result.insert("score".to_string(), vec![result["divergence_rate"][0].min(1.0).max(0.0)]);
         result
     }
 }

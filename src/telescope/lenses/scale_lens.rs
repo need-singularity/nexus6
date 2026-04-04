@@ -80,6 +80,7 @@ impl Lens for ScaleLens {
         let mut result = HashMap::new();
         result.insert("power_law_exponent".to_string(), vec![power_law_exponent]);
         result.insert("hurst_exponent".to_string(), vec![hurst]);
+        result.insert("score".to_string(), vec![result["power_law_exponent"][0].min(1.0).max(0.0)]);
         result
     }
 }

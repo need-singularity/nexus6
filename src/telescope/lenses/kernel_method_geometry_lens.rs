@@ -117,6 +117,7 @@ impl Lens for KernelMethodGeometryLens {
         result.insert("kernel_alignment".into(), vec![alignment]);
         result.insert("n6_degree_match".into(), vec![n6_degree_match]);
         result.insert("top_6_eigenvalues".into(), eigenvalues);
+        result.insert("score".to_string(), vec![result["kernel_trace"][0].min(1.0).max(0.0)]);
         result
     }
 }

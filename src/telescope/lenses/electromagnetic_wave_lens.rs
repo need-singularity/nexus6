@@ -178,6 +178,7 @@ impl Lens for UelectromagneticUwaveLens {
             vec![mean_amp, amp_variance, max_amp, min_amp],
         );
         result.insert("wavenumber".to_string(), vec![k]);
+        result.insert("score".to_string(), vec![result["amplitudes"][0].min(1.0).max(0.0)]);
         result
     }
 }

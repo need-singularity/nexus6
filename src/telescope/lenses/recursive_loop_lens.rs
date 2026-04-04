@@ -84,6 +84,7 @@ impl Lens for RecursiveLoopLens {
         result.insert("self_similarity".to_string(), vec![self_similarity]);
         result.insert("convergence_history".to_string(), convergence_history);
         result.insert("recursion_depth".to_string(), vec![history.len() as f64]);
+        result.insert("score".to_string(), vec![result["fixed_point_depth"][0].min(1.0).max(0.0)]);
         result
     }
 }

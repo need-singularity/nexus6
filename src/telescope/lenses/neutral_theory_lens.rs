@@ -106,6 +106,7 @@ impl Lens for NeutralTheoryLens {
         result.insert("segregating_sites".into(), vec![seg_sites as f64]);
         result.insert("tajima_d_analog".into(), vec![tajima_d_analog]);
         result.insert("coalescence_theta".into(), vec![theta]);
+        result.insert("score".to_string(), vec![result["mean_heterozygosity"][0].min(1.0).max(0.0)]);
         result
     }
 }

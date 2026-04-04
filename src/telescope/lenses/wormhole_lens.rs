@@ -98,6 +98,7 @@ impl Lens for WormholeLens {
         result.insert("mean_shortcut_ratio".to_string(), vec![mean_shortcut]);
         result.insert("bypass_efficiency".to_string(), vec![bypass_efficiency]);
         result.insert("shortcut_ratios".to_string(), shortcut_ratios);
+        result.insert("score".to_string(), vec![result["wormhole_count"][0].min(1.0).max(0.0)]);
         result
     }
 }

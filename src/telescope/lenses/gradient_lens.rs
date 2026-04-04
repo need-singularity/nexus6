@@ -69,6 +69,7 @@ impl Lens for GradientLens {
         result.insert("mean_sign_change_rate".to_string(), vec![mean_sign_change_rate]);
         result.insert("gradient_stabilities".to_string(), grad_stabilities);
         result.insert("mean_gradient_stability".to_string(), vec![mean_stability]);
+        result.insert("score".to_string(), vec![result["mean_gradient_magnitude"][0].min(1.0).max(0.0)]);
         result
     }
 }

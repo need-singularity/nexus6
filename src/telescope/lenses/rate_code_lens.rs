@@ -97,6 +97,7 @@ impl Lens for RateCodeLens {
         result.insert("mean_fano_factor".into(), vec![mean_fano]);
         result.insert("info_per_spike".into(), vec![info_per_spike]);
         result.insert("n_neurons".into(), vec![n_neurons as f64]);
+        result.insert("score".to_string(), vec![result["mean_fisher_information"][0].min(1.0).max(0.0)]);
         result
     }
 }

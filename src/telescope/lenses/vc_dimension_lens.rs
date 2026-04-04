@@ -111,6 +111,7 @@ impl Lens for VCDimensionLens {
         result.insert("sample_complexity".into(), vec![sample_complexity]);
         result.insert("rademacher_from_vc".into(), vec![rademacher_from_vc]);
         result.insert("n6_vc_match".into(), vec![n6_vc_match]);
+        result.insert("score".to_string(), vec![result["linear_vc_dimension"][0].min(1.0).max(0.0)]);
         result
     }
 }

@@ -85,6 +85,7 @@ impl Lens for EmLens {
         let mut result = HashMap::new();
         result.insert("mean_gradient".to_string(), vec![mean_grad]);
         result.insert("mean_divergence".to_string(), vec![mean_div]);
+        result.insert("score".to_string(), vec![result["mean_gradient"][0].min(1.0).max(0.0)]);
         result
     }
 }

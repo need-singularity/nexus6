@@ -122,6 +122,7 @@ impl Lens for PlasmaDispersionLens {
         result.insert("debye_length".to_string(), vec![debye_length]);
         result.insert("coupling_matrix".to_string(), coupling);
         result.insert("dielectric_function".to_string(), dielectric);
+        result.insert("score".to_string(), vec![result["plasma_frequencies"][0].min(1.0).max(0.0)]);
         result
     }
 }

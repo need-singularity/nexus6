@@ -66,6 +66,7 @@ impl Lens for BernsteinApproximationLens {
         result.insert("bernstein_control_spread".to_string(), control_point_spreads);
         result.insert("bernstein_mean_error".to_string(), vec![mean_error]);
         result.insert("bernstein_mean_condition".to_string(), vec![mean_cond]);
+        result.insert("score".to_string(), vec![result["bernstein_approx_error"][0].min(1.0).max(0.0)]);
         result
     }
 }

@@ -86,6 +86,7 @@ impl Lens for QuantumMicroLens {
         let mut result = HashMap::new();
         result.insert("von_neumann_entropy".to_string(), vec![vn_entropy]);
         result.insert("purity".to_string(), vec![purity]);
+        result.insert("score".to_string(), vec![result["von_neumann_entropy"][0].min(1.0).max(0.0)]);
         result
     }
 }

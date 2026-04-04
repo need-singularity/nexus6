@@ -129,6 +129,7 @@ impl Lens for CommunicationComplexityLens {
         result.insert("mutual_information_approx".into(), vec![mi_approx]);
         result.insert("communication_lower_bound".into(), vec![lower_bound]);
         result.insert("n6_protocol_match".into(), vec![n6_match]);
+        result.insert("score".to_string(), vec![result["rate_no_communication"][0].min(1.0).max(0.0)]);
         result
     }
 }

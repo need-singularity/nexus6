@@ -113,6 +113,7 @@ impl Lens for CPViolationLens {
         result.insert("mixing_angles".to_string(), vec![theta12, theta23, theta13]);
         result.insert("unitarity_triangle_area".to_string(), vec![triangle_area]);
         result.insert("cp_phase".to_string(), vec![cp_phase]);
+        result.insert("score".to_string(), vec![result["jarlskog_invariant"][0].min(1.0).max(0.0)]);
         result
     }
 }

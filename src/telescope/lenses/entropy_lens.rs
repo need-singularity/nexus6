@@ -64,6 +64,7 @@ impl Lens for EntropyLens {
         result.insert("mean_renyi2".to_string(), vec![mean_renyi]);
         result.insert("entropy_ratio".to_string(), vec![entropy_ratio]);
         result.insert("normalized_entropy".to_string(), vec![normalized_entropy]);
+        result.insert("score".to_string(), vec![result["shannon_per_dim"][0].min(1.0).max(0.0)]);
         result
     }
 }

@@ -105,6 +105,7 @@ impl Lens for RelativisticBarrierLens {
         result.insert("barrier_sharpness".to_string(), vec![barrier_sharpness]);
         result.insert("subluminal_fraction".to_string(), vec![subluminal_fraction]);
         result.insert("gradient_explosion".to_string(), vec![max_gradient_ratio]);
+        result.insert("score".to_string(), vec![result["divergence_fraction"][0].min(1.0).max(0.0)]);
         result
     }
 }

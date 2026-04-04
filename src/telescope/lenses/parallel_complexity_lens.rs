@@ -83,6 +83,7 @@ impl Lens for ParallelComplexityLens {
         result.insert("load_imbalance_cv".into(), vec![load_cv]);
         result.insert("processor_loads".into(), processor_load.to_vec());
         result.insert("n6_resonance".into(), vec![n6_resonance]);
+        result.insert("score".to_string(), vec![result["total_work"][0].min(1.0).max(0.0)]);
         result
     }
 }

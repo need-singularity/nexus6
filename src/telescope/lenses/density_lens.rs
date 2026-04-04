@@ -47,6 +47,7 @@ impl Lens for DensityLens {
         result.insert("density_cv".to_string(), vec![density_cv]);
         result.insert("density_ratio".to_string(), vec![density_ratio]);
         result.insert("dense_fraction".to_string(), vec![dense_fraction]);
+        result.insert("score".to_string(), vec![result["densities"][0].min(1.0).max(0.0)]);
         result
     }
 }

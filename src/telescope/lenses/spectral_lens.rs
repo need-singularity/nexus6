@@ -79,6 +79,7 @@ impl Lens for SpectralLens {
         result.insert("spectral_entropy".to_string(), spectral_entropy_vals);
         result.insert("mean_spectral_entropy".to_string(), vec![mean_spectral_entropy]);
         result.insert("harmonic_ratio_matches".to_string(), vec![harmonic_ratio_matches as f64]);
+        result.insert("score".to_string(), vec![result["dominant_frequencies"][0].min(1.0).max(0.0)]);
         result
     }
 }

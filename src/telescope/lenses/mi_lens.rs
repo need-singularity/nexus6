@@ -98,6 +98,7 @@ impl Lens for MiLens {
         result.insert("high_mi_dim_j".to_string(), high_mi_pairs_j);
         result.insert("high_mi_values".to_string(), high_mi_values);
         result.insert("total_mi".to_string(), vec![total_mi]);
+        result.insert("score".to_string(), vec![result["mi_matrix"][0].min(1.0).max(0.0)]);
         result
     }
 }

@@ -126,6 +126,7 @@ impl Lens for LatticeBasisLens {
         result.insert("lll_quality".into(), vec![lll_quality]);
         result.insert("n6_dim_match".into(), vec![n6_dim_match]);
         result.insert("gs_norms".into(), gs_norms.iter().map(|n| n.sqrt()).collect());
+        result.insert("score".to_string(), vec![result["basis_dimension"][0].min(1.0).max(0.0)]);
         result
     }
 }

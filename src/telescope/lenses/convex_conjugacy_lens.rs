@@ -53,6 +53,7 @@ impl Lens for ConvexConjugacyLens {
         result.insert("convex_fy_violation_rate".to_string(), vec![fy_violations]);
         result.insert("convex_hull_volume_ratio".to_string(), vec![hull_volume_ratio]);
         result.insert("convex_mean_inner_product".to_string(), vec![mean_inner_product]);
+        result.insert("score".to_string(), vec![result["convex_convexity_measure"][0].min(1.0).max(0.0)]);
         result
     }
 }

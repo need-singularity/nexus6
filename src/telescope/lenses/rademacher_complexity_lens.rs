@@ -107,6 +107,7 @@ impl Lens for RademacherComplexityLens {
         result.insert("between_fold_variance".into(), vec![between_fold_var]);
         result.insert("n6_rademacher_match".into(), vec![n6_rad_match]);
         result.insert("fold_variances".into(), fold_variances);
+        result.insert("score".to_string(), vec![result["rademacher_complexity"][0].min(1.0).max(0.0)]);
         result
     }
 }

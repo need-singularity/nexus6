@@ -104,6 +104,7 @@ impl Lens for ContractingScanLens {
         result.insert("zoom_gradient".to_string(), vec![zoom_gradient]);
         result.insert("detail_emergence".to_string(), vec![detail_emergence]);
         result.insert("fractal_consistency".to_string(), vec![fractal_consistency]);
+        result.insert("score".to_string(), vec![result["coarse_structure"][0].min(1.0).max(0.0)]);
         result
     }
 }

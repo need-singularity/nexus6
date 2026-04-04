@@ -151,6 +151,7 @@ impl Lens for PolyhedronFaceLens {
         result.insert("hull_vertex_fraction".into(), vec![hull_fraction]);
         result.insert("n6_dim_match".into(), vec![n6_dim_match]);
         result.insert("f_vector".into(), vec![f0 as f64, f1 as f64, f2 as f64]);
+        result.insert("score".to_string(), vec![result["f0_vertices"][0].min(1.0).max(0.0)]);
         result
     }
 }

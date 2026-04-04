@@ -48,6 +48,7 @@ impl Lens for StateSpaceObservabilityLens {
         result.insert("ss_is_stable".to_string(), vec![if is_stable { 1.0 } else { 0.0 }]);
         result.insert("ss_hankel_sv".to_string(), hankel_svs);
         result.insert("ss_state_dim".to_string(), vec![state_dim as f64]);
+        result.insert("score".to_string(), vec![result["ss_observability_rank"][0].min(1.0).max(0.0)]);
         result
     }
 }

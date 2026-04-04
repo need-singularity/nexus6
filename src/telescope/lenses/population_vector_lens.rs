@@ -114,6 +114,7 @@ impl Lens for PopulationVectorLens {
         result.insert("decoding_precision".into(), vec![precision.min(1e10)]);
         result.insert("mean_pop_vector_magnitude".into(), vec![mean_magnitude]);
         result.insert("motor_dimensions".into(), vec![n_dim as f64]);
+        result.insert("score".to_string(), vec![result["mean_decoding_accuracy"][0].min(1.0).max(0.0)]);
         result
     }
 }

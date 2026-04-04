@@ -111,6 +111,7 @@ impl Lens for GravityLens {
         result.insert("attractor_count".to_string(), vec![merged_peaks.len() as f64]);
         result.insert("peak_densities".to_string(), peak_densities);
         result.insert("peak_indices".to_string(), peak_indices);
+        result.insert("score".to_string(), vec![result["attractor_count"][0].min(1.0).max(0.0)]);
         result
     }
 }

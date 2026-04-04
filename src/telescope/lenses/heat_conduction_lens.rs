@@ -163,6 +163,7 @@ impl Lens for UheatUconductionLens {
         result.insert("gradient_entropy".to_string(), vec![gradient_entropy]);
         result.insert("gradient_magnitudes".to_string(), gradient_mag);
         result.insert("net_flux".to_string(), net_flux);
+        result.insert("score".to_string(), vec![result["mean_heat_flux"][0].min(1.0).max(0.0)]);
         result
     }
 }

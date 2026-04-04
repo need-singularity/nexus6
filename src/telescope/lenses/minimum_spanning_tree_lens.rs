@@ -132,6 +132,7 @@ impl Lens for MinimumSpanningTreeLens {
         result.insert("steiner_lower_bound".into(), vec![steiner_lower_bound]);
         result.insert("n6_cycle_match".into(), vec![n6_cycle_match]);
         result.insert("mst_edge_weights".into(), mst_edge_weights);
+        result.insert("score".to_string(), vec![result["mst_weight"][0].min(1.0).max(0.0)]);
         result
     }
 }

@@ -161,6 +161,7 @@ impl Lens for UfrustrationLens {
             "local_frustration".to_string(),
             vec![local_mean, local_std],
         );
+        result.insert("score".to_string(), vec![frustration_index.min(1.0).max(0.0)]);
         result
     }
 }

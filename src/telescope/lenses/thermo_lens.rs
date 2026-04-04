@@ -75,6 +75,7 @@ impl Lens for ThermoLens {
         result.insert("shannon_entropy".to_string(), vec![total_entropy]);
         result.insert("free_energy_proxy".to_string(), vec![free_energy]);
         result.insert("entropy_per_dim".to_string(), entropies);
+        result.insert("score".to_string(), vec![result["shannon_entropy"][0].min(1.0).max(0.0)]);
         result
     }
 }

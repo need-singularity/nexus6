@@ -81,6 +81,7 @@ impl Lens for MutationLens {
         result.insert("mutation_rate".to_string(), vec![mutation_rate]);
         result.insert("beneficial_fraction".to_string(), vec![beneficial_fraction]);
         result.insert("reversion_rate".to_string(), vec![reversion_rate]);
+        result.insert("score".to_string(), vec![result["mutation_count"][0].min(1.0).max(0.0)]);
         result
     }
 }

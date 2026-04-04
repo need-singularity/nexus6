@@ -128,6 +128,7 @@ impl Lens for BigBangLens {
                 0.0
             };
             result.insert("cmb_uniformity".to_string(), vec![cmb_uniformity]);
+            result.insert("score".to_string(), vec![result["expansion_rate"][0].min(1.0).max(0.0)]);
         }
 
         result

@@ -129,6 +129,7 @@ impl Lens for QuantumJumpLens {
         result.insert("state_count".to_string(), vec![state_count as f64]);
         result.insert("jump_rate".to_string(), vec![jump_rate]);
         result.insert("quantum_discreteness".to_string(), vec![discreteness]);
+        result.insert("score".to_string(), vec![result["jump_count"][0].min(1.0).max(0.0)]);
         result
     }
 }

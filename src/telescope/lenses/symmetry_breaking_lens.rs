@@ -70,6 +70,7 @@ impl Lens for SymmetryBreakingLens {
         result.insert("mean_lr_imbalance".to_string(), vec![mean_lr_imbalance]);
         result.insert("excess_kurtosis".to_string(), kurtosis);
         result.insert("mean_excess_kurtosis".to_string(), vec![mean_excess_kurtosis]);
+        result.insert("score".to_string(), vec![result["skewness"][0].min(1.0).max(0.0)]);
         result
     }
 }

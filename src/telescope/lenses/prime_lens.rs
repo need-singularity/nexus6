@@ -142,6 +142,7 @@ impl Lens for PrimeLens {
                     0.0
                 };
                 result.insert("prime_staircase_fit".to_string(), vec![staircase_fit]);
+                result.insert("score".to_string(), vec![result["prime_density"][0].min(1.0).max(0.0)]);
             }
         }
 

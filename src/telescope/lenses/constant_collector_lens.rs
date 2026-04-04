@@ -103,6 +103,7 @@ impl Lens for ConstantCollectorLens {
         result.insert("best_match_idx".to_string(), vec![best_match_name]);
         result.insert("match_precision".to_string(), vec![match_precision]);
         result.insert("n6_fraction".to_string(), vec![n6_fraction]);
+        result.insert("score".to_string(), vec![result["constant_matches"][0].min(1.0).max(0.0)]);
         result
     }
 }

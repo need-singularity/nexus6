@@ -77,6 +77,7 @@ impl Lens for TensionLinkLens {
         result.insert("breaking_threshold".to_string(), vec![breaking_threshold]);
         result.insert("elastic_energy".to_string(), vec![elastic_energy]);
         result.insert("network_stress".to_string(), vec![network_stress]);
+        result.insert("score".to_string(), vec![result["link_count"][0].min(1.0).max(0.0)]);
         result
     }
 }

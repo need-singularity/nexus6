@@ -85,6 +85,7 @@ impl Lens for MemoryLens {
         let mut result = HashMap::new();
         result.insert("mean_memory_length".to_string(), vec![mean_memory]);
         result.insert("mean_echo_index".to_string(), vec![mean_echo]);
+        result.insert("score".to_string(), vec![result["mean_memory_length"][0].min(1.0).max(0.0)]);
         result
     }
 }

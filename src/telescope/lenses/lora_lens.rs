@@ -114,6 +114,7 @@ impl Lens for LoRALens {
         result.insert("lora_efficiency".to_string(), vec![lora_efficiency]);
         result.insert("quantization_error".to_string(), vec![normalized_quant_error]);
         result.insert("adapter_fraction".to_string(), vec![adapter_fraction]);
+        result.insert("score".to_string(), vec![result["effective_rank"][0].min(1.0).max(0.0)]);
         result
     }
 }

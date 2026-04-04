@@ -69,6 +69,7 @@ impl Lens for DimensionReductionLens {
         result.insert("participation_ratio".to_string(), vec![participation_ratio]);
         result.insert("explained_variance".to_string(), explained);
         result.insert("total_variance".to_string(), vec![total_var]);
+        result.insert("score".to_string(), vec![result["intrinsic_dimensionality"][0].min(1.0).max(0.0)]);
         result
     }
 }

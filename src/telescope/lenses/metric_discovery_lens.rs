@@ -81,6 +81,7 @@ impl Lens for MetricDiscoveryLens {
         result.insert("metric_advantage".into(), vec![metric_advantage]);
         result.insert("anisotropy_direction".into(), vec![max_var_idx as f64]);
         result.insert("effective_dimensionality".into(), vec![eff_dim]);
+        result.insert("score".to_string(), vec![result["best_metric_type"][0].min(1.0).max(0.0)]);
         result
     }
 }

@@ -102,6 +102,7 @@ impl Lens for TensionLens {
         result.insert("tension_anisotropy".to_string(), vec![mean_anisotropy]);
         result.insert("rupture_risk".to_string(), vec![rupture_risk]);
         result.insert("surface_tension".to_string(), vec![surface_tension]);
+        result.insert("score".to_string(), vec![result["tension_field"][0].min(1.0).max(0.0)]);
         result
     }
 }

@@ -116,6 +116,7 @@ impl Lens for ScalarCurvatureLens {
         result.insert("positive_curvature_fraction".to_string(), vec![pos_frac]);
         result.insert("curvature_per_dim".to_string(), curvature_per_dim);
         result.insert("local_curvatures".to_string(), curvatures);
+        result.insert("score".to_string(), vec![result["scalar_curvature"][0].min(1.0).max(0.0)]);
         result
     }
 }

@@ -154,6 +154,7 @@ impl Lens for UmagneticUmonopoleLens {
         result.insert("defect_density".to_string(), vec![defect_density]);
         result.insert("mean_winding_number".to_string(), vec![mean_winding]);
         result.insert("mean_monopole_isolation".to_string(), vec![mean_monopole_isolation]);
+        result.insert("score".to_string(), vec![result["divergence_mean_std"][0].min(1.0).max(0.0)]);
         result
     }
 }

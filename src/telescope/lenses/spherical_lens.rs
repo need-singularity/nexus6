@@ -118,6 +118,7 @@ impl Lens for SphericalLens {
                     d as f64 // fallback
                 };
                 result.insert("dimension_estimate".to_string(), vec![dimension_estimate]);
+                result.insert("score".to_string(), vec![result["sphericity"][0].min(1.0).max(0.0)]);
             }
         }
 

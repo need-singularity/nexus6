@@ -193,6 +193,7 @@ impl Lens for UextrapolationLens {
         result.insert("mean_r_squared".to_string(), vec![mean_r2]);
         result.insert("mean_boundary_expansion".to_string(), vec![mean_expansion]);
         result.insert("extrapolation_confidence".to_string(), vec![confidence]);
+        result.insert("score".to_string(), vec![result["slopes"][0].min(1.0).max(0.0)]);
         result
     }
 }

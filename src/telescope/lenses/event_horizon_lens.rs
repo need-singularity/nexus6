@@ -83,6 +83,7 @@ impl Lens for EventHorizonLens {
         result.insert("escape_fraction".to_string(), vec![escape_fraction]);
         result.insert("information_loss".to_string(), vec![information_loss]);
         result.insert("hawking_temperature".to_string(), vec![hawking_temperature]);
+        result.insert("score".to_string(), vec![result["horizon_radius"][0].min(1.0).max(0.0)]);
         result
     }
 }

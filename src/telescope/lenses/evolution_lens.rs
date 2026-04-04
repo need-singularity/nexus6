@@ -81,6 +81,7 @@ impl Lens for EvolutionLens {
         let mut result = HashMap::new();
         result.insert("pareto_front_size".to_string(), vec![pareto_size as f64]);
         result.insert("fitness_variance".to_string(), vec![var_fit]);
+        result.insert("score".to_string(), vec![result["pareto_front_size"][0].min(1.0).max(0.0)]);
         result
     }
 }

@@ -65,6 +65,7 @@ impl Lens for ConvexLens {
         result.insert("focal_length".to_string(), vec![focal_length]);
         result.insert("depth_of_field".to_string(), vec![depth_of_field]);
         result.insert("magnification".to_string(), vec![magnification]);
+        result.insert("score".to_string(), vec![result["convergence_rate"][0].min(1.0).max(0.0)]);
         result
     }
 }

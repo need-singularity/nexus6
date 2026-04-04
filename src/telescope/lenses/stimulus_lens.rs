@@ -69,6 +69,7 @@ impl Lens for StimulusLens {
         result.insert("response_latency".to_string(), vec![response_latency]);
         result.insert("habituation_rate".to_string(), vec![habituation_rate]);
         result.insert("sensitization".to_string(), vec![sensitization]);
+        result.insert("score".to_string(), vec![result["stimulus_strength"][0].min(1.0).max(0.0)]);
         result
     }
 }

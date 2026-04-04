@@ -63,6 +63,7 @@ impl Lens for MolecularCombinationLens {
         result.insert("bond_strength".into(), vec![bond_strength]);
         result.insert("molecular_weight".into(), vec![molecular_weight]);
         result.insert("valence_saturation".into(), vec![valence_saturation]);
+        result.insert("score".to_string(), vec![result["bond_count"][0].min(1.0).max(0.0)]);
         result
     }
 }

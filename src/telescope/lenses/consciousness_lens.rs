@@ -133,6 +133,7 @@ impl Lens for ConsciousnessLens {
             vec![integration, differentiation],
         );
         result.insert("num_cliques".to_string(), vec![num_cliques as f64]);
+        result.insert("score".to_string(), vec![result["phi_approx"][0].min(1.0).max(0.0)]);
         result
     }
 }

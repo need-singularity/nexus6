@@ -53,6 +53,7 @@ impl Lens for CorrelationLens {
         result.insert("max_abs_correlation".to_string(), vec![max_abs_corr]);
         result.insert("strong_correlation_count".to_string(), vec![strong_count as f64]);
         result.insert("weak_correlation_count".to_string(), vec![weak_count as f64]);
+        result.insert("score".to_string(), vec![result["pearson_values"][0].min(1.0).max(0.0)]);
         result
     }
 }

@@ -69,6 +69,7 @@ impl Lens for PadeApproximantLens {
         result.insert("pade_min_pole_distance".to_string(), min_pole_dists);
         result.insert("pade_mean_error".to_string(), vec![mean_error]);
         result.insert("pade_mean_pole_count".to_string(), vec![mean_poles]);
+        result.insert("score".to_string(), vec![result["pade_best_error"][0].min(1.0).max(0.0)]);
         result
     }
 }

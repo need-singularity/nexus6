@@ -84,6 +84,7 @@ impl Lens for TopologyLens {
         );
         result.insert("total_persistence".to_string(), vec![total_persistence]);
         result.insert("max_gap".to_string(), vec![max_dist]);
+        result.insert("score".to_string(), vec![result["total_persistence"][0].min(1.0).max(0.0)]);
         result
     }
 }

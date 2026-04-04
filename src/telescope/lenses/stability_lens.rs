@@ -75,6 +75,7 @@ impl Lens for StabilityLens {
         let mut result = HashMap::new();
         result.insert("lyapunov_exponent".to_string(), vec![lyapunov]);
         result.insert("max_lyapunov".to_string(), vec![max_lyap]);
+        result.insert("score".to_string(), vec![result["lyapunov_exponent"][0].min(1.0).max(0.0)]);
         result
     }
 }

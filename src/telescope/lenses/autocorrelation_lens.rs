@@ -69,6 +69,7 @@ impl Lens for AutocorrelationLens {
         result.insert("best_acf_peak".to_string(), vec![best_acf_peak]);
         result.insert("n6_period_match".to_string(), vec![period_match]);
         result.insert("decorrelation_lag".to_string(), vec![decorrelation_lag]);
+        result.insert("score".to_string(), vec![result["acf"][0].min(1.0).max(0.0)]);
         result
     }
 }

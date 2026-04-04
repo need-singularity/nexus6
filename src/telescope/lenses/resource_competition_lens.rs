@@ -129,6 +129,7 @@ impl Lens for ResourceCompetitionLens {
         result.insert("limiting_similarity".into(), vec![min_winner_dist]);
         result.insert("mean_r_star".into(), vec![mean_r_star]);
         result.insert("n_resources".into(), vec![n_resources as f64]);
+        result.insert("score".to_string(), vec![result["coexistence_count"][0].min(1.0).max(0.0)]);
         result
     }
 }

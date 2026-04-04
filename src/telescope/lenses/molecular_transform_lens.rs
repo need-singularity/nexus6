@@ -83,6 +83,7 @@ impl Lens for MolecularTransformLens {
         result.insert("catalyst_presence".into(), vec![catalyst_presence]);
         result.insert("product_diversity".into(), vec![product_diversity]);
         result.insert("reversibility".into(), vec![reversibility]);
+        result.insert("score".to_string(), vec![result["transform_count"][0].min(1.0).max(0.0)]);
         result
     }
 }

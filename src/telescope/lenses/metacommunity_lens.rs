@@ -162,6 +162,7 @@ impl Lens for MetacommunityLens {
         result.insert("mean_dispersal_rate".into(), vec![mean_dispersal]);
         result.insert("dispersal_limitation_index".into(), vec![dispersal_limitation]);
         result.insert("n_patches".into(), vec![n_patches as f64]);
+        result.insert("score".to_string(), vec![result["mean_beta_diversity"][0].min(1.0).max(0.0)]);
         result
     }
 }

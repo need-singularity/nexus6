@@ -119,6 +119,7 @@ impl Lens for QuantizationGapLens {
         result.insert("quantization_number".to_string(), quant_numbers);
         result.insert("phase_space_volume".to_string(), vec![phase_volume]);
         result.insert("estimated_states".to_string(), vec![n_states]);
+        result.insert("score".to_string(), vec![result["energy_gaps"][0].min(1.0).max(0.0)]);
         result
     }
 }

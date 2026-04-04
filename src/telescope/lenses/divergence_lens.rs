@@ -38,6 +38,7 @@ impl Lens for DivergenceLens {
         result.insert("js_divergences".to_string(), js_divergences);
         result.insert("mean_js".to_string(), vec![mean_js]);
         result.insert("max_js".to_string(), vec![max_js]);
+        result.insert("score".to_string(), vec![result["js_divergences"][0].min(1.0).max(0.0)]);
         result
     }
 }

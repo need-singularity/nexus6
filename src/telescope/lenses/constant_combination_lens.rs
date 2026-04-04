@@ -74,6 +74,7 @@ impl Lens for ConstantCombinationLens {
         result.insert("best_combination".into(), vec![if best_err < f64::MAX { best_err } else { 1.0 }]);
         result.insert("match_precision".into(), vec![1.0 - best_err.min(1.0)]);
         result.insert("n6_combinations".into(), vec![n6_matches as f64]);
+        result.insert("score".to_string(), vec![result["combination_matches"][0].min(1.0).max(0.0)]);
         result
     }
 }

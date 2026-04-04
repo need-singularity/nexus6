@@ -92,6 +92,7 @@ impl Lens for NetworkLens {
         result.insert("mean_degree".to_string(), vec![mean_degree]);
         result.insert("clustering_coefficient".to_string(), vec![clustering_coeff]);
         result.insert("degree_variance".to_string(), vec![degree_var]);
+        result.insert("score".to_string(), vec![result["mean_degree"][0].min(1.0).max(0.0)]);
         result
     }
 }

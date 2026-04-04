@@ -84,6 +84,7 @@ impl Lens for BoundaryLens {
         let mut result = HashMap::new();
         result.insert("boundary_point_count".to_string(), vec![boundary_count as f64]);
         result.insert("mean_density_gradient".to_string(), vec![mean_grad]);
+        result.insert("score".to_string(), vec![result["boundary_point_count"][0].min(1.0).max(0.0)]);
         result
     }
 }

@@ -72,6 +72,7 @@ impl Lens for CompassLens {
         let mut result = HashMap::new();
         result.insert("mean_curvature".to_string(), vec![mean_curv]);
         result.insert("curvature_variance".to_string(), vec![var_curv]);
+        result.insert("score".to_string(), vec![result["mean_curvature"][0].min(1.0).max(0.0)]);
         result
     }
 }

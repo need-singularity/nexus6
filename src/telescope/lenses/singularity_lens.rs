@@ -66,6 +66,7 @@ impl Lens for SingularityLens {
         result.insert("singularity_strength".to_string(), vec![singularity_strength]);
         result.insert("curvature_divergence".to_string(), vec![curvature_divergence]);
         result.insert("resolution_limit".to_string(), vec![resolution_limit]);
+        result.insert("score".to_string(), vec![result["singularity_count"][0].min(1.0).max(0.0)]);
         result
     }
 }

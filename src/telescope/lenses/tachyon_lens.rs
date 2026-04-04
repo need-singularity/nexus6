@@ -72,6 +72,7 @@ impl Lens for TachyonLens {
         result.insert("tachyon_energy".to_string(), vec![tachyon_energy]);
         result.insert("causality_violation".to_string(), vec![causality_violation]);
         result.insert("group_velocity_ratio".to_string(), vec![group_velocity_ratio]);
+        result.insert("score".to_string(), vec![result["superluminal_fraction"][0].min(1.0).max(0.0)]);
         result
     }
 }

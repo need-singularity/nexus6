@@ -63,6 +63,7 @@ impl Lens for ErgodicityBreakingLens {
         result.insert("ergodic_web_param".to_string(), vec![web_param]);
         result.insert("ergodic_mean_gap".to_string(), vec![mean_gap]);
         result.insert("ergodic_mean_decay".to_string(), vec![mean_decay]);
+        result.insert("score".to_string(), vec![result["ergodic_gap"][0].min(1.0).max(0.0)]);
         result
     }
 }

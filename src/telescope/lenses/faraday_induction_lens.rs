@@ -141,6 +141,7 @@ impl Lens for UfaradayUinductionLens {
         result.insert("total_induced_energy".to_string(), vec![total_energy]);
         result.insert("flux_series".to_string(), flux);
         result.insert("emf_series".to_string(), emf);
+        result.insert("score".to_string(), vec![result["emf_mean"][0].min(1.0).max(0.0)]);
         result
     }
 }

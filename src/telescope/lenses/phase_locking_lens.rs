@@ -128,6 +128,7 @@ impl Lens for PhaseLockingLens {
         result.insert("sync_stability".into(), vec![sync_stability]);
         result.insert("dominant_frequency".into(), vec![dominant_freq]);
         result.insert("n_oscillators".into(), vec![n_osc as f64]);
+        result.insert("score".to_string(), vec![result["kuramoto_order_parameter"][0].min(1.0).max(0.0)]);
         result
     }
 }

@@ -103,6 +103,7 @@ impl Lens for GraphLens {
         result.insert("clustering_coefficient".to_string(), vec![clustering_coeff]);
         result.insert("connected_components".to_string(), vec![components as f64]);
         result.insert("degree_distribution".to_string(), degrees.iter().map(|&d| d as f64).collect());
+        result.insert("score".to_string(), vec![result["mean_degree"][0].min(1.0).max(0.0)]);
         result
     }
 }

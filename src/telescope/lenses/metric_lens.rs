@@ -93,6 +93,7 @@ impl Lens for MetricLens {
         r.insert("degree_variance_change".into(), vec![ratio(row_mag_var(first,half,d), row_mag_var(second,n2,d))]);
         r.insert("lyapunov_change".into(), vec![cc]);
         r.insert("pareto_change".into(), vec![ratio(pareto_f(first), pareto_f(second))]);
+        r.insert("score".to_string(), vec![r["barrier_height_change"][0].min(1.0).max(0.0)]);
         r
     }
 }

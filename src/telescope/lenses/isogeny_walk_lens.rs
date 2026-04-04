@@ -99,6 +99,7 @@ impl Lens for IsogenyWalkLens {
         result.insert("ramanujan_ratio".into(), vec![ramanujan_ratio]);
         result.insert("girth".into(), vec![girth as f64]);
         result.insert("n6_isogeny_match".into(), vec![n6_isogeny_match]);
+        result.insert("score".to_string(), vec![result["mean_degree"][0].min(1.0).max(0.0)]);
         result
     }
 }

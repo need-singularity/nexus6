@@ -193,6 +193,7 @@ impl Lens for SpeculativeDecodeLens {
         result.insert("pred_error_entropy".to_string(), vec![pred_entropy]);
         result.insert("draft_quality".to_string(), vec![draft_quality]);
         result.insert("median_distance".to_string(), vec![median_dist]);
+        result.insert("score".to_string(), vec![result["acceptance_rate"][0].min(1.0).max(0.0)]);
         result
     }
 }

@@ -84,6 +84,7 @@ impl Lens for AutoCalibrationLens {
         result.insert("signal_to_noise".into(), vec![snr]);
         result.insert("calibration_confidence".into(), vec![confidence]);
         result.insert("dynamic_range".into(), vec![dynamic_range]);
+        result.insert("score".to_string(), vec![result["optimal_k"][0].min(1.0).max(0.0)]);
         result
     }
 }

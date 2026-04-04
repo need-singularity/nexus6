@@ -96,6 +96,7 @@ impl Lens for InfoLens {
         let mut result = HashMap::new();
         result.insert("shannon_entropy".to_string(), vec![shannon_entropy]);
         result.insert("lz_compression_ratio".to_string(), vec![compression_ratio]);
+        result.insert("score".to_string(), vec![result["shannon_entropy"][0].min(1.0).max(0.0)]);
         result
     }
 }

@@ -86,6 +86,7 @@ impl Lens for InfiniteDiscoveryLens {
         result.insert("saturation_point".into(), vec![saturation_depth as f64]);
         result.insert("fractal_discovery_dimension".into(), vec![fractal_dim]);
         result.insert("total_discoveries".into(), vec![total_discoveries as f64]);
+        result.insert("score".to_string(), vec![result["discovery_depth"][0].min(1.0).max(0.0)]);
         result
     }
 }

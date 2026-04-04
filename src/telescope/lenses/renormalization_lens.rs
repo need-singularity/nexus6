@@ -141,6 +141,7 @@ impl Lens for RenormalizationLens {
         );
         result.insert("correlation_length".to_string(), vec![correlation_length]);
         result.insert("rg_flow".to_string(), rg_flow);
+        result.insert("score".to_string(), vec![result["critical_exponent"][0].min(1.0).max(0.0)]);
         result
     }
 }
