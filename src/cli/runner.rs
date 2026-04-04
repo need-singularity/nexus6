@@ -1334,6 +1334,12 @@ fn run_loop(domain: Option<String>, cycles: usize) -> Result<(), String> {
             println!("━━━ Cycle {}/{} ━━━", cycle, cycles);
         }
 
+        // Phase 0: Bridge self-update (fresh config before each cycle)
+        let pt = Instant::now();
+        println!("  [0/6] 🔄 Bridge update");
+        let _ = run_bridge(vec!["update".to_string()]);
+        phase_times.push(("BridgeUpdate".to_string(), pt.elapsed().as_secs_f64()));
+
         // Phase 1: Discover + Auto-Connect
         let pt = Instant::now();
         println!("  [1/6] 🔍 Discover + Connect");
