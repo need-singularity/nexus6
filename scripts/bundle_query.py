@@ -319,18 +319,153 @@ def cmd_completed(projects, dev_dir, args):
     print(f"\nTotal completed: {len(rows)}")
 
 
+def cmd_breakthrough(projects, dev_dir, args):
+    """돌파(grade>=threshold) 전수조사."""
+    threshold = args.threshold
+    by_project = {}
+    total = 0
+    for pname, pcfg in projects.items():
+        bundles = pcfg.get("bundles", {})
+        for bname, bcfg in bundles.items():
+            if args.project and args.project != pname:
+                continue
+            if args.bundle and args.bundle != bname:
+                continue
+            if not bcfg.get("grade_field"):
+                continue
+            items = load_bundle_items(pname, pcfg, bname, bcfg, dev_dir)
+            grade_field = bcfg["grade_field"]
+            grade_map = bcfg.get("grade_map")
+            label_field = bcfg.get("label_field", bcfg.get("key", "_key"))
+            verify_field = bcfg.get("verify_field")
+            comp_flag = bcfg.get("completion_flag")
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                g = normalize_grade(item.get(grade_field), grade_map)
+                # completion_flag도 돌파로 인정
+                is_complete_flag = comp_flag and item.get(comp_flag)
+                if g is None and not is_complete_flag:
+                    continue
+                if not is_complete_flag and (g is None or g < threshold):
+                    continue
+                label = item.get(label_field) or item.get("_key") or "?"
+                has_verify = bool(verify_field and item.get(verify_field))
+                by_project.setdefault(pname, {}).setdefault(bname, []).append({
+                    "label": str(label)[:60],
+                    "grade": g if g is not None else "flag",
+                    "verify": has_verify,
+                })
+                total += 1
+
+    if args.json:
+        print(json.dumps({"threshold": threshold, "total": total, "by_project": by_project},
+                         ensure_ascii=False, indent=2))
+        return
+
+    print(f"\n🛸 돌파 전수조사 (grade >= {threshold})\n")
+    for pname, bundles in by_project.items():
+        for bname, items in bundles.items():
+            print(f"── [{pname}] {bname} — {len(items)}개 ──")
+            rows = [[i["grade"], "✓" if i["verify"] else "·", i["label"]] for i in items]
+            print(format_table(rows, ["grade", "V", "label"]))
+            print()
+    print(f"TOTAL 돌파: {total}")
+
+
+def cmd_audit(projects, dev_dir, args):
+    """전수조사 상세 — 돌파 + verify 커버리지 + 프로젝트 통계."""
+    threshold = args.threshold
+    summary_rows = []
+    gap_items = []
+    total_break = 0
+    total_break_verified = 0
+
+    for pname, pcfg in projects.items():
+        bundles = pcfg.get("bundles", {})
+        for bname, bcfg in bundles.items():
+            if args.project and args.project != pname:
+                continue
+            items = load_bundle_items(pname, pcfg, bname, bcfg, dev_dir)
+            grade_field = bcfg.get("grade_field")
+            grade_map = bcfg.get("grade_map")
+            verify_field = bcfg.get("verify_field")
+            comp_flag = bcfg.get("completion_flag")
+            label_field = bcfg.get("label_field", bcfg.get("key", "_key"))
+            criterion = bcfg.get("completion_criterion", "-")
+            has_verify_rule = bool(bcfg.get("verify_rule"))
+
+            n_total = len(items)
+            n_break = 0
+            n_verified = 0
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                g = normalize_grade(item.get(grade_field), grade_map) if grade_field else None
+                is_break = False
+                if comp_flag and item.get(comp_flag):
+                    is_break = True
+                elif g is not None and g >= threshold:
+                    is_break = True
+                if is_break:
+                    n_break += 1
+                    has_v = bool(verify_field and item.get(verify_field))
+                    if has_v:
+                        n_verified += 1
+                    else:
+                        label = item.get(label_field) or item.get("_key") or "?"
+                        gap_items.append([pname, bname, str(label)[:60], g if g is not None else "flag"])
+
+            summary_rows.append([
+                pname, bname, n_total, n_break, n_verified,
+                criterion, "✓" if has_verify_rule else "·",
+            ])
+            total_break += n_break
+            total_break_verified += n_verified
+
+    if args.json:
+        print(json.dumps({
+            "threshold": threshold,
+            "summary": summary_rows,
+            "verify_gap": gap_items,
+            "total_breakthrough": total_break,
+            "total_verified": total_break_verified,
+            "coverage_pct": round(100 * total_break_verified / total_break, 1) if total_break else 0,
+        }, ensure_ascii=False, indent=2))
+        return
+
+    print(f"\n전수조사 (돌파 임계: grade >= {threshold})\n")
+    print(format_table(summary_rows,
+        ["project", "bundle", "total", "돌파", "verified", "criterion", "rule"]))
+    print(f"\n돌파 총합: {total_break}  |  verified: {total_break_verified}  "
+          f"|  coverage: {round(100*total_break_verified/total_break,1) if total_break else 0}%")
+
+    if gap_items:
+        print(f"\n⚠️  verify 누락 돌파 항목 ({len(gap_items)}개) — 규칙상 1단계 강등 대상:\n")
+        print(format_table(gap_items[:30], ["project", "bundle", "label", "grade"]))
+        if len(gap_items) > 30:
+            print(f"... (+{len(gap_items)-30} more)")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--project", help="프로젝트 필터")
     p.add_argument("--bundle", help="묶음 필터")
     p.add_argument("--top", type=int, default=0, help="grade 상위 N개")
     p.add_argument("--completed", action="store_true", help="완성된 것만")
+    p.add_argument("--breakthrough", action="store_true", help="돌파(grade>=10) 전수조사")
+    p.add_argument("--audit", action="store_true", help="전수조사 상세 (돌파 + verify gap)")
+    p.add_argument("--threshold", type=float, default=10.0, help="돌파 임계값 (기본 10)")
     p.add_argument("--json", action="store_true", help="JSON 출력")
     args = p.parse_args()
 
     projects, dev_dir = load_projects()
 
-    if args.top > 0:
+    if args.audit:
+        cmd_audit(projects, dev_dir, args)
+    elif args.breakthrough:
+        cmd_breakthrough(projects, dev_dir, args)
+    elif args.top > 0:
         cmd_top(projects, dev_dir, args)
     elif args.completed:
         cmd_completed(projects, dev_dir, args)
