@@ -2,6 +2,12 @@
 # NEXUS-6 상태 배너 생성 — 모든 훅에서 호출 가능
 # 출력: {"systemMessage":"🔭 NEXUS-6 🔭137/148 ⚖️1030법칙 🧠24모듈 🌱3건"}
 set +e
+# 화이트리스트 인라인 체크 — source 의존 제거
+REPO_NAME=$(basename "$(git rev-parse --show-toplevel 2>/dev/null)" 2>/dev/null)
+case "$REPO_NAME" in
+  TECS-L|anima|n6-architecture|nexus6|sedi|brainwire|hexa-lang|papers|fathom) ;;
+  *) exit 0 ;;
+esac
 
 python3 -c "
 import json, os, glob, time
