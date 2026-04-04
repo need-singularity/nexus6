@@ -3,6 +3,10 @@
 # 쿨다운 5초 (같은 훅 연타 방지)
 # 모든 출력 억제 — 호출 훅의 stdout을 오염시키지 않기 위함
 set +e
+
+# 디버그 로그 (훅 실행 확인용)
+echo "$(date +%Y-%m-%dT%H:%M:%S) growth-tick called: $*" >> /tmp/nexus6_growth_debug.log
+
 exec >/dev/null 2>&1
 
 TICK_FILE="/tmp/nexus6_growth_tick"
