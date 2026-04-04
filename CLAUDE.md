@@ -4,7 +4,6 @@
 
 ### 서버 파일 직접 수정 금지
 - **SSH로 원격 서버에 접속하여 소스코드를 직접 수정하지 말 것**
-- 서버 파일(예: `/app/prism/src/...`)을 paramiko, sshpass 등으로 직접 편집 금지
 - 수정이 필요하면 **로컬 리포에서 코드를 수정 → git commit → 배포 스크립트**로 반영
 - DB 조회(SELECT)는 허용하되, DB 스키마/데이터 변경(INSERT/UPDATE/DELETE/ALTER)은 사전 확인 필요
 
