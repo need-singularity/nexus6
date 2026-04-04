@@ -1,6 +1,6 @@
 # Math Atlas
 
-> Auto-generated: 2026-04-05T01:26:15 | 687 hypotheses | 122 constant maps
+> Auto-generated: 2026-04-05T01:58:50 | 687 hypotheses | 122 constant maps
 
 ## Summary
 
@@ -752,7 +752,7 @@
 | 9 | DIMENSION_MAP | sedi/tecs.py:166 | dict | 14 | other | - |
 | 10 | SM_COUNTS | sedi/tecs.py:186 | dict | 10 | other | Y |
 | 11 | PHYSICS_MATCHES | sedi/tecs.py:202 | dict | 12 | physics | - |
-| 12 | ATA_SPECS | sedi/sources/ata.py:18 | dict | 7 | other | Y |
+| 12 | ATA_SPECS | sedi/sources/ata.py:21 | dict | 7 | other | Y |
 | 13 | OBSERVED | sedi/sources/atomic_precision.py:46 | dict | 7 | observed | Y |
 | 14 | OCTET | sedi/sources/baryon_splittings.py:44 | dict | 8 | other | Y |
 | 15 | DECUPLET | sedi/sources/baryon_splittings.py:57 | dict | 4 | other | Y |
@@ -765,8 +765,8 @@
 | 22 | NEUROSCIENCE | sedi/sources/biology_n6.py:451 | OrderedDict | 5 | other | - |
 | 23 | EGYPTIAN_FRACTIONS | sedi/sources/branching_ratios.py:266 | dict | 5 | other | - |
 | 24 | TECS_FRACTIONS | sedi/sources/branching_ratios.py:275 | dict | 7 | other | - |
-| 25 | N6_PRIORITY_TARGETS | sedi/sources/breakthrough_listen.py:29 | list | 6 | targets | Y |
-| 26 | BL_BACKUP_TARGETS | sedi/sources/breakthrough_listen.py:39 | list | 18 | targets | Y |
+| 25 | N6_PRIORITY_TARGETS | sedi/sources/breakthrough_listen.py:32 | list | 6 | targets | Y |
+| 26 | BL_BACKUP_TARGETS | sedi/sources/breakthrough_listen.py:42 | list | 18 | targets | Y |
 | 27 | TECS_EXPRESSIONS | sedi/sources/calabi_yau.py:63 | OrderedDict | 30 | expressions | - |
 | 28 | TIAN_YAU | sedi/sources/calabi_yau.py:144 | list | 2 | other | Y |
 | 29 | DIMUON_RESONANCES | sedi/sources/cern_invariant_mass.py:19 | dict | 4 | physics | Y |
@@ -856,7 +856,7 @@
 | 113 | TECS_TARGETS | sedi/sources/resonance_ladder.py:66 | OrderedDict | 14 | targets | - |
 | 114 | LADDER_GROUND | sedi/sources/resonance_ladder.py:114 | list | 3 | physics | Y |
 | 115 | ZETA_ZEROS | sedi/sources/riemann_connection.py:60 | list | 20 | physics | Y |
-| 116 | SETI_CATALOGS | sedi/sources/seti_archive.py:21 | dict | 3 | other | Y |
+| 116 | SETI_CATALOGS | sedi/sources/seti_archive.py:24 | dict | 3 | other | Y |
 | 117 | WOW_SIGNAL | sedi/sources/seti_databases.py:14 | dict | 15 | other | Y |
 | 118 | BLC1_SIGNAL | sedi/sources/seti_databases.py:35 | dict | 14 | other | Y |
 | 119 | HISTORICAL_CANDIDATES | sedi/sources/seti_databases.py:55 | list | 5 | other | Y |

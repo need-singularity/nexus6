@@ -86,14 +86,6 @@ pub struct ForgeSection {
     pub similarity_threshold: Option<f64>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct LogRotationSection {
-    /// Maximum file size in bytes before rotation (default: 1_048_576 = 1 MB).
-    pub max_bytes: Option<u64>,
-    /// Maximum number of rotated files to keep (default: 5).
-    pub max_files: Option<usize>,
-}
-
 // ── Loading ─────────────────────────────────────────────────────
 
 impl NexusConfig {
