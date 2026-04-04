@@ -58,6 +58,19 @@ fn spawn_background(subcmd: &str, domain: &Option<String>, extra_args: &[(&str, 
         .map(|h| format!("{}/.nexus6", h))
         .unwrap_or_else(|_| "/tmp".to_string());
     let _ = std::fs::create_dir_all(&log_dir);
+
+    // ── PID lock: 중복 실행 방지 ──
+    let pid_path = format!("{}/{}.pid", log_dir, subcmd);
+    if let Ok(old_pid) = std::fs::read_to_string(&pid_path) {
+        let old_pid = old_pid.trim();
+        if !old_pid.is_empty() && check_pid_alive(old_pid) {
+            return Err(format!(
+                "{} 이미 실행 중 (PID {}). 중복 실행 차단됨. 강제 재시작: kill {} 후 재실행",
+                subcmd, old_pid, old_pid
+            ));
+        }
+    }
+
     let log_path = format!("{}/{}_bg.log", log_dir, subcmd);
     let log_file = std::fs::File::create(&log_path)
         .map_err(|e| format!("log create: {}", e))?;
@@ -79,7 +92,10 @@ fn spawn_background(subcmd: &str, domain: &Option<String>, extra_args: &[(&str, 
         .spawn()
         .map_err(|e| format!("spawn: {}", e))?;
 
-    info!(pid = child.id(), subcmd, "백그라운드 실행 시작");
+    let pid = child.id();
+    // PID 파일 기록
+    let _ = std::fs::write(&pid_path, pid.to_string());
+    info!(pid, subcmd, "백그라운드 실행 시작");
     info!(log_path, "로그 파일");
     Ok(())
 }
@@ -2156,6 +2172,39 @@ fn run_blowup(domain: &str, max_depth: usize, nexus_cfg: &NexusConfig) -> Result
 
 fn run_daemon(domain: Option<String>, interval_min: u64, max_loops: Option<usize>, nexus_cfg: &NexusConfig) -> Result<(), String> {
     let domain_str = domain.as_deref().unwrap_or("number_theory").to_string();
+
+    // ── PID lock (foreground 모드) ──
+    let log_dir = std::env::var("HOME")
+        .map(|h| format!("{}/.nexus6", h))
+        .unwrap_or_else(|_| "/tmp".to_string());
+    let _ = std::fs::create_dir_all(&log_dir);
+    let pid_path = format!("{}/daemon.pid", log_dir);
+    let my_pid = std::process::id().to_string();
+    if let Ok(old_pid) = std::fs::read_to_string(&pid_path) {
+        let old_pid = old_pid.trim();
+        if !old_pid.is_empty() && old_pid != my_pid && check_pid_alive(old_pid) {
+            return Err(format!(
+                "Daemon 이미 실행 중 (PID {}). 중복 실행 차단됨.",
+                old_pid
+            ));
+        }
+    }
+    let _ = std::fs::write(&pid_path, &my_pid);
+
+    // 종료 시 PID 파일 정리
+    let pid_path_cleanup = pid_path.clone();
+    let cleanup_pid = my_pid.clone();
+    struct PidGuard { path: String, pid: String }
+    impl Drop for PidGuard {
+        fn drop(&mut self) {
+            if let Ok(content) = std::fs::read_to_string(&self.path) {
+                if content.trim() == self.pid {
+                    let _ = std::fs::remove_file(&self.path);
+                }
+            }
+        }
+    }
+    let _guard = PidGuard { path: pid_path_cleanup, pid: cleanup_pid };
 
     info!(domain = %domain_str, interval_min, max_loops = ?max_loops, "Daemon 시작");
 
