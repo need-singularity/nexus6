@@ -607,7 +607,7 @@ run_growth_loop() {
         # 프로젝트별 phases
         $domain_phases "$cycle" "$load_status"
 
-        # 공통 phases
+        # 공통 phases (매 사이클)
         common_nexus6_scan "$domain"
         common_blowup "$domain"
         common_singularity_cascade
@@ -616,21 +616,32 @@ run_growth_loop() {
         common_growth_bridge
         common_shared_graph
         common_heartbeat
+        common_vector_clock 2>/dev/null || true
+        common_metric_bus_publish 2>/dev/null || true
+        common_resonance_bridge 2>/dev/null || true
         common_update_state "$cycle"
         common_auto_commit "$cycle" "$dry_run"
 
-        # 6 사이클마다 연방제 성장 포인트 전파 + 양방향 렌즈 동기화
+        # 3 사이클마다 (네트워크 + 실험)
+        if [ $((cycle % 3)) -eq 0 ]; then
+            common_sync_priority_queue 2>/dev/null || true
+            common_cross_test 2>/dev/null || true
+            common_live_graph 2>/dev/null || true
+        fi
+
+        # 6 사이클마다 (연방 + 렌즈 + 실험)
         if [ $((cycle % 6)) -eq 0 ]; then
             common_federated_growth
             common_reverse_lens_sync
+            common_cross_experiment 2>/dev/null || true
         fi
 
-        # 12 사이클마다 프로젝트간 렌즈 추천
+        # 12 사이클마다 (렌즈 추천)
         if [ $((cycle % 12)) -eq 0 ]; then
             common_lens_recommend
         fi
 
-        # 10 사이클마다 휴면 프로젝트 활성화
+        # 10 사이클마다 (휴면 활성화)
         if [ $((cycle % 10)) -eq 0 ]; then
             common_seed_dormant
         fi
