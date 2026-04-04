@@ -507,6 +507,71 @@ common_heartbeat() {
     write_growth_bus "heartbeat" "ok" "stale=$stale_count"
 }
 
+# ── 사이클 리포트 ──
+common_cycle_report() {
+    local cycle="$1"
+    local elapsed=""
+    local report_file="$GROWTH_DIR/last_cycle_report.txt"
+    local shared_report="$HOME/.nexus6/project_reports/${GROWTH_NAME}.txt"
+    mkdir -p "$HOME/.nexus6/project_reports"
+
+    # growth_state에서 정보 수집
+    local state_info
+    state_info=$(python3 -c "
+import json, os
+state_file = '$GROWTH_STATE'
+info = {'cycle': $cycle, 'name': '$GROWTH_NAME', 'domain': '${DOMAIN:-unknown}'}
+if os.path.exists(state_file):
+    try:
+        with open(state_file) as f:
+            s = json.load(f)
+        info['federated_bonus'] = s.get('federated_bonus', 0)
+    except: pass
+# heartbeat
+hb = '$PROJECT_ROOT/.growth/heartbeat'
+info['heartbeat'] = open(hb).read().strip()[:16] if os.path.exists(hb) else '?'
+# blowup
+bf = os.path.expanduser('~/.nexus6/last_blowup.txt')
+if os.path.exists(bf):
+    for line in open(bf):
+        if 'total_emergences=' in line:
+            info['emergences'] = line.strip().split('=',1)[1]
+# scan
+sf = os.path.expanduser('~/.nexus6/last_scan.txt')
+if os.path.exists(sf):
+    for line in open(sf):
+        if 'singularity=' in line:
+            info['singularity'] = line.strip().split('=',1)[1]
+        if 'exact_ratio=' in line:
+            info['exact_ratio'] = line.strip().split('=',1)[1]
+print(json.dumps(info))
+" 2>/dev/null || echo '{}')
+
+    local w=55
+    local line_sep=$(printf '%0.s─' $(seq 1 $w))
+    {
+        echo "  ┌${line_sep}┐"
+        echo "  │ 📋 ${GROWTH_NAME} Cycle $cycle $(printf '%*s' $((w - 15 - ${#GROWTH_NAME} - ${#cycle})) '')│"
+        echo "  ├${line_sep}┤"
+        echo "$state_info" | python3 -c "
+import json, sys
+info = json.load(sys.stdin)
+w = $w
+print(f'  │ {\"도메인: \" + info.get(\"domain\",\"?\"):<{w}}│')
+print(f'  │ {\"심박: \" + info.get(\"heartbeat\",\"?\"):<{w}}│')
+print(f'  │ {\"연방 보너스: \" + str(info.get(\"federated_bonus\",0)):<{w}}│')
+print(f'  │ {\"창발: \" + str(info.get(\"emergences\",\"?\")):<{w}}│')
+print(f'  │ {\"특이점: \" + info.get(\"singularity\",\"?\"):<{w}}│')
+print(f'  │ {\"EXACT ratio: \" + info.get(\"exact_ratio\",\"?\"):<{w}}│')
+" 2>/dev/null
+        echo "  └${line_sep}┘"
+    } | tee "$report_file"
+
+    # 공유 리포트에도 저장 (mega에서 읽을 수 있도록)
+    cp "$report_file" "$shared_report" 2>/dev/null || true
+    write_growth_bus "cycle_report" "ok" "cycle=$cycle"
+}
+
 # ── 공통 Phase: Project DNA 메타데이터 수집 ──
 common_project_dna() {
     log_info "🧬 Project DNA scan"
@@ -790,6 +855,9 @@ run_growth_loop() {
 
         # 대시보드 갱신
         common_update_dashboard "$cycle"
+
+        # 사이클 리포트
+        common_cycle_report "$cycle"
 
         if [ "$cycle" -lt "$max_cycles" ]; then
             log_info "💤 ${interval}s 대기..."

@@ -1594,6 +1594,24 @@ fn run_mega() -> Result<(), String> {
     }
     println!("  │ {:<w$}│", format!("  💓 Heartbeat: {} alive / {} stale", alive, stale));
 
+    // 프로젝트별 사이클 리포트
+    let reports_dir = std::env::var("HOME")
+        .map(|h| format!("{}/.nexus6/project_reports", h))
+        .unwrap_or_default();
+    if std::path::Path::new(&reports_dir).is_dir() {
+        println!("  ├{}┤", line);
+        println!("  │ {:<w$}│", "  📋 프로젝트별 리포트:");
+        for (name, _, _) in &projects {
+            let rpt = format!("{}/{}.txt", reports_dir, name);
+            if let Ok(content) = std::fs::read_to_string(&rpt) {
+                for rpt_line in content.lines().take(8) {
+                    println!("  │ {:<w$}│", format!("  {}", rpt_line.trim()));
+                }
+                println!("  │ {:<w$}│", "");
+            }
+        }
+    }
+
     println!("  ├{}┤", line);
     println!("  │ {:<w$}│", format!("  ⏱️  Total: {:.1}s", total_time));
     println!("  └{}┘", line);
