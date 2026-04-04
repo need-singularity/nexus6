@@ -20,6 +20,43 @@ use crate::experiment::report;
 
 use super::parser::{CliCommand, ExperimentMode, GraphFormat, LensFilter};
 
+/// 자기 자신을 --fg 붙여서 백그라운드 프로세스로 spawn.
+/// 로그는 ~/.nexus6/<subcmd>_bg.log 에 기록.
+fn spawn_background(subcmd: &str, domain: &Option<String>, extra_args: &[(&str, &str)]) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+
+    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {}", e))?;
+
+    let log_dir = std::env::var("HOME")
+        .map(|h| format!("{}/.nexus6", h))
+        .unwrap_or_else(|_| "/tmp".to_string());
+    let _ = std::fs::create_dir_all(&log_dir);
+    let log_path = format!("{}/{}_bg.log", log_dir, subcmd);
+    let log_file = std::fs::File::create(&log_path)
+        .map_err(|e| format!("log create: {}", e))?;
+
+    let mut args = vec![subcmd.to_string(), "--fg".to_string()];
+    if let Some(d) = domain {
+        args.push(d.clone());
+    }
+    for (k, v) in extra_args {
+        args.push(k.to_string());
+        args.push(v.to_string());
+    }
+
+    let child = Command::new(&exe)
+        .args(&args)
+        .stdout(Stdio::from(log_file.try_clone().map_err(|e| e.to_string())?))
+        .stderr(Stdio::from(log_file))
+        .stdin(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("spawn: {}", e))?;
+
+    println!("🚀 {} 백그라운드 실행 (PID {})", subcmd, child.id());
+    println!("   로그: {}", log_path);
+    Ok(())
+}
+
 /// Execute a parsed CLI command, printing results to stdout.
 pub fn run(cmd: CliCommand) -> Result<(), String> {
     match cmd {
@@ -57,9 +94,29 @@ pub fn run(cmd: CliCommand) -> Result<(), String> {
             run_cycle(&experiment_type, &target)
         }
         CliCommand::Bridge { sub } => run_bridge(sub),
-        CliCommand::Loop { domain, cycles } => run_loop(domain, cycles),
-        CliCommand::Daemon { domain, interval_min, max_loops } => {
-            run_daemon(domain, interval_min, max_loops)
+        CliCommand::Loop { domain, cycles, foreground } => {
+            if foreground {
+                run_loop(domain, cycles)
+            } else {
+                spawn_background("loop", &domain, &[
+                    ("--cycles", &cycles.to_string()),
+                ])
+            }
+        }
+        CliCommand::Daemon { domain, interval_min, max_loops, foreground } => {
+            if foreground {
+                run_daemon(domain, interval_min, max_loops)
+            } else {
+                let iv_str = interval_min.to_string();
+                let ml_str = max_loops.map(|n| n.to_string());
+                let mut extra: Vec<(&str, &str)> = vec![
+                    ("--interval", &iv_str),
+                ];
+                if let Some(ref s) = ml_str {
+                    extra.push(("--max-loops", s));
+                }
+                spawn_background("daemon", &domain, &extra)
+            }
         }
         CliCommand::Blowup { domain, max_depth } => {
             run_blowup(&domain, max_depth)
