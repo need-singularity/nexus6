@@ -18,6 +18,10 @@ set -euo pipefail
 INTERVAL="${INTERVAL:-300}"
 NEXUS6_ROOT="${NEXUS6_ROOT:-$HOME/Dev/nexus6}"
 PROJECTS_JSON="${PROJECTS_JSON:-$NEXUS6_ROOT/shared/projects.json}"
+PAPERS_REPO="${PAPERS_REPO:-$HOME/Dev/papers}"
+REGISTER_SCRIPT="$NEXUS6_ROOT/scripts/paper-gen/register_paper.py"
+AUTO_COMMIT="${AUTO_COMMIT:-1}"           # 1=자동 commit+push, 0=생성만
+AUTO_REGISTER="${AUTO_REGISTER:-1}"       # 1=manifest.json 자동 등록
 LOG="$HOME/Library/Logs/nexus6/watch-papers.log"
 mkdir -p "$(dirname "$LOG")"
 
@@ -81,6 +85,66 @@ while true; do
             log "   → $OUTPUT_DIR"
             if command -v osascript &>/dev/null; then
                 osascript -e "display notification \"$proj_name: +$CREATED_COUNT papers ($CREATED_LIST)\" with title \"NEXUS-6 Papers\"" 2>/dev/null || true
+            fi
+
+            # ── manifest.json 자동 등록 ──
+            if [ "$AUTO_REGISTER" = "1" ] && [ -f "$REGISTER_SCRIPT" ]; then
+                echo "$REPORT" | jq -r --arg dir "$OUTPUT_DIR" '.created[] | "\($dir)/\(.).md"' 2>/dev/null | while read -r md; do
+                    [ -f "$md" ] || continue
+                    RESULT=$(python3 "$REGISTER_SCRIPT" --file "$md" --repo "$proj_name" --tier 2 2>&1)
+                    STATUS=$(echo "$RESULT" | jq -r '.status' 2>/dev/null || echo "error")
+                    if [ "$STATUS" = "registered" ]; then
+                        ID=$(echo "$RESULT" | jq -r '.entry.id')
+                        log "   ✓ manifest 등록: $ID ($(basename "$md"))"
+                    elif [ "$STATUS" = "skipped" ]; then
+                        log "   - manifest skip: $(basename "$md") (중복)"
+                    else
+                        log "   ⚠️ manifest 등록 실패: $(basename "$md")"
+                    fi
+                done
+            fi
+
+            # ── papers 리포 자동 commit + push ──
+            if [ "$AUTO_COMMIT" = "1" ] && [ -d "$PAPERS_REPO/.git" ]; then
+                cd "$PAPERS_REPO" || continue
+
+                # 안전장치: 현재 브랜치 main/master 확인
+                BRANCH=$(git branch --show-current 2>/dev/null)
+                if [ "$BRANCH" != "main" ] && [ "$BRANCH" != "master" ]; then
+                    log "   ⚠️ commit skip: branch=$BRANCH (main/master 아님)"
+                    continue
+                fi
+
+                # staged 변경 있으면 skip (사용자 작업 중 보호)
+                if ! git diff --cached --quiet 2>/dev/null; then
+                    log "   ⚠️ commit skip: staged 변경 존재 (사용자 작업 중)"
+                    continue
+                fi
+
+                # 생성 파일 + manifest.json만 add (다른 수정사항 건드리지 않음)
+                REL_DIR="${OUTPUT_DIR#$PAPERS_REPO/}"
+                git add "$REL_DIR" manifest.json 2>/dev/null
+
+                if git diff --cached --quiet 2>/dev/null; then
+                    log "   - commit skip: staged 변경 없음"
+                    continue
+                fi
+
+                COMMIT_MSG="auto: [$proj_name] +$CREATED_COUNT papers — $CREATED_LIST
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>"
+                if git commit -m "$COMMIT_MSG" >> "$LOG" 2>&1; then
+                    SHA=$(git rev-parse --short HEAD)
+                    log "   ✓ committed $SHA"
+                    if git push >> "$LOG" 2>&1; then
+                        log "   ✓ pushed to origin/$BRANCH"
+                    else
+                        log "   ⚠️ push 실패 (commit만 됨)"
+                    fi
+                else
+                    log "   ⚠️ commit 실패"
+                fi
+                cd - > /dev/null || true
             fi
         fi
     done < <(jq -r '.projects | to_entries[]
