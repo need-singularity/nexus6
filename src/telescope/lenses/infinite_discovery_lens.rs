@@ -9,7 +9,7 @@ impl Lens for InfiniteDiscoveryLens {
     fn name(&self) -> &str { "InfiniteDiscoveryLens" }
     fn category(&self) -> &str { "T1" }
 
-    fn scan(&self, data: &[f64], n: usize, d: usize, shared: &SharedData) -> LensResult {
+    fn scan(&self, _data: &[f64], n: usize, _d: usize, shared: &SharedData) -> LensResult {
         if n < 6 { return HashMap::new(); }
         let max_n = n.min(200);
         let mut result = HashMap::new();
@@ -31,7 +31,7 @@ impl Lens for InfiniteDiscoveryLens {
             let densities: Vec<f64> = active_set.iter()
                 .map(|&i| shared.knn_density(i))
                 .collect();
-            let ent = shannon_entropy(&densities, densities.len().max(2).min(24));
+            let _ent = shannon_entropy(&densities, densities.len().max(2).min(24));
 
             // "Discovery" = points whose density deviates significantly from mean
             let mean_d = densities.iter().sum::<f64>() / densities.len() as f64;
@@ -79,7 +79,7 @@ impl Lens for InfiniteDiscoveryLens {
 
         // Mean discoveries per level (for non-zero levels)
         let active_levels = discoveries_per_level.iter().filter(|&&x| x > 0.0).count().max(1);
-        let mean_per_level = total_discoveries as f64 / active_levels as f64;
+        let _mean_per_level = total_discoveries as f64 / active_levels as f64;
 
         result.insert("discovery_depth".into(), vec![saturation_depth as f64]);
         result.insert("discoveries_per_level".into(), discoveries_per_level);

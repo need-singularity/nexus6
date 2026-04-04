@@ -14,7 +14,7 @@ impl Lens for ProvidenceEyeLens {
     fn name(&self) -> &str { "ProvidenceEyeLens" }
     fn category(&self) -> &str { "T1" }
 
-    fn scan(&self, data: &[f64], n: usize, d: usize, shared: &SharedData) -> LensResult {
+    fn scan(&self, _data: &[f64], n: usize, d: usize, shared: &SharedData) -> LensResult {
         if n < 6 { return HashMap::new(); }
         let max_n = n.min(200);
 

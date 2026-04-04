@@ -49,7 +49,7 @@ impl Lens for MolecularTransformLens {
 
         // Product diversity: how varied the outputs are (entropy of last-row distribution)
         let last_row = &data[((max_n - 1) * d)..((max_n - 1) * d + d).min(data.len())];
-        let first_row = &data[..d.min(data.len())];
+        let _first_row = &data[..d.min(data.len())];
         let mut unique_bins = std::collections::HashSet::new();
         let n_bins = 16;
         let (mn, mx) = last_row.iter().fold((f64::MAX, f64::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)));

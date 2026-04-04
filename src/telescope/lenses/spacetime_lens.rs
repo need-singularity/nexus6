@@ -99,7 +99,7 @@ impl Lens for SpacetimeLens {
         // 3. Causal ordering: check if first dimension can serve as "time"
         // (monotonically increasing along trajectory)
         let mut ordered_pairs = 0u64;
-        let total_pairs = (n * (n - 1)) / 2;
+        let _total_pairs = (n * (n - 1)) / 2;
         let max_check = n.min(100);
         let check_pairs = (max_check * (max_check - 1)) / 2;
         for i in 0..max_check {

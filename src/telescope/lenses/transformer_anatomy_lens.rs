@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::telescope::lens_trait::{Lens, LensResult};
-use crate::telescope::shared_data::{SharedData, mean_var, column_vectors, shannon_entropy};
+use crate::telescope::shared_data::{SharedData, mean_var, column_vectors};
 
 /// n=6 transformer constants (BT-33, BT-54, BT-56, BT-58)
 const SIGMA: f64 = 12.0;
@@ -57,13 +57,13 @@ impl Lens for TransformerAnatomyLens {
         "T1"
     }
 
-    fn scan(&self, data: &[f64], n: usize, d: usize, shared: &SharedData) -> LensResult {
+    fn scan(&self, data: &[f64], n: usize, d: usize, _shared: &SharedData) -> LensResult {
         if n < 3 || d == 0 {
             return HashMap::new();
         }
 
         let (means, vars) = mean_var(data, n, d);
-        let columns = column_vectors(data, n, d);
+        let _columns = column_vectors(data, n, d);
 
         // 1. Transformer constant matching
         let mut n6_matches = 0;

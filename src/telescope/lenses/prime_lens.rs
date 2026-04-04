@@ -123,7 +123,7 @@ impl Lens for PrimeLens {
             if count >= 3 {
                 let mean_y = sum_y / count as f64;
                 let mut ss_tot = 0.0;
-                let mut idx = 0;
+                let idx = 0;
                 for (i, &v) in vals.iter().enumerate() {
                     if v > 2.0 {
                         let y = (i + 1) as f64;

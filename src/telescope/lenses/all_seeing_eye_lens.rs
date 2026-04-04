@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::telescope::lens_trait::{Lens, LensResult};
-use crate::telescope::shared_data::{SharedData, shannon_entropy};
+use crate::telescope::shared_data::SharedData;
 
 /// AllSeeingEyeLens: Comprehensive omnidirectional scan.
 ///

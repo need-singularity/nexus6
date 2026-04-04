@@ -82,6 +82,13 @@ pub enum CliCommand {
         experiment_type: String,
         target: String,
     },
+    Bridge {
+        sub: Vec<String>,
+    },
+    Loop {
+        domain: Option<String>,
+        cycles: usize,
+    },
     Help,
 }
 
@@ -136,6 +143,8 @@ pub fn parse_args(args: &[String]) -> Result<CliCommand, String> {
         "ingest" => parse_ingest(rest),
         "bench" => Ok(CliCommand::Bench),
         "dashboard" => parse_dashboard(rest),
+        "bridge" | "br" => Ok(CliCommand::Bridge { sub: rest.to_vec() }),
+        "loop" => parse_loop(rest),
         "help" | "--help" | "-h" => Ok(CliCommand::Help),
         other => Err(format!("Unknown command: '{}'. Run 'nexus6 help' for usage.", other)),
     }
@@ -522,6 +531,33 @@ fn parse_dashboard(args: &[String]) -> Result<CliCommand, String> {
     }
 
     Ok(CliCommand::Dashboard { html, output })
+}
+
+fn parse_loop(args: &[String]) -> Result<CliCommand, String> {
+    let mut domain: Option<String> = None;
+    let mut cycles: usize = 1;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--cycles" | "-n" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--cycles requires a number".to_string());
+                }
+                cycles = args[i].parse().map_err(|_| "cycles must be a number".to_string())?;
+            }
+            other if !other.starts_with('-') && domain.is_none() => {
+                domain = Some(other.to_string());
+            }
+            other => {
+                return Err(format!("loop: unknown option '{}'", other));
+            }
+        }
+        i += 1;
+    }
+
+    Ok(CliCommand::Loop { domain, cycles })
 }
 
 fn parse_predict(args: &[String]) -> Result<CliCommand, String> {

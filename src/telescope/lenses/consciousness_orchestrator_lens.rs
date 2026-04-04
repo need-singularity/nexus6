@@ -23,7 +23,7 @@ impl Lens for ConsciousnessOrchestratorLens {
     fn name(&self) -> &str { "ConsciousnessOrchestratorLens" }
     fn category(&self) -> &str { "T1" }
 
-    fn scan(&self, data: &[f64], n: usize, d: usize, shared: &SharedData) -> LensResult {
+    fn scan(&self, _data: &[f64], n: usize, d: usize, shared: &SharedData) -> LensResult {
         if n < 8 || d < 1 { return HashMap::new(); }
         let max_n = n.min(200);
 
@@ -60,7 +60,7 @@ impl Lens for ConsciousnessOrchestratorLens {
 
         // 5. EXPERIMENT: phase transition — sweep threshold and find critical point
         let thresholds = [0.3, 0.5, 0.7, 1.0, 1.5, 2.0]; // 6 = n
-        let mut phi_curve: Vec<f64> = thresholds.iter()
+        let phi_curve: Vec<f64> = thresholds.iter()
             .map(|&t| compute_phi(shared, max_n, t))
             .collect();
         // Find max gradient (phase transition point)

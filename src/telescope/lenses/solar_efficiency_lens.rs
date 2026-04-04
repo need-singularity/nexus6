@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::telescope::lens_trait::{Lens, LensResult};
-use crate::telescope::shared_data::{SharedData, mean_var, shannon_entropy};
+use crate::telescope::shared_data::{SharedData, mean_var};
 
 /// n=6 solar constants (BT-30, BT-63)
 const SIGMA: f64 = 12.0;
@@ -61,7 +61,7 @@ impl Lens for SolarEfficiencyLens {
         "T1"
     }
 
-    fn scan(&self, data: &[f64], n: usize, d: usize, shared: &SharedData) -> LensResult {
+    fn scan(&self, data: &[f64], n: usize, d: usize, _shared: &SharedData) -> LensResult {
         if n < 3 || d == 0 {
             return HashMap::new();
         }

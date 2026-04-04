@@ -55,6 +55,8 @@ pub fn run(cmd: CliCommand) -> Result<(), String> {
         CliCommand::Cycle { experiment_type, target } => {
             run_cycle(&experiment_type, &target)
         }
+        CliCommand::Bridge { sub } => run_bridge(sub),
+        CliCommand::Loop { domain, cycles } => run_loop(domain, cycles),
         CliCommand::Ingest { sources, config, verbose } => run_ingest(sources, config, verbose),
         CliCommand::Bench => run_bench(),
         CliCommand::Dashboard { html, output } => run_dashboard(html, output),
@@ -1296,6 +1298,107 @@ fn run_cycle(experiment_type: &str, target: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn run_loop(domain: Option<String>, cycles: usize) -> Result<(), String> {
+    use std::time::Instant;
+
+    let domain_str = domain.as_deref().unwrap_or("number_theory");
+
+    println!("┌─────────────────────────────────────────────────┐");
+    println!("│  🔄 NEXUS-6 LOOP — scan + evolve + bridge      │");
+    println!("│  Domain: {:<39} │", domain_str);
+    println!("│  Cycles: {:<39} │", cycles);
+    println!("└─────────────────────────────────────────────────┘");
+    println!();
+
+    let t0 = Instant::now();
+
+    for cycle in 1..=cycles {
+        if cycles > 1 {
+            println!("━━━ Cycle {}/{} ━━━", cycle, cycles);
+        }
+
+        // Phase 1: nexus6 scan
+        println!("  [1/4] 🔭 Scan: {}", domain_str);
+        if let Err(e) = run_scan(domain_str, None, false) {
+            println!("  ⚠️  scan error: {}", e);
+        }
+        println!();
+
+        // Phase 2: nexus6 evolve (OUROBOROS 1 cycle)
+        println!("  [2/4] 🐍 Evolve: {}", domain_str);
+        if let Err(e) = run_evolve(domain_str, 1, vec![format!("n=6 in {}", domain_str)]) {
+            println!("  ⚠️  evolve error: {}", e);
+        }
+        println!();
+
+        // Phase 3: bridge sync
+        println!("  [3/4] 🌉 Bridge Sync");
+        if let Err(e) = run_bridge(vec!["sync".to_string()]) {
+            println!("  ⚠️  bridge sync error: {}", e);
+        }
+        println!();
+
+        // Phase 4: bridge evolve
+        println!("  [4/4] 🌀 Bridge Evolve");
+        if let Err(e) = run_bridge(vec!["evolve".to_string(), "1".to_string()]) {
+            println!("  ⚠️  bridge evolve error: {}", e);
+        }
+        println!();
+    }
+
+    let elapsed = t0.elapsed();
+    println!("┌─────────────────────────────────────────────────┐");
+    println!("│  ✅ LOOP COMPLETE                               │");
+    println!("│  {} cycle(s) in {:.1}s                          │", cycles, elapsed.as_secs_f64());
+    println!("└─────────────────────────────────────────────────┘");
+
+    Ok(())
+}
+
+fn run_bridge(sub: Vec<String>) -> Result<(), String> {
+    use std::process::Command;
+
+    // nexus-bridge.py 경로: 바이너리 위치 기준 또는 NEXUS6_ROOT 환경변수
+    let nexus_root = std::env::var("NEXUS6_ROOT")
+        .unwrap_or_else(|_| {
+            // fallback: 실행파일 기준 상위 디렉토리
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                .and_then(|p| p.parent().map(|d| d.to_string_lossy().to_string()))
+                .unwrap_or_else(|| ".".to_string())
+        });
+
+    let script = format!("{}/nexus-bridge.py", nexus_root);
+
+    // 스크립트 존재 확인
+    if !std::path::Path::new(&script).exists() {
+        return Err(format!(
+            "nexus-bridge.py not found at '{}'. Set NEXUS6_ROOT or run from project root.",
+            script
+        ));
+    }
+
+    // 인자가 없으면 기본 status
+    let args: Vec<&str> = if sub.is_empty() {
+        vec!["status"]
+    } else {
+        sub.iter().map(|s| s.as_str()).collect()
+    };
+
+    let status = Command::new("python3")
+        .arg(&script)
+        .args(&args)
+        .status()
+        .map_err(|e| format!("Failed to run nexus-bridge.py: {}", e))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("nexus-bridge.py exited with code {:?}", status.code()))
+    }
+}
+
 fn print_help() {
     println!("NEXUS-6 Discovery Engine v0.1.0");
     println!("Usage: nexus6 <command> [options]");
@@ -1356,6 +1459,16 @@ fn print_help() {
     println!("      Default: loads shared/projects.json (6 projects).");
     println!("      --config PATH  use a custom projects.json file.");
     println!("      --source PATH  override with explicit paths (skips JSON config).");
+    println!();
+    println!("  loop [domain] [--cycles N]");
+    println!("      Unified growth loop: scan → evolve → bridge sync → bridge evolve.");
+    println!("      Default domain: number_theory, default cycles: 1.");
+    println!();
+    println!("  bridge [sub-command] [args...]   (alias: br)");
+    println!("      Run nexus-bridge operations directly.");
+    println!("      Sub-commands: status, discover, connect, disconnect, sync,");
+    println!("                    health, list, report, evolve, loop, cp");
+    println!("      No sub-command = status");
     println!();
     println!("  bench");
     println!("      Run benchmark suite (registry, telescope, OUROBOROS, forge).");

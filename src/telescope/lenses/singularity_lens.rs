@@ -18,7 +18,7 @@ impl Lens for SingularityLens {
         // Compute local densities via kNN
         let densities: Vec<f64> = (0..max_n).map(|i| shared.knn_density(i)).collect();
 
-        let mean_density = densities.iter().sum::<f64>() / max_n as f64;
+        let _mean_density = densities.iter().sum::<f64>() / max_n as f64;
         let median_density = {
             let mut sorted = densities.clone();
             sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());

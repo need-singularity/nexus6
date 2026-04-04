@@ -56,7 +56,7 @@ impl Lens for AutoCalibrationLens {
         let optimal_threshold = dists.get(dists.len() / 2).copied().unwrap_or(1.0);
 
         // Signal-to-noise ratio
-        let (means, vars) = mean_var(data, max_n, d);
+        let (_means, vars) = mean_var(data, max_n, d);
         let signal = vars.iter().sum::<f64>();
         // Noise estimate: mean of squared differences between adjacent points
         let noise = if max_n > 1 {

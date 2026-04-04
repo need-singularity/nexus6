@@ -52,7 +52,7 @@ impl Lens for BatteryChemistryLens {
             return HashMap::new();
         }
 
-        let (means, vars) = mean_var(data, n, d);
+        let (means, _vars) = mean_var(data, n, d);
         let columns = column_vectors(data, n, d);
 
         // 1. Coordination number detection via k-NN

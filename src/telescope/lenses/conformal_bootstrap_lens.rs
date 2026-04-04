@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::telescope::lens_trait::{Lens, LensResult};
-use crate::telescope::shared_data::{SharedData, mean_var, column_vectors, shannon_entropy};
+use crate::telescope::shared_data::{SharedData, column_vectors, shannon_entropy};
 
 /// n=6 conformal/CFT constants (BT-105, BT-49)
 const N: f64 = 6.0;

@@ -82,7 +82,7 @@ impl Lens for ChipArchitectureLens {
             return HashMap::new();
         }
 
-        let (means, vars) = mean_var(data, n, d);
+        let (means, _vars) = mean_var(data, n, d);
 
         // 1. Check feature means against architecture constants
         let (mean_matches, matched_constants) = count_n6_matches(&means);

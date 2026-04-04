@@ -92,7 +92,7 @@ impl Lens for ConstantDiscoveryEngineLens {
 
         // 3. Debit/Credit transformation (대차변환)
         let mut debit_credit_balance = Vec::new();
-        for &(val, _name, ref _source, error) in discoveries.iter().take(20) {
+        for &(_val, _name, ref _source, error) in discoveries.iter().take(20) {
             debit_credit_balance.push(error); // Balance = residual error %
         }
 

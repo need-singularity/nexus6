@@ -99,7 +99,7 @@ impl Lens for LatticeFieldLens {
 
         // 2. Packing fraction estimation
         //    Approximate: volume of n hyperspheres / total bounding volume
-        let (means, vars) = mean_var(data, n, d);
+        let (_means, _vars) = mean_var(data, n, d);
 
         let mut bounding_vol = 1.0_f64;
         for j in 0..d {

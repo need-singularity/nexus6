@@ -14,8 +14,8 @@ impl Lens for EngineDiscoveryLens {
         let max_n = n.min(200);
         let mut result = HashMap::new();
 
-        let (means, vars) = mean_var(data, max_n, d);
-        let total_var: f64 = vars.iter().sum();
+        let (_means, vars) = mean_var(data, max_n, d);
+        let _total_var: f64 = vars.iter().sum();
 
         // Distance distribution analysis
         let mut dists = Vec::with_capacity(max_n * (max_n - 1) / 2);
