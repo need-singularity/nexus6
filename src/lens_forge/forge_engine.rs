@@ -2,7 +2,8 @@ use crate::history::recorder::ScanRecord;
 use crate::telescope::registry::{LensCategory, LensEntry, LensRegistry};
 
 use super::candidate_gen::{
-    generate_from_analogy, generate_from_combination, generate_from_mutation, LensCandidate,
+    generate_from_analogy, generate_from_combination, generate_from_discovery,
+    generate_from_mutation, LensCandidate,
 };
 use super::gap_analyzer::{analyze_gaps, GapReport};
 use super::validator::{validate, Recommendation, ValidationResult};
@@ -97,6 +98,11 @@ pub fn forge_cycle(
     let mut mutation = generate_from_mutation(registry);
     mutation.truncate(config.max_candidates);
     all_candidates.extend(mutation);
+
+    // Bottom-up: generate from discovery data (no gap analysis required)
+    let mut discovery = generate_from_discovery(registry, history);
+    discovery.truncate(config.max_candidates);
+    all_candidates.extend(discovery);
 
     // Filter by dynamic minimum confidence (decreases as cycles progress)
     let effective_threshold = config.effective_min_confidence();

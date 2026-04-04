@@ -1603,7 +1603,7 @@ mod lens_forge_tests {
     #[test]
     fn test_forge_with_empty_registry() {
         let registry = LensRegistry::new();
-        let config = ForgeConfig { max_candidates: 5, min_confidence: 0.0, similarity_threshold: 0.99 };
+        let config = ForgeConfig { max_candidates: 5, min_confidence: 0.0, similarity_threshold: 0.99, cycle_number: 1 };
         let _result = forge_engine::forge_cycle(&registry, &[], &config);
         // Should not panic
     }

@@ -1,5 +1,6 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
+use crate::history::recorder::ScanRecord;
 use crate::telescope::registry::{LensEntry, LensRegistry};
 
 use super::gap_analyzer::GapReport;
@@ -223,6 +224,99 @@ pub fn generate_from_mutation(registry: &LensRegistry) -> Vec<LensCandidate> {
             if candidates.len() >= 20 {
                 return candidates;
             }
+        }
+    }
+
+    candidates
+}
+
+/// Generate candidates bottom-up from OUROBOROS discovery data.
+///
+/// Unlike the other generators this does NOT require gap analysis.
+/// It inspects scan history to find domains where discoveries were made
+/// and proposes new lenses that deepen coverage there.  When no
+/// discoveries exist yet it falls back to creating lenses based on the
+/// most-scanned domains (the ones the engine is actively exploring).
+pub fn generate_from_discovery(
+    registry: &LensRegistry,
+    scan_history: &[ScanRecord],
+) -> Vec<LensCandidate> {
+    if scan_history.is_empty() {
+        return Vec::new();
+    }
+
+    // 1. Tally discoveries per domain and collect lenses that produced them
+    let mut domain_discovery_count: HashMap<String, usize> = HashMap::new();
+    let mut domain_lenses: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut domain_scan_count: HashMap<String, usize> = HashMap::new();
+
+    for record in scan_history {
+        let d = record.domain.to_lowercase();
+        *domain_scan_count.entry(d.clone()).or_insert(0) += 1;
+        if !record.discoveries.is_empty() {
+            *domain_discovery_count.entry(d.clone()).or_insert(0) += record.discoveries.len();
+            domain_lenses.entry(d).or_default()
+                .extend(record.lenses_used.iter().cloned());
+        }
+    }
+
+    // 2. Pick target domains: prefer domains with discoveries, fall back to most-scanned
+    let mut target_domains: Vec<(String, usize)> = if domain_discovery_count.is_empty() {
+        domain_scan_count.into_iter().collect()
+    } else {
+        domain_discovery_count.into_iter().collect()
+    };
+    target_domains.sort_by(|a, b| b.1.cmp(&a.1));
+    target_domains.truncate(6); // n=6
+
+    // 3. For each target domain produce a candidate that deepens coverage
+    let existing_names: HashSet<String> = registry.iter().map(|(n, _)| n.clone()).collect();
+    let mut candidates = Vec::new();
+
+    for (domain, count) in &target_domains {
+        // Gather lenses already associated with this domain from history
+        let productive_lenses: Vec<String> = domain_lenses
+            .get(domain)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default();
+
+        // Create a deepening lens that combines the productive lenses' affinities
+        let name = format!("{}_discovery_deep", domain);
+        if existing_names.contains(&name) {
+            continue;
+        }
+
+        let mut affinity = vec![domain.clone()];
+        // Pull in affinities from the productive lenses (cross-pollination)
+        for lens_name in &productive_lenses {
+            if let Some(entry) = registry.get(lens_name) {
+                for a in &entry.domain_affinity {
+                    let al = a.to_lowercase();
+                    if !affinity.contains(&al) {
+                        affinity.push(al);
+                    }
+                }
+            }
+        }
+        affinity.sort();
+        affinity.truncate(6);
+
+        let complementary: Vec<String> = productive_lenses.iter().take(4).cloned().collect();
+
+        candidates.push(LensCandidate {
+            name,
+            description: format!(
+                "Bottom-up lens deepening {} based on {} prior discoveries",
+                domain, count,
+            ),
+            source: CandidateSource::GapFill(domain.clone()),
+            domain_affinity: affinity,
+            complementary,
+            confidence: 0.5,
+        });
+
+        if candidates.len() >= 20 {
+            break;
         }
     }
 

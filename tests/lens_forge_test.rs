@@ -350,6 +350,7 @@ fn test_forge_cycle_with_history() {
         max_candidates: 10,
         min_confidence: 0.2,
         similarity_threshold: 0.8,
+        cycle_number: 1,
     };
 
     let result = forge_cycle(&reg, &history, &config);
@@ -379,6 +380,7 @@ fn test_forge_config_strict() {
         max_candidates: 5,
         min_confidence: 0.99,
         similarity_threshold: 0.1, // very strict uniqueness
+        cycle_number: 1,
     };
 
     let result = forge_cycle(&reg, &history, &strict);

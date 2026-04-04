@@ -315,7 +315,7 @@ fn test_registry_core_count() {
     let reg = LensRegistry::new();
     let cores = reg.by_category(LensCategory::Core);
     assert_eq!(cores.len(), 23, "Registry must contain exactly 28 Core lenses");
-    assert_eq!(reg.len(), 1014, "Total registry size after new()");
+    assert_eq!(reg.len(), 1024, "Total registry size after new()");
 }
 
 // ──────────────────────────────────────────────
@@ -343,10 +343,10 @@ fn test_registry_get() {
 fn test_registry_by_category() {
     let mut reg = LensRegistry::new();
 
-    // 991 Extended, no Custom or DomainCombo
+    // 991 Extended, 10 DomainCombo, no Custom
     assert_eq!(reg.by_category(LensCategory::Extended).len(), 991);
     assert_eq!(reg.by_category(LensCategory::Custom).len(), 0);
-    assert_eq!(reg.by_category(LensCategory::DomainCombo).len(), 0);
+    assert_eq!(reg.by_category(LensCategory::DomainCombo).len(), 10);
 
     // Add one more Extended
     reg.register(LensEntry {
@@ -423,7 +423,7 @@ fn test_domain_combos() {
 #[test]
 fn test_register_custom() {
     let mut reg = LensRegistry::new();
-    assert_eq!(reg.len(), 1014);
+    assert_eq!(reg.len(), 1024);
 
     reg.register(LensEntry {
         name: "my_custom_lens".into(),
@@ -531,7 +531,7 @@ fn test_global_lens_name_uniqueness() {
 #[test]
 fn test_registry_total_411() {
     let reg = LensRegistry::new();
-    assert_eq!(reg.len(), 1014, "Registry total lenses");
+    assert_eq!(reg.len(), 1024, "Registry total lenses");
 
     let extended = reg.by_category(LensCategory::Extended);
     assert_eq!(extended.len(), 991, "Extended category lenses");

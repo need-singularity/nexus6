@@ -197,17 +197,9 @@ impl MetaLoop {
 
             total_discoveries += cycle_discoveries;
 
-            // Build scan records from engine history for LensForge
-            for cr in &engine.history {
-                accumulated_records.push(ScanRecord {
-                    id: format!("meta{}-{}", meta_cycle, cr.cycle),
-                    timestamp: format!("meta-{}-cycle-{}", meta_cycle, cr.cycle),
-                    domain: self.domain.clone(),
-                    lenses_used: cr.lenses_used.clone(),
-                    discoveries: Vec::new(),
-                    consensus_level: cr.lenses_used.len(),
-                });
-            }
+            // Accumulate full scan records (with discovery data) from the engine
+            // so the forge's gap_analyzer can use actual discovery history
+            accumulated_records.extend(engine.scan_records());
 
             // Forge new lenses after OUROBOROS saturation or completion
             let mut lenses_forged_this_cycle: Vec<String> = Vec::new();
@@ -282,7 +274,7 @@ mod tests {
         let config = MetaLoopConfig::default();
         assert_eq!(config.max_ouroboros_cycles, 6);
         assert_eq!(config.max_meta_cycles, 6);
-        assert_eq!(config.forge_after_n_cycles, 0);
+        assert_eq!(config.forge_after_n_cycles, 3);
     }
 
     #[test]
@@ -314,6 +306,7 @@ mod tests {
                 max_candidates: 5,
                 min_confidence: 0.99, // very high bar -> likely no new lenses
                 similarity_threshold: 0.1,
+                cycle_number: 1,
             },
         };
         let meta_loop = MetaLoop::new(
