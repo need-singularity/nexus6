@@ -36,7 +36,7 @@ pub struct SingularityDetector {
 impl Default for SingularityDetector {
     fn default() -> Self {
         Self {
-            min_closure: 0.9,
+            min_closure: 0.5,
             min_compression: 2.0,
             window: 6, // n=6
         }
@@ -93,24 +93,63 @@ impl SingularityDetector {
             variances.insert(key.clone(), variance);
         }
 
-        // Closure degree: fraction of metrics with near-zero variance
+        // Closure degree: fraction of metrics that are "frozen"
+        // Use relative variance (variance / mean²) to handle different scales:
+        //   - If mean is near zero, fall back to absolute variance < 1e-6
+        //   - Otherwise, relative variance < 0.01 (1% variation) counts as frozen
         let total_metrics = variances.len() as f64;
         if total_metrics == 0.0 {
             return None;
         }
-        let frozen_count = variances.values().filter(|&&v| v < 1e-6).count() as f64;
-        let closure_degree = frozen_count / total_metrics;
+        let frozen_count = variances.iter().filter(|(k, v)| {
+            let mean = means.get(k.as_str()).copied().unwrap_or(0.0);
+            let mean_sq = mean * mean;
+            if mean_sq < 1e-10 {
+                // Near-zero mean: use absolute variance
+                **v < 1e-6
+            } else {
+                // Relative variance: frozen if < 1% variation
+                **v / mean_sq < 0.01
+            }
+        }).count() as f64;
+
+        // Also check for monotone-decreasing pattern (convergence toward zero)
+        let mut decreasing_count = 0usize;
+        for key in &all_keys {
+            let values: Vec<f64> = recent
+                .iter()
+                .filter_map(|m| m.get(key).copied())
+                .collect();
+            if values.len() >= 3 {
+                let is_decreasing = values.windows(2).all(|w| w[1] <= w[0] + 1e-10);
+                if is_decreasing {
+                    decreasing_count += 1;
+                }
+            }
+        }
+        // Count monotone-decreasing metrics as half-frozen (convergence signal)
+        let effective_frozen = frozen_count + (decreasing_count as f64) * 0.5;
+        let closure_degree = (effective_frozen / total_metrics).min(1.0);
 
         if closure_degree < self.min_closure {
             return None;
         }
 
         // Find axioms: metrics that are non-zero and frozen (stable)
+        // Uses the same relative-variance criterion as closure detection
         let axioms: Vec<String> = means
             .iter()
             .filter(|(k, v)| {
-                v.abs() > 1e-10
-                    && variances.get(k.as_str()).copied().unwrap_or(1.0) < 1e-6
+                if v.abs() <= 1e-10 {
+                    return false;
+                }
+                let var = variances.get(k.as_str()).copied().unwrap_or(1.0);
+                let mean_sq = **v * **v;
+                if mean_sq < 1e-10 {
+                    var < 1e-6
+                } else {
+                    var / mean_sq < 0.01
+                }
             })
             .map(|(k, _)| k.clone())
             .collect();
