@@ -2,11 +2,8 @@
 # NEXUS-6 상태 배너 생성 — 모든 훅에서 호출 가능
 # 출력: {"systemMessage":"🔭 NEXUS-6 🔭137/148 ⚖️1030법칙 🧠24모듈 🌱3건"}
 set +e
-# 화이트리스트 — hooks-config.json 참조 (하드코딩 제거)
 HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_NAME=$(basename "$(git rev-parse --show-toplevel 2>/dev/null)" 2>/dev/null)
-WHITELIST=$(python3 -c "import json; print(' '.join(json.load(open('$HOOK_DIR/hooks-config.json'))['whitelisted_projects']))" 2>/dev/null)
-echo " $WHITELIST " | grep -q " $REPO_NAME " || exit 0
+source "$HOOK_DIR/bootstrap.sh" || exit 0
 
 python3 -c "
 import json, os, glob, time
