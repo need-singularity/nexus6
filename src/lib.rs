@@ -11,6 +11,8 @@ pub mod experiment;
 pub mod science;
 pub mod cli;
 
+pub mod blowup;
+
 // --- Agent-generated modules ---
 pub mod alert;
 pub mod api;

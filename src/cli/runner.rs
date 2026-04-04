@@ -1334,10 +1334,26 @@ fn run_loop(domain: Option<String>, cycles: usize) -> Result<(), String> {
             println!("━━━ Cycle {}/{} ━━━", cycle, cycles);
         }
 
-        // Phase 0: Bridge self-update (fresh config before each cycle)
+        // Phase 0: Bridge self-update + load check
         let pt = Instant::now();
-        println!("  [0/6] 🔄 Bridge update");
+        println!("  [0/6] 🔄 Bridge update + 부하 체크");
         let _ = run_bridge(vec!["update".to_string()]);
+
+        // System load gate — wait if overloaded
+        loop {
+            let load = get_system_load();
+            let mem_free_pct = get_mem_free_pct();
+            if load.0 < 20.0 && mem_free_pct > 5.0 {
+                if load.0 > 10.0 {
+                    println!("    ⚡ Load {:.1} — 경량 모드 진행", load.0);
+                } else {
+                    println!("    ✅ Load {:.1} | Free RAM {:.0}% — 정상", load.0, mem_free_pct);
+                }
+                break;
+            }
+            println!("    ⏳ 과부하 감지 (Load {:.1}, Free {:.0}%) — 30초 대기...", load.0, mem_free_pct);
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        }
         phase_times.push(("BridgeUpdate".to_string(), pt.elapsed().as_secs_f64()));
 
         // Phase 1: Discover + Auto-Connect
@@ -1519,6 +1535,59 @@ fn run_loop(domain: Option<String>, cycles: usize) -> Result<(), String> {
     println!("  └{}┘", line);
 
     Ok(())
+}
+
+/// Get system load averages (1min, 5min, 15min).
+fn get_system_load() -> (f64, f64, f64) {
+    use std::process::Command;
+    Command::new("sysctl")
+        .args(["-n", "vm.loadavg"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| {
+            // Output: "{ 10.50 8.20 6.30 }"
+            let nums: Vec<f64> = s.replace(['{', '}'], "")
+                .split_whitespace()
+                .filter_map(|n| n.parse().ok())
+                .collect();
+            if nums.len() >= 3 { Some((nums[0], nums[1], nums[2])) } else { None }
+        })
+        .unwrap_or((0.0, 0.0, 0.0))
+}
+
+/// Get free memory percentage (macOS).
+fn get_mem_free_pct() -> f64 {
+    use std::process::Command;
+    // Total RAM
+    let total = Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .unwrap_or(1.0);
+
+    // vm_stat for free + inactive pages
+    let vm = Command::new("vm_stat")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default();
+
+    let page_size = 16384.0_f64; // Apple Silicon default
+    let mut free_pages = 0u64;
+    for line in vm.lines() {
+        if line.contains("Pages free") || line.contains("Pages inactive") {
+            if let Some(n) = line.split(':').nth(1) {
+                if let Ok(v) = n.trim().trim_end_matches('.').parse::<u64>() {
+                    free_pages += v;
+                }
+            }
+        }
+    }
+    let free_bytes = free_pages as f64 * page_size;
+    (free_bytes / total) * 100.0
 }
 
 /// Get current time as formatted string.

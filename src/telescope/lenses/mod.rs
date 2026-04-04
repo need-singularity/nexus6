@@ -260,3 +260,191 @@ pub use wall_inspection_lens::WallInspectionLens;
 pub use warp_lens::WarpLens;
 pub use weight_learning_lens::WeightLearningLens;
 pub use wormhole_lens::WormholeLens;
+pub use crypto_lens::CryptoLens;
+pub use weight_feedback_lens::WeightFeedbackLens;
+pub use audio_lens::AudioLens;
+pub use environment_lens::EnvironmentLens;
+pub use finance_lens::FinanceLens;
+pub use medicine_lens::MedicineLens;
+pub use robotics_lens::RoboticsLens;
+
+pub mod crypto_lens;
+pub mod weight_feedback_lens;
+pub mod audio_lens;
+pub mod environment_lens;
+pub mod finance_lens;
+pub mod medicine_lens;
+pub mod robotics_lens;
+
+pub mod harmonic_series_lens;
+pub mod metrical_lens;
+pub mod hexameter_lens;
+pub mod narrative_arc_lens;
+pub mod color_harmony_lens;
+pub mod architectural_proportion_lens;
+
+pub use harmonic_series_lens::HarmonicSeriesLens;
+pub use metrical_lens::MetricalLens;
+pub use hexameter_lens::HexameterLens;
+pub use narrative_arc_lens::NarrativeArcLens;
+pub use color_harmony_lens::ColorHarmonyLens;
+pub use architectural_proportion_lens::ArchitecturalProportionLens;
+
+pub mod fisher_geometric_lens;
+pub mod neutral_theory_lens;
+pub mod frequency_dependent_lens;
+pub mod rate_code_lens;
+pub mod population_vector_lens;
+pub mod phase_locking_lens;
+pub mod lotka_volterra_lens;
+pub mod metacommunity_lens;
+pub mod resource_competition_lens;
+pub mod protein_folding_lens;
+pub mod gene_network_lens;
+pub mod epigenetic_lens;
+
+pub use fisher_geometric_lens::FisherGeometricLens;
+pub use neutral_theory_lens::NeutralTheoryLens;
+pub use frequency_dependent_lens::FrequencyDependentLens;
+pub use rate_code_lens::RateCodeLens;
+pub use population_vector_lens::PopulationVectorLens;
+pub use phase_locking_lens::PhaseLockingLens;
+pub use lotka_volterra_lens::LotkaVolterraLens;
+pub use metacommunity_lens::MetacommunityLens;
+pub use resource_competition_lens::ResourceCompetitionLens;
+pub use protein_folding_lens::ProteinFoldingLens;
+pub use gene_network_lens::GeneNetworkLens;
+pub use epigenetic_lens::EpigeneticLens;
+
+pub mod parallel_complexity_lens;
+pub mod query_complexity_lens;
+pub mod communication_complexity_lens;
+pub mod discrete_log_lens;
+pub mod lattice_basis_lens;
+pub mod isogeny_walk_lens;
+pub mod vc_dimension_lens;
+pub mod rademacher_complexity_lens;
+pub mod kernel_method_geometry_lens;
+pub mod matroid_lens;
+pub mod polyhedron_face_lens;
+pub mod minimum_spanning_tree_lens;
+
+pub use parallel_complexity_lens::ParallelComplexityLens;
+pub use query_complexity_lens::QueryComplexityLens;
+pub use communication_complexity_lens::CommunicationComplexityLens;
+pub use discrete_log_lens::DiscreteLogLens;
+pub use lattice_basis_lens::LatticeBasisLens;
+pub use isogeny_walk_lens::IsogenyWalkLens;
+pub use vc_dimension_lens::VCDimensionLens;
+pub use rademacher_complexity_lens::RademacherComplexityLens;
+pub use kernel_method_geometry_lens::KernelMethodGeometryLens;
+pub use matroid_lens::MatroidLens;
+pub use polyhedron_face_lens::PolyhedronFaceLens;
+pub use minimum_spanning_tree_lens::MinimumSpanningTreeLens;
+
+pub mod pade_approximant_lens;
+pub mod bernstein_approximation_lens;
+pub mod spline_interpolation_lens;
+pub mod convex_conjugacy_lens;
+pub mod subdifferential_lens;
+pub mod arima_hidden_lens;
+pub mod state_space_observability_lens;
+pub mod ergodicity_breaking_lens;
+
+pub use pade_approximant_lens::PadeApproximantLens;
+pub use bernstein_approximation_lens::BernsteinApproximationLens;
+pub use spline_interpolation_lens::SplineInterpolationLens;
+pub use convex_conjugacy_lens::ConvexConjugacyLens;
+pub use subdifferential_lens::SubdifferentialLens;
+pub use arima_hidden_lens::ARIMAHiddenLens;
+pub use state_space_observability_lens::StateSpaceObservabilityLens;
+pub use ergodicity_breaking_lens::ErgodicityBreakingLens;
+
+pub mod running_coupling_lens;
+pub mod anomaly_matching_lens;
+pub mod dispersion_relation_lens;
+pub mod quantization_gap_lens;
+pub mod scalar_curvature_lens;
+pub mod isometry_group_lens;
+pub mod cosmological_constant_lens;
+pub mod band_structure_lens;
+pub mod magnon_lens;
+pub mod skyrmion_lens;
+pub mod plasma_dispersion_lens;
+pub mod reconnection_lens;
+pub mod cp_violation_lens;
+pub mod baryogenesis_lens;
+
+pub use running_coupling_lens::RunningCouplingLens;
+pub use anomaly_matching_lens::AnomalyMatchingLens;
+pub use dispersion_relation_lens::DispersionRelationLens;
+pub use quantization_gap_lens::QuantizationGapLens;
+pub use scalar_curvature_lens::ScalarCurvatureLens;
+pub use isometry_group_lens::IsometryGroupLens;
+pub use cosmological_constant_lens::CosmologicalConstantLens;
+pub use band_structure_lens::BandStructureLens;
+pub use magnon_lens::MagnonLens;
+pub use skyrmion_lens::SkyrmionLens;
+pub use plasma_dispersion_lens::PlasmaDispersionLens;
+pub use reconnection_lens::ReconnectionLens;
+pub use cp_violation_lens::CPViolationLens;
+pub use baryogenesis_lens::BaryogenesisLens;
+
+pub mod birch_swinnerton_dyer_lens;
+pub mod modular_lens;
+pub mod class_number_lens;
+pub mod lattice_congruence_lens;
+pub mod mobius_inversion_lens;
+pub mod cohomology_ring_lens;
+pub mod k_theory_lens;
+pub mod character_induction_lens;
+pub mod schur_functor_lens;
+pub mod triangulated_category_lens;
+pub mod derived_functor_lens;
+pub mod maclane_coherence_lens;
+pub mod arnold_classification_lens;
+pub mod calabi_yau_metrics_lens;
+pub mod moment_map_lens;
+pub mod mirror_symmetry_lens;
+pub mod resolution_tree_lens;
+pub mod holonomy_group_lens;
+
+pub use birch_swinnerton_dyer_lens::BirchSwinnertonDyerLens;
+pub use modular_lens::ModularLens;
+pub use class_number_lens::ClassNumberLens;
+pub use lattice_congruence_lens::LatticeCongruenceLens;
+pub use mobius_inversion_lens::MobiusInversionLens;
+pub use cohomology_ring_lens::CohomologyRingLens;
+pub use k_theory_lens::KTheoryLens;
+pub use character_induction_lens::CharacterInductionLens;
+pub use schur_functor_lens::SchurFunctorLens;
+pub use triangulated_category_lens::TriangulatedCategoryLens;
+pub use derived_functor_lens::DerivedFunctorLens;
+pub use maclane_coherence_lens::MacLaneCoherenceLens;
+pub use arnold_classification_lens::ArnoldClassificationLens;
+pub use calabi_yau_metrics_lens::CalabiYauMetricsLens;
+pub use moment_map_lens::MomentMapLens;
+pub use mirror_symmetry_lens::MirrorSymmetryAlgLens;
+pub use resolution_tree_lens::ResolutionTreeLens;
+pub use holonomy_group_lens::HolonomyGroupLens;
+
+pub mod electromagnetic_wave_lens;
+pub use electromagnetic_wave_lens::UelectromagneticUwaveLens;
+
+pub mod maxwell_equation_lens;
+pub use maxwell_equation_lens::UmaxwellUequationLens;
+
+pub mod superconductor_lens_lens;
+pub use superconductor_lens_lens::UsuperconductorUlensLens;
+
+pub mod heat_conduction_lens;
+pub use heat_conduction_lens::UheatUconductionLens;
+
+pub mod faraday_induction_lens;
+pub use faraday_induction_lens::UfaradayUinductionLens;
+
+pub mod magnetic_monopole_lens;
+pub use magnetic_monopole_lens::UmagneticUmonopoleLens;
+
+pub mod convection_pattern_lens;
+pub use convection_pattern_lens::UconvectionUpatternLens;
