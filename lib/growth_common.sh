@@ -1134,6 +1134,9 @@ run_common_phases() {
     # 위상 체크 + 리포트 + 미연결 발견 (매 J₂=24 사이클)
     engine_topology_check "$cycle" "$repo_name"
 
+    # 조건부 진화 (정체 감지 시 자동 트리거)
+    conditional_evolution "$cycle" "$repo_name"
+
     # 동기화
     common_phase_full_sync
 }
@@ -2737,6 +2740,118 @@ topo = {
 }
 json.dump(topo, open(prev_file, 'w'), indent=2, ensure_ascii=False)
 " 2>/dev/null || echo "    Topology: error"
+}
+
+# ═══════════════════════════════════════════════════════════════
+# CONDITIONAL EVOLUTION — 정체 감지 시 자동 진화 트리거
+# ═══════════════════════════════════════════════════════════════
+# 조건: 성장률 하락 OR FP 장기 고정 OR fitness 전체 하락
+# → OUROBOROS 진화 + 렌즈 블로업 + 새 fiber 탐색
+# → 대발견 시 코드 즉시 반영
+
+conditional_evolution() {
+    local cycle="${1:-1}"
+    local repo="${2:-unknown}"
+
+    # 매 사이클 체크 (가벼움) — 트리거 조건만 확인
+    python3 -c "
+import json, os, time
+
+n6 = os.path.expanduser('~/.nexus6')
+bus_file = os.path.expanduser('~/Dev/nexus6/shared/growth_bus.jsonl')
+need_evolve = False
+reasons = []
+
+# 조건 1: 성장률 하락 (auto_cubed에서)
+auto3 = {}
+af = os.path.join(n6, 'auto_cubed.json')
+if os.path.exists(af):
+    try: auto3 = json.load(open(af))
+    except: pass
+rate_delta = auto3.get('levels', {}).get('L2_rate_delta', 0)
+if rate_delta < 0:
+    need_evolve = True
+    reasons.append(f'rate_declining({rate_delta:+.1f})')
+
+# 조건 2: FP 장기 고정 (σ²=144+ 사이클 변화 없음)
+mb = {}
+mbf = os.path.join(n6, 'meta_blowup_state.json')
+if os.path.exists(mbf):
+    try: mb = json.load(open(mbf))
+    except: pass
+conv = mb.get('convergence_count', 0)
+if conv >= 36:  # σ²/τ=36
+    need_evolve = True
+    reasons.append(f'fp_stagnant(x{conv})')
+
+# 조건 3: fitness 전체 하락
+fit = {}
+ff = os.path.join(n6, 'engine_fitness.json')
+if os.path.exists(ff):
+    try: fit = json.load(open(ff))
+    except: pass
+deact = fit.get('total_deactivate', 0)
+if deact >= 2:
+    need_evolve = True
+    reasons.append(f'fitness_drop(deact={deact})')
+
+# 조건 4: 위상 미연결 증가
+topo = {}
+tf = os.path.join(n6, 'engine_topology.json')
+if os.path.exists(tf):
+    try: topo = json.load(open(tf))
+    except: pass
+unreachable = len(topo.get('unreachable', []))
+if unreachable > 15:
+    need_evolve = True
+    reasons.append(f'disconnected({unreachable})')
+
+if need_evolve:
+    print(f'    EVOLVE triggered: {\" + \".join(reasons)}')
+    # 진화 실행
+    import subprocess
+    n6_bin = os.path.expanduser('~/Dev/nexus6/target/release/nexus6')
+    lens_script = os.path.expanduser('~/Dev/n6-architecture/tools/nexus6/scripts/growth_infinite_lens.py')
+
+    # OUROBOROS 진화
+    if os.path.exists(n6_bin) and os.access(n6_bin, os.X_OK):
+        r = subprocess.run([n6_bin, 'evolve', 'all', '--max-cycles', '6'],
+                         capture_output=True, text=True, timeout=30)
+        if r.stdout:
+            print(f'    Evolve: {r.stdout.strip()[-60:]}')
+
+    # 블로업 창발
+    if os.path.exists(lens_script):
+        r = subprocess.run(['python3', lens_script, '진행'],
+                         capture_output=True, text=True, timeout=30)
+        if r.stdout:
+            print(f'    Blowup: {r.stdout.strip()[-60:]}')
+
+    # bus 기록
+    with open(bus_file, 'a') as bf:
+        bf.write(json.dumps({
+            'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'repo': '$repo',
+            'type': 'conditional_evolution',
+            'detail': '; '.join(reasons)
+        }) + '\n')
+
+    # 진화 히스토리 저장
+    evo_file = os.path.join(n6, 'evolution_history.json')
+    history = []
+    if os.path.exists(evo_file):
+        try: history = json.load(open(evo_file))
+        except: pass
+    history.append({
+        'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'cycle': $cycle,
+        'reasons': reasons,
+    })
+    # 최근 24건만 유지
+    json.dump(history[-24:], open(evo_file, 'w'), indent=2, ensure_ascii=False)
+else:
+    print(f'    No evolution needed (rate_delta={rate_delta:+.1f}, fp_conv={conv}, deact={deact}, unreachable={unreachable})')
+" 2>/dev/null || true
 }
 
 log_info "growth_common.sh loaded (n=$N6_N, σ=$N6_SIGMA, J₂=$N6_J2)"
