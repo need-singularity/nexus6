@@ -389,6 +389,29 @@ grow_integration() {
         --allowedTools Edit,Write,Read,Bash,Grep,Glob 2>/dev/null || return 1
 }
 
+grow_connections() {
+    log_info "  Action: Scan and fix unlinked connections (BT↔Domain, Atlas↔BT, Lens↔Domain)"
+    # First run scanner to detect gaps
+    local scan_result
+    scan_result=$(bash "$SCRIPT_DIR/grow_connections.sh" --dry-run 2>/dev/null || echo "scan failed")
+    local total_gaps
+    total_gaps=$(echo "$scan_result" | grep "Total gaps:" | grep -oE "[0-9]+" || echo "0")
+
+    if [[ "$total_gaps" -eq 0 ]]; then
+        log_info "  No connection gaps found — all linked ✅"
+        return 0
+    fi
+
+    log_info "  Found $total_gaps connection gaps — dispatching fix..."
+    $CLAUDE_CLI -p "In /Users/ghost/Dev/n6-architecture/, run: bash ~/Dev/nexus6/scripts/grow_connections.sh
+Then fix ALL unlinked connections found:
+1. BTs not referenced in any domain hypotheses → add cross-reference in most relevant domain's hypotheses.md
+2. BTs not in atlas-constants.md → extract EXACT constants and add to atlas
+3. Domains with 0 BT references → find and add relevant BT connections
+After fixes, run the scanner again to verify 0 gaps remain." \
+        --allowedTools Edit,Write,Read,Bash,Grep,Glob 2>/dev/null || return 1
+}
+
 # ── Execute growth action for a dimension ────────────────────────────
 
 execute_dimension_growth() {
@@ -410,6 +433,7 @@ execute_dimension_growth() {
         atlas)           grow_atlas ;;
         documentation)   grow_documentation ;;
         integration)     grow_integration ;;
+        connections)     grow_connections ;;
         *)
             log_warn "Unknown dimension: $dimension"
             return 1
