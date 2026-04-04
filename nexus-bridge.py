@@ -188,6 +188,46 @@ def cmd_notify(bridge: NexusBridge, args: list[str]):
     print(f"  [{source}] {event} x{count} → +{points} pts (total: {gp}, stage: {stage})")
 
 
+def cmd_commit_push(bridge: NexusBridge, args: list[str]):
+    """변경 있는 프로젝트 commit + push."""
+    projects = args if args else None
+    msg = None
+
+    # --msg 옵션
+    if "--msg" in (args or []):
+        idx = args.index("--msg")
+        if idx + 1 < len(args):
+            msg = args[idx + 1]
+            projects = [a for a in args if a != "--msg" and a != msg] or None
+
+    label = ", ".join(projects) if projects else "ALL"
+    print(f"  Commit+Push: {label}...")
+
+    results = bridge.commit_push(projects, msg)
+    for name, r in sorted(results.items()):
+        if r.get("ok"):
+            action = r.get("action", "done")
+            icon = "ok" if action != "clean" else "--"
+            print(f"  [{icon}] {name}: {action}")
+        else:
+            print(f"  [FAIL] {name}: {r.get('error', '?')}")
+
+    pushed = sum(1 for v in results.values() if v.get("action") == "pushed")
+    clean = sum(1 for v in results.values() if v.get("action") == "clean")
+    print(f"\n  {pushed} pushed, {clean} clean, {len(results) - pushed - clean} failed")
+
+
+def cmd_loop(bridge: NexusBridge, args: list[str]):
+    """sync → commit → push 반복 루프."""
+    interval = int(args[0]) if args else 300
+    print(f"  nexus-bridge loop 시작 (매 {interval}초)")
+    print(f"  Ctrl+C로 중지\n")
+    try:
+        bridge.loop(interval=interval)
+    except KeyboardInterrupt:
+        print("\n  loop 중지됨")
+
+
 def main():
     bridge = NexusBridge()
 
@@ -207,6 +247,9 @@ def main():
         "health": lambda: cmd_health(bridge),
         "list": lambda: cmd_list(bridge),
         "notify": lambda: cmd_notify(bridge, args),
+        "commit-push": lambda: cmd_commit_push(bridge, args),
+        "cp": lambda: cmd_commit_push(bridge, args),
+        "loop": lambda: cmd_loop(bridge, args),
     }
 
     if cmd in commands:

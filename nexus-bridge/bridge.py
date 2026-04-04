@@ -379,6 +379,92 @@ class NexusBridge:
                     })
                 break
 
+    # ── Commit & Push ───────────────────────────────────
+
+    def _git(self, repo_path: Path, *args) -> tuple[bool, str]:
+        """git 명령 실행."""
+        r = subprocess.run(
+            ["git", *args],
+            cwd=str(repo_path),
+            capture_output=True, text=True, timeout=30
+        )
+        return r.returncode == 0, r.stdout.strip() or r.stderr.strip()
+
+    def commit_push(self, projects: Optional[list[str]] = None,
+                    message: Optional[str] = None) -> dict:
+        """연결된 프로젝트들의 변경사항 commit + push.
+        projects=None이면 변경 있는 모든 프로젝트 대상."""
+        targets = projects or list(self.state.get("connections", {}).keys())
+        results = {}
+
+        for name in targets:
+            conn = self.state.get("connections", {}).get(name)
+            if not conn:
+                results[name] = {"ok": False, "error": "not connected"}
+                continue
+
+            repo = Path(conn["path"]).expanduser()
+            if not repo.is_dir():
+                results[name] = {"ok": False, "error": "path missing"}
+                continue
+
+            # 변경사항 확인
+            ok, diff = self._git(repo, "status", "--porcelain")
+            if not ok or not diff:
+                results[name] = {"ok": True, "action": "clean"}
+                continue
+
+            # stage all changes
+            self._git(repo, "add", "-A")
+
+            # commit
+            msg = message or f"sync: nexus-bridge auto-commit ({datetime.now().strftime('%Y-%m-%d %H:%M')})"
+            ok, out = self._git(repo, "commit", "-m", msg)
+            if not ok:
+                results[name] = {"ok": False, "error": f"commit: {out[:100]}"}
+                continue
+
+            # push
+            ok, out = self._git(repo, "push")
+            if ok:
+                results[name] = {"ok": True, "action": "pushed"}
+                self._add_growth(self.config["growth"]["points_per_sync"],
+                                 f"push: {name}")
+            else:
+                results[name] = {"ok": False, "error": f"push: {out[:100]}"}
+
+        self._save_state()
+        return results
+
+    def loop(self, interval: int = 300) -> None:
+        """sync → commit → push 루프. interval=초 (기본 5분)."""
+        import time as _time
+        cycle = 0
+        while True:
+            cycle += 1
+            now = datetime.now().strftime("%H:%M:%S")
+            print(f"\n[{now}] cycle {cycle}")
+
+            # 1. sync
+            print("  sync...", end=" ", flush=True)
+            sync_r = self.sync()
+            ok = sum(1 for v in sync_r.values() if v.get("ok"))
+            print(f"{ok}/{len(sync_r)}")
+
+            # 2. commit + push (nexus6 자체)
+            print("  commit+push...", end=" ", flush=True)
+            cp_r = self.commit_push(["nexus6"])
+            for n, r in cp_r.items():
+                action = r.get("action", r.get("error", "?"))
+                print(f"{n}={action}")
+
+            # 3. 상태
+            s = self.status()
+            print(f"  bridge: {s['growth_points']:,} pts | {s['active']} active")
+
+            print(f"  next in {interval}s...")
+            _time.sleep(interval)
+
     # ── 라우팅 ──────────────────────────────────────────
 
     def route(self, content_type: str, source: str) -> Optional[str]:
