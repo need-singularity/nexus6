@@ -210,6 +210,7 @@ impl Telescope {
             Box::new(UcombinatorialLens),
             Box::new(UcompletenessLens),
             Box::new(UemergenceLens),
+            Box::new(lenses::singularity_cycle_lens::SingularityCycleLens),
             Box::new(UextrapolationLens),
             Box::new(UflashUattentionUlensLens),
             Box::new(UfrustrationLens),
