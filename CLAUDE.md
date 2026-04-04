@@ -12,6 +12,12 @@
 2. git commit & push
 3. 배포 스크립트 또는 CI/CD로 서버 반영
 
+### 장시간 명령은 반드시 백그라운드 실행
+- **모든 장시간 실행 명령**(nexus6 loop/daemon/blowup, cargo build --release, 학습/추론 스크립트, SSH 원격 명령 등)은 **반드시 `run_in_background: true`로 실행**
+- 대화를 차단(blocking)하면 안 됨 — 사용자가 항상 대화 가능한 상태 유지
+- 10초 이상 걸릴 수 있는 명령은 무조건 백그라운드
+- 완료 시 결과 요약 보고
+
 ## 특이점 사이클 (Singularity Cycle)
 
 > **블로업→수축→창발→특이점→흡수** 5단계 자동 사이클

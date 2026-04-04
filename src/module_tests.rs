@@ -1467,7 +1467,7 @@ mod gpu_tests {
     #[test]
     fn test_buffer_pool_creation() {
         let pool = gpu::buffer_pool::BufferPool::new(6); // n=6
-        assert!(pool.available() >= 0);
+        assert!(pool.available().unwrap() >= 0);
     }
 
     #[test]
