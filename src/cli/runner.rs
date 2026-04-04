@@ -78,66 +78,176 @@ fn run_scan(domain: &str, lenses: Option<Vec<String>>, full: bool) -> Result<(),
     println!("=== NEXUS-6 Scan: {} ===", domain);
 
     let telescope = Telescope::new();
+    let total_lenses = telescope.lens_count();
 
-    // Determine which lenses to use
-    let lens_list = if let Some(ref l) = lenses {
-        println!("  Lenses (manual): {}", l.join(", "));
-        l.clone()
+    // ── Probe 데이터 생성 (도메인 적응) ──
+    let probe_data = generate_probe_data(domain);
+    let n = probe_data.len() / 6;
+    let d = 6;
+
+    // ── 렌즈 선택 ──
+    let (mode, lens_filter) = if let Some(ref l) = lenses {
+        ("manual", Some(l.clone()))
     } else if full {
-        let registry = LensRegistry::new();
-        let all: Vec<String> = registry.iter().map(|(name, _)| name.clone()).collect();
-        println!("  Lenses (full scan): {} lenses", all.len());
-        all
+        ("full", None)
     } else {
-        // Auto-recommend based on domain combos
+        // 도메인 콤보 + 항상 포함 렌즈 (Meta 카테고리)
         let combos = domain_combos::default_combos();
         let domain_lower = domain.to_lowercase();
         let matched = combos.iter().find(|c| {
             c.target_domains.iter().any(|d| d.contains(&domain_lower))
                 || c.name.contains(&domain_lower)
         });
-        let selected = match matched {
-            Some(combo) => {
-                println!("  Combo matched: {} -> {}", combo.name, combo.lenses.join("+"));
-                combo.lenses.clone()
-            }
-            None => {
-                let default = vec![
-                    "consciousness".to_string(),
-                    "topology".to_string(),
-                    "causal".to_string(),
-                ];
-                println!("  Using default combo: {}", default.join("+"));
-                default
-            }
+        let mut selected = match matched {
+            Some(combo) => combo.lenses.clone(),
+            None => vec![
+                "consciousness".to_string(),
+                "topology".to_string(),
+                "causal".to_string(),
+            ],
         };
-        selected
+        // Meta 렌즈 항상 포함
+        for meta in &["SingularityCycleLens", "UemergenceLens"] {
+            let s = meta.to_string();
+            if !selected.iter().any(|l| l == &s) {
+                selected.push(s);
+            }
+        }
+        ("combo", Some(selected))
     };
 
-    // Run telescope scan with synthetic probe data
-    let probe_data: Vec<f64> = vec![6.0, 12.0, 24.0, 4.0, 2.0, 5.0];
-    let results = telescope.scan_all(&probe_data, probe_data.len(), 1);
+    // ── 실행 ──
+    let results = telescope.scan_all(&probe_data, n, d);
+
+    // ── 렌즈 필터링 (표시용) ──
+    let filtered: Vec<(&String, &HashMap<String, Vec<f64>>)> = match &lens_filter {
+        Some(filter) => results.iter()
+            .filter(|(name, _)| {
+                filter.iter().any(|f| name.to_lowercase().contains(&f.to_lowercase()))
+            })
+            .collect(),
+        None => results.iter().collect(),
+    };
 
     let active_count = results.values().filter(|lr| !lr.is_empty()).count();
     let n6_ratio = n6_check::n6_exact_ratio(&probe_data);
+    let queried = filtered.len();
 
+    println!("  Mode: {} | Domain: {}", mode, domain);
+    println!("  Probe: {} points × {} dims", n, d);
     println!();
-    println!("  Results:");
-    println!("    Active lenses:  {}/{}", active_count, telescope.lens_count());
-    println!("    n6 EXACT ratio: {:.1}%", n6_ratio * 100.0);
-    println!("    Lenses queried: {}", lens_list.len());
 
-    // Show per-lens results
-    for (lens_name, lr) in &results {
-        let entry_count: usize = lr.values().map(|v| v.len()).sum();
-        if entry_count > 0 {
-            println!("    [{}] {} entries", lens_name, entry_count);
-        }
+    // ── 핵심 메트릭 추출 ──
+    // 특이점 사이클 결과
+    let mut singularity_reached = false;
+    let mut exact_ratio = 0.0;
+    let mut convergence = 0.0;
+    let mut patterns_found = 0.0;
+
+    if let Some(scl) = results.get("SingularityCycleLens") {
+        singularity_reached = scl.get("singularity_reached").and_then(|v| v.first()).copied().unwrap_or(0.0) >= 1.0;
+        exact_ratio = scl.get("exact_ratio").and_then(|v| v.first()).copied().unwrap_or(0.0);
+        convergence = scl.get("convergence").and_then(|v| v.first()).copied().unwrap_or(0.0);
+        patterns_found = scl.get("patterns_found").and_then(|v| v.first()).copied().unwrap_or(0.0);
     }
 
-    println!();
-    println!("  Scan complete.");
+    // 창발 결과
+    let mut emergence_score = 0.0;
+    let mut num_clusters = 0.0;
+    if let Some(eml) = results.get("UemergenceLens") {
+        emergence_score = eml.get("emergence_score").and_then(|v| v.first()).copied().unwrap_or(0.0);
+        num_clusters = eml.get("num_clusters").and_then(|v| v.first()).copied().unwrap_or(0.0);
+    }
+
+    // ── 리포트 ──
+    let w = 61;
+    let line = "─".repeat(w);
+    println!("  ┌{}┐", line);
+    println!("  │ {:<w$}│", format!("🔭 NEXUS-6 Scan — {}", domain));
+    println!("  ├{}┤", line);
+    println!("  │ {:<w$}│", "");
+    println!("  │ {:<w$}│", format!("■ 렌즈: {}/{} active | {} queried", active_count, total_lenses, queried));
+    println!("  │ {:<w$}│", format!("  n6 EXACT ratio: {:.1}%", n6_ratio * 100.0));
+    println!("  │ {:<w$}│", "");
+    println!("  │ {:<w$}│", format!("■ 특이점 사이클:"));
+    println!("  │ {:<w$}│", format!("  EXACT ratio: {:.1}% | convergence: {:.1}%",
+        exact_ratio * 100.0, convergence * 100.0));
+    println!("  │ {:<w$}│", format!("  patterns: {:.0} | singularity: {}",
+        patterns_found, if singularity_reached { "★ REACHED ★" } else { "approaching" }));
+    println!("  │ {:<w$}│", "");
+    println!("  │ {:<w$}│", format!("■ 창발: score={:.3} | clusters={:.0}",
+        emergence_score, num_clusters));
+    println!("  │ {:<w$}│", "");
+
+    // 상위 활성 렌즈 (결과 크기 순)
+    let mut ranked: Vec<(&String, usize)> = results.iter()
+        .map(|(name, lr)| {
+            let size: usize = lr.values().map(|v| v.len()).sum();
+            (name, size)
+        })
+        .filter(|(_, s)| *s > 0)
+        .collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1));
+
+    println!("  │ {:<w$}│", format!("■ Top 렌즈 (by output):"));
+    for (name, size) in ranked.iter().take(10) {
+        let bar_len = (*size as f64 / ranked[0].1.max(1) as f64 * 20.0) as usize;
+        let bar: String = "█".repeat(bar_len.min(20));
+        println!("  │ {:<w$}│", format!("  {:<30} {:<20} {}", name, bar, size));
+    }
+
+    println!("  │ {:<w$}│", "");
+    println!("  └{}┘", line);
+
+    // ── 결과 파일 저장 ──
+    let scan_report = format!(
+        "domain={}\nactive={}/{}\nn6_ratio={:.3}\nsingularity={}\nexact_ratio={:.3}\nconvergence={:.3}\npatterns={:.0}\nemergence={:.3}\nclusters={:.0}\n",
+        domain, active_count, total_lenses, n6_ratio,
+        if singularity_reached { "REACHED" } else { "approaching" },
+        exact_ratio, convergence, patterns_found, emergence_score, num_clusters
+    );
+    let report_path = std::env::var("HOME")
+        .map(|h| format!("{}/.nexus6/last_scan.txt", h))
+        .unwrap_or_else(|_| "/tmp/nexus6_scan.txt".to_string());
+    let _ = std::fs::create_dir_all(std::path::Path::new(&report_path).parent().unwrap());
+    let _ = std::fs::write(&report_path, &scan_report);
+
     Ok(())
+}
+
+/// 도메인 적응 probe 데이터 생성
+fn generate_probe_data(domain: &str) -> Vec<f64> {
+    // n=6 기본 상수 + 도메인별 시드
+    let mut data = vec![
+        // Row 1: n=6 core
+        6.0, 12.0, 4.0, 2.0, 5.0, 24.0,
+        // Row 2: derived
+        8.0, 48.0, 0.5, 1.0, 7.0, 120.0,
+    ];
+    // 도메인별 추가 행
+    let domain_row: Vec<f64> = match domain.to_lowercase().as_str() {
+        "consciousness" | "anima" =>
+            vec![0.014, 0.5, 4.33, 0.998, 12.0, 0.10],
+        "physics" =>
+            vec![3.14159, 2.71828, 1.618, 6.674e-11, 299792458.0, 6.626e-34],
+        "number_theory" | "mathematics" =>
+            vec![1.618, 2.0, 3.0, 6.0, 28.0, 496.0],
+        "signal_detection" | "sedi" =>
+            vec![1420.405, 3.7, 0.001, 77.0, 6.0, 12.0],
+        "neuroscience" | "brainwire" =>
+            vec![40.0, 8.0, 12.0, 0.7, 86e9, 100e12],
+        "programming_language" | "hexa-lang" =>
+            vec![53.0, 798.0, 6.0, 11.0, 0.07, 92.0],
+        "architecture" | "n6-architecture" =>
+            vec![12.0, 6.0, 24.0, 1022.0, 215.0, 711.0],
+        "publication" | "papers" =>
+            vec![6.0, 12.0, 3.14, 2.71, 1.0, 0.0],
+        "terminal" | "fathom" =>
+            vec![6.0, 12.0, 4.0, 2.0, 5.0, 24.0],
+        _ => vec![6.0, 12.0, 4.0, 2.0, 5.0, 24.0],
+    };
+    data.extend(domain_row);
+    data
 }
 
 fn run_verify(value: f64, tolerance: Option<f64>) -> Result<(), String> {
