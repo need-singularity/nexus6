@@ -88,11 +88,13 @@ pub enum CliCommand {
     Loop {
         domain: Option<String>,
         cycles: usize,
+        foreground: bool,
     },
     Daemon {
         domain: Option<String>,
         interval_min: u64,
         max_loops: Option<usize>,
+        foreground: bool,
     },
     Blowup {
         domain: String,
@@ -557,6 +559,7 @@ fn parse_dashboard(args: &[String]) -> Result<CliCommand, String> {
 fn parse_loop(args: &[String]) -> Result<CliCommand, String> {
     let mut domain: Option<String> = None;
     let mut cycles: usize = 1;
+    let mut foreground = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -568,6 +571,9 @@ fn parse_loop(args: &[String]) -> Result<CliCommand, String> {
                 }
                 cycles = args[i].parse().map_err(|_| "cycles must be a number".to_string())?;
             }
+            "--fg" | "--foreground" => {
+                foreground = true;
+            }
             other if !other.starts_with('-') && domain.is_none() => {
                 domain = Some(other.to_string());
             }
@@ -578,13 +584,14 @@ fn parse_loop(args: &[String]) -> Result<CliCommand, String> {
         i += 1;
     }
 
-    Ok(CliCommand::Loop { domain, cycles })
+    Ok(CliCommand::Loop { domain, cycles, foreground })
 }
 
 fn parse_daemon(args: &[String]) -> Result<CliCommand, String> {
     let mut domain: Option<String> = None;
     let mut interval_min: u64 = 30;
     let mut max_loops: Option<usize> = None;
+    let mut foreground = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -603,6 +610,9 @@ fn parse_daemon(args: &[String]) -> Result<CliCommand, String> {
                 }
                 max_loops = Some(args[i].parse().map_err(|_| "max-loops must be a number".to_string())?);
             }
+            "--fg" | "--foreground" => {
+                foreground = true;
+            }
             other if !other.starts_with('-') && domain.is_none() => {
                 domain = Some(other.to_string());
             }
@@ -613,7 +623,7 @@ fn parse_daemon(args: &[String]) -> Result<CliCommand, String> {
         i += 1;
     }
 
-    Ok(CliCommand::Daemon { domain, interval_min, max_loops })
+    Ok(CliCommand::Daemon { domain, interval_min, max_loops, foreground })
 }
 
 fn parse_dispatch(args: &[String]) -> Result<CliCommand, String> {
