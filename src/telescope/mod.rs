@@ -23,6 +23,8 @@ pub mod tier;
 use std::collections::HashMap;
 use std::panic;
 
+use rayon::prelude::*;
+
 use lens_trait::{Lens, LensResult};
 use mirror_scan::{
     FreeExploreResult, InfiniteCorridorResult, LensCombination,
@@ -343,26 +345,22 @@ impl Telescope {
         d: usize,
     ) -> HashMap<String, LensResult> {
         let shared = SharedData::compute(data, n, d);
-        let mut results = HashMap::new();
 
-        for lens in &self.lenses {
-            let name = lens.name().to_string();
+        self.lenses
+            .par_iter()
+            .map(|lens| {
+                let name = lens.name().to_string();
 
-            let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                lens.scan(data, n, d, &shared)
-            }));
+                let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    lens.scan(data, n, d, &shared)
+                }));
 
-            match result {
-                Ok(lr) => {
-                    results.insert(name, sanitize_lens_result(lr));
+                match result {
+                    Ok(lr) => (name, sanitize_lens_result(lr)),
+                    Err(_) => (name, HashMap::new()),
                 }
-                Err(_) => {
-                    results.insert(name, HashMap::new());
-                }
-            }
-        }
-
-        results
+            })
+            .collect()
     }
 
     /// Get the number of registered lenses.

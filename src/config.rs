@@ -13,6 +13,7 @@ pub struct NexusConfig {
     pub blowup: Option<BlowupSection>,
     pub evolution: Option<EvolutionSection>,
     pub forge: Option<ForgeSection>,
+    pub log_rotation: Option<LogRotationSection>,
 }
 
 // ── Section structs ─────────────────────────────────────────────
@@ -65,6 +66,14 @@ pub struct EvolutionSection {
     pub min_verification_score: Option<f64>,
     /// Maximum mutations per cycle.
     pub max_mutations_per_cycle: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct LogRotationSection {
+    /// Maximum log file size in bytes before rotation (default: 1 MB).
+    pub max_bytes: Option<u64>,
+    /// Maximum number of rotated files to keep (default: 5).
+    pub max_files: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -182,6 +191,22 @@ impl NexusConfig {
     pub fn default_blowup_depth(&self) -> usize {
         self.blowup.as_ref().and_then(|s| s.max_depth).unwrap_or(6)
     }
+
+    /// Maximum log file size in bytes before rotation (default: 1 MB).
+    pub fn log_rotation_max_bytes(&self) -> u64 {
+        self.log_rotation
+            .as_ref()
+            .and_then(|s| s.max_bytes)
+            .unwrap_or(1_048_576)
+    }
+
+    /// Maximum number of rotated log files to keep (default: 5).
+    pub fn log_rotation_max_files(&self) -> usize {
+        self.log_rotation
+            .as_ref()
+            .and_then(|s| s.max_files)
+            .unwrap_or(5)
+    }
 }
 
 // ── Example config generator ────────────────────────────────────
@@ -221,6 +246,10 @@ pub fn default_config_toml() -> String {
 # max_candidates = 20
 # min_confidence = 0.2
 # similarity_threshold = 0.8
+
+[log_rotation]
+# max_bytes = 1048576   # 1 MB
+# max_files = 5
 "#
     .to_string()
 }

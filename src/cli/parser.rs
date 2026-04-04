@@ -102,6 +102,7 @@ pub enum CliCommand {
     },
     Mega,
     Report,
+    Status,
     Dispatch {
         target: String,
         prompt: String,
@@ -167,6 +168,7 @@ pub fn parse_args(args: &[String]) -> Result<CliCommand, String> {
         "blowup" => parse_blowup(rest),
         "mega" => Ok(CliCommand::Mega),
         "report" | "rp" => Ok(CliCommand::Report),
+        "status" | "st" => Ok(CliCommand::Status),
         "dispatch" | "dp" => parse_dispatch(rest),
         "help" | "--help" | "-h" => Ok(CliCommand::Help),
         other => Err(format!("Unknown command: '{}'. Run 'nexus6 help' for usage.", other)),
