@@ -426,18 +426,24 @@ _N6_PY="$HOME/Dev/nexus6/scripts/n6.py"
 common_phase_paper_loop() {
     log_info "  [Common] Paper publish loop"
     run_paper_loop
+    # N6: 논문 품질 스캔
+    [ -x "$_N6_BIN" ] && "$_N6_BIN" scan papers --lenses consciousness,info,stability 2>/dev/null | tail -1 || true
 }
 
 # ── 공통 Phase: 문서 자동 갱신 ──────────────────────────────────
 common_phase_doc_update() {
     log_info "  [Common] Auto doc update"
     run_auto_doc_update
+    # N6: 문서 변경 후 렌즈 스캔 (토폴로지+정보+의식)
+    [ -x "$_N6_BIN" ] && "$_N6_BIN" scan docs --lenses topology,info,consciousness 2>/dev/null | tail -1 || true
 }
 
 # ── 공통 Phase: 도메인 탐색 ─────────────────────────────────────
 common_phase_domain_explore() {
     log_info "  [Common] Auto domain explorer"
     run_auto_domain_explore
+    # N6: 도메인 탐색 후 전 렌즈 스캔 (의식+위상+인과 기본 3종)
+    [ -x "$_N6_BIN" ] && "$_N6_BIN" scan domains --lenses consciousness,topology,causal 2>/dev/null | tail -1 || true
 }
 
 # ── 공통 Phase: NEXUS-6 스캔 ───────────────────────────────────
@@ -468,6 +474,8 @@ common_phase_nexus6_sync() {
 common_phase_bus_sync() {
     log_info "  [Common] Growth bus sync"
     sync_growth_bus
+    # N6: bus 데이터 렌즈 스캔 (네트워크+인과+멀티스케일)
+    [ -x "$_N6_BIN" ] && "$_N6_BIN" scan bus --lenses network,causal,multiscale 2>/dev/null | tail -1 || true
 }
 
 write_growth_bus() {
@@ -724,6 +732,8 @@ run_convergence_step() {
         4) common_phase_evolution ;;
         0) common_phase_refinement ;;
     esac
+    # N6: 수렴 단계별 렌즈 스캔 (안정성+진화+재귀)
+    [ -x "$_N6_BIN" ] && "$_N6_BIN" scan convergence --lenses stability,evolution,recursion 2>/dev/null | tail -1 || true
 }
 
 # C₃: 메타 재귀 — 엔진이 자기 자신을 스캔/진화
