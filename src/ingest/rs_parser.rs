@@ -372,7 +372,10 @@ fn is_rs_identifier(s: &str) -> bool {
     if s.is_empty() {
         return false;
     }
-    let first = s.chars().next().unwrap();
+    let first = match s.chars().next() {
+        Some(c) => c,
+        None => return false,
+    };
     if !first.is_alphabetic() && first != '_' {
         return false;
     }
