@@ -17,6 +17,13 @@ DIFF=$((NOW - LAST))
 
 echo "$NOW" > "$TICK_FILE"
 
+# nexus-bridge notify (프로젝트명 자동 감지)
+BRIDGE_CLI="${HOME}/Dev/nexus6/nexus-bridge.py"
+if [ -f "$BRIDGE_CLI" ]; then
+  PROJECT=$(basename "$(git rev-parse --show-toplevel 2>/dev/null || pwd)")
+  python3 "$BRIDGE_CLI" notify "$PROJECT" sync 1 2>/dev/null &
+fi
+
 # growth_state.json 직접 업데이트
 GROWTH_JSON="${HOME}/Dev/anima/anima/config/growth_state.json"
 [ -f "$GROWTH_JSON" ] || exit 0
