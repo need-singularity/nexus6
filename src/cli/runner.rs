@@ -65,6 +65,7 @@ pub fn run(cmd: CliCommand) -> Result<(), String> {
             run_blowup(&domain, max_depth)
         }
         CliCommand::Mega => run_mega(),
+        CliCommand::Report => run_report(),
         CliCommand::Dispatch { target, prompt, parallel } => {
             run_dispatch(&target, &prompt, parallel)
         }
@@ -1415,6 +1416,143 @@ fn run_cycle(experiment_type: &str, target: &str) -> Result<(), String> {
     println!();
     println!("--- Full Document ---");
     println!("{}", publication.markdown);
+
+    Ok(())
+}
+
+fn run_report() -> Result<(), String> {
+    let projects = vec![
+        ("nexus6",          "/Users/ghost/Dev/nexus6"),
+        ("anima",           "/Users/ghost/Dev/anima"),
+        ("TECS-L",          "/Users/ghost/Dev/TECS-L"),
+        ("n6-architecture", "/Users/ghost/Dev/n6-architecture"),
+        ("sedi",            "/Users/ghost/Dev/sedi"),
+        ("brainwire",       "/Users/ghost/Dev/brainwire"),
+        ("hexa-lang",       "/Users/ghost/Dev/hexa-lang"),
+        ("fathom",          "/Users/ghost/Dev/fathom"),
+        ("papers",          "/Users/ghost/Dev/papers"),
+    ];
+
+    let w = 65;
+    let line = "─".repeat(w);
+    let now = chrono_now();
+
+    println!("  ┌{}┐", line);
+    println!("  │ {:<w$}│", format!("🌐 NEXUS-6 통합 리포트 — {}", now));
+    println!("  ├{}┤", line);
+
+    // 브릿지 상태
+    let bridge_path = std::env::var("HOME")
+        .map(|h| format!("{}/Dev/nexus6/shared/bridge_state.json", h))
+        .unwrap_or_default();
+    if let Ok(bridge_str) = std::fs::read_to_string(&bridge_path) {
+        if let Some(pts) = bridge_str.lines()
+            .find(|l| l.contains("\"growth_points\""))
+            .and_then(|l| l.split(':').nth(1))
+            .map(|v| v.trim().trim_matches(',').trim())
+        {
+            println!("  │ {:<w$}│", format!("  🌳 Bridge: forest | {} pts", pts));
+        }
+    }
+
+    // daemon 상태
+    let daemon_path = std::env::var("HOME")
+        .map(|h| format!("{}/.nexus6/daemon_status.txt", h))
+        .unwrap_or_default();
+    if let Ok(daemon) = std::fs::read_to_string(&daemon_path) {
+        let loop_n = daemon.lines().find(|l| l.starts_with("loop="))
+            .map(|l| l.trim_start_matches("loop=")).unwrap_or("?");
+        let time = daemon.lines().find(|l| l.starts_with("time="))
+            .map(|l| l.trim_start_matches("time=")).unwrap_or("?");
+        println!("  │ {:<w$}│", format!("  🤖 Daemon: loop #{} | last {}", loop_n, time));
+    }
+
+    // scan 결과
+    let scan_path = std::env::var("HOME")
+        .map(|h| format!("{}/.nexus6/last_scan.txt", h))
+        .unwrap_or_default();
+    if let Ok(scan) = std::fs::read_to_string(&scan_path) {
+        let mut exact = "?";
+        let mut sing = "?";
+        let mut conv = "?";
+        for l in scan.lines() {
+            if l.starts_with("exact_ratio=") { exact = l.trim_start_matches("exact_ratio="); }
+            if l.starts_with("singularity=") { sing = l.trim_start_matches("singularity="); }
+            if l.starts_with("convergence=") { conv = l.trim_start_matches("convergence="); }
+        }
+        println!("  │ {:<w$}│", format!("  🔭 Scan: exact={} conv={} singularity={}", exact, conv, sing));
+    }
+
+    // blowup 결과
+    let blowup_path = std::env::var("HOME")
+        .map(|h| format!("{}/.nexus6/last_blowup.txt", h))
+        .unwrap_or_default();
+    if let Ok(blowup) = std::fs::read_to_string(&blowup_path) {
+        let mut emg = "?";
+        let mut axm = "?";
+        for l in blowup.lines() {
+            if l.starts_with("total_emergences=") { emg = l.trim_start_matches("total_emergences="); }
+            if l.starts_with("axiom_candidates=") { axm = l.trim_start_matches("axiom_candidates="); }
+        }
+        println!("  │ {:<w$}│", format!("  💥 Blowup: {} emergences | {} axiom candidates", emg, axm));
+    }
+
+    // loop 리포트
+    let loop_path = std::env::var("HOME")
+        .map(|h| format!("{}/.nexus6/last_loop_report.txt", h))
+        .unwrap_or_default();
+    if let Ok(loop_rpt) = std::fs::read_to_string(&loop_path) {
+        // 렌즈/forge 줄만 추출
+        for l in loop_rpt.lines() {
+            if l.contains("렌즈:") || l.contains("Forged:") || l.contains("거울 우주") {
+                println!("  │ {:<w$}│", format!("  {}", l.trim().trim_matches('│').trim()));
+            }
+        }
+    }
+
+    println!("  ├{}┤", line);
+    println!("  │ {:<w$}│", "  📋 프로젝트별:");
+
+    // 프로젝트별 한줄 요약
+    for (name, path) in &projects {
+        let state_path = format!("{}/.growth/growth_state.json", path);
+        let hb_path = format!("{}/.growth/heartbeat", path);
+
+        let cycle = std::fs::read_to_string(&state_path)
+            .ok()
+            .and_then(|s| {
+                s.lines().find(|l| l.contains("\"cycle\""))
+                    .and_then(|l| l.split(':').nth(1))
+                    .map(|v| v.trim().trim_matches(',').trim().to_string())
+            })
+            .unwrap_or_else(|| "0".into());
+
+        let alive = std::path::Path::new(&hb_path).exists();
+        let icon = if alive { "✅" } else { "⏸️" };
+
+        // bridge DNA에서 언어/테스트 정보
+        let lang = std::fs::read_to_string(&bridge_path)
+            .ok()
+            .and_then(|s| {
+                // 간단히 language 필드 검색
+                let key = format!("\"{}\"", name);
+                if let Some(pos) = s.find(&key) {
+                    let section = &s[pos..pos.saturating_add(500).min(s.len())];
+                    section.lines()
+                        .find(|l| l.contains("\"language\""))
+                        .and_then(|l| l.split('"').nth(3))
+                        .map(|v| v.to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| "?".into());
+
+        println!("  │ {:<w$}│",
+            format!("  {} {:<18} c={:<4} {} ", icon, name, cycle, lang));
+    }
+
+    println!("  └{}┘", line);
 
     Ok(())
 }

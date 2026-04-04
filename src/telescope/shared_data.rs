@@ -393,7 +393,7 @@ impl SharedData {
         // The last neighbor in the KNN list is the k-th nearest
         let k_neighbor = self.knn_indices[i * self.knn_k + self.knn_k - 1] as usize;
         let d = self.dist(i, k_neighbor);
-        if d > 1e-15 { (1.0 / d).min(1e12) } else { 1e12 }
+        if d > 1e-15 { (1.0 / d).min(1e6) } else { 1e6 }
     }
 }
 

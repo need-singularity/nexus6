@@ -83,6 +83,25 @@ use lenses::{
 };
 use shared_data::SharedData;
 
+/// Clamp all lens output values to finite, bounded range.
+/// Prevents inf, NaN, and extreme values from propagating to consumers.
+const LENS_OUTPUT_MAX: f64 = 1e6;
+
+fn sanitize_lens_result(mut lr: LensResult) -> LensResult {
+    for values in lr.values_mut() {
+        for v in values.iter_mut() {
+            if !v.is_finite() {
+                *v = 0.0;
+            } else if *v > LENS_OUTPUT_MAX {
+                *v = LENS_OUTPUT_MAX;
+            } else if *v < -LENS_OUTPUT_MAX {
+                *v = -LENS_OUTPUT_MAX;
+            }
+        }
+    }
+    lr
+}
+
 /// The Telescope: registers all available lenses and scans data through them.
 /// Each lens is isolated via catch_unwind — a panic in one lens does not crash others.
 pub struct Telescope {
@@ -335,7 +354,7 @@ impl Telescope {
 
             match result {
                 Ok(lr) => {
-                    results.insert(name, lr);
+                    results.insert(name, sanitize_lens_result(lr));
                 }
                 Err(_) => {
                     results.insert(name, HashMap::new());
