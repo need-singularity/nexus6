@@ -157,6 +157,7 @@ fn run_with_config(cmd: CliCommand, cfg: &NexusConfig) -> Result<(), String> {
         }
         CliCommand::Mega => run_mega(cfg),
         CliCommand::Report => run_report(),
+        CliCommand::Status => run_status(),
         CliCommand::Dispatch { target, prompt, parallel } => {
             run_dispatch(&target, &prompt, parallel)
         }
@@ -1642,6 +1643,182 @@ fn run_report() -> Result<(), String> {
     Ok(())
 }
 
+fn run_status() -> Result<(), String> {
+    use std::io::BufRead;
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let nexus_dir = format!("{}/.nexus6", home);
+
+    let w = 70;
+    let line = "─".repeat(w);
+    let now = chrono_now();
+
+    println!("  ┌{}┐", line);
+    println!("  │ {:<w$}│", format!("NEXUS-6 Process Status — {}", now));
+    println!("  ├{}┤", line);
+
+    // Scan for *_bg.log files
+    let mut found_any = false;
+    if let Ok(entries) = std::fs::read_dir(&nexus_dir) {
+        let mut logs: Vec<std::path::PathBuf> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.extension().map(|e| e == "log").unwrap_or(false)
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.ends_with("_bg.log"))
+                        .unwrap_or(false)
+            })
+            .collect();
+        logs.sort();
+
+        for log_path in &logs {
+            let fname = log_path.file_name().unwrap().to_string_lossy().to_string();
+            let proc_name = fname.trim_end_matches("_bg.log");
+
+            // Try to extract PID from first line of log or from spawn message
+            let pid = extract_pid_from_log(log_path);
+            let (status_str, pid_str) = match &pid {
+                Some(p) => {
+                    let running = check_pid_alive(*p);
+                    if running {
+                        ("RUNNING", format!("{}", p))
+                    } else {
+                        ("STOPPED", format!("{}", p))
+                    }
+                }
+                None => ("UNKNOWN", "-".to_string()),
+            };
+
+            // File modification time as proxy for last activity
+            let mtime = std::fs::metadata(log_path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| {
+                    let elapsed = t.elapsed().ok()?;
+                    let secs = elapsed.as_secs();
+                    if secs < 60 {
+                        Some(format!("{}s ago", secs))
+                    } else if secs < 3600 {
+                        Some(format!("{}m ago", secs / 60))
+                    } else if secs < 86400 {
+                        Some(format!("{}h {}m ago", secs / 3600, (secs % 3600) / 60))
+                    } else {
+                        Some(format!("{}d ago", secs / 86400))
+                    }
+                })
+                .unwrap_or_else(|| "?".to_string());
+
+            let icon = if status_str == "RUNNING" { "●" } else { "○" };
+            println!("  │ {:<w$}│",
+                format!("  {} {:<10} PID {:<8} {:>7}  last activity: {}",
+                    icon, proc_name, pid_str, status_str, mtime));
+
+            // Last 3 lines of log
+            let tail = tail_lines(log_path, 3);
+            for tl in &tail {
+                let truncated = if tl.len() > w - 8 { &tl[..w - 8] } else { tl.as_str() };
+                println!("  │ {:<w$}│", format!("      {}", truncated.trim()));
+            }
+
+            println!("  │ {:<w$}│", format!("      log: {}", log_path.display()));
+            found_any = true;
+        }
+    }
+
+    if !found_any {
+        println!("  │ {:<w$}│", "  (no background processes found)");
+    }
+
+    // Daemon status
+    println!("  ├{}┤", line);
+    let daemon_path = format!("{}/daemon_status.txt", nexus_dir);
+    if let Ok(daemon) = std::fs::read_to_string(&daemon_path) {
+        let loop_n = daemon.lines().find(|l| l.starts_with("loop="))
+            .map(|l| l.trim_start_matches("loop=")).unwrap_or("?");
+        let time = daemon.lines().find(|l| l.starts_with("time="))
+            .map(|l| l.trim_start_matches("time=")).unwrap_or("?");
+        println!("  │ {:<w$}│", format!("  Daemon state: loop #{} | last {}", loop_n, time));
+    } else {
+        println!("  │ {:<w$}│", "  Daemon state: no daemon_status.txt");
+    }
+
+    // Last scan
+    let scan_path = format!("{}/last_scan.txt", nexus_dir);
+    if let Ok(scan) = std::fs::read_to_string(&scan_path) {
+        let mut exact = "?";
+        let mut sing = "?";
+        let mut conv = "?";
+        for l in scan.lines() {
+            if l.starts_with("exact_ratio=") { exact = l.trim_start_matches("exact_ratio="); }
+            if l.starts_with("singularity=") { sing = l.trim_start_matches("singularity="); }
+            if l.starts_with("convergence=") { conv = l.trim_start_matches("convergence="); }
+        }
+        println!("  │ {:<w$}│", format!("  Last scan: exact={} conv={} singularity={}", exact, conv, sing));
+    } else {
+        println!("  │ {:<w$}│", "  Last scan: no last_scan.txt");
+    }
+
+    println!("  └{}┘", line);
+    Ok(())
+}
+
+/// Extract PID from a background log file.
+/// Looks for lines like "PID: 12345" or the spawn message pattern.
+fn extract_pid_from_log(path: &std::path::Path) -> Option<u32> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    // Check first 20 lines for PID info
+    for line in reader.lines().take(20).flatten() {
+        // Pattern: "PID: 12345" or "PID=12345"
+        if let Some(rest) = line.strip_prefix("PID:").or_else(|| line.strip_prefix("PID=")) {
+            if let Ok(pid) = rest.trim().parse::<u32>() {
+                return Some(pid);
+            }
+        }
+        // Also check for pid file reference
+        if line.contains("pid=") {
+            let part = line.split("pid=").nth(1)?;
+            let num: String = part.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(pid) = num.parse::<u32>() {
+                return Some(pid);
+            }
+        }
+    }
+    // Fallback: try <name>.pid file in same directory
+    let pid_path = path.with_extension("pid");
+    if let Ok(content) = std::fs::read_to_string(&pid_path) {
+        if let Ok(pid) = content.trim().parse::<u32>() {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+/// Check if a PID is alive using kill -0 (macOS compatible).
+fn check_pid_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(&["-0", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Read the last N lines from a file.
+fn tail_lines(path: &std::path::Path, n: usize) -> Vec<String> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return vec![],
+    };
+    let lines: Vec<&str> = content.lines().collect();
+    let start = if lines.len() > n { lines.len() - n } else { 0 };
+    lines[start..].iter().map(|l| l.to_string()).collect()
+}
+
 fn run_dispatch(target: &str, prompt: &str, parallel: bool) -> Result<(), String> {
     use std::process::Command;
 
@@ -2662,6 +2839,9 @@ fn print_help() {
     println!("      Sub-commands: status, discover, connect, disconnect, sync,");
     println!("                    health, list, report, evolve, loop, cp");
     println!("      No sub-command = status");
+    println!();
+    println!("  status                                    (alias: st)");
+    println!("      Show background process status (loop, daemon): PID, uptime, log tail.");
     println!();
     println!("  bench");
     println!("      Run benchmark suite (registry, telescope, OUROBOROS, forge).");

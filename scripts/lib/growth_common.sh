@@ -40,12 +40,19 @@ write_growth_bus() {
     printf '{"ts":"%s","repo":"%s","phase":"%s","status":"%s","detail":"%s"}\n' \
         "$ts" "$GROWTH_NAME" "$phase" "$status" "$detail" >> "$GROWTH_BUS" 2>/dev/null || true
 
-    # 10K줄 초과 시 로테이션
-    local line_count
-    line_count=$(wc -l < "$GROWTH_BUS" 2>/dev/null | tr -d ' ')
-    if [ "${line_count:-0}" -gt 10000 ]; then
-        mv "$GROWTH_BUS" "${GROWTH_BUS}.$(date +%Y%m%d)" 2>/dev/null || true
-        log_info "📋 growth_bus 로테이션 (${line_count}줄 → 아카이브)"
+    # Size-based rotation: > 1 MB → numbered rotation (.1, .2, … keep max 5)
+    local max_bytes=1048576  # 1 MB
+    local max_files=5
+    local file_size
+    file_size=$(stat -f%z "$GROWTH_BUS" 2>/dev/null || stat -c%s "$GROWTH_BUS" 2>/dev/null || echo 0)
+    if [ "${file_size:-0}" -gt "$max_bytes" ]; then
+        local i=$((max_files - 1))
+        while [ "$i" -ge 1 ]; do
+            [ -f "${GROWTH_BUS}.$i" ] && mv "${GROWTH_BUS}.$i" "${GROWTH_BUS}.$((i + 1))" 2>/dev/null || true
+            i=$((i - 1))
+        done
+        mv "$GROWTH_BUS" "${GROWTH_BUS}.1" 2>/dev/null || true
+        log_info "📋 growth_bus 로테이션 (${file_size}bytes → .1)"
     fi
 }
 

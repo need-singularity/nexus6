@@ -18,6 +18,7 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use nexus6::config::NexusConfig;
 use nexus6::verifier::n6_check::n6_match;
 use serde_json::{json, Value};
 
@@ -94,6 +95,33 @@ fn extract_numbers(text: &str) -> Vec<f64> {
     nums
 }
 
+// ═══ 로그 로테이션 ═══
+
+/// Rotate a log file if it exceeds `max_bytes`.
+/// Renames .jsonl → .jsonl.1, .jsonl.1 → .jsonl.2, etc., keeping at most `max_files`.
+fn rotate_log_if_needed(path: &Path, max_bytes: u64, max_files: usize) {
+    let size = match fs::metadata(path) {
+        Ok(m) => m.len(),
+        Err(_) => return, // file doesn't exist yet — nothing to rotate
+    };
+    if size < max_bytes {
+        return;
+    }
+
+    let path_str = path.to_string_lossy().to_string();
+
+    // Shift existing rotated files: .N → .N+1  (drop oldest if > max_files)
+    for i in (1..max_files).rev() {
+        let src = format!("{}.{}", path_str, i);
+        let dst = format!("{}.{}", path_str, i + 1);
+        let _ = fs::rename(&src, &dst);
+    }
+
+    // Current file → .1
+    let _ = fs::rename(&path_str, format!("{}.1", path_str));
+    // A fresh file will be created on next append
+}
+
 // ═══ 발견 기록 ═══
 
 fn discovery_log_path() -> PathBuf {
@@ -103,6 +131,11 @@ fn discovery_log_path() -> PathBuf {
 
 fn record_discovery(value: f64, constant: &str, source: &str) {
     let path = discovery_log_path();
+
+    // Rotate before appending
+    let cfg = NexusConfig::load();
+    rotate_log_if_needed(&path, cfg.log_rotation_max_bytes(), cfg.log_rotation_max_files());
+
     let entry = json!({
         "timestamp": chrono_now(),
         "value": format!("{}", value),
