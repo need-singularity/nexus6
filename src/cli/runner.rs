@@ -17,8 +17,33 @@ use super::dashboard;
 use crate::experiment::types::{ExperimentConfig, ExperimentType};
 use crate::experiment::runner::ExperimentRunner;
 use crate::experiment::report;
+use crate::config::NexusConfig;
 
 use super::parser::{CliCommand, ExperimentMode, GraphFormat, LensFilter};
+
+/// ~/.nexus6/projects.json에서 프로젝트 목록 로드
+#[derive(serde::Deserialize)]
+struct ProjectEntry {
+    name: String,
+    domain: String,
+    path: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ProjectsFile {
+    projects: Vec<ProjectEntry>,
+}
+
+fn load_projects() -> Vec<ProjectEntry> {
+    let path = std::env::var("HOME")
+        .map(|h| format!("{}/.nexus6/projects.json", h))
+        .unwrap_or_default();
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<ProjectsFile>(&s).ok())
+        .map(|f| f.projects)
+        .unwrap_or_default()
+}
 
 /// 자기 자신을 --fg 붙여서 백그라운드 프로세스로 spawn.
 /// 로그는 ~/.nexus6/<subcmd>_bg.log 에 기록.
@@ -59,6 +84,11 @@ fn spawn_background(subcmd: &str, domain: &Option<String>, extra_args: &[(&str, 
 
 /// Execute a parsed CLI command, printing results to stdout.
 pub fn run(cmd: CliCommand) -> Result<(), String> {
+    let cfg = NexusConfig::load();
+    run_with_config(cmd, &cfg)
+}
+
+fn run_with_config(cmd: CliCommand, cfg: &NexusConfig) -> Result<(), String> {
     match cmd {
         CliCommand::Scan { domain, lenses, full } => run_scan(&domain, lenses, full),
         CliCommand::Verify { value, tolerance } => run_verify(value, tolerance),
@@ -67,7 +97,7 @@ pub fn run(cmd: CliCommand) -> Result<(), String> {
         CliCommand::Recommend { domain } => run_recommend(&domain),
         CliCommand::Evolve { domain, max_cycles, seeds } => run_evolve(&domain, max_cycles, seeds),
         CliCommand::Auto { domain, max_meta_cycles, max_ouroboros_cycles } => {
-            run_auto(&domain, max_meta_cycles, max_ouroboros_cycles)
+            run_auto(&domain, max_meta_cycles, max_ouroboros_cycles, cfg)
         }
         CliCommand::Lenses { category, domain, search, count_only, complementary, export_json } => {
             run_lenses(category, domain, search, count_only, complementary, export_json)
@@ -95,8 +125,10 @@ pub fn run(cmd: CliCommand) -> Result<(), String> {
         }
         CliCommand::Bridge { sub } => run_bridge(sub),
         CliCommand::Loop { domain, cycles, foreground } => {
+            // CLI > config.toml > hardcoded defaults
+            let domain = domain.or_else(|| cfg.default_loop_domain());
             if foreground {
-                run_loop(domain, cycles)
+                run_loop(domain, cycles, cfg)
             } else {
                 spawn_background("loop", &domain, &[
                     ("--cycles", &cycles.to_string()),
@@ -104,8 +136,10 @@ pub fn run(cmd: CliCommand) -> Result<(), String> {
             }
         }
         CliCommand::Daemon { domain, interval_min, max_loops, foreground } => {
+            // CLI > config.toml > hardcoded defaults
+            let domain = domain.or_else(|| cfg.default_daemon_domain());
             if foreground {
-                run_daemon(domain, interval_min, max_loops)
+                run_daemon(domain, interval_min, max_loops, cfg)
             } else {
                 let iv_str = interval_min.to_string();
                 let ml_str = max_loops.map(|n| n.to_string());
@@ -119,9 +153,9 @@ pub fn run(cmd: CliCommand) -> Result<(), String> {
             }
         }
         CliCommand::Blowup { domain, max_depth } => {
-            run_blowup(&domain, max_depth)
+            run_blowup(&domain, max_depth, cfg)
         }
-        CliCommand::Mega => run_mega(),
+        CliCommand::Mega => run_mega(cfg),
         CliCommand::Report => run_report(),
         CliCommand::Dispatch { target, prompt, parallel } => {
             run_dispatch(&target, &prompt, parallel)
@@ -665,17 +699,18 @@ fn run_evolve(domain: &str, max_cycles: usize, seeds: Vec<String>) -> Result<(),
     Ok(())
 }
 
-fn run_auto(domain: &str, max_meta_cycles: usize, max_ouroboros_cycles: usize) -> Result<(), String> {
+fn run_auto(domain: &str, max_meta_cycles: usize, max_ouroboros_cycles: usize, nexus_cfg: &NexusConfig) -> Result<(), String> {
     println!("=== NEXUS-6 Auto: {} (meta={}, ouroboros={}) ===",
         domain, max_meta_cycles, max_ouroboros_cycles);
     println!("  OUROBOROS + LensForge meta-loop");
     println!();
 
+    let base_mlc = nexus_cfg.meta_loop_config();
     let config = MetaLoopConfig {
         max_ouroboros_cycles,
         max_meta_cycles,
-        forge_after_n_cycles: 3,
-        ..MetaLoopConfig::default()
+        forge_after_n_cycles: base_mlc.forge_after_n_cycles,
+        forge_config: base_mlc.forge_config,
     };
 
     let seeds = vec![format!("n=6 patterns in {}", domain)];
@@ -1478,17 +1513,10 @@ fn run_cycle(experiment_type: &str, target: &str) -> Result<(), String> {
 }
 
 fn run_report() -> Result<(), String> {
-    let projects = vec![
-        ("nexus6",          "/Users/ghost/Dev/nexus6"),
-        ("anima",           "/Users/ghost/Dev/anima"),
-        ("TECS-L",          "/Users/ghost/Dev/TECS-L"),
-        ("n6-architecture", "/Users/ghost/Dev/n6-architecture"),
-        ("sedi",            "/Users/ghost/Dev/sedi"),
-        ("brainwire",       "/Users/ghost/Dev/brainwire"),
-        ("hexa-lang",       "/Users/ghost/Dev/hexa-lang"),
-        ("fathom",          "/Users/ghost/Dev/fathom"),
-        ("papers",          "/Users/ghost/Dev/papers"),
-    ];
+    let entries = load_projects();
+    let projects: Vec<(&str, &str)> = entries.iter()
+        .map(|p| (p.name.as_str(), p.path.as_str()))
+        .collect();
 
     let w = 65;
     let line = "─".repeat(w);
@@ -1643,7 +1671,7 @@ fn run_dispatch(target: &str, prompt: &str, parallel: bool) -> Result<(), String
     }
 }
 
-fn run_mega() -> Result<(), String> {
+fn run_mega(nexus_cfg: &NexusConfig) -> Result<(), String> {
     use std::process::Command;
     use std::time::Instant;
 
@@ -1651,24 +1679,17 @@ fn run_mega() -> Result<(), String> {
     println!("🌐 NEXUS-6 MEGA LOOP — 전 프로젝트 통합 루프");
     println!();
 
-    let projects = vec![
-        ("nexus6",          "number_theory",        "/Users/ghost/Dev/nexus6"),
-        ("anima",           "consciousness",        "/Users/ghost/Dev/anima"),
-        ("TECS-L",          "number_theory",        "/Users/ghost/Dev/TECS-L"),
-        ("n6-architecture", "architecture",         "/Users/ghost/Dev/n6-architecture"),
-        ("sedi",            "signal_detection",     "/Users/ghost/Dev/sedi"),
-        ("brainwire",       "neuroscience",         "/Users/ghost/Dev/brainwire"),
-        ("hexa-lang",       "programming_language", "/Users/ghost/Dev/hexa-lang"),
-        ("fathom",          "terminal",             "/Users/ghost/Dev/fathom"),
-        ("papers",          "publication",          "/Users/ghost/Dev/papers"),
-    ];
+    let entries = load_projects();
+    let projects: Vec<(&str, &str, &str)> = entries.iter()
+        .map(|p| (p.name.as_str(), p.domain.as_str(), p.path.as_str()))
+        .collect();
 
     let mut results: Vec<(String, String, f64, bool)> = Vec::new(); // name, status, time, ok
 
     // Step 1: nexus6 loop
     println!("━━━ [1/3] NEXUS-6 Core Loop ━━━");
     let pt = Instant::now();
-    let loop_ok = run_loop(Some("number_theory".to_string()), 1).is_ok();
+    let loop_ok = run_loop(Some("number_theory".to_string()), 1, nexus_cfg).is_ok();
     let loop_time = pt.elapsed().as_secs_f64();
     results.push(("nexus6".into(), if loop_ok { "OK" } else { "FAIL" }.into(), loop_time, loop_ok));
     println!();
@@ -1824,7 +1845,7 @@ fn run_mega() -> Result<(), String> {
     Ok(())
 }
 
-fn run_blowup(domain: &str, max_depth: usize) -> Result<(), String> {
+fn run_blowup(domain: &str, max_depth: usize, nexus_cfg: &NexusConfig) -> Result<(), String> {
     use std::collections::HashMap;
 
     println!("=== NEXUS-6 Blowup Engine ===");
@@ -1834,11 +1855,12 @@ fn run_blowup(domain: &str, max_depth: usize) -> Result<(), String> {
     // Step 1: 진화 루프를 돌려서 메트릭 히스토리 생성 (특이점 탐색)
     println!("  [1/4] 🐍 진화 루프 (특이점 탐색)...");
     let seeds = vec![format!("n=6 patterns in {}", domain)];
+    let base_config = nexus_cfg.meta_loop_config();
     let config = MetaLoopConfig {
-        max_ouroboros_cycles: 6,
-        max_meta_cycles: 3,
-        forge_after_n_cycles: 3,
-        ..MetaLoopConfig::default()
+        max_ouroboros_cycles: base_config.max_ouroboros_cycles,
+        max_meta_cycles: 3, // blowup uses 3 meta-cycles for probing
+        forge_after_n_cycles: base_config.forge_after_n_cycles,
+        forge_config: base_config.forge_config,
     };
     let mut meta_loop = MetaLoop::new(domain.to_string(), seeds, config);
     meta_loop.on_progress = Some(Box::new(|mc, oc, msg| {
@@ -1987,7 +2009,7 @@ fn run_blowup(domain: &str, max_depth: usize) -> Result<(), String> {
     Ok(())
 }
 
-fn run_daemon(domain: Option<String>, interval_min: u64, max_loops: Option<usize>) -> Result<(), String> {
+fn run_daemon(domain: Option<String>, interval_min: u64, max_loops: Option<usize>, nexus_cfg: &NexusConfig) -> Result<(), String> {
     let domain_str = domain.as_deref().unwrap_or("number_theory").to_string();
 
     println!("🤖 NEXUS-6 Daemon 시작");
@@ -2009,7 +2031,7 @@ fn run_daemon(domain: Option<String>, interval_min: u64, max_loops: Option<usize
         loop_count += 1;
         println!("━━━ Daemon #{} — {} ━━━", loop_count, chrono_now());
 
-        if let Err(e) = run_loop(Some(domain_str.clone()), 1) {
+        if let Err(e) = run_loop(Some(domain_str.clone()), 1, nexus_cfg) {
             println!("⚠️ Loop 에러: {} — {}분 후 재시도", e, interval_min);
         }
 
@@ -2032,7 +2054,7 @@ fn run_daemon(domain: Option<String>, interval_min: u64, max_loops: Option<usize
     Ok(())
 }
 
-fn run_loop(domain: Option<String>, cycles: usize) -> Result<(), String> {
+fn run_loop(domain: Option<String>, cycles: usize, nexus_cfg: &NexusConfig) -> Result<(), String> {
     use std::time::Instant;
 
     // 적응형 도메인 선택: 이전 루프 발견 수가 0이면 도메인 전환
@@ -2167,11 +2189,12 @@ fn run_loop(domain: Option<String>, cycles: usize) -> Result<(), String> {
         let carry_len = carry_registry.len();
         println!("  [3/8] 🐍 Auto: {} (3m×3o) [{}]", domain_str, carry_len);
         let seeds = vec![format!("n=6 in {}", domain_str)];
+        let base_mlc = nexus_cfg.meta_loop_config();
         let config = MetaLoopConfig {
             max_ouroboros_cycles: 3,
             max_meta_cycles: 3,
-            forge_after_n_cycles: 3,
-            ..MetaLoopConfig::default()
+            forge_after_n_cycles: base_mlc.forge_after_n_cycles,
+            forge_config: base_mlc.forge_config,
         };
         let mut meta_loop = MetaLoop::new(domain_str.to_string(), seeds, config);
         meta_loop.initial_registry = Some(carry_registry.clone());

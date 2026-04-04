@@ -154,7 +154,11 @@ fn parse_class_def(trimmed: &str) -> Option<String> {
     let rest = &trimmed[6..];
     let end = rest.find(|c: char| c == '(' || c == ':').unwrap_or(rest.len());
     let name = rest[..end].trim();
-    if name.is_empty() || !name.chars().next().unwrap().is_alphabetic() {
+    let first_char = match name.chars().next() {
+        Some(c) => c,
+        None => return None,
+    };
+    if !first_char.is_alphabetic() {
         return None;
     }
     Some(name.to_string())
@@ -240,7 +244,10 @@ fn is_py_identifier(s: &str) -> bool {
     if s.is_empty() {
         return false;
     }
-    let first = s.chars().next().unwrap();
+    let first = match s.chars().next() {
+        Some(c) => c,
+        None => return false,
+    };
     if !first.is_alphabetic() && first != '_' {
         return false;
     }

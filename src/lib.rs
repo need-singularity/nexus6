@@ -12,6 +12,7 @@ pub mod science;
 pub mod cli;
 
 pub mod blowup;
+pub mod config;
 
 // --- Agent-generated modules ---
 pub mod alert;
