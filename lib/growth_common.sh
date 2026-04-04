@@ -1093,6 +1093,9 @@ run_common_phases() {
     common_phase_paper_loop
     common_phase_bus_sync
 
+    # NEXUS-6 발견 엔진 (매 사이클 — scan + discover)
+    common_phase_nexus6_scan
+
     # C₂: 수렴 파이프라인 (라운드 로빈)
     run_convergence_step "$cycle"
 
