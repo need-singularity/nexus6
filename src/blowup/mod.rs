@@ -12,8 +12,10 @@
 
 pub mod blowup_engine;
 pub mod corollary;
+pub mod cycle_engine;
 pub mod singularity;
 
 pub use blowup_engine::{BlowupEngine, BlowupConfig, BlowupResult};
 pub use corollary::{Corollary, CorollaryType};
+pub use cycle_engine::{CycleEngine, CycleResult, Phase};
 pub use singularity::{Singularity, SingularityDetector};
