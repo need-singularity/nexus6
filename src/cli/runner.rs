@@ -2221,7 +2221,14 @@ fn run_daemon(domain: Option<String>, interval_min: u64, max_loops: Option<usize
         loop_count += 1;
         info!(loop_count, "Daemon 루프 시작");
 
-        if let Err(e) = run_loop(Some(domain_str.clone()), 1, nexus_cfg) {
+        // 각 프로젝트가 독립 무한루프하므로, max_loops만큼 cycles를 한번에 넘김
+        let batch_cycles = if interval_min == 0 {
+            max_loops.unwrap_or(usize::MAX)  // interval=0이면 전부 한번에
+        } else {
+            1
+        };
+
+        if let Err(e) = run_loop(Some(domain_str.clone()), batch_cycles, nexus_cfg) {
             warn!(error = %e, retry_min = interval_min, "Loop 에러 — 재시도 대기");
         }
 
@@ -2234,6 +2241,8 @@ fn run_daemon(domain: Option<String>, interval_min: u64, max_loops: Option<usize
         let _ = std::fs::create_dir_all(std::path::Path::new(&path).parent().unwrap());
         let _ = std::fs::write(&path, &status);
 
+        // interval=0 + batch이면 이미 전부 끝남
+        if interval_min == 0 { break; }
         if max_loops.map(|m| loop_count >= m).unwrap_or(false) { break; }
 
         debug!(interval_min, "대기 중...");
@@ -2394,7 +2403,7 @@ fn run_loop(domain: Option<String>, cycles: usize, nexus_cfg: &NexusConfig) -> R
 
             let (tx, rx) = mpsc::channel::<ProjectSignal>();
 
-            // 각 프로젝트를 독립 스레드로 실행
+            // 각 프로젝트가 독립적으로 무한 자기 루프 — 끝나면 바로 다시 시작
             for (dom, name) in project_domains.iter().zip(project_names.iter()) {
                 let dom = dom.clone();
                 let name = name.clone();
@@ -2402,53 +2411,63 @@ fn run_loop(domain: Option<String>, cycles: usize, nexus_cfg: &NexusConfig) -> R
                 let initial_reg = carry_registry.clone();
                 let forge_after = base_mlc.forge_after_n_cycles;
                 let forge_cfg = base_mlc.forge_config.clone();
+                let target_cycles = cycles;
 
                 thread::spawn(move || {
-                    let t0 = Instant::now();
-                    let _ = tx.send(ProjectSignal::Started { name: name.clone() });
+                    let mut local_reg = initial_reg;
+                    let mut round = 0usize;
+                    loop {
+                        round += 1;
+                        if round > target_cycles { break; }
 
-                    // Scan
-                    let scan_ok = match run_scan(&dom, None, false) {
-                        Ok(_) => true,
-                        Err(e) => {
-                            let _ = tx.send(ProjectSignal::Error { name: name.clone(), msg: format!("scan: {}", e) });
-                            false
-                        }
-                    };
-                    let _ = tx.send(ProjectSignal::ScanDone { name: name.clone(), ok: scan_ok });
+                        let t0 = Instant::now();
+                        let _ = tx.send(ProjectSignal::Started { name: name.clone() });
 
-                    // Auto
-                    let seeds = vec![format!("n=6 in {}", dom)];
-                    let config = MetaLoopConfig {
-                        max_ouroboros_cycles: 3,
-                        max_meta_cycles: 3,
-                        forge_after_n_cycles: forge_after,
-                        forge_config: forge_cfg,
-                    };
-                    let proj_name = name.clone();
-                    let mut meta_loop = MetaLoop::new(dom.clone(), seeds, config);
-                    meta_loop.initial_registry = Some(initial_reg);
-                    meta_loop.on_progress = Some(Box::new(move |mc, oc, msg| {
-                        if oc == 0 {
-                            tracing::debug!(project = %proj_name, meta_cycle = mc, "{}", msg);
-                        } else {
-                            tracing::debug!(project = %proj_name, meta_cycle = mc, ouro_cycle = oc, "{}", msg);
-                        }
-                    }));
-                    let result = meta_loop.run();
-                    let curve: Vec<usize> = result.meta_cycle_summaries.iter().map(|s| s.discoveries).collect();
+                        // Scan
+                        let scan_ok = match run_scan(&dom, None, false) {
+                            Ok(_) => true,
+                            Err(e) => {
+                                let _ = tx.send(ProjectSignal::Error { name: name.clone(), msg: format!("scan: {}", e) });
+                                false
+                            }
+                        };
+                        let _ = tx.send(ProjectSignal::ScanDone { name: name.clone(), ok: scan_ok });
 
-                    let _ = tx.send(ProjectSignal::AutoDone {
-                        name,
-                        discoveries: result.total_discoveries,
-                        forged: result.forged_lenses.clone(),
-                        curve,
-                        registry: result.final_registry.clone(),
-                        elapsed: t0.elapsed().as_secs_f64(),
-                    });
+                        // Auto
+                        let seeds = vec![format!("n=6 in {}", dom)];
+                        let config = MetaLoopConfig {
+                            max_ouroboros_cycles: 3,
+                            max_meta_cycles: 3,
+                            forge_after_n_cycles: forge_after,
+                            forge_config: forge_cfg.clone(),
+                        };
+                        let proj_name = name.clone();
+                        let mut meta_loop = MetaLoop::new(dom.clone(), seeds, config);
+                        meta_loop.initial_registry = Some(local_reg.clone());
+                        meta_loop.on_progress = Some(Box::new(move |mc, oc, msg| {
+                            if oc == 0 {
+                                tracing::debug!(project = %proj_name, meta_cycle = mc, "{}", msg);
+                            } else {
+                                tracing::debug!(project = %proj_name, meta_cycle = mc, ouro_cycle = oc, "{}", msg);
+                            }
+                        }));
+                        let result = meta_loop.run();
+                        let curve: Vec<usize> = result.meta_cycle_summaries.iter().map(|s| s.discoveries).collect();
+                        local_reg = result.final_registry.clone();
+
+                        let _ = tx.send(ProjectSignal::AutoDone {
+                            name: name.clone(),
+                            discoveries: result.total_discoveries,
+                            forged: result.forged_lenses.clone(),
+                            curve,
+                            registry: result.final_registry.clone(),
+                            elapsed: t0.elapsed().as_secs_f64(),
+                        });
+                        // 바로 다음 라운드 시작 — 대기 없음
+                    }
                 });
             }
-            drop(tx); // sender 닫아서 rx 종료 조건 성립
+            drop(tx); // 모든 스레드 종료 시 rx 자동 종료
 
             // 메인 스레드: 시그널 수신 + 집계
             let mut done_count = 0usize;
