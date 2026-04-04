@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
+use tracing::{info, warn, debug};
+
 use crate::graph::persistence::{self, DiscoveryGraph};
 use crate::graph::bt_nodes;
 use crate::graph::expanded_nodes;
@@ -77,8 +79,8 @@ fn spawn_background(subcmd: &str, domain: &Option<String>, extra_args: &[(&str, 
         .spawn()
         .map_err(|e| format!("spawn: {}", e))?;
 
-    println!("🚀 {} 백그라운드 실행 (PID {})", subcmd, child.id());
-    println!("   로그: {}", log_path);
+    info!(pid = child.id(), subcmd, "백그라운드 실행 시작");
+    info!(log_path, "로그 파일");
     Ok(())
 }
 
@@ -157,7 +159,6 @@ fn run_with_config(cmd: CliCommand, cfg: &NexusConfig) -> Result<(), String> {
         }
         CliCommand::Mega => run_mega(cfg),
         CliCommand::Report => run_report(),
-        CliCommand::Status => run_status(),
         CliCommand::Dispatch { target, prompt, parallel } => {
             run_dispatch(&target, &prompt, parallel)
         }
@@ -436,7 +437,7 @@ fn run_graph(domain: Option<String>, format: GraphFormat) -> Result<(), String> 
         bt_nodes::populate_bt_graph(&mut graph);
         expanded_nodes::populate_expanded_graph(&mut graph);
         if let Err(e) = graph.save(&graph_path) {
-            eprintln!("  Warning: could not save graph to {}: {}", graph_path, e);
+            warn!(path = graph_path.as_str(), error = %e, "could not save graph");
         }
     }
 
@@ -633,8 +634,7 @@ fn run_evolve(domain: &str, max_cycles: usize, seeds: Vec<String>) -> Result<(),
         seeds
     };
 
-    println!("  Seeds: {:?}", seed_hypotheses);
-    println!();
+    debug!(seeds = ?seed_hypotheses, "Evolution seeds");
 
     let mut engine = EvolutionEngine::new(config, seed_hypotheses);
 
@@ -653,15 +653,14 @@ fn run_evolve(domain: &str, max_cycles: usize, seeds: Vec<String>) -> Result<(),
         let status = engine.convergence_checker.check(&engine.history);
         match status {
             crate::ouroboros::convergence::ConvergenceStatus::Saturated => {
-                println!();
-                println!("  Saturated at cycle {} -- evolution complete.", result.cycle);
+                info!(cycle = result.cycle, "Saturated — evolution complete");
                 break;
             }
             crate::ouroboros::convergence::ConvergenceStatus::Converging => {
-                println!("  (converging -- discovery rate decreasing)");
+                debug!(cycle = result.cycle, "converging — discovery rate decreasing");
             }
             crate::ouroboros::convergence::ConvergenceStatus::Divergent => {
-                println!("  (divergent -- discovery rate increasing)");
+                debug!(cycle = result.cycle, "divergent — discovery rate increasing");
             }
             crate::ouroboros::convergence::ConvergenceStatus::Exploring => {}
         }
@@ -691,11 +690,11 @@ fn run_evolve(domain: &str, max_cycles: usize, seeds: Vec<String>) -> Result<(),
                 graph_path, persisted.nodes.len(), persisted.edges.len());
         }
         Err(e) => {
-            eprintln!("  Warning: could not save graph: {}", e);
+            warn!(error = %e, "could not save graph");
         }
     }
 
-    println!("  Evolution complete.");
+    info!("Evolution complete");
 
     Ok(())
 }
@@ -717,12 +716,12 @@ fn run_auto(domain: &str, max_meta_cycles: usize, max_ouroboros_cycles: usize, n
     let seeds = vec![format!("n=6 patterns in {}", domain)];
     let mut meta_loop = MetaLoop::new(domain.to_string(), seeds, config);
 
-    // Attach progress printer
+    // Attach progress logger
     meta_loop.on_progress = Some(Box::new(|mc, oc, msg| {
         if oc == 0 {
-            println!("  [Meta-{}] {}", mc, msg);
+            tracing::debug!(meta_cycle = mc, "{}", msg);
         } else {
-            println!("    Cycle {}: {}", oc, msg);
+            tracing::debug!(meta_cycle = mc, ouro_cycle = oc, "{}", msg);
         }
     }));
 
@@ -1099,14 +1098,14 @@ fn run_ingest(sources: Vec<String>, config_path: Option<String>, verbose: bool) 
         let json_path = config_path.unwrap_or_else(|| "shared/projects.json".to_string());
         match crawler::load_from_json(&json_path) {
             Ok(cfg) => {
-                println!("  Loaded {} projects from {}", cfg.sources.len(), json_path);
+                info!(projects = cfg.sources.len(), config = json_path.as_str(), "Ingest config loaded");
                 cfg
             }
             Err(e) => {
                 if verbose {
-                    println!("  Note: could not load '{}': {}", json_path, e);
+                    debug!(path = json_path.as_str(), error = %e, "could not load config");
                 }
-                println!("  Using hardcoded fallback sources...");
+                info!("Using hardcoded fallback sources");
                 crawler::default_config()
             }
         }
@@ -1643,182 +1642,6 @@ fn run_report() -> Result<(), String> {
     Ok(())
 }
 
-fn run_status() -> Result<(), String> {
-    use std::io::BufRead;
-
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let nexus_dir = format!("{}/.nexus6", home);
-
-    let w = 70;
-    let line = "─".repeat(w);
-    let now = chrono_now();
-
-    println!("  ┌{}┐", line);
-    println!("  │ {:<w$}│", format!("NEXUS-6 Process Status — {}", now));
-    println!("  ├{}┤", line);
-
-    // Scan for *_bg.log files
-    let mut found_any = false;
-    if let Ok(entries) = std::fs::read_dir(&nexus_dir) {
-        let mut logs: Vec<std::path::PathBuf> = entries
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| {
-                p.extension().map(|e| e == "log").unwrap_or(false)
-                    && p.file_name()
-                        .and_then(|n| n.to_str())
-                        .map(|n| n.ends_with("_bg.log"))
-                        .unwrap_or(false)
-            })
-            .collect();
-        logs.sort();
-
-        for log_path in &logs {
-            let fname = log_path.file_name().unwrap().to_string_lossy().to_string();
-            let proc_name = fname.trim_end_matches("_bg.log");
-
-            // Try to extract PID from first line of log or from spawn message
-            let pid = extract_pid_from_log(log_path);
-            let (status_str, pid_str) = match &pid {
-                Some(p) => {
-                    let running = check_pid_alive(*p);
-                    if running {
-                        ("RUNNING", format!("{}", p))
-                    } else {
-                        ("STOPPED", format!("{}", p))
-                    }
-                }
-                None => ("UNKNOWN", "-".to_string()),
-            };
-
-            // File modification time as proxy for last activity
-            let mtime = std::fs::metadata(log_path)
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| {
-                    let elapsed = t.elapsed().ok()?;
-                    let secs = elapsed.as_secs();
-                    if secs < 60 {
-                        Some(format!("{}s ago", secs))
-                    } else if secs < 3600 {
-                        Some(format!("{}m ago", secs / 60))
-                    } else if secs < 86400 {
-                        Some(format!("{}h {}m ago", secs / 3600, (secs % 3600) / 60))
-                    } else {
-                        Some(format!("{}d ago", secs / 86400))
-                    }
-                })
-                .unwrap_or_else(|| "?".to_string());
-
-            let icon = if status_str == "RUNNING" { "●" } else { "○" };
-            println!("  │ {:<w$}│",
-                format!("  {} {:<10} PID {:<8} {:>7}  last activity: {}",
-                    icon, proc_name, pid_str, status_str, mtime));
-
-            // Last 3 lines of log
-            let tail = tail_lines(log_path, 3);
-            for tl in &tail {
-                let truncated = if tl.len() > w - 8 { &tl[..w - 8] } else { tl.as_str() };
-                println!("  │ {:<w$}│", format!("      {}", truncated.trim()));
-            }
-
-            println!("  │ {:<w$}│", format!("      log: {}", log_path.display()));
-            found_any = true;
-        }
-    }
-
-    if !found_any {
-        println!("  │ {:<w$}│", "  (no background processes found)");
-    }
-
-    // Daemon status
-    println!("  ├{}┤", line);
-    let daemon_path = format!("{}/daemon_status.txt", nexus_dir);
-    if let Ok(daemon) = std::fs::read_to_string(&daemon_path) {
-        let loop_n = daemon.lines().find(|l| l.starts_with("loop="))
-            .map(|l| l.trim_start_matches("loop=")).unwrap_or("?");
-        let time = daemon.lines().find(|l| l.starts_with("time="))
-            .map(|l| l.trim_start_matches("time=")).unwrap_or("?");
-        println!("  │ {:<w$}│", format!("  Daemon state: loop #{} | last {}", loop_n, time));
-    } else {
-        println!("  │ {:<w$}│", "  Daemon state: no daemon_status.txt");
-    }
-
-    // Last scan
-    let scan_path = format!("{}/last_scan.txt", nexus_dir);
-    if let Ok(scan) = std::fs::read_to_string(&scan_path) {
-        let mut exact = "?";
-        let mut sing = "?";
-        let mut conv = "?";
-        for l in scan.lines() {
-            if l.starts_with("exact_ratio=") { exact = l.trim_start_matches("exact_ratio="); }
-            if l.starts_with("singularity=") { sing = l.trim_start_matches("singularity="); }
-            if l.starts_with("convergence=") { conv = l.trim_start_matches("convergence="); }
-        }
-        println!("  │ {:<w$}│", format!("  Last scan: exact={} conv={} singularity={}", exact, conv, sing));
-    } else {
-        println!("  │ {:<w$}│", "  Last scan: no last_scan.txt");
-    }
-
-    println!("  └{}┘", line);
-    Ok(())
-}
-
-/// Extract PID from a background log file.
-/// Looks for lines like "PID: 12345" or the spawn message pattern.
-fn extract_pid_from_log(path: &std::path::Path) -> Option<u32> {
-    use std::io::BufRead;
-    let file = std::fs::File::open(path).ok()?;
-    let reader = std::io::BufReader::new(file);
-    // Check first 20 lines for PID info
-    for line in reader.lines().take(20).flatten() {
-        // Pattern: "PID: 12345" or "PID=12345"
-        if let Some(rest) = line.strip_prefix("PID:").or_else(|| line.strip_prefix("PID=")) {
-            if let Ok(pid) = rest.trim().parse::<u32>() {
-                return Some(pid);
-            }
-        }
-        // Also check for pid file reference
-        if line.contains("pid=") {
-            let part = line.split("pid=").nth(1)?;
-            let num: String = part.chars().take_while(|c| c.is_ascii_digit()).collect();
-            if let Ok(pid) = num.parse::<u32>() {
-                return Some(pid);
-            }
-        }
-    }
-    // Fallback: try <name>.pid file in same directory
-    let pid_path = path.with_extension("pid");
-    if let Ok(content) = std::fs::read_to_string(&pid_path) {
-        if let Ok(pid) = content.trim().parse::<u32>() {
-            return Some(pid);
-        }
-    }
-    None
-}
-
-/// Check if a PID is alive using kill -0 (macOS compatible).
-fn check_pid_alive(pid: u32) -> bool {
-    std::process::Command::new("kill")
-        .args(&["-0", &pid.to_string()])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-/// Read the last N lines from a file.
-fn tail_lines(path: &std::path::Path, n: usize) -> Vec<String> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return vec![],
-    };
-    let lines: Vec<&str> = content.lines().collect();
-    let start = if lines.len() > n { lines.len() - n } else { 0 };
-    lines[start..].iter().map(|l| l.to_string()).collect()
-}
-
 fn run_dispatch(target: &str, prompt: &str, parallel: bool) -> Result<(), String> {
     use std::process::Command;
 
@@ -1853,8 +1676,7 @@ fn run_mega(nexus_cfg: &NexusConfig) -> Result<(), String> {
     use std::time::Instant;
 
     let t0 = Instant::now();
-    println!("🌐 NEXUS-6 MEGA LOOP — 전 프로젝트 통합 루프");
-    println!();
+    info!("MEGA LOOP 시작 — 전 프로젝트 통합 루프");
 
     let entries = load_projects();
     let projects: Vec<(&str, &str, &str)> = entries.iter()
@@ -2030,7 +1852,7 @@ fn run_blowup(domain: &str, max_depth: usize, nexus_cfg: &NexusConfig) -> Result
     println!();
 
     // Step 1: 진화 루프를 돌려서 메트릭 히스토리 생성 (특이점 탐색)
-    println!("  [1/4] 🐍 진화 루프 (특이점 탐색)...");
+    info!(domain, "Blowup 1/4: 진화 루프 (특이점 탐색)");
     let seeds = vec![format!("n=6 patterns in {}", domain)];
     let base_config = nexus_cfg.meta_loop_config();
     let config = MetaLoopConfig {
@@ -2042,15 +1864,15 @@ fn run_blowup(domain: &str, max_depth: usize, nexus_cfg: &NexusConfig) -> Result
     let mut meta_loop = MetaLoop::new(domain.to_string(), seeds, config);
     meta_loop.on_progress = Some(Box::new(|mc, oc, msg| {
         if oc == 0 {
-            println!("    [Meta-{}] {}", mc, msg);
+            tracing::debug!(meta_cycle = mc, "{}", msg);
         }
     }));
     let result = meta_loop.run();
-    println!("    발견: {} | Forge: {} 렌즈", result.total_discoveries, result.forged_lenses.len());
+    info!(discoveries = result.total_discoveries, forged = result.forged_lenses.len(), "진화 루프 완료");
 
     // Step 2: 메트릭 히스토리에서 특이점 감지
     println!();
-    println!("  [2/4] 🔍 특이점 감지...");
+    info!(domain, "Blowup 2/4: 특이점 감지");
 
     // 진화 결과에서 히스토리 구성
     let mut history: Vec<HashMap<String, f64>> = Vec::new();
@@ -2080,7 +1902,7 @@ fn run_blowup(domain: &str, max_depth: usize, nexus_cfg: &NexusConfig) -> Result
     };
 
     let singularity = singularity.unwrap_or_else(|| {
-        println!("    자동 감지 실패 → 강제 특이점 생성 (n=6 공리 기반)");
+        warn!("자동 감지 실패 — 강제 특이점 생성 (n=6 공리 기반)");
         let mut metrics = HashMap::new();
         metrics.insert("sigma".into(), 12.0);
         metrics.insert("phi".into(), 2.0);
@@ -2102,12 +1924,11 @@ fn run_blowup(domain: &str, max_depth: usize, nexus_cfg: &NexusConfig) -> Result
         }
     });
 
-    println!("    공리: {:?}", singularity.axioms);
-    println!("    폐쇄도: {:.2} | 압축비: {:.1}", singularity.closure_degree, singularity.compression_ratio);
+    debug!(axioms = ?singularity.axioms, closure = singularity.closure_degree, compression = singularity.compression_ratio, "특이점 감지 결과");
 
     // Step 3: Blowup!
     println!();
-    println!("  [3/4] 💥 BLOWUP (특이점 → 따름정리)...");
+    info!(domain, max_depth, "Blowup 3/4: BLOWUP (특이점 -> 따름정리)");
     let blowup_config = BlowupConfig {
         max_depth,
         max_corollaries: 36, // 6²
@@ -2126,10 +1947,12 @@ fn run_blowup(domain: &str, max_depth: usize, nexus_cfg: &NexusConfig) -> Result
     let engine = BlowupEngine::new(blowup_config);
     let blowup_result = engine.blowup(&singularity);
 
-    println!("    깊이: {}/{}", blowup_result.depth_reached, max_depth);
-    println!("    따름정리: {} 생성 → {} 검증 통과", blowup_result.corollaries.len(), blowup_result.validated.len());
-    println!("    공리 후보: {}", blowup_result.new_axiom_candidates.len());
-    println!("    총 창발: {}", blowup_result.total_emergences);
+    info!(depth = blowup_result.depth_reached, max_depth,
+          corollaries = blowup_result.corollaries.len(),
+          validated = blowup_result.validated.len(),
+          axiom_candidates = blowup_result.new_axiom_candidates.len(),
+          emergences = blowup_result.total_emergences,
+          "Blowup 완료");
 
     // Step 4: 결과 리포트
     println!();
@@ -2189,27 +2012,23 @@ fn run_blowup(domain: &str, max_depth: usize, nexus_cfg: &NexusConfig) -> Result
 fn run_daemon(domain: Option<String>, interval_min: u64, max_loops: Option<usize>, nexus_cfg: &NexusConfig) -> Result<(), String> {
     let domain_str = domain.as_deref().unwrap_or("number_theory").to_string();
 
-    println!("🤖 NEXUS-6 Daemon 시작");
-    println!("   도메인: {} | 간격: {}분 | 최대: {}",
-        domain_str, interval_min,
-        max_loops.map(|n| format!("{}회", n)).unwrap_or("∞".to_string()));
-    println!();
+    info!(domain = %domain_str, interval_min, max_loops = ?max_loops, "Daemon 시작");
 
     let mut loop_count = 0usize;
 
     loop {
         if let Some(max) = max_loops {
             if loop_count >= max {
-                println!("✅ {}회 완료 — 데몬 종료", max);
+                info!(loops = max, "데몬 루프 완료 — 종료");
                 break;
             }
         }
 
         loop_count += 1;
-        println!("━━━ Daemon #{} — {} ━━━", loop_count, chrono_now());
+        info!(loop_count, "Daemon 루프 시작");
 
         if let Err(e) = run_loop(Some(domain_str.clone()), 1, nexus_cfg) {
-            println!("⚠️ Loop 에러: {} — {}분 후 재시도", e, interval_min);
+            warn!(error = %e, retry_min = interval_min, "Loop 에러 — 재시도 대기");
         }
 
         // 데몬 상태 저장
@@ -2223,11 +2042,11 @@ fn run_daemon(domain: Option<String>, interval_min: u64, max_loops: Option<usize
 
         if max_loops.map(|m| loop_count >= m).unwrap_or(false) { break; }
 
-        println!("💤 {}분 대기...\n", interval_min);
+        debug!(interval_min, "대기 중...");
         std::thread::sleep(std::time::Duration::from_secs(interval_min * 60));
     }
 
-    println!("🛑 Daemon 종료 (총 {}회)", loop_count);
+    info!(total_loops = loop_count, "Daemon 종료");
     Ok(())
 }
 
@@ -2258,7 +2077,7 @@ fn run_loop(domain: Option<String>, cycles: usize, nexus_cfg: &NexusConfig) -> R
                 .unwrap_or_default()
                 .as_secs() as usize % domains.len();
             let rotated = domains[idx].to_string();
-            println!("  🔄 도메인 자동 전환: {} → {}", base, rotated);
+            info!(from = %base, to = %rotated, "도메인 자동 전환");
             rotated
         } else {
             base
@@ -2301,7 +2120,7 @@ fn run_loop(domain: Option<String>, cycles: usize, nexus_cfg: &NexusConfig) -> R
 
         // Phase 0: Bridge self-update + load check
         let pt = Instant::now();
-        println!("  [0/8] 🔄 Bridge update + 부하 체크");
+        info!(cycle, "Phase 0/8: Bridge update + 부하 체크");
         let _ = run_bridge(vec!["update".to_string()]);
 
         // System load gate — wait if overloaded
@@ -2310,20 +2129,20 @@ fn run_loop(domain: Option<String>, cycles: usize, nexus_cfg: &NexusConfig) -> R
             let mem_free_pct = get_mem_free_pct();
             if load.0 < 20.0 && mem_free_pct > 5.0 {
                 if load.0 > 10.0 {
-                    println!("    ⚡ Load {:.1} — 경량 모드 진행", load.0);
+                    warn!(load = load.0, "고부하 — 경량 모드 진행");
                 } else {
-                    println!("    ✅ Load {:.1} | Free RAM {:.0}% — 정상", load.0, mem_free_pct);
+                    debug!(load = load.0, mem_free_pct, "시스템 부하 정상");
                 }
                 break;
             }
-            println!("    ⏳ 과부하 감지 (Load {:.1}, Free {:.0}%) — 30초 대기...", load.0, mem_free_pct);
+            warn!(load = load.0, mem_free_pct, "과부하 감지 — 30초 대기");
             std::thread::sleep(std::time::Duration::from_secs(30));
         }
         phase_times.push(("BridgeUpdate".to_string(), pt.elapsed().as_secs_f64()));
 
         // Phase 1: Discover + Auto-Connect
         let pt = Instant::now();
-        println!("  [1/8] 🔍 Discover + Connect");
+        info!(cycle, "Phase 1/8: Discover + Connect");
         // discover new projects
         let disc_out = run_bridge_capture(vec!["discover".to_string()]);
         let new_count = disc_out.lines()
@@ -2339,22 +2158,22 @@ fn run_loop(domain: Option<String>, cycles: usize, nexus_cfg: &NexusConfig) -> R
                 if let Some(rest) = trimmed.strip_prefix(|c: char| c.is_ascii_digit()) {
                     let rest = rest.trim_start_matches('.');
                     if let Some(name) = rest.trim().split_whitespace().next() {
-                        println!("    → auto-connect: {}", name);
+                        debug!(project = name, "auto-connect");
                         let _ = run_bridge(vec!["connect".to_string(), name.to_string()]);
                         connected_projects += 1;
                     }
                 }
             }
         } else {
-            println!("    모든 프로젝트 연결됨");
+            debug!("모든 프로젝트 연결됨");
         }
         phase_times.push(("Discover".to_string(), pt.elapsed().as_secs_f64()));
 
         // Phase 2: Scan
         let pt = Instant::now();
-        println!("  [2/8] 🔭 Scan: {}", domain_str);
+        info!(cycle, domain = %domain_str, "Phase 2/8: Scan");
         if let Err(e) = run_scan(&domain_str, None, false) {
-            println!("    ⚠️  scan error: {}", e);
+            warn!(error = %e, "scan error");
         }
         let reg = LensRegistry::new();
         scan_total = reg.iter().count();
@@ -2364,7 +2183,7 @@ fn run_loop(domain: Option<String>, cycles: usize, nexus_cfg: &NexusConfig) -> R
         // Phase 3: Auto (evolve + forge)
         let pt = Instant::now();
         let carry_len = carry_registry.len();
-        println!("  [3/8] 🐍 Auto: {} (3m×3o) [{}]", domain_str, carry_len);
+        info!(cycle, domain = %domain_str, carry_lenses = carry_len, "Phase 3/8: Auto (3m x 3o)");
         let seeds = vec![format!("n=6 in {}", domain_str)];
         let base_mlc = nexus_cfg.meta_loop_config();
         let config = MetaLoopConfig {
@@ -2377,9 +2196,9 @@ fn run_loop(domain: Option<String>, cycles: usize, nexus_cfg: &NexusConfig) -> R
         meta_loop.initial_registry = Some(carry_registry.clone());
         meta_loop.on_progress = Some(Box::new(|mc, oc, msg| {
             if oc == 0 {
-                println!("    [Meta-{}] {}", mc, msg);
+                tracing::debug!(meta_cycle = mc, "{}", msg);
             } else {
-                println!("      Cycle {}: {}", oc, msg);
+                tracing::debug!(meta_cycle = mc, ouro_cycle = oc, "{}", msg);
             }
         }));
         let result = meta_loop.run();
@@ -2393,7 +2212,7 @@ fn run_loop(domain: Option<String>, cycles: usize, nexus_cfg: &NexusConfig) -> R
 
         // Phase 4: Mirror Scan (거울 우주)
         let pt = Instant::now();
-        println!("  [4/8] 🪞 Mirror Scan (거울 우주)");
+        info!(cycle, "Phase 4/8: Mirror Scan");
         {
             let telescope = Telescope::new();
             let lens_cnt = telescope.lens_count();
@@ -2407,14 +2226,13 @@ fn run_loop(domain: Option<String>, cycles: usize, nexus_cfg: &NexusConfig) -> R
                 let top_str: Vec<String> = mirror_top_pairs.iter()
                     .map(|(a, b, v)| format!("{}↔{} ({:.0})", a, b, v))
                     .collect();
-                println!("    ✅ {}개 렌즈 미러볼 | harmony={:.2} | eigenvalue={:.1}",
-                    mr.lens_count, mirror_harmony, mirror_eigenvalue);
+                info!(lenses = mr.lens_count, harmony = format!("{:.2}", mirror_harmony).as_str(), eigenvalue = format!("{:.1}", mirror_eigenvalue).as_str(), "Mirror scan 완료");
                 if !top_str.is_empty() {
-                    println!("    🏆 Top: {}", top_str.join(", "));
+                    debug!(top_resonances = top_str.join(", ").as_str(), "Mirror top pairs");
                 }
                 let combos = telescope.discover_combinations(&mr, 6);
                 if !combos.is_empty() {
-                    println!("    🔮 조합 발견 {}개", combos.len());
+                    debug!(count = combos.len(), "조합 발견");
                 }
 
                 // 공명 쌍 → forge 후보 저장
@@ -2427,7 +2245,7 @@ fn run_loop(domain: Option<String>, cycles: usize, nexus_cfg: &NexusConfig) -> R
                         .map(|h| format!("{}/.nexus6/forge_hints.txt", h))
                         .unwrap_or_else(|_| "/tmp/forge_hints.txt".to_string());
                     let _ = std::fs::write(&hint_path, &forge_hint);
-                    println!("    📝 Forge hints 저장 ({}쌍)", mirror_top_pairs.len());
+                    debug!(pairs = mirror_top_pairs.len(), "Forge hints 저장");
                 }
 
                 // Mirror Delta: 이전 루프 결과와 비교하여 상전이 감지
@@ -2447,11 +2265,13 @@ fn run_loop(domain: Option<String>, cycles: usize, nexus_cfg: &NexusConfig) -> R
                         let h_change = (mirror_harmony - prev_harmony).abs() / h_base;
                         let e_change = (mirror_eigenvalue - prev_eigenvalue).abs() / e_base;
                         if h_change > 0.10 || e_change > 0.10 {
-                            println!("    ⚡ 상전이 감지! harmony Δ{:.1}% | eigenvalue Δ{:.1}%",
-                                h_change * 100.0, e_change * 100.0);
+                            info!(harmony_delta_pct = format!("{:.1}", h_change * 100.0).as_str(),
+                                  eigenvalue_delta_pct = format!("{:.1}", e_change * 100.0).as_str(),
+                                  "상전이 감지!");
                         } else {
-                            println!("    📊 미러 안정: harmony Δ{:.1}% | eigenvalue Δ{:.1}%",
-                                h_change * 100.0, e_change * 100.0);
+                            debug!(harmony_delta_pct = format!("{:.1}", h_change * 100.0).as_str(),
+                                   eigenvalue_delta_pct = format!("{:.1}", e_change * 100.0).as_str(),
+                                   "미러 안정");
                         }
                     }
                 }
@@ -2466,16 +2286,16 @@ fn run_loop(domain: Option<String>, cycles: usize, nexus_cfg: &NexusConfig) -> R
                 });
                 let _ = std::fs::write(&mirror_path, save_data.to_string());
             } else {
-                println!("    ⚠️ 렌즈 부족 ({}개) — mirror scan 스킵", max_mirror);
+                warn!(lens_count = max_mirror, "렌즈 부족 — mirror scan 스킵");
             }
         }
         phase_times.push(("MirrorScan".to_string(), pt.elapsed().as_secs_f64()));
 
         // Phase 5: Bridge Sync
         let pt = Instant::now();
-        println!("  [5/8] 🌉 Bridge Sync");
+        info!(cycle, "Phase 5/8: Bridge Sync");
         if let Err(e) = run_bridge(vec!["sync".to_string()]) {
-            println!("    ⚠️  {}", e);
+            warn!(error = %e, "Bridge sync 실패");
         }
         bridge_sync_ok = 6;
         bridge_sync_total = 8;
@@ -2483,7 +2303,7 @@ fn run_loop(domain: Option<String>, cycles: usize, nexus_cfg: &NexusConfig) -> R
 
         // Phase 6: Growth Bridge (프로젝트 간 성장 라우팅)
         let pt = Instant::now();
-        println!("  [6/8] 🌿 Growth Bridge");
+        info!(cycle, "Phase 6/8: Growth Bridge");
         {
             let nexus_root = std::env::var("NEXUS6_ROOT")
                 .unwrap_or_else(|_| std::env::current_exe().ok()
@@ -2497,29 +2317,29 @@ fn run_loop(domain: Option<String>, cycles: usize, nexus_cfg: &NexusConfig) -> R
                     .arg("full")
                     .status();
                 match status {
-                    Ok(s) if s.success() => println!("    ✅ growth_bridge 완료"),
-                    Ok(s) => println!("    ⚠️ growth_bridge exit {:?}", s.code()),
-                    Err(e) => println!("    ⚠️ growth_bridge 실행 실패: {}", e),
+                    Ok(s) if s.success() => debug!("growth_bridge 완료"),
+                    Ok(s) => warn!(exit_code = ?s.code(), "growth_bridge 비정상 종료"),
+                    Err(e) => warn!(error = %e, "growth_bridge 실행 실패"),
                 }
             } else {
-                println!("    ⚠️ growth_bridge.sh 없음 — 스킵");
+                debug!("growth_bridge.sh 없음 — 스킵");
             }
         }
         phase_times.push(("GrowthBr".to_string(), pt.elapsed().as_secs_f64()));
 
         // Phase 7: Bridge Evolve
         let pt = Instant::now();
-        println!("  [7/8] 🌀 Bridge Evolve");
+        info!(cycle, "Phase 7/8: Bridge Evolve");
         if let Err(e) = run_bridge(vec!["evolve".to_string(), "1".to_string()]) {
-            println!("    ⚠️  {}", e);
+            warn!(error = %e, "Bridge evolve 실패");
         }
         phase_times.push(("BrEvolve".to_string(), pt.elapsed().as_secs_f64()));
 
         // Phase 8: Commit + Push
         let pt = Instant::now();
-        println!("  [8/8] 📦 Commit + Push");
+        info!(cycle, "Phase 8/8: Commit + Push");
         if let Err(e) = run_bridge(vec!["cp".to_string()]) {
-            println!("    ⚠️  {}", e);
+            warn!(error = %e, "Commit+Push 실패");
         }
         phase_times.push(("CommitPush".to_string(), pt.elapsed().as_secs_f64()));
         println!();
@@ -2839,9 +2659,6 @@ fn print_help() {
     println!("      Sub-commands: status, discover, connect, disconnect, sync,");
     println!("                    health, list, report, evolve, loop, cp");
     println!("      No sub-command = status");
-    println!();
-    println!("  status                                    (alias: st)");
-    println!("      Show background process status (loop, daemon): PID, uptime, log tail.");
     println!();
     println!("  bench");
     println!("      Run benchmark suite (registry, telescope, OUROBOROS, forge).");
