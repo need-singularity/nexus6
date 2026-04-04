@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# watch-papers.sh — 프로젝트별 paper_trigger.generator 주기 실행
+#
+# 동작:
+#   - projects.json에서 paper_trigger.enabled=true 인 모든 프로젝트의 generator 호출
+#   - generator는 JSON 리포트 출력 (created, skipped 등)
+#   - 새 파일 생성 시 로그 + 알림
+#
+# 각 프로젝트는 자기만의 완성 기준을 generator 스크립트로 정의.
+# generator 경로는 projects.json의 `paper_trigger.generator` (NEXUS6_ROOT 상대경로).
+#
+# Usage:
+#   ./scripts/watch-papers.sh                # 기본 300초 (5분) 간격
+#   INTERVAL=60 ./scripts/watch-papers.sh    # 1분 간격
+
+set -euo pipefail
+
+INTERVAL="${INTERVAL:-300}"
+NEXUS6_ROOT="${NEXUS6_ROOT:-$HOME/Dev/nexus6}"
+PROJECTS_JSON="${PROJECTS_JSON:-$NEXUS6_ROOT/shared/projects.json}"
+LOG="$HOME/Library/Logs/nexus6/watch-papers.log"
+mkdir -p "$(dirname "$LOG")"
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"; }
+
+if ! command -v jq &>/dev/null; then
+    log "[FATAL] jq not found"
+    exit 1
+fi
+
+if [ ! -f "$PROJECTS_JSON" ]; then
+    log "[FATAL] projects registry not found: $PROJECTS_JSON"
+    exit 1
+fi
+
+log "watch-papers started — interval=${INTERVAL}s"
+
+# 활성화된 generator 목록 표시
+log "활성 generator:"
+jq -r '.projects | to_entries[]
+    | select(.value.paper_trigger.enabled == true)
+    | "  [\(.key)] \(.value.paper_trigger.generator) — \(.value.paper_trigger.description // "")"' \
+    "$PROJECTS_JSON" | while read -r line; do log "$line"; done
+
+while true; do
+    # generator 목록 추출 (프로젝트명 + 스크립트 상대경로)
+    while IFS=$'\t' read -r proj_name gen_rel; do
+        [ -z "$proj_name" ] && continue
+        gen_path="$NEXUS6_ROOT/$gen_rel"
+
+        if [ ! -f "$gen_path" ]; then
+            log "⚠️ [$proj_name] generator not found: $gen_path"
+            continue
+        fi
+
+        # 실행 (python 또는 bash 자동 판별)
+        REPORT=""
+        if [[ "$gen_path" == *.py ]]; then
+            REPORT=$(python3 "$gen_path" 2>>"$LOG") || {
+                log "⚠️ [$proj_name] generator failed (python)"
+                continue
+            }
+        elif [[ "$gen_path" == *.sh ]]; then
+            REPORT=$(bash "$gen_path" 2>>"$LOG") || {
+                log "⚠️ [$proj_name] generator failed (bash)"
+                continue
+            }
+        else
+            REPORT=$("$gen_path" 2>>"$LOG") || {
+                log "⚠️ [$proj_name] generator failed"
+                continue
+            }
+        fi
+
+        # 리포트 파싱 (JSON 기대)
+        CREATED_COUNT=$(echo "$REPORT" | jq -r '.created | length' 2>/dev/null || echo "0")
+        if [ "$CREATED_COUNT" -gt 0 ]; then
+            CREATED_LIST=$(echo "$REPORT" | jq -r '.created | join(", ")' 2>/dev/null || echo "?")
+            OUTPUT_DIR=$(echo "$REPORT" | jq -r '.output_dir' 2>/dev/null || echo "?")
+            log "📄 [$proj_name] +$CREATED_COUNT paper(s): $CREATED_LIST"
+            log "   → $OUTPUT_DIR"
+            if command -v osascript &>/dev/null; then
+                osascript -e "display notification \"$proj_name: +$CREATED_COUNT papers ($CREATED_LIST)\" with title \"NEXUS-6 Papers\"" 2>/dev/null || true
+            fi
+        fi
+    done < <(jq -r '.projects | to_entries[]
+        | select(.value.paper_trigger.enabled == true)
+        | "\(.key)\t\(.value.paper_trigger.generator)"' "$PROJECTS_JSON")
+
+    sleep "$INTERVAL"
+done
