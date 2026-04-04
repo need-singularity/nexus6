@@ -449,3 +449,8 @@ pub use magnetic_monopole_lens::UmagneticUmonopoleLens;
 
 pub mod convection_pattern_lens;
 pub use convection_pattern_lens::UconvectionUpatternLens;
+
+pub mod composition_explorer_lens;
+pub mod stability_filter_lens;
+pub use composition_explorer_lens::CompositionExplorerLens;
+pub use stability_filter_lens::StabilityFilterLens;
