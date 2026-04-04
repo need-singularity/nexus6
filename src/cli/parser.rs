@@ -94,6 +94,10 @@ pub enum CliCommand {
         interval_min: u64,
         max_loops: Option<usize>,
     },
+    Blowup {
+        domain: String,
+        max_depth: usize,
+    },
     Help,
 }
 
@@ -151,6 +155,7 @@ pub fn parse_args(args: &[String]) -> Result<CliCommand, String> {
         "bridge" | "br" => Ok(CliCommand::Bridge { sub: rest.to_vec() }),
         "loop" => parse_loop(rest),
         "daemon" => parse_daemon(rest),
+        "blowup" => parse_blowup(rest),
         "help" | "--help" | "-h" => Ok(CliCommand::Help),
         other => Err(format!("Unknown command: '{}'. Run 'nexus6 help' for usage.", other)),
     }
@@ -599,6 +604,25 @@ fn parse_daemon(args: &[String]) -> Result<CliCommand, String> {
     }
 
     Ok(CliCommand::Daemon { domain, interval_min, max_loops })
+}
+
+fn parse_blowup(args: &[String]) -> Result<CliCommand, String> {
+    let domain = args.first().map(|s| s.as_str()).unwrap_or("number_theory").to_string();
+    let mut max_depth = 6;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--depth" | "-d" => {
+                i += 1;
+                if i < args.len() {
+                    max_depth = args[i].parse().unwrap_or(6);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    Ok(CliCommand::Blowup { domain, max_depth })
 }
 
 fn parse_predict(args: &[String]) -> Result<CliCommand, String> {

@@ -7,6 +7,7 @@ use crate::graph::expanded_nodes;
 use crate::history::{recorder, stats, recommend, DomainStats};
 use crate::lens_forge::forge_engine::{self, ForgeConfig};
 use crate::ouroboros::{EvolutionEngine, EvolutionConfig, MetaLoop, MetaLoopConfig};
+use crate::blowup::{BlowupEngine, BlowupConfig, Singularity};
 use crate::telescope::registry::{LensCategory, LensRegistry};
 use crate::telescope::domain_combos;
 use crate::telescope::Telescope;
@@ -59,6 +60,9 @@ pub fn run(cmd: CliCommand) -> Result<(), String> {
         CliCommand::Loop { domain, cycles } => run_loop(domain, cycles),
         CliCommand::Daemon { domain, interval_min, max_loops } => {
             run_daemon(domain, interval_min, max_loops)
+        }
+        CliCommand::Blowup { domain, max_depth } => {
+            run_blowup(&domain, max_depth)
         }
         CliCommand::Ingest { sources, config, verbose } => run_ingest(sources, config, verbose),
         CliCommand::Bench => run_bench(),
@@ -1297,6 +1301,169 @@ fn run_cycle(experiment_type: &str, target: &str) -> Result<(), String> {
     println!();
     println!("--- Full Document ---");
     println!("{}", publication.markdown);
+
+    Ok(())
+}
+
+fn run_blowup(domain: &str, max_depth: usize) -> Result<(), String> {
+    use std::collections::HashMap;
+
+    println!("=== NEXUS-6 Blowup Engine ===");
+    println!("  도메인: {} | 최대 깊이: {}", domain, max_depth);
+    println!();
+
+    // Step 1: 진화 루프를 돌려서 메트릭 히스토리 생성 (특이점 탐색)
+    println!("  [1/4] 🐍 진화 루프 (특이점 탐색)...");
+    let seeds = vec![format!("n=6 patterns in {}", domain)];
+    let config = MetaLoopConfig {
+        max_ouroboros_cycles: 6,
+        max_meta_cycles: 3,
+        forge_after_n_cycles: 3,
+        ..MetaLoopConfig::default()
+    };
+    let mut meta_loop = MetaLoop::new(domain.to_string(), seeds, config);
+    meta_loop.on_progress = Some(Box::new(|mc, oc, msg| {
+        if oc == 0 {
+            println!("    [Meta-{}] {}", mc, msg);
+        }
+    }));
+    let result = meta_loop.run();
+    println!("    발견: {} | Forge: {} 렌즈", result.total_discoveries, result.forged_lenses.len());
+
+    // Step 2: 메트릭 히스토리에서 특이점 감지
+    println!();
+    println!("  [2/4] 🔍 특이점 감지...");
+
+    // 진화 결과에서 히스토리 구성
+    let mut history: Vec<HashMap<String, f64>> = Vec::new();
+    for summary in &result.meta_cycle_summaries {
+        let mut snapshot = HashMap::new();
+        snapshot.insert("discoveries".into(), summary.discoveries as f64);
+        snapshot.insert("ouroboros_cycles".into(), summary.ouroboros_cycles_run as f64);
+        snapshot.insert("lenses".into(), result.final_registry.len() as f64);
+        // n=6 상수 주입
+        snapshot.insert("sigma".into(), 12.0);
+        snapshot.insert("phi".into(), 2.0);
+        snapshot.insert("tau".into(), 4.0);
+        snapshot.insert("n".into(), 6.0);
+        history.push(snapshot);
+    }
+
+    // 히스토리가 부족하면 수동으로 특이점 구성
+    let singularity = if history.len() >= 6 {
+        let detector = crate::blowup::SingularityDetector {
+            min_closure: 0.5,
+            min_compression: 1.5,
+            window: history.len().min(6),
+        };
+        detector.detect(&history)
+    } else {
+        None
+    };
+
+    let singularity = singularity.unwrap_or_else(|| {
+        println!("    자동 감지 실패 → 강제 특이점 생성 (n=6 공리 기반)");
+        let mut metrics = HashMap::new();
+        metrics.insert("sigma".into(), 12.0);
+        metrics.insert("phi".into(), 2.0);
+        metrics.insert("tau".into(), 4.0);
+        metrics.insert("n".into(), 6.0);
+        metrics.insert("sopfr".into(), 5.0);
+        metrics.insert("J2".into(), 24.0);
+        if let Some(last) = history.last() {
+            for (k, v) in last {
+                metrics.insert(k.clone(), *v);
+            }
+        }
+        Singularity {
+            axioms: vec!["sigma".into(), "phi".into(), "tau".into(), "n".into(), "sopfr".into(), "J2".into()],
+            compression_ratio: 6.0,
+            closure_degree: 1.0,
+            domain: domain.to_string(),
+            metrics,
+        }
+    });
+
+    println!("    공리: {:?}", singularity.axioms);
+    println!("    폐쇄도: {:.2} | 압축비: {:.1}", singularity.closure_degree, singularity.compression_ratio);
+
+    // Step 3: Blowup!
+    println!();
+    println!("  [3/4] 💥 BLOWUP (특이점 → 따름정리)...");
+    let blowup_config = BlowupConfig {
+        max_depth,
+        max_corollaries: 36, // 6²
+        min_confidence: 0.2,
+        transfer_domains: vec![
+            domain.into(),
+            "physics".into(),
+            "mathematics".into(),
+            "information".into(),
+            "biology".into(),
+            "consciousness".into(),
+            "architecture".into(),
+        ],
+        ..BlowupConfig::default()
+    };
+    let engine = BlowupEngine::new(blowup_config);
+    let blowup_result = engine.blowup(&singularity);
+
+    println!("    깊이: {}/{}", blowup_result.depth_reached, max_depth);
+    println!("    따름정리: {} 생성 → {} 검증 통과", blowup_result.corollaries.len(), blowup_result.validated.len());
+    println!("    공리 후보: {}", blowup_result.new_axiom_candidates.len());
+    println!("    총 창발: {}", blowup_result.total_emergences);
+
+    // Step 4: 결과 리포트
+    println!();
+    println!("  [4/4] 📋 창발 리포트");
+    let w = 65;
+    let line = "─".repeat(w);
+    println!("  ┌{}┐", line);
+    println!("  │ 💥 BLOWUP 결과 — {} {:<pad$}│", domain, "", pad = w - 18 - domain.len());
+    println!("  ├{}┤", line);
+
+    if blowup_result.validated.is_empty() {
+        println!("  │ {:<w$}│", "  (따름정리 없음 — 시스템이 아직 열려있음)");
+    } else {
+        for (i, c) in blowup_result.validated.iter().enumerate().take(20) {
+            let type_str = match c.corollary_type {
+                crate::blowup::CorollaryType::Deduction => "연역",
+                crate::blowup::CorollaryType::DomainTransfer => "이전",
+                crate::blowup::CorollaryType::SymmetryBreaking => "대칭파괴",
+                crate::blowup::CorollaryType::Bifurcation => "분기",
+                crate::blowup::CorollaryType::Composition => "합성",
+                crate::blowup::CorollaryType::Projection => "사영",
+                crate::blowup::CorollaryType::Dual => "쌍대",
+            };
+            let axiom_tag = if c.is_axiom_candidate { " ★" } else { "" };
+            println!("  │ {:<w$}│",
+                format!("  {:>2}. [{}] {} (conf={:.2}){}",
+                    i + 1, type_str, c.expression.chars().take(35).collect::<String>(),
+                    c.confidence, axiom_tag));
+        }
+        if blowup_result.validated.len() > 20 {
+            println!("  │ {:<w$}│", format!("  ... +{} more", blowup_result.validated.len() - 20));
+        }
+    }
+
+    println!("  ├{}┤", line);
+    println!("  │ {:<w$}│", format!("  창발 {}개 | 공리후보 {}개 | 깊이 {}/{}",
+        blowup_result.total_emergences, blowup_result.new_axiom_candidates.len(),
+        blowup_result.depth_reached, max_depth));
+    println!("  └{}┘", line);
+
+    // 결과를 파일로 저장
+    let report_path = std::env::var("HOME")
+        .map(|h| format!("{}/.nexus6/last_blowup.txt", h))
+        .unwrap_or_else(|_| "/tmp/nexus6_blowup.txt".to_string());
+    let _ = std::fs::create_dir_all(std::path::Path::new(&report_path).parent().unwrap());
+    let report = format!(
+        "domain={}\ndepth={}/{}\ncorollaries={}\nvalidated={}\naxiom_candidates={}\ntotal_emergences={}\n",
+        domain, blowup_result.depth_reached, max_depth,
+        blowup_result.corollaries.len(), blowup_result.validated.len(),
+        blowup_result.new_axiom_candidates.len(), blowup_result.total_emergences
+    );
+    let _ = std::fs::write(&report_path, &report);
 
     Ok(())
 }
