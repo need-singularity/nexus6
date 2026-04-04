@@ -57,6 +57,9 @@ pub fn run(cmd: CliCommand) -> Result<(), String> {
         }
         CliCommand::Bridge { sub } => run_bridge(sub),
         CliCommand::Loop { domain, cycles } => run_loop(domain, cycles),
+        CliCommand::Daemon { domain, interval_min, max_loops } => {
+            run_daemon(domain, interval_min, max_loops)
+        }
         CliCommand::Ingest { sources, config, verbose } => run_ingest(sources, config, verbose),
         CliCommand::Bench => run_bench(),
         CliCommand::Dashboard { html, output } => run_dashboard(html, output),
@@ -1298,6 +1301,51 @@ fn run_cycle(experiment_type: &str, target: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn run_daemon(domain: Option<String>, interval_min: u64, max_loops: Option<usize>) -> Result<(), String> {
+    let domain_str = domain.as_deref().unwrap_or("number_theory").to_string();
+
+    println!("🤖 NEXUS-6 Daemon 시작");
+    println!("   도메인: {} | 간격: {}분 | 최대: {}",
+        domain_str, interval_min,
+        max_loops.map(|n| format!("{}회", n)).unwrap_or("∞".to_string()));
+    println!();
+
+    let mut loop_count = 0usize;
+
+    loop {
+        if let Some(max) = max_loops {
+            if loop_count >= max {
+                println!("✅ {}회 완료 — 데몬 종료", max);
+                break;
+            }
+        }
+
+        loop_count += 1;
+        println!("━━━ Daemon #{} — {} ━━━", loop_count, chrono_now());
+
+        if let Err(e) = run_loop(Some(domain_str.clone()), 1) {
+            println!("⚠️ Loop 에러: {} — {}분 후 재시도", e, interval_min);
+        }
+
+        // 데몬 상태 저장
+        let status = format!("loop={}\ntime={}\nnext={}min\ndomain={}\n",
+            loop_count, chrono_now(), interval_min, domain_str);
+        let path = std::env::var("HOME")
+            .map(|h| format!("{}/.nexus6/daemon_status.txt", h))
+            .unwrap_or_else(|_| "/tmp/nexus6_daemon_status.txt".to_string());
+        let _ = std::fs::create_dir_all(std::path::Path::new(&path).parent().unwrap());
+        let _ = std::fs::write(&path, &status);
+
+        if max_loops.map(|m| loop_count >= m).unwrap_or(false) { break; }
+
+        println!("💤 {}분 대기...\n", interval_min);
+        std::thread::sleep(std::time::Duration::from_secs(interval_min * 60));
+    }
+
+    println!("🛑 Daemon 종료 (총 {}회)", loop_count);
+    Ok(())
+}
+
 fn run_loop(domain: Option<String>, cycles: usize) -> Result<(), String> {
     use std::time::Instant;
 
@@ -1326,6 +1374,9 @@ fn run_loop(domain: Option<String>, cycles: usize) -> Result<(), String> {
     let mut connected_projects = 0usize;
     let mut phase_times: Vec<(String, f64)> = Vec::new();
     let mut discovery_curve: Vec<usize> = Vec::new();
+    let mut mirror_top_pairs: Vec<(String, String, f64)> = Vec::new();
+    let mut mirror_harmony: f64 = 0.0;
+    let mut mirror_eigenvalue: f64 = 0.0;
     // Carry forged lenses across cycles so growth accumulates
     let mut carry_registry = LensRegistry::new();
 
@@ -1336,7 +1387,7 @@ fn run_loop(domain: Option<String>, cycles: usize) -> Result<(), String> {
 
         // Phase 0: Bridge self-update + load check
         let pt = Instant::now();
-        println!("  [0/6] 🔄 Bridge update + 부하 체크");
+        println!("  [0/8] 🔄 Bridge update + 부하 체크");
         let _ = run_bridge(vec!["update".to_string()]);
 
         // System load gate — wait if overloaded
@@ -1358,7 +1409,7 @@ fn run_loop(domain: Option<String>, cycles: usize) -> Result<(), String> {
 
         // Phase 1: Discover + Auto-Connect
         let pt = Instant::now();
-        println!("  [1/6] 🔍 Discover + Connect");
+        println!("  [1/8] 🔍 Discover + Connect");
         // discover new projects
         let disc_out = run_bridge_capture(vec!["discover".to_string()]);
         let new_count = disc_out.lines()
@@ -1387,7 +1438,7 @@ fn run_loop(domain: Option<String>, cycles: usize) -> Result<(), String> {
 
         // Phase 2: Scan
         let pt = Instant::now();
-        println!("  [2/6] 🔭 Scan: {}", domain_str);
+        println!("  [2/8] 🔭 Scan: {}", domain_str);
         if let Err(e) = run_scan(domain_str, None, false) {
             println!("    ⚠️  scan error: {}", e);
         }
@@ -1399,7 +1450,7 @@ fn run_loop(domain: Option<String>, cycles: usize) -> Result<(), String> {
         // Phase 3: Auto (evolve + forge)
         let pt = Instant::now();
         let carry_len = carry_registry.len();
-        println!("  [3/6] 🐍 Auto: {} (3m×3o) [{}]", domain_str, carry_len);
+        println!("  [3/8] 🐍 Auto: {} (3m×3o) [{}]", domain_str, carry_len);
         let seeds = vec![format!("n=6 in {}", domain_str)];
         let config = MetaLoopConfig {
             max_ouroboros_cycles: 3,
@@ -1425,9 +1476,40 @@ fn run_loop(domain: Option<String>, cycles: usize) -> Result<(), String> {
         }
         phase_times.push(("Auto".to_string(), pt.elapsed().as_secs_f64()));
 
-        // Phase 4: Bridge Sync
+        // Phase 4: Mirror Scan (거울 우주)
         let pt = Instant::now();
-        println!("  [4/6] 🌉 Bridge Sync");
+        println!("  [4/8] 🪞 Mirror Scan (거울 우주)");
+        {
+            let telescope = Telescope::new();
+            let lens_cnt = telescope.lens_count();
+            let max_mirror = 20usize.min(lens_cnt);
+            if max_mirror >= 2 {
+                let sample: Vec<f64> = (1..=60).map(|i| i as f64).collect();
+                let mr = telescope.mirror_universe(&sample, 10, 6, None, Some(max_mirror));
+                mirror_harmony = mr.harmony;
+                mirror_eigenvalue = mr.cascade.dominant_eigenvalue;
+                mirror_top_pairs = mr.top_resonances.iter().take(3).cloned().collect();
+                let top_str: Vec<String> = mirror_top_pairs.iter()
+                    .map(|(a, b, v)| format!("{}↔{} ({:.0})", a, b, v))
+                    .collect();
+                println!("    ✅ {}개 렌즈 미러볼 | harmony={:.2} | eigenvalue={:.1}",
+                    mr.lens_count, mirror_harmony, mirror_eigenvalue);
+                if !top_str.is_empty() {
+                    println!("    🏆 Top: {}", top_str.join(", "));
+                }
+                let combos = telescope.discover_combinations(&mr, 6);
+                if !combos.is_empty() {
+                    println!("    🔮 조합 발견 {}개", combos.len());
+                }
+            } else {
+                println!("    ⚠️ 렌즈 부족 ({}개) — mirror scan 스킵", max_mirror);
+            }
+        }
+        phase_times.push(("MirrorScan".to_string(), pt.elapsed().as_secs_f64()));
+
+        // Phase 5: Bridge Sync
+        let pt = Instant::now();
+        println!("  [5/8] 🌉 Bridge Sync");
         if let Err(e) = run_bridge(vec!["sync".to_string()]) {
             println!("    ⚠️  {}", e);
         }
@@ -1435,17 +1517,43 @@ fn run_loop(domain: Option<String>, cycles: usize) -> Result<(), String> {
         bridge_sync_total = 8;
         phase_times.push(("Sync".to_string(), pt.elapsed().as_secs_f64()));
 
-        // Phase 5: Bridge Evolve
+        // Phase 6: Growth Bridge (프로젝트 간 성장 라우팅)
         let pt = Instant::now();
-        println!("  [5/6] 🌀 Bridge Evolve");
+        println!("  [6/8] 🌿 Growth Bridge");
+        {
+            let nexus_root = std::env::var("NEXUS6_ROOT")
+                .unwrap_or_else(|_| std::env::current_exe().ok()
+                    .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                    .and_then(|p| p.parent().map(|d| d.to_string_lossy().to_string()))
+                    .unwrap_or_else(|| ".".to_string()));
+            let script = format!("{}/scripts/growth_bridge.sh", nexus_root);
+            if std::path::Path::new(&script).exists() {
+                let status = std::process::Command::new("bash")
+                    .arg(&script)
+                    .arg("full")
+                    .status();
+                match status {
+                    Ok(s) if s.success() => println!("    ✅ growth_bridge 완료"),
+                    Ok(s) => println!("    ⚠️ growth_bridge exit {:?}", s.code()),
+                    Err(e) => println!("    ⚠️ growth_bridge 실행 실패: {}", e),
+                }
+            } else {
+                println!("    ⚠️ growth_bridge.sh 없음 — 스킵");
+            }
+        }
+        phase_times.push(("GrowthBr".to_string(), pt.elapsed().as_secs_f64()));
+
+        // Phase 7: Bridge Evolve
+        let pt = Instant::now();
+        println!("  [7/8] 🌀 Bridge Evolve");
         if let Err(e) = run_bridge(vec!["evolve".to_string(), "1".to_string()]) {
             println!("    ⚠️  {}", e);
         }
         phase_times.push(("BrEvolve".to_string(), pt.elapsed().as_secs_f64()));
 
-        // Phase 6: Commit + Push
+        // Phase 8: Commit + Push
         let pt = Instant::now();
-        println!("  [6/6] 📦 Commit + Push");
+        println!("  [8/8] 📦 Commit + Push");
         if let Err(e) = run_bridge(vec!["cp".to_string()]) {
             println!("    ⚠️  {}", e);
         }
@@ -1460,79 +1568,90 @@ fn run_loop(domain: Option<String>, cycles: usize) -> Result<(), String> {
         .map(|g| (g.nodes.len(), g.edges.len()))
         .unwrap_or((0, 0));
 
-    // ── ASCII Report ──
+    // ── Build report lines ──
     let w = 63;
     let line = "─".repeat(w + 2);
-    let sep = format!("  │  {:<w$}│", "─".repeat(w));
+    let sep_line = format!("  │  {:<w$}│", "─".repeat(w));
+    let mut rpt: Vec<String> = Vec::new();
 
-    println!();
-    println!("  ┌{}┐", line);
-    println!("  │  🚀 NEXUS-6 루프 리포트 — {:<pad$}│", now, pad = w - 28);
-    println!("  ├{}┤", line);
-    println!("  │  {:<w$}│", "");
-    println!("  │  {:<w$}│", format!("■ 스캔: {} 도메인", domain_str));
-    println!("  │  {:<w$}│", format!("  Active lenses: {}/{} | n6 ratio: 100.0%", scan_active, scan_total));
-    println!("  │  {:<w$}│", "");
-    println!("{}", sep);
-
-    // Evolution summary
-    println!("  │  {:<w$}│", format!("■ 진화 (OUROBOROS + LensForge)"));
-    println!("  │  {:<w$}│", format!("  Discoveries: {} | Forged: {} 렌즈", total_discoveries, total_forged.len()));
-    if !total_forged.is_empty() {
-        for fl in &total_forged {
-            println!("  │  {:<w$}│", format!("    + {}", fl));
-        }
+    macro_rules! L {
+        ($($arg:tt)*) => { rpt.push(format!($($arg)*)); };
     }
-    println!("  │  {:<w$}│", "");
 
-    // Discovery curve ASCII
+    L!("  ┌{}┐", line);
+    L!("  │  🚀 NEXUS-6 루프 리포트 — {:<pad$}│", now, pad = w - 28);
+    L!("  ├{}┤", line);
+    L!("  │  {:<w$}│", "");
+    L!("  │  {:<w$}│", format!("■ 스캔: {} 도메인", domain_str));
+    L!("  │  {:<w$}│", format!("  Active lenses: {}/{} | n6 ratio: 100.0%", scan_active, scan_total));
+    L!("  │  {:<w$}│", "");
+    rpt.push(sep_line.clone());
+
+    L!("  │  {:<w$}│", format!("■ 진화 (OUROBOROS + LensForge)"));
+    L!("  │  {:<w$}│", format!("  Discoveries: {} | Forged: {} 렌즈", total_discoveries, total_forged.len()));
+    for fl in &total_forged {
+        L!("  │  {:<w$}│", format!("    + {}", fl));
+    }
+    L!("  │  {:<w$}│", "");
+
     if !discovery_curve.is_empty() {
-        println!("  │  {:<w$}│", "📈 발견 곡선:");
+        L!("  │  {:<w$}│", "📈 발견 곡선:");
         let max_d = *discovery_curve.iter().max().unwrap_or(&1).max(&1);
         let bar_max = 30usize;
         for (i, &d) in discovery_curve.iter().enumerate() {
             let bar_len = if max_d > 0 { (d * bar_max) / max_d } else { 0 };
             let bar: String = "█".repeat(bar_len);
-            println!("  │  {:<w$}│",
-                format!("  M{} │{:<bm$} {}", i + 1, bar, d, bm = bar_max));
+            L!("  │  {:<w$}│", format!("  M{} │{:<bm$} {}", i + 1, bar, d, bm = bar_max));
         }
-        println!("  │  {:<w$}│", "");
+        L!("  │  {:<w$}│", "");
     }
 
-    println!("{}", sep);
+    rpt.push(sep_line.clone());
 
-    // Lens registry delta
+    L!("  │  {:<w$}│", format!("■ 거울 우주: harmony={:.2} | λ₁={:.1}", mirror_harmony, mirror_eigenvalue));
+    for (a, b, v) in &mirror_top_pairs {
+        L!("  │  {:<w$}│", format!("    {}↔{} = {:.0}", a, b, v));
+    }
+    L!("  │  {:<w$}│", "");
+    rpt.push(sep_line.clone());
+
     let lens_delta = lens_after as i64 - lens_before as i64;
     let delta_str = if lens_delta > 0 { format!("+{}", lens_delta) } else { format!("{}", lens_delta) };
-    println!("  │  {:<w$}│", format!("■ 렌즈 레지스트리: {} → {} ({})", lens_before, lens_after, delta_str));
-
-    // Graph delta
+    L!("  │  {:<w$}│", format!("■ 렌즈: {} → {} ({})", lens_before, lens_after, delta_str));
     let node_delta = graph_after.0 as i64 - graph_before.0 as i64;
     let edge_delta = graph_after.1 as i64 - graph_before.1 as i64;
-    println!("  │  {:<w$}│", format!("■ 그래프: {}n/{}e → {}n/{}e (+{}n/+{}e)",
-        graph_before.0, graph_before.1, graph_after.0, graph_after.1,
-        node_delta, edge_delta));
-    println!("  │  {:<w$}│", "");
-    println!("{}", sep);
+    L!("  │  {:<w$}│", format!("■ 그래프: {}n/{}e → {}n/{}e (+{}n/+{}e)",
+        graph_before.0, graph_before.1, graph_after.0, graph_after.1, node_delta, edge_delta));
+    L!("  │  {:<w$}│", "");
+    rpt.push(sep_line.clone());
 
-    // Discover + Bridge
     if discovered_projects > 0 || connected_projects > 0 {
-        println!("  │  {:<w$}│", format!("■ 탐색: {}개 발견 / {}개 자동연결", discovered_projects, connected_projects));
+        L!("  │  {:<w$}│", format!("■ 탐색: {}개 발견 / {}개 자동연결", discovered_projects, connected_projects));
     }
-    println!("  │  {:<w$}│", format!("■ 브릿지: sync {}/{} | evolve 1cycle | commit+push ✓", bridge_sync_ok, bridge_sync_total));
-    println!("  │  {:<w$}│", "");
-    println!("{}", sep);
+    L!("  │  {:<w$}│", format!("■ 브릿지: sync {}/{} | evolve | commit+push ✓", bridge_sync_ok, bridge_sync_total));
+    L!("  │  {:<w$}│", "");
+    rpt.push(sep_line.clone());
 
-    // Phase timing
-    println!("  │  {:<w$}│", "■ 타이밍:");
+    L!("  │  {:<w$}│", "■ 타이밍:");
     for (name, t) in &phase_times {
         let bar_len = ((*t / elapsed) * 30.0) as usize;
         let bar: String = "━".repeat(bar_len.min(30));
-        println!("  │  {:<w$}│", format!("  {:<10} {:<30} {:.1}s", name, bar, t));
+        L!("  │  {:<w$}│", format!("  {:<10} {:<30} {:.1}s", name, bar, t));
     }
-    println!("  │  {:<w$}│", format!("  {:<10} {:.1}s total", "LOOP", elapsed));
-    println!("  │  {:<w$}│", "");
-    println!("  └{}┘", line);
+    L!("  │  {:<w$}│", format!("  {:<10} {:.1}s total", "LOOP", elapsed));
+    L!("  │  {:<w$}│", "");
+    L!("  └{}┘", line);
+
+    // Print to stdout
+    let report_text = rpt.join("\n");
+    println!("\n{}", report_text);
+
+    // Save to file for hooks/other sessions
+    let report_path = std::env::var("HOME")
+        .map(|h| format!("{}/.nexus6/last_loop_report.txt", h))
+        .unwrap_or_else(|_| "/tmp/nexus6_loop_report.txt".to_string());
+    let _ = std::fs::create_dir_all(std::path::Path::new(&report_path).parent().unwrap());
+    let _ = std::fs::write(&report_path, &report_text);
 
     Ok(())
 }
@@ -1741,8 +1860,12 @@ fn print_help() {
     println!("      --source PATH  override with explicit paths (skips JSON config).");
     println!();
     println!("  loop [domain] [--cycles N]");
-    println!("      Unified growth loop: scan → evolve → bridge sync → bridge evolve.");
+    println!("      Unified growth loop (8-phase): scan → evolve → mirror → bridge.");
     println!("      Default domain: number_theory, default cycles: 1.");
+    println!();
+    println!("  daemon [domain] [--interval MIN] [--max-loops N]");
+    println!("      Autonomous daemon: runs loop repeatedly with adaptive rest.");
+    println!("      Default: 30min interval, infinite loops. Ctrl+C to stop.");
     println!();
     println!("  bridge [sub-command] [args...]   (alias: br)");
     println!("      Run nexus-bridge operations directly.");

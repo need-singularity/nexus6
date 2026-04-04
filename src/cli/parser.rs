@@ -89,6 +89,11 @@ pub enum CliCommand {
         domain: Option<String>,
         cycles: usize,
     },
+    Daemon {
+        domain: Option<String>,
+        interval_min: u64,
+        max_loops: Option<usize>,
+    },
     Help,
 }
 
@@ -145,6 +150,7 @@ pub fn parse_args(args: &[String]) -> Result<CliCommand, String> {
         "dashboard" => parse_dashboard(rest),
         "bridge" | "br" => Ok(CliCommand::Bridge { sub: rest.to_vec() }),
         "loop" => parse_loop(rest),
+        "daemon" => parse_daemon(rest),
         "help" | "--help" | "-h" => Ok(CliCommand::Help),
         other => Err(format!("Unknown command: '{}'. Run 'nexus6 help' for usage.", other)),
     }
@@ -558,6 +564,41 @@ fn parse_loop(args: &[String]) -> Result<CliCommand, String> {
     }
 
     Ok(CliCommand::Loop { domain, cycles })
+}
+
+fn parse_daemon(args: &[String]) -> Result<CliCommand, String> {
+    let mut domain: Option<String> = None;
+    let mut interval_min: u64 = 30;
+    let mut max_loops: Option<usize> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--interval" | "-i" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--interval requires minutes".to_string());
+                }
+                interval_min = args[i].parse().map_err(|_| "interval must be a number".to_string())?;
+            }
+            "--max-loops" | "-n" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--max-loops requires a number".to_string());
+                }
+                max_loops = Some(args[i].parse().map_err(|_| "max-loops must be a number".to_string())?);
+            }
+            other if !other.starts_with('-') && domain.is_none() => {
+                domain = Some(other.to_string());
+            }
+            other => {
+                return Err(format!("daemon: unknown option '{}'", other));
+            }
+        }
+        i += 1;
+    }
+
+    Ok(CliCommand::Daemon { domain, interval_min, max_loops })
 }
 
 fn parse_predict(args: &[String]) -> Result<CliCommand, String> {

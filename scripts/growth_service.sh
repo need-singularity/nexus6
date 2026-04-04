@@ -1,51 +1,59 @@
 #!/usr/bin/env bash
-# NEXUS-6 Growth Service Controller
+# NEXUS-6 Autonomous Daemon Controller
 # Usage: ./scripts/growth_service.sh [start|stop|status|logs]
 
-PLIST="$HOME/Library/LaunchAgents/com.nexus6.growth.plist"
-LABEL="com.nexus6.growth"
-LOG_FILE="$HOME/Library/Logs/nexus6/growth.log"
+PLIST="$HOME/Library/LaunchAgents/com.n6.sync.nexus6.plist"
+LABEL="com.n6.sync.nexus6"
+LOG_FILE="$HOME/Library/Logs/nexus6/daemon.log"
+STATUS_FILE="$HOME/.nexus6/daemon_status.txt"
 
-case "${1:-}" in
+case "${1:-status}" in
   start)
-    echo "[NEXUS-6] Loading growth service..."
-    launchctl load "$PLIST" 2>&1
-    echo "[NEXUS-6] Service loaded. Runs every 30 minutes."
-    launchctl list | grep "$LABEL" && echo "[NEXUS-6] Confirmed running." || echo "[NEXUS-6] Warning: not found in launchctl list."
+    echo "🤖 NEXUS-6 Daemon 시작..."
+    launchctl load "$PLIST" 2>/dev/null
+    if launchctl list | grep -q "$LABEL"; then
+      echo "✅ Daemon 실행 중"
+    else
+      echo "⚠️ 로드 실패 — plist 확인 필요"
+    fi
     ;;
   stop)
-    echo "[NEXUS-6] Unloading growth service..."
-    launchctl unload "$PLIST" 2>&1
-    echo "[NEXUS-6] Service stopped."
+    echo "🛑 NEXUS-6 Daemon 중지..."
+    launchctl unload "$PLIST" 2>/dev/null
+    echo "   중지 완료"
     ;;
   status)
-    echo "[NEXUS-6] Service status:"
     if launchctl list | grep -q "$LABEL"; then
+      echo "✅ Daemon 실행 중"
       launchctl list | grep "$LABEL"
-      echo "[NEXUS-6] Status: ACTIVE"
     else
-      echo "[NEXUS-6] Status: INACTIVE"
+      echo "⏸️  Daemon 중지됨"
     fi
-    if [ -f "$LOG_FILE" ]; then
-      echo ""
-      echo "[NEXUS-6] Last 5 log lines:"
-      tail -5 "$LOG_FILE"
+    echo ""
+    if [ -f "$STATUS_FILE" ]; then
+      echo "📊 마지막 상태:"
+      cat "$STATUS_FILE"
+    fi
+    echo ""
+    if [ -f "$HOME/.nexus6/last_loop_report.txt" ]; then
+      echo "📋 마지막 루프 리포트:"
+      cat "$HOME/.nexus6/last_loop_report.txt"
     fi
     ;;
   logs)
     if [ -f "$LOG_FILE" ]; then
       tail -f "$LOG_FILE"
     else
-      echo "[NEXUS-6] No log file found at $LOG_FILE"
+      echo "로그 없음: $LOG_FILE"
     fi
     ;;
   *)
     echo "Usage: $0 [start|stop|status|logs]"
     echo ""
-    echo "  start   - Load LaunchAgent (runs every 30 min)"
-    echo "  stop    - Unload LaunchAgent"
-    echo "  status  - Show service status + recent logs"
-    echo "  logs    - Tail log file"
+    echo "  start   - 자율 데몬 시작 (30분 간격 루프)"
+    echo "  stop    - 데몬 중지"
+    echo "  status  - 상태 + 마지막 리포트"
+    echo "  logs    - 실시간 로그"
     exit 1
     ;;
 esac
