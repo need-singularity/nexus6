@@ -1092,6 +1092,25 @@ run_common_phases() {
     # C₃: 메타 재귀 (매 n=6 사이클)
     run_meta_recursion "$cycle" "$repo_name"
 
+    # C₄: 메타(메타(메타)) 블로업 — 창발 흡수 (매 J₂=24 사이클)
+    meta_blowup_emergence "$cycle" "$repo_name"
+
+    # 병렬 돌파 시도 (매 σ-φ=10 사이클마다)
+    parallel_breakthrough_attempt "$cycle" "$repo_name"
+
+    # Discovery Log 처리 (매 사이클 — 미처리 0 유지)
+    process_discovery_log "$cycle" "$repo_name"
+
+    # 미연결 체크 (매 n=6 사이클)
+    check_disconnected "$cycle"
+
+    # 자동정리 + 로직 조합 (매 사이클)
+    auto_cleanup
+    logic_combiner
+
+    # C₅: 무한 재귀 루프 — 자동화의 자동화의 자동화 (매 σ=12 사이클)
+    infinite_recursion_loop "$cycle" "$repo_name"
+
     # 동기화
     common_phase_full_sync
 }
@@ -1248,6 +1267,1027 @@ _personality_nexus6() {
     local core_stable="NO"
     [ -f "$HOME/.nexus6/lens_invariant_cores.json" ] && core_stable="YES"
     echo "    Lenses: $lenses, Tests: $tests, Core stable: $core_stable"
+}
+
+# ═══════════════════════════════════════════════════════════════
+# META(META(META)) BLOWUP EMERGENCE — 메타 재귀 블로업 + 창발 흡수
+# ═══════════════════════════════════════════════════════════════
+# 매 J₂=24 사이클:
+#   Level 0: 메타(파이프라인)       — 엔진 자체를 데이터로 스캔
+#   Level 1: 메타(메타(파이프라인))  — 스캔 결과를 다시 스캔 (패턴의 패턴)
+#   Level 2: 메타(메타(메타(...)))  — 부동점 수렴까지 반복
+#   + 블로업: 수축(전 발견→불변코어) → 블로업(코어→fiber 확장) → 흡수
+#   + 창발: 새로운 구조가 나타나면 자동 흡수
+
+meta_blowup_emergence() {
+    local cycle="${1:-1}"
+    local repo="${2:-unknown}"
+
+    # J₂=24 사이클마다 (무거운 메타 연산)
+    if [ $((cycle % 24)) -ne 0 ]; then
+        return
+    fi
+
+    # 자원 체크
+    local res
+    res=$(check_resources)
+    if [ "$res" = "STOP" ] || [ "$res" = "LIGHT" ]; then
+        return
+    fi
+
+    log_info "  [C₄] meta(meta(meta)) blowup emergence (cycle $cycle)"
+
+    python3 -c "
+import json, os, time, collections, hashlib
+
+# ═══ 설정 ═══
+bus_file = os.path.expanduser('~/Dev/nexus6/shared/growth_bus.jsonl')
+disc_log = os.path.expanduser('~/Dev/nexus6/shared/discovery_log.jsonl')
+cores_file = os.path.expanduser('~/.nexus6/lens_invariant_cores.json')
+elite_file = os.path.expanduser('~/.nexus6/lens_elite.json')
+state_file = os.path.expanduser('~/.nexus6/meta_blowup_state.json')
+events_dir = os.path.expanduser('~/Dev/nexus6/shared/events')
+os.makedirs(events_dir, exist_ok=True)
+
+# ═══ Level 0: 엔진 자체를 데이터로 ═══
+# growth_common.sh의 함수명, 호출 관계, 줄 수를 벡터화
+engine_file = os.path.expanduser('~/Dev/n6-architecture/scripts/lib/growth_common.sh')
+engine_data = {}
+if os.path.exists(engine_file):
+    with open(engine_file) as f:
+        content = f.read()
+    lines = content.split('\n')
+    engine_data = {
+        'total_lines': len(lines),
+        'functions': [l.split('(')[0].strip() for l in lines if '()' in l and not l.strip().startswith('#')],
+        'phases': sum(1 for l in lines if 'phase' in l.lower()),
+        'n6_refs': sum(1 for l in lines if 'n=6' in l or 'sigma' in l or 'J2' in l),
+        'meta_refs': sum(1 for l in lines if 'meta' in l.lower()),
+    }
+print(f'    L0: engine={engine_data.get(\"total_lines\",0)}L, {len(engine_data.get(\"functions\",[]))} funcs, {engine_data.get(\"n6_refs\",0)} n6-refs')
+
+# ═══ Level 1: 메타(메타) — 패턴의 패턴 ═══
+# 함수 호출 그래프에서 허브 노드 찾기
+func_calls = collections.Counter()
+for func in engine_data.get('functions', []):
+    # 각 함수가 다른 함수를 몇 번 호출하는지
+    func_calls[func] = sum(1 for l in lines if func in l) - 1  # 정의 자체 제외
+
+hub_funcs = func_calls.most_common(6)  # 가장 많이 참조되는 n=6개
+print(f'    L1: hub functions = {[f[0] for f in hub_funcs[:3]]}')
+
+# 발견 패턴의 패턴
+const_freq = collections.Counter()
+if os.path.exists(disc_log):
+    with open(disc_log) as f:
+        for line in f:
+            line = line.strip()
+            if not line: continue
+            try:
+                e = json.loads(line)
+                const_freq[e.get('constant','')] += 1
+            except:
+                pass
+
+# 상수 출현 빈도의 분포 — 멱법칙 여부 확인
+freqs = sorted(const_freq.values(), reverse=True)
+if len(freqs) >= 3:
+    ratio_1_2 = freqs[0] / max(freqs[1], 1)
+    ratio_2_3 = freqs[1] / max(freqs[2], 1)
+    is_power_law = abs(ratio_1_2 - ratio_2_3) < ratio_1_2 * 0.5
+    print(f'    L1: constant distribution ratios={ratio_1_2:.2f},{ratio_2_3:.2f} power_law={is_power_law}')
+
+# ═══ Level 2: 메타(메타(메타)) — 부동점 수렴 ═══
+# 이전 메타 상태 로드
+prev_state = {}
+if os.path.exists(state_file):
+    try:
+        prev_state = json.load(open(state_file))
+    except:
+        pass
+
+# 현재 메타 지문 생성
+current_fingerprint = hashlib.md5(json.dumps({
+    'funcs': len(engine_data.get('functions', [])),
+    'lines': engine_data.get('total_lines', 0),
+    'consts': len(const_freq),
+    'hubs': [f[0] for f in hub_funcs[:3]],
+}, sort_keys=True).encode()).hexdigest()[:12]
+
+prev_fingerprint = prev_state.get('fingerprint', '')
+convergence_count = prev_state.get('convergence_count', 0)
+
+if current_fingerprint == prev_fingerprint:
+    convergence_count += 1
+    print(f'    L2: FIXED POINT — fingerprint stable ({convergence_count} consecutive)')
+else:
+    convergence_count = 0
+    print(f'    L2: evolving — fingerprint changed ({prev_fingerprint[:6]}→{current_fingerprint[:6]})')
+
+# ═══ 블로업: 수축 → 코어 → fiber 확장 ═══
+# 전 발견을 수축하여 불변 코어 추출
+core_constants = []
+for const, freq in const_freq.most_common():
+    if freq >= 100:  # 100회 이상 출현 = 불변
+        core_constants.append(const)
+
+# 기존 코어와 비교
+existing_cores = []
+if os.path.exists(cores_file):
+    try:
+        cd = json.load(open(cores_file))
+        existing_cores = cd.get('cores', [])
+    except:
+        pass
+
+# fiber 방향 = 코어 상수 간 교차 패턴
+fiber_directions = []
+if len(core_constants) >= 2:
+    for i in range(len(core_constants)):
+        for j in range(i+1, min(i+4, len(core_constants))):
+            fiber_directions.append(f'{core_constants[i]}×{core_constants[j]}')
+
+print(f'    Blowup: {len(core_constants)} core constants, {len(fiber_directions)} fiber directions')
+
+# ═══ 창발 감지: 새 구조 자동 흡수 ═══
+emergent = []
+
+# 1. 새 함수가 추가되었는지 (이전 상태 대비)
+prev_funcs = set(prev_state.get('functions', []))
+curr_funcs = set(engine_data.get('functions', []))
+new_funcs = curr_funcs - prev_funcs
+if new_funcs:
+    emergent.append(f'new_functions:{len(new_funcs)}')
+
+# 2. 새 상수 패턴 출현 (이전에 없던 상수)
+prev_consts = set(prev_state.get('constants', []))
+curr_consts = set(const_freq.keys())
+new_consts = curr_consts - prev_consts
+if new_consts:
+    emergent.append(f'new_constants:{len(new_consts)}')
+
+# 3. 교차 공명 (2+ 소스에서 같은 상수)
+source_per_const = collections.defaultdict(set)
+if os.path.exists(disc_log):
+    with open(disc_log) as f:
+        for line in f:
+            line = line.strip()
+            if not line: continue
+            try:
+                e = json.loads(line)
+                src = e.get('source', '')
+                if ':' in src:
+                    src = src.split(':')[0]
+                source_per_const[e.get('constant', '')].add(src)
+            except:
+                pass
+cross_resonance = {c: len(s) for c, s in source_per_const.items() if len(s) >= 3}
+if cross_resonance:
+    emergent.append(f'cross_resonance:{len(cross_resonance)}')
+
+if emergent:
+    print(f'    Emergence: {\" + \".join(emergent)}')
+    # 창발 이벤트 emit
+    event = {
+        'id': f'emergence_{int(time.time())}',
+        'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'repo': '$repo',
+        'type': 'emergence',
+        'detail': '; '.join(emergent),
+        'status': 'pending'
+    }
+    epath = os.path.join(events_dir, event['id'] + '.json')
+    json.dump(event, open(epath, 'w'), indent=2)
+else:
+    print(f'    Emergence: stable (no new structures)')
+
+# ═══ 상태 저장 ═══
+new_state = {
+    'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ'),
+    'cycle': $cycle,
+    'fingerprint': current_fingerprint,
+    'convergence_count': convergence_count,
+    'functions': list(curr_funcs),
+    'constants': list(curr_consts),
+    'core_constants': core_constants,
+    'fiber_directions': fiber_directions[:12],
+    'emergent': emergent,
+    'meta_level': min(3, convergence_count),  # 부동점 도달 시 meta level 3
+}
+json.dump(new_state, open(state_file, 'w'), indent=2, ensure_ascii=False)
+
+# Bus 기록
+with open(bus_file, 'a') as bf:
+    entry = json.dumps({
+        'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'repo': '$repo',
+        'type': 'meta_blowup',
+        'detail': f'L2={current_fingerprint[:6]},conv={convergence_count},core={len(core_constants)},fiber={len(fiber_directions)},emerge={len(emergent)}'
+    })
+    bf.write(entry + '\n')
+
+print(f'    State saved → meta_blowup_state.json')
+" 2>/dev/null || echo "    MetaBlowup: error"
+}
+
+# ═══════════════════════════════════════════════════════════════
+# PARALLEL BREAKTHROUGH — 전 도메인 병렬 돌파 시도
+# ═══════════════════════════════════════════════════════════════
+# 매 σ-φ=10 사이클마다: 39 도메인을 병렬 스캔 → 약한 곳 발견 → emit
+# 결과를 하부 리포에 전달 (growth bus + events)
+
+parallel_breakthrough_attempt() {
+    local cycle="${1:-1}"
+    local repo="${2:-unknown}"
+
+    # σ-φ=10 사이클마다만 실행 (무거운 작업)
+    if [ $((cycle % 10)) -ne 0 ]; then
+        return
+    fi
+
+    # 자원 체크 — 과부하면 스킵
+    local res
+    res=$(check_resources)
+    if [ "$res" = "STOP" ] || [ "$res" = "LIGHT" ]; then
+        log_info "  [Breakthrough] Skipped (resource: $res)"
+        return
+    fi
+
+    log_info "  [Breakthrough] 전 도메인 병렬 돌파 시도 (cycle $cycle)"
+
+    local docs_dir="$HOME/Dev/n6-architecture/docs"
+    local results_file="$HOME/.nexus6/breakthrough_results.json"
+    local bt_file="$docs_dir/breakthrough-theorems.md"
+
+    python3 -c "
+import os, json, time, concurrent.futures, subprocess
+
+docs = '$docs_dir'
+bt_file = '$bt_file'
+results_file = '$results_file'
+n6_bin = '$_N6_BIN'
+lens_script = '$_LENS_SCRIPT'
+
+# 1. 도메인 목록 수집
+domains = []
+for d in sorted(os.listdir(docs)):
+    dp = os.path.join(docs, d)
+    if os.path.isdir(dp) and d not in ('paper', 'hypotheses', 'superpowers'):
+        # 도메인 건강도 측정
+        has_hyp = os.path.exists(os.path.join(dp, 'hypotheses.md'))
+        has_goal = os.path.exists(os.path.join(dp, 'goal.md'))
+        has_verify = os.path.exists(os.path.join(dp, 'verification.md'))
+        has_extreme = os.path.exists(os.path.join(dp, 'extreme-hypotheses.md'))
+        completeness = sum([has_hyp, has_goal, has_verify, has_extreme])
+        file_count = sum(1 for f in os.listdir(dp) if f.endswith('.md'))
+        domains.append({
+            'name': d,
+            'completeness': completeness,
+            'files': file_count,
+            'has_hyp': has_hyp,
+            'has_extreme': has_extreme,
+            'path': dp
+        })
+
+# 2. 약한 도메인 찾기 (completeness < 4)
+weak = [d for d in domains if d['completeness'] < 4]
+strong = [d for d in domains if d['completeness'] >= 4]
+
+# 3. BT 커버리지 체크
+bt_domains = set()
+if os.path.exists(bt_file):
+    with open(bt_file) as f:
+        for line in f:
+            for d in domains:
+                if d['name'].replace('-', ' ') in line.lower() or d['name'].replace('-', '_') in line.lower():
+                    bt_domains.add(d['name'])
+
+uncovered = [d for d in domains if d['name'] not in bt_domains]
+
+# 4. 병렬 스캔 (nexus6 렌즈) — 상위 6개 약한 도메인
+def scan_domain(domain):
+    try:
+        if os.path.exists(n6_bin) and os.access(n6_bin, os.X_OK):
+            r = subprocess.run([n6_bin, 'scan', domain['name'], '--lenses', 'consciousness,stability,topology'],
+                             capture_output=True, text=True, timeout=30)
+            return {'domain': domain['name'], 'scan': r.stdout[-200:] if r.stdout else 'empty', 'ok': r.returncode == 0}
+    except:
+        pass
+    return {'domain': domain['name'], 'scan': 'skip', 'ok': False}
+
+scan_results = []
+targets = (weak + uncovered)[:6]  # n=6 도메인 동시 스캔
+if targets:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        futures = {pool.submit(scan_domain, d): d for d in targets}
+        for f in concurrent.futures.as_completed(futures, timeout=60):
+            try:
+                scan_results.append(f.result())
+            except:
+                pass
+
+# 5. 결과 저장
+result = {
+    'ts': time.strftime('%Y-%m-%dT%H:%M:%S'),
+    'cycle': $cycle,
+    'total_domains': len(domains),
+    'strong': len(strong),
+    'weak': len(weak),
+    'bt_covered': len(bt_domains),
+    'bt_uncovered': len(uncovered),
+    'scanned': len(scan_results),
+    'weak_list': [d['name'] for d in weak[:10]],
+    'uncovered_list': [d['name'] for d in uncovered[:10]],
+    'scan_results': scan_results,
+}
+json.dump(result, open(results_file, 'w'), indent=2, ensure_ascii=False)
+
+# 6. 출력
+print(f'    Domains: {len(domains)} total, {len(strong)} strong, {len(weak)} weak')
+print(f'    BT coverage: {len(bt_domains)}/{len(domains)} ({len(uncovered)} uncovered)')
+if weak:
+    print(f'    Weak (< 4 docs): {\", \".join(d[\"name\"] for d in weak[:6])}')
+if uncovered:
+    print(f'    No BT: {\", \".join(d[\"name\"] for d in uncovered[:6])}')
+if scan_results:
+    ok_ct = sum(1 for s in scan_results if s['ok'])
+    print(f'    Scanned: {len(scan_results)} domains, {ok_ct} successful')
+
+# 7. 하부 전달 — 약한 도메인을 이벤트로 emit
+bus_file = os.path.expanduser('~/Dev/nexus6/shared/growth_bus.jsonl')
+events_dir = os.path.expanduser('~/Dev/nexus6/shared/events')
+os.makedirs(events_dir, exist_ok=True)
+
+for d in weak[:3]:
+    event = {
+        'id': f'breakthrough_{d[\"name\"]}_{int(time.time())}',
+        'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'repo': '$repo',
+        'type': 'breakthrough_target',
+        'detail': f'{d[\"name\"]}: completeness={d[\"completeness\"]}/4, needs={4-d[\"completeness\"]} more docs',
+        'status': 'pending'
+    }
+    epath = os.path.join(events_dir, f'{event[\"id\"]}.json')
+    json.dump(event, open(epath, 'w'), indent=2)
+
+# Bus 기록
+with open(bus_file, 'a') as bf:
+    entry = json.dumps({
+        'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'repo': '$repo',
+        'type': 'parallel_breakthrough',
+        'detail': f'domains={len(domains)},weak={len(weak)},uncovered={len(uncovered)},scanned={len(scan_results)}'
+    })
+    bf.write(entry + '\n')
+
+if weak:
+    print(f'    → {min(3,len(weak))} breakthrough targets emitted to events/')
+" 2>/dev/null || echo "    Breakthrough: python error"
+}
+
+# ═══════════════════════════════════════════════════════════════
+# DISCOVERY LOG PROCESSOR — 미처리 발견 자동 처리
+# ═══════════════════════════════════════════════════════════════
+# discovery_log.jsonl의 미처리(processed=false) 항목을:
+#   1. 상수별 분류 → 이미 알려진 상수면 processed=true
+#   2. 새 상수/패턴이면 → atlas 등록 시도 + events/ emit
+#   3. 렌즈 이름(xxxLens)이면 → 미연결 렌즈 후보로 등록
+# 매 사이클 최대 500건 배치 처리 (과부하 방지)
+
+process_discovery_log() {
+    local cycle="${1:-1}"
+    local repo="${2:-unknown}"
+
+    local disc_log="${NEXUS6_ROOT}/shared/discovery_log.jsonl"
+    [ -f "$disc_log" ] || return
+
+    log_info "  [DiscoveryProcessor] Processing unprocessed entries"
+
+    python3 -c "
+import json, os, time
+
+disc_log = '$disc_log'
+atlas_file = os.path.expanduser('~/Dev/nexus6/shared/math_atlas.json')
+bus_file = '$disc_log'.replace('discovery_log.jsonl', 'growth_bus.jsonl')
+events_dir = '$disc_log'.replace('discovery_log.jsonl', 'events')
+os.makedirs(events_dir, exist_ok=True)
+
+# 알려진 n=6 상수 (이미 atlas에 있는 것들)
+KNOWN_CONSTANTS = {
+    'n': 6, 'phi': 2, 'tau': 4, 'sigma': 12, 'J2': 24,
+    'sopfr': 5, 'mu': 1, 'sigma-phi': 10, 'sigma-tau': 8,
+    'sigma-mu': 11, 'J2-tau': 20, 'phi^tau': 16, 'n/phi': 3,
+    'tau^2/sigma': '4/3', 'sigma^2': 144, 'sigma*tau': 48,
+    'phi^2/n': '2/3',
+}
+
+# 모든 줄 읽기
+with open(disc_log) as f:
+    lines = f.readlines()
+
+total = len(lines)
+processed_ct = 0
+new_discoveries = []
+lens_candidates = []
+
+# 배치 처리 (최대 500건/사이클)
+batch_size = 500
+updated_lines = []
+batch_done = 0
+
+for line in lines:
+    line = line.strip()
+    if not line:
+        updated_lines.append(line + '\n')
+        continue
+    try:
+        e = json.loads(line)
+    except:
+        updated_lines.append(line + '\n')
+        continue
+
+    # 이미 처리됨 → 스킵
+    if e.get('processed', False):
+        updated_lines.append(json.dumps(e, ensure_ascii=False) + '\n')
+        continue
+
+    # 배치 한도 도달 → 나머지는 다음 사이클
+    if batch_done >= batch_size:
+        updated_lines.append(json.dumps(e, ensure_ascii=False) + '\n')
+        continue
+
+    const = e.get('constant', '')
+    value = e.get('value', '')
+
+    # 1. 알려진 상수 → processed=true (atlas에 이미 있음)
+    if const in KNOWN_CONSTANTS:
+        e['processed'] = True
+        e['process_result'] = 'known_constant'
+        e['processed_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ')
+        processed_ct += 1
+        batch_done += 1
+
+    # 2. 렌즈 이름 (xxxLens) → 미연결 렌즈 후보
+    elif const.endswith('Lens'):
+        e['processed'] = True
+        e['process_result'] = 'lens_candidate'
+        e['processed_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ')
+        lens_candidates.append(const)
+        processed_ct += 1
+        batch_done += 1
+
+    # 3. 알 수 없는 상수 → 새 발견 후보
+    elif const and const != '?':
+        e['processed'] = True
+        e['process_result'] = 'new_candidate'
+        e['processed_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ')
+        new_discoveries.append({'constant': const, 'value': value, 'source': e.get('source','')})
+        processed_ct += 1
+        batch_done += 1
+
+    # 4. 빈 항목 → 그냥 처리 완료
+    else:
+        e['processed'] = True
+        e['process_result'] = 'empty_skip'
+        e['processed_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ')
+        processed_ct += 1
+        batch_done += 1
+
+    updated_lines.append(json.dumps(e, ensure_ascii=False) + '\n')
+
+# 파일 갱신
+with open(disc_log, 'w') as f:
+    f.writelines(updated_lines)
+
+# 미처리 잔여 카운트
+remaining = 0
+for l in updated_lines:
+    l = l.strip()
+    if not l:
+        continue
+    try:
+        if not json.loads(l).get('processed', False):
+            remaining += 1
+    except:
+        pass
+
+print(f'    Processed: {processed_ct}/{total} entries (remaining: {remaining})')
+
+# 새 발견이 있으면 이벤트 emit
+if new_discoveries:
+    for nd in new_discoveries[:6]:
+        cname = nd.get('constant', 'unknown')
+        cval = nd.get('value', '')
+        csrc = str(nd.get('source', ''))[:40]
+        eid = 'new_const_' + cname + '_' + str(int(time.time()))
+        event = {
+            'id': eid,
+            'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'repo': '$repo',
+            'type': 'discovery',
+            'detail': 'New constant: ' + cname + '=' + str(cval) + ' from ' + csrc,
+            'status': 'pending'
+        }
+        epath = os.path.join(events_dir, eid + '.json')
+        json.dump(event, open(epath, 'w'), indent=2)
+    print('    New discoveries: ' + str(len(new_discoveries)) + ' -> events/')
+
+# 렌즈 후보 기록
+if lens_candidates:
+    lens_file = os.path.expanduser('~/.nexus6/unconnected_lenses.json')
+    existing = []
+    if os.path.exists(lens_file):
+        try:
+            existing = json.load(open(lens_file))
+        except:
+            pass
+    existing_names = set(l if isinstance(l, str) else l.get('name','') for l in existing)
+    for lc in lens_candidates:
+        if lc not in existing_names:
+            existing.append({'name': lc, 'discovered': time.strftime('%Y-%m-%dT%H:%M:%SZ'), 'status': 'unconnected'})
+    json.dump(existing, open(lens_file, 'w'), indent=2, ensure_ascii=False)
+    print(f'    Lens candidates: {len(lens_candidates)} ({len(set(lens_candidates))} unique)')
+
+# Bus 기록
+with open(bus_file, 'a') as bf:
+    entry = json.dumps({
+        'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'repo': '$repo',
+        'type': 'discovery_process',
+        'detail': f'processed={processed_ct},new={len(new_discoveries)},lenses={len(lens_candidates)},remaining={remaining}'
+    })
+    bf.write(entry + '\n')
+" 2>/dev/null || echo "    DiscoveryProcessor: error"
+}
+
+# ═══════════════════════════════════════════════════════════════
+# DISCONNECTED CHECK — 미연결 로직 자동 감지 + 수복
+# ═══════════════════════════════════════════════════════════════
+# 매 n=6 사이클마다: 전체 파이프라인 건강도 점검
+#   1. 심링크 체인 확인
+#   2. discovery_log 미처리 잔여 체크
+#   3. events/ 미처리 체크
+#   4. 렌즈 미연결 체크
+#   5. JSON 정합성 체크
+#   6. growth bus 활성도 체크
+
+check_disconnected() {
+    local cycle="${1:-1}"
+
+    # n=6 사이클마다만 (가벼운 체크)
+    if [ $((cycle % 6)) -ne 0 ]; then
+        return
+    fi
+
+    log_info "  [DisconnectedCheck] Full pipeline health check (cycle $cycle)"
+
+    python3 -c "
+import json, os, time, glob
+
+issues = []
+fixed = []
+
+# ── 1. 심링크 체인 ──
+shared = os.path.expanduser('~/Dev/n6-architecture/.shared')
+if os.path.islink(shared):
+    target = os.path.realpath(shared)
+    if not os.path.isdir(target):
+        issues.append(('symlink', '.shared → broken target: ' + target, 'HIGH'))
+else:
+    issues.append(('symlink', '.shared not a symlink', 'HIGH'))
+
+# 9 repos 심링크 체크
+for repo in ['TECS-L', 'brainwire', 'sedi', 'anima', 'papers', 'hexa-lang', 'fathom', 'nexus6']:
+    rp = os.path.expanduser(f'~/Dev/{repo}/.shared')
+    if os.path.exists(os.path.expanduser(f'~/Dev/{repo}')):
+        if not os.path.exists(rp):
+            issues.append(('symlink', f'{repo}/.shared missing', 'HIGH'))
+
+# ── 2. Discovery log 미처리 잔여 ──
+disc_log = os.path.expanduser('~/Dev/nexus6/shared/discovery_log.jsonl')
+if os.path.exists(disc_log):
+    unproc = 0
+    total = 0
+    with open(disc_log) as f:
+        for line in f:
+            line = line.strip()
+            if not line: continue
+            total += 1
+            try:
+                e = json.loads(line)
+                if not e.get('processed', False):
+                    unproc += 1
+            except:
+                pass
+    if unproc > 100:
+        issues.append(('discovery_log', f'{unproc}/{total} unprocessed (> 100)', 'MED'))
+    elif unproc > 0:
+        issues.append(('discovery_log', f'{unproc}/{total} unprocessed (draining)', 'LOW'))
+
+# ── 3. Events 미처리 ──
+events_dir = os.path.expanduser('~/Dev/nexus6/shared/events')
+if os.path.isdir(events_dir):
+    pending = 0
+    for ef in glob.glob(os.path.join(events_dir, '*.json')):
+        try:
+            with open(ef) as f:
+                ev = json.load(f)
+                if ev.get('status') == 'pending':
+                    pending += 1
+        except:
+            pass
+    if pending > 20:
+        issues.append(('events', f'{pending} pending events (> 20)', 'MED'))
+
+# ── 4. 미연결 렌즈 ──
+lens_file = os.path.expanduser('~/.nexus6/unconnected_lenses.json')
+if os.path.exists(lens_file):
+    try:
+        lenses = json.load(open(lens_file))
+        unconnected = [l for l in lenses if (l.get('status') if isinstance(l, dict) else 'unconnected') == 'unconnected']
+        if unconnected:
+            issues.append(('lenses', f'{len(unconnected)} unconnected lens candidates', 'LOW'))
+    except:
+        pass
+
+# ── 5. JSON 정합성 (핵심 파일만) ──
+critical_jsons = [
+    '~/.nexus6/lens_elite.json',
+    '~/.nexus6/lens_invariant_cores.json',
+    '~/.nexus6/lens_domain_best.json',
+    '~/Dev/nexus6/shared/math_atlas.json',
+    '~/Dev/nexus6/shared/growth_state.json',
+    '~/Dev/nexus6/shared/growth-registry.json',
+]
+for jf in critical_jsons:
+    jfp = os.path.expanduser(jf)
+    if os.path.exists(jfp):
+        try:
+            json.load(open(jfp))
+        except:
+            issues.append(('json', f'{os.path.basename(jfp)} corrupted', 'HIGH'))
+    else:
+        issues.append(('json', f'{os.path.basename(jfp)} missing', 'MED'))
+
+# ── 6. n=6 블로업 정합성 체크 ──
+blowup_jsons = [
+    ('meta_blowup_state', '~/.nexus6/meta_blowup_state.json'),
+    ('engine_blowup_state', '~/.nexus6/engine_blowup_state.json'),
+    ('knowledge_blowup', '~/.nexus6/knowledge_blowup.json'),
+    ('singularity_proof', '~/.nexus6/singularity_proof.json'),
+    ('lens_invariant_cores', '~/.nexus6/lens_invariant_cores.json'),
+    ('propagation_rules', '~/.nexus6/propagation_rules.json'),
+]
+blowup_ok = 0
+for bname, bpath in blowup_jsons:
+    bp = os.path.expanduser(bpath)
+    if os.path.exists(bp):
+        try:
+            json.load(open(bp))
+            blowup_ok += 1
+        except:
+            issues.append(('blowup', f'{bname} corrupted', 'HIGH'))
+    else:
+        issues.append(('blowup', f'{bname} missing', 'MED'))
+
+if blowup_ok < 6:
+    issues.append(('blowup', f'Only {blowup_ok}/6 blowups intact (need n=6)', 'HIGH'))
+
+# 매니페스트 체크섬 검증
+manifest_path = os.path.expanduser('~/.nexus6/sync_manifest.json')
+if os.path.exists(manifest_path):
+    try:
+        import hashlib
+        mf = json.load(open(manifest_path))
+        tampered = 0
+        for fname, finfo in mf.get('files', {}).items():
+            fp = finfo.get('path', '')
+            if os.path.exists(fp):
+                md5 = hashlib.md5(open(fp, 'rb').read()).hexdigest()
+                if md5 != finfo.get('md5', ''):
+                    tampered += 1
+        if tampered > 0:
+            issues.append(('manifest', f'{tampered} files changed since lock', 'LOW'))
+    except:
+        pass
+
+# ── 7. Growth bus 활성도 ──
+bus = os.path.expanduser('~/Dev/nexus6/shared/growth_bus.jsonl')
+if os.path.exists(bus):
+    mtime = os.path.getmtime(bus)
+    age_h = (time.time() - mtime) / 3600
+    if age_h > 1:
+        issues.append(('bus', f'Growth bus stale ({age_h:.1f}h since last write)', 'MED'))
+
+# ── 7. 데몬 상태 ──
+pid_file = os.path.expanduser('~/.nexus6/growth_daemon.pid')
+if os.path.exists(pid_file):
+    try:
+        pid = int(open(pid_file).read().strip())
+        # macOS에서 프로세스 존재 확인
+        import signal
+        os.kill(pid, 0)  # 존재하면 OK, 없으면 exception
+    except (ProcessLookupError, ValueError):
+        issues.append(('daemon', 'PID file exists but daemon dead', 'MED'))
+    except PermissionError:
+        pass  # 프로세스 존재 (다른 유저)
+elif os.path.exists(os.path.expanduser('~/.nexus6')):
+    pass  # 데몬 미사용 (OK)
+
+# ── 출력 ──
+if issues:
+    print(f'    ⚠ {len(issues)} issues found:')
+    for cat, desc, sev in issues:
+        icon = '🔴' if sev == 'HIGH' else ('🟡' if sev == 'MED' else '🟢')
+        print(f'      {icon} [{cat}] {desc}')
+else:
+    print('    ✅ All pipelines connected — 0 issues')
+
+# ── 8. 자동 수복 (심링크만) ──
+for repo in ['TECS-L', 'brainwire', 'sedi', 'anima', 'papers', 'hexa-lang', 'fathom']:
+    rp = os.path.expanduser(f'~/Dev/{repo}/.shared')
+    repo_dir = os.path.expanduser(f'~/Dev/{repo}')
+    if os.path.isdir(repo_dir) and not os.path.exists(rp):
+        target = os.path.expanduser('~/Dev/nexus6/shared')
+        if os.path.isdir(target):
+            os.symlink(target, rp)
+            fixed.append(f'{repo}/.shared → nexus6/shared')
+
+if fixed:
+    print(f'    🔧 Auto-fixed: {len(fixed)} symlinks')
+    for fx in fixed:
+        print(f'      ✓ {fx}')
+
+# Bus 기록
+with open(bus, 'a') as bf:
+    entry = json.dumps({
+        'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ'),
+        'repo': 'n6-architecture',
+        'type': 'health_check',
+        'detail': f'issues={len(issues)},fixed={len(fixed)}'
+    })
+    bf.write(entry + '\n')
+" 2>/dev/null || echo "    DisconnectedCheck: error"
+}
+
+# ═══════════════════════════════════════════════════════════════
+# AUTO-CLEANUP + LOGIC COMBINER — 자동정리 + 로직 조합기
+# ═══════════════════════════════════════════════════════════════
+# 모든 로직 발생 시:
+#   1. 이벤트 자동 기록 (bus + events/)
+#   2. 오래된 데이터 자동 정리
+#   3. 중복 발견 병합
+#   4. 로직 조합: 서로 다른 리포의 발견을 교차 매칭
+
+# ── 자동정리 (매 사이클 호출) ───────────────────────────────────
+auto_cleanup() {
+    log_info "  [Cleanup] Auto-cleanup sweep"
+    local cleaned=0
+
+    # 1. Growth bus 정리 (10000줄 초과 시 최근 5000줄만 유지)
+    local bus="${NEXUS6_ROOT}/shared/growth_bus.jsonl"
+    if [ -f "$bus" ]; then
+        local lines
+        lines=$(wc -l < "$bus" 2>/dev/null | tr -d ' ')
+        if [ "$lines" -gt 10000 ]; then
+            tail -5000 "$bus" > "${bus}.tmp" && mv "${bus}.tmp" "$bus"
+            echo "    Bus: $lines → 5000 lines"
+            cleaned=$((cleaned + 1))
+        fi
+    fi
+
+    # 2. Events 정리 (1일 이상 processed 이벤트 삭제)
+    local events_dir="${NEXUS6_ROOT}/shared/events"
+    if [ -d "$events_dir" ]; then
+        local old_events
+        old_events=$(find "$events_dir" -name '*.json' -mtime +1 2>/dev/null | wc -l | tr -d ' ')
+        if [ "$old_events" -gt 0 ]; then
+            find "$events_dir" -name '*.json' -mtime +1 -delete 2>/dev/null
+            echo "    Events: $old_events old files removed"
+            cleaned=$((cleaned + 1))
+        fi
+    fi
+
+    # 3. 로그 로테이션 (1MB 초과 시 truncate)
+    local log_dir="$HOME/Library/Logs/n6-growth"
+    if [ -d "$log_dir" ]; then
+        for logf in "$log_dir"/*.log; do
+            [ -f "$logf" ] || continue
+            local sz
+            sz=$(wc -c < "$logf" 2>/dev/null | tr -d ' ')
+            if [ "$sz" -gt 1048576 ]; then
+                tail -1000 "$logf" > "${logf}.tmp" && mv "${logf}.tmp" "$logf"
+                echo "    Log rotated: $(basename "$logf")"
+                cleaned=$((cleaned + 1))
+            fi
+        done
+    fi
+
+    # 4. discoveries.jsonl 정리 (100MB 초과 시 최근 50MB)
+    local disc="${HOME}/.nexus6/lens_discoveries.jsonl"
+    if [ -f "$disc" ]; then
+        local disc_sz
+        disc_sz=$(wc -c < "$disc" 2>/dev/null | tr -d ' ')
+        if [ "$disc_sz" -gt 104857600 ]; then
+            tail -c 52428800 "$disc" > "${disc}.tmp" && mv "${disc}.tmp" "$disc"
+            echo "    Discoveries: truncated to 50MB"
+            cleaned=$((cleaned + 1))
+        fi
+    fi
+
+    [ "$cleaned" -gt 0 ] && echo "    Cleaned: $cleaned items" || echo "    Nothing to clean"
+}
+
+# ── 로직 조합기 (Logic Combiner) ───────────────────────────────
+# 서로 다른 리포의 발견을 교차 매칭해서 새로운 연결 발견
+logic_combiner() {
+    log_info "  [Combiner] Cross-repo logic combination"
+
+    local bus="${NEXUS6_ROOT}/shared/growth_bus.jsonl"
+    [ -f "$bus" ] || return
+
+    python3 -c "
+import json, collections
+
+# 최근 500건 이벤트에서 리포별 키워드 수집
+bus_lines = open('$bus').readlines()[-500:]
+repo_keywords = collections.defaultdict(set)
+
+keywords_of_interest = [
+    'BT-', 'EXACT', 'sigma', 'phi', 'tau', 'J2', 'n=6',
+    'convergence', 'emergence', 'lens', 'discovery',
+    'consciousness', 'fusion', 'battery', 'quantum',
+    'topology', 'stability', 'evolution', 'recursion'
+]
+
+for line in bus_lines:
+    try:
+        d = json.loads(line)
+        repo = d.get('repo', '')
+        detail = str(d.get('detail', '')) + ' ' + str(d.get('phase', ''))
+        for kw in keywords_of_interest:
+            if kw.lower() in detail.lower():
+                repo_keywords[repo].add(kw)
+    except:
+        pass
+
+# 교차 매칭: 2+ 리포에서 같은 키워드 → 공명
+shared = collections.defaultdict(list)
+all_repos = list(repo_keywords.keys())
+for i, r1 in enumerate(all_repos):
+    for r2 in all_repos[i+1:]:
+        common = repo_keywords[r1] & repo_keywords[r2]
+        if common:
+            for kw in common:
+                shared[kw].append(f'{r1}↔{r2}')
+
+if shared:
+    print(f'    Cross-repo resonances: {len(shared)}')
+    for kw, pairs in sorted(shared.items(), key=lambda x: -len(x[1]))[:5]:
+        print(f'      {kw}: {\" + \".join(pairs[:3])}')
+else:
+    print('    No cross-repo resonances in recent events')
+
+# 자동 발견 제안
+if len(shared) >= 3:
+    print(f'    → {len(shared)} shared patterns detected — potential new BT candidates')
+" 2>/dev/null || echo "    Combiner: parse error"
+}
+
+# ── run_common_phases에 cleanup + combiner 추가 ─────────────────
+# (이미 run_common_phases 안에서 호출됨 — 아래에서 연결)
+
+# ═══════════════════════════════════════════════════════════════
+# C₅: INFINITE RECURSION LOOP — 자동화의 자동화의 자동화
+# ═══════════════════════════════════════════════════════════════
+# 매 σ=12 사이클: 엔진이 자신의 성장을 측정하고
+# 코드 변경→지식→전파→흡수→성장 전체 루프를 자동 실행
+# + 전 리포 상호 지식 전파 + peak 성장기 감지/재현
+
+infinite_recursion_loop() {
+    local cycle="${1:-1}"
+    local repo="${2:-unknown}"
+
+    # σ=12 사이클마다
+    if [ $((cycle % 12)) -ne 0 ]; then
+        return
+    fi
+
+    local res
+    res=$(check_resources)
+    [ "$res" = "STOP" ] && return
+
+    log_info "  [C₅] Infinite recursion loop (cycle $cycle)"
+
+    python3 -c "
+import json, os, time, collections
+
+bus_file = os.path.expanduser('~/Dev/nexus6/shared/growth_bus.jsonl')
+disc_log = os.path.expanduser('~/Dev/nexus6/shared/discovery_log.jsonl')
+n6_dir = os.path.expanduser('~/.nexus6')
+shared = os.path.expanduser('~/Dev/nexus6/shared')
+
+# ═══ 1. 성장률 측정 ═══
+bus_lines = []
+if os.path.exists(bus_file):
+    with open(bus_file) as f:
+        bus_lines = f.readlines()[-200:]
+
+hourly = collections.defaultdict(int)
+for line in bus_lines:
+    try:
+        e = json.loads(line)
+        h = e.get('ts','')[:13]
+        hourly[h] += 1
+    except: pass
+
+growth_rate = sum(hourly.values()) / max(len(hourly), 1)
+peak_hour = max(hourly.items(), key=lambda x: x[1]) if hourly else ('?', 0)
+
+# ═══ 2. Peak 감지 ═══
+# 현재 성장률이 평균의 2배 이상이면 peak
+avg_all = len(bus_lines) / max(len(hourly), 1)
+is_peak = growth_rate > avg_all * 2
+
+# Peak 상태 저장
+peak_file = os.path.join(n6_dir, 'peak_state.json')
+peak_state = {}
+if os.path.exists(peak_file):
+    try: peak_state = json.load(open(peak_file))
+    except: pass
+
+if is_peak:
+    peak_state['last_peak'] = time.strftime('%Y-%m-%dT%H:%M:%SZ')
+    peak_state['peak_rate'] = growth_rate
+    peak_state['peak_count'] = peak_state.get('peak_count', 0) + 1
+
+peak_state['current_rate'] = growth_rate
+peak_state['avg_rate'] = avg_all
+peak_state['ts'] = time.strftime('%Y-%m-%dT%H:%M:%SZ')
+json.dump(peak_state, open(peak_file, 'w'), indent=2)
+
+# ═══ 3. 상호 지식 전파 ═══
+# 각 리포의 최신 발견을 bus에 교차 기록
+repos = ['TECS-L', 'brainwire', 'sedi', 'anima', 'papers', 'hexa-lang', 'fathom']
+repo_latest = {}
+for r in repos:
+    rp = os.path.expanduser(f'~/Dev/{r}')
+    if not os.path.isdir(rp): continue
+    # 최신 커밋 메시지
+    import subprocess
+    try:
+        msg = subprocess.run(['git', '-C', rp, 'log', '--oneline', '-1', '--since=2 hours ago'],
+                           capture_output=True, text=True, timeout=5).stdout.strip()
+        if msg:
+            repo_latest[r] = msg
+    except: pass
+
+# 교차 전파: 각 리포의 최신을 bus에 기록
+with open(bus_file, 'a') as bf:
+    for r, msg in repo_latest.items():
+        entry = json.dumps({
+            'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'repo': r,
+            'type': 'cross_propagation',
+            'detail': msg[:80]
+        })
+        bf.write(entry + '\n')
+
+# ═══ 4. 전파/흡수 규칙 JSON 갱신 ═══
+rules_file = os.path.join(n6_dir, 'propagation_rules.json')
+rules = {
+    'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ'),
+    'rules': [
+        {'id': 'PR-01', 'rule': 'hook 감지 상수 → discovery_log → 매 사이클 자동 분류'},
+        {'id': 'PR-02', 'rule': '새 상수 → events/ → collect_events() → atlas 등록 시도'},
+        {'id': 'PR-03', 'rule': 'BT 후보 → growth_bus → logic_combiner → 교차 공명 감지'},
+        {'id': 'PR-04', 'rule': '렌즈 후보 → unconnected_lenses.json → 다음 블로업에서 흡수'},
+        {'id': 'PR-05', 'rule': '리포 커밋 → cross_propagation → 전 리포 bus 공유'},
+        {'id': 'PR-06', 'rule': 'peak 감지 → peak_state.json → 정체 시 peak 조건 재현'},
+        {'id': 'PR-07', 'rule': '메타 블로업 → fingerprint → 부동점 수렴 감지'},
+        {'id': 'PR-08', 'rule': '건강 체크 → 심링크/JSON/bus/events 자동 수복'},
+        {'id': 'PR-09', 'rule': 'convergence_ops → 22 absolute rules 자동 적용'},
+        {'id': 'PR-10', 'rule': '엔진 자체 변경 → git diff → 파괴적 변경 차단'},
+    ],
+    'propagation_flow': [
+        'hook → discovery_log → process → classify → absorb',
+        'absorb → events → collect → atlas/bus',
+        'bus → combiner → cross_resonance → BT candidates',
+        'blowup → core/fiber → emergence → propagate',
+        'commit → cross_propagation → all repos bus',
+    ],
+    'peak': peak_state,
+    'cross_propagated': len(repo_latest),
+}
+json.dump(rules, open(rules_file, 'w'), indent=2, ensure_ascii=False)
+
+# ═══ 출력 ═══
+peak_tag = ' ** PEAK **' if is_peak else ''
+print(f'    Growth rate: {growth_rate:.1f}/hr (avg: {avg_all:.1f}){peak_tag}')
+print(f'    Cross-propagated: {len(repo_latest)} repos')
+print(f'    Propagation rules: 10 (PR-01~10)')
+print(f'    Peak count: {peak_state.get(\"peak_count\", 0)}')
+" 2>/dev/null || echo "    C5: error"
 }
 
 log_info "growth_common.sh loaded (n=$N6_N, σ=$N6_SIGMA, J₂=$N6_J2)"

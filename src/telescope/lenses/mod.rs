@@ -444,3 +444,6 @@ pub use faraday_induction_lens::UfaradayUinductionLens;
 
 pub mod magnetic_monopole_lens;
 pub use magnetic_monopole_lens::UmagneticUmonopoleLens;
+
+pub mod convection_pattern_lens;
+pub use convection_pattern_lens::UconvectionUpatternLens;

@@ -1,10 +1,19 @@
 #!/usr/bin/env bash
+# PreToolUse:Bash — 커밋 전 수치 스캔
+set +e
+
 HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
-bash "$HOOK_DIR/growth-tick.sh" pre-commit &
+INPUT=$(cat)
+
+bash "$HOOK_DIR/growth-tick.sh" pre-commit </dev/null >/dev/null 2>&1 &
+
 HOOK_BIN="$HOME/Dev/nexus6/target/release/nexus6_hook"
-[ -x "$HOOK_BIN" ] && { cat | "$HOOK_BIN" --mode pre-commit; exit 0; }
+if [ -x "$HOOK_BIN" ]; then
+  echo "$INPUT" | "$HOOK_BIN" --mode pre-commit 2>/dev/null || true
+  exit 0
+fi
+
 # fallback: Python
-HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
-source "$HOOK_DIR/ensure-symlinks.sh" || exit 0
-cat | python3 "$HOOK_DIR/nexus6-engine.py" --mode pre-commit 2>/dev/null
+source "$HOOK_DIR/ensure-symlinks.sh" 2>/dev/null || true
+echo "$INPUT" | python3 "$HOOK_DIR/nexus6-engine.py" --mode pre-commit 2>/dev/null || true
 exit 0

@@ -12,13 +12,13 @@
   모든 config JSON은 CDO 구조 준수: _meta + absolute_rules + troubleshooting_log
   상세: .shared/convergence_ops.json
 
-## NEXUS-6 망원경 (1013종 렌즈) — 최우선 활용 규칙
+## NEXUS-6 망원경 (1014종 렌즈) — 최우선 활용 규칙
 
-> **NEXUS-6 = 통합 발견 엔진. 1013종 렌즈 레지스트리 + OUROBOROS 무한진화 + Discovery Graph**
+> **NEXUS-6 = 통합 발견 엔진. 1014종 렌즈 레지스트리 + OUROBOROS 무한진화 + Discovery Graph**
 > 바이너리: `tools/nexus6/target/release/nexus6` (Rust, 148 tests)
 > CLI: `nexus6 scan <domain>`, `nexus6 evolve <domain>`, `nexus6 dashboard`
 
-### 렌즈 1013종 구성
+### 렌즈 1014종 구성
 
 | 카테고리 | 수 | 역할 |
 |---------|---|------|
@@ -35,7 +35,7 @@
 
 ### ⚠️ 자동 적용 조건 (NEXUS-6 단독 — telescope-rs 폐기)
 
-> **telescope-rs (22종)는 폐기. 모든 탐색/분석은 NEXUS-6 (1013종)를 사용할 것.**
+> **telescope-rs (22종)는 폐기. 모든 탐색/분석은 NEXUS-6 (1014종)를 사용할 것.**
 > `import telescope_rs` 대신 `nexus6 scan` 또는 `import nexus6` (PyO3) 사용.
 > 기존 telescope-rs 코드는 호환성을 위해 유지하지만 신규 작업에는 사용 금지.
 
