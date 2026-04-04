@@ -78,11 +78,18 @@ impl Lens for TopologyLens {
         let total_persistence: f64 = lifetimes.iter().sum();
 
         let mut result = HashMap::new();
+        // Normalize by max_dist to make scale-independent
+        let normalized_persistence = if max_dist > 1e-12 {
+            total_persistence / max_dist
+        } else {
+            total_persistence
+        };
+
         result.insert(
             "betti0_significant".to_string(),
             vec![significant_components as f64],
         );
-        result.insert("total_persistence".to_string(), vec![total_persistence]);
+        result.insert("total_persistence".to_string(), vec![normalized_persistence]);
         result.insert("max_gap".to_string(), vec![max_dist]);
         result.insert("score".to_string(), vec![result["total_persistence"][0].min(1.0).max(0.0)]);
         result

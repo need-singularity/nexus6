@@ -32,9 +32,9 @@ impl Lens for SingularityLens {
         // Singularity strength: peak / median
         let peak_density = densities.iter().cloned().fold(0.0f64, f64::max);
         let singularity_strength = if median_density > 1e-12 {
-            peak_density / median_density
+            (peak_density / median_density).min(1e6)
         } else {
-            0.0
+            peak_density.min(1e6)
         };
 
         // Curvature divergence: second derivative analog via distance differences

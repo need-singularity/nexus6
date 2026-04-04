@@ -56,7 +56,9 @@ impl Lens for QuantumJumpLens {
 
         let jump_count = jump_indices.len();
         let mean_magnitude = if jump_count > 0 {
-            jump_magnitudes.iter().sum::<f64>() / jump_count as f64
+            let raw = jump_magnitudes.iter().sum::<f64>() / jump_count as f64;
+            // Normalize by median_delta for scale-independence
+            if median_delta > 1e-12 { raw / median_delta } else { raw.min(1e6) }
         } else {
             0.0
         };

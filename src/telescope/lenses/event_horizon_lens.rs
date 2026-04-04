@@ -79,7 +79,9 @@ impl Lens for EventHorizonLens {
         };
 
         let mut result = HashMap::new();
-        result.insert("horizon_radius".to_string(), vec![horizon_radius]);
+        // Normalize horizon_radius by median for scale-independence
+        let normalized_horizon = if median_r > 1e-12 { horizon_radius / median_r } else { horizon_radius.min(1e6) };
+        result.insert("horizon_radius".to_string(), vec![normalized_horizon]);
         result.insert("escape_fraction".to_string(), vec![escape_fraction]);
         result.insert("information_loss".to_string(), vec![information_loss]);
         result.insert("hawking_temperature".to_string(), vec![hawking_temperature]);

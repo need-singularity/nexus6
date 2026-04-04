@@ -70,11 +70,12 @@ impl Lens for RecursiveLoopLens {
         let self_similarity = if convergence_history.len() >= 2 {
             let first = convergence_history[0];
             let last = convergence_history[convergence_history.len() - 1];
-            if first > 1e-15 { last / first } else { 0.0 }
+            if first > 1e-15 { (last / first).min(1e6) } else { 0.0 }
         } else { 1.0 };
 
         let convergence_rate = if !convergence_history.is_empty() {
-            convergence_history.iter().sum::<f64>() / convergence_history.len() as f64
+            let rate = convergence_history.iter().sum::<f64>() / convergence_history.len() as f64;
+            if rate.is_finite() { rate } else { 0.0 }
         } else { 0.0 };
 
         let mut result = HashMap::new();

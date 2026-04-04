@@ -38,7 +38,7 @@ impl Lens for TachyonLens {
             .filter(|&&v| v > speed_limit)
             .map(|&v| v * v - limit_sq)
             .sum::<f64>();
-        let tachyon_energy = tachyon_energy / max_n as f64;
+        let tachyon_energy = (tachyon_energy / max_n as f64).min(1e6);
 
         // Causality violation: effect before cause
         // Check if signal[i+1] predicts signal[i] better than signal[i] predicts signal[i+1]

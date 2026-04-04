@@ -39,6 +39,14 @@ write_growth_bus() {
     ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     printf '{"ts":"%s","repo":"%s","phase":"%s","status":"%s","detail":"%s"}\n' \
         "$ts" "$GROWTH_NAME" "$phase" "$status" "$detail" >> "$GROWTH_BUS" 2>/dev/null || true
+
+    # 10K줄 초과 시 로테이션
+    local line_count
+    line_count=$(wc -l < "$GROWTH_BUS" 2>/dev/null | tr -d ' ')
+    if [ "${line_count:-0}" -gt 10000 ]; then
+        mv "$GROWTH_BUS" "${GROWTH_BUS}.$(date +%Y%m%d)" 2>/dev/null || true
+        log_info "📋 growth_bus 로테이션 (${line_count}줄 → 아카이브)"
+    fi
 }
 
 # ── 중복실행 방지 (mkdir 기반, macOS/Linux 호환) ──
@@ -101,9 +109,16 @@ common_blowup() {
     log_info "💥 Blowup (창발)"
     if [ -f "$NEXUS6_BIN" ]; then
         local domain="${1:-number_theory}"
-        NEXUS6_ROOT="$HOME/Dev/nexus6" "$NEXUS6_BIN" blowup "$domain" --depth 6 2>/dev/null | grep -E "따름정리|공리 후보|총 창발|깊이" | while IFS= read -r line; do
+        # 30초 타임아웃 (macOS 호환: bash 백그라운드 + wait)
+        (NEXUS6_ROOT="$HOME/Dev/nexus6" "$NEXUS6_BIN" blowup "$domain" --depth 6 2>/dev/null | grep -E "따름정리|공리 후보|총 창발|깊이" | while IFS= read -r line; do
             log_info "  $line"
-        done
+        done) &
+        local blowup_pid=$!
+        (sleep 30 && kill $blowup_pid 2>/dev/null) &
+        local timer_pid=$!
+        wait $blowup_pid 2>/dev/null
+        kill $timer_pid 2>/dev/null || true
+        wait $timer_pid 2>/dev/null || true
         write_growth_bus "blowup" "ok" "domain=$domain"
     else
         write_growth_bus "blowup" "skip" "no_binary"
@@ -596,12 +611,29 @@ run_growth_loop() {
         cycle=$((cycle + 1))
         log_info "━━━ Cycle $cycle/$max_cycles ━━━"
 
+        # bridge_state 백업
+        local bridge_json="$HOME/Dev/nexus6/shared/bridge_state.json"
+        if [ -f "$bridge_json" ]; then
+            cp "$bridge_json" "${bridge_json}.bak" 2>/dev/null || true
+        fi
+
         # 부하 체크
         local load_status
         load_status=$(check_load)
         if [ "$load_status" = "STOP" ]; then
             log_warn "과부하 — 60초 대기"
             sleep 60; continue
+        fi
+
+        # 디스크 공간 체크
+        local free_gb
+        free_gb=$(df -g / 2>/dev/null | tail -1 | awk '{print $4}')
+        if [ "${free_gb:-99}" -lt 2 ]; then
+            log_warn "⚠️ 디스크 부족 (${free_gb}GB) — incremental cache 정리"
+            for d in "$HOME"/Dev/*/target/*/incremental; do
+                [ -d "$d" ] && rm -rf "$d" 2>/dev/null
+            done
+            log_info "  cache 정리 완료"
         fi
 
         # 프로젝트별 phases

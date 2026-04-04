@@ -66,7 +66,7 @@ impl Lens for EngineDiscoveryLens {
             .map(|(i, _)| i).unwrap_or(0);
 
         // Convergence estimate: based on smoothness and dimensionality
-        let convergence = (d as f64 * 10.0) / smoothness.max(0.01);
+        let convergence = ((d as f64 * 10.0) / smoothness.max(0.01)).min(1e6);
 
         // Parallelizability: high when data is separable (low MI between dims)
         let mi_sum = if d >= 2 {
@@ -85,8 +85,8 @@ impl Lens for EngineDiscoveryLens {
         let search_space = (max_n as f64).ln() * (d as f64).ln().max(1.0);
 
         // Efficiency: insights per op estimate
-        let efficiency = if search_space > 1e-12 {
-            dist_entropy / search_space
+        let efficiency = if search_space > 1e-6 {
+            (dist_entropy / search_space).min(1e6)
         } else { 0.0 };
 
         result.insert("optimal_engine_type".into(), vec![best_idx as f64]);

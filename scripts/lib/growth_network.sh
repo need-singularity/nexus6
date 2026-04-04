@@ -199,4 +199,74 @@ print(f'Live graph: {len(nodes)} nodes, {len(edges)} edges')
     write_growth_bus "live_graph" "ok" ""
 }
 
+# ── #9: 성장 추이 타임라인 (HTML) ──
+
+common_growth_timeline() {
+    log_info "📈 Growth timeline"
+    local bus_file="$HOME/Dev/nexus6/shared/growth_bus.jsonl"
+    local html_file="$HOME/.nexus6/timeline.html"
+    [ ! -f "$bus_file" ] && return
+
+    python3 -c "
+import json, os
+from collections import defaultdict
+
+bus_file = '$bus_file'
+events = []
+with open(bus_file) as f:
+    for line in f:
+        try:
+            ev = json.loads(line)
+            events.append(ev)
+        except: pass
+
+# 프로젝트별 이벤트 수 시계열 (시간별)
+by_hour = defaultdict(lambda: defaultdict(int))
+for ev in events[-5000:]:  # 최근 5000개만
+    ts = ev.get('ts', '')[:13]  # YYYY-MM-DDTHH
+    repo = ev.get('repo', 'unknown')
+    by_hour[ts][repo] += 1
+
+hours = sorted(by_hour.keys())[-48:]  # 최근 48시간
+repos = sorted(set(r for h in hours for r in by_hour[h]))
+
+# HTML
+html = '''<!DOCTYPE html>
+<html><head><meta charset=\"utf-8\"><meta http-equiv=\"refresh\" content=\"60\">
+<title>NEXUS-6 Growth Timeline</title>
+<style>
+body{background:#0a0a0a;color:#0f0;font-family:monospace;padding:20px}
+h1{color:#0ff}
+table{border-collapse:collapse;margin-top:10px}
+td,th{border:1px solid #333;padding:3px 8px;text-align:center;font-size:11px}
+th{color:#ff0}
+.hot{background:#030}
+.cold{background:#111}
+</style></head>
+<body><h1>Growth Timeline (last 48h)</h1>
+<table><tr><th>Hour</th>'''
+
+for r in repos:
+    html += f'<th>{r[:8]}</th>'
+html += '</tr>'
+
+for h in hours:
+    html += f'<tr><td>{h[5:]}</td>'
+    for r in repos:
+        v = by_hour[h].get(r, 0)
+        cls = 'hot' if v > 0 else 'cold'
+        html += f'<td class=\"{cls}\">{v if v > 0 else \"\"}</td>'
+    html += '</tr>'
+
+html += '</table></body></html>'
+
+with open('$html_file', 'w') as f:
+    f.write(html)
+print(f'Timeline: {len(hours)} hours, {len(repos)} repos')
+" 2>/dev/null | while IFS= read -r line; do
+        log_info "  $line"
+    done
+    write_growth_bus "timeline" "ok" ""
+}
+
 # ── growth_network.sh loaded ──

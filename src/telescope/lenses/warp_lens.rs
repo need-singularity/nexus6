@@ -58,9 +58,9 @@ impl Lens for WarpLens {
 
         let nf = warp_factors.len() as f64;
         let mean_warp = warp_factors.iter().sum::<f64>() / nf;
-        let warp_var = warp_factors.iter()
+        let warp_var = (warp_factors.iter()
             .map(|w| (w - mean_warp) * (w - mean_warp))
-            .sum::<f64>() / nf;
+            .sum::<f64>() / nf).min(1e6);
         let contraction_frac = warp_factors.iter().filter(|&&w| w < 1.0).count() as f64 / nf;
 
         let mut result = HashMap::new();

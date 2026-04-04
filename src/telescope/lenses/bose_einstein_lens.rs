@@ -94,7 +94,7 @@ impl Lens for BoseEinsteinLens {
         let max_dist = all_dists.last().copied().unwrap_or(1.0).max(1e-12);
         let volume_fraction = (short_range_threshold / max_dist).powi(d.min(10) as i32);
         let expected_short = (pair_count as f64 * volume_fraction).max(1.0);
-        let g2 = short_pairs as f64 / expected_short;
+        let g2 = (short_pairs as f64 / expected_short).min(1e6);
 
         // 6. Coherence length: find the distance scale where density-density correlation drops to 1/e
         //    Use KNN density and compute correlation vs distance
@@ -159,7 +159,8 @@ impl Lens for BoseEinsteinLens {
         for k in 0..n_bins {
             let e_center = (k as f64 + 0.5) * bin_width;
             // BE distribution (with chemical potential ~ 0 for condensation)
-            let be_expected = 1.0 / ((e_center / kt).exp() - 1.0 + 1e-12);
+            let exponent = (e_center / kt).min(500.0); // prevent exp overflow
+            let be_expected = 1.0 / (exponent.exp() - 1.0 + 1e-12);
             let observed = occupation[k] as f64;
             be_fit_norm += be_expected;
             be_fit_error += (observed - be_expected).abs();

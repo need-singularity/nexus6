@@ -109,6 +109,12 @@ impl BlowupEngine {
                 .filter(|c| c.confidence >= self.config.min_confidence)
                 .collect();
 
+            // dedup by name
+            let mut seen = std::collections::HashSet::new();
+            let validated: Vec<Corollary> = validated.into_iter()
+                .filter(|c| seen.insert(c.name.clone()))
+                .collect();
+
             if validated.is_empty() {
                 break;
             }
@@ -128,10 +134,23 @@ impl BlowupEngine {
                 }
             }
 
-            all_corollaries.extend(validated);
+            // depth별 budget: depth 0에 50%, depth 1에 30%, depth 2+에 20%
+            let depth_budget = match depth {
+                0 => self.config.max_corollaries / 2,
+                1 => self.config.max_corollaries * 3 / 10,
+                _ => self.config.max_corollaries * 2 / 10,
+            };
+            let cycle_corollaries_count = validated.len();
+            if cycle_corollaries_count >= depth_budget {
+                // 이 depth의 budget 소진 → budget만큼만 취하고 다음 depth로
+                all_corollaries.extend(validated.into_iter().take(depth_budget));
+            } else {
+                all_corollaries.extend(validated);
+            }
             depth += 1;
 
-            if all_corollaries.len() >= self.config.max_corollaries {
+            // 총량 3배까지 허용
+            if all_corollaries.len() >= self.config.max_corollaries * 3 {
                 break;
             }
         }

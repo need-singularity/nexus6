@@ -65,6 +65,9 @@ pub fn run(cmd: CliCommand) -> Result<(), String> {
             run_blowup(&domain, max_depth)
         }
         CliCommand::Mega => run_mega(),
+        CliCommand::Dispatch { target, prompt, parallel } => {
+            run_dispatch(&target, &prompt, parallel)
+        }
         CliCommand::Ingest { sources, config, verbose } => run_ingest(sources, config, verbose),
         CliCommand::Bench => run_bench(),
         CliCommand::Dashboard { html, output } => run_dashboard(html, output),
@@ -1416,6 +1419,35 @@ fn run_cycle(experiment_type: &str, target: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn run_dispatch(target: &str, prompt: &str, parallel: bool) -> Result<(), String> {
+    use std::process::Command;
+
+    let nexus_root = std::env::var("NEXUS6_ROOT")
+        .unwrap_or_else(|_| "/Users/ghost/Dev/nexus6".to_string());
+    let script = format!("{}/scripts/dispatch.sh", nexus_root);
+
+    let mut args = Vec::new();
+    if parallel {
+        args.push("--parallel".to_string());
+    }
+    args.push(target.to_string());
+    args.push(prompt.to_string());
+
+    println!("📡 Dispatch: {} → \"{}\"", target, prompt);
+
+    let status = Command::new("bash")
+        .arg(&script)
+        .args(&args)
+        .status()
+        .map_err(|e| format!("dispatch 실행 실패: {}", e))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("dispatch exit {:?}", status.code()))
+    }
+}
+
 fn run_mega() -> Result<(), String> {
     use std::process::Command;
     use std::time::Instant;
@@ -1446,28 +1478,55 @@ fn run_mega() -> Result<(), String> {
     results.push(("nexus6".into(), if loop_ok { "OK" } else { "FAIL" }.into(), loop_time, loop_ok));
     println!();
 
-    // Step 2: 각 프로젝트 infinite_growth 1회
-    println!("━━━ [2/3] 프로젝트별 Growth (1 cycle) ━━━");
-    for (name, _domain, path) in &projects {
-        if *name == "nexus6" { continue; }
-        let script = format!("{}/scripts/infinite_growth.sh", path);
-        if !std::path::Path::new(&script).exists() {
-            results.push((name.to_string(), "NO_SCRIPT".into(), 0.0, false));
-            continue;
+    // heartbeat 갱신
+    for (name, _, path) in &projects {
+        let hb_dir = format!("{}/.growth", path);
+        let _ = std::fs::create_dir_all(&hb_dir);
+        let hb = format!("{}/heartbeat", hb_dir);
+        let now = chrono_now();
+        let _ = std::fs::write(&hb, &now);
+    }
+
+    // Step 2: 각 프로젝트 infinite_growth 1회 (병렬)
+    println!("━━━ [2/3] 프로젝트별 Growth (1 cycle, 병렬) ━━━");
+    {
+        use std::thread;
+        use std::sync::{Arc, Mutex};
+
+        let results_shared = Arc::new(Mutex::new(Vec::new()));
+        let mut handles = Vec::new();
+
+        for (name, _domain, path) in &projects {
+            if *name == "nexus6" { continue; }
+            let script = format!("{}/scripts/infinite_growth.sh", path);
+            if !std::path::Path::new(&script).exists() {
+                results_shared.lock().unwrap().push((name.to_string(), "NO_SCRIPT".into(), 0.0, false));
+                continue;
+            }
+            let name = name.to_string();
+            let script = script.clone();
+            let results = Arc::clone(&results_shared);
+            handles.push(thread::spawn(move || {
+                let pt = std::time::Instant::now();
+                let status = std::process::Command::new("bash")
+                    .arg(&script)
+                    .env("MAX_CYCLES", "1")
+                    .env("INTERVAL", "0")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                let elapsed = pt.elapsed().as_secs_f64();
+                let ok = status.map(|s| s.success()).unwrap_or(false);
+                results.lock().unwrap().push((name, if ok { "OK".into() } else { "FAIL".into() }, elapsed, ok));
+            }));
         }
-        let pt = Instant::now();
-        print!("  {:<20}", format!("{}:", name));
-        let status = Command::new("bash")
-            .arg(&script)
-            .env("MAX_CYCLES", "1")
-            .env("INTERVAL", "0")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        let elapsed = pt.elapsed().as_secs_f64();
-        let ok = status.map(|s| s.success()).unwrap_or(false);
-        println!("{} ({:.1}s)", if ok { "✅" } else { "⚠️" }, elapsed);
-        results.push((name.to_string(), if ok { "OK" } else { "FAIL" }.into(), elapsed, ok));
+        for h in handles { let _ = h.join(); }
+        // Arc에서 결과 꺼내기
+        let parallel_results = results_shared.lock().unwrap().clone();
+        for (name, status, elapsed, _) in &parallel_results {
+            println!("  {:<20} {} ({:.1}s)", format!("{}:", name), if status == "OK" { "✅" } else { "⚠️" }, elapsed);
+        }
+        results.extend(parallel_results);
     }
     println!();
 
@@ -1485,7 +1544,20 @@ fn run_mega() -> Result<(), String> {
 
     for (name, status, time, _ok) in &results {
         let icon = if status == "OK" { "✅" } else if status == "NO_SCRIPT" { "⏭️" } else { "⚠️" };
-        println!("  │ {:<w$}│", format!("  {} {:<20} {} ({:.1}s)", icon, name, status, time));
+
+        // 프로젝트별 상세 정보 읽기
+        let detail = std::fs::read_to_string(format!("/Users/ghost/Dev/{}/.growth/growth_state.json", name))
+            .ok()
+            .and_then(|s| {
+                // cycle 수 추출
+                s.lines().find(|l| l.contains("\"cycle\""))
+                    .and_then(|l| l.split(':').nth(1))
+                    .map(|v| v.trim().trim_matches(',').to_string())
+            })
+            .unwrap_or_else(|| "?".to_string());
+
+        println!("  │ {:<w$}│", format!("  {} {:<18} {} c={} ({:.1}s)",
+            icon, name, status, detail, time));
     }
 
     println!("  ├{}┤", line);
@@ -1750,7 +1822,36 @@ fn run_daemon(domain: Option<String>, interval_min: u64, max_loops: Option<usize
 fn run_loop(domain: Option<String>, cycles: usize) -> Result<(), String> {
     use std::time::Instant;
 
-    let domain_str = domain.as_deref().unwrap_or("number_theory");
+    // 적응형 도메인 선택: 이전 루프 발견 수가 0이면 도메인 전환
+    let domain_str = {
+        let base = domain.as_deref().unwrap_or("number_theory").to_string();
+        let scan_file = std::env::var("HOME")
+            .map(|h| format!("{}/.nexus6/last_scan.txt", h))
+            .unwrap_or_default();
+        let should_rotate = std::fs::read_to_string(&scan_file)
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("domain="))
+                    .map(|l| l.trim_start_matches("domain=").to_string())
+            })
+            .map(|prev_domain| prev_domain == base)
+            .unwrap_or(false);
+
+        if should_rotate && base == "number_theory" {
+            let domains = ["physics", "consciousness", "architecture",
+                           "signal_detection", "neuroscience", "programming_language"];
+            let idx = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as usize % domains.len();
+            let rotated = domains[idx].to_string();
+            println!("  🔄 도메인 자동 전환: {} → {}", base, rotated);
+            rotated
+        } else {
+            base
+        }
+    };
     let now = chrono_now();
     let t0 = Instant::now();
 
@@ -1840,7 +1941,7 @@ fn run_loop(domain: Option<String>, cycles: usize) -> Result<(), String> {
         // Phase 2: Scan
         let pt = Instant::now();
         println!("  [2/8] 🔭 Scan: {}", domain_str);
-        if let Err(e) = run_scan(domain_str, None, false) {
+        if let Err(e) = run_scan(&domain_str, None, false) {
             println!("    ⚠️  scan error: {}", e);
         }
         let reg = LensRegistry::new();
@@ -1901,6 +2002,19 @@ fn run_loop(domain: Option<String>, cycles: usize) -> Result<(), String> {
                 let combos = telescope.discover_combinations(&mr, 6);
                 if !combos.is_empty() {
                     println!("    🔮 조합 발견 {}개", combos.len());
+                }
+
+                // 공명 쌍 → forge 후보 저장
+                if !mirror_top_pairs.is_empty() {
+                    let forge_hint = mirror_top_pairs.iter()
+                        .map(|(a, b, v)| format!("{}+{} resonance={:.0}", a, b, v))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let hint_path = std::env::var("HOME")
+                        .map(|h| format!("{}/.nexus6/forge_hints.txt", h))
+                        .unwrap_or_else(|_| "/tmp/forge_hints.txt".to_string());
+                    let _ = std::fs::write(&hint_path, &forge_hint);
+                    println!("    📝 Forge hints 저장 ({}쌍)", mirror_top_pairs.len());
                 }
 
                 // Mirror Delta: 이전 루프 결과와 비교하여 상전이 감지

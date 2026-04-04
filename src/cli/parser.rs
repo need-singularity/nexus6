@@ -99,6 +99,11 @@ pub enum CliCommand {
         max_depth: usize,
     },
     Mega,
+    Dispatch {
+        target: String,
+        prompt: String,
+        parallel: bool,
+    },
     Help,
 }
 
@@ -158,6 +163,7 @@ pub fn parse_args(args: &[String]) -> Result<CliCommand, String> {
         "daemon" => parse_daemon(rest),
         "blowup" => parse_blowup(rest),
         "mega" => Ok(CliCommand::Mega),
+        "dispatch" | "dp" => parse_dispatch(rest),
         "help" | "--help" | "-h" => Ok(CliCommand::Help),
         other => Err(format!("Unknown command: '{}'. Run 'nexus6 help' for usage.", other)),
     }
@@ -606,6 +612,27 @@ fn parse_daemon(args: &[String]) -> Result<CliCommand, String> {
     }
 
     Ok(CliCommand::Daemon { domain, interval_min, max_loops })
+}
+
+fn parse_dispatch(args: &[String]) -> Result<CliCommand, String> {
+    if args.is_empty() {
+        return Err("dispatch requires <project|all> <prompt>".to_string());
+    }
+    let mut parallel = false;
+    let mut rest = args;
+    if rest[0] == "--parallel" || rest[0] == "-P" {
+        parallel = true;
+        rest = &rest[1..];
+    }
+    if rest.is_empty() {
+        return Err("dispatch requires <project|all> <prompt>".to_string());
+    }
+    let target = rest[0].clone();
+    let prompt = rest[1..].join(" ");
+    if prompt.is_empty() {
+        return Err("dispatch requires a prompt after project name".to_string());
+    }
+    Ok(CliCommand::Dispatch { target, prompt, parallel })
 }
 
 fn parse_blowup(args: &[String]) -> Result<CliCommand, String> {

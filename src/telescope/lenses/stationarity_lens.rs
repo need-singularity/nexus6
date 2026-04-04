@@ -53,7 +53,7 @@ impl Lens for StationarityLens {
             // Variance ratio: max window var / min window var
             let max_var = window_vars.iter().cloned().fold(0.0_f64, f64::max);
             let min_var = window_vars.iter().cloned().fold(f64::INFINITY, f64::min);
-            let vr = if min_var > 1e-12 { max_var / min_var } else { max_var };
+            let vr = if min_var > 1e-12 { (max_var / min_var).min(1e6) } else { max_var.min(1e6) };
             variance_ratios.push(vr);
         }
 
