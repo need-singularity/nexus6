@@ -62,7 +62,7 @@ impl Lens for ColorHarmonyLens {
         let mut hexadic_score = 0.0;
         if feature_hues.len() >= 6 {
             let mut sorted_hues = feature_hues.clone();
-            sorted_hues.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            sorted_hues.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             // Check spacing between consecutive hues
             let mut spacings: Vec<f64> = Vec::new();
             for i in 0..sorted_hues.len() {

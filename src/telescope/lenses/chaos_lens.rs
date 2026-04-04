@@ -145,7 +145,7 @@ fn median_distance(shared: &SharedData, n: usize) -> f64 {
         i += step;
     }
     if dists.is_empty() { return 1.0; }
-    dists.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+    dists.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     dists[dists.len() / 2]
 }
 
@@ -191,7 +191,7 @@ fn correlation_dimension(shared: &SharedData, n: usize) -> f64 {
             dists.push(shared.dist(i, j));
         }
     }
-    dists.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+    dists.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
     if dists.is_empty() || dists[dists.len() - 1] < 1e-15 { return 0.0; }
 

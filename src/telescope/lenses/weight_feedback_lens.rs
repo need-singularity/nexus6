@@ -114,7 +114,7 @@ impl Lens for WeightFeedbackLens {
 
         // Top weighted constant
         let top_idx = const_w.iter().enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
             .map(|(i, _)| i).unwrap_or(0);
 
         // Convergence estimate: L2 distance between persisted and ideal weights

@@ -82,7 +82,7 @@ impl Lens for NarrativeArcLens {
 
             // 2. Climax position: where is the maximum? Ideal = act 4 (index 3)
             let max_idx = acts.iter().enumerate()
-                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|(i, _)| i).unwrap_or(3);
             // Score: 1.0 at index 3, decreasing with distance
             climax_pos_sum += 1.0 / (1.0 + (max_idx as f64 - 3.0).abs());

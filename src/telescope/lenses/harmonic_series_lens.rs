@@ -63,7 +63,7 @@ impl Lens for HarmonicSeriesLens {
         let mut alignment_sum = 0.0;
         for col in &columns {
             let mut sorted: Vec<f64> = col.iter().copied().filter(|x| x.abs() > 1e-12).collect();
-            sorted.sort_by(|a, b| a.abs().partial_cmp(&b.abs()).unwrap());
+            sorted.sort_by(|a, b| a.abs().partial_cmp(&b.abs()).unwrap_or(std::cmp::Ordering::Equal));
             if sorted.len() < 2 { continue; }
             let base = sorted[0].abs();
             if base < 1e-12 { continue; }
@@ -84,7 +84,7 @@ impl Lens for HarmonicSeriesLens {
         let mut found = [false; 6];
         for col in &columns {
             let mut sorted: Vec<f64> = col.iter().copied().filter(|x| x.abs() > 1e-12).collect();
-            sorted.sort_by(|a, b| a.abs().partial_cmp(&b.abs()).unwrap());
+            sorted.sort_by(|a, b| a.abs().partial_cmp(&b.abs()).unwrap_or(std::cmp::Ordering::Equal));
             for w in sorted.windows(2) {
                 let ratio = w[1].abs() / w[0].abs().max(1e-12);
                 for (idx, &(target, _, _)) in HARMONIC_RATIOS.iter().enumerate() {
