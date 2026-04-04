@@ -64,6 +64,7 @@ pub fn run(cmd: CliCommand) -> Result<(), String> {
         CliCommand::Blowup { domain, max_depth } => {
             run_blowup(&domain, max_depth)
         }
+        CliCommand::Mega => run_mega(),
         CliCommand::Ingest { sources, config, verbose } => run_ingest(sources, config, verbose),
         CliCommand::Bench => run_bench(),
         CliCommand::Dashboard { html, output } => run_dashboard(html, output),
@@ -1415,6 +1416,129 @@ fn run_cycle(experiment_type: &str, target: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn run_mega() -> Result<(), String> {
+    use std::process::Command;
+    use std::time::Instant;
+
+    let t0 = Instant::now();
+    println!("🌐 NEXUS-6 MEGA LOOP — 전 프로젝트 통합 루프");
+    println!();
+
+    let projects = vec![
+        ("nexus6",          "number_theory",        "/Users/ghost/Dev/nexus6"),
+        ("anima",           "consciousness",        "/Users/ghost/Dev/anima"),
+        ("TECS-L",          "number_theory",        "/Users/ghost/Dev/TECS-L"),
+        ("n6-architecture", "architecture",         "/Users/ghost/Dev/n6-architecture"),
+        ("sedi",            "signal_detection",     "/Users/ghost/Dev/sedi"),
+        ("brainwire",       "neuroscience",         "/Users/ghost/Dev/brainwire"),
+        ("hexa-lang",       "programming_language", "/Users/ghost/Dev/hexa-lang"),
+        ("fathom",          "terminal",             "/Users/ghost/Dev/fathom"),
+        ("papers",          "publication",          "/Users/ghost/Dev/papers"),
+    ];
+
+    let mut results: Vec<(String, String, f64, bool)> = Vec::new(); // name, status, time, ok
+
+    // Step 1: nexus6 loop
+    println!("━━━ [1/3] NEXUS-6 Core Loop ━━━");
+    let pt = Instant::now();
+    let loop_ok = run_loop(Some("number_theory".to_string()), 1).is_ok();
+    let loop_time = pt.elapsed().as_secs_f64();
+    results.push(("nexus6".into(), if loop_ok { "OK" } else { "FAIL" }.into(), loop_time, loop_ok));
+    println!();
+
+    // Step 2: 각 프로젝트 infinite_growth 1회
+    println!("━━━ [2/3] 프로젝트별 Growth (1 cycle) ━━━");
+    for (name, _domain, path) in &projects {
+        if *name == "nexus6" { continue; }
+        let script = format!("{}/scripts/infinite_growth.sh", path);
+        if !std::path::Path::new(&script).exists() {
+            results.push((name.to_string(), "NO_SCRIPT".into(), 0.0, false));
+            continue;
+        }
+        let pt = Instant::now();
+        print!("  {:<20}", format!("{}:", name));
+        let status = Command::new("bash")
+            .arg(&script)
+            .env("MAX_CYCLES", "1")
+            .env("INTERVAL", "0")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let elapsed = pt.elapsed().as_secs_f64();
+        let ok = status.map(|s| s.success()).unwrap_or(false);
+        println!("{} ({:.1}s)", if ok { "✅" } else { "⚠️" }, elapsed);
+        results.push((name.to_string(), if ok { "OK" } else { "FAIL" }.into(), elapsed, ok));
+    }
+    println!();
+
+    // Step 3: 통합 리포트
+    println!("━━━ [3/3] 통합 리포트 ━━━");
+    let total_time = t0.elapsed().as_secs_f64();
+    let ok_count = results.iter().filter(|r| r.3).count();
+    let total = results.len();
+
+    let w = 65;
+    let line = "─".repeat(w);
+    println!("  ┌{}┐", line);
+    println!("  │ {:<w$}│", format!("🌐 MEGA LOOP — {}/{} 프로젝트 성공", ok_count, total));
+    println!("  ├{}┤", line);
+
+    for (name, status, time, _ok) in &results {
+        let icon = if status == "OK" { "✅" } else if status == "NO_SCRIPT" { "⏭️" } else { "⚠️" };
+        println!("  │ {:<w$}│", format!("  {} {:<20} {} ({:.1}s)", icon, name, status, time));
+    }
+
+    println!("  ├{}┤", line);
+
+    // scan/blowup 결과 표시
+    let scan_file = std::env::var("HOME")
+        .map(|h| format!("{}/.nexus6/last_scan.txt", h))
+        .unwrap_or_default();
+    if let Ok(scan) = std::fs::read_to_string(&scan_file) {
+        for line_str in scan.lines() {
+            if line_str.contains("singularity") || line_str.contains("exact_ratio") || line_str.contains("convergence") {
+                println!("  │ {:<w$}│", format!("  📊 {}", line_str));
+            }
+        }
+    }
+
+    let blowup_file = std::env::var("HOME")
+        .map(|h| format!("{}/.nexus6/last_blowup.txt", h))
+        .unwrap_or_default();
+    if let Ok(blowup) = std::fs::read_to_string(&blowup_file) {
+        for line_str in blowup.lines() {
+            if line_str.contains("total_emergences") || line_str.contains("axiom_candidates") {
+                println!("  │ {:<w$}│", format!("  💥 {}", line_str));
+            }
+        }
+    }
+
+    // heartbeat 상태
+    let mut alive = 0;
+    let mut stale = 0;
+    for (name, _, _) in &projects {
+        let hb = format!("/Users/ghost/Dev/{}/.growth/heartbeat", name);
+        if std::path::Path::new(&hb).exists() { alive += 1; } else { stale += 1; }
+    }
+    println!("  │ {:<w$}│", format!("  💓 Heartbeat: {} alive / {} stale", alive, stale));
+
+    println!("  ├{}┤", line);
+    println!("  │ {:<w$}│", format!("  ⏱️  Total: {:.1}s", total_time));
+    println!("  └{}┘", line);
+
+    // 파일 저장
+    let report = format!(
+        "mega_loop\nprojects={}/{}\ntime={:.1}s\nok={}\nfail={}\n",
+        ok_count, total, total_time, ok_count, total - ok_count
+    );
+    let path = std::env::var("HOME")
+        .map(|h| format!("{}/.nexus6/last_mega.txt", h))
+        .unwrap_or_else(|_| "/tmp/nexus6_mega.txt".to_string());
+    let _ = std::fs::write(&path, &report);
+
+    Ok(())
+}
+
 fn run_blowup(domain: &str, max_depth: usize) -> Result<(), String> {
     use std::collections::HashMap;
 
@@ -2179,6 +2303,9 @@ fn print_help() {
     println!("  daemon [domain] [--interval MIN] [--max-loops N]");
     println!("      Autonomous daemon: runs loop repeatedly with adaptive rest.");
     println!("      Default: 30min interval, infinite loops. Ctrl+C to stop.");
+    println!();
+    println!("  mega");
+    println!("      Mega loop: nexus6 loop + 전 프로젝트 growth 1회 + 통합 리포트.");
     println!();
     println!("  bridge [sub-command] [args...]   (alias: br)");
     println!("      Run nexus-bridge operations directly.");

@@ -98,6 +98,7 @@ pub enum CliCommand {
         domain: String,
         max_depth: usize,
     },
+    Mega,
     Help,
 }
 
@@ -156,6 +157,7 @@ pub fn parse_args(args: &[String]) -> Result<CliCommand, String> {
         "loop" => parse_loop(rest),
         "daemon" => parse_daemon(rest),
         "blowup" => parse_blowup(rest),
+        "mega" => Ok(CliCommand::Mega),
         "help" | "--help" | "-h" => Ok(CliCommand::Help),
         other => Err(format!("Unknown command: '{}'. Run 'nexus6 help' for usage.", other)),
     }
