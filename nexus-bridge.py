@@ -18,6 +18,7 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "nexus-bridge"))
 from bridge import NexusBridge
+from evolve import BridgeEvolver
 
 
 def fmt_stage(stage: str) -> str:
@@ -293,6 +294,70 @@ def cmd_report(bridge: NexusBridge):
     print(f"  └{'─' * (W + 2)}┘")
 
 
+def cmd_evolve(bridge: NexusBridge, args: list[str]):
+    """자기진화 루프 실행."""
+    import time
+
+    cycles = int(args[0]) if args else 1  # 0 = 무한
+    evolver = BridgeEvolver(bridge)
+    ev = evolver.evolve_state
+
+    W = 65
+    def L(text=""):
+        print(f"  │  {text:<{W}}│")
+
+    cycle_count = 0
+    while True:
+        cycle_count += 1
+        if cycles > 0 and cycle_count > cycles:
+            break
+
+        t0 = time.monotonic()
+        result = evolver.evolve_cycle()
+        elapsed = time.monotonic() - t0
+        c = result["cycle"]
+        p = result["phases"]
+
+        # 리포트 출력
+        print(f"  ┌{'─' * (W + 2)}┐")
+        print(f"  │  🌀 NEXUS-BRIDGE Evolve — Cycle {c:<{W - 33}}│")
+        print(f"  ├{'─' * (W + 2)}┤")
+        L()
+        L(f"■ DISCOVER")
+        L(f"  New projects: {p['discover']['new_projects']} | Sync: {p['discover']['sync']}")
+        L(f"■ ABSORB")
+        L(f"  Affinity changed: {p['absorb']['affinity_changed']} | New routes: {p['absorb']['new_routes']}")
+        L(f"■ EXPAND")
+        L(f"  Cross-pollinations: {p['expand']['cross_pollinations']}")
+        L(f"■ DEEPEN")
+        walls_d = p["deepen"]["walls_detected"]
+        walls_b = p["deepen"]["walls_broken"]
+        L(f"  Walls: {walls_d} detected, {walls_b} broken | Depth: {ev.get('depth', 1)}")
+        for action in p["deepen"].get("actions", []):
+            L(f"  → {action}")
+        L()
+
+        # 전체 상태
+        gp = bridge.state.get("bridge", {}).get("growth_points", 0)
+        stage = bridge.state.get("bridge", {}).get("stage", "?")
+        total_walls = ev.get("walls_broken", 0)
+        L(f"■ Bridge: {gp:,} pts | {stage} | Walls broken: {total_walls}")
+        L(f"■ Commit: {result.get('commit_push', {})}")
+
+        if result.get("self_loop"):
+            L(f"■ Self-Loop: {result['self_loop']}")
+
+        L(f"■ Elapsed: {elapsed:.1f}s")
+        L()
+        print(f"  └{'─' * (W + 2)}┘")
+
+        if cycles == 0:
+            # 무한 모드 — 다음 사이클 대기
+            interval = 60 * ev.get("depth", 1)  # depth 비례 간격
+            print(f"\n  next cycle in {interval}s (depth={ev.get('depth', 1)})...")
+            time.sleep(interval)
+
+
 def cmd_commit_push(bridge: NexusBridge, args: list[str]):
     """변경 있는 프로젝트 commit + push."""
     projects = args if args else None
@@ -353,6 +418,7 @@ def main():
         "list": lambda: cmd_list(bridge),
         "notify": lambda: cmd_notify(bridge, args),
         "report": lambda: cmd_report(bridge),
+        "evolve": lambda: cmd_evolve(bridge, args),
         "commit-push": lambda: cmd_commit_push(bridge, args),
         "cp": lambda: cmd_commit_push(bridge, args),
         "loop": lambda: cmd_loop(bridge, args),
