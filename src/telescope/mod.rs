@@ -82,6 +82,7 @@ use lenses::{
     TriangulatedCategoryLens, VCDimensionLens,
     UelectromagneticUwaveLens, UmaxwellUequationLens, UsuperconductorUlensLens,
     UheatUconductionLens, UfaradayUinductionLens, UmagneticUmonopoleLens, UconvectionUpatternLens,
+    CompositionExplorerLens, StabilityFilterLens,
 };
 use shared_data::SharedData;
 
@@ -331,6 +332,8 @@ impl Telescope {
             Box::new(UfaradayUinductionLens),
             Box::new(UmagneticUmonopoleLens),
             Box::new(UconvectionUpatternLens),
+            Box::new(CompositionExplorerLens),
+            Box::new(StabilityFilterLens),
         ];
         Telescope { lenses }
     }

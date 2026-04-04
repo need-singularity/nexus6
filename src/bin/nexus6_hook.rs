@@ -129,37 +129,12 @@ fn discovery_log_path() -> PathBuf {
     PathBuf::from(home).join("Dev/nexus6/shared/discovery_log.jsonl")
 }
 
-/// Rotate a log file if it exceeds max_bytes.
-/// Renames .jsonl -> .jsonl.1, .jsonl.1 -> .jsonl.2, etc., keeping at most max_files rotated copies.
-fn rotate_log_if_needed(path: &str, max_bytes: u64, max_files: usize) {
-    let meta = match fs::metadata(path) {
-        Ok(m) => m,
-        Err(_) => return,
-    };
-    if meta.len() <= max_bytes {
-        return;
-    }
-
-    // Shift existing rotated files: .N -> .N+1 (highest first)
-    for i in (1..max_files).rev() {
-        let src = format!("{}.{}", path, i);
-        let dst = format!("{}.{}", path, i + 1);
-        let _ = fs::rename(&src, &dst);
-    }
-
-    // Rotate current file to .1
-    let _ = fs::rename(path, format!("{}.1", path));
-
-    // Delete overflow file if it exists
-    let overflow = format!("{}.{}", path, max_files + 1);
-    let _ = fs::remove_file(&overflow);
-}
 
 fn record_discovery(value: f64, constant: &str, source: &str) {
     let path = discovery_log_path();
     let cfg = NexusConfig::load();
     rotate_log_if_needed(
-        path.to_str().unwrap_or(""),
+        &path,
         cfg.log_rotation_max_bytes(),
         cfg.log_rotation_max_files(),
     );

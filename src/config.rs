@@ -14,6 +14,7 @@ pub struct NexusConfig {
     pub evolution: Option<EvolutionSection>,
     pub forge: Option<ForgeSection>,
     pub log_rotation: Option<LogRotationSection>,
+    pub materials: Option<MaterialsSection>,
 }
 
 // ── Section structs ─────────────────────────────────────────────
@@ -74,6 +75,12 @@ pub struct LogRotationSection {
     pub max_bytes: Option<u64>,
     /// Maximum number of rotated files to keep (default: 5).
     pub max_files: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct MaterialsSection {
+    /// Materials Project API key (alternative to MP_API_KEY env var).
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -246,6 +253,9 @@ pub fn default_config_toml() -> String {
 # max_candidates = 20
 # min_confidence = 0.2
 # similarity_threshold = 0.8
+
+[materials]
+# api_key = "your-materials-project-api-key"
 
 [log_rotation]
 # max_bytes = 1048576   # 1 MB
