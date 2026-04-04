@@ -357,7 +357,7 @@ fn test_registry_by_category() {
         complementary: vec![],
     });
     assert_eq!(reg.by_category(LensCategory::Extended).len(), 992);
-    assert_eq!(reg.len(), 1015);
+    assert_eq!(reg.len(), 1025);
 }
 
 // ──────────────────────────────────────────────
@@ -433,7 +433,7 @@ fn test_register_custom() {
         complementary: vec!["consciousness".into()],
     });
 
-    assert_eq!(reg.len(), 1015);
+    assert_eq!(reg.len(), 1025);
 
     let custom = reg.get("my_custom_lens").unwrap();
     assert_eq!(custom.category, LensCategory::Custom);
