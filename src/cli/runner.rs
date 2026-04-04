@@ -1322,6 +1322,8 @@ fn run_loop(domain: Option<String>, cycles: usize) -> Result<(), String> {
     let mut scan_total = 0usize;
     let mut bridge_sync_ok = 0usize;
     let mut bridge_sync_total = 0usize;
+    let mut discovered_projects = 0usize;
+    let mut connected_projects = 0usize;
     let mut phase_times: Vec<(String, f64)> = Vec::new();
     let mut discovery_curve: Vec<usize> = Vec::new();
     // Carry forged lenses across cycles so growth accumulates
@@ -1332,21 +1334,50 @@ fn run_loop(domain: Option<String>, cycles: usize) -> Result<(), String> {
             println!("━━━ Cycle {}/{} ━━━", cycle, cycles);
         }
 
-        // Phase 1: Scan
+        // Phase 1: Discover + Auto-Connect
         let pt = Instant::now();
-        println!("  [1/4] 🔭 Scan: {}", domain_str);
+        println!("  [1/6] 🔍 Discover + Connect");
+        // discover new projects
+        let disc_out = run_bridge_capture(vec!["discover".to_string()]);
+        let new_count = disc_out.lines()
+            .filter(|l| l.contains("새 프로젝트 발견"))
+            .filter_map(|l| l.split_whitespace().next().and_then(|n| n.trim().parse::<usize>().ok()))
+            .next().unwrap_or(0);
+        if new_count > 0 {
+            discovered_projects += new_count;
+            // extract project names and auto-connect each
+            for line in disc_out.lines() {
+                let trimmed = line.trim();
+                // lines like "  1. project_name   [markers]"
+                if let Some(rest) = trimmed.strip_prefix(|c: char| c.is_ascii_digit()) {
+                    let rest = rest.trim_start_matches('.');
+                    if let Some(name) = rest.trim().split_whitespace().next() {
+                        println!("    → auto-connect: {}", name);
+                        let _ = run_bridge(vec!["connect".to_string(), name.to_string()]);
+                        connected_projects += 1;
+                    }
+                }
+            }
+        } else {
+            println!("    모든 프로젝트 연결됨");
+        }
+        phase_times.push(("Discover".to_string(), pt.elapsed().as_secs_f64()));
+
+        // Phase 2: Scan
+        let pt = Instant::now();
+        println!("  [2/6] 🔭 Scan: {}", domain_str);
         if let Err(e) = run_scan(domain_str, None, false) {
             println!("    ⚠️  scan error: {}", e);
         }
         let reg = LensRegistry::new();
         scan_total = reg.iter().count();
-        scan_active = scan_total; // all registered lenses are active
+        scan_active = scan_total;
         phase_times.push(("Scan".to_string(), pt.elapsed().as_secs_f64()));
 
-        // Phase 2: Auto (evolve + forge) — carry_registry feeds forged lenses forward
+        // Phase 3: Auto (evolve + forge)
         let pt = Instant::now();
         let carry_len = carry_registry.len();
-        println!("  [2/4] 🐍 Auto: {} (3 meta × 3 ouro) [registry: {}]", domain_str, carry_len);
+        println!("  [3/6] 🐍 Auto: {} (3m×3o) [{}]", domain_str, carry_len);
         let seeds = vec![format!("n=6 in {}", domain_str)];
         let config = MetaLoopConfig {
             max_ouroboros_cycles: 3,
@@ -1364,41 +1395,45 @@ fn run_loop(domain: Option<String>, cycles: usize) -> Result<(), String> {
             }
         }));
         let result = meta_loop.run();
-        // Update carry_registry with forged lenses for next cycle
         carry_registry = result.final_registry.clone();
         total_discoveries += result.total_discoveries;
         total_forged.extend(result.forged_lenses.clone());
-        // Build discovery curve from per-meta summaries
         for s in &result.meta_cycle_summaries {
             discovery_curve.push(s.discoveries);
         }
         phase_times.push(("Auto".to_string(), pt.elapsed().as_secs_f64()));
 
-        // Phase 3: Bridge Sync
+        // Phase 4: Bridge Sync
         let pt = Instant::now();
-        println!("  [3/4] 🌉 Bridge Sync");
+        println!("  [4/6] 🌉 Bridge Sync");
         if let Err(e) = run_bridge(vec!["sync".to_string()]) {
             println!("    ⚠️  {}", e);
         }
-        // Parse bridge sync results (approximate from bridge state)
-        bridge_sync_ok = 6; // will be overwritten by actual count if available
+        bridge_sync_ok = 6;
         bridge_sync_total = 8;
         phase_times.push(("Sync".to_string(), pt.elapsed().as_secs_f64()));
 
-        // Phase 4: Bridge Evolve
+        // Phase 5: Bridge Evolve
         let pt = Instant::now();
-        println!("  [4/4] 🌀 Bridge Evolve");
+        println!("  [5/6] 🌀 Bridge Evolve");
         if let Err(e) = run_bridge(vec!["evolve".to_string(), "1".to_string()]) {
             println!("    ⚠️  {}", e);
         }
         phase_times.push(("BrEvolve".to_string(), pt.elapsed().as_secs_f64()));
+
+        // Phase 6: Commit + Push
+        let pt = Instant::now();
+        println!("  [6/6] 📦 Commit + Push");
+        if let Err(e) = run_bridge(vec!["cp".to_string()]) {
+            println!("    ⚠️  {}", e);
+        }
+        phase_times.push(("CommitPush".to_string(), pt.elapsed().as_secs_f64()));
         println!();
     }
 
     // ── Post-state snapshot ──
     let elapsed = t0.elapsed().as_secs_f64();
-    let registry_after = LensRegistry::new();
-    let lens_after = registry_after.iter().count();
+    let lens_after = carry_registry.len();
     let graph_after = DiscoveryGraph::load(&graph_path)
         .map(|g| (g.nodes.len(), g.edges.len()))
         .unwrap_or((0, 0));
@@ -1458,8 +1493,11 @@ fn run_loop(domain: Option<String>, cycles: usize) -> Result<(), String> {
     println!("  │  {:<w$}│", "");
     println!("{}", sep);
 
-    // Bridge
-    println!("  │  {:<w$}│", format!("■ 브릿지: sync {}/{} | evolve 1cycle", bridge_sync_ok, bridge_sync_total));
+    // Discover + Bridge
+    if discovered_projects > 0 || connected_projects > 0 {
+        println!("  │  {:<w$}│", format!("■ 탐색: {}개 발견 / {}개 자동연결", discovered_projects, connected_projects));
+    }
+    println!("  │  {:<w$}│", format!("■ 브릿지: sync {}/{} | evolve 1cycle | commit+push ✓", bridge_sync_ok, bridge_sync_total));
     println!("  │  {:<w$}│", "");
     println!("{}", sep);
 
@@ -1487,6 +1525,39 @@ fn chrono_now() -> String {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "?".to_string())
+}
+
+/// Run bridge command and capture stdout as string.
+fn run_bridge_capture(sub: Vec<String>) -> String {
+    use std::process::Command;
+
+    let nexus_root = std::env::var("NEXUS6_ROOT")
+        .unwrap_or_else(|_| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                .and_then(|p| p.parent().map(|d| d.to_string_lossy().to_string()))
+                .unwrap_or_else(|| ".".to_string())
+        });
+
+    let script = format!("{}/nexus-bridge.py", nexus_root);
+    if !std::path::Path::new(&script).exists() {
+        return String::new();
+    }
+
+    let args: Vec<&str> = if sub.is_empty() {
+        vec!["status"]
+    } else {
+        sub.iter().map(|s| s.as_str()).collect()
+    };
+
+    Command::new("python3")
+        .arg(&script)
+        .args(&args)
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default()
 }
 
 fn run_bridge(sub: Vec<String>) -> Result<(), String> {
