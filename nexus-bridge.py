@@ -188,6 +188,92 @@ def cmd_notify(bridge: NexusBridge, args: list[str]):
     print(f"  [{source}] {event} x{count} → +{points} pts (total: {gp}, stage: {stage})")
 
 
+def cmd_report(bridge: NexusBridge):
+    """극가속 스타일 리포트 출력."""
+    import subprocess
+
+    s = bridge.status()
+    state = bridge.state
+    b = state.get("bridge", {})
+    conn = state.get("connections", {})
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    # git 정보
+    r = subprocess.run(["git", "log", "--oneline", "-1"], capture_output=True, text=True,
+                       cwd=str(bridge.nexus_root))
+    last_commit = r.stdout.strip()[:60] if r.stdout else "?"
+
+    r2 = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True,
+                        cwd=str(bridge.nexus_root))
+    dirty = len([l for l in r2.stdout.strip().split("\n") if l]) if r2.stdout.strip() else 0
+
+    # 성장 진행 바
+    thresholds = sorted(bridge.config["growth"]["stage_thresholds"].items(), key=lambda x: x[1])
+    gp = b.get("growth_points", 0)
+    current_stage = b.get("stage", "seedling")
+    stage_bar = ""
+    for name, thresh in thresholds:
+        if gp >= thresh:
+            stage_bar += f"  {name} {'█' * 8} ✅"
+        else:
+            filled = min(8, int(8 * gp / thresh)) if thresh > 0 else 0
+            stage_bar += f"  {name} {'█' * filled}{'░' * (8 - filled)} 🔄"
+            break
+        stage_bar += "\n"
+
+    # 프로젝트별 affinity 바
+    proj_bars = ""
+    for name, p in sorted(s["projects"].items(), key=lambda x: x[1]["affinity"], reverse=True):
+        aff = p["affinity"]
+        bar_len = int(aff / 10)
+        bar = "━" * bar_len + "░" * (10 - bar_len)
+        sync_ago = ""
+        if p["last_sync"] and p["last_sync"] != "never":
+            try:
+                last = datetime.fromisoformat(p["last_sync"])
+                delta = datetime.now() - last
+                if delta.total_seconds() < 3600:
+                    sync_ago = f"{int(delta.total_seconds()/60)}m ago"
+                else:
+                    sync_ago = f"{int(delta.total_seconds()/3600)}h ago"
+            except Exception:
+                sync_ago = ""
+        proj_bars += f"  │  {name:<16} {bar} {aff:>5.1f}  {p['absorbed']:>5,}  {sync_ago}\n"
+
+    # 라우팅 요약
+    rt = state.get("routing_table", {})
+    total_routed = sum(sum(v.values()) for v in rt.values())
+    top_types = sorted(rt.items(), key=lambda x: sum(x[1].values()), reverse=True)[:3]
+    route_summary = ", ".join(f"{t}({sum(v.values())})" for t, v in top_types)
+
+    # 건강
+    issues = bridge.health_check()
+    health_str = "✅ 전원 정상" if not issues else f"⚠️ {len(issues)}건 문제"
+
+    print(f"""┌─────────────────────────────────────────────────────────────┐
+│  NEXUS-BRIDGE 리포트 — {now:<36}│
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  ■ 브릿지 상태 {fmt_stage(current_stage):<43}│
+│  Growth: {gp:>6,} pts | Health: {b.get('health',0):.0f}% | Cycle: {b.get('cycle',0):<11}│
+│  Connections: {s['active']} active / {s['dormant']} dormant | Routes: {total_routed:,}       │
+│  ───────────────────────────────────────────────────────────│
+│  📈 성장 로드맵:                                              │
+{stage_bar}│                                                             │
+│  ■ 프로젝트 연결 ({s['total_connections']}개)                                     │
+│  {'Project':<18} {'Affinity':>10} {'Absorbed':>7}  {'Sync':<8}│
+│  ───────────────────────────────────────────────────────────│
+{proj_bars}│  ───────────────────────────────────────────────────────────│
+│  ■ 라우팅 Top: {route_summary:<44}│
+│  Total: {total_routed:,} items across {len(rt)} types                          │
+│                                                             │
+│  ■ 건강 체크: {health_str:<45}│
+│  ■ Git: {last_commit:<52}│
+│  ■ Dirty: {dirty} files                                              │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘""")
+
+
 def cmd_commit_push(bridge: NexusBridge, args: list[str]):
     """변경 있는 프로젝트 commit + push."""
     projects = args if args else None
@@ -247,6 +333,7 @@ def main():
         "health": lambda: cmd_health(bridge),
         "list": lambda: cmd_list(bridge),
         "notify": lambda: cmd_notify(bridge, args),
+        "report": lambda: cmd_report(bridge),
         "commit-push": lambda: cmd_commit_push(bridge, args),
         "cp": lambda: cmd_commit_push(bridge, args),
         "loop": lambda: cmd_loop(bridge, args),
