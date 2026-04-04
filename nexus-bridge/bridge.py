@@ -11,6 +11,7 @@
 import json
 import os
 import subprocess
+import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -62,8 +63,91 @@ class NexusBridge:
 
     def _save_state(self):
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.state_path, "w") as f:
-            json.dump(self.state, f, indent=2, ensure_ascii=False)
+        # Backup existing state before overwrite
+        if self.state_path.exists():
+            bak = self.state_path.with_suffix(".json.bak")
+            try:
+                bak.write_text(self.state_path.read_text())
+            except OSError:
+                pass
+        # Atomic write: tempfile + rename
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(self.state_path.parent),
+            suffix=".tmp",
+            prefix="bridge_state_",
+        )
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(self.state, f, indent=2, ensure_ascii=False)
+            os.replace(tmp_path, str(self.state_path))
+        except Exception:
+            # Clean up temp file on failure
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+    # ── 자기갱신 (self-update) ────────────────────────────
+
+    def update(self) -> dict:
+        """Pull latest repo, reload config, validate state."""
+        report: dict = {"git_pull": None, "config_reloaded": False,
+                        "state_fixed": [], "changed_keys": []}
+
+        # 1. git pull
+        ok, out = self._git(self.nexus_root, "pull", "--ff-only")
+        report["git_pull"] = {"ok": ok, "output": out[:200]}
+
+        # 2. Reload config.json
+        old_config = self.config.copy()
+        self.config = self._load_config()
+        report["config_reloaded"] = True
+        changed = [k for k in set(list(old_config) + list(self.config))
+                   if old_config.get(k) != self.config.get(k)]
+        report["changed_keys"] = changed
+
+        # 3. Validate bridge_state.json integrity
+        report["state_fixed"] = self._validate_state()
+
+        return report
+
+    def _validate_state(self) -> list[str]:
+        """Check bridge_state.json structure, fix missing/corrupt fields."""
+        fixes = []
+        # Ensure required top-level keys
+        required = {
+            "_meta": {
+                "description": "nexus-bridge — project connection state",
+                "version": "0.1.0",
+                "created": datetime.now().isoformat(),
+            },
+            "bridge": {
+                "stage": "seedling", "cycle": 0, "health": 100.0,
+                "total_processed": 0, "total_routed": 0, "growth_points": 0,
+            },
+            "connections": {},
+            "routing_table": {},
+            "growth_log": [],
+        }
+        for key, default in required.items():
+            if key not in self.state:
+                self.state[key] = default
+                fixes.append(f"added missing key: {key}")
+            elif not isinstance(self.state[key], type(default)):
+                self.state[key] = default
+                fixes.append(f"reset corrupt key: {key}")
+
+        # Ensure bridge sub-keys
+        bridge = self.state["bridge"]
+        for field, default in required["bridge"].items():
+            if field not in bridge:
+                bridge[field] = default
+                fixes.append(f"added bridge.{field}")
+
+        if fixes:
+            self._save_state()
+        return fixes
 
     # ── 프로젝트 감지 ──────────────────────────────────
 
@@ -386,7 +470,7 @@ class NexusBridge:
         r = subprocess.run(
             ["git", *args],
             cwd=str(repo_path),
-            capture_output=True, text=True, timeout=30
+            capture_output=True, text=True, timeout=120
         )
         return r.returncode == 0, r.stdout.strip() or r.stderr.strip()
 

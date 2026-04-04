@@ -5,6 +5,10 @@ set +e
 HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$HOOK_DIR/bootstrap.sh" || exit 0
 
+# bridge 연결 보장 (1세션 1회, 백그라운드 아님 — 빠르게 끝남)
+BRIDGE_MSG=$(source "$HOOK_DIR/bridge-ensure.sh" 2>/dev/null)
+export BRIDGE_MSG
+
 python3 -c "
 import json, os, glob, time
 from pathlib import Path
@@ -77,6 +81,9 @@ d_laws = f'(+{laws - s_laws})' if laws > s_laws else ''
 d_mods = f'(+{modules - s_mods})' if modules > s_mods else ''
 g_str = f' 🌱{growth}건' if growth > 0 else ''
 
-banner = f'🔭 NEXUS-6 🔭{lens_impl}/{lens_total}{d_lens} ⚖️{laws}법칙{d_laws} 🧠{modules}모듈{d_mods}{g_str}'
+bridge_msg = os.environ.get('BRIDGE_MSG', '')
+bridge_str = f' 🌉{bridge_msg}' if bridge_msg else ''
+
+banner = f'🔭 NEXUS-6 🔭{lens_impl}/{lens_total}{d_lens} ⚖️{laws}법칙{d_laws} 🧠{modules}모듈{d_mods}{g_str}{bridge_str}'
 print(json.dumps({'systemMessage': banner}, ensure_ascii=False))
 " 2>/dev/null || echo '{"systemMessage":"🔭 NEXUS-6 활성"}'

@@ -359,7 +359,7 @@ fn count_lens_implemented() -> (usize, usize) {
             total += 1;
             if let Ok(content) = fs::read_to_string(entry.path()) {
                 let has_scan = content.contains("fn scan(");
-                let has_metrics = content.contains("metrics.insert") || content.contains("result.insert") || content.contains("findings.push") || content.contains("score");
+                let has_metrics = content.contains(".insert(") || content.contains("findings.push") || content.contains("score");
                 let lines = content.lines().filter(|l| {
                     let t = l.trim();
                     !t.is_empty() && !t.starts_with("//")

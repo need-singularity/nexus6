@@ -10,6 +10,7 @@ Usage:
   python3 nexus-bridge.py sync lenses,readmes # 부분 동기화
   python3 nexus-bridge.py health              # 건강 점검
   python3 nexus-bridge.py list                # 연결된 프로젝트 목록
+  python3 nexus-bridge.py update             # git pull + config reload + state validate
 """
 
 import sys
@@ -387,6 +388,37 @@ def cmd_commit_push(bridge: NexusBridge, args: list[str]):
     print(f"\n  {pushed} pushed, {clean} clean, {len(results) - pushed - clean} failed")
 
 
+def cmd_update(bridge: NexusBridge):
+    """Pull latest, reload config, validate state."""
+    print("  Updating nexus-bridge...")
+    r = bridge.update()
+
+    # git pull
+    gp = r["git_pull"]
+    if gp["ok"]:
+        out = gp["output"].strip()
+        if "Already up to date" in out:
+            print("  [git] Already up to date")
+        else:
+            print(f"  [git] Pulled: {out[:80]}")
+    else:
+        print(f"  [git] Pull failed: {gp['output'][:80]}")
+
+    # config
+    if r["changed_keys"]:
+        print(f"  [config] Changed keys: {', '.join(r['changed_keys'])}")
+    else:
+        print("  [config] No changes")
+
+    # state validation
+    if r["state_fixed"]:
+        print(f"  [state] Fixed {len(r['state_fixed'])} issues:")
+        for fix in r["state_fixed"]:
+            print(f"    - {fix}")
+    else:
+        print("  [state] Integrity OK")
+
+
 def cmd_loop(bridge: NexusBridge, args: list[str]):
     """sync → commit → push 반복 루프."""
     interval = int(args[0]) if args else 300
@@ -422,6 +454,7 @@ def main():
         "commit-push": lambda: cmd_commit_push(bridge, args),
         "cp": lambda: cmd_commit_push(bridge, args),
         "loop": lambda: cmd_loop(bridge, args),
+        "update": lambda: cmd_update(bridge),
     }
 
     if cmd in commands:
