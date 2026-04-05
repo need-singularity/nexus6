@@ -72,6 +72,12 @@ const N6_CONSTANTS: &[(&str, f64)] = &[
     // ── Physical exponents (dimensionless) ──────────────
     ("J2-mu", 23.0),         // Avogadro exponent mantissa
     ("-J2+mu", -23.0),       // Boltzmann exponent
+    // ── QED / cosmology compound formulas ──────────────
+    ("alpha_inv", 137.033_333_333),           // α⁻¹ ≈ σ² − M₃ + φ/(σ·sopfr)
+    ("m_p/m_e (Lenz)", 1836.118_108_87),      // n·π⁵
+    ("Omega_m (meta FP)", 0.333_333_333_3),   // φ/n = ρ
+    ("Omega_Lambda", 0.666_666_666_6),        // τ/n = 1-ρ
+    ("u/d quark density", 0.666_666_666_6),   // τ/n
 ];
 
 /// Match a value against n=6 constants.
