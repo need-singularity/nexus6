@@ -186,12 +186,14 @@ fn run_with_config(cmd: CliCommand, cfg: &NexusConfig) -> Result<(), String> {
         CliCommand::SingularityTick { base_dir } => run_singularity_tick(base_dir),
         CliCommand::SingularityDaemon { base_dir, interval_sec } => run_singularity_daemon(base_dir, interval_sec),
         CliCommand::SingularityBackfill { base_dir, project_root, memory, all_projects, fast } => run_singularity_backfill(base_dir, project_root, memory, all_projects, fast),
-        CliCommand::SingularityConvergence { base_dir, eps, min_domains, top } => run_singularity_convergence(base_dir, eps, min_domains, top),
+        CliCommand::SingularityConvergence { base_dir, eps, min_domains, top, export } => run_singularity_convergence(base_dir, eps, min_domains, top, export),
         CliCommand::SingularityQuery { base_dir, query, limit } => run_singularity_query(base_dir, query, limit),
         CliCommand::SingularityFrontier { base_dir, eps, top } => run_singularity_frontier(base_dir, eps, top),
         CliCommand::SingularityBridges { base_dir, domain_a, domain_b, eps, top } => run_singularity_bridges(base_dir, domain_a, domain_b, eps, top),
         CliCommand::SingularityRebuildEdges { base_dir, eps } => run_singularity_rebuild_edges(base_dir, eps),
         CliCommand::SingularityResonance { base_dir, limit, domain_filter } => run_singularity_resonance(base_dir, limit, domain_filter),
+        CliCommand::SingularitySeed { base_dir, eps, top, domain_filter, json } => run_singularity_seed(base_dir, eps, top, domain_filter, json),
+        CliCommand::SingularityViz { base_dir, output, sample } => run_singularity_viz(base_dir, output, sample),
         CliCommand::Pack { sub } => run_pack(sub),
         CliCommand::Sentry { sub } => run_sentry(sub),
         CliCommand::Hook { sub } => run_hook(sub),
@@ -3105,7 +3107,7 @@ fn load_topo_for_analysis(base_dir: Option<String>) -> crate::singularity_recurs
         .unwrap_or_else(|_| Topology::new(cfg.neighborhood_radius_eps))
 }
 
-fn run_singularity_convergence(base_dir: Option<String>, eps: f32, min_domains: usize, top: usize) -> Result<(), String> {
+fn run_singularity_convergence(base_dir: Option<String>, eps: f32, min_domains: usize, top: usize, export: Option<String>) -> Result<(), String> {
     use crate::singularity_recursion::analysis::find_convergence;
     let t = load_topo_for_analysis(base_dir);
     println!("convergence scan: {} points, eps={}, min_domains={}", t.points.len(), eps, min_domains);
@@ -3116,6 +3118,23 @@ fn run_singularity_convergence(base_dir: Option<String>, eps: f32, min_domains: 
         println!("   rep: {} | {}", c.representative_id, c.representative_invariant);
         println!("   members: {:?}", &c.member_ids.iter().take(5).collect::<Vec<_>>());
         println!();
+    }
+    if let Some(path) = export {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&path).map_err(|e| format!("create {}: {}", path, e))?;
+        for (rank, c) in clusters.iter().enumerate() {
+            let line = format!(
+                "{{\"rank\":{},\"size\":{},\"domains\":{},\"representative_id\":{},\"representative_invariant\":{},\"member_ids\":{}}}\n",
+                rank + 1,
+                c.size,
+                serde_json::to_string(&c.domains).unwrap_or_else(|_| "[]".into()),
+                serde_json::to_string(&c.representative_id).unwrap_or_default(),
+                serde_json::to_string(&c.representative_invariant).unwrap_or_default(),
+                serde_json::to_string(&c.member_ids).unwrap_or_else(|_| "[]".into()),
+            );
+            f.write_all(line.as_bytes()).map_err(|e| format!("write: {}", e))?;
+        }
+        println!("exported {} clusters -> {}", clusters.len(), path);
     }
     Ok(())
 }
@@ -3142,6 +3161,122 @@ fn run_singularity_frontier(base_dir: Option<String>, eps: f32, top: usize) -> R
         println!("   {}\n", p.singularity.invariant.chars().take(200).collect::<String>());
     }
     Ok(())
+}
+
+fn run_singularity_seed(base_dir: Option<String>, eps: f32, top: usize, domain_filter: Option<String>, json: bool) -> Result<(), String> {
+    use crate::singularity_recursion::analysis::core_points;
+    let t = load_topo_for_analysis(base_dir);
+    let mut results = core_points(&t, eps, top * 5);
+    if let Some(ref d) = domain_filter {
+        results.retain(|(_, p)| &p.domain == d);
+    }
+    results.truncate(top);
+    if json {
+        print!("[");
+        for (i, (density, p)) in results.iter().enumerate() {
+            if i > 0 { print!(","); }
+            print!(
+                "{{\"id\":\"{}\",\"domain\":\"{}\",\"density\":{},\"invariant\":{}}}",
+                p.id, p.domain, density,
+                serde_json::to_string(&p.singularity.invariant).unwrap_or_default()
+            );
+        }
+        println!("]");
+    } else {
+        println!("core seeds: {} points, eps={}, top={}\n", t.points.len(), eps, top);
+        for (rank, (density, p)) in results.iter().enumerate() {
+            println!("#{} density={} domain={} id={}", rank+1, density, p.domain, p.id);
+            println!("   {}\n", p.singularity.invariant.chars().take(160).collect::<String>());
+        }
+    }
+    Ok(())
+}
+
+fn run_singularity_viz(base_dir: Option<String>, output: String, sample: usize) -> Result<(), String> {
+    use std::collections::HashMap;
+    use std::io::Write;
+    let t = load_topo_for_analysis(base_dir);
+    let total = t.points.len();
+    // Sample evenly across the topology
+    let step = if total > sample { total / sample } else { 1 };
+    let sampled: Vec<_> = t.points.iter().step_by(step).take(sample).collect();
+
+    // Stats per domain
+    let mut dom_counts: HashMap<&str, usize> = HashMap::new();
+    for p in &t.points { *dom_counts.entry(p.domain.as_str()).or_insert(0) += 1; }
+    let mut domains: Vec<_> = dom_counts.iter().collect();
+    domains.sort_by_key(|(_, c)| std::cmp::Reverse(**c));
+
+    // Build HTML
+    let mut html = String::new();
+    html.push_str("<!doctype html><html><head><meta charset=\"utf-8\"><title>nexus6 singularity topology</title>");
+    html.push_str("<style>");
+    html.push_str("body{font:13px -apple-system,sans-serif;margin:0;padding:20px;background:#0a0a0a;color:#ddd;}");
+    html.push_str("h1{color:#fff;font-size:22px;margin:0 0 8px;} h2{color:#8ef;font-size:15px;margin:16px 0 8px;}");
+    html.push_str(".meta{color:#888;font-size:12px;margin-bottom:16px;}");
+    html.push_str("table{border-collapse:collapse;width:100%;margin-bottom:16px;}");
+    html.push_str("th,td{padding:6px 10px;text-align:left;border-bottom:1px solid #222;}");
+    html.push_str("th{color:#8ef;font-weight:600;}");
+    html.push_str(".dom{padding:2px 6px;border-radius:3px;font-size:11px;}");
+    html.push_str(".inv{color:#bbb;font-family:Menlo,monospace;font-size:11px;max-width:600px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}");
+    html.push_str(".grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(10px,1fr));gap:2px;margin:16px 0;}");
+    html.push_str(".cell{aspect-ratio:1;border-radius:2px;}");
+    html.push_str("</style></head><body>");
+    html.push_str(&format!(
+        "<h1>nexus6 singularity topology</h1><div class=\"meta\">total={} points · sampled={} · generated={}</div>",
+        total, sampled.len(), now_secs()
+    ));
+
+    // Domain distribution
+    html.push_str("<h2>도메인 분포</h2><table><tr><th>domain</th><th>count</th><th>pct</th></tr>");
+    for (d, c) in &domains {
+        let pct = (**c as f64) * 100.0 / total.max(1) as f64;
+        html.push_str(&format!("<tr><td>{}</td><td>{}</td><td>{:.1}%</td></tr>", d, c, pct));
+    }
+    html.push_str("</table>");
+
+    // Sampled points grid (colored by domain hash)
+    html.push_str("<h2>sampled point grid (색상=domain)</h2><div class=\"grid\">");
+    for p in &sampled {
+        let hue = hash_str_to_hue(&p.domain);
+        html.push_str(&format!(
+            "<div class=\"cell\" style=\"background:hsl({},70%,45%);\" title=\"{} | {}\"></div>",
+            hue, p.id, escape_html(&p.domain)
+        ));
+    }
+    html.push_str("</div>");
+
+    // Sample points table
+    html.push_str("<h2>샘플 points (처음 80)</h2><table><tr><th>id</th><th>domain</th><th>invariant</th></tr>");
+    for p in sampled.iter().take(80) {
+        let hue = hash_str_to_hue(&p.domain);
+        html.push_str(&format!(
+            "<tr><td>{}</td><td><span class=\"dom\" style=\"background:hsl({},70%,30%);\">{}</span></td><td class=\"inv\">{}</td></tr>",
+            p.id, hue, escape_html(&p.domain),
+            escape_html(&p.singularity.invariant.chars().take(180).collect::<String>())
+        ));
+    }
+    html.push_str("</table></body></html>");
+
+    let mut f = std::fs::File::create(&output).map_err(|e| format!("create {}: {}", output, e))?;
+    f.write_all(html.as_bytes()).map_err(|e| format!("write: {}", e))?;
+    println!("viz written: {} ({} points, {} sampled)", output, total, sampled.len());
+    Ok(())
+}
+
+fn now_secs() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn hash_str_to_hue(s: &str) -> u32 {
+    let mut h: u32 = 5381;
+    for b in s.bytes() { h = h.wrapping_mul(33).wrapping_add(b as u32); }
+    h % 360
+}
+
+fn escape_html(s: &str) -> String {
+    s.replace('&',"&amp;").replace('<',"&lt;").replace('>',"&gt;").replace('"',"&quot;")
 }
 
 fn run_singularity_resonance(base_dir: Option<String>, limit: usize, domain_filter: Option<String>) -> Result<(), String> {

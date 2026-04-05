@@ -131,6 +131,7 @@ pub enum CliCommand {
         eps: f32,
         min_domains: usize,
         top: usize,
+        export: Option<String>,
     },
     SingularityQuery {
         base_dir: Option<String>,
@@ -157,6 +158,18 @@ pub enum CliCommand {
         base_dir: Option<String>,
         limit: usize,
         domain_filter: Option<String>,
+    },
+    SingularitySeed {
+        base_dir: Option<String>,
+        eps: f32,
+        top: usize,
+        domain_filter: Option<String>,
+        json: bool,
+    },
+    SingularityViz {
+        base_dir: Option<String>,
+        output: String,
+        sample: usize,
     },
     /// Pack: install/uninstall CLI-only nexus6 integration (symlink + CC hooks).
     Pack { sub: PackSub },
@@ -269,6 +282,8 @@ pub fn parse_args(args: &[String]) -> Result<CliCommand, String> {
         "singularity-bridges" | "sbridges" => parse_singularity_bridges(rest),
         "singularity-rebuild-edges" | "sreb" => parse_singularity_rebuild_edges(rest),
         "singularity-resonance" | "sres" => parse_singularity_resonance(rest),
+        "singularity-seed" | "sseed" => parse_singularity_seed(rest),
+        "singularity-viz" | "sviz" => parse_singularity_viz(rest),
         "pack" => parse_pack(rest),
         "sentry" => parse_sentry(rest),
         "hook" => parse_hook(rest),
@@ -1010,6 +1025,7 @@ fn parse_singularity_convergence(args: &[String]) -> Result<CliCommand, String> 
     let mut eps: f32 = 0.25;
     let mut min_domains: usize = 3;
     let mut top: usize = 20;
+    let mut export: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1017,11 +1033,12 @@ fn parse_singularity_convergence(args: &[String]) -> Result<CliCommand, String> 
             "--eps" => { i += 1; eps = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(eps); }
             "--min-domains" => { i += 1; min_domains = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(min_domains); }
             "--top" => { i += 1; top = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(top); }
+            "--export" => { i += 1; export = args.get(i).cloned(); }
             _ => {}
         }
         i += 1;
     }
-    Ok(CliCommand::SingularityConvergence { base_dir, eps, min_domains, top })
+    Ok(CliCommand::SingularityConvergence { base_dir, eps, min_domains, top, export })
 }
 
 fn parse_singularity_query(args: &[String]) -> Result<CliCommand, String> {
@@ -1057,6 +1074,44 @@ fn parse_singularity_frontier(args: &[String]) -> Result<CliCommand, String> {
         i += 1;
     }
     Ok(CliCommand::SingularityFrontier { base_dir, eps, top })
+}
+
+fn parse_singularity_seed(args: &[String]) -> Result<CliCommand, String> {
+    let mut base_dir: Option<String> = None;
+    let mut eps: f32 = 0.2;
+    let mut top: usize = 10;
+    let mut domain_filter: Option<String> = None;
+    let mut json = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--base-dir" => { i += 1; base_dir = args.get(i).cloned(); }
+            "--eps" => { i += 1; eps = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(eps); }
+            "--top" => { i += 1; top = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(top); }
+            "--domain" => { i += 1; domain_filter = args.get(i).cloned(); }
+            "--json" => { json = true; }
+            _ => {}
+        }
+        i += 1;
+    }
+    Ok(CliCommand::SingularitySeed { base_dir, eps, top, domain_filter, json })
+}
+
+fn parse_singularity_viz(args: &[String]) -> Result<CliCommand, String> {
+    let mut base_dir: Option<String> = None;
+    let mut output = "shared/cycle/topology.html".to_string();
+    let mut sample: usize = 500;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--base-dir" => { i += 1; base_dir = args.get(i).cloned(); }
+            "--output" => { i += 1; if let Some(s) = args.get(i) { output = s.clone(); } }
+            "--sample" => { i += 1; sample = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(sample); }
+            _ => {}
+        }
+        i += 1;
+    }
+    Ok(CliCommand::SingularityViz { base_dir, output, sample })
 }
 
 fn parse_singularity_resonance(args: &[String]) -> Result<CliCommand, String> {
