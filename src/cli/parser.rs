@@ -149,6 +149,10 @@ pub enum CliCommand {
         eps: f32,
         top: usize,
     },
+    SingularityRebuildEdges {
+        base_dir: Option<String>,
+        eps: f32,
+    },
     /// Pack: install/uninstall CLI-only nexus6 integration (symlink + CC hooks).
     Pack { sub: PackSub },
     /// Sentry: pure-Rust health watcher for nexus6 daemon (no API calls).
@@ -258,6 +262,7 @@ pub fn parse_args(args: &[String]) -> Result<CliCommand, String> {
         "singularity-query" | "sq" => parse_singularity_query(rest),
         "singularity-frontier" | "sfrontier" => parse_singularity_frontier(rest),
         "singularity-bridges" | "sbridges" => parse_singularity_bridges(rest),
+        "singularity-rebuild-edges" | "sreb" => parse_singularity_rebuild_edges(rest),
         "pack" => parse_pack(rest),
         "sentry" => parse_sentry(rest),
         "hook" => parse_hook(rest),
@@ -1046,6 +1051,21 @@ fn parse_singularity_frontier(args: &[String]) -> Result<CliCommand, String> {
         i += 1;
     }
     Ok(CliCommand::SingularityFrontier { base_dir, eps, top })
+}
+
+fn parse_singularity_rebuild_edges(args: &[String]) -> Result<CliCommand, String> {
+    let mut base_dir: Option<String> = None;
+    let mut eps: f32 = 0.2;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--base-dir" => { i += 1; base_dir = args.get(i).cloned(); }
+            "--eps" => { i += 1; eps = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(eps); }
+            _ => {}
+        }
+        i += 1;
+    }
+    Ok(CliCommand::SingularityRebuildEdges { base_dir, eps })
 }
 
 fn parse_singularity_bridges(args: &[String]) -> Result<CliCommand, String> {
