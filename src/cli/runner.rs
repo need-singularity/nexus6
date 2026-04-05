@@ -186,6 +186,10 @@ fn run_with_config(cmd: CliCommand, cfg: &NexusConfig) -> Result<(), String> {
         CliCommand::SingularityTick { base_dir } => run_singularity_tick(base_dir),
         CliCommand::SingularityDaemon { base_dir, interval_sec } => run_singularity_daemon(base_dir, interval_sec),
         CliCommand::SingularityBackfill { base_dir, project_root, memory, all_projects, fast } => run_singularity_backfill(base_dir, project_root, memory, all_projects, fast),
+        CliCommand::SingularityConvergence { base_dir, eps, min_domains, top } => run_singularity_convergence(base_dir, eps, min_domains, top),
+        CliCommand::SingularityQuery { base_dir, query, limit } => run_singularity_query(base_dir, query, limit),
+        CliCommand::SingularityFrontier { base_dir, eps, top } => run_singularity_frontier(base_dir, eps, top),
+        CliCommand::SingularityBridges { base_dir, domain_a, domain_b, eps, top } => run_singularity_bridges(base_dir, domain_a, domain_b, eps, top),
         CliCommand::Pack { sub } => run_pack(sub),
         CliCommand::Sentry { sub } => run_sentry(sub),
         CliCommand::Hook { sub } => run_hook(sub),
@@ -3086,6 +3090,68 @@ fn run_singularity_daemon(base_dir: Option<String>, interval_sec: u64) -> Result
         }
         sleep(interval);
     }
+}
+
+fn load_topo_for_analysis(base_dir: Option<String>) -> crate::singularity_recursion::topology::Topology {
+    use crate::singularity_recursion::tick::TickPaths;
+    use crate::singularity_recursion::topology::{load, Topology};
+    use crate::config::SingularityRecursionConfig;
+    let base = base_dir.unwrap_or_else(|| "shared/cycle".to_string());
+    let paths = TickPaths::from_base(&base);
+    let cfg = SingularityRecursionConfig::default();
+    load(&paths.topology, &paths.edges, cfg.neighborhood_radius_eps)
+        .unwrap_or_else(|_| Topology::new(cfg.neighborhood_radius_eps))
+}
+
+fn run_singularity_convergence(base_dir: Option<String>, eps: f32, min_domains: usize, top: usize) -> Result<(), String> {
+    use crate::singularity_recursion::analysis::find_convergence;
+    let t = load_topo_for_analysis(base_dir);
+    println!("convergence scan: {} points, eps={}, min_domains={}", t.points.len(), eps, min_domains);
+    let clusters = find_convergence(&t, eps, min_domains);
+    println!("found {} cross-domain clusters\n", clusters.len());
+    for (rank, c) in clusters.iter().take(top).enumerate() {
+        println!("#{} size={} domains={:?}", rank+1, c.size, c.domains);
+        println!("   rep: {} | {}", c.representative_id, c.representative_invariant);
+        println!("   members: {:?}", &c.member_ids.iter().take(5).collect::<Vec<_>>());
+        println!();
+    }
+    Ok(())
+}
+
+fn run_singularity_query(base_dir: Option<String>, query: String, limit: usize) -> Result<(), String> {
+    use crate::singularity_recursion::analysis::query_similar;
+    let t = load_topo_for_analysis(base_dir);
+    println!("query: {:?}  (scan {} points)\n", query, t.points.len());
+    let results = query_similar(&t, &query, limit);
+    for (rank, (dist, p)) in results.iter().enumerate() {
+        println!("#{} dist={:.3} domain={} id={}", rank+1, dist, p.domain, p.id);
+        println!("   {}\n", p.singularity.invariant.chars().take(200).collect::<String>());
+    }
+    Ok(())
+}
+
+fn run_singularity_frontier(base_dir: Option<String>, eps: f32, top: usize) -> Result<(), String> {
+    use crate::singularity_recursion::analysis::frontier_points;
+    let t = load_topo_for_analysis(base_dir);
+    println!("frontier scan: {} points, eps={}\n", t.points.len(), eps);
+    let results = frontier_points(&t, eps, top);
+    for (rank, (density, p)) in results.iter().enumerate() {
+        println!("#{} density={} domain={} id={}", rank+1, density, p.domain, p.id);
+        println!("   {}\n", p.singularity.invariant.chars().take(200).collect::<String>());
+    }
+    Ok(())
+}
+
+fn run_singularity_bridges(base_dir: Option<String>, domain_a: String, domain_b: String, eps: f32, top: usize) -> Result<(), String> {
+    use crate::singularity_recursion::analysis::bridges_between;
+    let t = load_topo_for_analysis(base_dir);
+    println!("bridges: {} ↔ {}  eps={}  ({} points)\n", domain_a, domain_b, eps, t.points.len());
+    let results = bridges_between(&t, &domain_a, &domain_b, eps, top);
+    for (rank, (p, na, nb)) in results.iter().enumerate() {
+        println!("#{} near_a={} near_b={} domain={} id={}", rank+1, na, nb, p.domain, p.id);
+        println!("   {}\n", p.singularity.invariant.chars().take(200).collect::<String>());
+    }
+    Ok(())
 }
 
 fn run_singularity_backfill(
