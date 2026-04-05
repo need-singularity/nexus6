@@ -126,6 +126,29 @@ pub enum CliCommand {
         all_projects: bool,
         fast: bool,
     },
+    SingularityConvergence {
+        base_dir: Option<String>,
+        eps: f32,
+        min_domains: usize,
+        top: usize,
+    },
+    SingularityQuery {
+        base_dir: Option<String>,
+        query: String,
+        limit: usize,
+    },
+    SingularityFrontier {
+        base_dir: Option<String>,
+        eps: f32,
+        top: usize,
+    },
+    SingularityBridges {
+        base_dir: Option<String>,
+        domain_a: String,
+        domain_b: String,
+        eps: f32,
+        top: usize,
+    },
     /// Pack: install/uninstall CLI-only nexus6 integration (symlink + CC hooks).
     Pack { sub: PackSub },
     /// Sentry: pure-Rust health watcher for nexus6 daemon (no API calls).
@@ -231,6 +254,10 @@ pub fn parse_args(args: &[String]) -> Result<CliCommand, String> {
         "singularity-tick" | "stk" => parse_singularity_tick(rest),
         "singularity-daemon" | "sdm" => parse_singularity_daemon(rest),
         "singularity-backfill" | "sbf" => parse_singularity_backfill(rest),
+        "singularity-convergence" | "sconv" => parse_singularity_convergence(rest),
+        "singularity-query" | "sq" => parse_singularity_query(rest),
+        "singularity-frontier" | "sfrontier" => parse_singularity_frontier(rest),
+        "singularity-bridges" | "sbridges" => parse_singularity_bridges(rest),
         "pack" => parse_pack(rest),
         "sentry" => parse_sentry(rest),
         "hook" => parse_hook(rest),
@@ -965,6 +992,83 @@ fn parse_singularity_daemon(args: &[String]) -> Result<CliCommand, String> {
         i += 1;
     }
     Ok(CliCommand::SingularityDaemon { base_dir, interval_sec })
+}
+
+fn parse_singularity_convergence(args: &[String]) -> Result<CliCommand, String> {
+    let mut base_dir: Option<String> = None;
+    let mut eps: f32 = 0.25;
+    let mut min_domains: usize = 3;
+    let mut top: usize = 20;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--base-dir" => { i += 1; base_dir = args.get(i).cloned(); }
+            "--eps" => { i += 1; eps = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(eps); }
+            "--min-domains" => { i += 1; min_domains = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(min_domains); }
+            "--top" => { i += 1; top = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(top); }
+            _ => {}
+        }
+        i += 1;
+    }
+    Ok(CliCommand::SingularityConvergence { base_dir, eps, min_domains, top })
+}
+
+fn parse_singularity_query(args: &[String]) -> Result<CliCommand, String> {
+    let mut base_dir: Option<String> = None;
+    let mut limit: usize = 10;
+    let mut query_parts: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--base-dir" => { i += 1; base_dir = args.get(i).cloned(); }
+            "--limit" => { i += 1; limit = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(limit); }
+            s => { query_parts.push(s.to_string()); }
+        }
+        i += 1;
+    }
+    let query = query_parts.join(" ");
+    if query.is_empty() { return Err("query text required (positional args)".into()); }
+    Ok(CliCommand::SingularityQuery { base_dir, query, limit })
+}
+
+fn parse_singularity_frontier(args: &[String]) -> Result<CliCommand, String> {
+    let mut base_dir: Option<String> = None;
+    let mut eps: f32 = 0.3;
+    let mut top: usize = 20;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--base-dir" => { i += 1; base_dir = args.get(i).cloned(); }
+            "--eps" => { i += 1; eps = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(eps); }
+            "--top" => { i += 1; top = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(top); }
+            _ => {}
+        }
+        i += 1;
+    }
+    Ok(CliCommand::SingularityFrontier { base_dir, eps, top })
+}
+
+fn parse_singularity_bridges(args: &[String]) -> Result<CliCommand, String> {
+    let mut base_dir: Option<String> = None;
+    let mut domain_a: Option<String> = None;
+    let mut domain_b: Option<String> = None;
+    let mut eps: f32 = 0.35;
+    let mut top: usize = 10;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--base-dir" => { i += 1; base_dir = args.get(i).cloned(); }
+            "--a" => { i += 1; domain_a = args.get(i).cloned(); }
+            "--b" => { i += 1; domain_b = args.get(i).cloned(); }
+            "--eps" => { i += 1; eps = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(eps); }
+            "--top" => { i += 1; top = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(top); }
+            _ => {}
+        }
+        i += 1;
+    }
+    let domain_a = domain_a.ok_or("--a <domain> required")?;
+    let domain_b = domain_b.ok_or("--b <domain> required")?;
+    Ok(CliCommand::SingularityBridges { base_dir, domain_a, domain_b, eps, top })
 }
 
 fn parse_singularity_backfill(args: &[String]) -> Result<CliCommand, String> {
