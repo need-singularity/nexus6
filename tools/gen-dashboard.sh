@@ -696,10 +696,12 @@ closures |
   <div class="panel n6a">
     <div class="panel-title">우주 밀도 분해</div>
     <div class="panel-section">
-      <div class="row"><span class="k">Ω_DM</span><span class="v">4/15 (n=15)</span></div>
-      <div class="row"><span class="k">Ω_Λ</span><span class="v">24/35 (n=35)</span></div>
+      <div class="row"><span class="k">Ω_DM</span><span class="v">4/15 ({2,3,5})</span></div>
+      <div class="row"><span class="k">Ω_Λ</span><span class="v">24/35 (=ρ(35))</span></div>
       <div class="row"><span class="k">Ω_b</span><span class="v">1/21</span></div>
       <div class="row"><span class="k">Σ</span><span class="v hi">= 1 (exact)</span></div>
+      <div class="row"><span class="k">H₀ 텐션</span><span class="v hi">73-67=6=n</span></div>
+      <div class="row"><span class="k">n_s</span><span class="v hi">139/144 EXACT</span></div>
     </div>
   </div>
 
