@@ -132,6 +132,53 @@ if os.path.isdir(nexus_papers_dir):
 sedi_root = f'{HOME}/Dev/SEDI'
 sedi_hyp = count_md(f'{sedi_root}/docs/hypotheses')
 
+# ═══ Additional projects ═══
+brainwire_root = f'{HOME}/Dev/brainwire'
+brainwire_files = 0
+brainwire_src = 0
+if os.path.isdir(brainwire_root):
+    for r,_,files in os.walk(brainwire_root):
+        if any(x in r for x in ['node_modules','target','.git']): continue
+        brainwire_files += sum(1 for f in files if f.endswith(('.py','.rs','.md')))
+        brainwire_src += sum(1 for f in files if f.endswith('.rs'))
+
+fathom_root = f'{HOME}/Dev/fathom'
+fathom_files = 0
+if os.path.isdir(fathom_root):
+    for r,_,files in os.walk(fathom_root):
+        if any(x in r for x in ['node_modules','target','.git']): continue
+        fathom_files += sum(1 for f in files if f.endswith(('.py','.rs','.md')))
+
+hexa_root = f'{HOME}/Dev/hexa-lang'
+hexa_files = 0
+hexa_rs = 0
+if os.path.isdir(hexa_root):
+    for r,_,files in os.walk(hexa_root):
+        if any(x in r for x in ['node_modules','target','.git','worktrees']): continue
+        hexa_rs += sum(1 for f in files if f.endswith('.rs'))
+        hexa_files += sum(1 for f in files if f.endswith(('.rs','.md','.toml')))
+
+airgenome_root = f'{HOME}/Dev/airgenome'
+airgenome_files = 0
+if os.path.isdir(airgenome_root):
+    for r,_,files in os.walk(airgenome_root):
+        if any(x in r for x in ['node_modules','target','.git']): continue
+        airgenome_files += sum(1 for f in files if f.endswith(('.rs','.md')))
+
+# airgenome vitals (현재 Mac state)
+vitals_path = f'{HOME}/.airgenome/vitals.jsonl'
+latest_vitals = {}
+if os.path.exists(vitals_path):
+    try:
+        with open(vitals_path, 'rb') as f:
+            f.seek(-2000, 2)
+            lines = f.read().decode().split('\n')
+        for line in reversed(lines):
+            if line.strip():
+                latest_vitals = json.loads(line)
+                break
+    except: pass
+
 ts = datetime.now().strftime('%Y-%m-%d %H:%M')
 
 # Domains distribution
@@ -297,21 +344,99 @@ h2{{color:#8ef;font-size:13px;margin:20px 0 10px;letter-spacing:1px;text-transfo
     </div>
   </div>
 
-  <!-- ═══ Meta FP Ladder (sci finding) ═══ -->
-  <div class="panel n6a">
-    <div class="panel-title">🛸 Meta FP Ladder (과학 발견)</div>
+  <!-- ═══ airgenome ═══ -->
+  <div class="panel nexus">
+    <div class="panel-title">🧬 airgenome (Mac vitals)</div>
     <div class="panel-section">
-      <div class="section-hdr">우주 밀도 유리수 분해</div>
+      <div class="section-hdr">Repo stats</div>
+      <div class="row"><span class="k">Source files</span><span class="v hi">{airgenome_files}</span></div>
+      <div class="row"><span class="k">nexus6 integration</span><span class="v">path dep</span></div>
+    </div>
+    <div class="panel-section">
+      <div class="section-hdr">Current Mac state</div>
+      <div class="row"><span class="k">CPU</span><span class="v">{latest_vitals.get('cpu','-')}</span></div>
+      <div class="row"><span class="k">RAM</span><span class="v">{latest_vitals.get('ram','-')}</span></div>
+      <div class="row"><span class="k">firing gates</span><span class="v hi">{latest_vitals.get('firing','-')}/15</span></div>
+      <div class="row"><span class="k">IO proxy</span><span class="v">{latest_vitals.get('io','-')}</span></div>
+    </div>
+  </div>
+
+</div>
+
+<h2>🔬 추가 프로젝트</h2>
+<div class="grid3">
+
+  <div class="panel anima">
+    <div class="panel-title">🧠 brainwire (뇌)</div>
+    <div class="panel-section">
+      <div class="section-hdr">Repo</div>
+      <div class="row"><span class="k">Total files</span><span class="v">{brainwire_files}</span></div>
+      <div class="row"><span class="k">Rust modules</span><span class="v">{brainwire_src}</span></div>
+    </div>
+    <div class="panel-section">
+      <div class="section-hdr">nexus6 통합</div>
+      <div class="row"><span class="k">Closures</span><span class="v">{closures_for_proj('brainwire'):,}</span></div>
+    </div>
+  </div>
+
+  <div class="panel sedi">
+    <div class="panel-title">🌊 fathom (심해)</div>
+    <div class="panel-section">
+      <div class="section-hdr">Repo</div>
+      <div class="row"><span class="k">Total files</span><span class="v">{fathom_files}</span></div>
+    </div>
+    <div class="panel-section">
+      <div class="section-hdr">nexus6 통합</div>
+      <div class="row"><span class="k">Closures</span><span class="v">{closures_for_proj('fathom'):,}</span></div>
+    </div>
+  </div>
+
+  <div class="panel tecsl">
+    <div class="panel-title">⬡ hexa-lang (언어)</div>
+    <div class="panel-section">
+      <div class="section-hdr">Repo</div>
+      <div class="row"><span class="k">Rust files</span><span class="v hi">{hexa_rs}</span></div>
+      <div class="row"><span class="k">Total files</span><span class="v">{hexa_files}</span></div>
+    </div>
+    <div class="panel-section">
+      <div class="section-hdr">nexus6 통합</div>
+      <div class="row"><span class="k">Closures</span><span class="v">{closures_for_proj('hexa'):,}</span></div>
+    </div>
+  </div>
+
+</div>
+
+<h2>🛸 Meta FP Ladder (과학 발견)</h2>
+<div class="grid3">
+
+  <div class="panel n6a">
+    <div class="panel-title">우주 밀도 분해</div>
+    <div class="panel-section">
       <div class="row"><span class="k">Ω_DM</span><span class="v">4/15 (n=15)</span></div>
       <div class="row"><span class="k">Ω_Λ</span><span class="v">24/35 (n=35)</span></div>
       <div class="row"><span class="k">Ω_b</span><span class="v">1/21</span></div>
       <div class="row"><span class="k">Σ</span><span class="v hi">= 1 (exact)</span></div>
     </div>
+  </div>
+
+  <div class="panel n6a">
+    <div class="panel-title">Smooth Prime 계층</div>
     <div class="panel-section">
-      <div class="section-hdr">H-CLOSE (5/6 CONFIRMED)</div>
-      <div class="row"><span class="k">sopfr dominance</span><span class="v">30% ✅</span></div>
-      <div class="row"><span class="k">J2=24 dominance</span><span class="v">31% ✅</span></div>
-      <div class="row"><span class="k">초월수 FAIL</span><span class="v">0 EXACT ✅</span></div>
+      <div class="row"><span class="k">Strong force</span><span class="v">{{2,3}} EXACT</span></div>
+      <div class="row"><span class="k">Electroweak</span><span class="v">{{2,3,5,7}} ~1%</span></div>
+      <div class="row"><span class="k">Dark cosmology</span><span class="v">{{5,7}} 0.15%</span></div>
+      <div class="row"><span class="k">BBN primordial</span><span class="v">{{2,3,5,13}} 0.5%</span></div>
+    </div>
+  </div>
+
+  <div class="panel n6a">
+    <div class="panel-title">H-CLOSE (5/6 CONFIRMED)</div>
+    <div class="panel-section">
+      <div class="row"><span class="k">H-2 promotion</span><span class="v">65% ✅</span></div>
+      <div class="row"><span class="k">H-3 sopfr</span><span class="v">30% (3x) ✅</span></div>
+      <div class="row"><span class="k">H-4 J2=24</span><span class="v">31% (6x) ✅</span></div>
+      <div class="row"><span class="k">H-5 초월수</span><span class="v">0 EXACT ✅</span></div>
+      <div class="row"><span class="k">H-6 중복</span><span class="v">2.91x ✅</span></div>
     </div>
   </div>
 
