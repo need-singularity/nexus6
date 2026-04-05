@@ -63,9 +63,12 @@ const N6_CONSTANTS: &[(&str, f64)] = &[
     ("pi*phi", 6.283_185_307_179_586),             // 2π
     ("pi^phi/n", 1.644_934_066_848_226),           // π²/6
     // ── n=6 관련 특수값 (perfect number family) ────────
-    ("M3", 7.0),             // Mersenne (n+μ)
+    ("M3", 7.0),             // 2³-1 = σ-sopfr = n+μ
     ("P2", 28.0),            // 2nd perfect number = σ(12)
-    ("P3", 496.0),           // 3rd perfect number
+    ("P3", 496.0),           // 3rd perfect number = φ^τ · (2^sopfr-1)
+    ("P4", 8128.0),          // 4th perfect number = 2⁶ · 127 = n·(2^M3-1) · σ^0
+    ("2^sopfr-1", 31.0),     // Mersenne-5 (P3 prime)
+    ("2^M3-1", 127.0),       // Mersenne-7 (P4 prime)
     // ── Physical exponents (dimensionless) ──────────────
     ("J2-mu", 23.0),         // Avogadro exponent mantissa
     ("-J2+mu", -23.0),       // Boltzmann exponent
