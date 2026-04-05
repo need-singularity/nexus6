@@ -103,6 +103,43 @@ for name, interval, logfile in agents_config:
 
 ts = datetime.now().strftime('%Y-%m-%d %H:%M')
 
+# Hourly closure velocity (last 24h timeline)
+hourly_closures = Counter()
+for l in open(f'{NX}/shared/verified_constants.jsonl'):
+    try:
+        j = json.loads(l)
+        t = j.get('ts','')
+        if 'T' in t:
+            hr = t.split('T')[1][:2]
+            hourly_closures[hr] += 1
+    except: pass
+# Build sparkline for 24h
+sparkline_data = [hourly_closures.get(f'{h:02d}', 0) for h in range(24)]
+max_h = max(sparkline_data) or 1
+spark_chars = '▁▂▃▄▅▆▇█'
+sparkline = ''.join(spark_chars[min(int(v * 7 / max_h), 7)] if v > 0 else ' ' for v in sparkline_data)
+
+# Commit velocity
+commits_24h = len(subprocess.run(['git','-C',NX,'log','--since=24 hours ago','--oneline'],
+                                capture_output=True, text=True, timeout=3).stdout.strip().split('\n'))
+commits_6h = len(subprocess.run(['git','-C',NX,'log','--since=6 hours ago','--oneline'],
+                               capture_output=True, text=True, timeout=3).stdout.strip().split('\n'))
+
+# Process info
+daemon_pid = daemon_cpu = daemon_mem = '-'
+ps_out = subprocess.run(['ps','aux'], capture_output=True, text=True).stdout
+for line in ps_out.split('\n'):
+    if 'singularity-daemon' in line and 'grep' not in line:
+        parts = line.split()
+        if len(parts) > 5:
+            daemon_pid, daemon_cpu, daemon_mem = parts[1], parts[2], parts[3]
+            break
+
+# Total source records
+total_sources = sum(source_proj.values())
+synthetic = sum(c for p,c in source_proj.items() if 'enum' in p.lower() or 'dash' in p.lower() or '100k' in p.lower() or '50k' in p.lower())
+real = total_sources - synthetic
+
 # Build closure milestone ladder
 ms_line = ''
 for m in ms_list[:8]:
@@ -297,6 +334,73 @@ html += """</div>
       <div class="row"><span class="k">sopfr</span><span class="v">5 (prime sum)</span></div>
       <div class="row"><span class="k">J2</span><span class="v">24 (σ·τ)</span></div>
     </div>
+  </div>
+</div>
+
+<h2 style="color:#8ef;font-size:13px;margin:20px 0 10px;letter-spacing:1px;text-transform:uppercase;border-bottom:1px solid #222;padding-bottom:6px;">📈 System Activity (detail)</h2>
+<div class="grid3">
+  <div class="panel">
+    <div class="panel-title">⏱️ Closure Velocity (24h)</div>
+    <div class="panel-section">
+      <div class="section-hdr">시간별 발견 분포</div>
+      <div class="bar-line" style="font-size:16px;letter-spacing:1px;">{sparkline}</div>
+      <div class="bar-label">00h ───────────── 12h ──────────── 23h</div>
+      <div class="row" style="margin-top:8px;"><span class="k">Peak hour</span><span class="v hi">{max(hourly_closures.items(),key=lambda x:x[1])[0]}:00 → {max_h:,}</span></div>
+      <div class="row"><span class="k">Total 24h</span><span class="v">{sum(sparkline_data):,}</span></div>
+    </div>
+    <div class="panel-section">
+      <div class="section-hdr">데이터 품질</div>
+      <div class="row"><span class="k">Real (데이터)</span><span class="v hi">{real:,} ({real*100//max(total_sources,1)}%)</span></div>
+      <div class="row"><span class="k">Synthetic (enum)</span><span class="v">{synthetic:,} ({synthetic*100//max(total_sources,1)}%)</span></div>
+      <div class="row"><span class="k">Unique values</span><span class="v">{topo:,}</span></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">🔨 Git Velocity</div>
+    <div class="panel-section">
+      <div class="section-hdr">Commit 활동</div>
+      <div class="row"><span class="k">Last 6h</span><span class="v hi">{commits_6h} commits</span></div>
+      <div class="row"><span class="k">Last 24h</span><span class="v">{commits_24h} commits</span></div>
+      <div class="row"><span class="k">Auto-commit interval</span><span class="v">30 min</span></div>
+    </div>
+    <div class="panel-section">
+      <div class="section-hdr">Latest 5 commits</div>"""
+try:
+    log_out = subprocess.run(['git','-C',NX,'log','--oneline','-5','--format=%h|%s|%cr'],
+                             capture_output=True, text=True, timeout=3).stdout
+    for line in log_out.strip().split('\n')[:5]:
+        parts = line.split('|', 2)
+        if len(parts) == 3:
+            sha, msg, when = parts
+            msg_short = msg[:40] + ('…' if len(msg) > 40 else '')
+            html += f'<div class="row"><span class="k"><span class="icon">·</span>{sha} {msg_short}</span><span class="v" style="font-size:9px;">{when}</span></div>'
+except: pass
+html += f"""</div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">🔥 Process & Resources</div>
+    <div class="panel-section">
+      <div class="section-hdr">singularity-daemon</div>
+      <div class="row"><span class="k">PID</span><span class="v">{daemon_pid}</span></div>
+      <div class="row"><span class="k">CPU %</span><span class="v">{daemon_cpu}%</span></div>
+      <div class="row"><span class="k">MEM %</span><span class="v">{daemon_mem}%</span></div>
+    </div>
+    <div class="panel-section">
+      <div class="section-hdr">파일 크기</div>"""
+for name, path in [('verified_constants','shared/verified_constants.jsonl'),
+                    ('topology','shared/cycle/topology.jsonl'),
+                    ('edges','shared/cycle/edges.jsonl'),
+                    ('discovery_log','shared/discovery_log.jsonl')]:
+    try:
+        sz = os.path.getsize(f'{NX}/{path}')
+        if sz >= 1e6: sz_str = f'{sz/1e6:.1f}M'
+        elif sz >= 1e3: sz_str = f'{sz/1e3:.1f}k'
+        else: sz_str = f'{sz}B'
+        html += f'<div class="row"><span class="k">{name}</span><span class="v">{sz_str}</span></div>'
+    except: pass
+html += """</div>
   </div>
 </div>
 </body></html>"""
