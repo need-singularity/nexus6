@@ -45,5 +45,19 @@ class TestInterpret(unittest.TestCase):
         rule = translate_to_rule(pattern, source_hypothesis="H?")
         self.assertIn("unknown_xyz", rule["text"])
 
+    def test_render_rules_md_and_empty(self):
+        from interpret_breakthrough import render_rules_md
+        rules = [
+            {"id": "R1", "text": "foo", "source": "H1", "rationale": "x"},
+            {"id": "R2", "text": "bar", "source": "H2", "rationale": "y"},
+        ]
+        md = render_rules_md(rules, date_str="2026-04-05")
+        self.assertIn("# 도출 규칙 후보", md)
+        self.assertIn("R1", md)
+        self.assertIn("foo", md)
+
+        empty_md = render_rules_md([], date_str="2026-04-05")
+        self.assertIn("패턴 없음", empty_md)
+
 if __name__ == "__main__":
     unittest.main()
