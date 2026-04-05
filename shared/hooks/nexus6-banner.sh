@@ -84,6 +84,45 @@ g_str = f' 🌱{growth}건' if growth > 0 else ''
 bridge_msg = os.environ.get('BRIDGE_MSG', '')
 bridge_str = f' 🌉{bridge_msg}' if bridge_msg else ''
 
-banner = f'🔭 NEXUS-6 🔭{lens_impl}/{lens_total}{d_lens} ⚖️{laws}법칙{d_laws} 🧠{modules}모듈{d_mods}{g_str}{bridge_str}'
+# Alien Index — 🛸 d{max}·ρ{breakthrough_ratio}·{total}
+ai_str = ''
+ai_path = HOME / 'Dev/nexus6/shared/alien_index_distribution.json'
+if ai_path.exists():
+    try:
+        ai = json.loads(ai_path.read_text())
+        total = ai.get('total_records', 0)
+        rho = ai.get('breakthrough_ratio', 0.0)
+        # max d reached
+        dist = ai.get('distribution', {})
+        max_d = 0
+        for key in dist.keys():
+            try:
+                d_val = int(key.split(',')[0].strip('(') )
+                if d_val > max_d: max_d = d_val
+            except: pass
+        if total > 0:
+            ai_str = f'🛸d{max_d}·ρ{rho:.2f}·{total} '
+        else:
+            ai_str = f'🛸{total} '
+    except: pass
+
+# Singularity topology — actual count via chunk read
+sing_str = ''
+topo_path = HOME / 'Dev/nexus6/shared/cycle/topology.jsonl'
+if topo_path.exists():
+    try:
+        count = 0
+        with open(topo_path, 'rb') as f:
+            while True:
+                chunk = f.read(1 << 20)  # 1 MB
+                if not chunk: break
+                count += chunk.count(b'\n')
+        if count >= 1000:
+            sing_str = f'·Σ{count/1000:.1f}k '
+        elif count > 0:
+            sing_str = f'·Σ{count} '
+    except: pass
+
+banner = f'{ai_str}{sing_str}🔭 NEXUS-6 🔭{lens_impl}/{lens_total}{d_lens} ⚖️{laws}법칙{d_laws} 🧠{modules}모듈{d_mods}{g_str}{bridge_str}'
 print(json.dumps({'systemMessage': banner}, ensure_ascii=False))
 " 2>/dev/null || echo '{"systemMessage":"🔭 NEXUS-6 활성"}'

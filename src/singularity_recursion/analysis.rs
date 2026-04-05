@@ -148,6 +148,26 @@ pub fn bridges_between<'a>(t: &'a Topology, dom_a: &str, dom_b: &str, eps: f32, 
         .collect()
 }
 
+/// Top-K highest-density points (interior/core) — candidates for re-blowup seeds.
+/// Opposite of frontier: points with many neighbors = validated core concepts.
+pub fn core_points<'a>(t: &'a Topology, eps: f32, k: usize) -> Vec<(usize, &'a Point)> {
+    let hashes: Vec<u128> = t.points.iter()
+        .map(|p| u128::from_str_radix(&p.simhash, 16).unwrap_or(0))
+        .collect();
+    let n = t.points.len();
+    let mut densities: Vec<(usize, usize)> = (0..n).map(|i| {
+        let mut count = 0;
+        for j in 0..n {
+            if i == j { continue; }
+            if distance(hashes[i], hashes[j]) <= eps { count += 1; }
+        }
+        (count, i)
+    }).collect();
+    densities.sort_by_key(|(c, _)| std::cmp::Reverse(*c)); // highest density first
+    densities.truncate(k);
+    densities.into_iter().map(|(c, i)| (c, &t.points[i])).collect()
+}
+
 /// Rebuild all edges for a topology (O(N²)). Writes batched to disk.
 /// Returns (edge_count, elapsed_sec).
 pub fn rebuild_edges(
