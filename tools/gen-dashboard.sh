@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
-# Generate HTML dashboard of nexus6 system status.
 set -euo pipefail
-
 NEXUS6="${HOME}/Dev/nexus6"
-OUT="${NEXUS6}/shared/dashboard.html"
 
 python3 << 'PYEOF'
 import json, os
@@ -13,45 +10,33 @@ from collections import Counter
 HOME = os.path.expanduser('~')
 NX = f'{HOME}/Dev/nexus6'
 
-# Load state
-def count_lines(p):
+def cnt(p):
     try: return sum(1 for _ in open(p))
     except: return 0
 
-closed_total = count_lines(f'{NX}/shared/verified_constants.jsonl')
-exact = sum(1 for l in open(f'{NX}/shared/verified_constants.jsonl') if json.loads(l).get('status')=='EXACT')
-topo = count_lines(f'{NX}/shared/cycle/topology.jsonl')
+closed = cnt(f'{NX}/shared/verified_constants.jsonl')
+topo = cnt(f'{NX}/shared/cycle/topology.jsonl')
+disc = cnt(f'{NX}/shared/discovery_log.jsonl')
 stubs = len(os.listdir(f'{NX}/shared/calc/auto_stubs')) if os.path.isdir(f'{NX}/shared/calc/auto_stubs') else 0
-discovery = count_lines(f'{NX}/shared/discovery_log.jsonl')
 
-# Top convergences
-quality_path = f'{NX}/shared/closure_quality_report.json'
-convergences = []
-if os.path.exists(quality_path):
-    q = json.loads(open(quality_path).read())
-    convergences = q.get('top_convergences', [])[:15]
-
-# Domain distribution
-domains = Counter()
-for i,line in enumerate(open(f'{NX}/shared/cycle/topology.jsonl')):
-    if i > 10000: break
-    try: domains[json.loads(line).get('domain','?')] += 1
-    except: pass
-
-# Source types
-source_types = Counter()
-for line in open(f'{NX}/shared/verified_constants.jsonl'):
+status = Counter()
+source_proj = Counter()
+for l in open(f'{NX}/shared/verified_constants.jsonl'):
     try:
-        j = json.loads(line)
-        if j.get('status')=='EXACT':
-            source_types[j.get('project','?')] += 1
+        j = json.loads(l)
+        status[j.get('status','?')] += 1
+        source_proj[j.get('project','?')] += 1
+    except: pass
+exact = status.get('EXACT', 0)
+
+# Domains
+domains = Counter()
+for i,l in enumerate(open(f'{NX}/shared/cycle/topology.jsonl')):
+    if i > 15000: break
+    try: domains[json.loads(l).get('domain','?')] += 1
     except: pass
 
-ts = datetime.now().isoformat()
-pct_100k = closed_total * 100 / 100000
-pct_200k = closed_total * 100 / 200000
-
-# Per-project progress — scan hypothesis_dirs + count closed
+# Per-project stats
 projects_json = f'{NX}/shared/projects.json'
 project_stats = []
 try:
@@ -60,103 +45,123 @@ try:
         proot = f'{HOME}/Dev/{pcfg.get("root",pname)}'
         hyp_count = 0
         for sd in pcfg.get('hypothesis_dirs',[]):
-            dir_path = f'{proot}/{sd}'
-            if os.path.isdir(dir_path):
-                for root_d, _, files in os.walk(dir_path):
+            dp = f'{proot}/{sd}'
+            if os.path.isdir(dp):
+                for _,_,files in os.walk(dp):
                     hyp_count += sum(1 for f in files if f.endswith('.md') and 'NEXUS6' not in f)
-        # closures from this project
         dom_key = f'hypothesis:{pname}'
-        pts_in_topo = domains.get(dom_key, 0)
-        # closure EXACTs from this project source
-        closed_from = sum(c for p,c in source_types.items() if pname.lower() in p.lower())
+        pts = domains.get(dom_key, 0)
+        cls = sum(c for p,c in source_proj.items() if pname.lower() in p.lower())
         project_stats.append({
-            'name': pname,
-            'hyp_files': hyp_count,
-            'topo_points': pts_in_topo,
-            'closed': closed_from,
+            'name': pname, 'hyp': hyp_count, 'topo': pts, 'closed': cls
         })
-    project_stats.sort(key=lambda x: -x['topo_points'])
-except Exception as e:
-    project_stats = []
+    project_stats.sort(key=lambda x: -(x['topo']+x['closed']))
+except: pass
 
-# Build HTML
-html = f"""<!doctype html><html><head><meta charset="utf-8"><title>nexus6 dashboard</title>
+# Milestone
+milestones = [1000, 2500, 5000, 7500, 10000, 20000, 50000, 100000, 200000, 500000, 1000000]
+next_ms = next((m for m in milestones if m > closed), milestones[-1])
+pct_ms = closed * 100 / next_ms
+bar_fill = int(pct_ms / 5)  # 20 cells
+
+ts = datetime.now().strftime('%Y-%m-%d %H:%M')
+max_topo = max((p['topo'] for p in project_stats), default=1) or 1
+
+def status_icon(p):
+    if p['topo'] > 1000: return '🔥'
+    if p['topo'] > 100: return '✅'
+    if p['topo'] > 10: return '🔄'
+    if p['closed'] > 10: return '⏳'
+    return '░'
+
+html = f"""<!doctype html><html lang="ko"><head><meta charset="utf-8">
+<title>🛸 nexus6 dashboard</title>
+<meta http-equiv="refresh" content="60">
 <style>
-body{{font:13px -apple-system,sans-serif;margin:0;padding:24px;background:#0a0a0a;color:#ddd;max-width:1200px;margin:0 auto;}}
-h1{{color:#8ef;margin:0 0 4px;font-size:24px;}}
-h2{{color:#8ef;margin:24px 0 8px;font-size:15px;border-bottom:1px solid #333;padding-bottom:4px;}}
-.meta{{color:#666;font-size:11px;margin-bottom:16px;}}
-.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px;}}
-.card{{background:#151515;padding:12px;border-radius:4px;border-left:3px solid #4a9;}}
+*{{margin:0;padding:0;box-sizing:border-box;}}
+body{{font:13px -apple-system,BlinkMacSystemFont,sans-serif;background:#0a0a0a;color:#ddd;padding:20px;max-width:1400px;margin:0 auto;}}
+h1{{color:#8ef;font-size:22px;margin:0 0 4px;}}
+.meta{{color:#555;font-size:10px;margin-bottom:20px;}}
+.hero{{background:linear-gradient(135deg,#1a2e3e,#0d1419);padding:20px;border-radius:8px;margin-bottom:20px;border:1px solid #253648;}}
+.hero-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:16px;}}
+.stat{{text-align:left;}}
+.stat-num{{font-size:28px;color:#8ef;font-weight:700;line-height:1;}}
+.stat-lbl{{font-size:10px;color:#666;text-transform:uppercase;letter-spacing:1.5px;margin-top:4px;}}
+.milestone-bar{{margin-top:14px;background:#0d1419;border-radius:4px;padding:3px;border:1px solid #253648;}}
+.mbar{{height:10px;background:linear-gradient(90deg,#4a9,#8ef,#4a9);border-radius:2px;}}
+h2{{color:#8ef;font-size:13px;margin:28px 0 12px;border-bottom:1px solid #222;padding-bottom:6px;letter-spacing:1px;text-transform:uppercase;}}
+.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px;}}
+.card{{background:#111;padding:14px;border-radius:6px;border-left:3px solid #333;transition:border-color .2s;}}
 .card.hot{{border-left-color:#f80;}}
-.card.info{{border-left-color:#4a9;}}
-.num{{font-size:28px;color:#fff;font-weight:600;line-height:1;}}
-.lbl{{font-size:10px;color:#888;text-transform:uppercase;letter-spacing:1px;}}
-.bar{{background:#222;height:8px;border-radius:4px;margin:6px 0;overflow:hidden;}}
-.bar-fill{{background:linear-gradient(90deg,#4a9,#8ef);height:100%;}}
-table{{border-collapse:collapse;width:100%;}}
-th{{text-align:left;color:#8ef;padding:6px 10px;border-bottom:1px solid #333;font-weight:600;font-size:11px;}}
-td{{padding:5px 10px;border-bottom:1px solid #1a1a1a;font-family:Menlo,monospace;font-size:12px;}}
-.tag{{background:#1e2e3e;padding:2px 6px;border-radius:3px;font-size:10px;color:#8ef;}}
+.card.ok{{border-left-color:#4a9;}}
+.card.active{{border-left-color:#8ef;}}
+.card.idle{{border-left-color:#444;}}
+.card-hdr{{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px;}}
+.card-name{{font-size:14px;font-weight:600;color:#fff;}}
+.card-icon{{font-size:16px;}}
+.card-metrics{{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;}}
+.metric{{font-size:10px;}}
+.metric-num{{font-size:16px;color:#8ef;font-weight:600;display:block;}}
+.metric-lbl{{color:#555;text-transform:uppercase;letter-spacing:1px;font-size:9px;}}
+.prog{{margin-top:10px;background:#1a1a1a;height:4px;border-radius:2px;overflow:hidden;}}
+.prog-fill{{height:100%;background:linear-gradient(90deg,#4a9,#8ef);}}
+table{{width:100%;border-collapse:collapse;}}
+th,td{{padding:5px 10px;text-align:left;border-bottom:1px solid #1a1a1a;font-size:11px;}}
+th{{color:#8ef;text-transform:uppercase;letter-spacing:1px;font-weight:600;font-size:9px;}}
+td.num{{font-family:Menlo,monospace;color:#8ef;text-align:right;}}
+.tag{{display:inline-block;background:#1e2e3e;padding:2px 6px;border-radius:3px;font-size:9px;color:#8ef;font-family:Menlo,monospace;}}
 </style></head><body>
-<h1>🛸 nexus6 dashboard</h1>
-<div class="meta">generated {ts} · auto-refresh via gen-dashboard.sh</div>
+<h1>🛸 nexus6 autonomous system</h1>
+<div class="meta">last refresh {ts} · auto-reload 60s · 16 LaunchAgents</div>
 
-<div class="grid">
-  <div class="card hot"><div class="lbl">total closed</div><div class="num">{closed_total:,}</div></div>
-  <div class="card hot"><div class="lbl">EXACT</div><div class="num">{exact:,}</div></div>
-  <div class="card info"><div class="lbl">topology points</div><div class="num">{topo:,}</div></div>
-  <div class="card info"><div class="lbl">discovery log</div><div class="num">{discovery:,}</div></div>
-  <div class="card info"><div class="lbl">calc stubs</div><div class="num">{stubs:,}</div></div>
-  <div class="card"><div class="lbl">100k milestone</div><div class="num">{pct_100k:.1f}%</div><div class="bar"><div class="bar-fill" style="width:{min(pct_100k,100)}%"></div></div></div>
+<div class="hero">
+  <div class="hero-grid">
+    <div class="stat"><div class="stat-num">{closed:,}</div><div class="stat-lbl">Total Closed</div></div>
+    <div class="stat"><div class="stat-num">{exact:,}</div><div class="stat-lbl">EXACT</div></div>
+    <div class="stat"><div class="stat-num">{topo:,}</div><div class="stat-lbl">Topology Σ</div></div>
+    <div class="stat"><div class="stat-num">{disc:,}</div><div class="stat-lbl">Discovery Log</div></div>
+    <div class="stat"><div class="stat-num">{stubs}</div><div class="stat-lbl">Calc Stubs</div></div>
+    <div class="stat"><div class="stat-num">{pct_ms:.0f}%</div><div class="stat-lbl">→{next_ms//1000}k</div></div>
+  </div>
+  <div class="milestone-bar"><div class="mbar" style="width:{min(pct_ms,100):.1f}%"></div></div>
 </div>
 
-<h2>🎯 top cross-project convergences (real discoveries)</h2>
-<table><tr><th>value</th><th>count</th><th>sources</th></tr>
-"""
-
-for c in convergences:
-    val = c['value']; cnt = c['count']; srcs = ', '.join(c['sources'][:4])
-    html += f"<tr><td><b>{val}</b></td><td>{cnt}x</td><td class='tag'>{srcs}</td></tr>"
-
-html += """</table>
-
 <h2>📦 프로젝트별 진행상황</h2>
-<table><tr><th>project</th><th>hyp files</th><th>topo points</th><th>closures</th><th>progress</th></tr>
+<div class="grid">
 """
 
-max_topo = max((p['topo_points'] for p in project_stats), default=1) or 1
 for p in project_stats:
-    pct = 100 * p['topo_points'] / max_topo if max_topo > 0 else 0
-    html += f'<tr><td><b>{p["name"]}</b></td><td>{p["hyp_files"]}</td><td>{p["topo_points"]:,}</td><td>{p["closed"]:,}</td><td style="min-width:140px"><div class="bar"><div class="bar-fill" style="width:{pct:.0f}%"></div></div></td></tr>'
-
-html += """</table>
-
-<h2>📊 topology domains</h2>
-<table><tr><th>domain</th><th>points</th><th>pct</th></tr>
+    name = p['name']
+    pts = p['topo']; cls = p['closed']; hyp = p['hyp']
+    icon = status_icon(p)
+    prog = 100 * pts / max_topo if max_topo > 0 else 0
+    css_class = 'hot' if pts > 1000 else 'active' if pts > 100 else 'ok' if cls > 10 else 'idle'
+    html += f"""  <div class="card {css_class}">
+    <div class="card-hdr"><span class="card-name">{name}</span><span class="card-icon">{icon}</span></div>
+    <div class="card-metrics">
+      <div class="metric"><span class="metric-num">{hyp:,}</span><span class="metric-lbl">hyp files</span></div>
+      <div class="metric"><span class="metric-num">{pts:,}</span><span class="metric-lbl">topo pts</span></div>
+      <div class="metric"><span class="metric-num">{cls:,}</span><span class="metric-lbl">closures</span></div>
+    </div>
+    <div class="prog"><div class="prog-fill" style="width:{prog:.0f}%"></div></div>
+  </div>
 """
 
-total_topo = sum(domains.values()) or 1
-for dom, cnt in domains.most_common(15):
-    pct = cnt*100/total_topo
-    html += f"<tr><td>{dom}</td><td>{cnt:,}</td><td>{pct:.1f}%</td></tr>"
+html += """</div>
+
+<h2>📊 Topology Domains</h2>
+<table><tr><th>domain</th><th>points</th><th>%</th></tr>
+"""
+total_topo_sum = sum(domains.values()) or 1
+for d,c in domains.most_common(10):
+    pct = c*100/total_topo_sum
+    html += f'<tr><td><span class="tag">{d}</span></td><td class="num">{c:,}</td><td class="num">{pct:.1f}%</td></tr>'
 
 html += """</table>
+</body></html>"""
 
-<h2>📁 source projects (EXACT records)</h2>
-<table><tr><th>project</th><th>records</th></tr>
-"""
-
-for proj, cnt in source_types.most_common(20):
-    html += f"<tr><td>{proj}</td><td>{cnt:,}</td></tr>"
-
-html += """</table>
-<div class="meta">nexus6 singularity-recursion · 14 agents · auto-committed to feat/alien-index</div>
-</body></html>
-"""
-
-out = os.path.expanduser('~/Dev/nexus6/shared/dashboard.html')
+out = f'{NX}/shared/dashboard.html'
 with open(out, 'w') as f: f.write(html)
-print(f"[{ts}] dashboard → {out}")
-print(f"  closed={closed_total:,} EXACT={exact:,} topo={topo:,}")
+print(f"[{ts}] dashboard → {out} ({len(html)}B)")
+print(f"  closed={closed:,} exact={exact:,} topo={topo:,} projects={len(project_stats)}")
 PYEOF
