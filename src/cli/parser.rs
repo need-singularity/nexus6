@@ -115,6 +115,17 @@ pub enum CliCommand {
     SingularityTick {
         base_dir: Option<String>,
     },
+    SingularityDaemon {
+        base_dir: Option<String>,
+        interval_sec: u64,
+    },
+    SingularityBackfill {
+        base_dir: Option<String>,
+        project_root: Option<String>,
+        memory: bool,
+        all_projects: bool,
+        fast: bool,
+    },
     /// Pack: install/uninstall CLI-only nexus6 integration (symlink + CC hooks).
     Pack { sub: PackSub },
     /// Sentry: pure-Rust health watcher for nexus6 daemon (no API calls).
@@ -218,6 +229,8 @@ pub fn parse_args(args: &[String]) -> Result<CliCommand, String> {
         "dispatch" | "dp" => parse_dispatch(rest),
         "alien-index" | "ai" => parse_alien_index(rest),
         "singularity-tick" | "stk" => parse_singularity_tick(rest),
+        "singularity-daemon" | "sdm" => parse_singularity_daemon(rest),
+        "singularity-backfill" | "sbf" => parse_singularity_backfill(rest),
         "pack" => parse_pack(rest),
         "sentry" => parse_sentry(rest),
         "hook" => parse_hook(rest),
@@ -929,6 +942,58 @@ fn parse_singularity_tick(args: &[String]) -> Result<CliCommand, String> {
         i += 1;
     }
     Ok(CliCommand::SingularityTick { base_dir })
+}
+
+fn parse_singularity_daemon(args: &[String]) -> Result<CliCommand, String> {
+    let mut base_dir: Option<String> = None;
+    let mut interval_sec: u64 = 30;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--base-dir" => {
+                i += 1;
+                if i >= args.len() { return Err("--base-dir requires a path".to_string()); }
+                base_dir = Some(args[i].clone());
+            }
+            "--interval" => {
+                i += 1;
+                if i >= args.len() { return Err("--interval requires seconds".to_string()); }
+                interval_sec = args[i].parse().map_err(|e| format!("bad --interval: {}", e))?;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    Ok(CliCommand::SingularityDaemon { base_dir, interval_sec })
+}
+
+fn parse_singularity_backfill(args: &[String]) -> Result<CliCommand, String> {
+    let mut base_dir: Option<String> = None;
+    let mut project_root: Option<String> = None;
+    let mut memory = true;
+    let mut all_projects = false;
+    let mut fast = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--base-dir" => {
+                i += 1;
+                if i >= args.len() { return Err("--base-dir requires a path".to_string()); }
+                base_dir = Some(args[i].clone());
+            }
+            "--project-root" => {
+                i += 1;
+                if i >= args.len() { return Err("--project-root requires a path".to_string()); }
+                project_root = Some(args[i].clone());
+            }
+            "--no-memory" => { memory = false; }
+            "--all-projects" => { all_projects = true; }
+            "--fast" => { fast = true; }
+            _ => {}
+        }
+        i += 1;
+    }
+    Ok(CliCommand::SingularityBackfill { base_dir, project_root, memory, all_projects, fast })
 }
 
 fn parse_pack(args: &[String]) -> Result<CliCommand, String> {

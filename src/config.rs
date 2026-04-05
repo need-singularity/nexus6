@@ -241,7 +241,7 @@ pub struct SingularityRecursionConfig {
 }
 
 fn singularity_default_domain() -> String { "architecture_design".into() }
-fn singularity_default_max_points() -> u64 { 50_000 }
+fn singularity_default_max_points() -> u64 { u64::MAX } // 흡수 원칙: 모든 발견 보관
 fn singularity_default_eps() -> f32 { 0.3 }
 fn singularity_default_top_k() -> usize { 20 }
 fn singularity_default_cpu_per_tick() -> u64 { 30 }

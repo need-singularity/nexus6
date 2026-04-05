@@ -184,6 +184,8 @@ fn run_with_config(cmd: CliCommand, cfg: &NexusConfig) -> Result<(), String> {
         CliCommand::Dashboard { html, output } => run_dashboard(html, output),
         CliCommand::AlienIndex { sub } => crate::cli::alien_index_cmd::run(sub),
         CliCommand::SingularityTick { base_dir } => run_singularity_tick(base_dir),
+        CliCommand::SingularityDaemon { base_dir, interval_sec } => run_singularity_daemon(base_dir, interval_sec),
+        CliCommand::SingularityBackfill { base_dir, project_root, memory, all_projects, fast } => run_singularity_backfill(base_dir, project_root, memory, all_projects, fast),
         CliCommand::Pack { sub } => run_pack(sub),
         CliCommand::Sentry { sub } => run_sentry(sub),
         CliCommand::Hook { sub } => run_hook(sub),
@@ -1542,7 +1544,7 @@ fn run_report() -> Result<(), String> {
 
     let w = 65;
     let line = "─".repeat(w);
-    let now = chrono_now();
+    let now = hms_now();
 
     println!("  ┌{}┐", line);
     println!("  │ {:<w$}│", format!("🌐 NEXUS-6 통합 리포트 — {}", now));
@@ -1896,7 +1898,7 @@ fn run_mega(nexus_cfg: &NexusConfig) -> Result<(), String> {
         let hb_dir = format!("{}/.growth", path);
         let _ = std::fs::create_dir_all(&hb_dir);
         let hb = format!("{}/heartbeat", hb_dir);
-        let now = chrono_now();
+        let now = hms_now();
         let _ = std::fs::write(&hb, &now);
     }
 
@@ -2271,7 +2273,7 @@ fn run_daemon(domain: Option<String>, interval_min: u64, max_loops: Option<usize
 
         // 데몬 상태 저장
         let status = format!("loop={}\ntime={}\nnext={}min\ndomain={}\n",
-            loop_count, chrono_now(), interval_min, domain_str);
+            loop_count, hms_now(), interval_min, domain_str);
         let path = std::env::var("HOME")
             .map(|h| format!("{}/.nexus6/daemon_status.txt", h))
             .unwrap_or_else(|_| "/tmp/nexus6_daemon_status.txt".to_string());
@@ -2323,7 +2325,7 @@ fn run_loop(domain: Option<String>, cycles: usize, nexus_cfg: &NexusConfig) -> R
             base
         }
     };
-    let now = chrono_now();
+    let now = hms_now();
     let t0 = Instant::now();
 
     // ── Pre-state snapshot ──
@@ -2833,7 +2835,7 @@ fn get_mem_free_pct() -> f64 {
 }
 
 /// Get current time as formatted string.
-fn chrono_now() -> String {
+fn hms_now() -> String {
     use std::process::Command;
     Command::new("date")
         .arg("+%Y-%m-%d %H:%M")
@@ -3026,31 +3028,120 @@ fn hit_rate_bar(rate: f64, width: usize) -> String {
 }
 
 fn run_singularity_tick(base_dir: Option<String>) -> Result<(), String> {
-    use crate::singularity_recursion::tick::{run_tick, CycleRunner, TickPaths};
-    use crate::singularity_recursion::topology::{Point, Singularity};
+    use crate::singularity_recursion::airgenome_runner::AirgenomeRunner;
+    use crate::singularity_recursion::tick::{run_tick, TickPaths};
     use crate::config::SingularityRecursionConfig;
-
-    // Placeholder runner: deterministic fake until CycleEngine wiring lands.
-    struct ShimRunner;
-    impl CycleRunner for ShimRunner {
-        fn run(&mut self, domain: &str, seed: Option<&Point>) -> Singularity {
-            let prior = seed.map(|p| p.singularity.invariant.clone()).unwrap_or_default();
-            Singularity {
-                invariant: format!("{} :: probe from [{}]", domain,
-                                   prior.chars().take(60).collect::<String>()),
-                confidence: 0.5,
-                novelty: 0.8,
-                depth_reached: 3,
-            }
-        }
-    }
 
     let base = base_dir.unwrap_or_else(|| "shared/cycle".to_string());
     let paths = TickPaths::from_base(&base);
     let cfg = SingularityRecursionConfig::default();
-    let mut runner = ShimRunner;
+    let mut runner = AirgenomeRunner;
     let out = run_tick(&paths, &cfg, &mut runner);
     println!("tick exit={} point={:?} elapsed={}s",
              out.exit_code, out.point_id, out.elapsed_sec);
     if out.exit_code == 0 { Ok(()) } else { std::process::exit(out.exit_code); }
 }
+
+fn run_singularity_daemon(base_dir: Option<String>, interval_sec: u64) -> Result<(), String> {
+    use crate::singularity_recursion::airgenome_runner::AirgenomeRunner;
+    use crate::singularity_recursion::tick::{run_tick, TickPaths};
+    use crate::config::SingularityRecursionConfig;
+    use std::thread::sleep;
+    use std::time::Duration;
+
+    let base = base_dir.unwrap_or_else(|| "shared/cycle".to_string());
+    let paths = TickPaths::from_base(&base);
+    let cfg = SingularityRecursionConfig::default();
+    let mut runner = AirgenomeRunner;
+    let interval = Duration::from_secs(interval_sec);
+
+    println!("singularity-daemon: base={} interval={}s absorb=∞ (u64::MAX cap)",
+             base, interval_sec);
+    println!("halt: touch {}", paths.halt.display());
+    println!();
+
+    let mut tick_no: u64 = 0;
+    loop {
+        tick_no += 1;
+        let out = run_tick(&paths, &cfg, &mut runner);
+        let code_name = match out.exit_code {
+            0 => "OK",
+            1 => "SKIP",
+            2 => "BUDGET",
+            3 => "HALT",
+            4 => "LOCK",
+            _ => "?",
+        };
+        println!("[{}] tick#{} {} point={:?} elapsed={}s",
+                 hms_now(), tick_no, code_name, out.point_id, out.elapsed_sec);
+
+        if out.exit_code == 3 {
+            // halt file present — idle poll instead of exit
+            sleep(Duration::from_secs(5));
+            continue;
+        }
+        if out.exit_code == 2 {
+            eprintln!("budget exhausted — daemon stopping");
+            return Err("budget exhausted".into());
+        }
+        sleep(interval);
+    }
+}
+
+fn run_singularity_backfill(
+    base_dir: Option<String>,
+    project_root: Option<String>,
+    memory: bool,
+    all_projects: bool,
+    fast: bool,
+) -> Result<(), String> {
+    use crate::singularity_recursion::backfill::{default_memory_root, run_backfill, run_backfill_all_projects};
+    use crate::singularity_recursion::tick::TickPaths;
+    use crate::singularity_recursion::topology::load;
+    use crate::config::SingularityRecursionConfig;
+    use std::path::PathBuf;
+
+    let base = base_dir.unwrap_or_else(|| "shared/cycle".to_string());
+    let paths = TickPaths::from_base(&base);
+    std::fs::create_dir_all(&paths.base).ok();
+    let cfg = SingularityRecursionConfig::default();
+
+    let mut topo = load(&paths.topology, &paths.edges, cfg.neighborhood_radius_eps)
+        .unwrap_or_else(|_| crate::singularity_recursion::topology::Topology::new(cfg.neighborhood_radius_eps));
+    let before = topo.points.len();
+    let memdir = if memory { default_memory_root() } else { None };
+
+    println!("singularity-backfill (fast={}, all_projects={}):", fast, all_projects);
+
+    if all_projects {
+        let projects_json = PathBuf::from("/Users/ghost/Dev/nexus6/shared/projects.json");
+        let (stats, per_proj) = run_backfill_all_projects(
+            &projects_json, memdir.as_deref(), &mut topo, &paths.topology, &paths.edges, fast,
+        );
+        println!("  projects.json   : {}", projects_json.display());
+        println!("  memory_root     : {:?}", memdir);
+        for (name, count) in &per_proj {
+            println!("  - {:<18}: {} absorbed", name, count);
+        }
+        println!("  memory          : {} absorbed", stats.memory);
+        let after = topo.points.len();
+        println!("  total new       : {} ({} → {} points)", stats.total_absorbed(), before, after);
+    } else {
+        let proj = PathBuf::from(
+            project_root.unwrap_or_else(|| std::env::current_dir()
+                .ok()
+                .and_then(|p| p.to_str().map(|s| s.to_string()))
+                .unwrap_or_else(|| ".".to_string())),
+        );
+        let stats = run_backfill(&proj, memdir.as_deref(), &mut topo, &paths.topology, &paths.edges, fast);
+        let after = topo.points.len();
+        println!("  project_root    : {}", proj.display());
+        println!("  memory_root     : {:?}", memdir);
+        println!("  discovery_log   : {} absorbed", stats.discovery);
+        println!("  hypotheses      : {} absorbed", stats.hypotheses);
+        println!("  memory          : {} absorbed", stats.memory);
+        println!("  total new       : {} ({} → {} points)", stats.total_absorbed(), before, after);
+    }
+    Ok(())
+}
+
