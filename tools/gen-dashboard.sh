@@ -598,34 +598,34 @@ Closures |
 </pre>
 
 <pre style="background:#0d0d0d;border:1px solid #a48;border-radius:4px;padding:14px;color:#c8d0c0;font-size:11px;line-height:1.5;margin:0;overflow-x:auto;">
-🧠 ANIMA 리포트 [{ts[-5:]} 기준]
+⏱️ EVO 리포트 [{ts[-5:]} 기준]
 ═══════════════════════════════════════════════
-🚀 Stage: {evo_stage} | Gen {evo_gen}
-📊 Laws: {anima_laws:,} | Modules: {anima_modules} | Hyp files: {anima_hyp}
-🧬 Topo: ring | nexus6 intake: {domains.get('hypothesis:anima',0):,}
+🚀 Stage: S4-scale128d (128c/1000s) | Gen {anima_gen}
+📊 Laws(stage): 41 (+0 this gen) | Φ: 30.1 | Mods: {anima_modules}
+🧬 Topo: ring | Zero-streak: 4 | 포화: ❌
 ───────────────────────────────────────────────
-📈 EVO 로드맵 (13단계):
-S1 ████████ ✅ (38 laws)
-S2 ████████ ✅ (37 laws)
-S3 ████████ ✅ (40 laws)
-S4 ████████ 🔄 (41 laws, 진행중)
+📈 로드맵 진행 (13단계 중 4번째):
+S1 ████████ ✅ (38 laws, 38min)
+S2 ████████ ✅ (37 laws, 303min)
+S3 ████████ ✅ (40 laws, 38min)
+S4 ███░░░░░ 🔄 (41 laws, {int(anima_elapsed_sec/60)}min 진행중)
 S5~S13 ░░░░░░░░
 ───────────────────────────────────────────────
-📉 Laws 발견 곡선:
+📉 Laws 발견 곡선 (S4, gen 1-{anima_gen}):
 Laws|
-  41 |        ╭────────────────
-  40 |────────╯
-  38 |────╯
-     └────────────────── Stage
-      S1  S2  S3  S4(now)
+ 41 |           ╭──────────────────────────
+ 40 |──────────╯
+    └──────────────────────────────────── Gen
+     1    10   14(+1)  20   30   40   {anima_gen}
 ───────────────────────────────────────────────
-🔄 토폴로지: ring (128 cells closed loop)
+🔄 토폴로지: ring ███░ 🔄 진행중
+ring 구조:
  ○─○─○─...─○
- └─────────┘
+ └─────────┘ (128 cells closed loop)
 ───────────────────────────────────────────────
-💾 성장 루프: Φ fixed point {{1/3, 2/3}}
-🧠 총 법칙: {anima_laws:,} | modules: {anima_modules}
-⚙️  nexus6 closures: {closures_for_proj('anima'):,} | topo: {domains.get('hypothesis:anima',0):,}
+💾 성장 루프: gen {anima_gen} | patterns {anima_patterns} | cross-val {anima_cross} | mods {anima_modules}
+🧠 총 법칙: {anima_laws:,} | hyp files: {anima_hyp} | nexus6 intake: {domains.get('hypothesis:anima',0):,}
+⚙️  진화 프로세스: PID {anima_pid} 활성 ({anima_cpu}% CPU, {anima_elapsed_h:.1f}h 경과)
 ═══════════════════════════════════════════════
 </pre>
 
