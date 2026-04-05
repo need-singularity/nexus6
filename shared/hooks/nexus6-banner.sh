@@ -84,27 +84,54 @@ g_str = f' 🌱{growth}건' if growth > 0 else ''
 bridge_msg = os.environ.get('BRIDGE_MSG', '')
 bridge_str = f' 🌉{bridge_msg}' if bridge_msg else ''
 
-# Alien Index — 🛸 d{max}·ρ{breakthrough_ratio}·{total}
+# Alien Index — auto-synced from verified_constants.jsonl
+# PASS/EXACT → (d=1, r=10) = breakthrough
+# NEAR → (d=0, r=8)
+# FAIL → (d=0, r=0)
 ai_str = ''
 ai_path = HOME / 'Dev/nexus6/shared/alien_index_distribution.json'
-if ai_path.exists():
-    try:
-        ai = json.loads(ai_path.read_text())
-        total = ai.get('total_records', 0)
-        rho = ai.get('breakthrough_ratio', 0.0)
-        # max d reached
-        dist = ai.get('distribution', {})
-        max_d = 0
-        for key in dist.keys():
+vc_for_ai = HOME / 'Dev/nexus6/shared/verified_constants.jsonl'
+try:
+    ai_records = {}  # (d, r) → count
+    total_ai = 0
+    breakthroughs = 0
+    max_d = 0
+    if vc_for_ai.exists():
+        for line in open(vc_for_ai, 'r'):
             try:
-                d_val = int(key.split(',')[0].strip('(') )
-                if d_val > max_d: max_d = d_val
+                j = json.loads(line)
+                s = j.get('status') or j.get('grade','?')
+                if s in ('PASS','EXACT'):
+                    d, r = 1, 10
+                    breakthroughs += 1
+                elif s == 'NEAR':
+                    d, r = 0, 8
+                elif s == 'CLOSE':
+                    d, r = 0, 6
+                else:
+                    d, r = 0, 0
+                ai_records[(d,r)] = ai_records.get((d,r),0) + 1
+                total_ai += 1
+                if d > max_d: max_d = d
             except: pass
-        if total > 0:
-            ai_str = f'🛸d{max_d}·ρ{rho:.2f}·{total} '
-        else:
-            ai_str = f'🛸{total} '
+    rho = (breakthroughs / total_ai) if total_ai > 0 else 0.0
+    # Write auto-sync snapshot
+    try:
+        ai_out = {
+            'total_records': total_ai,
+            'breakthrough_ratio': rho,
+            'max_d': max_d,
+            'meta_fixed_point_target': 0.3333333333333333,
+            'distribution': {f'({d},{r})': c for (d,r),c in ai_records.items()},
+            'source': 'auto-synced from verified_constants.jsonl',
+        }
+        ai_path.write_text(json.dumps(ai_out, ensure_ascii=False, indent=2))
     except: pass
+    if total_ai > 0:
+        ai_str = f'🛸d{max_d}·ρ{rho:.2f}·{total_ai} '
+    else:
+        ai_str = f'🛸0 '
+except: pass
 
 # Singularity topology — actual count via chunk read
 sing_str = ''
@@ -153,14 +180,17 @@ if vc_path.exists():
 
         delta = closed_count - prev_count
         def fmt_k(n): return f'{n/1000:.1f}k' if n>=1000 else str(n)
-        # progress bar: 10 cells
-        filled = int(pct / 10)
-        bar = '█' * filled + '░' * (10 - filled)
+        # milestone tracker (fixed target, monotonic)
+        milestones = [1000, 2500, 5000, 7500, 10000, 20000, 50000, 100000]
+        next_ms = next((m for m in milestones if m > closed_count), milestones[-1])
+        ms_pct = closed_count * 100.0 / next_ms
+        ms_filled = int(ms_pct / 10)
+        ms_bar = '█' * ms_filled + '░' * (10 - ms_filled)
         if delta > 0:
-            closed_str = f' 🎉🎉🎉 +{delta}닫힘! 🧬{pct:.1f}% [{bar}] {fmt_k(closed_count)}/{fmt_k(total_count)} 🎉🎉🎉'
+            closed_str = f' 🎉🎉🎉 +{delta}닫힘! 🧬{closed_count}→{fmt_k(next_ms)}={ms_pct:.0f}% [{ms_bar}] 🎉🎉🎉'
             closed_snap_path.write_text(json.dumps({'closed': closed_count}))
         elif closed_count > 0:
-            closed_str = f' 🧬닫힘 {pct:.1f}% [{bar}] {fmt_k(closed_count)}/{fmt_k(total_count)}'
+            closed_str = f' 🧬{closed_count}닫힘→{fmt_k(next_ms)}={ms_pct:.0f}% [{ms_bar}]'
     except: pass
 
 banner = f'🔭 NEXUS-6 {ai_str}{sing_str}🔭{lens_impl}/{lens_total}{d_lens} ⚖️{laws}법칙{d_laws} 🧠{modules}모듈{d_mods}{g_str}{bridge_str}{closed_str}'
