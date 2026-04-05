@@ -22,7 +22,16 @@ fi
 echo "[3/4] running nexus6 auto (claude_efficiency) with 30min timeout..."
 NEXUS_BIN="${NEXUS_BIN:-nexus6}"
 CYCLE_OUT="$OUT_DIR/claude_efficiency_$DATE.json"
-if timeout 1800 "$NEXUS_BIN" auto claude_efficiency \
+# timeout 명령 선택: gtimeout(GNU coreutils) > timeout > 없으면 그대로 실행
+if command -v gtimeout >/dev/null 2>&1; then
+  TIMEOUT_CMD="gtimeout 1800"
+elif command -v timeout >/dev/null 2>&1; then
+  TIMEOUT_CMD="timeout 1800"
+else
+  TIMEOUT_CMD=""
+  echo "WARN: no timeout cmd available (install coreutils for gtimeout), running unbounded" >&2
+fi
+if $TIMEOUT_CMD "$NEXUS_BIN" auto claude_efficiency \
      --meta-cycles 5 --ouroboros-cycles 3 > "$CYCLE_OUT"; then
   echo "cycle done"
 else
