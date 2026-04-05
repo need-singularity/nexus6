@@ -2,6 +2,7 @@
 //!
 //! topology.jsonl and edges.jsonl are append-only, source of truth.
 
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
@@ -28,6 +29,15 @@ pub struct Point {
     pub singularity: Singularity,
     pub discovered_at_tick: u64,
     pub ts: String,
+    /// mk2: physics sector (backward-compat: defaults to None for old points)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mk2_sector: Option<String>,
+    /// mk2: prime set as sorted vec (e.g. [2,3,5])
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mk2_primes: Option<Vec<u64>>,
+    /// mk2: classifier confidence
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mk2_confidence: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -63,6 +73,8 @@ impl Topology {
         ts: &str,
     ) -> Point {
         let h = simhash(&sing.invariant);
+        // mk2: classify the invariant text
+        let (mk2_sector, mk2_primes, mk2_confidence) = classify_point_mk2(&sing.invariant);
         Point {
             id: self.next_id(),
             domain: domain.to_string(),
@@ -72,6 +84,9 @@ impl Topology {
             singularity: sing,
             discovered_at_tick: tick,
             ts: ts.to_string(),
+            mk2_sector,
+            mk2_primes,
+            mk2_confidence,
         }
     }
 
@@ -154,6 +169,46 @@ pub fn load(points_path: &Path, edges_path: &Path, eps: f32) -> std::io::Result<
     Ok(t)
 }
 
+/// mk2: classify a point's invariant text → (sector, primes, confidence).
+/// Extracts numeric values from the text and runs classify_v2.
+fn classify_point_mk2(text: &str) -> (Option<String>, Option<Vec<u64>>, Option<f64>) {
+    use crate::mk2::classify_v2::{classify_v2, default_sectors};
+    use crate::mk2::primes::PrimeSet;
+
+    // Extract numbers from text (quick regex-free scan)
+    let values: Vec<f64> = text
+        .split(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')
+        .filter_map(|s| s.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v != 0.0)
+        .collect();
+
+    let mut ps = PrimeSet::empty();
+    for &v in &values {
+        if v.abs() < 1e-10 || v.abs() > 1e6 { continue; }
+        for den in &[1u64, 2, 3, 5, 6, 7, 15, 21, 35, 105, 210] {
+            let num = (v * *den as f64).round() as i128;
+            if num > 0 && ((num as f64 / *den as f64) - v).abs() < 1e-6 {
+                for (p, _) in crate::mk2::primes::factorize(num.unsigned_abs() as u64) {
+                    ps.insert(p);
+                }
+                for (p, _) in crate::mk2::primes::factorize(*den) {
+                    ps.insert(p);
+                }
+                break;
+            }
+        }
+    }
+
+    let sectors = default_sectors();
+    let result = classify_v2(text, &values, &ps, &sectors);
+
+    let sector = Some(result.sector.to_string());
+    let primes = if ps.is_empty() { None } else { Some(ps.to_vec()) };
+    let confidence = Some(result.confidence);
+
+    (sector, primes, confidence)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,5 +281,242 @@ mod tests {
         let n2 = t.neighbors("p_000001");
         assert!(n1.contains(&"p_000001"));
         assert!(n2.contains(&"p_000000"));
+    }
+}
+
+// ════════════════════════════════════════════════════════════════
+// Knowledge Simplicial Complex — Gap-Guided Blowup Seeds
+// ════════════════════════════════════════════════════════════════
+
+use std::collections::BTreeSet;
+
+/// A node in the knowledge complex.
+#[derive(Debug, Clone)]
+pub struct KnowledgeNode {
+    pub id: String,
+    pub value: Option<f64>,
+    pub expr: Option<String>,
+    pub domain: String,
+    pub grade: u8,
+}
+
+/// The knowledge simplicial complex.
+/// 0-simplex=node, 1-simplex=edge, 2-simplex=triangle, ...
+#[derive(Debug)]
+pub struct KnowledgeComplex {
+    pub nodes: HashMap<String, KnowledgeNode>,
+    pub edges: HashSet<(String, String)>,     // sorted pairs
+    pub triangles: HashSet<(String, String, String)>, // sorted triples
+}
+
+/// A gap = missing simplex with high discovery potential.
+#[derive(Debug, Clone)]
+pub struct Gap {
+    pub nodes: Vec<String>,
+    pub dimension: usize,
+    pub score: f64,
+    pub seed_expr: Option<String>,
+}
+
+impl KnowledgeComplex {
+    /// Build from .n6 parsed JSON (array of entries).
+    pub fn from_n6_json(json_str: &str) -> Self {
+        let mut complex = KnowledgeComplex {
+            nodes: HashMap::new(),
+            edges: HashSet::new(),
+            triangles: HashSet::new(),
+        };
+
+        let entries: Vec<serde_json::Value> = match serde_json::from_str(json_str) {
+            Ok(v) => v,
+            Err(_) => return complex,
+        };
+
+        for entry in &entries {
+            let id = entry["name"].as_str().unwrap_or("").to_string();
+            if id.is_empty() { continue; }
+            let value = entry["value"].as_f64();
+            let expr = entry["expr"].as_str().map(|s| s.to_string());
+            let domain = entry["domain"].as_str().unwrap_or("").to_string();
+            let grade = entry["grade"].as_u64().unwrap_or(0) as u8;
+
+            complex.nodes.insert(id.clone(), KnowledgeNode {
+                id: id.clone(), value, expr, domain, grade,
+            });
+
+            // edges from depends_on
+            if let Some(deps) = entry["depends_on"].as_array() {
+                for dep in deps {
+                    if let Some(dep_id) = dep.as_str() {
+                        let (a, b) = if id < dep_id.to_string() {
+                            (id.clone(), dep_id.to_string())
+                        } else {
+                            (dep_id.to_string(), id.clone())
+                        };
+                        if a != b {
+                            complex.edges.insert((a, b));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Auto-detect triangles: if A-B, A-C, B-C all exist
+        let edge_set: HashSet<(&str, &str)> = complex.edges.iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        let ids: Vec<&str> = complex.nodes.keys().map(|s| s.as_str()).collect();
+        for i in 0..ids.len() {
+            for j in (i+1)..ids.len() {
+                for k in (j+1)..ids.len() {
+                    let (a, b, c) = (ids[i], ids[j], ids[k]);
+                    let has_ab = edge_set.contains(&(a, b)) || edge_set.contains(&(b, a));
+                    let has_ac = edge_set.contains(&(a, c)) || edge_set.contains(&(c, a));
+                    let has_bc = edge_set.contains(&(b, c)) || edge_set.contains(&(c, b));
+                    if has_ab && has_ac && has_bc {
+                        complex.triangles.insert((a.to_string(), b.to_string(), c.to_string()));
+                    }
+                }
+            }
+        }
+
+        complex
+    }
+
+    /// Find gaps sorted by discovery potential (highest first).
+    pub fn find_gaps(&self, max_gaps: usize) -> Vec<Gap> {
+        let mut gaps = Vec::new();
+        let ids: Vec<&str> = self.nodes.keys().map(|s| s.as_str()).collect();
+        let n6_targets: &[f64] = &[
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 12.0, 16.0, 24.0,
+            32.0, 48.0, 64.0, 72.0, 128.0, 144.0, 192.0, 220.0, 256.0,
+            720.0, 1536.0, 4096.0, 0.333333,
+        ];
+
+        // Binary gaps (missing edges between valued nodes)
+        for i in 0..ids.len() {
+            for j in (i+1)..ids.len() {
+                let (a, b) = (ids[i], ids[j]);
+                let sorted = if a < b { (a.to_string(), b.to_string()) } else { (b.to_string(), a.to_string()) };
+                if self.edges.contains(&sorted) { continue; }
+
+                let na = &self.nodes[a];
+                let nb = &self.nodes[b];
+                if na.value.is_none() || nb.value.is_none() { continue; }
+
+                let va = na.value.unwrap();
+                let vb = nb.value.unwrap();
+                let domain_bonus = if na.domain == nb.domain { 0.3 } else { 0.1 };
+
+                // Check if any operation yields an n=6 value
+                let ops = [va + vb, va * vb, va - vb, vb - va,
+                           if vb != 0.0 { va / vb } else { f64::NAN },
+                           if va != 0.0 { vb / va } else { f64::NAN }];
+                let mut best_hit = f64::MAX;
+                let mut best_expr = String::new();
+                for &result in &ops {
+                    if result.is_nan() || result.is_infinite() { continue; }
+                    for &target in n6_targets {
+                        let dist = (result - target).abs();
+                        if dist < best_hit {
+                            best_hit = dist;
+                            best_expr = format!("{}⊕{} ≈ {}", a, b, target);
+                        }
+                    }
+                }
+
+                let proximity_score = if best_hit < 0.001 { 1.0 }
+                    else if best_hit < 0.1 { 0.7 }
+                    else if best_hit < 1.0 { 0.3 }
+                    else { 0.0 };
+
+                let score = domain_bonus + proximity_score;
+                if score >= 0.4 {
+                    gaps.push(Gap {
+                        nodes: vec![a.to_string(), b.to_string()],
+                        dimension: 1,
+                        score,
+                        seed_expr: if proximity_score > 0.0 { Some(best_expr) } else { None },
+                    });
+                }
+            }
+        }
+
+        // Ternary gaps (almost-triangles: 2 of 3 edges present)
+        for i in 0..ids.len().min(40) {
+            for j in (i+1)..ids.len().min(40) {
+                for k in (j+1)..ids.len().min(40) {
+                    let (a, b, c) = (ids[i], ids[j], ids[k]);
+                    let tri = (a.to_string(), b.to_string(), c.to_string());
+                    if self.triangles.contains(&tri) { continue; }
+
+                    let has = |x: &str, y: &str| -> bool {
+                        let sorted = if x < y { (x.to_string(), y.to_string()) } else { (y.to_string(), x.to_string()) };
+                        self.edges.contains(&sorted)
+                    };
+                    let face_count = [has(a,b), has(a,c), has(b,c)].iter().filter(|&&x| x).count();
+                    if face_count >= 2 {
+                        // Generate ternary seed
+                        let vals: Vec<f64> = [a, b, c].iter()
+                            .filter_map(|id| self.nodes.get(*id).and_then(|n| n.value))
+                            .collect();
+                        let seed = if vals.len() == 3 {
+                            let r = vals[0] * vals[1] + vals[2];
+                            let closest = n6_targets.iter().min_by(|&&x, &&y|
+                                (x - r).abs().partial_cmp(&(y - r).abs()).unwrap()
+                            );
+                            closest.map(|t| format!("{}·{}+{} ≈ {}", a, b, c, t))
+                        } else { None };
+
+                        gaps.push(Gap {
+                            nodes: vec![a.to_string(), b.to_string(), c.to_string()],
+                            dimension: 2,
+                            score: face_count as f64 / 3.0 + 0.2,
+                            seed_expr: seed,
+                        });
+                    }
+                }
+            }
+        }
+
+        gaps.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        gaps.truncate(max_gaps);
+        gaps
+    }
+
+    /// Convert gaps to blowup axiom seeds.
+    pub fn gaps_to_axioms(&self, gaps: &[Gap]) -> (Vec<String>, HashMap<String, f64>) {
+        let mut axioms = Vec::new();
+        let mut metrics = HashMap::new();
+
+        for gap in gaps {
+            if let Some(ref expr) = gap.seed_expr {
+                axioms.push(expr.clone());
+            }
+            axioms.push(format!("gap_d{}:{}", gap.dimension, gap.nodes.join("+")));
+
+            for nid in &gap.nodes {
+                if let Some(node) = self.nodes.get(nid) {
+                    if let Some(v) = node.value {
+                        metrics.insert(nid.clone(), v);
+                    }
+                }
+            }
+        }
+
+        (axioms, metrics)
+    }
+
+    /// Euler characteristic: χ = V - E + T
+    pub fn euler_char(&self) -> i64 {
+        self.nodes.len() as i64 - self.edges.len() as i64 + self.triangles.len() as i64
+    }
+
+    pub fn stats(&self) -> String {
+        let v = self.nodes.len();
+        let e = self.edges.len();
+        let t = self.triangles.len();
+        let density = if v > 1 { (2 * e) as f64 / (v * (v-1)) as f64 } else { 0.0 };
+        format!("V={} E={} T={} χ={} density={:.4}", v, e, t, self.euler_char(), density)
     }
 }
