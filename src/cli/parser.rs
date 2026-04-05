@@ -153,6 +153,11 @@ pub enum CliCommand {
         base_dir: Option<String>,
         eps: f32,
     },
+    SingularityResonance {
+        base_dir: Option<String>,
+        limit: usize,
+        domain_filter: Option<String>,
+    },
     /// Pack: install/uninstall CLI-only nexus6 integration (symlink + CC hooks).
     Pack { sub: PackSub },
     /// Sentry: pure-Rust health watcher for nexus6 daemon (no API calls).
@@ -263,6 +268,7 @@ pub fn parse_args(args: &[String]) -> Result<CliCommand, String> {
         "singularity-frontier" | "sfrontier" => parse_singularity_frontier(rest),
         "singularity-bridges" | "sbridges" => parse_singularity_bridges(rest),
         "singularity-rebuild-edges" | "sreb" => parse_singularity_rebuild_edges(rest),
+        "singularity-resonance" | "sres" => parse_singularity_resonance(rest),
         "pack" => parse_pack(rest),
         "sentry" => parse_sentry(rest),
         "hook" => parse_hook(rest),
@@ -1051,6 +1057,23 @@ fn parse_singularity_frontier(args: &[String]) -> Result<CliCommand, String> {
         i += 1;
     }
     Ok(CliCommand::SingularityFrontier { base_dir, eps, top })
+}
+
+fn parse_singularity_resonance(args: &[String]) -> Result<CliCommand, String> {
+    let mut base_dir: Option<String> = None;
+    let mut limit: usize = 10;
+    let mut domain_filter: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--base-dir" => { i += 1; base_dir = args.get(i).cloned(); }
+            "--limit" => { i += 1; limit = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(limit); }
+            "--domain" => { i += 1; domain_filter = args.get(i).cloned(); }
+            _ => {}
+        }
+        i += 1;
+    }
+    Ok(CliCommand::SingularityResonance { base_dir, limit, domain_filter })
 }
 
 fn parse_singularity_rebuild_edges(args: &[String]) -> Result<CliCommand, String> {

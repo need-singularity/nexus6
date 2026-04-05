@@ -191,6 +191,7 @@ fn run_with_config(cmd: CliCommand, cfg: &NexusConfig) -> Result<(), String> {
         CliCommand::SingularityFrontier { base_dir, eps, top } => run_singularity_frontier(base_dir, eps, top),
         CliCommand::SingularityBridges { base_dir, domain_a, domain_b, eps, top } => run_singularity_bridges(base_dir, domain_a, domain_b, eps, top),
         CliCommand::SingularityRebuildEdges { base_dir, eps } => run_singularity_rebuild_edges(base_dir, eps),
+        CliCommand::SingularityResonance { base_dir, limit, domain_filter } => run_singularity_resonance(base_dir, limit, domain_filter),
         CliCommand::Pack { sub } => run_pack(sub),
         CliCommand::Sentry { sub } => run_sentry(sub),
         CliCommand::Hook { sub } => run_hook(sub),
@@ -3139,6 +3140,39 @@ fn run_singularity_frontier(base_dir: Option<String>, eps: f32, top: usize) -> R
     for (rank, (density, p)) in results.iter().enumerate() {
         println!("#{} density={} domain={} id={}", rank+1, density, p.domain, p.id);
         println!("   {}\n", p.singularity.invariant.chars().take(200).collect::<String>());
+    }
+    Ok(())
+}
+
+fn run_singularity_resonance(base_dir: Option<String>, limit: usize, domain_filter: Option<String>) -> Result<(), String> {
+    use crate::singularity_recursion::airgenome_runner::AirgenomeRunner;
+    use crate::singularity_recursion::tick::CycleRunner;
+    use crate::singularity_recursion::analysis::query_similar;
+
+    // Sample current Mac state via airgenome
+    let mut runner = AirgenomeRunner;
+    let sing = runner.run("architecture_design", None);
+    println!("current Mac state:");
+    println!("  {}", sing.invariant);
+    println!();
+
+    let t = load_topo_for_analysis(base_dir);
+    println!("resonance scan: {} points in topology", t.points.len());
+    if let Some(ref d) = domain_filter {
+        println!("  filtering domain={}", d);
+    }
+    println!();
+
+    let mut results = query_similar(&t, &sing.invariant, limit * 5);
+    if let Some(ref d) = domain_filter {
+        results.retain(|(_, p)| &p.domain == d);
+    }
+    results.truncate(limit);
+
+    println!("top {} resonant points:", results.len());
+    for (rank, (dist, p)) in results.iter().enumerate() {
+        println!("#{} dist={:.3} domain={} id={}", rank+1, dist, p.domain, p.id);
+        println!("   {}\n", p.singularity.invariant.chars().take(160).collect::<String>());
     }
     Ok(())
 }
