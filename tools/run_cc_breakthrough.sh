@@ -41,6 +41,31 @@ fi
 
 echo "[4/4] interpreting breakthrough..."
 if [ -s "$CYCLE_OUT" ]; then
+  # nexus6 auto는 텍스트를 출력하므로 interpreter용 JSON으로 변환
+  # 유효 JSON 아니면 stub JSON으로 감쌈 (현재 도메인 전용 렌즈 없을 시 패턴 0개)
+  if ! python3 -c "import json,sys; json.load(open('$CYCLE_OUT'))" 2>/dev/null; then
+    TEXT_OUT="${CYCLE_OUT%.json}.txt"
+    mv "$CYCLE_OUT" "$TEXT_OUT"
+    python3 -c "
+import json, re, sys
+text = open('$TEXT_OUT').read()
+# discovery 카운트 추출
+m = re.search(r'Total discoveries:\s*(\d+)', text)
+disc = int(m.group(1)) if m else 0
+m = re.search(r'Meta-cycles completed:\s*(\d+)', text)
+cycles = int(m.group(1)) if m else 0
+stub = {
+    'domain': 'claude_efficiency',
+    'cycles_run': cycles,
+    'converged_patterns': [],
+    'surviving_hypotheses': [],
+    'discovery_log_refs': [],
+    '_note': f'synthesized from nexus6 auto text output ({disc} discoveries, no claude_efficiency-specific lenses yet)',
+}
+json.dump(stub, open('$CYCLE_OUT','w'), indent=2)
+print(f'synthesized stub JSON: {disc} discoveries, {cycles} cycles')
+"
+  fi
   python3 tools/interpret_breakthrough.py "$CYCLE_OUT"
 else
   echo "ERROR: cycle output empty, cannot interpret" >&2
