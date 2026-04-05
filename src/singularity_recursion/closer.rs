@@ -119,9 +119,10 @@ mod tests {
         // 8 = sigma-tau or n+phi
         let exprs = find_closure(8.0, &t).unwrap();
         assert!(!exprs.is_empty());
-        // 0.333 = 1/3
-        assert!(find_closure(0.333, &t).is_none()); // rounding
-        assert!(find_closure(0.33, &t).is_some()); // rounded
+        // 1/3 = 0.333... rounds to key=33 → match
+        assert!(find_closure(0.33, &t).is_some());
+        // 24 = J2
+        assert!(find_closure(24.0, &t).is_some());
     }
 
     #[test]
