@@ -7,7 +7,7 @@ NEXUS6="${HOME}/Dev/nexus6"
 LOG="${NEXUS6}/shared/self_improve_log.jsonl"
 CLAUDE_BIN="${HOME}/.local/bin/claude"
 [ -x "$CLAUDE_BIN" ] || CLAUDE_BIN="$(which claude 2>/dev/null || echo '')"
-[ -x "$CLAUDE_BIN" ] || { echo "claude CLI not found"; exit 0; }
+[ -x "$CLAUDE_BIN" ] || CLAUDE_BIN=""
 
 cd "$NEXUS6"
 TS=$(date -u +'%Y-%m-%dT%H:%M:%SZ')

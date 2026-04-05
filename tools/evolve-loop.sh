@@ -15,4 +15,9 @@ cd "${HOME}/Dev/nexus6"
 echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] evolve domain=$DOMAIN (hour=$HOUR)"
 
 # Run evolve with short cycles — don't overload
-timeout 180 "$NEXUS6_BIN" evolve "$DOMAIN" --max-cycles 3 2>&1 | tail -20 || echo "(timeout or error)"
+"$NEXUS6_BIN" evolve "$DOMAIN" --max-cycles 3 2>&1 | tail -20 &
+PID=$!
+( sleep 180; kill -TERM $PID 2>/dev/null ) &
+WATCHER=$!
+wait $PID 2>/dev/null
+kill $WATCHER 2>/dev/null || true

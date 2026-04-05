@@ -12,4 +12,10 @@ DOMAIN="${DOMAINS[$IDX]}"
 
 cd "${HOME}/Dev/nexus6"
 echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] scan domain=$DOMAIN"
-timeout 120 "$NEXUS6_BIN" scan "$DOMAIN" 2>&1 | tail -15 || echo "(timeout)"
+# macOS-compatible timeout via background + kill
+"$NEXUS6_BIN" scan "$DOMAIN" 2>&1 | tail -15 &
+PID=$!
+( sleep 120; kill -TERM $PID 2>/dev/null ) &
+WATCHER=$!
+wait $PID 2>/dev/null
+kill $WATCHER 2>/dev/null || true
