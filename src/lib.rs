@@ -17,6 +17,8 @@ pub mod resource_limit;
 pub mod alien_index;
 pub mod meta_gate;
 pub mod implant;
+pub mod pack;
+pub mod sentry;
 
 // --- Agent-generated modules ---
 pub mod alert;
@@ -48,6 +50,9 @@ pub mod calibration;
 
 // --- Safety gate ---
 pub mod safety;
+
+// --- HEXA-GATE (breakthrough gate, Mk.I, from n6-architecture commit 736fc1a6) ---
+pub mod gate;
 
 // --- Growth engine ---
 pub mod growth;
