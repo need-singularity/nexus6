@@ -51,6 +51,34 @@ ts = datetime.now().isoformat()
 pct_100k = closed_total * 100 / 100000
 pct_200k = closed_total * 100 / 200000
 
+# Per-project progress — scan hypothesis_dirs + count closed
+projects_json = f'{NX}/shared/projects.json'
+project_stats = []
+try:
+    pj = json.loads(open(projects_json).read())
+    for pname, pcfg in pj.get('projects',{}).items():
+        proot = f'{HOME}/Dev/{pcfg.get("root",pname)}'
+        hyp_count = 0
+        for sd in pcfg.get('hypothesis_dirs',[]):
+            dir_path = f'{proot}/{sd}'
+            if os.path.isdir(dir_path):
+                for root_d, _, files in os.walk(dir_path):
+                    hyp_count += sum(1 for f in files if f.endswith('.md') and 'NEXUS6' not in f)
+        # closures from this project
+        dom_key = f'hypothesis:{pname}'
+        pts_in_topo = domains.get(dom_key, 0)
+        # closure EXACTs from this project source
+        closed_from = sum(c for p,c in source_types.items() if pname.lower() in p.lower())
+        project_stats.append({
+            'name': pname,
+            'hyp_files': hyp_count,
+            'topo_points': pts_in_topo,
+            'closed': closed_from,
+        })
+    project_stats.sort(key=lambda x: -x['topo_points'])
+except Exception as e:
+    project_stats = []
+
 # Build HTML
 html = f"""<!doctype html><html><head><meta charset="utf-8"><title>nexus6 dashboard</title>
 <style>
@@ -90,6 +118,17 @@ td{{padding:5px 10px;border-bottom:1px solid #1a1a1a;font-family:Menlo,monospace
 for c in convergences:
     val = c['value']; cnt = c['count']; srcs = ', '.join(c['sources'][:4])
     html += f"<tr><td><b>{val}</b></td><td>{cnt}x</td><td class='tag'>{srcs}</td></tr>"
+
+html += """</table>
+
+<h2>📦 프로젝트별 진행상황</h2>
+<table><tr><th>project</th><th>hyp files</th><th>topo points</th><th>closures</th><th>progress</th></tr>
+"""
+
+max_topo = max((p['topo_points'] for p in project_stats), default=1) or 1
+for p in project_stats:
+    pct = 100 * p['topo_points'] / max_topo if max_topo > 0 else 0
+    html += f'<tr><td><b>{p["name"]}</b></td><td>{p["hyp_files"]}</td><td>{p["topo_points"]:,}</td><td>{p["closed"]:,}</td><td style="min-width:140px"><div class="bar"><div class="bar-fill" style="width:{pct:.0f}%"></div></div></td></tr>'
 
 html += """</table>
 
