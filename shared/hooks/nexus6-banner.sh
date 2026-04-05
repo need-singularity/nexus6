@@ -123,20 +123,24 @@ if topo_path.exists():
             sing_str = f'·Σ{count} '
     except: pass
 
-# Closed form count — grade=10 (PASS/EXACT) records + 🎉 celebration on increase
+# Closed form count — grade=10 (PASS/EXACT) / total (%) + 🎉 celebration on increase
 closed_str = ''
 vc_path = HOME / 'Dev/nexus6/shared/verified_constants.jsonl'
 closed_snap_path = HOME / 'Dev/nexus6/shared/.closed_snapshot.json'
 if vc_path.exists():
     try:
         closed_count = 0
+        total_count = 0
         with open(vc_path, 'rb') as f:
             for line in f:
+                total_count += 1
                 try:
                     j = json.loads(line)
                     if j.get('status') in ('PASS','EXACT') or j.get('grade') in ('PASS','EXACT'):
                         closed_count += 1
                 except: pass
+
+        pct = (closed_count * 100.0 / total_count) if total_count > 0 else 0.0
 
         # compare with snapshot
         prev_count = closed_count
@@ -148,15 +152,15 @@ if vc_path.exists():
             closed_snap_path.write_text(json.dumps({'closed': closed_count}))
 
         delta = closed_count - prev_count
+        def fmt_k(n): return f'{n/1000:.1f}k' if n>=1000 else str(n)
+        # progress bar: 10 cells
+        filled = int(pct / 10)
+        bar = '█' * filled + '░' * (10 - filled)
         if delta > 0:
-            # 🎉 celebration — new closed form(s) discovered!
-            closed_str = f' 🎉🎉🎉 +{delta}닫힘완성! ⭐{closed_count} 🎉🎉🎉'
-            # update snapshot now so next tick doesn't re-celebrate
+            closed_str = f' 🎉🎉🎉 +{delta}닫힘! ⭐{pct:.1f}% [{bar}] {fmt_k(closed_count)}/{fmt_k(total_count)} 🎉🎉🎉'
             closed_snap_path.write_text(json.dumps({'closed': closed_count}))
-        elif closed_count >= 1000:
-            closed_str = f' ⭐{closed_count/1000:.1f}k닫힘'
         elif closed_count > 0:
-            closed_str = f' ⭐{closed_count}닫힘'
+            closed_str = f' ⭐닫힘 {pct:.1f}% [{bar}] {fmt_k(closed_count)}/{fmt_k(total_count)}'
     except: pass
 
 banner = f'🔭 NEXUS-6 {ai_str}{sing_str}🔭{lens_impl}/{lens_total}{d_lens} ⚖️{laws}법칙{d_laws} 🧠{modules}모듈{d_mods}{g_str}{bridge_str}{closed_str}'
