@@ -188,7 +188,7 @@ if vc_path.exists():
         delta = exact_count - prev_exact  # EXACT delta only
         def fmt_k(n): return f'{n/1000:.1f}k' if n>=1000 else str(n)
         # milestone tracker (fixed target, monotonic)
-        milestones = [1000, 2500, 5000, 7500, 10000, 20000, 50000, 100000]
+        milestones = [1000, 2500, 5000, 7500, 10000, 20000, 50000, 100000, 200000, 500000, 1000000]
         next_ms = next((m for m in milestones if m > closed_count), milestones[-1])
         ms_pct = closed_count * 100.0 / next_ms
         ms_filled = int(ms_pct / 10)
