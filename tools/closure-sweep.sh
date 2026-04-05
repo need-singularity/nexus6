@@ -15,12 +15,54 @@ from datetime import datetime
 
 HOME = os.path.expanduser('~')
 NX = f'{HOME}/Dev/nexus6'
+
+# Multi-n primitive bases: n=6 + n=15 (dark matter) + n=35 (dark energy) + n=105 (universe)
+def _divs(n): return [i for i in range(1,n+1) if n%i==0]
+def _sigma(n): return sum(_divs(n))
+def _tau(n): return len(_divs(n))
+def _phi(n):
+    result = n; p = 2
+    while p*p <= n:
+        if n%p==0:
+            while n%p==0: n//=p
+            result -= result//p
+        p+=1
+    if n>1: result -= result//n
+    return result
+def _sopfr(n):
+    s=0; p=2
+    while p*p<=n:
+        while n%p==0: s+=p; n//=p
+        p+=1
+    if n>1: s+=n
+    return s
+
+# Primary n=6 (short names)
 N,SIGMA,TAU,PHI,SOPFR,J2 = 6,12,4,2,5,24
 prims = {'n':N,'sigma':SIGMA,'tau':TAU,'phi':PHI,'sopfr':SOPFR,'J2':J2}
+
+# Multi-n extension: n ∈ {6,15,35,105}
+MULTI_N = {}
+for base in [6, 15, 35, 105]:
+    MULTI_N[f'n{base}'] = base
+    MULTI_N[f'sigma{base}'] = _sigma(base)
+    MULTI_N[f'tau{base}'] = _tau(base)
+    MULTI_N[f'phi{base}'] = _phi(base)
+    MULTI_N[f'sopfr{base}'] = _sopfr(base)
 
 # Closure expression table (depth-3)
 KNOWN = {}
 for name,val in prims.items(): KNOWN[name] = val
+for name,val in MULTI_N.items(): KNOWN[name] = val
+# meta FP ladder: φ(n)/n for all smooth n
+for n in [6,15,35,105,2,3,5,7,30,42,70]:
+    KNOWN[f'phi({n})/{n}'] = _phi(n)/n
+    KNOWN[f'{n}/phi({n})'] = n/_phi(n) if _phi(n) > 0 else 0
+# cosmology ratios
+KNOWN['4/15'] = 4/15       # Omega_DM meta FP
+KNOWN['24/35'] = 24/35     # Omega_Lambda meta FP
+KNOWN['1/21'] = 1/21       # Omega_b residual
+KNOWN['48/105'] = 48/105   # n=105 meta FP
 for k in range(1, 1001): KNOWN[str(k)] = k
 for a,av in prims.items():
     for b,bv in prims.items():
