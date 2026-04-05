@@ -248,6 +248,68 @@ mk2가 제대로 돌면 mk3는 불필요. 하지만 **가능한 확장**:
 
 ---
 
+## Post-Phase-4 Findings (2026-04-06 실측)
+
+### Electroweak 분류 오탐 발견
+
+Python migrate prototype을 43K+ topology에 적용 후:
+- **118 points "electroweak" 분류 → 전부 오탐**
+- 실제 내용: PDG 입자질량, Galois 군, Mirror symmetry, String theory, Bitcoin ECC, ConsciousLM
+- 공통점: text에 2,3,5,7 숫자 들어있을 뿐 **주제가 EW 아님**
+
+**근본 원인**: prime_set만으론 context 판정 불가.
+- 2·3·5·7 = 210 있다 ≠ electroweak physics
+- Weinberg/Cabibbo 같은 keyword + value-range 매칭 필요
+
+### Classifier v2 요구사항 (mk3 방지)
+
+단추 4 보강:
+```rust
+fn classify_sector_v2(
+    prime_set: &PrimeSet,
+    value: Option<f64>,
+    keywords: &[&str],
+    domain: &str,
+) -> (Sector, f64 /* confidence */) {
+    // Score-based combination:
+    //   - Keyword match (Weinberg, θ_W, Ω_Λ, etc.)
+    //   - Value range (sector-specific)
+    //   - prime_set match
+    // Confidence = weighted sum
+}
+```
+
+**Keyword dictionary** per sector (external YAML):
+```yaml
+electroweak:
+  keywords: [weinberg, theta_w, cabibbo, theta_c, "sin²θ", W boson, Z boson]
+  value_ranges: [[0.2, 0.3]]
+  prime_set_required: [2, 3, 5, 7]
+cosmology:
+  keywords: [omega_m, omega_lambda, omega_b, dark energy, dark matter, hubble]
+  value_ranges: [[0.0, 1.0]]
+  prime_set_preferred: [[5,7], [2,3,5], [2,3]]
+primordial:
+  keywords: [helium, deuterium, BBN, nucleosynthesis, baryogenesis, eta]
+  value_ranges: [[0.2, 0.3]]
+  prime_set_preferred: [[2,3,5,13]]
+strong:
+  keywords: [quark, color, qcd, asymptotic freedom]
+  value_ranges: [[0.3, 0.7]]  # u=2/3, d=1/3
+  prime_set_preferred: [[2], [3], [2,3]]
+```
+
+### 업데이트된 Phase 5
+
+Phase 5: CLI + visualization + **classifier refinement**
+- Score-based classify_v2()
+- YAML keyword dictionary
+- Confidence threshold gating
+- 기존 43K point re-classify
+
+**예상 추가 작업**: 3일
+**총 Phase 시간 재산정**: 3.5주
+
 ## Sign-off
 
 - [ ] 단추 1 (Point representation) 확정
