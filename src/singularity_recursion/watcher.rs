@@ -5,17 +5,22 @@
 //! the topology via the backfill path (fast mode, dedup via simhash).
 
 use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use super::backfill::backfill_markdown_dir;
-use super::topology::Topology;
+use super::topology::{append_edge, append_point, Singularity, Topology};
 
 /// Watch state: file_path → last seen mtime (unix secs).
 #[derive(Debug, Default)]
 pub struct WatchState {
     pub mtimes: HashMap<PathBuf, u64>,
     pub watch_dirs: Vec<(PathBuf, String)>, // (dir, domain)
+    /// Append-only jsonl files: (path, domain). Tail for new lines.
+    pub tail_files: Vec<(PathBuf, String)>,
+    /// Byte offset per tail file for incremental reads.
+    pub tail_offsets: HashMap<PathBuf, u64>,
 }
 
 impl WatchState {
@@ -117,8 +122,6 @@ pub fn poll_and_absorb(
     }
 
     // For any changed dir, rescan it (dedup via simhash).
-    // Re-scan entire dir is simpler than tracking file-level changes because
-    // backfill_markdown_dir already dedups via simhash.
     let mut absorbed = 0;
     for (dir, domain) in &changed_dirs {
         let before = t.points.len();
@@ -127,7 +130,48 @@ pub fn poll_and_absorb(
         );
         absorbed += t.points.len() - before;
     }
+
+    // Tail append-only jsonl files for new lines.
+    let tail_snapshot = state.tail_files.clone();
+    for (path, domain) in &tail_snapshot {
+        if !path.exists() { continue; }
+        let offset = state.tail_offsets.get(path).copied().unwrap_or(0);
+        let file_size = std::fs::metadata(path).ok().map(|m| m.len()).unwrap_or(0);
+        if file_size <= offset { continue; }
+        let mut f = match std::fs::File::open(path) { Ok(f) => f, Err(_) => continue };
+        if f.seek(SeekFrom::Start(offset)).is_err() { continue; }
+        let reader = BufReader::new(f);
+        let mut tick = 30_000_000u64;
+        let mut new_offset = offset;
+        for line in reader.lines().flatten() {
+            new_offset += line.len() as u64 + 1; // +1 for newline
+            let trimmed = line.trim();
+            if trimmed.is_empty() { continue; }
+            let text: String = trimmed.chars().take(400).collect();
+            let sing = Singularity {
+                invariant: text,
+                confidence: 0.5,
+                novelty: 0.7,
+                depth_reached: 1,
+            };
+            let p = t.make_point(domain, None, sing, tick, &iso_now());
+            if seen.contains(&p.simhash) { continue; }
+            seen.insert(p.simhash.clone());
+            let p_save = p.clone();
+            t.points.push(p);
+            let _ = append_point(topology_path, &p_save);
+            absorbed += 1;
+            tick += 1;
+        }
+        state.tail_offsets.insert(path.clone(), new_offset);
+    }
     absorbed
+}
+
+fn iso_now() -> String {
+    let secs = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs()).unwrap_or(0);
+    format!("{}Z", secs)
 }
 
 #[cfg(test)]

@@ -3067,17 +3067,43 @@ fn run_singularity_daemon(base_dir: Option<String>, interval_sec: u64) -> Result
     let mut runner = AirgenomeRunner;
     let interval = Duration::from_secs(interval_sec);
 
-    // Build watcher state: track all project hypothesis dirs + memory dir.
+    // Build watcher state: track all project hypothesis dirs + memory dir + tail files.
     let watch_state_path = paths.base.join("watch_state.json");
     let mut watch = WatchState::load(&watch_state_path);
     let projects_json = PathBuf::from("/Users/ghost/Dev/nexus6/shared/projects.json");
     for (name, root, hyp_dirs) in parse_projects_json(&projects_json) {
+        // hypothesis dirs (markdown)
         for subdir in &hyp_dirs {
             watch.watch_dirs.push((root.join(subdir), format!("hypothesis:{}", name)));
+        }
+        // per-project discovery log tail (if exists)
+        let disc = root.join("shared/discovery_log.jsonl");
+        if disc.exists() {
+            watch.tail_files.push((disc, format!("discovery_log:{}", name)));
         }
     }
     if let Some(memdir) = default_memory_root() {
         watch.watch_dirs.push((memdir, "memory".into()));
+    }
+    // Global tail files (shared/)
+    let shared = PathBuf::from("/Users/ghost/Dev/nexus6/shared");
+    for (name, domain) in &[
+        ("discovery_log.jsonl", "discovery_log"),
+        ("verified_constants.jsonl", "verified_constants"),
+        ("discovered_constants.jsonl", "discovered_constants"),
+    ] {
+        let p = shared.join(name);
+        if p.exists() {
+            watch.tail_files.push((p, (*domain).into()));
+        }
+    }
+    // Don't re-read what we backfilled already — seek to end on first run.
+    for (p, _) in &watch.tail_files {
+        if !watch.tail_offsets.contains_key(p) {
+            if let Ok(meta) = std::fs::metadata(p) {
+                watch.tail_offsets.insert(p.clone(), meta.len());
+            }
+        }
     }
 
     println!("singularity-daemon: base={} interval={}s absorb=∞ (u64::MAX cap)",
@@ -3090,19 +3116,60 @@ fn run_singularity_daemon(base_dir: Option<String>, interval_sec: u64) -> Result
     loop {
         tick_no += 1;
 
-        // File watcher pass — detect new/changed md files and absorb them.
-        // Load topology fresh for dedup (could optimize with caching later).
+        // File watcher pass — detect new/changed md files + tail append-only files.
+        let mut topo_for_probe: Option<crate::singularity_recursion::topology::Topology> = None;
         match load_topo(&paths.topology, &paths.edges, cfg.neighborhood_radius_eps) {
             Ok(mut t) => {
                 let absorbed = poll_and_absorb(
                     &mut watch, &mut t, &paths.topology, &paths.edges,
                 );
                 if absorbed > 0 {
-                    println!("[{}] watcher absorbed {} new file(s)", hms_now(), absorbed);
+                    println!("[{}] watcher absorbed {} new file(s/lines)", hms_now(), absorbed);
                     let _ = watch.save(&watch_state_path);
                 }
+                topo_for_probe = Some(t);
             }
             Err(_) => {}
+        }
+
+        // Active breakthrough probe — rotate through all domains each tick.
+        // Finds domain's lowest-density (frontier) point and emits a probe meta-point.
+        if let Some(t) = topo_for_probe.as_ref() {
+            use crate::singularity_recursion::analysis::frontier_points;
+            use crate::singularity_recursion::topology::{append_point, Singularity};
+            use std::collections::BTreeSet;
+            let domains: BTreeSet<String> = t.points.iter().map(|p| p.domain.clone()).collect();
+            let doms: Vec<String> = domains.into_iter().collect();
+            if !doms.is_empty() {
+                let target_dom = &doms[(tick_no as usize) % doms.len()];
+                // find frontier point within this domain
+                let frontier = frontier_points(t, 0.15, 50);
+                let pick = frontier.iter().find(|(_, p)| p.domain == *target_dom);
+                if let Some((density, fp)) = pick {
+                    // emit meta-probe point describing the frontier probe
+                    let invariant = format!(
+                        "[probe:{}] frontier at density={} via {}: {}",
+                        target_dom, density, fp.id,
+                        fp.singularity.invariant.chars().take(120).collect::<String>()
+                    );
+                    let sing = Singularity { invariant, confidence: 0.4, novelty: 0.9, depth_reached: 1 };
+                    // Build a fresh point directly (don't insert in topo for deduping)
+                    use crate::singularity_recursion::embedding::{simhash, to_vector};
+                    let h = simhash(&sing.invariant);
+                    let probe_pt = crate::singularity_recursion::topology::Point {
+                        id: format!("p_{:06}", t.points.len() + 1_000_000_000),
+                        domain: format!("probe:{}", target_dom),
+                        seed_from: Some(fp.id.clone()),
+                        simhash: format!("{:032x}", h),
+                        embedding: to_vector(h),
+                        singularity: sing,
+                        discovered_at_tick: 40_000_000 + tick_no,
+                        ts: hms_now(),
+                    };
+                    let _ = append_point(&paths.topology, &probe_pt);
+                    println!("[{}] probe domain={} frontier={} d={}", hms_now(), target_dom, fp.id, density);
+                }
+            }
         }
 
         // Airgenome sample tick.
