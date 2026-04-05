@@ -158,6 +158,56 @@ for d,c in domains.most_common(10):
     html += f'<tr><td><span class="tag">{d}</span></td><td class="num">{c:,}</td><td class="num">{pct:.1f}%</td></tr>'
 
 html += """</table>
+
+<h2>⚙️ Agent Health</h2>
+<div class="grid">
+"""
+
+# Check each agent's last-run log mtime
+import time
+agents_config = [
+    ('closure-sweep', 300, 'closure-sweep.log'),
+    ('publish-insights', 600, 'publish-insights.log'),
+    ('gen-calc-stubs', 900, 'gen-calc-stubs.log'),
+    ('paper-gen', 3600, 'paper-gen.log'),
+    ('auto-commit', 1800, 'auto-commit.log'),
+    ('dashboard', 600, 'dashboard.log'),
+    ('self-improve', 1800, 'self-improve.log'),
+    ('evolve-loop', 3600, 'evolve-loop.log'),
+    ('scan-loop', 1800, 'scan-loop.log'),
+    ('physics-fetch', 86400, 'physics-fetch.log'),
+    ('cycle-tick', 60, 'singularity-daemon.log'),
+    ('watch-atlas', 30, 'watch-atlas.log'),
+    ('watch-papers', 300, 'watch-papers.log'),
+]
+logs_dir = f'{HOME}/Library/Logs/nexus6'
+now_ts = time.time()
+for name, interval, logfile in agents_config:
+    logpath = f'{logs_dir}/{logfile}'
+    if os.path.exists(logpath):
+        mtime = os.path.getmtime(logpath)
+        age_sec = int(now_ts - mtime)
+        if age_sec < 60: age_str = f'{age_sec}s'
+        elif age_sec < 3600: age_str = f'{age_sec//60}m'
+        else: age_str = f'{age_sec//3600}h'
+        healthy = age_sec < interval * 3  # within 3x expected interval
+        icon = '🟢' if healthy else '🟡' if age_sec < interval * 10 else '🔴'
+        css = 'ok' if healthy else 'idle'
+    else:
+        age_str = 'never'
+        icon = '⚪'
+        css = 'idle'
+    html += f"""  <div class="card {css}">
+    <div class="card-hdr"><span class="card-name">{name}</span><span class="card-icon">{icon}</span></div>
+    <div class="card-metrics">
+      <div class="metric"><span class="metric-num">{age_str}</span><span class="metric-lbl">last run</span></div>
+      <div class="metric"><span class="metric-num">{interval//60 if interval>=60 else interval}{'m' if interval>=60 else 's'}</span><span class="metric-lbl">interval</span></div>
+      <div class="metric"><span class="metric-num">{'OK' if healthy else 'LAG'}</span><span class="metric-lbl">status</span></div>
+    </div>
+  </div>
+"""
+
+html += """</div>
 </body></html>"""
 
 out = f'{NX}/shared/dashboard.html'
