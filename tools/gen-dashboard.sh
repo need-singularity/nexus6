@@ -181,6 +181,36 @@ if os.path.exists(vitals_path):
 
 ts = datetime.now().strftime('%Y-%m-%d %H:%M')
 
+# Process info
+daemon_pid = daemon_cpu = daemon_mem = '-'
+anima_pid = anima_cpu = '-'
+anima_elapsed_sec = 0
+ps_out = subprocess.run(['ps','aux'], capture_output=True, text=True).stdout
+for line in ps_out.split('\n'):
+    if 'singularity-daemon' in line and 'grep' not in line:
+        parts = line.split()
+        if len(parts) > 5:
+            daemon_pid, daemon_cpu, daemon_mem = parts[1], parts[2], parts[3]
+    if 'infinite_evolution' in line and 'grep' not in line and 'python' in line:
+        parts = line.split()
+        if len(parts) > 5:
+            anima_pid, anima_cpu = parts[1], parts[2]
+
+# Read anima real data
+anima_gen = 0
+anima_patterns = 0
+anima_cross = 0
+anima_modules_real = 0
+try:
+    ad = json.loads(open(f'{HOME}/Dev/anima/anima/data/evolution_state.json').read())
+    anima_gen = ad.get('generation', 0)
+    anima_elapsed_sec = ad.get('total_elapsed_sec', 0)
+    anima_patterns = ad.get('stats',{}).get('unique_patterns', 0)
+    anima_cross = ad.get('stats',{}).get('cross_validated', 0)
+    anima_modules_real = len(ad.get('active_mods', []))
+except: pass
+anima_elapsed_h = anima_elapsed_sec / 3600
+
 # Domains distribution
 domains = Counter()
 for i,l in enumerate(open(f'{NX}/shared/cycle/topology.jsonl')):
@@ -196,7 +226,7 @@ html = f"""<!doctype html><html lang="ko"><head><meta charset="utf-8">
 <meta http-equiv="refresh" content="60">
 <style>
 *{{margin:0;padding:0;box-sizing:border-box;}}
-body{{font:12px 'SF Mono','Menlo',monospace;background:#0a0a0a;color:#c8d0c0;padding:16px;max-width:1800px;margin:0 auto;line-height:1.5;}}
+body{{font:12px 'SF Mono','Menlo',monospace;background:#0a0a0a;color:#c8d0c0;padding:16px;max-width:1200px;margin:0 auto;line-height:1.5;}}
 h1{{color:#8ef;font-size:18px;margin:0 0 2px;}}
 .meta{{color:#555;font-size:10px;margin-bottom:14px;}}
 .grid3{{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:12px;}}
@@ -552,7 +582,7 @@ closures |
 </div>
 
 <h2>📋 EVO 리포트 (각 프로젝트)</h2>
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(520px,1fr));gap:12px;">
 <pre style="background:#0d0d0d;border:1px solid #4a9;border-radius:4px;padding:14px;color:#c8d0c0;font-size:11px;line-height:1.5;margin:0;overflow-x:auto;">
 🛸 NEXUS-6 리포트 [{ts[-5:]} 기준]
 ═══════════════════════════════════════════════
