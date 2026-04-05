@@ -21,7 +21,7 @@ use crate::experiment::runner::ExperimentRunner;
 use crate::experiment::report;
 use crate::config::NexusConfig;
 
-use super::parser::{CliCommand, ExperimentMode, GraphFormat, LensFilter};
+use super::parser::{CliCommand, ExperimentMode, ForgeSub, GraphFormat, LensFilter};
 
 /// ~/.nexus6/projects.json에서 프로젝트 목록 로드
 #[derive(serde::Deserialize)]
@@ -199,6 +199,7 @@ fn run_with_config(cmd: CliCommand, cfg: &NexusConfig) -> Result<(), String> {
         CliCommand::Sentry { sub } => run_sentry(sub),
         CliCommand::Hook { sub } => run_hook(sub),
         CliCommand::Mk2 { sub } => run_mk2(sub),
+        CliCommand::Forge { sub } => run_forge(sub),
         CliCommand::Help => {
             print_help();
             Ok(())
@@ -3583,6 +3584,96 @@ fn run_singularity_backfill(
         println!("  total new       : {} ({} → {} points)", stats.total_absorbed(), before, after);
     }
     Ok(())
+}
+
+fn run_forge(sub: ForgeSub) -> Result<(), String> {
+    use crate::forge::{ForgeEngine, AnvilEngine, Profiler};
+    use crate::forge::compress::ForgeConfig;
+
+    match sub {
+        ForgeSub::Compress { file, rounds } => {
+            let text = std::fs::read_to_string(&file)
+                .map_err(|e| format!("파일 읽기 실패: {}", e))?;
+            println!("=== nexus6 forge compress ===");
+            println!("입력: {} ({} chars)", file, text.len());
+            println!("라운드: {}", rounds);
+            println!();
+            let config = ForgeConfig {
+                rounds,
+                ..Default::default()
+            };
+            let report = ForgeEngine::compress(&text, &config)?;
+            println!(
+                "\n최종: r={:.4} ({}/{} chars)",
+                report.final_r, report.final_chars, report.original_chars
+            );
+            Ok(())
+        }
+        ForgeSub::Verify { compressed, original } => {
+            let comp_text = std::fs::read_to_string(&compressed)
+                .map_err(|e| format!("압축 파일 읽기 실패: {}", e))?;
+            let orig_text = std::fs::read_to_string(&original)
+                .map_err(|e| format!("원문 파일 읽기 실패: {}", e))?;
+            println!("=== nexus6 forge verify ===");
+            println!("압축본: {}", compressed);
+            println!("원문: {}", original);
+            println!();
+            AnvilEngine::verify(&comp_text, &orig_text)?;
+            Ok(())
+        }
+        ForgeSub::Profile { file } => {
+            let text = std::fs::read_to_string(&file)
+                .map_err(|e| format!("파일 읽기 실패: {}", e))?;
+            println!("=== nexus6 forge profile ===");
+            println!("입력: {} ({} chars)", file, text.len());
+            println!();
+            Profiler::profile(&text)?;
+            Ok(())
+        }
+        ForgeSub::Optimize { file, rounds } => {
+            let text = std::fs::read_to_string(&file)
+                .map_err(|e| format!("파일 읽기 실패: {}", e))?;
+            println!("=== nexus6 forge optimize ===");
+            println!("입력: {} ({} chars)", file, text.len());
+            println!();
+
+            // forge
+            println!("[1/2] forge...");
+            let config = ForgeConfig {
+                rounds,
+                ..Default::default()
+            };
+            let report = ForgeEngine::compress(&text, &config)?;
+
+            // 최종 압축본 읽기
+            let run_dir = std::path::PathBuf::from("bench/runs").join(&report.run_id);
+            let last_round = report.rounds.last().unwrap().round;
+            let comp_path = run_dir.join(format!("round_{}.tf", last_round));
+            let compressed = std::fs::read_to_string(&comp_path)
+                .map_err(|e| format!("압축본 읽기 실패: {}", e))?;
+
+            // anvil
+            println!("\n[2/2] anvil...");
+            let result = AnvilEngine::verify(&compressed, &text)?;
+
+            if result.pass {
+                let out_path = file.replace(".md", ".optimized.tf");
+                std::fs::write(&out_path, &compressed)
+                    .map_err(|e| format!("출력 파일 저장 실패: {}", e))?;
+                let savings = (1.0 - report.final_r) * 100.0;
+                println!("\n✓ 최적화 완료: {}", out_path);
+                println!(
+                    "  절감: {:.1}% ({}→{} chars)",
+                    savings,
+                    text.len(),
+                    compressed.len()
+                );
+            } else {
+                println!("\n✗ 검증 실패 (L={}). 원본 유지 권장.", result.loss);
+            }
+            Ok(())
+        }
+    }
 }
 
 fn run_mk2(sub: crate::cli::parser::Mk2Sub) -> Result<(), String> {

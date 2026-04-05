@@ -60,14 +60,12 @@ fn generate_table() -> Vec<N6Entry> {
     let omega_b = 1.0 - omega_dm - omega_lambda;               // {3,7} residual → 1/21
     let sin2_theta_w = euler_ratio(&prime_set_of(210)).to_f64();// {2,3,5,7} → 8/35
     let y_p = euler_ratio(&prime_set_of(2 * 3 * 5 * 13)).to_f64(); // {2,3,5,13} → 16/65
-    let omega_dm_over_m = euler_ratio(&prime_set_of(42)).to_f64();  // {2,3,7} → 6/7... no
-    // Actually Ω_DM/Ω_m = (4/15)/(1/3) = 4/5... no, from mk1 it's 6/7 = 0.857
-    // mk1 says "Omega_DM/Omega_m (6/7)" → this is a derived ratio, not euler_ratio
+    // Ω_DM/Ω_m: mk1 says 6/7 = 0.857 — derived ratio, not euler_ratio
 
     // Meta FP
     let meta_fp = phi as f64 / nf; // ρ(6) = 1/3
 
-    let mut table = vec![
+    let table = vec![
         // ── Primitives ──
         N6Entry { name: "n", value: nf },
         N6Entry { name: "sigma", value: sf },

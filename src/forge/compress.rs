@@ -1,7 +1,6 @@
 //! 반복 자기 압축 엔진.
 
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -71,7 +70,7 @@ pub struct ForgeEngine;
 
 impl ForgeEngine {
     /// claude CLI를 사용해 LLM 호출.
-    fn llm_call(prompt: &str) -> Result<String, String> {
+    pub(crate) fn llm_call(prompt: &str) -> Result<String, String> {
         // claude CLI 경로 탐색
         let cli = Self::find_claude_cli()
             .ok_or_else(|| "claude CLI를 찾을 수 없습니다".to_string())?;
@@ -101,8 +100,9 @@ impl ForgeEngine {
             }
         }
         // 알려진 경로
+        let home = std::env::var("HOME").ok().map(PathBuf::from);
         for p in &[
-            dirs::home_dir().map(|h| h.join(".local/bin/claude")),
+            home.as_ref().map(|h| h.join(".local/bin/claude")),
             Some(PathBuf::from("/usr/local/bin/claude")),
             Some(PathBuf::from("/opt/homebrew/bin/claude")),
         ] {
@@ -131,7 +131,7 @@ impl ForgeEngine {
             .map_err(|e| format!("디렉토리 생성 실패: {}", e))?;
 
         let original_chars = text.len();
-        let mut results = Vec::new();
+        let mut results: Vec<RoundResult> = Vec::new();
         let mut current = text.to_string();
         let mut converged_at = None;
 
@@ -180,13 +180,14 @@ impl ForgeEngine {
             current = compressed;
         }
 
-        let last = results.last().unwrap();
+        let final_r = results.last().unwrap().r;
+        let final_chars = results.last().unwrap().chars;
         let report = ForgeReport {
             run_id: run_id.clone(),
             original_chars,
             rounds: results,
-            final_r: last.r,
-            final_chars: last.chars,
+            final_r,
+            final_chars,
             converged_at,
         };
 

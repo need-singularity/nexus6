@@ -19,6 +19,7 @@ pub mod meta_gate;
 pub mod mk2;
 pub mod pack;
 pub mod sentry;
+pub mod forge;
 
 // --- Agent-generated modules ---
 pub mod alert;

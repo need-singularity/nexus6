@@ -98,11 +98,11 @@ impl Profiler {
 
         let total_orig: usize = results.iter().map(|r| r.original_chars).sum();
         let total_comp: usize = results.iter().map(|r| r.compressed_chars).sum();
-        let skip: Vec<&SectionResult> = results
-            .iter()
+        let skip_count = results.iter().filter(|r| r.grade == "SKIP" || r.grade == "LOW").count();
+        let skip_chars: usize = results.iter()
             .filter(|r| r.grade == "SKIP" || r.grade == "LOW")
-            .collect();
-        let skip_chars: usize = skip.iter().map(|r| r.original_chars).sum();
+            .map(|r| r.original_chars)
+            .sum();
 
         let overall_r = if total_orig > 0 {
             (total_comp as f64 / total_orig as f64 * 10000.0).round() / 10000.0
@@ -115,10 +115,10 @@ impl Profiler {
             "전체: {}→{} chars (r={:.4})",
             total_orig, total_comp, overall_r
         );
-        if !skip.is_empty() {
+        if skip_count > 0 {
             println!(
                 "삭제 후보 (LOW/SKIP): {}섹션, {} chars ({:.1}%)",
-                skip.len(),
+                skip_count,
                 skip_chars,
                 skip_chars as f64 / total_orig as f64 * 100.0
             );
@@ -129,7 +129,7 @@ impl Profiler {
             total_original: total_orig,
             total_compressed: total_comp,
             overall_r,
-            skip_count: skip.len(),
+            skip_count,
             skip_chars,
         })
     }
