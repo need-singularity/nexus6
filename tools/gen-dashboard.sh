@@ -403,6 +403,84 @@ for name, path in [('verified_constants','shared/verified_constants.jsonl'),
 html += """</div>
   </div>
 </div>
+
+<h2 style="color:#8ef;font-size:13px;margin:20px 0 10px;letter-spacing:1px;text-transform:uppercase;border-bottom:1px solid #222;padding-bottom:6px;">📡 Live Data Feed</h2>
+<div class="grid3">
+  <div class="panel">
+    <div class="panel-title">🆕 Latest Discoveries (EXACT)</div>
+    <div class="panel-section">
+"""
+
+# Last 10 EXACT records
+last_exact = []
+for l in open(f'{NX}/shared/verified_constants.jsonl'):
+    try:
+        rec = json.loads(l)
+        if rec.get('status') == 'EXACT': last_exact.append(rec)
+    except: pass
+for rec in last_exact[-10:][::-1]:
+    val = rec.get('value','?')
+    exprs = rec.get('n6_expr', [''])
+    expr = str(exprs[0])[:35] if exprs else '?'
+    proj = rec.get('project','?')[:18]
+    html += f'<div class="row"><span class="k">{val} = {expr}</span><span class="v" style="font-size:9px;">{proj}</span></div>'
+html += """    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">📡 Latest Topology Additions</div>
+    <div class="panel-section">
+"""
+
+# Last 10 topology points
+topo_recent = []
+try:
+    with open(f'{NX}/shared/cycle/topology.jsonl', 'rb') as f:
+        f.seek(-min(100000, os.path.getsize(f'{NX}/shared/cycle/topology.jsonl')), 2)
+        lines = f.read().decode('utf-8','ignore').split('\n')
+    for line in lines[-15:]:
+        if not line.strip(): continue
+        try:
+            rec = json.loads(line)
+            topo_recent.append(rec)
+        except: pass
+except: pass
+for rec in topo_recent[-10:][::-1]:
+    pid = rec.get('id','?')
+    dom = rec.get('domain','?')[:16]
+    inv = rec.get('singularity',{}).get('invariant','?')[:40]
+    html += f'<div class="row"><span class="k"><span class="icon">·</span>{pid}</span><span class="v" style="font-size:9px;">{dom}</span></div><div class="row"><span class="k" style="font-size:9px;color:#555;padding-left:20px;">{inv}</span><span class="v"></span></div>'
+html += """    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">💬 Agent Log Tails</div>
+    <div class="panel-section">
+"""
+
+# Last line from each key agent log
+for name, logfile in [('closure-sweep','closure-sweep.log'),
+                       ('publish-insights','publish-insights.log'),
+                       ('gen-calc-stubs','gen-calc-stubs.log'),
+                       ('self-improve','self-improve.log'),
+                       ('auto-commit','auto-commit.log'),
+                       ('dashboard','dashboard.log'),
+                       ('paper-gen','paper-gen.log')]:
+    logpath = f'{HOME}/Library/Logs/nexus6/{logfile}'
+    if os.path.exists(logpath):
+        try:
+            with open(logpath, 'rb') as f:
+                f.seek(-min(2000, os.path.getsize(logpath)), 2)
+                last = f.read().decode('utf-8','ignore').strip().split('\n')[-1]
+            # strip timestamp prefix
+            if ']' in last:
+                last = last.split(']', 1)[1].strip() if last.startswith('[') else last
+            last = last[:60] + ('…' if len(last) > 60 else '')
+            html += f'<div class="row"><span class="k" style="min-width:110px;"><span class="icon">·</span>{name}</span><span class="v" style="font-size:9px;color:#888;">{last}</span></div>'
+        except: pass
+html += """    </div>
+  </div>
+</div>
 </body></html>"""
 
 with open(f'{NX}/shared/dashboard.html', 'w') as f:
