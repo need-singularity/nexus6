@@ -5,5 +5,6 @@
 pub mod boundary;
 pub mod budget;
 pub mod embedding;
+pub mod preflight;
 pub mod topology;
 pub mod wal;
