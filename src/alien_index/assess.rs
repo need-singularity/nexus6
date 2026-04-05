@@ -35,6 +35,16 @@ pub fn rank_from_grade(grade: &str) -> Option<u8> {
     None
 }
 
+/// Map mk2 classifier v2 confidence (0.0..1.0) to `r`.
+/// Per spec: 0.9+ → 10, 0.7+ → 9, 0.5+ → 8, 0.3+ → 7, below → 0.
+pub fn rank_from_mk2_confidence(confidence: f64) -> u8 {
+    if confidence >= 0.9 { 10 }
+    else if confidence >= 0.7 { 9 }
+    else if confidence >= 0.5 { 8 }
+    else if confidence >= 0.3 { 7 }
+    else { 0 }
+}
+
 /// Take the strongest signal. `r = max(all available)`.
 pub fn combine_signals(
     n6_quality: Option<f64>,
@@ -45,6 +55,18 @@ pub fn combine_signals(
     let r_lens = lens_consensus.map(rank_from_lens_consensus).unwrap_or(0);
     let r_grade = grade.and_then(rank_from_grade).unwrap_or(0);
     r_n6.max(r_lens).max(r_grade)
+}
+
+/// Extended combine with mk2 confidence as 4th signal.
+pub fn combine_signals_v2(
+    n6_quality: Option<f64>,
+    lens_consensus: Option<u32>,
+    grade: Option<&str>,
+    mk2_confidence: Option<f64>,
+) -> u8 {
+    let base = combine_signals(n6_quality, lens_consensus, grade);
+    let r_mk2 = mk2_confidence.map(rank_from_mk2_confidence).unwrap_or(0);
+    base.max(r_mk2)
 }
 
 #[cfg(test)]
@@ -106,5 +128,32 @@ mod tests {
         let r = combine_signals(None, None, Some("🟩"));
         assert_eq!(r, 9);
         assert_eq!(combine_signals(None, None, None), 0);
+    }
+
+    #[test]
+    fn rank_from_mk2_confidence_thresholds() {
+        assert_eq!(rank_from_mk2_confidence(1.0), 10);
+        assert_eq!(rank_from_mk2_confidence(0.95), 10);
+        assert_eq!(rank_from_mk2_confidence(0.9), 10);
+        assert_eq!(rank_from_mk2_confidence(0.8), 9);
+        assert_eq!(rank_from_mk2_confidence(0.7), 9);
+        assert_eq!(rank_from_mk2_confidence(0.6), 8);
+        assert_eq!(rank_from_mk2_confidence(0.5), 8);
+        assert_eq!(rank_from_mk2_confidence(0.4), 7);
+        assert_eq!(rank_from_mk2_confidence(0.3), 7);
+        assert_eq!(rank_from_mk2_confidence(0.29), 0);
+        assert_eq!(rank_from_mk2_confidence(0.0), 0);
+    }
+
+    #[test]
+    fn combine_v2_takes_max_including_mk2() {
+        // mk2 0.9 → r=10 beats n6 EXACT (r=9)
+        let r = combine_signals_v2(Some(1.0), None, None, Some(0.9));
+        assert_eq!(r, 10);
+        // mk2 0.4 → r=7, grade 🟩 → r=9 ⇒ max 9
+        let r = combine_signals_v2(None, None, Some("🟩"), Some(0.4));
+        assert_eq!(r, 9);
+        // none provided → 0
+        assert_eq!(combine_signals_v2(None, None, None, None), 0);
     }
 }
