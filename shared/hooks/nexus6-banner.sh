@@ -123,6 +123,42 @@ if topo_path.exists():
             sing_str = f'·Σ{count} '
     except: pass
 
-banner = f'🔭 NEXUS-6 {ai_str}{sing_str}🔭{lens_impl}/{lens_total}{d_lens} ⚖️{laws}법칙{d_laws} 🧠{modules}모듈{d_mods}{g_str}{bridge_str}'
+# Closed form count — grade=10 (PASS/EXACT) records + 🎉 celebration on increase
+closed_str = ''
+vc_path = HOME / 'Dev/nexus6/shared/verified_constants.jsonl'
+closed_snap_path = HOME / 'Dev/nexus6/shared/.closed_snapshot.json'
+if vc_path.exists():
+    try:
+        closed_count = 0
+        with open(vc_path, 'rb') as f:
+            for line in f:
+                try:
+                    j = json.loads(line)
+                    if j.get('status') in ('PASS','EXACT') or j.get('grade') in ('PASS','EXACT'):
+                        closed_count += 1
+                except: pass
+
+        # compare with snapshot
+        prev_count = closed_count
+        if closed_snap_path.exists():
+            try:
+                prev_count = json.loads(closed_snap_path.read_text()).get('closed', closed_count)
+            except: pass
+        else:
+            closed_snap_path.write_text(json.dumps({'closed': closed_count}))
+
+        delta = closed_count - prev_count
+        if delta > 0:
+            # 🎉 celebration — new closed form(s) discovered!
+            closed_str = f' 🎉🎉🎉 +{delta}닫힘완성! ⭐{closed_count} 🎉🎉🎉'
+            # update snapshot now so next tick doesn't re-celebrate
+            closed_snap_path.write_text(json.dumps({'closed': closed_count}))
+        elif closed_count >= 1000:
+            closed_str = f' ⭐{closed_count/1000:.1f}k닫힘'
+        elif closed_count > 0:
+            closed_str = f' ⭐{closed_count}닫힘'
+    except: pass
+
+banner = f'🔭 NEXUS-6 {ai_str}{sing_str}🔭{lens_impl}/{lens_total}{d_lens} ⚖️{laws}법칙{d_laws} 🧠{modules}모듈{d_mods}{g_str}{bridge_str}{closed_str}'
 print(json.dumps({'systemMessage': banner}, ensure_ascii=False))
 " 2>/dev/null || echo '{"systemMessage":"🔭 NEXUS-6 활성"}'
