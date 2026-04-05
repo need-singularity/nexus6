@@ -218,6 +218,56 @@ impl NexusConfig {
 
 // ── Example config generator ────────────────────────────────────
 
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct SingularityRecursionConfig {
+    #[serde(default = "singularity_default_domain")]
+    pub domain: String,
+    #[serde(default = "singularity_default_max_points")]
+    pub max_total_points: u64,
+    #[serde(default = "singularity_default_eps")]
+    pub neighborhood_radius_eps: f32,
+    #[serde(default = "singularity_default_top_k")]
+    pub boundary_sample_top_k: usize,
+    #[serde(default = "singularity_default_cpu_per_tick")]
+    pub cpu_sec_per_tick: u64,
+    #[serde(default = "singularity_default_wall_per_tick")]
+    pub wall_sec_per_tick: u64,
+    #[serde(default = "singularity_default_global_budget")]
+    pub global_cpu_sec_budget: u64,
+    #[serde(default = "singularity_default_min_mem")]
+    pub min_free_memory_mb: usize,
+    #[serde(default = "singularity_default_max_load")]
+    pub max_loadavg_1min: f64,
+}
+
+fn singularity_default_domain() -> String { "architecture_design".into() }
+fn singularity_default_max_points() -> u64 { 50_000 }
+fn singularity_default_eps() -> f32 { 0.3 }
+fn singularity_default_top_k() -> usize { 20 }
+fn singularity_default_cpu_per_tick() -> u64 { 30 }
+fn singularity_default_wall_per_tick() -> u64 { 60 }
+fn singularity_default_global_budget() -> u64 { 86_400 }
+fn singularity_default_min_mem() -> usize { 2048 }
+fn singularity_default_max_load() -> f64 { 8.0 }
+
+impl Default for SingularityRecursionConfig {
+    fn default() -> Self {
+        Self {
+            domain: singularity_default_domain(),
+            max_total_points: singularity_default_max_points(),
+            neighborhood_radius_eps: singularity_default_eps(),
+            boundary_sample_top_k: singularity_default_top_k(),
+            cpu_sec_per_tick: singularity_default_cpu_per_tick(),
+            wall_sec_per_tick: singularity_default_wall_per_tick(),
+            global_cpu_sec_budget: singularity_default_global_budget(),
+            min_free_memory_mb: singularity_default_min_mem(),
+            max_loadavg_1min: singularity_default_max_load(),
+        }
+    }
+}
+
+// ── Example config generator ────────────────────────────────────
+
 /// Generate a commented example `config.toml`.
 pub fn default_config_toml() -> String {
     r#"# NEXUS-6 Configuration
