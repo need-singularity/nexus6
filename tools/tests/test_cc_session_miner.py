@@ -24,5 +24,14 @@ class TestParseSession(unittest.TestCase):
         self.assertEqual(result["unique_calls"], 2)
         self.assertAlmostEqual(result["repeat_rate"], 1/3, places=5)
 
+    def test_aggregate_sessions(self):
+        from cc_session_miner import aggregate_sessions
+        result = aggregate_sessions([FIX / "sample_session.jsonl", FIX / "corrupt_session.jsonl"])
+        # sample: 3 calls, corrupt: 1 call → 4 total
+        self.assertEqual(result["total_tool_calls"], 4)
+        self.assertEqual(result["session_count"], 2)
+        self.assertIn("mean_tool_result_bytes", result)
+        self.assertIn("p95_tool_result_bytes", result)
+
 if __name__ == "__main__":
     unittest.main()
