@@ -466,6 +466,8 @@ fn entry_to_node(e: &DiscoveryEntry) -> Node {
         confidence: e.confidence,
         lenses_used: e.lenses.iter().map(|s| s.to_string()).collect(),
         timestamp: "2026-04-03".to_string(),
+        mk2_sector: None,
+        mk2_confidence: None,
     }
 }
 

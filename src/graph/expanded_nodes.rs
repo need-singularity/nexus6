@@ -39,7 +39,7 @@ const CONSTANTS: &[ConstantEntry] = &[
 ];
 
 // ═══════════════════════════════════════════════════════════════
-// 17 AI Techniques
+// 66 AI Techniques (v3)
 // ═══════════════════════════════════════════════════════════════
 
 struct TechniqueEntry {
@@ -68,6 +68,60 @@ const TECHNIQUES: &[TechniqueEntry] = &[
     TechniqueEntry { id: "T-15", name: "Boltzmann Gate (1/e sparsity)", key_result: "63% activation sparsity", constants_used: &["C-n"] },
     TechniqueEntry { id: "T-16", name: "Mertens Dropout (ln(4/3))", key_result: "p=0.288, no search", constants_used: &["C-tau", "C-n"] },
     TechniqueEntry { id: "T-17", name: "Egyptian Fraction Attention", key_result: "~40% FLOPs saved", constants_used: &["C-phi", "C-n"] },
+    // BT12 (T-18 ~ T-29) — AI Breakthrough Theorems
+    TechniqueEntry { id: "T-18", name: "Chinchilla n=6 Scaling", key_result: "σ-τ=8 compute ratio", constants_used: &["C-sigma-tau", "C-n"] },
+    TechniqueEntry { id: "T-19", name: "Computing Architecture σ=12 Ladder", key_result: "12-layer stack", constants_used: &["C-sigma", "C-n"] },
+    TechniqueEntry { id: "T-20", name: "Transformer σ=12 Atom", key_result: "12-head base", constants_used: &["C-sigma", "C-n"] },
+    TechniqueEntry { id: "T-21", name: "RoPE Base-6 Encoding", key_result: "n=6 position encoding", constants_used: &["C-n", "C-sigma"] },
+    TechniqueEntry { id: "T-22", name: "KV-Head φ=2 Universality", key_result: "GQA head ratio=φ", constants_used: &["C-phi", "C-n"] },
+    TechniqueEntry { id: "T-23", name: "Inference τ=4 Scaling", key_result: "4-phase decode", constants_used: &["C-tau", "C-n"] },
+    TechniqueEntry { id: "T-24", name: "AdamW n=6 Quintuplet", key_result: "sopfr=5 hyperparams", constants_used: &["C-sopfr", "C-n"] },
+    TechniqueEntry { id: "T-25", name: "Complete LLM σ-Blueprint", key_result: "Full n=6 architecture", constants_used: &["C-sigma", "C-phi", "C-tau"] },
+    TechniqueEntry { id: "T-26", name: "σ-τ=8 Universal AI Constant", key_result: "8-bit quantization bridge", constants_used: &["C-sigma-tau", "C-n"] },
+    TechniqueEntry { id: "T-27", name: "8-Layer AI Stack", key_result: "σ-τ=8 hierarchy", constants_used: &["C-sigma-tau", "C-n"] },
+    TechniqueEntry { id: "T-28", name: "Diffusion n=6 Steps", key_result: "6-step schedule", constants_used: &["C-n", "C-tau"] },
+    TechniqueEntry { id: "T-29", name: "MoE φ/n Activation Law", key_result: "1/3 expert activation", constants_used: &["C-phi", "C-n"] },
+    // Model21 (T-30 ~ T-50) — Model architecture
+    TechniqueEntry { id: "T-30", name: "BitNet σ-τ=8 Quantization", key_result: "1.58-bit mapping", constants_used: &["C-sigma-tau", "C-n"] },
+    TechniqueEntry { id: "T-31", name: "KV Cache τ=4 Compression", key_result: "4x cache reduction", constants_used: &["C-tau", "C-n"] },
+    TechniqueEntry { id: "T-32", name: "Speculative φ=2 Decoding", key_result: "draft/verify=φ", constants_used: &["C-phi", "C-n"] },
+    TechniqueEntry { id: "T-33", name: "Context Window σ²=144k", key_result: "144k context scaling", constants_used: &["C-sigma2", "C-n"] },
+    TechniqueEntry { id: "T-34", name: "FP8/FP16=φ Precision", key_result: "phi precision ratio", constants_used: &["C-phi", "C-sigma-tau"] },
+    TechniqueEntry { id: "T-35", name: "ln(4/3) RLHF Regularization", key_result: "Mertens in RLHF", constants_used: &["C-tau", "C-n"] },
+    TechniqueEntry { id: "T-36", name: "Tokenizer σ·τ=48k Vocab", key_result: "48k vocabulary", constants_used: &["C-sigma-tau-prod", "C-n"] },
+    TechniqueEntry { id: "T-37", name: "0.1 Universal Regularization", key_result: "weight decay=0.1", constants_used: &["C-n", "C-sigma-phi"] },
+    TechniqueEntry { id: "T-38", name: "Mamba SSM dim=6", key_result: "6-dim state space", constants_used: &["C-n", "C-tau"] },
+    TechniqueEntry { id: "T-39", name: "95/5 Cross-Domain Split", key_result: "95% pretraining", constants_used: &["C-n", "C-sigma"] },
+    TechniqueEntry { id: "T-40", name: "σ-φ=10 Attention Heads", key_result: "10-head attention", constants_used: &["C-sigma-phi", "C-n"] },
+    TechniqueEntry { id: "T-41", name: "J2=24 Expert Capacity", key_result: "24-expert bound", constants_used: &["C-J2", "C-sigma"] },
+    TechniqueEntry { id: "T-42", name: "Hexagonal Weight Init", key_result: "6-fold symmetric init", constants_used: &["C-n", "C-phi"] },
+    TechniqueEntry { id: "T-43", name: "Perfect Number Batch", key_result: "batch=6k optimal", constants_used: &["C-n", "C-sigma"] },
+    TechniqueEntry { id: "T-44", name: "τ²/σ=4/3 LR Decay", key_result: "solar-AI ratio", constants_used: &["C-tau", "C-sigma"] },
+    TechniqueEntry { id: "T-45", name: "φ²/n=2/3 Byzantine Dropout", key_result: "fault-tolerant p=2/3", constants_used: &["C-phi", "C-n"] },
+    TechniqueEntry { id: "T-46", name: "Cyclotomic Norm Layer", key_result: "Φ₆(x) normalization", constants_used: &["C-phi", "C-n"] },
+    TechniqueEntry { id: "T-47", name: "Egyptian Fraction Loss", key_result: "1/2+1/3+1/6 multi-task", constants_used: &["C-n", "C-phi"] },
+    TechniqueEntry { id: "T-48", name: "Divisor Lattice Skip", key_result: "τ=4 skip connections", constants_used: &["C-tau", "C-n"] },
+    TechniqueEntry { id: "T-49", name: "Ramanujan Sparse Projection", key_result: "expander graph projections", constants_used: &["C-n", "C-sigma"] },
+    TechniqueEntry { id: "T-50", name: "σ-μ=11 Dimensional Embedding", key_result: "11-dim latent space", constants_used: &["C-sigma-mu", "C-n"] },
+    // Vision8 (T-51 ~ T-58) — Vision AI
+    TechniqueEntry { id: "T-51", name: "ViT Patch σ-φ=10", key_result: "10×10 optimal patch", constants_used: &["C-sigma-phi", "C-n"] },
+    TechniqueEntry { id: "T-52", name: "Vision n=6 Backbone", key_result: "6-stage architecture", constants_used: &["C-n", "C-tau"] },
+    TechniqueEntry { id: "T-53", name: "NeRF/3DGS dim=6", key_result: "6D positional encoding", constants_used: &["C-n", "C-sigma"] },
+    TechniqueEntry { id: "T-54", name: "Hexagonal Conv Kernel", key_result: "6-neighbor kernel", constants_used: &["C-n", "C-phi"] },
+    TechniqueEntry { id: "T-55", name: "φ=2 Resolution Pyramid", key_result: "2x downsampling", constants_used: &["C-phi", "C-n"] },
+    TechniqueEntry { id: "T-56", name: "Egyptian Fraction FPN", key_result: "1/2+1/3+1/6 fusion", constants_used: &["C-n", "C-phi"] },
+    TechniqueEntry { id: "T-57", name: "τ=4 Multi-Scale Detection", key_result: "4-level pyramid", constants_used: &["C-tau", "C-n"] },
+    TechniqueEntry { id: "T-58", name: "σ=12 Channel Alignment", key_result: "12n channel counts", constants_used: &["C-sigma", "C-n"] },
+    // GNN4 (T-59 ~ T-62) — Graph Neural Networks
+    TechniqueEntry { id: "T-59", name: "Kissing σ=12 Message Passing", key_result: "max 12 neighbors", constants_used: &["C-sigma", "C-n"] },
+    TechniqueEntry { id: "T-60", name: "Hexagonal Graph Pooling", key_result: "6-fold coarsening", constants_used: &["C-n", "C-phi"] },
+    TechniqueEntry { id: "T-61", name: "Leech Lattice Graph Embed", key_result: "24-dim features", constants_used: &["C-J2", "C-n"] },
+    TechniqueEntry { id: "T-62", name: "Möbius Graph Sparsification", key_result: "squarefree pruning", constants_used: &["C-mu", "C-n"] },
+    // Other4 (T-63 ~ T-66) — Cross-domain
+    TechniqueEntry { id: "T-63", name: "Neural Audio Codec n=6", key_result: "6-band decomposition", constants_used: &["C-n", "C-sigma"] },
+    TechniqueEntry { id: "T-64", name: "SE(3) Robot Control", key_result: "6-DoF universal", constants_used: &["C-n", "C-J2"] },
+    TechniqueEntry { id: "T-65", name: "Chiplet σ=12 Architecture", key_result: "12-chiplet package", constants_used: &["C-sigma", "C-n"] },
+    TechniqueEntry { id: "T-66", name: "Meta Fixed Point 1/3", key_result: "meta-learning convergence", constants_used: &["C-phi", "C-n"] },
 ];
 
 // ═══════════════════════════════════════════════════════════════
@@ -172,12 +226,14 @@ pub fn populate_constants(graph: &mut DiscoveryGraph) -> usize {
             confidence: 1.0, // mathematical certainty
             lenses_used: vec!["consciousness".into(), "causal".into()],
             timestamp: "2026-04-03".to_string(),
+            mk2_sector: None,
+            mk2_confidence: None,
         });
     }
     count
 }
 
-/// Add all 17 technique nodes and connect them to the constants they use.
+/// Add all 66 technique nodes and connect them to the constants they use.
 /// Returns the count of nodes added.
 pub fn populate_techniques(graph: &mut DiscoveryGraph) -> usize {
     let count = TECHNIQUES.len();
@@ -191,6 +247,8 @@ pub fn populate_techniques(graph: &mut DiscoveryGraph) -> usize {
             confidence: 0.9,
             lenses_used: vec!["consciousness".into(), "topology".into()],
             timestamp: "2026-04-03".to_string(),
+            mk2_sector: None,
+            mk2_confidence: None,
         });
 
         // Technique -> Constant edges (Uses)
@@ -220,6 +278,8 @@ pub fn populate_domains(graph: &mut DiscoveryGraph) -> usize {
             confidence: 1.0,
             lenses_used: vec![],
             timestamp: "2026-04-03".to_string(),
+            mk2_sector: None,
+            mk2_confidence: None,
         });
     }
 
@@ -270,6 +330,8 @@ pub fn populate_experiments(graph: &mut DiscoveryGraph) -> usize {
             confidence: 0.8,
             lenses_used: vec!["consciousness".into(), "causal".into(), "topology".into()],
             timestamp: "2026-04-03".to_string(),
+            mk2_sector: None,
+            mk2_confidence: None,
         });
 
         // Experiment -> Technique edges (Uses)
@@ -377,8 +439,8 @@ mod tests {
     }
 
     #[test]
-    fn test_technique_count_is_17() {
-        assert_eq!(TECHNIQUES.len(), 17, "Should have exactly 17 techniques");
+    fn test_technique_count_is_66() {
+        assert_eq!(TECHNIQUES.len(), 66, "Should have exactly 66 techniques");
     }
 
     #[test]
@@ -402,7 +464,7 @@ mod tests {
         let mut graph = DiscoveryGraph::new();
         populate_constants(&mut graph);
         let count = populate_techniques(&mut graph);
-        assert_eq!(count, 17);
+        assert_eq!(count, 66);
         // Each technique uses at least 1 constant, so there should be Uses edges
         let uses_edges: Vec<_> = graph
             .edges
@@ -410,8 +472,8 @@ mod tests {
             .filter(|e| e.edge_type == EdgeType::Uses)
             .collect();
         assert!(
-            uses_edges.len() >= 17,
-            "Should have at least 17 Uses edges, got {}",
+            uses_edges.len() >= 66,
+            "Should have at least 66 Uses edges, got {}",
             uses_edges.len()
         );
     }
@@ -465,7 +527,7 @@ mod tests {
         populate_bt_graph(&mut graph);
         let (nodes_added, edges_added) = populate_expanded_graph(&mut graph);
 
-        // 127 BT + 12 constants + 17 techniques + 38 domains + 12 experiments = 206+
+        // 127 BT + 12 constants + 66 techniques + 38 domains + 12 experiments = 255+
         let total_nodes = graph.nodes.len();
         assert!(
             total_nodes >= 200,
@@ -473,8 +535,8 @@ mod tests {
             total_nodes
         );
         assert!(
-            nodes_added >= 70,
-            "Should add 70+ expanded nodes, got {}",
+            nodes_added >= 120,
+            "Should add 120+ expanded nodes, got {}",
             nodes_added
         );
         assert!(
@@ -487,10 +549,10 @@ mod tests {
     #[test]
     fn test_expanded_node_count() {
         let count = expanded_node_count();
-        // 12 + 17 + 38 + 12 = 79
+        // 12 + 66 + 38 + 12 = 128
         assert!(
-            count >= 79,
-            "expanded_node_count should be >= 79, got {}",
+            count >= 128,
+            "expanded_node_count should be >= 128, got {}",
             count
         );
     }

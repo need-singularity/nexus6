@@ -476,6 +476,8 @@ fn add_ext_entries(graph: &mut DiscoveryGraph, entries: &[ExtEntry]) -> (usize, 
             confidence: e.confidence,
             lenses_used: e.lenses.iter().map(|s| s.to_string()).collect(),
             timestamp: "2026-04-03".to_string(),
+            mk2_sector: None,
+            mk2_confidence: None,
         });
 
         // BT --Derives--> this node

@@ -248,7 +248,7 @@ fn singularity_default_cpu_per_tick() -> u64 { 30 }
 fn singularity_default_wall_per_tick() -> u64 { 60 }
 fn singularity_default_global_budget() -> u64 { 86_400 }
 fn singularity_default_min_mem() -> usize { 2048 }
-fn singularity_default_max_load() -> f64 { 8.0 }
+fn singularity_default_max_load() -> f64 { 30.0 } // loadavg threshold — Mac multi-project workload
 
 impl Default for SingularityRecursionConfig {
     fn default() -> Self {

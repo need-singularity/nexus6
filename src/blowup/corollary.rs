@@ -5,6 +5,9 @@
 
 use std::collections::HashMap;
 
+use crate::mk2::primes::PrimeSet;
+use crate::mk2::types::Sector;
+
 /// How a corollary was generated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CorollaryType {
@@ -43,6 +46,12 @@ pub struct Corollary {
     pub target_domain: String,
     /// Is this corollary itself a potential new axiom?
     pub is_axiom_candidate: bool,
+    /// mk2: physics sector classification (None = not yet classified).
+    pub mk2_sector: Option<Sector>,
+    /// mk2: prime set of signature values.
+    pub mk2_prime_set: Option<PrimeSet>,
+    /// mk2: classification confidence (0.0..1.0).
+    pub mk2_confidence: Option<f64>,
 }
 
 impl Corollary {
@@ -57,6 +66,40 @@ impl Corollary {
             self.corollary_type,
             CorollaryType::DomainTransfer | CorollaryType::Projection
         )
+    }
+
+    /// Run mk2 classify_v2 on this corollary's expression + signature values.
+    /// Enriches mk2_sector, mk2_prime_set, mk2_confidence in-place.
+    pub fn classify_mk2(&mut self) {
+        let values: Vec<f64> = self.signature.values().copied().collect();
+        let text = format!("{} {}", self.name, self.expression);
+
+        // Build prime_set from signature values (only small rationals)
+        let mut ps = PrimeSet::empty();
+        for &v in &values {
+            if v.is_finite() && v.abs() > 1e-10 && v.abs() < 1e6 {
+                // Try small denominators only (smooth-class relevant range)
+                for den in &[1u64, 2, 3, 5, 6, 7, 15, 21, 35, 105, 210] {
+                    let num = (v * *den as f64).round() as i128;
+                    if num > 0 && ((num as f64 / *den as f64) - v).abs() < 1e-6 {
+                        for (p, _) in crate::mk2::primes::factorize(num.unsigned_abs() as u64) {
+                            ps.insert(p);
+                        }
+                        for (p, _) in crate::mk2::primes::factorize(*den) {
+                            ps.insert(p);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        let sectors = crate::mk2::classify_v2::default_sectors();
+        let result = crate::mk2::classify_v2::classify_v2(&text, &values, &ps, &sectors);
+
+        self.mk2_sector = Some(result.sector);
+        self.mk2_prime_set = Some(ps);
+        self.mk2_confidence = Some(result.confidence);
     }
 }
 
@@ -75,6 +118,9 @@ mod tests {
             signature: HashMap::new(),
             target_domain: "growth".into(),
             is_axiom_candidate: false,
+            mk2_sector: None,
+            mk2_prime_set: None,
+            mk2_confidence: None,
         };
         assert!(c.is_nontrivial());
         assert!(!c.is_cross_domain());
@@ -91,7 +137,53 @@ mod tests {
             signature: HashMap::new(),
             target_domain: "music".into(),
             is_axiom_candidate: true,
+            mk2_sector: None,
+            mk2_prime_set: None,
+            mk2_confidence: None,
         };
         assert!(c.is_cross_domain());
+    }
+
+    #[test]
+    fn test_classify_mk2_cosmology() {
+        let mut sig = HashMap::new();
+        sig.insert("Omega_Lambda".into(), 0.6857);
+        let mut c = Corollary {
+            name: "dark_energy".into(),
+            corollary_type: CorollaryType::Deduction,
+            source_axioms: vec!["Omega_Lambda".into()],
+            expression: "Hubble dark energy fraction Ω_Λ = 24/35".into(),
+            confidence: 0.9,
+            signature: sig,
+            target_domain: "physics".into(),
+            is_axiom_candidate: false,
+            mk2_sector: None,
+            mk2_prime_set: None,
+            mk2_confidence: None,
+        };
+        c.classify_mk2();
+        assert!(c.mk2_sector.is_some());
+        assert!(c.mk2_confidence.unwrap() > 0.0);
+        // "Hubble" + "dark energy" keywords → cosmology
+        assert_eq!(c.mk2_sector.unwrap(), Sector::Cosmology);
+    }
+
+    #[test]
+    fn test_classify_mk2_unknown() {
+        let mut c = Corollary {
+            name: "random".into(),
+            corollary_type: CorollaryType::Dual,
+            source_axioms: vec![],
+            expression: "abstract nonsense".into(),
+            confidence: 0.3,
+            signature: HashMap::new(),
+            target_domain: "math".into(),
+            is_axiom_candidate: false,
+            mk2_sector: None,
+            mk2_prime_set: None,
+            mk2_confidence: None,
+        };
+        c.classify_mk2();
+        assert_eq!(c.mk2_sector.unwrap(), Sector::Unknown);
     }
 }

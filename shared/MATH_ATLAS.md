@@ -1,15 +1,15 @@
 # Math Atlas
 
-> Auto-generated: 2026-04-05T15:34:10 | 688 hypotheses | 122 constant maps
+> Auto-generated: 2026-04-05T20:53:47 | 698 hypotheses | 122 constant maps
 
 ## Summary
 
 | Repo | Hypotheses | Constant Maps |
 |------|-----------|--------------|
-| TECS-L | 1 | 0 |
-| SEDI | 688 | 122 |
+| TECS-L | 10 | 0 |
+| SEDI | 689 | 122 |
 | anima | 0 | 0 |
-| **Total** | **689** | **122** |
+| **Total** | **699** | **122** |
 
 ### Grade Distribution
 
@@ -18,12 +18,13 @@
 | 🟩 | 249 |
 | 🟧 | 239 |
 | 🟧★ | 131 |
+| (none) | 29 |
 | 🟦 | 22 |
-| (none) | 20 |
 | ⚪ | 12 |
 | ⬜ UNTESTED | 7 |
 | 🟥★ | 3 |
 | 🟥★★ | 2 |
+| 8 | 1 |
 | 7 | 1 |
 | 🟥★★★★ | 1 |
 | 🟧★★★ | 1 |
@@ -32,13 +33,22 @@
 
 ## Hypotheses
 
-### TECS-L (1)
+### TECS-L (10)
 
 | # | ID | Title | Grade | Domain |
 |---|-----|-------|-------|--------|
-| 1 | architecture_breakthrough | 아키텍처 특이점 돌파 분석 | 7 | - |
+| 1 | H-ALPHA-001 | α⁻¹ = σ² − M₃ + φ/(σ·sopfr) | - | ALPHA |
+| 2 | H-CLOSE-breakthrough-hypotheses | H-CLOSE: 닫힘 돌파 가설 6개 | 8 | - |
+| 3 | H-COSMO-001 | Ω_m = φ/n = meta fixed point 1/3 | - | COSMO |
+| 4 | H-COSMO-002 | 우주 밀도 완전 유리수 분해 Ω = {4/15, 24/35, 1/21} | - | COSMO |
+| 5 | H-HUBBLE-001 | Hubble Tension = n (both measurements in n=6 basis) | - | HUBBLE |
+| 6 | H-META-FP-001-universality-class | H-META-FP-001: ρ=1/3 Universality Class | - | - |
+| 7 | H-SMOOTH-001 | Weinberg & Cabibbo = {2,3,5,7}-smooth = 8/35 | - | SMOOTH |
+| 8 | H-SMOOTH-002 | Physics sectors organized by prime hierarchy | - | SMOOTH |
+| 9 | NEXUS6-auto-insights | 🛸 NEXUS-6 자동 전파 인사이트 | - | - |
+| 10 | architecture_breakthrough | 아키텍처 특이점 돌파 분석 | 7 | - |
 
-### SEDI (687)
+### SEDI (688)
 
 | # | ID | Title | Grade | Domain |
 |---|-----|-------|-------|--------|
@@ -729,6 +739,7 @@
 | 685 | H-CX-998 | Completeness Theorem | 🟧★ | CX |
 | 686 | H-CX-999 | Perfect Number Uniqueness | 🟩 | CX |
 | 687 | H-CX-superconductor-tc-survey | H-CX-TC-Survey: Systematic Superconductor Tc Matching with n | 🟧 | - |
+| 688 | NEXUS6-auto-insights | 🛸 NEXUS-6 자동 전파 인사이트 | - | - |
 
 ### anima (0)
 

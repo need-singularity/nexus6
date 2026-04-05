@@ -192,6 +192,8 @@ impl EvolutionEngine {
                     confidence: verification.score,
                     lenses_used: lenses_used.clone(),
                     timestamp: format!("cycle-{}", cycle),
+                    mk2_sector: None,
+                    mk2_confidence: None,
                 });
 
                 // Connect to previous cycle's discoveries if any

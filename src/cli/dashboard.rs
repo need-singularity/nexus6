@@ -49,6 +49,12 @@ pub fn render_dashboard() -> String {
     out.push_str("║    sigma=12  phi=2  tau=4  J2=24  sopfr=5    ║\n");
     out.push_str("║    sigma*phi=n*tau  <=>  n=6 (PROVED)        ║\n");
     out.push_str("╠══════════════════════════════════════════════╣\n");
+    out.push_str("║  mk2 Smooth-Class Sectors:                   ║\n");
+    out.push_str("║    Strong     {2,3}       ρ=1/3  u=2/3,d=1/3 ║\n");
+    out.push_str("║    Cosmology  {2,3,5}/{5,7} Ω_DM/Ω_Λ        ║\n");
+    out.push_str("║    EW         {2,3,5,7}   sin²θ_W=8/35      ║\n");
+    out.push_str("║    Primordial {2,3,5,13}  Y_p=16/65         ║\n");
+    out.push_str("╠══════════════════════════════════════════════╣\n");
     out.push_str("║  Domain Combos (10):                         ║\n");
     for combo in &combos {
         let lenses_str = combo.lenses.join("+");
@@ -181,6 +187,21 @@ pub fn render_html_dashboard() -> String {
     html.push_str("<tr><td>sopfr</td><td>5</td><td>\u{03bc}</td><td>1</td></tr>\n");
     html.push_str("<tr><td>\u{03c3}-\u{03c6}</td><td>10</td><td>\u{03c3}-\u{03c4}</td><td>8</td></tr>\n");
     html.push_str("</table>\n</div>\n");
+    html.push_str("</section>\n");
+
+    // mk2 Smooth-Class Summary
+    html.push_str("<section class=\"chart-section\">\n");
+    html.push_str("<div class=\"constants\" style=\"width:100%;max-width:900px\">\n");
+    html.push_str("<h2>mk2 Smooth-Class Engine</h2>\n");
+    html.push_str("<table class=\"const-table\">\n");
+    html.push_str("<tr style=\"font-weight:bold\"><td>Sector</td><td>Prime Set</td><td>\u{03c1}(n)</td><td>Physics</td></tr>\n");
+    html.push_str("<tr><td>Strong</td><td>{2,3}</td><td>1/3</td><td>u=2/3, d=1/3</td></tr>\n");
+    html.push_str("<tr><td>Cosmology</td><td>{2,3,5} / {5,7}</td><td>4/15, 24/35</td><td>\u{03a9}_DM=4/15, \u{03a9}_\u{039b}=24/35</td></tr>\n");
+    html.push_str("<tr><td>Electroweak</td><td>{2,3,5,7}</td><td>8/35</td><td>sin\u{00b2}\u{03b8}_W=8/35</td></tr>\n");
+    html.push_str("<tr><td>Primordial</td><td>{2,3,5,13}</td><td>16/65</td><td>Y_p=16/65</td></tr>\n");
+    html.push_str("</table>\n");
+    html.push_str("<p style=\"margin-top:8px;color:#888;font-size:0.85em\">\u{03c1}(n)=\u{03c6}(n)/n &mdash; Meta Fixed Point 1/3 ({2,3}-smooth universality)</p>\n");
+    html.push_str("</div>\n");
     html.push_str("</section>\n");
 
     // Search + lens table

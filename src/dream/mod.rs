@@ -9,6 +9,10 @@ pub struct Dream {
     pub recombination: String,
     pub novelty_score: f64,
     pub plausibility: f64,
+    /// mk2: physics sector of the recombined hypothesis
+    pub mk2_sector: Option<String>,
+    /// mk2: classification confidence
+    pub mk2_confidence: Option<f64>,
 }
 
 /// The dream engine accumulates past discoveries and recombines them.
@@ -57,11 +61,14 @@ impl DreamEngine {
             let novelty_score = compute_novelty(&fragments, n_mem, i);
             let plausibility = compute_plausibility(&fragments);
 
+            let (mk2_sector, mk2_confidence) = classify_dream(&recombination);
             dreams.push(Dream {
                 fragments,
                 recombination,
                 novelty_score,
                 plausibility,
+                mk2_sector,
+                mk2_confidence,
             });
         }
 
@@ -97,11 +104,14 @@ impl DreamEngine {
         let novelty_score = compute_novelty(&fragments, self.past_discoveries.len(), 42);
         let plausibility = compute_plausibility(&fragments);
 
+        let (mk2_sector, mk2_confidence) = classify_dream(&recombination);
         Dream {
             fragments,
             recombination,
             novelty_score,
             plausibility,
+            mk2_sector,
+            mk2_confidence,
         }
     }
 }
@@ -176,6 +186,18 @@ fn compute_plausibility(fragments: &[String]) -> f64 {
     }
     // Normalize to 0..1
     (shared as f64 / total as f64).min(1.0).max(0.0)
+}
+
+/// mk2: classify a dream's recombination text.
+fn classify_dream(text: &str) -> (Option<String>, Option<f64>) {
+    let sectors = crate::mk2::classify_v2::default_sectors();
+    let ps = crate::mk2::primes::PrimeSet::empty();
+    let result = crate::mk2::classify_v2::classify_v2(text, &[], &ps, &sectors);
+    if result.confidence > 0.0 {
+        (Some(result.sector.to_string()), Some(result.confidence))
+    } else {
+        (None, None)
+    }
 }
 
 #[cfg(test)]

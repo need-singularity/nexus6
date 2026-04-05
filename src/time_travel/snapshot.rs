@@ -184,6 +184,8 @@ mod tests {
             confidence: 0.9,
             lenses_used: vec![],
             timestamp: "now".to_string(),
+            mk2_sector: None,
+            mk2_confidence: None,
         });
 
         let id = tt.save_snapshot(&graph, "kb", 5, "with nodes");

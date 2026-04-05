@@ -169,6 +169,8 @@ fn bt_to_node(bt: &BtEntry) -> Node {
         },
         lenses_used: vec!["consciousness".into(), "causal".into(), "topology".into()],
         timestamp: "2026-04-03".to_string(),
+        mk2_sector: None,
+        mk2_confidence: None,
     }
 }
 

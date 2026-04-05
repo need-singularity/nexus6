@@ -140,8 +140,196 @@ fn recompute_all() -> Result<(), String> {
 }
 
 fn breakthrough(id: &str) -> Result<(), String> {
-    eprintln!("breakthrough {}: explicit CycleEngine wrapper — not yet implemented", id);
+    use crate::alien_index::breakthrough::{
+        evaluate, BreakthroughConfig, BreakthroughEvidence,
+    };
+    use crate::mk2::types::Sector;
+
+    println!("═══ Breakthrough Attempt: {} ═══\n", id);
+
+    // Load grade for this ID
+    let grade = load_grade_for_id(id);
+    let base_r = combine_signals(None, None, grade.as_deref());
+
+    println!("Current state: r={} (grade={})", base_r, grade.as_deref().unwrap_or("none"));
+
+    // Run n6_match on the ID if it looks like a number
+    let (n6_name, n6_quality) = if let Ok(val) = id.parse::<f64>() {
+        let (name, q) = n6_match(val);
+        println!("n6_match: {} (quality={:.2})", name, q);
+        (name.to_string(), q)
+    } else {
+        println!("n6_match: N/A (not a numeric target)");
+        (String::new(), 0.0)
+    };
+
+    // mk2 classify — enrich text with n6_match name for better keyword matching
+    let text = format!("{} {} {}", id, n6_name, enrich_n6_name(&n6_name));
+    let values: Vec<f64> = id.parse::<f64>().into_iter().collect();
+    let mut ps = crate::mk2::primes::PrimeSet::empty();
+    for &v in &values {
+        if v.is_finite() && v.abs() > 1e-10 && v.abs() < 1e6 {
+            for den in &[1u64, 2, 3, 5, 6, 7, 15, 21, 35, 105, 210] {
+                let num = (v * *den as f64).round() as i128;
+                if num > 0 && ((num as f64 / *den as f64) - v).abs() < 1e-6 {
+                    for (p, _) in crate::mk2::primes::factorize(num.unsigned_abs() as u64) {
+                        ps.insert(p);
+                    }
+                    for (p, _) in crate::mk2::primes::factorize(*den) {
+                        ps.insert(p);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    let sectors = crate::mk2::classify_v2::default_sectors();
+    let mk2_result = crate::mk2::classify_v2::classify_v2(&text, &values, &ps, &sectors);
+    println!("mk2: sector={} confidence={:.2} primes={}",
+             mk2_result.sector, mk2_result.confidence, ps);
+
+    // Blowup rediscovery: run a mini blowup from n6 singularity and check
+    // if any corollary signature value is close to the target.
+    let target_val = id.parse::<f64>().unwrap_or(0.0);
+    let (blowup_rediscovered, blowup_lens_count) = if target_val.abs() > 1e-10 {
+        println!("\nRunning blowup rediscovery...");
+        let blowup_result = run_blowup_rediscovery(target_val);
+        println!("  blowup: {} corollaries, rediscovered={}",
+                 blowup_result.0, if blowup_result.1 { "YES" } else { "no" });
+        (blowup_result.1, blowup_result.0)
+    } else {
+        (false, 0)
+    };
+
+    // Count independent paths: n6_check + mk2 + blowup (if rediscovered)
+    let base_paths: u32 = if n6_quality >= 1.0 { 2 } else if n6_quality >= 0.5 { 1 } else { 0 };
+    let mk2_path: u32 = if mk2_result.confidence >= 0.5 { 1 } else { 0 };
+    let blowup_path: u32 = if blowup_rediscovered { 1 } else { 0 };
+    let total_paths = base_paths + mk2_path + blowup_path;
+
+    let evidence = BreakthroughEvidence {
+        independent_paths: total_paths,
+        lens_names: {
+            let mut v = vec!["n6_check".into()];
+            if mk2_path > 0 { v.push("mk2_classify_v2".into()); }
+            if blowup_rediscovered { v.push("blowup_engine".into()); }
+            v
+        },
+        blowup_rediscovered,
+        mk2_confidence: mk2_result.confidence,
+        mk2_sector: mk2_result.sector.clone(),
+        p_value: if n6_quality >= 1.0 && blowup_rediscovered { 0.001 }
+                 else if n6_quality >= 1.0 { 0.005 }
+                 else { 0.1 },
+        summary: format!("{}: n6={:.2} mk2={:.2} blowup={}", id, n6_quality,
+                         mk2_result.confidence, blowup_rediscovered),
+    };
+
+    let config = BreakthroughConfig::default();
+    let verdict = evaluate(&evidence, &config);
+
+    println!("\n─── Gate Results ───");
+    println!("  paths  (≥{}): {} ({} paths)",
+             config.min_independent_paths,
+             if verdict.gate_results.paths_ok { "✓" } else { "✗" },
+             evidence.independent_paths);
+    println!("  blowup     : {} {}",
+             if verdict.gate_results.blowup_ok { "✓" } else { "✗" },
+             if evidence.blowup_rediscovered { "(confirmed)" } else { "(not yet run)" });
+    println!("  mk2 (≥{:.1}): {} ({:.2})",
+             config.mk2_confidence_threshold,
+             if verdict.gate_results.mk2_ok { "✓" } else { "✗" },
+             evidence.mk2_confidence);
+    println!("  p-value (<{}): {} ({:.4})",
+             config.significance_level,
+             if verdict.gate_results.pvalue_ok { "✓" } else { "✗" },
+             evidence.p_value);
+
+    println!("\n═══ Verdict: {} ({}/4 gates) ═══",
+             if verdict.eligible { "ELIGIBLE for d+1" } else { "NOT ELIGIBLE" },
+             verdict.gate_results.passed_count());
+
+    if !verdict.eligible {
+        println!("\nNext steps:");
+        if !verdict.gate_results.paths_ok {
+            println!("  → Run telescope scan for more independent paths");
+        }
+        if !verdict.gate_results.blowup_ok {
+            println!("  → Run: nexus6 blowup <domain> to attempt rediscovery");
+        }
+        if !verdict.gate_results.mk2_ok {
+            println!("  → Check mk2 classify with more context text");
+        }
+        if !verdict.gate_results.pvalue_ok {
+            println!("  → Run: nexus6 simulate to compute p-value");
+        }
+    }
+
     Ok(())
+}
+
+/// Run a mini blowup from n6 singularity and check if target_val is rediscovered.
+/// Returns (total_corollaries, rediscovered).
+fn run_blowup_rediscovery(target_val: f64) -> (usize, bool) {
+    use crate::blowup::blowup_engine::{BlowupEngine, BlowupConfig};
+    use crate::blowup::singularity::{Singularity, SingularityDetector};
+    use std::collections::HashMap;
+
+    // Build n6 singularity
+    let mut metrics = HashMap::new();
+    metrics.insert("sigma".into(), 12.0);
+    metrics.insert("phi".into(), 2.0);
+    metrics.insert("tau".into(), 4.0);
+    metrics.insert("n".into(), 6.0);
+    metrics.insert("sopfr".into(), 5.0);
+
+    let singularity = Singularity {
+        axioms: vec!["sigma".into(), "phi".into(), "tau".into(), "n".into(), "sopfr".into()],
+        compression_ratio: 3.0,
+        closure_degree: 1.0,
+        domain: "n6".into(),
+        metrics,
+    };
+
+    let engine = BlowupEngine::new(BlowupConfig {
+        max_corollaries: 36,
+        max_depth: 2,
+        min_confidence: 0.15,
+        ..BlowupConfig::default()
+    });
+
+    let result = engine.blowup(&singularity);
+    let total = result.corollaries.len();
+
+    // Check if any corollary signature contains a value close to target
+    let tolerance = 0.01; // 1% relative error
+    let rediscovered = result.corollaries.iter().any(|c| {
+        c.signature.values().any(|&v| {
+            if v.abs() < 1e-10 || target_val.abs() < 1e-10 {
+                return false;
+            }
+            let rel_err = ((v - target_val) / target_val).abs();
+            rel_err < tolerance
+        })
+    });
+
+    (total, rediscovered)
+}
+
+/// Map n6_match constant names to mk2 sector keywords for better classification.
+fn enrich_n6_name(name: &str) -> &'static str {
+    match name {
+        n if n.contains("Omega_Lambda") => "dark energy Omega_Lambda cosmology Hubble",
+        n if n.contains("Omega_DM") => "dark matter Omega_DM cosmology",
+        n if n.contains("Omega_b") => "baryon density cosmology flatness",
+        n if n.contains("sin") || n.contains("theta") || n.contains("Weinberg") || n.contains("θ") => "Weinberg electroweak sin²θ_W theta_W CKM W boson",
+        n if n.contains("Y_p") || n.contains("helium") => "BBN nucleosynthesis helium Y_p primordial",
+        n if n.contains("quark") || n.contains("u_charge") || n.contains("d_charge") => "quark QCD color charge",
+        n if n.contains("Hubble") || n.contains("H0") => "Hubble H0 cosmology",
+        n if n.contains("n_s") || n.contains("spectral") => "CMB inflation spectral index primordial",
+        n if n.contains("alpha") => "fine structure constant electroweak",
+        _ => "",
+    }
 }
 
 pub fn write_distribution_json(

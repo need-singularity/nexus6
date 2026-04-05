@@ -182,6 +182,8 @@ pub enum CliCommand {
     Hook { sub: HookSub },
     /// mk2: prime-atomic smooth-class engine (Phase 5-6).
     Mk2 { sub: Mk2Sub },
+    /// forge: LLM 자기 압축 엔진 (token-forge).
+    Forge { sub: ForgeSub },
     Help,
 }
 
@@ -195,6 +197,20 @@ pub enum Mk2Sub {
     Layer { primes: Vec<u64>, max: u64 },
     /// Show Euler ratio for a prime set.
     EulerRatio { primes: Vec<u64> },
+    /// Show all physics constants for a sector.
+    Sector { name: String },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ForgeSub {
+    /// 반복 자기 압축.
+    Compress { file: String, rounds: usize },
+    /// 압축본 의미 보존 검증.
+    Verify { compressed: String, original: String },
+    /// 섹션별 정보 밀도 분석.
+    Profile { file: String },
+    /// 압축 + 검증 원스톱.
+    Optimize { file: String, rounds: usize },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -306,6 +322,7 @@ pub fn parse_args(args: &[String]) -> Result<CliCommand, String> {
         "sentry" => parse_sentry(rest),
         "hook" => parse_hook(rest),
         "mk2" => parse_mk2(rest),
+        "forge" | "tf" => parse_forge(rest),
         "help" | "--help" | "-h" => Ok(CliCommand::Help),
         other => Err(format!("Unknown command: '{}'. Run 'nexus6 help' for usage.", other)),
     }
@@ -1303,6 +1320,74 @@ fn parse_hook(args: &[String]) -> Result<CliCommand, String> {
     Ok(CliCommand::Hook { sub })
 }
 
+fn parse_forge(args: &[String]) -> Result<CliCommand, String> {
+    let sub_name = args.first().ok_or(
+        "forge: requires subcommand (compress|verify|profile|optimize)"
+    )?;
+    let rest = &args[1..];
+    let sub = match sub_name.as_str() {
+        "compress" => {
+            let file = rest.first()
+                .ok_or("forge compress: requires <file>")?
+                .clone();
+            let mut rounds = 5;
+            let mut i = 1;
+            while i < rest.len() {
+                if rest[i] == "--rounds" && i + 1 < rest.len() {
+                    rounds = rest[i + 1].parse().unwrap_or(5);
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            ForgeSub::Compress { file, rounds }
+        }
+        "verify" => {
+            let compressed = rest.first()
+                .ok_or("forge verify: requires <compressed>")?
+                .clone();
+            let mut original = String::new();
+            let mut i = 1;
+            while i < rest.len() {
+                if rest[i] == "--original" && i + 1 < rest.len() {
+                    original = rest[i + 1].clone();
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            if original.is_empty() {
+                return Err("forge verify: requires --original <file>".to_string());
+            }
+            ForgeSub::Verify { compressed, original }
+        }
+        "profile" => {
+            let file = rest.first()
+                .ok_or("forge profile: requires <file>")?
+                .clone();
+            ForgeSub::Profile { file }
+        }
+        "optimize" => {
+            let file = rest.first()
+                .ok_or("forge optimize: requires <file>")?
+                .clone();
+            let mut rounds = 3;
+            let mut i = 1;
+            while i < rest.len() {
+                if rest[i] == "--rounds" && i + 1 < rest.len() {
+                    rounds = rest[i + 1].parse().unwrap_or(3);
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            ForgeSub::Optimize { file, rounds }
+        }
+        other => return Err(format!("forge: unknown subcommand '{}'. Use compress|verify|profile|optimize", other)),
+    };
+    Ok(CliCommand::Forge { sub })
+}
+
 fn parse_mk2(args: &[String]) -> Result<CliCommand, String> {
     let sub = args.first().ok_or(
         "mk2: requires subcommand (classify|arithmetic|layer|euler-ratio)"
@@ -1374,8 +1459,15 @@ fn parse_mk2(args: &[String]) -> Result<CliCommand, String> {
             }
             Mk2Sub::EulerRatio { primes }
         }
+        "sector" => {
+            let name = rest
+                .first()
+                .ok_or("mk2 sector: requires <name> (strong|electroweak|cosmology|primordial)")?
+                .to_lowercase();
+            Mk2Sub::Sector { name }
+        }
         other => return Err(format!(
-            "Unknown mk2 sub-command: '{}'. Use classify|arithmetic|layer|euler-ratio.",
+            "Unknown mk2 sub-command: '{}'. Use classify|arithmetic|layer|euler-ratio|sector.",
             other
         )),
     };

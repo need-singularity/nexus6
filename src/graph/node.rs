@@ -23,4 +23,8 @@ pub struct Node {
     pub confidence: f64,
     pub lenses_used: Vec<String>,
     pub timestamp: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mk2_sector: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mk2_confidence: Option<f64>,
 }

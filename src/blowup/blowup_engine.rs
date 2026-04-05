@@ -155,6 +155,11 @@ impl BlowupEngine {
             }
         }
 
+        // mk2: classify all corollaries with smooth-class engine
+        for c in &mut all_corollaries {
+            c.classify_mk2();
+        }
+
         let new_axiom_candidates: Vec<Corollary> = all_corollaries
             .iter()
             .filter(|c| c.is_axiom_candidate)
@@ -304,6 +309,9 @@ impl BlowupEngine {
             signature: sig,
             target_domain: "same".into(),
             is_axiom_candidate: confidence > 0.8,
+            mk2_sector: None,
+            mk2_prime_set: None,
+            mk2_confidence: None,
         })
     }
 
@@ -339,6 +347,9 @@ impl BlowupEngine {
             signature: sig,
             target_domain: domain.to_string(),
             is_axiom_candidate: false,
+            mk2_sector: None,
+            mk2_prime_set: None,
+            mk2_confidence: None,
         })
     }
 
@@ -377,6 +388,9 @@ impl BlowupEngine {
             signature: sig,
             target_domain: "same".into(),
             is_axiom_candidate: confidence > 0.7,
+            mk2_sector: None,
+            mk2_prime_set: None,
+            mk2_confidence: None,
         })
     }
 
@@ -408,6 +422,9 @@ impl BlowupEngine {
             signature: sig,
             target_domain: "same".into(),
             is_axiom_candidate: false,
+            mk2_sector: None,
+            mk2_prime_set: None,
+            mk2_confidence: None,
         })
     }
 
@@ -442,6 +459,9 @@ impl BlowupEngine {
             signature: sig,
             target_domain: "reduced".into(),
             is_axiom_candidate: false,
+            mk2_sector: None,
+            mk2_prime_set: None,
+            mk2_confidence: None,
         })
     }
 
@@ -477,6 +497,9 @@ impl BlowupEngine {
             signature: sig,
             target_domain: "dual".into(),
             is_axiom_candidate: false,
+            mk2_sector: None,
+            mk2_prime_set: None,
+            mk2_confidence: None,
         })
     }
 
@@ -523,6 +546,9 @@ impl BlowupEngine {
                 "cross".into()
             },
             is_axiom_candidate: confidence > 0.7,
+            mk2_sector: None,
+            mk2_prime_set: None,
+            mk2_confidence: None,
         })
     }
 }
@@ -602,7 +628,14 @@ mod tests {
                  result.total_emergences, result.depth_reached);
 
         for c in &result.corollaries[..result.corollaries.len().min(10)] {
-            println!("  {:?}: {} (conf={:.3})", c.corollary_type, c.expression, c.confidence);
+            println!("  {:?}: {} (conf={:.3}) sector={:?}",
+                     c.corollary_type, c.expression, c.confidence, c.mk2_sector);
+        }
+
+        // mk2 classify should have been applied to all corollaries
+        for c in &result.corollaries {
+            assert!(c.mk2_sector.is_some(), "mk2_sector should be set after blowup");
+            assert!(c.mk2_confidence.is_some(), "mk2_confidence should be set after blowup");
         }
     }
 

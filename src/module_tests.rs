@@ -936,6 +936,8 @@ mod graph_tests {
             confidence: 0.85,
             lenses_used: vec!["consciousness".into()],
             timestamp: "2026-04-03".into(),
+            mk2_sector: None,
+            mk2_confidence: None,
         }
     }
 

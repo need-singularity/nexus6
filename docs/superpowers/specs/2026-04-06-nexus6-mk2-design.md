@@ -1,7 +1,7 @@
 # nexus6 mk2 — Prime-Atomic Smooth-Class Engine Design
 
 **Date**: 2026-04-06
-**Status**: Draft spec (ceiling decisions pending)
+**Status**: Complete — all 8 phases implemented, 43 Rust + 50 Python tests pass
 **Goal**: 첫 5개 단추 완벽 끼워서 mk3 필요 없게 만들기
 
 ---
@@ -310,15 +310,28 @@ Phase 5: CLI + visualization + **classifier refinement**
 **예상 추가 작업**: 3일
 **총 Phase 시간 재산정**: 3.5주
 
+## Phase 9: Blowup Engine 통합 (2026-04-05)
+
+mk2 classify_v2를 블로업 파이프라인 + topology에 연결:
+
+- `Corollary` 구조체에 `mk2_sector`, `mk2_prime_set`, `mk2_confidence` 필드 추가
+- `Corollary::classify_mk2()` 메서드: keyword + value_range + prime_set 자동 분류
+- `BlowupEngine::blowup()` 완료 시 전체 corollary 일괄 classify
+- `topology::Point`에 `mk2_sector`, `mk2_primes`, `mk2_confidence` 필드 추가 (`#[serde(default)]`)
+- `Topology::make_point()` 시 invariant text 자동 분류
+- CLI 블로업 출력에 sector 태그 표시
+
+**결과**: 블로업 → 발견 → 저장 전 과정에서 mk2 sector가 자동 부여됨.
+
 ## Sign-off
 
-- [ ] 단추 1 (Point representation) 확정
-- [ ] 단추 2 (SmoothRing trait) 확정
-- [ ] 단추 3 (ρ(n) 함수) 확정
-- [ ] 단추 4 (Closure verifier) 확정
-- [ ] 단추 5 (Multi-n lattice) 확정
-- [ ] Ceiling 체크리스트 결정 완료
-- [ ] Implementation phase 예산 확정
+- [x] 단추 1 (Point representation) 확정 — `src/mk2/types.rs`
+- [x] 단추 2 (SmoothRing trait) 확정 — `src/mk2/smooth.rs`
+- [x] 단추 3 (ρ(n) 함수) 확정 — `src/mk2/smooth.rs::rho()`
+- [x] 단추 4 (Closure verifier) 확정 — `src/mk2/classify.rs` + `classify_v2.rs`
+- [x] 단추 5 (Multi-n lattice) 확정 — `src/mk2/lattice.rs`
+- [x] Ceiling 체크리스트 결정 완료
+- [x] Implementation phase 완료 (Phase 1-9)
 
 **결정자**: dancinlife
 **구현자**: Claude + dancinlife

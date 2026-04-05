@@ -24,6 +24,12 @@ pub struct ConsensusResult {
     pub weighted_score: f64,
     /// Consensus level
     pub level: ConsensusLevel,
+    /// mk2: physics sector classification
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mk2_sector: Option<String>,
+    /// mk2: classification confidence
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mk2_confidence: Option<f64>,
 }
 
 use crate::telescope::lens_trait::LensResult;
@@ -73,11 +79,16 @@ pub fn weighted_consensus(
             ConsensusLevel::Candidate
         };
 
+        // mk2: classify the consensus pattern
+        let (mk2_sector, mk2_confidence) = classify_consensus(&pattern_id, results);
+
         consensus_results.push(ConsensusResult {
             pattern_id,
             agreeing_lenses,
             weighted_score,
             level,
+            mk2_sector,
+            mk2_confidence,
         });
     }
 
@@ -89,4 +100,41 @@ pub fn weighted_consensus(
     });
 
     consensus_results
+}
+
+/// mk2: classify a consensus pattern by collecting all values from agreeing lenses.
+fn classify_consensus(
+    pattern_id: &str,
+    results: &HashMap<String, LensResult>,
+) -> (Option<String>, Option<f64>) {
+    let mut all_values = Vec::new();
+    for lr in results.values() {
+        if let Some(vals) = lr.get(pattern_id) {
+            all_values.extend(vals.iter().copied().filter(|v| v.is_finite()));
+        }
+    }
+    if all_values.is_empty() {
+        return (None, None);
+    }
+
+    let mut ps = crate::mk2::primes::PrimeSet::empty();
+    for &v in &all_values {
+        if v.abs() < 1e-10 || v.abs() > 1e6 { continue; }
+        for den in &[1u64, 2, 3, 5, 6, 7, 15, 21, 35, 105, 210] {
+            let num = (v * *den as f64).round() as i128;
+            if num > 0 && ((num as f64 / *den as f64) - v).abs() < 1e-6 {
+                for (p, _) in crate::mk2::primes::factorize(num.unsigned_abs() as u64) {
+                    ps.insert(p);
+                }
+                for (p, _) in crate::mk2::primes::factorize(*den) {
+                    ps.insert(p);
+                }
+                break;
+            }
+        }
+    }
+
+    let sectors = crate::mk2::classify_v2::default_sectors();
+    let result = crate::mk2::classify_v2::classify_v2(pattern_id, &all_values, &ps, &sectors);
+    (Some(result.sector.to_string()), Some(result.confidence))
 }
