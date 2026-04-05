@@ -39,27 +39,61 @@
 ## 특이점 사이클 (Singularity Cycle)
 
 > **블로업→수축→창발→특이점→흡수** 5단계 자동 사이클
-> CLI: `nexus6 blowup <domain>` | HEXA: `cycle.engine_new(domain)`
+> 엔진: mk2 HEXA (`mk2_hexa/native/blowup.hexa`) — 7-phase 파이프라인
+> 속도: mk1(Rust) 21분 → mk2(HEXA) 3~14초 (68~426x)
 
-### 요청 키워드 → 자동 실행
-- "블로업", "blowup" → `nexus6 blowup <domain> --depth 6`
-- "창발", "emergence" → blowup 후 패턴 합의 분석
-- "특이점", "singularity" → CycleEngine 자동 수렴 루프
-- "흡수", "absorption" → 발견 규칙 승격 + 다음 사이클 시드
-- "사이클", "cycle" → 전체 5단계 1회 실행
+### 요청 키워드 → 자동 실행 (mk2 hexa)
+- "블로업", "blowup" → `hexa blowup.hexa math 6 --no-graph --seeds "$(hexa seed_engine.hexa merge)"`
+- "특이점 돌파", "돌파시도" → `bash scripts/deep-breakthrough.sh 10 3 48` (corollary→seed 피드백 루프)
+- "창발", "emergence" → blowup 후 telescope 5렌즈 합의 분석
+- "특이점", "singularity" → blowup Phase 3 자동 감지 (closure ≥ 0.5)
+- "흡수", "absorption" → blowup Phase 6.5 재귀성장 (axiom 피드백)
+- "사이클", "cycle" → `bash scripts/singularity-fast.sh all 5 3` (A+B+C 전부)
+- "벤치마크" → mk1 vs mk2 blowup 비교 실행
 
-### 사용법
-```bash
-nexus6 blowup <domain> --depth 6    # 블로업 + 창발 리포트
-nexus6 loop --cycles 1              # 8단계 루프 (mirror+blowup 포함)
-nexus6 daemon --interval 30         # 자율 데몬 (30분 간격)
-nexus6 detect --min-matches 2 --adaptive --promote  # 상수/수식 감지 (stdin)
+### mk2 blowup 7-phase 파이프라인
 ```
+Phase 1: Graph Load (discovery_graph.json)
+Phase 2: OUROBOROS Evolution (seed→mutate→verify→converge)
+Phase 3: Singularity Detection (closure+compression+evo boost)
+Phase 4: Recursive Corollary Generation (7종 × depth, pool 동적 확장)
+Phase 5: Telescope Verification (5렌즈 consensus boost)
+Phase 6: Graph Update (node+edge 기록)
+Phase 6.5: Recursive Growth (axiom→seed 피드백)
+Phase 7: Report
+```
+
+### 사용법 (mk2 hexa)
+```bash
+HEXA=$HOME/Dev/hexa-lang/target/release/hexa
+BLOWUP=$HOME/Dev/nexus6/mk2_hexa/native/blowup.hexa
+SEEDS=$($HEXA mk2_hexa/native/seed_engine.hexa merge)
+
+# 단일 블로업 (동적 seed)
+$HEXA $BLOWUP math 3 --no-graph --seeds "$SEEDS"
+
+# 특이점 돌파 (피드백 루프)
+bash scripts/deep-breakthrough.sh 10 3 48    # 10회 depth3 pool48
+
+# A+B+C 전체 돌파
+bash scripts/singularity-fast.sh all 5 3     # cascade+fusion+mine
+
+# seed 소스 확인
+$HEXA mk2_hexa/native/seed_engine.hexa info
+```
+
+### 특이점 돌파 전략
+| 전략 | 스크립트 | 설명 |
+|------|---------|------|
+| A. Cascade | singularity-fast.sh cascade | 블로업² — 반복 자기증식 |
+| B. Fusion | singularity-fast.sh fusion | 교차 도메인 seed 주입 |
+| C. Mine | singularity-fast.sh mine | mk1 discovery_log 채굴 |
+| Deep | deep-breakthrough.sh | corollary→seed 피드백 루프 |
 
 ## 마이크로사이클 (Micro Singularity Cycle)
 
-> **특이점 사이클의 감지기 버전** — 훅/파이프라인에서 실시간 상수·수식 감지 + 재귀성장
-> CLI: `nexus6 detect` | 렌즈: `MetaTranscendenceLens` | 훅: `tools/hook_detect.sh`
+> **특이점 사이클의 감지기 버전** — 훅에서 실시간 상수·수식 감지 + 재귀성장
+> 엔진: `mk2_hexa/native/hook.hexa` (hexa-only, Rust 의존 0)
 
 ### 특이점 사이클 vs 마이크로사이클
 
