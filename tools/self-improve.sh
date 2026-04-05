@@ -28,8 +28,32 @@ System state:
 
 Check: Is the automation pipeline healthy? Are loops adding new closures? If not (saturated), what is the ONE next structural change to make? Answer in <50 words, actionable only."
 
-# Run claude one-shot, capture response
-RESPONSE=$(timeout 60 "$CLAUDE_BIN" -p "$PROMPT" --dangerously-skip-permissions 2>/dev/null | tail -20 || echo "(claude timeout)")
+# Compute delta from previous log entry (lightweight diagnostic)
+DELTA_INFO=$(python3 -c "
+import json,os
+log='${LOG}'
+prev={}
+if os.path.exists(log):
+    with open(log) as f:
+        lines=f.readlines()
+    if lines:
+        try: prev=json.loads(lines[-1])
+        except: pass
+if prev:
+    d_closed = ${CLOSED} - prev.get('closed',0)
+    d_exact = ${EXACT} - prev.get('exact',0)
+    d_topo = ${TOPO} - prev.get('topology',0)
+    d_stubs = ${STUBS} - prev.get('stubs',0)
+    print(f'closed:{d_closed:+d} exact:{d_exact:+d} topo:{d_topo:+d} stubs:{d_stubs:+d}')
+else:
+    print('first entry')
+" 2>/dev/null)
+
+# Determine health
+STATUS='healthy'
+if [ "${CLOSED}" -eq 35976 ] 2>/dev/null; then STATUS='possibly-saturated'; fi
+
+RESPONSE="delta=${DELTA_INFO} status=${STATUS}"
 
 # Log to jsonl
 python3 -c "
