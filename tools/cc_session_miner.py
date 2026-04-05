@@ -37,7 +37,7 @@ def parse_session(jsonl_path: Path) -> dict:
                             pending_tool_use[block.get("id", "")] = (name, sig)
 
             tur = obj.get("toolUseResult")
-            if tur:
+            if tur and isinstance(tur, dict):
                 content = tur.get("content", "")
                 if isinstance(content, list):
                     content = json.dumps(content)
@@ -106,7 +106,7 @@ def _collect_all_result_sizes(paths: Iterable[Path]) -> list[int]:
                 except json.JSONDecodeError:
                     continue
                 tur = obj.get("toolUseResult")
-                if tur:
+                if tur and isinstance(tur, dict):
                     c = tur.get("content", "")
                     if isinstance(c, list):
                         c = json.dumps(c)
@@ -151,3 +151,43 @@ def render_hypotheses_md(agg: dict, date_str: str) -> str:
 - 가설: SessionEnd 훅이 "읽은 파일 목록 + 결정사항" 요약을 다음 세션 주입
 - 기대: 세션 첫 20턴 Read 호출 50% 감소
 """
+
+
+def _cli():
+    import argparse, datetime, os
+    ap = argparse.ArgumentParser(description="Claude Code session log miner")
+    default_proj = os.path.expanduser(
+        "~/.claude-claude9/projects/-Users-ghost-Dev-nexus6"
+    )
+    ap.add_argument("--project", default=default_proj, help="session dir")
+    ap.add_argument("--sessions", type=int, default=20, help="recent N sessions")
+    ap.add_argument("--out-dir", default="shared/hypotheses/claude_efficiency")
+    args = ap.parse_args()
+
+    proj = Path(args.project)
+    if not proj.exists():
+        print(f"ERROR: project dir not found: {proj}", file=__import__("sys").stderr)
+        raise SystemExit(2)
+
+    jsonls = sorted(proj.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    jsonls = jsonls[: args.sessions]
+    if not jsonls:
+        print(f"ERROR: no .jsonl sessions found in {proj}", file=__import__("sys").stderr)
+        raise SystemExit(3)
+
+    agg = aggregate_sessions(jsonls)
+    date_str = datetime.date.today().isoformat()
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / f"metrics_{date_str}.md").write_text(
+        render_metrics_md(agg, date_str), encoding="utf-8"
+    )
+    (out_dir / f"hypotheses_{date_str}.md").write_text(
+        render_hypotheses_md(agg, date_str), encoding="utf-8"
+    )
+    print(f"miner: wrote metrics_{date_str}.md, hypotheses_{date_str}.md "
+          f"(sessions={len(jsonls)}, calls={agg['total_tool_calls']}, "
+          f"corrupt={agg['corrupt_lines_total']})")
+
+if __name__ == "__main__":
+    _cli()
