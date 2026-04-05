@@ -148,6 +148,58 @@ pub fn bridges_between<'a>(t: &'a Topology, dom_a: &str, dom_b: &str, eps: f32, 
         .collect()
 }
 
+/// Rebuild all edges for a topology (O(N²)). Writes batched to disk.
+/// Returns (edge_count, elapsed_sec).
+pub fn rebuild_edges(
+    t: &mut Topology,
+    eps: f32,
+    edges_path: &std::path::Path,
+    progress_every: usize,
+) -> std::io::Result<(usize, u64)> {
+    use std::io::Write;
+    use std::time::Instant;
+
+    let started = Instant::now();
+    let n = t.points.len();
+    if n < 2 { return Ok((0, 0)); }
+
+    let hashes: Vec<u128> = t.points.iter()
+        .map(|p| u128::from_str_radix(&p.simhash, 16).unwrap_or(0))
+        .collect();
+
+    // Truncate existing edges file (rebuild replaces)
+    let mut f = std::fs::OpenOptions::new()
+        .create(true).write(true).truncate(true).open(edges_path)?;
+
+    let mut count = 0;
+    let ts = {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        format!("{}Z", secs)
+    };
+    for i in 0..n {
+        for j in (i+1)..n {
+            let d = distance(hashes[i], hashes[j]);
+            if d <= eps {
+                let line = format!(
+                    "{{\"from\":\"{}\",\"to\":\"{}\",\"distance\":{:.4},\"ts\":\"{}\"}}\n",
+                    t.points[i].id, t.points[j].id, d, ts
+                );
+                f.write_all(line.as_bytes())?;
+                count += 1;
+            }
+        }
+        if progress_every > 0 && (i + 1) % progress_every == 0 {
+            let elapsed = started.elapsed().as_secs();
+            let pct = ((i + 1) as f64 * 100.0) / n as f64;
+            eprintln!("  rebuild_edges: {}/{} points ({:.1}%) edges={} elapsed={}s",
+                      i + 1, n, pct, count, elapsed);
+        }
+    }
+    f.sync_all()?;
+    Ok((count, started.elapsed().as_secs()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

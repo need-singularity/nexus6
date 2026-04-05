@@ -190,6 +190,7 @@ fn run_with_config(cmd: CliCommand, cfg: &NexusConfig) -> Result<(), String> {
         CliCommand::SingularityQuery { base_dir, query, limit } => run_singularity_query(base_dir, query, limit),
         CliCommand::SingularityFrontier { base_dir, eps, top } => run_singularity_frontier(base_dir, eps, top),
         CliCommand::SingularityBridges { base_dir, domain_a, domain_b, eps, top } => run_singularity_bridges(base_dir, domain_a, domain_b, eps, top),
+        CliCommand::SingularityRebuildEdges { base_dir, eps } => run_singularity_rebuild_edges(base_dir, eps),
         CliCommand::Pack { sub } => run_pack(sub),
         CliCommand::Sentry { sub } => run_sentry(sub),
         CliCommand::Hook { sub } => run_hook(sub),
@@ -3139,6 +3140,19 @@ fn run_singularity_frontier(base_dir: Option<String>, eps: f32, top: usize) -> R
         println!("#{} density={} domain={} id={}", rank+1, density, p.domain, p.id);
         println!("   {}\n", p.singularity.invariant.chars().take(200).collect::<String>());
     }
+    Ok(())
+}
+
+fn run_singularity_rebuild_edges(base_dir: Option<String>, eps: f32) -> Result<(), String> {
+    use crate::singularity_recursion::analysis::rebuild_edges;
+    use crate::singularity_recursion::tick::TickPaths;
+    let base = base_dir.unwrap_or_else(|| "shared/cycle".to_string());
+    let paths = TickPaths::from_base(&base);
+    let mut t = load_topo_for_analysis(Some(base.clone()));
+    println!("rebuild_edges: {} points, eps={}", t.points.len(), eps);
+    let (count, elapsed) = rebuild_edges(&mut t, eps, &paths.edges, 1000)
+        .map_err(|e| format!("rebuild failed: {}", e))?;
+    println!("done: {} edges written in {}s → {}", count, elapsed, paths.edges.display());
     Ok(())
 }
 
