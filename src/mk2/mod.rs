@@ -8,6 +8,7 @@
 //! - [`smooth`] — SmoothRing trait (φ, τ, σ, sopfr, ρ) over u64
 //! - [`types`] — Rational, PrimeSet, Sector, Point (mk2 extensions)
 
+pub mod bridge;
 pub mod classify;
 pub mod classify_v2;
 pub mod lattice;
