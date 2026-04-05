@@ -6,6 +6,7 @@ pub mod airgenome_runner;
 pub mod analysis;
 pub mod backfill;
 pub mod boundary;
+pub mod closer;
 pub mod budget;
 pub mod embedding;
 pub mod preflight;
