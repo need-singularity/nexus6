@@ -182,6 +182,7 @@ fn run_with_config(cmd: CliCommand, cfg: &NexusConfig) -> Result<(), String> {
         CliCommand::Ingest { sources, config, verbose } => run_ingest(sources, config, verbose),
         CliCommand::Bench => run_bench(),
         CliCommand::Dashboard { html, output } => run_dashboard(html, output),
+        CliCommand::AlienIndex { sub } => crate::cli::alien_index_cmd::run(sub),
         CliCommand::Help => {
             print_help();
             Ok(())
