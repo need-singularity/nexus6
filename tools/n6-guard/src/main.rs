@@ -67,6 +67,9 @@ struct GuardConfig {
 
     #[serde(default)]
     log_rotation: LogRotationConfig,
+
+    #[serde(default)]
+    task_scheduler: TaskSchedulerConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -188,6 +191,55 @@ struct LogRotationConfig {
     extra_log_dirs: Vec<String>,
 }
 
+// ── Task Scheduler Config ─────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+struct TaskSchedulerConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_max_concurrent")]
+    max_concurrent: usize,
+    #[serde(default = "default_task_mem")]
+    max_task_memory_mb: usize,
+    #[serde(default = "default_task_log_dir")]
+    task_log_dir: String,
+    #[serde(default)]
+    tasks: Vec<TaskDef>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TaskDef {
+    name: String,
+    command: String,
+    #[serde(default = "default_task_mode")]
+    mode: String,           // "continuous" | "interval"
+    #[serde(default)]
+    interval_sec: u64,
+    #[serde(default = "default_task_mem")]
+    max_memory_mb: usize,
+    #[serde(default = "default_priority")]
+    priority: u8,
+}
+
+impl Default for TaskSchedulerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_concurrent: 2,
+            max_task_memory_mb: 2048,
+            task_log_dir: default_task_log_dir(),
+            tasks: vec![],
+        }
+    }
+}
+
+fn default_max_concurrent() -> usize { 2 }
+fn default_task_mem() -> usize { 2048 }
+fn default_task_log_dir() -> String {
+    format!("{}/Library/Logs/nexus6", std::env::var("HOME").unwrap_or_default())
+}
+fn default_task_mode() -> String { "interval".into() }
+
 // ── Defaults ───────────────────────────────────────────────────
 
 fn default_interval() -> u64 { 5 }
@@ -267,6 +319,7 @@ impl Default for GuardConfig {
         auto_restart: AutoRestartConfig::default(),
         history: HistoryConfig::default(),
         log_rotation: LogRotationConfig::default(),
+        task_scheduler: TaskSchedulerConfig::default(),
     }}
 }
 
@@ -886,6 +939,226 @@ fn reap_stale_pid_files() {
 }
 
 // ════════════════════════════════════════════════════════════════
+// Feature 8: Task Scheduler (LaunchAgent 통합)
+// ════════════════════════════════════════════════════════════════
+
+struct TaskRunner {
+    /// 실행 중인 태스크: name → (Child, start_time)
+    running: HashMap<String, (std::process::Child, Instant)>,
+    /// 마지막 실행 완료 시각: name → Instant
+    last_run: HashMap<String, Instant>,
+    /// burst 모드: 발견 시그널 수신 시 max_concurrent 일시 상향
+    burst_until: Option<Instant>,
+}
+
+impl TaskRunner {
+    fn new() -> Self {
+        Self {
+            running: HashMap::new(),
+            last_run: HashMap::new(),
+            burst_until: None,
+        }
+    }
+
+    fn effective_max_concurrent(&self, base: usize) -> usize {
+        if let Some(until) = self.burst_until {
+            if Instant::now() < until {
+                return (base + 2).min(4); // burst: +2 슬롯, 최대 4
+            }
+        }
+        base
+    }
+
+    fn check_burst_signal(&mut self) {
+        // burst 만료 체크
+        if let Some(until) = self.burst_until {
+            if Instant::now() >= until {
+                log_action("TASK-SCHED: burst mode expired — back to normal");
+                self.burst_until = None;
+            }
+        }
+        // discovery_log.jsonl에 최근 60초 내 새 발견이 있으면 burst
+        let sig_path = format!("{}/Dev/nexus6/shared/discovery_log.jsonl", home());
+        if let Ok(meta) = fs::metadata(&sig_path) {
+            if let Ok(modified) = meta.modified() {
+                if let Ok(elapsed) = SystemTime::now().duration_since(modified) {
+                    if elapsed < Duration::from_secs(60) {
+                        if self.burst_until.is_none() {
+                            log_action("TASK-SCHED: burst mode — discovery signal detected");
+                        }
+                        self.burst_until = Some(Instant::now() + Duration::from_secs(300)); // 5분간 burst
+                    }
+                }
+            }
+        }
+    }
+
+    fn tick(&mut self, cfg: &TaskSchedulerConfig, notify_cfg: &NotifyConfig, last_notify: &mut Instant) {
+        if !cfg.enabled { return; }
+
+        let log_dir = expand_tilde(&cfg.task_log_dir);
+        let _ = fs::create_dir_all(&log_dir);
+
+        // burst 시그널 확인
+        self.check_burst_signal();
+
+        // 1. 완료된 태스크 수거
+        let mut finished = Vec::new();
+        for (name, (child, start)) in &mut self.running {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let elapsed = start.elapsed().as_secs();
+                    log_action(&format!("TASK-DONE: {} — status={} elapsed={}s", name, status, elapsed));
+                    finished.push(name.clone());
+                }
+                Ok(None) => {
+                    // 아직 실행 중 — 메모리 체크
+                    let pid = child.id();
+                    let rss = get_proc_rss(pid);
+                    let limit = cfg.tasks.iter()
+                        .find(|t| t.name == *name)
+                        .map(|t| t.max_memory_mb)
+                        .unwrap_or(cfg.max_task_memory_mb);
+                    if rss > limit {
+                        log_action(&format!("TASK-OOM: {} (pid={}) rss={}MB > limit={}MB — killing",
+                            name, pid, rss, limit));
+                        let _ = child.kill();
+                        finished.push(name.clone());
+                        let msg = format!("태스크 {} 메모리 초과로 종료 ({}MB)", name, rss);
+                        notify_macos(&msg, notify_cfg, last_notify);
+                    }
+                }
+                Err(_) => {
+                    finished.push(name.clone());
+                }
+            }
+        }
+        for name in &finished {
+            self.running.remove(name);
+            self.last_run.insert(name.clone(), Instant::now());
+        }
+
+        // 2. 새 태스크 시작 (우선순위순, 동시 실행 제한)
+        let max_conc = self.effective_max_concurrent(cfg.max_concurrent);
+        if self.running.len() >= max_conc { return; }
+
+        // 우선순위 정렬 (낮을수록 우선)
+        let mut ready: Vec<&TaskDef> = cfg.tasks.iter()
+            .filter(|t| !self.running.contains_key(&t.name))
+            .filter(|t| self.should_run(t))
+            .collect();
+        ready.sort_by_key(|t| t.priority);
+
+        for task in ready {
+            if self.running.len() >= max_conc { break; }
+            self.spawn_task(task, &log_dir);
+        }
+    }
+
+    fn should_run(&self, task: &TaskDef) -> bool {
+        if task.mode == "continuous" {
+            // continuous는 실행 중이 아니면 항상 시작
+            return true;
+        }
+        // interval: 마지막 실행 후 interval_sec 경과했는지
+        match self.last_run.get(&task.name) {
+            None => true, // 한 번도 안 돌았음
+            Some(last) => last.elapsed() >= Duration::from_secs(task.interval_sec),
+        }
+    }
+
+    fn spawn_task(&mut self, task: &TaskDef, log_dir: &str) {
+        let cmd = expand_tilde(&task.command);
+        let log_file = format!("{}/{}.log", log_dir, task.name);
+
+        let stdout = fs::OpenOptions::new()
+            .create(true).append(true)
+            .open(&log_file);
+        let stderr = fs::OpenOptions::new()
+            .create(true).append(true)
+            .open(&format!("{}/{}-err.log", log_dir, task.name));
+
+        let mut command = Command::new("bash");
+        command.args(["-c", &cmd]);
+
+        // nice 설정 — 우선순위 높으면 nice 낮게
+        let nice_val = if task.priority <= 2 { 0 } else if task.priority <= 5 { 5 } else { 10 };
+        command.env("GUARD_MANAGED", "1");
+
+        if let (Ok(out), Ok(err)) = (stdout, stderr) {
+            command.stdout(out).stderr(err);
+        }
+
+        match command.spawn() {
+            Ok(child) => {
+                let pid = child.id();
+                log_action(&format!("TASK-START: {} (pid={}) nice={} cmd={}",
+                    task.name, pid, nice_val, &cmd[..cmd.len().min(60)]));
+                // renice after spawn
+                renice_process(pid, nice_val);
+                self.running.insert(task.name.clone(), (child, Instant::now()));
+            }
+            Err(e) => {
+                log_action(&format!("TASK-FAIL: {} — {}", task.name, e));
+                // 실패해도 last_run 기록해서 즉시 재시도 방지
+                self.last_run.insert(task.name.clone(), Instant::now());
+            }
+        }
+    }
+
+    fn shutdown(&mut self) {
+        for (name, (child, _)) in &mut self.running {
+            log_action(&format!("TASK-SHUTDOWN: killing {}", name));
+            let _ = child.kill();
+        }
+        self.running.clear();
+    }
+
+    fn print_status(&mut self, cfg: &TaskSchedulerConfig) {
+        if !cfg.enabled {
+            println!("\nTask scheduler: disabled");
+            return;
+        }
+        let max_conc = self.effective_max_concurrent(cfg.max_concurrent);
+        let burst = self.burst_until.map_or(false, |u| Instant::now() < u);
+        println!("\n── Task Scheduler ── (slots: {}/{}{}) ──",
+            self.running.len(), max_conc, if burst { " 🔥BURST" } else { "" });
+        println!("{:<18} {:>6} {:>8} {:>10}", "TASK", "PID", "RSS(MB)", "UPTIME");
+        println!("{}", "─".repeat(46));
+
+        for (name, (child, start)) in &self.running {
+            let pid = child.id();
+            let rss = get_proc_rss(pid);
+            let up = start.elapsed().as_secs();
+            println!("{:<18} {:>6} {:>8} {:>8}s", name, pid, rss, up);
+        }
+
+        // 대기 중 태스크
+        let waiting: Vec<&TaskDef> = cfg.tasks.iter()
+            .filter(|t| !self.running.contains_key(&t.name))
+            .collect();
+        if !waiting.is_empty() {
+            println!("\nWaiting:");
+            for t in &waiting {
+                let next_in = self.last_run.get(&t.name)
+                    .map(|l| t.interval_sec.saturating_sub(l.elapsed().as_secs()))
+                    .unwrap_or(0);
+                println!("  {} — mode={} next_in={}s pri={}", t.name, t.mode, next_in, t.priority);
+            }
+        }
+    }
+}
+
+fn get_proc_rss(pid: u32) -> usize {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "rss="])
+        .output().ok();
+    output.and_then(|o| {
+        String::from_utf8_lossy(&o.stdout).trim().parse::<usize>().ok()
+    }).unwrap_or(0) / 1024 // KB → MB
+}
+
+// ════════════════════════════════════════════════════════════════
 // Main Loop
 // ════════════════════════════════════════════════════════════════
 
@@ -905,6 +1178,7 @@ fn guard_loop(cfg: &GuardConfig) {
     let mut stopped_pids: HashMap<u32, Instant> = HashMap::new();
     let mut build_queue = BuildQueue::new();
     let mut restart_tracker = RestartTracker::new();
+    let mut task_runner = TaskRunner::new();
     let mut last_notify = Instant::now() - Duration::from_secs(120);
     let mut loop_count: usize = 0;
 
@@ -918,6 +1192,7 @@ fn guard_loop(cfg: &GuardConfig) {
             for (&pid, _) in &build_queue.stopped_builds {
                 cont_process(pid);
             }
+            task_runner.shutdown();
             let _ = fs::remove_file(pid_path());
             log_action("n6-guard exited cleanly");
             std::process::exit(0);
@@ -1018,6 +1293,9 @@ fn guard_loop(cfg: &GuardConfig) {
         if cfg.log_rotation.enabled && loop_count % 60 == 0 {
             rotate_logs(&cfg.log_rotation);
         }
+
+        // ── Feature: Task Scheduler ──
+        task_runner.tick(&cfg.task_scheduler, &cfg.notify, &mut last_notify);
 
         // ── Ghost reaper ──
         stopped_pids.retain(|pid, ts| {
@@ -1168,6 +1446,16 @@ fn print_status(cfg: &GuardConfig) {
         println!("\n── Active builds ──");
         for b in &builds {
             println!("  pid={} {} cpu={:.1}%", b.pid, b.name, b.cpu_percent);
+        }
+    }
+
+    // Task scheduler summary
+    if cfg.task_scheduler.enabled {
+        println!("\n── Task Scheduler ({} tasks, max_concurrent={}) ──",
+            cfg.task_scheduler.tasks.len(), cfg.task_scheduler.max_concurrent);
+        for t in &cfg.task_scheduler.tasks {
+            println!("  {:<18} mode={:<10} interval={}s pri={} mem_limit={}MB",
+                t.name, t.mode, t.interval_sec, t.priority, t.max_memory_mb);
         }
     }
 

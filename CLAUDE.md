@@ -1,22 +1,28 @@
 # CLAUDE.md — nexus6 프로젝트 규칙
 
-## 절대 금지 사항
+## ⚠️ 필수 규칙 (최우선)
 
-### 서버 파일 직접 수정 금지
-- **SSH로 원격 서버에 접속하여 소스코드를 직접 수정하지 말 것**
-- 수정이 필요하면 **로컬 리포에서 코드를 수정 → git commit → 배포 스크립트**로 반영
-- DB 조회(SELECT)는 허용하되, DB 스키마/데이터 변경(INSERT/UPDATE/DELETE/ALTER)은 사전 확인 필요
+### 1. 대화 차단 금지 — 모든 장시간 명령은 백그라운드 실행
+- **10초 이상 걸릴 수 있는 모든 명령**은 반드시 `run_in_background: true`로 실행
+- 대상: nexus6 loop/daemon/blowup, cargo build/test, 학습/추론, SSH 원격 명령 등
+- 사용자가 **항상 대화 가능한 상태**를 유지할 것
+- 완료 시 결과 요약 보고
 
-### 올바른 배포 흐름
+### 2. 서버 파일 직접 수정 금지
+- SSH로 원격 서버의 소스코드를 직접 수정하지 말 것
+- 수정: 로컬 리포 → git commit → 배포 스크립트
+- DB: SELECT 허용, 스키마/데이터 변경(INSERT/UPDATE/DELETE/ALTER)은 사전 확인
+
+### 3. 리소스 보호
+- nexus6 프로세스는 **n6-guard 태스크 스케줄러**로 관리 (LaunchAgent 직접 등록 금지)
+- 개별 태스크 메모리 한도: `~/.config/n6-guard.toml`의 `max_task_memory_mb` 준수
+- 동시 실행 제한: `max_concurrent = 2` (burst 모드 시 최대 4)
+- blowup 등 고부하 명령은 guard 관리 하에서만 실행
+
+### 4. 배포 흐름
 1. 로컬 리포에서 코드 수정
 2. git commit & push
 3. 배포 스크립트 또는 CI/CD로 서버 반영
-
-### 장시간 명령은 반드시 백그라운드 실행
-- **모든 장시간 실행 명령**(nexus6 loop/daemon/blowup, cargo build --release, 학습/추론 스크립트, SSH 원격 명령 등)은 **반드시 `run_in_background: true`로 실행**
-- 대화를 차단(blocking)하면 안 됨 — 사용자가 항상 대화 가능한 상태 유지
-- 10초 이상 걸릴 수 있는 명령은 무조건 백그라운드
-- 완료 시 결과 요약 보고
 
 ## Math Atlas 자동 추출 (물어보지 말 것)
 
