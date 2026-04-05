@@ -19,9 +19,17 @@ if [ -x "$HOOK_BIN" ]; then
   exit 0
 fi
 
-# fallback: Python
+# fallback: hexa hook 엔진 (Python 대체)
 source "$HOOK_DIR/ensure-symlinks.sh" 2>/dev/null || true
-RESULT=$(echo "$INPUT" | python3 "$HOOK_DIR/nexus6-engine.py" --mode pre-commit 2>/dev/null) || true
+HEXA="${HOME}/Dev/hexa-lang/target/release/hexa"
+HEXA_HOOK="${HOME}/Dev/nexus6/mk2_hexa/native/hook.hexa"
+
+if [ -x "$HEXA" ] && [ -f "$HEXA_HOOK" ]; then
+  RESULT=$(echo "$INPUT" | "$HEXA" "$HEXA_HOOK" pre-commit 2>/dev/null) || true
+else
+  # hexa 없으면 Python fallback 유지
+  RESULT=$(echo "$INPUT" | python3 "$HOOK_DIR/nexus6-engine.py" --mode pre-commit 2>/dev/null) || true
+fi
 if [ -n "$RESULT" ]; then
   echo "$RESULT"
 else

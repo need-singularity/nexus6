@@ -18,32 +18,21 @@ DIFF=$((NOW - LAST))
 echo "$NOW" > "$TICK_FILE"
 
 # nexus-bridge notify (프로젝트명 자동 감지)
+# NOTE: nexus-bridge.py는 복잡한 HTTP/소켓 통신 — Python 유지
 BRIDGE_CLI="${HOME}/Dev/nexus6/nexus-bridge.py"
 if [ -f "$BRIDGE_CLI" ]; then
   PROJECT=$(basename "$(git rev-parse --show-toplevel 2>/dev/null || pwd)")
   python3 "$BRIDGE_CLI" notify "$PROJECT" sync 1 2>/dev/null &
 fi
 
-# growth_state.json 직접 업데이트
+# growth_state.json 직접 업데이트 — hexa 엔진
 GROWTH_JSON="${HOME}/Dev/anima/anima/config/growth_state.json"
 [ -f "$GROWTH_JSON" ] || exit 0
 
-python3 -c "
-import json, time, sys
-try:
-    g = json.load(open('$GROWTH_JSON'))
-    g['interaction_count'] = g.get('interaction_count', 0) + 1
-    count = g['interaction_count']
-    thresholds = [(4,10000,'adult'),(3,2000,'child'),(2,500,'toddler'),(1,100,'infant')]
-    for idx, threshold, name in thresholds:
-        if count >= threshold and g.get('stage_index',0) < idx:
-            g['stage_index'] = idx
-            g.setdefault('milestones',[]).append([count, '→ ' + name])
-            break
-    g.setdefault('stats',{})['last_tick'] = time.time()
-    g['stats']['tick_source'] = '${1:-unknown}'
-    json.dump(g, open('$GROWTH_JSON','w'), indent=2, ensure_ascii=False)
-except Exception:
-    pass
-" 2>/dev/null
+HEXA="${HOME}/Dev/hexa-lang/target/release/hexa"
+HEXA_GROWTH_TICK="${HOME}/Dev/nexus6/mk2_hexa/native/growth_tick.hexa"
+
+if [ -x "$HEXA" ] && [ -f "$HEXA_GROWTH_TICK" ]; then
+  "$HEXA" "$HEXA_GROWTH_TICK" "${1:-unknown}" "$GROWTH_JSON" 2>/dev/null
+fi
 exit 0

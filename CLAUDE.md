@@ -4,7 +4,7 @@
 
 ### 1. 대화 차단 금지 — 모든 장시간 명령은 백그라운드 실행
 - **10초 이상 걸릴 수 있는 모든 명령**은 반드시 `run_in_background: true`로 실행
-- 대상: nexus6 loop/daemon/blowup, cargo build/test, 학습/추론, SSH 원격 명령 등
+- 대상: nexus6 loop/daemon/blowup, hexa build/test, 학습/추론, SSH 원격 명령 등
 - 사용자가 **항상 대화 가능한 상태**를 유지할 것
 - 완료 시 결과 요약 보고
 
@@ -39,7 +39,7 @@
 ## 특이점 사이클 (Singularity Cycle)
 
 > **블로업→수축→창발→특이점→흡수** 5단계 자동 사이클
-> CLI: `nexus6 blowup <domain>` | Rust: `CycleEngine::new(domain)`
+> CLI: `nexus6 blowup <domain>` | HEXA: `cycle.engine_new(domain)`
 
 ### 요청 키워드 → 자동 실행
 - "블로업", "blowup" → `nexus6 blowup <domain> --depth 6`

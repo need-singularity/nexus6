@@ -1,10 +1,10 @@
 # calc/ — Calculator Tools
 
-## Rust 우선 원칙
+## HEXA 우선 원칙
 
-성능 문제가 예상되는 계산기는 **반드시 Rust(tecsrs/)로 먼저 구현**.
+성능 문제가 예상되는 계산기는 **반드시 HEXA(mk2_hexa/native/)로 먼저 구현**.
 
-### 언제 Rust를 사용하는가
+### 언제 HEXA를 사용하는가
 
 - 반복 > 10,000회
 - 실행 시간 > 10초 예상
@@ -18,15 +18,14 @@
 - 오차율 테이블 출력
 - 외부 데이터 fetch / API 호출
 - 시각화 / ASCII 그래프
-- 빠른 프로토타입 (이후 Rust 포팅 가능)
+- 빠른 프로토타입
 
-### Rust 프로젝트
+### HEXA 프로젝트
 
 ```
-  위치: tecsrs/
-  빌드: cd tecsrs && cargo build --release
-  실행: cargo run --release -- <args>
-  모듈: perfect.rs (P1=6 상수), search.rs (탐색), monte_carlo.rs, grid.rs, sieves.rs
+  위치: mk2_hexa/native/
+  실행: nexus6 mk2 run <module>
+  모듈: constants.hexa, pure_math.hexa, classify.hexa, grading.hexa, cycle.hexa
 ```
 
 ### Python 계산기 컨벤션

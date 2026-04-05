@@ -60,18 +60,29 @@ fn load_all_records() -> Vec<AlienIndexRecord> {
     let path = crate::alien_index::record::discovery_log_path();
     let Ok(content) = std::fs::read_to_string(&path) else { return Vec::new() };
     let mut out = Vec::new();
-    for line in content.lines() {
+    for (idx, line) in content.lines().enumerate() {
         if line.trim().is_empty() { continue; }
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-            if let Some(inner) = v.get("alien_index") {
-                if let Ok(rec) = serde_json::from_value::<AlienIndexRecord>(inner.clone()) {
-                    out.push(rec);
-                    continue;
-                }
-            }
-            if let Ok(rec) = serde_json::from_value::<AlienIndexRecord>(v) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+
+        // Try full AlienIndexRecord first
+        if let Some(inner) = v.get("alien_index") {
+            if let Ok(rec) = serde_json::from_value::<AlienIndexRecord>(inner.clone()) {
                 out.push(rec);
+                continue;
             }
+            // Compact format: {"d": N, "r": N} — wrap into AlienIndexRecord
+            if let (Some(d), Some(r)) = (inner.get("d").and_then(|x| x.as_u64()),
+                                          inner.get("r").and_then(|x| x.as_u64())) {
+                let id = v.get("constant").and_then(|c| c.as_str())
+                    .unwrap_or("unknown");
+                let full_id = format!("{}#{}", id, idx);
+                let ai = AlienIndex::new(d as u32, r as u8);
+                out.push(AlienIndexRecord::new(full_id, ai));
+                continue;
+            }
+        }
+        if let Ok(rec) = serde_json::from_value::<AlienIndexRecord>(v) {
+            out.push(rec);
         }
     }
     out

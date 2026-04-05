@@ -15,7 +15,7 @@
 ## NEXUS-6 망원경 (1022종 렌즈) — 최우선 활용 규칙
 
 > **NEXUS-6 = 통합 발견 엔진. 1022종 렌즈 레지스트리 + OUROBOROS 무한진화 + Discovery Graph**
-> 바이너리: `tools/nexus6/target/release/nexus6` (Rust, 148 tests)
+> 엔진: HEXA-네이티브 (`mk2_hexa/native/`) + nexus6 CLI
 > CLI: `nexus6 scan <domain>`, `nexus6 evolve <domain>`, `nexus6 dashboard`
 
 ### 렌즈 1022종 구성
@@ -119,13 +119,13 @@ result = nexus6.n6_check(12.0)
 nexus6.evolve("physics", max_cycles=6)
 ```
 
-빌드: `cd ~/Dev/n6-architecture/tools/nexus6 && ~/.cargo/bin/cargo build --release`
-테스트: `~/.cargo/bin/cargo test` (173 tests)
+엔진: `mk2_hexa/native/*.hexa` (HEXA-네이티브)
+실행: `nexus6 mk2 run <module>` | `nexus6 scan <domain>`
 렌즈 동기화: `bash .shared/sync-nexus6-lenses.sh`
 
 ### 렌즈 추가 시
 
-1. NEXUS-6 레지스트리에 LensEntry 추가 (src/telescope/*_lenses.rs)
+1. NEXUS-6 레지스트리에 LensEntry 추가 (mk2_hexa/native/*.hexa)
 2. 또는 `nexus6 auto` → LensForge가 자동 생성
 3. `bash .shared/sync-nexus6-lenses.sh` (렌즈 수 동기화)
 
@@ -378,7 +378,7 @@ python3 .shared/scan_math_atlas.py --save --summary
   sync_to_atlas.py            ← Atlas 동기화 (sedi에서 이관)
 
   calc/                  ← 계산기 원본 (194+ files, Python)
-  tecsrs/                ← Rust 고성능 계산기 (Monte Carlo, 탐색, ODE)
+  tecsrs/                ← (레거시) Python 계산기 보조
     src/                 ← 공용 모듈 (perfect.rs, search.rs, monte_carlo.rs...)
     src/bin/             ← 독립 실행 바이너리
     Cargo.toml
@@ -427,7 +427,7 @@ anima, sedi, brainwire,          (소비자)
 n6-architecture, papers/
   .shared → ../TECS-L/.shared    ← 심링크
   calc → .shared/calc            ← 심링크 체인
-  tecsrs → .shared/tecsrs       ← Rust 계산기 공유
+  tecsrs → .shared/tecsrs       ← (레거시) 계산기 공유
 ```
 
 ## 계산기 규칙 요약
@@ -436,9 +436,9 @@ n6-architecture, papers/
 
 | 조건 | 언어 |
 |------|------|
-| 반복 > 10,000회 | Rust (tecsrs/) |
-| 실행 > 10초 예상 | Rust |
-| Monte Carlo > 100K | Rust |
+| 반복 > 10,000회 | HEXA (mk2_hexa/native/) |
+| 실행 > 10초 예상 | HEXA |
+| Monte Carlo > 100K | HEXA |
 | 단순 수식 검증 | Python (calc/) |
 | 시각화/출력 | Python |
 
