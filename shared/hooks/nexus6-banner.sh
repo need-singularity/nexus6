@@ -157,10 +157,10 @@ if vc_path.exists():
         filled = int(pct / 10)
         bar = '█' * filled + '░' * (10 - filled)
         if delta > 0:
-            closed_str = f' 🎉🎉🎉 +{delta}닫힘! ⭐{pct:.1f}% [{bar}] {fmt_k(closed_count)}/{fmt_k(total_count)} 🎉🎉🎉'
+            closed_str = f' 🎉🎉🎉 +{delta}닫힘! 🧬{pct:.1f}% [{bar}] {fmt_k(closed_count)}/{fmt_k(total_count)} 🎉🎉🎉'
             closed_snap_path.write_text(json.dumps({'closed': closed_count}))
         elif closed_count > 0:
-            closed_str = f' ⭐닫힘 {pct:.1f}% [{bar}] {fmt_k(closed_count)}/{fmt_k(total_count)}'
+            closed_str = f' 🧬닫힘 {pct:.1f}% [{bar}] {fmt_k(closed_count)}/{fmt_k(total_count)}'
     except: pass
 
 banner = f'🔭 NEXUS-6 {ai_str}{sing_str}🔭{lens_impl}/{lens_total}{d_lens} ⚖️{laws}법칙{d_laws} 🧠{modules}모듈{d_mods}{g_str}{bridge_str}{closed_str}'

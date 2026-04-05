@@ -3053,7 +3053,11 @@ fn run_singularity_tick(base_dir: Option<String>) -> Result<(), String> {
 fn run_singularity_daemon(base_dir: Option<String>, interval_sec: u64) -> Result<(), String> {
     use crate::singularity_recursion::airgenome_runner::AirgenomeRunner;
     use crate::singularity_recursion::tick::{run_tick, TickPaths};
+    use crate::singularity_recursion::topology::load as load_topo;
+    use crate::singularity_recursion::watcher::{poll_and_absorb, WatchState};
+    use crate::singularity_recursion::backfill::{default_memory_root, parse_projects_json};
     use crate::config::SingularityRecursionConfig;
+    use std::path::PathBuf;
     use std::thread::sleep;
     use std::time::Duration;
 
@@ -3063,14 +3067,45 @@ fn run_singularity_daemon(base_dir: Option<String>, interval_sec: u64) -> Result
     let mut runner = AirgenomeRunner;
     let interval = Duration::from_secs(interval_sec);
 
+    // Build watcher state: track all project hypothesis dirs + memory dir.
+    let watch_state_path = paths.base.join("watch_state.json");
+    let mut watch = WatchState::load(&watch_state_path);
+    let projects_json = PathBuf::from("/Users/ghost/Dev/nexus6/shared/projects.json");
+    for (name, root, hyp_dirs) in parse_projects_json(&projects_json) {
+        for subdir in &hyp_dirs {
+            watch.watch_dirs.push((root.join(subdir), format!("hypothesis:{}", name)));
+        }
+    }
+    if let Some(memdir) = default_memory_root() {
+        watch.watch_dirs.push((memdir, "memory".into()));
+    }
+
     println!("singularity-daemon: base={} interval={}s absorb=∞ (u64::MAX cap)",
              base, interval_sec);
+    println!("watching {} dirs", watch.watch_dirs.len());
     println!("halt: touch {}", paths.halt.display());
     println!();
 
     let mut tick_no: u64 = 0;
     loop {
         tick_no += 1;
+
+        // File watcher pass — detect new/changed md files and absorb them.
+        // Load topology fresh for dedup (could optimize with caching later).
+        match load_topo(&paths.topology, &paths.edges, cfg.neighborhood_radius_eps) {
+            Ok(mut t) => {
+                let absorbed = poll_and_absorb(
+                    &mut watch, &mut t, &paths.topology, &paths.edges,
+                );
+                if absorbed > 0 {
+                    println!("[{}] watcher absorbed {} new file(s)", hms_now(), absorbed);
+                    let _ = watch.save(&watch_state_path);
+                }
+            }
+            Err(_) => {}
+        }
+
+        // Airgenome sample tick.
         let out = run_tick(&paths, &cfg, &mut runner);
         let code_name = match out.exit_code {
             0 => "OK",
@@ -3084,7 +3119,6 @@ fn run_singularity_daemon(base_dir: Option<String>, interval_sec: u64) -> Result
                  hms_now(), tick_no, code_name, out.point_id, out.elapsed_sec);
 
         if out.exit_code == 3 {
-            // halt file present — idle poll instead of exit
             sleep(Duration::from_secs(5));
             continue;
         }

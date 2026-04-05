@@ -12,3 +12,4 @@ pub mod preflight;
 pub mod tick;
 pub mod topology;
 pub mod wal;
+pub mod watcher;
