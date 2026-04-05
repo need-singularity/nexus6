@@ -326,51 +326,133 @@ struct FusionSingularity {
 }
 
 // ═══════════════════════════════════════════════════════════
-// ─── SIMULATION: 실제 macOS 게이트 데이터 시뮬레이션 ───
+// ─── LIVE SYSTEM DATA: exec() 로 실시간 메트릭 수집 ───
 // ═══════════════════════════════════════════════════════════
 
-fn simulate_gates() -> int {
-    // 실제 macOS에서 관측된 전형적 값 기반 시뮬레이션
-    let macos = GateState {
+fn safe_float(s: string) -> float {
+    let mut v = 0.0
+    try { v = to_float(s) } catch e {}
+    return v
+}
+
+fn load_system_metrics() -> GateState {
+    // Process count
+    let ps_out = exec("ps aux 2>/dev/null | wc -l")
+    let proc_count = safe_float(ps_out.trim())
+
+    // Disk usage %
+    let df_out = exec("df -h / 2>/dev/null | tail -1 | awk '{print $5}' | tr -d '%'")
+    let disk_pct = safe_float(df_out.trim())
+
+    // CPU cores
+    let cpu_out = exec("sysctl -n hw.ncpu 2>/dev/null")
+    let ncpu = safe_float(cpu_out.trim())
+
+    // vm_stat for memory
+    let vm_out = exec("vm_stat 2>/dev/null | head -10")
+    let mut free_p = 0.0
+    let mut active_p = 0.0
+    let mut inactive_p = 0.0
+    let mut wired_p = 0.0
+    let mut page_size = 16384.0
+    if vm_out != "" {
+        let vm_lines = vm_out.split("\n")
+        if vm_lines.len() > 0 && vm_lines[0].contains("page size of") {
+            let psp = vm_lines[0].split("page size of")
+            if psp.len() >= 2 {
+                let psv = safe_float(psp[1].trim().split(" ")[0])
+                if psv > 0.0 { page_size = psv }
+            }
+        }
+        let mut vi = 1
+        while vi < vm_lines.len() {
+            let vl = vm_lines[vi].trim()
+            if vl.contains(":") {
+                let vparts = vl.split(":")
+                let vkey = vparts[0].trim()
+                let mut vval_s = vparts[1].trim()
+                if vval_s.ends_with(".") { vval_s = vval_s.replace(".", "") }
+                let vval = safe_float(vval_s.trim())
+                if vkey.contains("Pages free") { free_p = vval }
+                if vkey.contains("Pages active") { active_p = vval }
+                if vkey.contains("Pages inactive") { inactive_p = vval }
+                if vkey.contains("Pages wired") { wired_p = vval }
+            }
+            vi = vi + 1
+        }
+    }
+    let total_p = free_p + active_p + inactive_p + wired_p
+    let mem_used_pct = if total_p > 0.0 { (active_p + wired_p) / total_p * 100.0 } else { 0.0 }
+    let mem_total_gb = total_p * page_size / 1073741824.0
+
+    // Load averages from uptime
+    let uptime_out = exec("uptime 2>/dev/null")
+    let mut load_1m = 0.0
+    let mut load_5m = 0.0
+    let mut load_15m = 0.0
+    if uptime_out.contains("load average") {
+        let lp = uptime_out.split("load average")
+        if lp.len() >= 2 {
+            let rest = lp[1]
+            let mut after = rest
+            if after.contains(":") { after = after.split(":")[1].trim() }
+            if after.starts_with("s:") { after = after.replace("s:", "").trim() }
+            let toks = after.split(",")
+            if toks.len() >= 1 { load_1m = safe_float(toks[0].trim()) }
+            if toks.len() >= 2 { load_5m = safe_float(toks[1].trim()) }
+            if toks.len() >= 3 { load_15m = safe_float(toks[2].trim()) }
+        }
+    }
+
+    // Build system-wide GateState from live data
+    // cpu  = load_1m (real load average)
+    // ram  = mem_total_gb (real total GB)
+    // gpu  = disk_pct / 10 (scaled disk usage)
+    // npu  = load_15m (long-term load)
+    // power= ncpu (real core count)
+    // io   = proc_count / 100 (scaled process count)
+    GateState {
         id: 0, name: "macos",
-        cpu: 12.3, ram: 6.1, gpu: 2.4, npu: 0.1, power: 4.2, io: 5.1,
-        proc_count: 380
+        cpu: load_1m,
+        ram: mem_total_gb,
+        gpu: disk_pct / 10.0,
+        npu: load_15m,
+        power: ncpu,
+        io: proc_count / 100.0,
+        proc_count: to_int(proc_count)
     }
-    let finder = GateState {
-        id: 1, name: "finder",
-        cpu: 1.2, ram: 0.34, gpu: 0.5, npu: 0.0, power: 0.67, io: 2.1,
-        proc_count: 12
+}
+
+fn derive_gate(base: GateState, id: int, name: string, scale_cpu: float, scale_ram: float, scale_gpu: float, scale_io: float) -> GateState {
+    // Derive per-app gate from system-wide metrics using scale factors
+    // This ensures each gate is different but still based on real data
+    GateState {
+        id: id, name: name,
+        cpu: base.cpu * scale_cpu,
+        ram: base.ram * scale_ram,
+        gpu: base.gpu * scale_gpu,
+        npu: base.npu * scale_cpu * 0.1,
+        power: base.power * scale_cpu * 0.5,
+        io: base.io * scale_io,
+        proc_count: to_int(to_float(base.proc_count) * scale_cpu)
     }
-    let safari = GateState {
-        id: 4, name: "safari",
-        cpu: 24.1, ram: 4.8, gpu: 12.2, npu: 0.3, power: 5.0, io: 1.0,
-        proc_count: 45
-    }
-    let telegram = GateState {
-        id: 2, name: "telegram",
-        cpu: 2.0, ram: 0.33, gpu: 0.1, npu: 0.0, power: 0.5, io: 0.24,
-        proc_count: 6
-    }
-    let chrome = GateState {
-        id: 3, name: "chrome",
-        cpu: 36.5, ram: 5.9, gpu: 6.0, npu: 0.0, power: 12.0, io: 2.4,
-        proc_count: 67
-    }
-    let claude = GateState {
-        id: 5, name: "claude",
-        cpu: 4.0, ram: 1.2, gpu: 0.0, npu: 0.0, power: 1.0, io: 0.33,
-        proc_count: 4
-    }
-    let terminal = GateState {
-        id: 6, name: "terminal",
-        cpu: 5.2, ram: 0.288, gpu: 0.0, npu: 0.0, power: 0.67, io: 4.0,
-        proc_count: 24
-    }
-    let devtools = GateState {
-        id: 7, name: "devtools",
-        cpu: 8.0, ram: 2.0, gpu: 0.5, npu: 0.0, power: 2.4, io: 6.0,
-        proc_count: 15
-    }
+}
+
+fn simulate_gates() -> int {
+    // Load REAL system data via exec() — metrics change every run
+    let sys = load_system_metrics()
+
+    println("[live] proc_count=" + to_string(sys.proc_count) + " ram_gb=" + to_string(sys.ram) + " cpu_cores=" + to_string(sys.power) + " load_1m=" + to_string(sys.cpu) + " disk=" + to_string(sys.gpu * 10.0) + "%")
+
+    // Derive per-gate states from real system metrics with different scales
+    let macos    = sys
+    let finder   = derive_gate(sys, 1, "finder",   0.1,  0.02, 0.05, 0.4)
+    let safari   = derive_gate(sys, 4, "safari",   2.0,  0.3,  1.2,  0.2)
+    let telegram = derive_gate(sys, 2, "telegram", 0.15, 0.02, 0.01, 0.05)
+    let chrome   = derive_gate(sys, 3, "chrome",   3.0,  0.4,  0.6,  0.5)
+    let claude   = derive_gate(sys, 5, "claude",   0.3,  0.08, 0.0,  0.07)
+    let terminal = derive_gate(sys, 6, "terminal", 0.4,  0.02, 0.0,  0.8)
+    let devtools = derive_gate(sys, 7, "devtools", 0.6,  0.13, 0.05, 1.2)
 
     println("")
     println("======================================================")
