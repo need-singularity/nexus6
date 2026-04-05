@@ -115,21 +115,70 @@ fn show_leaderboard(limit: usize) -> Result<(), String> {
 }
 
 fn promote_pending() -> Result<(), String> {
-    let records = load_all_records();
-    let mut promoted = 0;
-    for mut rec in records.into_iter().filter(|r| r.promotion_candidate) {
-        let parent_d = rec.current.d;
-        if let Some(child) = rec.promote() {
-            println!(
-                "promote: {} (d={}, r=10) → {} (d={}, r=0)",
-                rec.id, parent_d, child.id, child.current.d
-            );
-            promoted += 1;
+    let path = crate::alien_index::record::discovery_log_path();
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+
+    // Parse: keep non-ai lines verbatim; collect ai records.
+    let mut preserved: Vec<String> = Vec::new();
+    let mut ai_records: Vec<AlienIndexRecord> = Vec::new();
+    for line in content.lines() {
+        if line.trim().is_empty() { continue; }
+        if line.contains("\"alien_index\"") {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                if let Some(inner) = v.get("alien_index") {
+                    if let Ok(rec) = serde_json::from_value::<AlienIndexRecord>(inner.clone()) {
+                        ai_records.push(rec);
+                        continue;
+                    }
+                }
+            }
+            preserved.push(line.to_string());
+        } else {
+            preserved.push(line.to_string());
         }
     }
+
+    // Promote candidates, collect children.
+    let mut promoted = 0;
+    let mut children: Vec<AlienIndexRecord> = Vec::new();
+    for rec in ai_records.iter_mut() {
+        if rec.promotion_candidate {
+            let parent_d = rec.current.d;
+            if let Some(child) = rec.promote() {
+                println!(
+                    "promote: {} (d={}, r=10) → {} (d={}, r=0)",
+                    rec.id, parent_d, child.id, child.current.d
+                );
+                children.push(child);
+                promoted += 1;
+            }
+        }
+    }
+
+    // Rewrite: preserved + updated ai + new children.
+    let mut out = String::new();
+    for l in &preserved { out.push_str(l); out.push('\n'); }
+    for rec in &ai_records {
+        match serde_json::to_string(rec) {
+            Ok(s) => { out.push_str(&format!("{{\"alien_index\":{}}}\n", s)); }
+            Err(e) => eprintln!("warn: skip serialize {}: {}", rec.id, e),
+        }
+    }
+    for child in &children {
+        match serde_json::to_string(child) {
+            Ok(s) => { out.push_str(&format!("{{\"alien_index\":{}}}\n", s)); }
+            Err(e) => eprintln!("warn: skip serialize child {}: {}", child.id, e),
+        }
+    }
+
+    // Atomic write: .tmp + rename.
+    let tmp = path.with_extension("jsonl.tmp");
+    std::fs::write(&tmp, &out).map_err(|e| format!("write tmp: {}", e))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("rename: {}", e))?;
+
     println!(
-        "{} record(s) promoted. (Note: writeback to disk is a follow-up task.)",
-        promoted
+        "{} record(s) promoted, {} child record(s) added, disk updated.",
+        promoted, children.len()
     );
     Ok(())
 }
