@@ -747,7 +747,27 @@ fn run_auto(domain: &str, max_meta_cycles: usize, max_ouroboros_cycles: usize, n
         forge_config: base_mlc.forge_config,
     };
 
-    let seeds = vec![format!("n=6 patterns in {}", domain)];
+    // Atlas gap seeds
+    let mut seeds = vec![format!("n=6 patterns in {}", domain)];
+    let atlas_path = std::env::var("HOME")
+        .map(|h| format!("{}/Dev/nexus6/shared/atlas.n6", h))
+        .unwrap_or_default();
+    if std::path::Path::new(&atlas_path).exists() {
+        let parse_script = std::env::var("HOME")
+            .map(|h| format!("{}/Dev/nexus6/shared/parse_n6.py", h))
+            .unwrap_or_default();
+        if let Ok(output) = std::process::Command::new("python3")
+            .args([&parse_script, &atlas_path, "--json"])
+            .output()
+        {
+            let json_str = String::from_utf8_lossy(&output.stdout);
+            let complex = crate::singularity_recursion::topology::KnowledgeComplex::from_n6_json(&json_str);
+            let gaps = complex.find_gaps(30);
+            let (gap_axioms, _) = complex.gaps_to_axioms(&gaps);
+            seeds.extend(gap_axioms);
+        }
+    }
+
     let mut meta_loop = MetaLoop::new(domain.to_string(), seeds, config);
 
     // Attach progress logger
@@ -2061,9 +2081,32 @@ fn run_blowup(domain: &str, max_depth: usize, nexus_cfg: &NexusConfig) -> Result
     println!("  도메인: {} | 최대 깊이: {}", domain, max_depth);
     println!();
 
+    // Step 0: atlas.n6 → 갭 분석 → 시드 생성
+    let mut seeds = vec![format!("n=6 patterns in {}", domain)];
+    let atlas_path = std::env::var("HOME")
+        .map(|h| format!("{}/Dev/nexus6/shared/atlas.n6", h))
+        .unwrap_or_default();
+    if std::path::Path::new(&atlas_path).exists() {
+        // Run parse_n6.py --json and feed into KnowledgeComplex
+        let parse_script = std::env::var("HOME")
+            .map(|h| format!("{}/Dev/nexus6/shared/parse_n6.py", h))
+            .unwrap_or_default();
+        if let Ok(output) = std::process::Command::new("python3")
+            .args([&parse_script, &atlas_path, "--json"])
+            .output()
+        {
+            let json_str = String::from_utf8_lossy(&output.stdout);
+            let complex = crate::singularity_recursion::topology::KnowledgeComplex::from_n6_json(&json_str);
+            let gaps = complex.find_gaps(50);
+            let (gap_axioms, _gap_metrics) = complex.gaps_to_axioms(&gaps);
+            let gap_count = gap_axioms.len();
+            seeds.extend(gap_axioms);
+            println!("  atlas.n6: {} | gaps: {} seeds injected", complex.stats(), gap_count);
+        }
+    }
+
     // Step 1: 진화 루프를 돌려서 메트릭 히스토리 생성 (특이점 탐색)
     info!(domain, "Blowup 1/4: 진화 루프 (특이점 탐색)");
-    let seeds = vec![format!("n=6 patterns in {}", domain)];
     let base_config = nexus_cfg.meta_loop_config();
     let config = MetaLoopConfig {
         max_ouroboros_cycles: base_config.max_ouroboros_cycles,
