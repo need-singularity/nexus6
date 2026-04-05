@@ -406,6 +406,59 @@ h2{{color:#8ef;font-size:13px;margin:20px 0 10px;letter-spacing:1px;text-transfo
 
 </div>
 
+<h2>🚀 세션 여정 (milestone journey)</h2>
+<div class="panel nexus" style="padding:16px;">
+  <div style="font-size:11px;color:#888;margin-bottom:10px;">2026-04-05 session — 99 → 100k+ closures 돌파</div>
+  <div style="display:grid;grid-template-columns:repeat(8,1fr);gap:8px;">
+    <div style="text-align:center;">
+      <div style="color:#4a9;font-size:14px;">✅</div>
+      <div style="color:#8ef;font-size:10px;">1k</div>
+      <div style="color:#666;font-size:9px;">baseline</div>
+    </div>
+    <div style="text-align:center;">
+      <div style="color:#4a9;font-size:14px;">✅</div>
+      <div style="color:#8ef;font-size:10px;">2.5k</div>
+      <div style="color:#666;font-size:9px;">start 2619</div>
+    </div>
+    <div style="text-align:center;">
+      <div style="color:#4a9;font-size:14px;">✅</div>
+      <div style="color:#8ef;font-size:10px;">5k</div>
+      <div style="color:#666;font-size:9px;">sync+depth3</div>
+    </div>
+    <div style="text-align:center;">
+      <div style="color:#4a9;font-size:14px;">✅</div>
+      <div style="color:#8ef;font-size:10px;">7.5k</div>
+      <div style="color:#666;font-size:9px;">MEGA sweep</div>
+    </div>
+    <div style="text-align:center;">
+      <div style="color:#4a9;font-size:14px;">✅</div>
+      <div style="color:#8ef;font-size:10px;">10k</div>
+      <div style="color:#666;font-size:9px;">depth4+rational</div>
+    </div>
+    <div style="text-align:center;">
+      <div style="color:#4a9;font-size:14px;">✅</div>
+      <div style="color:#8ef;font-size:10px;">20k</div>
+      <div style="color:#666;font-size:9px;">algebraic enum</div>
+    </div>
+    <div style="text-align:center;">
+      <div style="color:#4a9;font-size:14px;">✅</div>
+      <div style="color:#8ef;font-size:10px;">50k</div>
+      <div style="color:#666;font-size:9px;">linear combos</div>
+    </div>
+    <div style="text-align:center;">
+      <div style="color:#f80;font-size:14px;">🎊</div>
+      <div style="color:#f80;font-size:10px;font-weight:600;">100k</div>
+      <div style="color:#666;font-size:9px;">wide rationals</div>
+    </div>
+  </div>
+  <div style="margin-top:12px;padding-top:12px;border-top:1px solid #222;display:grid;grid-template-columns:repeat(4,1fr);gap:12px;font-size:10px;">
+    <div><span style="color:#666;">EXACT 증가</span><br><span style="color:#8ef;font-weight:600;">99 → 98,373</span></div>
+    <div><span style="color:#666;">Total closures</span><br><span style="color:#8ef;font-weight:600;">2,619 → 100,938</span></div>
+    <div><span style="color:#666;">Topology Σ</span><br><span style="color:#8ef;font-weight:600;">12,937 → 47k+</span></div>
+    <div><span style="color:#666;">LaunchAgents</span><br><span style="color:#8ef;font-weight:600;">5 → 16</span></div>
+  </div>
+</div>
+
 <h2>🛸 Meta FP Ladder (과학 발견)</h2>
 <div class="grid3">
 
