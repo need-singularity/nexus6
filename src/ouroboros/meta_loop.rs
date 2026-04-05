@@ -240,6 +240,9 @@ impl MetaLoop {
             }
         }
 
+        // Persist custom lenses to disk so they survive restarts
+        registry.save_custom();
+
         MetaLoopResult {
             ouroboros_results: all_ouroboros_results,
             forged_lenses: all_forged_lenses,

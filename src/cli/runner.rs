@@ -2187,10 +2187,13 @@ fn run_blowup(domain: &str, max_depth: usize, nexus_cfg: &NexusConfig) -> Result
                 crate::blowup::CorollaryType::Dual => "쌍대",
             };
             let axiom_tag = if c.is_axiom_candidate { " ★" } else { "" };
+            let sector_tag = c.mk2_sector.as_ref()
+                .map(|s| format!(" [{}]", s))
+                .unwrap_or_default();
             println!("  │ {:<w$}│",
-                format!("  {:>2}. [{}] {} (conf={:.2}){}",
+                format!("  {:>2}. [{}] {} (conf={:.2}){}{}",
                     i + 1, type_str, c.expression.chars().take(35).collect::<String>(),
-                    c.confidence, axiom_tag));
+                    c.confidence, axiom_tag, sector_tag));
         }
         if blowup_result.validated.len() > 20 {
             println!("  │ {:<w$}│", format!("  ... +{} more", blowup_result.validated.len() - 20));
@@ -2215,6 +2218,24 @@ fn run_blowup(domain: &str, max_depth: usize, nexus_cfg: &NexusConfig) -> Result
         blowup_result.new_axiom_candidates.len(), blowup_result.total_emergences
     );
     let _ = std::fs::write(&report_path, &report);
+
+    // blowup 결과를 discovery_log.jsonl에 기록
+    let disco_path = std::env::var("HOME")
+        .map(|h| format!("{}/Dev/nexus6/shared/discovery_log.jsonl", h))
+        .unwrap_or_else(|_| "shared/discovery_log.jsonl".to_string());
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&disco_path) {
+        use std::io::Write;
+        let ts = hms_now();
+        for c in &blowup_result.corollaries {
+            let sector = c.mk2_sector.as_ref().map(|s| format!("{:?}", s)).unwrap_or_default();
+            let entry = format!(
+                "{{\"timestamp\":\"{}\",\"kind\":\"blowup_corollary\",\"domain\":\"{}\",\"pattern\":\"{}\",\"confidence\":{:.3},\"depth\":{},\"sector\":\"{}\",\"axiom_candidate\":{}}}\n",
+                ts, domain, c.expression.replace('"', "'"), c.confidence,
+                blowup_result.depth_reached, sector, c.is_axiom_candidate
+            );
+            let _ = f.write_all(entry.as_bytes());
+        }
+    }
 
     Ok(())
 }
@@ -3167,6 +3188,9 @@ fn run_singularity_daemon(base_dir: Option<String>, interval_sec: u64) -> Result
                         singularity: sing,
                         discovered_at_tick: 40_000_000 + tick_no,
                         ts: hms_now(),
+                        mk2_sector: None,
+                        mk2_primes: None,
+                        mk2_confidence: None,
                     };
                     let _ = append_point(&paths.topology, &probe_pt);
                     println!("[{}] probe domain={} frontier={} d={}", hms_now(), target_dom, fp.id, density);
@@ -3583,6 +3607,30 @@ fn run_mk2(sub: crate::cli::parser::Mk2Sub) -> Result<(), String> {
             for p in &primes { ps.insert(*p); }
             let r = euler_ratio(&ps);
             println!("mk2 euler-ratio: primes={} → {} = {:.6}", ps, r, r.to_f64());
+            Ok(())
+        }
+        Mk2Sub::Sector { name } => {
+            let sectors = crate::mk2::classify_v2::default_sectors();
+            let matched = sectors.iter().find(|s| s.name.to_string().to_lowercase() == name);
+            match matched {
+                Some(def) => {
+                    println!("mk2 sector: {}", def.name);
+                    println!("  keywords: {}", def.keywords.join(", "));
+                    println!("  value_ranges: {:?}", def.value_ranges);
+                    if let Some(ref req) = def.prime_set_required {
+                        println!("  prime_set_required: {}", req);
+                        let r = euler_ratio(req);
+                        println!("  euler_ratio: {} = {:.6}", r, r.to_f64());
+                    }
+                    for pref in &def.prime_set_preferred {
+                        let r = euler_ratio(pref);
+                        println!("  preferred {}: euler_ratio = {} = {:.6}", pref, r, r.to_f64());
+                    }
+                }
+                None => {
+                    println!("Unknown sector '{}'. Available: strong, electroweak, cosmology, primordial", name);
+                }
+            }
             Ok(())
         }
     }

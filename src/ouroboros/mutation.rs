@@ -143,10 +143,11 @@ fn apply_scale_hint(_base: &str, const_name: &str, value: f64) -> String {
 
 /// Truncate a string to max_len characters, appending "..." if truncated.
 fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+    if s.chars().count() <= max_len {
         s.to_string()
     } else {
-        format!("{}...", &s[..max_len])
+        let end: String = s.chars().take(max_len).collect();
+        format!("{}...", end)
     }
 }
 

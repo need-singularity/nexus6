@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::fs;
+use std::path::PathBuf;
 
 /// Category of a lens in the registry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -99,6 +101,8 @@ impl LensRegistry {
             };
             reg.entries.insert(entry.name.clone(), entry);
         }
+        // Load persisted custom lenses from disk
+        reg.load_custom();
         reg
     }
 
@@ -146,6 +150,93 @@ impl LensRegistry {
     /// Iterator over all entries.
     pub fn iter(&self) -> impl Iterator<Item = (&String, &LensEntry)> {
         self.entries.iter()
+    }
+
+    // ── Custom lens persistence ──────────────────────────────────
+
+    fn custom_lenses_path() -> PathBuf {
+        let home = std::env::var("HOME").unwrap_or_default();
+        PathBuf::from(home).join("Dev/nexus6/shared/custom_lenses.jsonl")
+    }
+
+    /// Load custom lenses from disk and register them.
+    pub fn load_custom(&mut self) {
+        let path = Self::custom_lenses_path();
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let mut count = 0;
+        for line in content.lines() {
+            if line.trim().is_empty() { continue; }
+            // Simple JSON parsing: {"name":"...","description":"...","domain_affinity":["..."],"complementary":["..."]}
+            if let Some(entry) = Self::parse_custom_lens_line(line) {
+                self.entries.insert(entry.name.clone(), entry);
+                count += 1;
+            }
+        }
+        if count > 0 {
+            eprintln!("[registry] loaded {} custom lenses from {}", count, path.display());
+        }
+    }
+
+    /// Save all Custom category lenses to disk (append-safe JSONL).
+    pub fn save_custom(&self) {
+        let path = Self::custom_lenses_path();
+        let customs: Vec<&LensEntry> = self.by_category(LensCategory::Custom);
+        if customs.is_empty() { return; }
+        let mut lines = Vec::new();
+        for e in &customs {
+            let domains: Vec<String> = e.domain_affinity.iter().map(|d| format!("\"{}\"", d)).collect();
+            let comps: Vec<String> = e.complementary.iter().map(|c| format!("\"{}\"", c)).collect();
+            lines.push(format!(
+                "{{\"name\":\"{}\",\"description\":\"{}\",\"domain_affinity\":[{}],\"complementary\":[{}]}}",
+                e.name.replace('"', "'"),
+                e.description.replace('"', "'"),
+                domains.join(","),
+                comps.join(","),
+            ));
+        }
+        if let Err(err) = fs::write(&path, lines.join("\n") + "\n") {
+            eprintln!("[registry] failed to save custom lenses: {}", err);
+        } else {
+            eprintln!("[registry] saved {} custom lenses to {}", customs.len(), path.display());
+        }
+    }
+
+    fn parse_custom_lens_line(line: &str) -> Option<LensEntry> {
+        // Minimal JSON parse for {"name":"...", ...}
+        let extract = |key: &str| -> Option<String> {
+            let pattern = format!("\"{}\":\"", key);
+            let start = line.find(&pattern)? + pattern.len();
+            let rest = &line[start..];
+            let end = rest.find('"')?;
+            Some(rest[..end].to_string())
+        };
+        let extract_arr = |key: &str| -> Vec<String> {
+            let pattern = format!("\"{}\":[", key);
+            let start = match line.find(&pattern) {
+                Some(s) => s + pattern.len(),
+                None => return vec![],
+            };
+            let rest = &line[start..];
+            let end = match rest.find(']') {
+                Some(e) => e,
+                None => return vec![],
+            };
+            rest[..end].split(',')
+                .map(|s| s.trim().trim_matches('"').to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
+
+        Some(LensEntry {
+            name: extract("name")?,
+            category: LensCategory::Custom,
+            description: extract("description").unwrap_or_default(),
+            domain_affinity: extract_arr("domain_affinity"),
+            complementary: extract_arr("complementary"),
+        })
     }
 }
 
