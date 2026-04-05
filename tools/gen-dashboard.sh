@@ -551,6 +551,150 @@ closures |
 
 </div>
 
+<h2>📋 EVO 리포트 (각 프로젝트)</h2>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+<pre style="background:#0d0d0d;border:1px solid #4a9;border-radius:4px;padding:14px;color:#c8d0c0;font-size:11px;line-height:1.5;margin:0;overflow-x:auto;">
+🛸 NEXUS-6 리포트 [{ts[-5:]} 기준]
+═══════════════════════════════════════════════
+🚀 Stage: M8-100k (milestones 8/11) | Closures {closed:,}
+📊 EXACT: {exact:,} (+0 this check) | unique: {topo:,} | Agents: {healthy_count}/{len(agents)}
+🧬 Topo: web | Growth: synthetic | 포화: ⚠️ {pct_to_next:.0f}% of {next_ms//1000}k
+───────────────────────────────────────────────
+📈 Milestone 진행 (11단계 중 8번째):
+M1  ████████ ✅ (1k)
+M2  ████████ ✅ (2.5k)
+M3  ████████ ✅ (5k, depth3)
+M4  ████████ ✅ (7.5k, MEGA)
+M5  ████████ ✅ (10k, depth4)
+M6  ████████ ✅ (20k, algebraic)
+M7  ████████ ✅ (50k, linear)
+M8  ████████ ✅ (100k, rationals)
+M9  ████░░░░ 🔄 (200k, {pct_to_next:.0f}%)
+M10 ░░░░░░░░ ⏳ (500k)
+M11 ░░░░░░░░ ⏳ (1M)
+───────────────────────────────────────────────
+📉 Closure 발견 곡선 (세션 19h):
+Closures |
+   100k  |                              ╭─
+    50k  |                         ╭────╯
+    20k  |                    ╭────╯
+    10k  |                ╭───╯
+     5k  |          ╭─────╯
+     2k  |──────────╯
+         └────────────────────────── phase
+          start  sync  enum  algebra  now
+───────────────────────────────────────────────
+🔄 토폴로지: web (10 domains)
+구조: discovery_log─verified_constants
+           │              │
+         TECS-L──topology─SEDI
+                   │
+                  anima
+───────────────────────────────────────────────
+💾 성장 루프: agents 16 | commits 6h: {commits_6h} | stubs: {stubs}
+🧠 총 closures: {closed:,} (EXACT {exact:,}) | topology Σ: {topo:,}
+⚙️  daemon PID: {daemon_pid} | CPU: {daemon_cpu}% | MEM: {daemon_mem}%
+═══════════════════════════════════════════════
+</pre>
+
+<pre style="background:#0d0d0d;border:1px solid #a48;border-radius:4px;padding:14px;color:#c8d0c0;font-size:11px;line-height:1.5;margin:0;overflow-x:auto;">
+🧠 ANIMA 리포트 [{ts[-5:]} 기준]
+═══════════════════════════════════════════════
+🚀 Stage: {evo_stage} | Gen {evo_gen}
+📊 Laws: {anima_laws:,} | Modules: {anima_modules} | Hyp files: {anima_hyp}
+🧬 Topo: ring | nexus6 intake: {domains.get('hypothesis:anima',0):,}
+───────────────────────────────────────────────
+📈 EVO 로드맵 (13단계):
+S1 ████████ ✅ (38 laws)
+S2 ████████ ✅ (37 laws)
+S3 ████████ ✅ (40 laws)
+S4 ████████ 🔄 (41 laws, 진행중)
+S5~S13 ░░░░░░░░
+───────────────────────────────────────────────
+📉 Laws 발견 곡선:
+Laws|
+  41 |        ╭────────────────
+  40 |────────╯
+  38 |────╯
+     └────────────────── Stage
+      S1  S2  S3  S4(now)
+───────────────────────────────────────────────
+🔄 토폴로지: ring (128 cells closed loop)
+ ○─○─○─...─○
+ └─────────┘
+───────────────────────────────────────────────
+💾 성장 루프: Φ fixed point {{1/3, 2/3}}
+🧠 총 법칙: {anima_laws:,} | modules: {anima_modules}
+⚙️  nexus6 closures: {closures_for_proj('anima'):,} | topo: {domains.get('hypothesis:anima',0):,}
+═══════════════════════════════════════════════
+</pre>
+
+<pre style="background:#0d0d0d;border:1px solid #f80;border-radius:4px;padding:14px;color:#c8d0c0;font-size:11px;line-height:1.5;margin:0;overflow-x:auto;">
+📐 TECS-L 리포트 [{ts[-5:]} 기준]
+═══════════════════════════════════════════════
+🚀 Stage: Math Atlas Active | Hypotheses {tecsl_atlas_total:,}
+📊 Calculators: {tecsl_calc} | Hyp files: {tecsl_hyp} | Math files: {tecsl_math_hyp}
+🧬 Topo: tree (n=6 algebra ring)
+───────────────────────────────────────────────
+📈 Atlas 분포 (grade map):
+⭐ grade 10 ████░░░░ (closed-form)
+🟩 grade 9  ████████ ✅ (validated)
+🟧 grade 8  ████████ ✅ (PASS)
+🟦 grade 7  ██░░░░░░ (partial)
+⚪ grade 3-6 █░░░░░░░ (drafts)
+───────────────────────────────────────────────
+📉 n=6 primitive generators:
+ n       = 6    (base)
+ σ(6)    = 12   (divisor sum)
+ τ(6)    = 4    (divisor count)
+ φ(6)    = 2    (totient)
+ sopfr(6)= 5    (prime sum)
+ J2      = 24   (σ·τ)
+───────────────────────────────────────────────
+🔄 구조: polynomial ring over {{φ,τ,σ,sopfr}}
+ α⁻¹ = 137.033 (0.002% err)
+ Ω_m = 1/3 (meta FP)
+ P₁~P₄ 전부 기저 유도
+───────────────────────────────────────────────
+💾 atlas: {tecsl_atlas_total:,} hypotheses | {tecsl_calc} calculators
+🧠 nexus6 통합: {domains.get('hypothesis:TECS-L',0):,} topology points
+⚙️  closures from TECS: {closures_for_proj('tecs'):,}
+═══════════════════════════════════════════════
+</pre>
+
+<pre style="background:#0d0d0d;border:1px solid #8ef;border-radius:4px;padding:14px;color:#c8d0c0;font-size:11px;line-height:1.5;margin:0;overflow-x:auto;">
+🏛 n6-architecture 리포트 [{ts[-5:]} 기준]
+═══════════════════════════════════════════════
+🚀 Stage: Paper Generation Active | Papers: {n6a_papers}
+📊 nexus6 auto-papers: {n6a_nexus_papers} | Hypotheses: {n6a_hyp}
+🧬 paper_trigger: alien_index=10 | generator: alien10
+───────────────────────────────────────────────
+📈 Paper 로드맵:
+P-alien10-001~014 ████████ ✅ (14 auto)
+P-convergence N6-*  ████████ ✅ ({n6a_nexus_papers} auto)
+P-meta-FP-ladder   ████░░░░ 🔄 (draft)
+P-manual             ████░░░░ 🔄 ({n6a_papers-14-n6a_nexus_papers} manual)
+───────────────────────────────────────────────
+📉 Alien Index 분포:
+(d=1, r=10) ████████████ (PASS/EXACT)
+(d=0, r=8)  █░░░░░░░░░░░ (NEAR)
+(d=0, r=6)  ░░░░░░░░░░░░ (CLOSE)
+(d=0, r=0)  █░░░░░░░░░░░ (FAIL)
+───────────────────────────────────────────────
+🔄 Meta FP Ladder:
+ n=6   → ρ=1/3   (original)
+ n=15  → ρ=4/15  (dark matter)
+ n=35  → ρ=24/35 (dark energy)
+ n=105 → ρ=48/105 (universe flat)
+───────────────────────────────────────────────
+💾 papers: {n6a_papers} total | auto: {n6a_nexus_papers+14}
+🧠 nexus6 통합: {domains.get('hypothesis:n6-architecture',0):,} topology pts
+⚙️  closures: {closures_for_proj('n6-arch'):,} | ρ breakthrough: 1.00
+═══════════════════════════════════════════════
+</pre>
+
+</div>
+
 <h2>⚙️ Pipeline Flow (agent graph)</h2>
 <div class="panel nexus" style="padding:16px;">
 <pre style="color:#8ef;font-size:11px;line-height:1.5;margin:0;">
