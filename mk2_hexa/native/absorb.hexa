@@ -1,0 +1,124 @@
+// mk2_hexa/native/absorb.hexa
+// promote-pending + writeback — effect FileSystem 사용
+
+use effects::{FileSystem, Clock, Logger, IOError}
+use record::{AlienIndexRecord, record_promote}
+
+// ═══ 결과 타입 ════════════════════════════════════════════════════
+
+pub struct AbsorbReport {
+    total_ai_records: int,
+    promoted: int,
+    children_created: int,
+    preserved_non_ai_lines: int,
+    rho_before: float,
+    rho_after: float
+}
+
+// ═══ Promote-pending with writeback ═══════════════════════════════
+
+fn promote_pending_with_writeback(log_path: string) -> AbsorbReport
+    with FileSystem, Clock, Logger
+    throws IOError
+    ensures result.promoted == result.children_created
+    ensures result.rho_after >= result.rho_before
+{
+    Logger.info("reading: " + log_path)
+    let raw = FileSystem.read(log_path)
+
+    // 1. 라인 분류: ai / non-ai
+    let mut preserved: own [string] = []
+    let mut records: own [AlienIndexRecord] = []
+    for line in raw.split("\n") {
+        match line.trim() {
+            "" => continue,
+            l if line_is_alien_index(l) => {
+                match parse_alien_line(l) {
+                    Some(rec) => records = records.push(rec),
+                    None      => preserved = preserved.push(l.to_string())
+                }
+            }
+            l => preserved = preserved.push(l.to_string())
+        }
+    }
+
+    let total_before = len(records)
+    let d_ge_1_before = records.iter().filter(|r| r.current.d >= 1).count()
+    let rho_before = if total_before > 0 { d_ge_1_before as float / total_before as float } else { 0.0 }
+
+    // 2. 승격 라운드
+    let mut updated: own [AlienIndexRecord] = []
+    let mut children: own [AlienIndexRecord] = []
+    for rec in move records {
+        match rec.promotion_candidate {
+            true => {
+                let (parent, child_opt) = record_promote(move rec)
+                updated = updated.push(parent)
+                match child_opt {
+                    Some(child) => children = children.push(child),
+                    None => {}
+                }
+            }
+            false => updated = updated.push(rec)
+        }
+    }
+
+    let promoted = len(children)
+    let total_after = len(updated) + len(children)
+    let d_ge_1_after = updated.iter().filter(|r| r.current.d >= 1).count()
+        + children.iter().filter(|r| r.current.d >= 1).count()
+    let rho_after = if total_after > 0 { d_ge_1_after as float / total_after as float } else { 0.0 }
+
+    // 3. Atomic rewrite
+    let out = serialize_all(borrow preserved, borrow updated, borrow children)
+    FileSystem.write_atomic(log_path, out)
+    Logger.info("promoted=" + to_string(promoted) + " disk updated")
+
+    AbsorbReport {
+        total_ai_records: total_before,
+        promoted: promoted,
+        children_created: promoted,
+        preserved_non_ai_lines: len(preserved),
+        rho_before: rho_before,
+        rho_after: rho_after
+    }
+}
+
+// ═══ 보조 함수 ═══════════════════════════════════════════════════
+
+pure fn line_is_alien_index(line: string) -> bool {
+    line.contains("\"alien_index\"")
+}
+
+@intent("parse one JSONL line containing alien_index record")
+@generate("json-parser for AlienIndexRecord")
+fn parse_alien_line(line: string) -> option<AlienIndexRecord>
+
+@intent("serialize preserved + updated + children to JSONL string")
+@generate("json-writer")
+fn serialize_all(
+    preserved: borrow [string],
+    updated: borrow [AlienIndexRecord],
+    children: borrow [AlienIndexRecord]
+) -> string
+
+// ═══ 불변 증명 ══════════════════════════════════════════════════
+
+invariant writeback_preserves_non_ai {
+    forall path: string, pre: string, post: string,
+        pre == FileSystem.read(path)  (before promote)
+        => count_non_ai_lines(post) == count_non_ai_lines(pre)
+}
+
+invariant writeback_monotonic_depth {
+    // 승격 후에도 기존 레코드의 d 는 감소하지 않음
+    forall rec: AlienIndexRecord,
+        rec_after.current.d >= rec_before.current.d
+}
+
+theorem rho_monotonic_under_promote {
+    // 승격은 ρ 를 절대 감소시키지 않음
+    forall records: [AlienIndexRecord],
+        let post = run_promote_pending(records)
+        rho(post) >= rho(records)
+}

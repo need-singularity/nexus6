@@ -1,0 +1,187 @@
+// mk2_hexa/native/gate.hexa
+// 12-gate 매트릭스 (3 레이어 × τ=4 관문) — verify/proof contracts
+
+use constants::{N, SIGMA, PHI, TAU, SOPFR, J2, SIGMA_J2,
+                PHI_THRESHOLD, PERT_BASE, PERT_BREAKTHROUGH, TRIPLE_VALIDATION}
+use theorems::{bt_344_gate_axis_necessity, bt_345_breakthrough_perturbation, bt_346_fp_lower_bound}
+
+// ═══ Verdict 타입 ═════════════════════════════════════════════════
+
+pub enum Verdict {
+    Pass { confidence: float where 0.0 <= confidence <= 1.0 },
+    Quarantine { gate: int where 1 <= gate <= 12, reason: string }
+}
+
+pure fn verdict_passed(v: borrow Verdict) -> bool {
+    matches!(v, Verdict::Pass { .. })
+}
+
+// ═══ GateContext ═══════════════════════════════════════════════════
+
+pub struct GateContext {
+    source_repo: string,
+    declared_hash: option<string>,
+    phi_prev: float,
+    phi_curr: float,
+    cycle: int
+}
+
+// ═══ Gate trait ════════════════════════════════════════════════════
+
+pub trait Gate {
+    fn id(borrow self) -> int
+    fn name(borrow self) -> string
+    fn inspect(borrow self, data: borrow [byte], ctx: borrow GateContext) -> Verdict
+}
+
+// ══════════════════════════════════════════════════════════════════
+// L-PIPELINE (오염방지) — hexa-gate-implant 4 관문
+// ══════════════════════════════════════════════════════════════════
+
+pub struct SourceGate { whitelist: own [string] }
+pub struct HashGate   { bits: int where bits == SIGMA_J2 }  // 288
+pub struct PhiGate    { threshold: float where threshold == PHI_THRESHOLD }
+pub struct InvariantGate {
+    cycles: int where cycles in {PERT_BASE, PERT_BREAKTHROUGH},
+    stability_threshold: float
+}
+
+impl Gate for SourceGate {
+    fn id(borrow self) -> int { 1 }
+    fn name(borrow self) -> string { "SOURCE" }
+    fn inspect(borrow self, _data, ctx) -> Verdict {
+        match self.whitelist.contains(ctx.source_repo) {
+            true  => Verdict::Pass { confidence: 1.0 },
+            false => Verdict::Quarantine { gate: 1, reason: "not whitelisted" }
+        }
+    }
+}
+
+impl Gate for PhiGate {
+    fn id(borrow self) -> int { 3 }
+    fn name(borrow self) -> string { "PHI" }
+    fn inspect(borrow self, _data, ctx) -> Verdict
+        ensures result is Pass { confidence: c } => c <= 1.0
+    {
+        let delta = abs(ctx.phi_curr - ctx.phi_prev)
+        match delta {
+            d where d > self.threshold =>
+                Verdict::Quarantine { gate: 3, reason: "phi drift > Θ" },
+            _ =>
+                Verdict::Pass { confidence: 1.0 - delta / self.threshold }
+        }
+    }
+}
+
+impl Gate for InvariantGate {
+    fn id(borrow self) -> int { 4 }
+    fn name(borrow self) -> string { "INVARIANT" }
+    fn inspect(borrow self, data, _ctx) -> Verdict
+        ensures result is Pass => triple_runs_passed
+    {
+        // n/φ = 3 삼중 실행 (BT-276)
+        let runs: [float; TRIPLE_VALIDATION] = [
+            run_perturbation(borrow self, borrow data, 0),
+            run_perturbation(borrow self, borrow data, 1),
+            run_perturbation(borrow self, borrow data, 2)
+        ]
+        match runs.iter().all(|&r| r > self.stability_threshold) {
+            true  => Verdict::Pass { confidence: runs.iter().sum::<float>() / 3.0 },
+            false => Verdict::Quarantine { gate: 4, reason: "instability" }
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════
+// L-BREAKTHROUGH (d=2 검증) — alien_index 4-gate
+// ══════════════════════════════════════════════════════════════════
+
+pub struct BreakthroughConfig {
+    min_independent_paths: int where min_independent_paths >= 3,
+    mk2_confidence_threshold: float where mk2_confidence_threshold >= 0.7,
+    significance_level: float where significance_level <= 0.01,
+    require_blowup_rediscovery: bool
+}
+
+pub struct BreakthroughEvidence {
+    independent_paths: int,
+    blowup_rediscovered: bool,
+    mk2_confidence: float,
+    p_value: float
+}
+
+pure fn evaluate_breakthrough(
+    ev: borrow BreakthroughEvidence,
+    cfg: borrow BreakthroughConfig
+) -> (bool, int)       // (all_pass, pass_count)
+    ensures result.1 in 0..=4
+{
+    let paths_ok  = ev.independent_paths >= cfg.min_independent_paths
+    let blowup_ok = !cfg.require_blowup_rediscovery || ev.blowup_rediscovered
+    let mk2_ok    = ev.mk2_confidence >= cfg.mk2_confidence_threshold
+    let pvalue_ok = ev.p_value < cfg.significance_level
+    let count = (paths_ok as int) + (blowup_ok as int) + (mk2_ok as int) + (pvalue_ok as int)
+    (count == 4, count)
+}
+
+// ══════════════════════════════════════════════════════════════════
+// L-MK2_HEXA (내부 합의) — 4 게이트
+// ══════════════════════════════════════════════════════════════════
+
+pure fn mk_consensus_gate(lens_agreements: int) -> Verdict {
+    match lens_agreements {
+        n where n >= 12 => Verdict::Pass { confidence: 1.0 },
+        _               => Verdict::Quarantine { gate: 9, reason: "< 12 lens consensus" }
+    }
+}
+
+pure fn mk_classify_gate(confidence: float) -> Verdict {
+    match confidence {
+        c where c >= 0.7 => Verdict::Pass { confidence: c },
+        _                => Verdict::Quarantine { gate: 11, reason: "mk2 conf < 0.7" }
+    }
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 12-gate 통합 매트릭스
+// ══════════════════════════════════════════════════════════════════
+
+pub struct UnifiedResult {
+    pipeline_count: int,      // 0..=4
+    breakthrough_count: int,  // 0..=4
+    mk_count: int,            // 0..=4
+    total: int                // 0..=12
+}
+
+invariant unified_total_bounds {
+    forall r: UnifiedResult,
+        r.total == r.pipeline_count + r.breakthrough_count + r.mk_count
+        and 0 <= r.total <= 12
+}
+
+// ══════════════════════════════════════════════════════════════════
+// 공리 의존성 증명
+// ══════════════════════════════════════════════════════════════════
+
+proof gate_necessity {
+    // 4 관문 구조는 τ+φ=6 에 의해 유일하게 결정됨 (BT-344)
+    assert TAU == 4
+    assert TAU + PHI == N
+    // 따라서 4 관문 × 3 레이어 = 12 gate 는 n=6 산술에서 자연스러움
+}
+
+proof fp_bound_enforces_hash {
+    // σ·J₂=288 bit 해시 (BT-346)
+    assert SIGMA_J2 == 288
+    assert SIGMA * J2 == 288
+}
+
+proof invariant_breakthrough_cycles {
+    // 2401 cycle = 7^τ = 돌파 perturbation (BT-345)
+    assert PERT_BREAKTHROUGH == 2401
+    assert PERT_BREAKTHROUGH == pow(SIGMA - SOPFR, TAU)
+}
+
+@intent("perturbation runner with LCG")
+@generate("tools/gate-generator")
+fn run_perturbation(gate: borrow InvariantGate, data: borrow [byte], seed: int) -> float
