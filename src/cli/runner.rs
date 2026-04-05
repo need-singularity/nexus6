@@ -2921,18 +2921,41 @@ fn hms_now() -> String {
         .unwrap_or_else(|| "?".to_string())
 }
 
+/// Resolve NEXUS6_ROOT: env var > cwd > exe ancestor > ~/Dev/nexus6
+fn resolve_nexus_root() -> String {
+    if let Ok(root) = std::env::var("NEXUS6_ROOT") {
+        return root;
+    }
+    // cwd에 nexus-bridge.py가 있으면 cwd 사용
+    if let Ok(cwd) = std::env::current_dir() {
+        if cwd.join("nexus-bridge.py").exists() {
+            return cwd.to_string_lossy().to_string();
+        }
+    }
+    // exe 기준 상위
+    if let Some(root) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    {
+        if root.join("nexus-bridge.py").exists() {
+            return root.to_string_lossy().to_string();
+        }
+    }
+    // 알려진 기본 경로
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/ghost".to_string());
+    let default = format!("{}/Dev/nexus6", home);
+    if std::path::Path::new(&default).join("nexus-bridge.py").exists() {
+        return default;
+    }
+    ".".to_string()
+}
+
 /// Run bridge command and capture stdout as string.
 fn run_bridge_capture(sub: Vec<String>) -> String {
     use std::process::Command;
 
-    let nexus_root = std::env::var("NEXUS6_ROOT")
-        .unwrap_or_else(|_| {
-            std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-                .and_then(|p| p.parent().map(|d| d.to_string_lossy().to_string()))
-                .unwrap_or_else(|| ".".to_string())
-        });
+    let nexus_root = resolve_nexus_root();
 
     let script = format!("{}/nexus-bridge.py", nexus_root);
     if !std::path::Path::new(&script).exists() {
@@ -2957,16 +2980,7 @@ fn run_bridge_capture(sub: Vec<String>) -> String {
 fn run_bridge(sub: Vec<String>) -> Result<(), String> {
     use std::process::Command;
 
-    // nexus-bridge.py 경로: 바이너리 위치 기준 또는 NEXUS6_ROOT 환경변수
-    let nexus_root = std::env::var("NEXUS6_ROOT")
-        .unwrap_or_else(|_| {
-            // fallback: 실행파일 기준 상위 디렉토리
-            std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-                .and_then(|p| p.parent().map(|d| d.to_string_lossy().to_string()))
-                .unwrap_or_else(|| ".".to_string())
-        });
+    let nexus_root = resolve_nexus_root();
 
     let script = format!("{}/nexus-bridge.py", nexus_root);
 
@@ -3110,7 +3124,7 @@ fn run_singularity_tick(base_dir: Option<String>) -> Result<(), String> {
     let base = base_dir.unwrap_or_else(|| "shared/cycle".to_string());
     let paths = TickPaths::from_base(&base);
     let cfg = SingularityRecursionConfig::default();
-    let mut runner = AirgenomeRunner;
+    let mut runner = AirgenomeRunner::new();
     let out = run_tick(&paths, &cfg, &mut runner);
     println!("tick exit={} point={:?} elapsed={}s",
              out.exit_code, out.point_id, out.elapsed_sec);
@@ -3131,7 +3145,7 @@ fn run_singularity_daemon(base_dir: Option<String>, interval_sec: u64) -> Result
     let base = base_dir.unwrap_or_else(|| "shared/cycle".to_string());
     let paths = TickPaths::from_base(&base);
     let cfg = SingularityRecursionConfig::default();
-    let mut runner = AirgenomeRunner;
+    let mut runner = AirgenomeRunner::new();
     let interval = Duration::from_secs(interval_sec);
 
     // Build watcher state: track all project hypothesis dirs + memory dir + tail files.
@@ -3477,7 +3491,7 @@ fn run_singularity_resonance(base_dir: Option<String>, limit: usize, domain_filt
     use crate::singularity_recursion::analysis::query_similar;
 
     // Sample current Mac state via airgenome
-    let mut runner = AirgenomeRunner;
+    let mut runner = AirgenomeRunner::new();
     let sing = runner.run("architecture_design", None);
     println!("current Mac state:");
     println!("  {}", sing.invariant);

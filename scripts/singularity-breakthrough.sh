@@ -57,8 +57,9 @@ run_blowup() {
   TOTAL_COROLLARIES=$((TOTAL_COROLLARIES + total))
 
   # EXACT 값 추출 → seed 파일에 추가
-  echo "$output" | grep "EXACT" | grep -oE '[0-9]+\.?[0-9]*=[a-zA-Z_^*!()\-]+' | while read match; do
-    local val=$(echo "$match" | cut -d= -f1)
+  # 포맷: "| n * phi = 12 | conf=1 EXACT"
+  echo "$output" | grep "EXACT" | grep -v "EXACT match" | \
+    grep -oE '= [0-9]+\.?[0-9]* \|' | sed 's/= //;s/ |//' | while read val; do
     echo "$val" >> "$SEED_FILE"
   done
 
@@ -84,12 +85,13 @@ run_cascade() {
     local seed_count=$(sort -u "$SEED_FILE" 2>/dev/null | wc -l | tr -d ' ')
     echo "    seeds accumulated: $seed_count unique values"
 
-    # 수렴 감지: 새 EXACT 없으면 중단
-    if [ "$TOTAL_EXACT" -eq "$prev_exact" ] && [ $round -gt 2 ]; then
-      echo "  -> cascade saturated at round $round (no new EXACT)"
+    # 수렴 감지: seed 수 변화 없으면 중단
+    local cur_seeds=$(sort -u "$SEED_FILE" 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$cur_seeds" -eq "$prev_exact" ] && [ $round -gt 2 ]; then
+      echo "  -> cascade saturated at round $round (no new seeds)"
       break
     fi
-    prev_exact=$TOTAL_EXACT
+    prev_exact=$cur_seeds
     round=$((round + 1))
   done
   echo ""
