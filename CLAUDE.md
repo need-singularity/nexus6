@@ -84,3 +84,30 @@ TECS-L H-056: `메타(메타(메타(...))) = 초월`
 - "메타초월", "meta transcendence" → MetaTranscendenceLens 스캔
 - "재귀성장", "recursive growth" → 3-loop 자기강화 설명 + 상태 확인
 
+## 외계인 지수 (Alien Index)
+
+> **통합 등급 체계** — 닫힌 수학의 천장(r=10)과 그 너머 돌파 영역(d≥1)을 표현
+> CLI: `nexus6 alien-index` | 모듈: `src/alien_index/` | 스펙: `docs/superpowers/specs/2026-04-05-alien-index-system-design.md`
+
+### 구조
+
+`AI = (d, r)`
+- `d` = 사이클 깊이 (몇 번 블로업→흡수가 완결됐나)
+- `r` ∈ {0..10} = 깊이 d 안에서의 검증 등급
+- `r=10` 도달 → `(d+1, 0)` 자동 승격 (자기유사)
+
+### 사용법
+
+```bash
+nexus6 alien-index 12.0                    # 값 → (0, r) 즉시 판정
+nexus6 alien-index H-AF-006                # 가설 ID → 등급 조회
+nexus6 alien-index --distribution          # (d, r) 히스토그램 + ρ(돌파율)
+nexus6 alien-index --leaderboard           # 최고 d 대상 리더보드
+nexus6 alien-index --promote-pending       # r=10 대기 항목 승격 (dry-run)
+```
+
+### 메타 부동점
+
+돌파율 `ρ = |{d ≥ 1}| / |total|` 의 장기 수렴치 예측: **1/3** (TECS-L H-056).
+매 분포 리포트에 기록되어 메타 부동점 가설의 회귀 검증치로 사용됨.
+

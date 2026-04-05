@@ -108,7 +108,21 @@ pub enum CliCommand {
         prompt: String,
         parallel: bool,
     },
+    /// 외계인 지수 (alien index) 조회/승격/배치 처리
+    AlienIndex {
+        sub: AlienIndexSub,
+    },
     Help,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlienIndexSub {
+    Assess { target: String, scan: bool },
+    RecomputeAll,
+    PromotePending,
+    Breakthrough { id: String },
+    Distribution,
+    Leaderboard { limit: usize },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -170,6 +184,7 @@ pub fn parse_args(args: &[String]) -> Result<CliCommand, String> {
         "report" | "rp" => Ok(CliCommand::Report),
         "status" | "st" => Ok(CliCommand::Status),
         "dispatch" | "dp" => parse_dispatch(rest),
+        "alien-index" | "ai" => parse_alien_index(rest),
         "help" | "--help" | "-h" => Ok(CliCommand::Help),
         other => Err(format!("Unknown command: '{}'. Run 'nexus6 help' for usage.", other)),
     }
@@ -799,6 +814,56 @@ fn parse_ingest(args: &[String]) -> Result<CliCommand, String> {
     }
 
     Ok(CliCommand::Ingest { sources, config, verbose })
+}
+
+fn parse_alien_index(args: &[String]) -> Result<CliCommand, String> {
+    let mut scan = false;
+    let mut limit: usize = 20;
+    let mut target: Option<String> = None;
+    let mut flag_mode: Option<&'static str> = None;
+    let mut breakthrough_id: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--scan" => scan = true,
+            "--distribution" => flag_mode = Some("distribution"),
+            "--leaderboard" => flag_mode = Some("leaderboard"),
+            "--promote-pending" => flag_mode = Some("promote-pending"),
+            "--recompute-all" => flag_mode = Some("recompute-all"),
+            "--breakthrough" => {
+                i += 1;
+                if i < args.len() {
+                    breakthrough_id = Some(args[i].clone());
+                }
+                flag_mode = Some("breakthrough");
+            }
+            "--limit" => {
+                i += 1;
+                if i < args.len() {
+                    limit = args[i].parse().unwrap_or(20);
+                }
+            }
+            other if !other.starts_with("--") && target.is_none() => {
+                target = Some(other.to_string());
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let sub = match flag_mode {
+        Some("distribution") => AlienIndexSub::Distribution,
+        Some("leaderboard") => AlienIndexSub::Leaderboard { limit },
+        Some("promote-pending") => AlienIndexSub::PromotePending,
+        Some("recompute-all") => AlienIndexSub::RecomputeAll,
+        Some("breakthrough") => AlienIndexSub::Breakthrough {
+            id: breakthrough_id.ok_or_else(|| "--breakthrough requires an id".to_string())?,
+        },
+        _ => AlienIndexSub::Assess {
+            target: target.ok_or_else(|| "alien-index requires a target or flag".to_string())?,
+            scan,
+        },
+    };
+    Ok(CliCommand::AlienIndex { sub })
 }
 
 fn parse_cycle(args: &[String]) -> Result<CliCommand, String> {
