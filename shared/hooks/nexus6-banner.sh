@@ -150,35 +150,42 @@ if topo_path.exists():
             sing_str = f'·Σ{count} '
     except: pass
 
-# Closed form count — grade=10 (PASS/EXACT) / total (%) + 🎉 celebration on increase
+# Closed form tracker:
+#   🧬 PASS/EXACT count with milestone progress bar (always shown)
+#   🎉 닫힘완료 — ONLY when EXACT (grade 10 = alien index r=10) count increases
 closed_str = ''
 vc_path = HOME / 'Dev/nexus6/shared/verified_constants.jsonl'
 closed_snap_path = HOME / 'Dev/nexus6/shared/.closed_snapshot.json'
 if vc_path.exists():
     try:
-        closed_count = 0
+        closed_count = 0  # PASS + EXACT (all closures)
+        exact_count = 0   # EXACT only (true grade-10 closures)
         total_count = 0
         with open(vc_path, 'rb') as f:
             for line in f:
                 total_count += 1
                 try:
                     j = json.loads(line)
-                    if j.get('status') in ('PASS','EXACT') or j.get('grade') in ('PASS','EXACT'):
+                    s = j.get('status') or j.get('grade','?')
+                    if s in ('PASS','EXACT'):
                         closed_count += 1
+                    if s == 'EXACT':
+                        exact_count += 1
                 except: pass
 
         pct = (closed_count * 100.0 / total_count) if total_count > 0 else 0.0
 
-        # compare with snapshot
-        prev_count = closed_count
+        # compare EXACT count with snapshot (celebration trigger)
+        prev_exact = exact_count
         if closed_snap_path.exists():
             try:
-                prev_count = json.loads(closed_snap_path.read_text()).get('closed', closed_count)
+                snap = json.loads(closed_snap_path.read_text())
+                prev_exact = snap.get('exact', exact_count)
             except: pass
         else:
-            closed_snap_path.write_text(json.dumps({'closed': closed_count}))
+            closed_snap_path.write_text(json.dumps({'closed': closed_count, 'exact': exact_count}))
 
-        delta = closed_count - prev_count
+        delta = exact_count - prev_exact  # EXACT delta only
         def fmt_k(n): return f'{n/1000:.1f}k' if n>=1000 else str(n)
         # milestone tracker (fixed target, monotonic)
         milestones = [1000, 2500, 5000, 7500, 10000, 20000, 50000, 100000]
@@ -187,8 +194,9 @@ if vc_path.exists():
         ms_filled = int(ms_pct / 10)
         ms_bar = '█' * ms_filled + '░' * (10 - ms_filled)
         if delta > 0:
-            closed_str = f' 🧬{closed_count}닫힘→{fmt_k(next_ms)}={ms_pct:.0f}% [{ms_bar}] 🎉🎉🎉 +{delta}닫힘완료 🎉🎉🎉'
-            closed_snap_path.write_text(json.dumps({'closed': closed_count}))
+            # EXACT (grade 10) count increased → 닫힘완료 (full closure achieved)
+            closed_str = f' 🧬{closed_count}닫힘→{fmt_k(next_ms)}={ms_pct:.0f}% [{ms_bar}] 🎉🎉🎉 닫힘완료 🎉🎉🎉'
+            closed_snap_path.write_text(json.dumps({'closed': closed_count, 'exact': exact_count}))
         elif closed_count > 0:
             closed_str = f' 🧬{closed_count}닫힘→{fmt_k(next_ms)}={ms_pct:.0f}% [{ms_bar}]'
     except: pass
