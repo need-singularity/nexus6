@@ -171,13 +171,30 @@ pub enum CliCommand {
         output: String,
         sample: usize,
     },
+    ClosedFind {
+        value: f64,
+    },
     /// Pack: install/uninstall CLI-only nexus6 integration (symlink + CC hooks).
     Pack { sub: PackSub },
     /// Sentry: pure-Rust health watcher for nexus6 daemon (no API calls).
     Sentry { sub: SentrySub },
     /// Hook: toggle Claude Code hook scripts (local CLI, no API).
     Hook { sub: HookSub },
+    /// mk2: prime-atomic smooth-class engine (Phase 5-6).
+    Mk2 { sub: Mk2Sub },
     Help,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Mk2Sub {
+    /// Classify a value via keyword + value_range + prime_set scoring.
+    Classify { value: f64, text: Option<String> },
+    /// Show φ, τ, σ, sopfr, ρ for a given n.
+    Arithmetic { n: u64 },
+    /// List n values whose prime_set matches exactly.
+    Layer { primes: Vec<u64>, max: u64 },
+    /// Show Euler ratio for a prime set.
+    EulerRatio { primes: Vec<u64> },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -284,9 +301,11 @@ pub fn parse_args(args: &[String]) -> Result<CliCommand, String> {
         "singularity-resonance" | "sres" => parse_singularity_resonance(rest),
         "singularity-seed" | "sseed" => parse_singularity_seed(rest),
         "singularity-viz" | "sviz" => parse_singularity_viz(rest),
+        "closed-find" | "cf" => parse_closed_find(rest),
         "pack" => parse_pack(rest),
         "sentry" => parse_sentry(rest),
         "hook" => parse_hook(rest),
+        "mk2" => parse_mk2(rest),
         "help" | "--help" | "-h" => Ok(CliCommand::Help),
         other => Err(format!("Unknown command: '{}'. Run 'nexus6 help' for usage.", other)),
     }
@@ -1097,6 +1116,12 @@ fn parse_singularity_seed(args: &[String]) -> Result<CliCommand, String> {
     Ok(CliCommand::SingularitySeed { base_dir, eps, top, domain_filter, json })
 }
 
+fn parse_closed_find(args: &[String]) -> Result<CliCommand, String> {
+    if args.is_empty() { return Err("closed-find requires a numeric value".into()); }
+    let value: f64 = args[0].parse().map_err(|e| format!("invalid value: {}", e))?;
+    Ok(CliCommand::ClosedFind { value })
+}
+
 fn parse_singularity_viz(args: &[String]) -> Result<CliCommand, String> {
     let mut base_dir: Option<String> = None;
     let mut output = "shared/cycle/topology.html".to_string();
@@ -1276,6 +1301,85 @@ fn parse_hook(args: &[String]) -> Result<CliCommand, String> {
         )),
     };
     Ok(CliCommand::Hook { sub })
+}
+
+fn parse_mk2(args: &[String]) -> Result<CliCommand, String> {
+    let sub = args.first().ok_or(
+        "mk2: requires subcommand (classify|arithmetic|layer|euler-ratio)"
+    )?;
+    let rest = &args[1..];
+    let sub = match sub.as_str() {
+        "classify" => {
+            let value: f64 = rest
+                .first()
+                .ok_or("mk2 classify: requires <value>")?
+                .parse()
+                .map_err(|e| format!("bad <value>: {}", e))?;
+            let mut text: Option<String> = None;
+            let mut i = 1;
+            while i < rest.len() {
+                if rest[i] == "--text" {
+                    i += 1;
+                    text = rest.get(i).cloned();
+                }
+                i += 1;
+            }
+            Mk2Sub::Classify { value, text }
+        }
+        "arithmetic" | "arith" => {
+            let n: u64 = rest
+                .first()
+                .ok_or("mk2 arithmetic: requires <n>")?
+                .parse()
+                .map_err(|e| format!("bad <n>: {}", e))?;
+            Mk2Sub::Arithmetic { n }
+        }
+        "layer" => {
+            let mut primes: Vec<u64> = Vec::new();
+            let mut max: u64 = 1000;
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--primes" => {
+                        i += 1;
+                        if let Some(s) = rest.get(i) {
+                            primes = s
+                                .split(',')
+                                .filter_map(|p| p.trim().parse().ok())
+                                .collect();
+                        }
+                    }
+                    "--max" => {
+                        i += 1;
+                        max = rest.get(i).and_then(|s| s.parse().ok()).unwrap_or(max);
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            if primes.is_empty() {
+                return Err("mk2 layer: requires --primes p1,p2,...".into());
+            }
+            Mk2Sub::Layer { primes, max }
+        }
+        "euler-ratio" | "er" => {
+            let primes: Vec<u64> = rest
+                .first()
+                .ok_or("mk2 euler-ratio: requires comma-sep primes")?
+                .split(',')
+                .filter_map(|p| p.trim().parse().ok())
+                .collect();
+            if primes.is_empty() {
+                return Err("mk2 euler-ratio: no primes parsed".into());
+            }
+            Mk2Sub::EulerRatio { primes }
+        }
+        other => return Err(format!(
+            "Unknown mk2 sub-command: '{}'. Use classify|arithmetic|layer|euler-ratio.",
+            other
+        )),
+    };
+    Ok(CliCommand::Mk2 { sub })
 }
 
 #[cfg(test)]

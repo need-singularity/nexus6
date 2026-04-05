@@ -194,9 +194,11 @@ fn run_with_config(cmd: CliCommand, cfg: &NexusConfig) -> Result<(), String> {
         CliCommand::SingularityResonance { base_dir, limit, domain_filter } => run_singularity_resonance(base_dir, limit, domain_filter),
         CliCommand::SingularitySeed { base_dir, eps, top, domain_filter, json } => run_singularity_seed(base_dir, eps, top, domain_filter, json),
         CliCommand::SingularityViz { base_dir, output, sample } => run_singularity_viz(base_dir, output, sample),
+        CliCommand::ClosedFind { value } => run_closed_find(value),
         CliCommand::Pack { sub } => run_pack(sub),
         CliCommand::Sentry { sub } => run_sentry(sub),
         CliCommand::Hook { sub } => run_hook(sub),
+        CliCommand::Mk2 { sub } => run_mk2(sub),
         CliCommand::Help => {
             print_help();
             Ok(())
@@ -3293,6 +3295,27 @@ fn run_singularity_seed(base_dir: Option<String>, eps: f32, top: usize, domain_f
     Ok(())
 }
 
+fn run_closed_find(value: f64) -> Result<(), String> {
+    use crate::singularity_recursion::closer::{build_table, find_closure, table_stats};
+    let table = build_table(1000, 50);
+    let (total, unique, dup) = table_stats(&table);
+    println!("closed-find: {}", value);
+    println!("  table: {} exprs, {} unique values ({:.2}x duplication)", total, unique, dup);
+    match find_closure(value, &table) {
+        Some(exprs) => {
+            println!("  MATCH ({} expressions):", exprs.len());
+            for (i, e) in exprs.iter().take(10).enumerate() {
+                println!("    {}. {}", i+1, e);
+            }
+            if exprs.len() > 10 {
+                println!("    ... ({} more)", exprs.len() - 10);
+            }
+        }
+        None => println!("  no closure found (may be transcendental)"),
+    }
+    Ok(())
+}
+
 fn run_singularity_viz(base_dir: Option<String>, output: String, sample: usize) -> Result<(), String> {
     use std::collections::HashMap;
     use std::io::Write;
@@ -3495,3 +3518,72 @@ fn run_singularity_backfill(
     Ok(())
 }
 
+fn run_mk2(sub: crate::cli::parser::Mk2Sub) -> Result<(), String> {
+    use crate::cli::parser::Mk2Sub;
+    use crate::mk2::{
+        classify_v2, default_sectors, euler_ratio, PrimeSet,
+        rho, SmoothRing,
+    };
+    match sub {
+        Mk2Sub::Classify { value, text } => {
+            let sectors = default_sectors();
+            let text = text.unwrap_or_default();
+            // Extract values from text
+            let values: Vec<f64> = text
+                .split_whitespace()
+                .filter_map(|s| s.trim_matches(|c: char| !c.is_ascii_digit() && c != '.').parse().ok())
+                .filter(|&v: &f64| v > 0.0 && v < 10000.0)
+                .chain(std::iter::once(value))
+                .collect();
+            // Build a conservative prime set from the value if rational
+            let mut ps = PrimeSet::empty();
+            // Rough heuristic: if value is near an integer, use its prime factors
+            if (value - value.round()).abs() < 1e-6 && value > 1.0 {
+                let n = value.round() as u64;
+                for (p, _) in crate::mk2::factorize(n) {
+                    ps.insert(p);
+                }
+            }
+            let result = classify_v2(&text, &values, &ps, &sectors);
+            println!("mk2 classify: value={} text=\"{}\"", value, text);
+            println!("  sector       : {}", result.sector);
+            println!("  confidence   : {:.3}", result.confidence);
+            println!("  keyword hits : {}", result.keyword_hits);
+            println!("  value in range: {}", result.value_range_hit);
+            println!("  prime_set match: {:.2}", result.prime_set_match);
+            println!("  prime_set    : {}", ps);
+            Ok(())
+        }
+        Mk2Sub::Arithmetic { n } => {
+            println!("mk2 arithmetic(n={}):", n);
+            println!("  φ(n)   = {}", n.phi());
+            println!("  τ(n)   = {}", n.tau());
+            println!("  σ(n)   = {}", n.sigma());
+            println!("  sopfr  = {}", n.sopfr());
+            println!("  ρ(n)   = {} = {:.6}", rho(n), rho(n).to_f64());
+            println!("  primes = {}", n.prime_set());
+            Ok(())
+        }
+        Mk2Sub::Layer { primes, max } => {
+            let mut ps = PrimeSet::empty();
+            for p in &primes { ps.insert(*p); }
+            let lattice = crate::mk2::Lattice::default();
+            let entries = lattice.enumerate_layer(&ps, max);
+            println!("mk2 layer(primes={}, max={}): {} entries", ps, max, entries.len());
+            for n in entries.iter().take(40) {
+                println!("  {}", n);
+            }
+            if entries.len() > 40 {
+                println!("  ... ({} more)", entries.len() - 40);
+            }
+            Ok(())
+        }
+        Mk2Sub::EulerRatio { primes } => {
+            let mut ps = PrimeSet::empty();
+            for p in &primes { ps.insert(*p); }
+            let r = euler_ratio(&ps);
+            println!("mk2 euler-ratio: primes={} → {} = {:.6}", ps, r, r.to_f64());
+            Ok(())
+        }
+    }
+}
