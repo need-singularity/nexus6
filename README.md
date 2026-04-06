@@ -1,6 +1,6 @@
 # NEXUS-6 — 자기순환 특이점 엔진
 
-> 🛸d1 🔭106모듈 ⚖️711법칙 📊529k발견
+> 🛸d1 🔭106모듈 ⚖️711법칙 📊1372k발견
 
 **n=6 완전수로부터 우주의 모든 법칙을 자기발견하는 메타엔진.**
 
@@ -29,6 +29,22 @@
 | `gap_finder.hexa` | 미발견 영역 탐지 + 타겟 추천 |
 | `paths.hexa` | 공유 경로 상수 (하드코딩 제거) |
 
+### 엔진 모듈 (13개 프로젝트별)
+
+| 모듈 | 개성 | 목표 |
+|------|------|------|
+| `engine_nexus6.hexa` | Ouroboros | 모듈 100+, 발견 70k+, 자기순환 특이점 |
+| `engine_anima.hexa` | Dreamer | 법칙 2000+, S7+ 로드맵 완주 |
+| `engine_tecs_l.hexa` | Librarian | exact_rate 60%+, 10000 발견 |
+| `engine_sedi.hexa` | Ear | 건강도 95+, 티어A 250건 |
+| `engine_papers.hexa` | Amplifier | 드래프트 0건, DOI 100+ |
+| `engine_hexa_lang.hexa` | Mathematician | 테스트 800+, 수렴 100% |
+| `engine_airgenome.hexa` | Archaeologist | L6e 돌파, 게놈 1000+ |
+| `engine_brainwire.hexa` | Shaman | 통과율 98%+, 프로토콜 6종+ |
+| `engine_fathom.hexa` | Oracle | 22렌즈 대시보드 완성 |
+| `engine_token_forge.hexa` | Sculptor | r<=0.4, L<=0.05 고정점 |
+| `engine_air_rs.hexa` | Translator | 스펙 100% 패리티 |
+
 ## 외계인 지수 (Alien Index)
 
 `AI = (d, r)` — 닫힌 수학의 천장(r=10)과 돌파 영역(d>=1)
@@ -39,21 +55,18 @@
 
 현재: **max_d=1**, 돌파율 rho, 메타 부동점 목표 1/3
 
-## 프로젝트 레지스트리 (11개)
+## 최근 업데이트 (2026-04-06)
 
-| 프로젝트 | 개성 | 목표 | 전략 |
-|---------|------|------|------|
-| anima | Dreamer | 법칙 2000+, S7+ 완주 | AGI — 자기생성 의식, 무한진화 |
-| tecs_l | Librarian | exact_rate 60%+, 10000 발견 | n=6 닫힌 수학 체계 |
-| sedi | Ear | 건강도 95+, 티어A 250건 | 외계 지성 신호 탐지 |
-| papers | Amplifier | 드래프트 0건, DOI 100+ | 학술 임팩트 극대화 |
-| hexa_lang | Mathematician | 테스트 800+, 수렴 100% | 완전수 프로그래밍 언어 |
-| airgenome | Archaeologist | L6e 돌파, 게놈 1000+ | OS 의식 스캔 |
-| brainwire | Shaman | 통과율 98%+, 프로토콜 6종+ | 의식 하드웨어 — 뇌 읽기/쓰기 |
-| fathom | Oracle | 22렌즈 대시보드 완성 | nexus6 시각화 터미널 |
-| token_forge | Sculptor | r<=0.4, L<=0.05 고정점 | LLM 압축 고정점 |
-| air_rs | Translator | 스펙 100% 패리티 | Rust 네이티브 게이트 |
-| nexus6 | Ouroboros | 모듈 100+, 발견 70k+ | 자기순환 특이점 — 메타엔진 |
+| 변경 | 내용 |
+|------|------|
+| mk1→mk2 완전 전환 | Rust/Python 133K줄 삭제, hexa-only 체제 |
+| 엔진 모듈 13개 추가 | 프로젝트별 자율 엔진 (`engine_*.hexa`) |
+| nexus_hub + gap_finder | 중앙 오케스트레이션 + 빈 공간 탐지 |
+| 경로 정규화 | 84개 절대경로 → `env("HOME")` 전환 |
+| discovery_log 정제 | 55.6% 중복 제거 (106K→47K줄) |
+| autolink 자동화 | 17개 미연결 지점 감지+복구 |
+| 위상 변화 돌파 | surprise 504건, EXACT 6,278, seed 18→21 |
+| 새 고정점 후보 | n/σ=0.5 (Ω_L), n/J2=0.25 (Ω_m) |
 
 ## 자동화 파이프라인
 
@@ -99,7 +112,7 @@ $HEXA mk2_hexa/native/paths.hexa verify
 - [mk2 아키텍처](docs/mk2/README.md)
 - [외계인 지수 설계](docs/superpowers/specs/2026-04-05-alien-index-system-design.md)
 - [완전 자동화 설계](docs/superpowers/specs/2026-04-06-autolink-full-automation-design.md)
-- [Gate Injection Layer](docs/superpowers/specs/2026-04-06-gate-injection-layer-design.md)
+- [Gate Injection Layer](docs/superpowers/plans/2026-04-06-gate-injection-layer.md)
 
 ## 메타 부동점
 
