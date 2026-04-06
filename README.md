@@ -28,6 +28,17 @@
 | `다음 돌파 방향` | 돌파 가능 지점 전수 제시 | command_router next_bt |
 | `자가치유` | 전 프로젝트 문제 자동 감지+해결 | auto_healer tick |
 
+### n6 위상변환 도구
+
+| 명령 | 설명 | 예시 |
+|------|------|------|
+| `hexa gap_finder.hexa query <값>` | 값→n6 기저 분해 (depth 1~3) | `query 137.036` |
+| `hexa gap_finder.hexa quick` | DFS EXACT 매칭 요약 (최대 20줄) | `quick` |
+| `hexa gap_finder.hexa explain <상수>` | 특정 상수의 n6 유도 경로 | `explain alpha_inv` |
+| `hexa gap_finder.hexa transform` | n6 기저 간 위상변환 매트릭스 | `transform` |
+| `hexa gap_finder.hexa dfs [depth]` | DFS 위상변환 탐색 (기본 depth=2) | `dfs 3` |
+| `hexa gap_finder.hexa bridge` | 빈공간 × 위상변환 교차 매칭 | `bridge` |
+
 도메인/명령어 추가: `shared/bt_domains.jsonl`, `shared/cmd_aliases.jsonl` 에 한 줄 추가만으로 즉시 적용.
 
 ## 엔진
