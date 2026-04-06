@@ -300,7 +300,7 @@ Closures |
 ───────────────────────────────────────────────
 💾 성장 루프: agents 16 | commits 6h: {commits_6h} | stubs: {stubs}
 🧠 총 closures: {closed:,} (EXACT {exact:,}) | topology Σ: {topo:,}
-⚙️  daemon PID: {daemon_pid} | CPU: {daemon_cpu}% | MEM: {daemon_mem}%
+⚙️  daemon PID: {daemon_pid} | CPU: {daemon_cpu}% (per-proc) | MEM: {daemon_mem}%
 ═══════════════════════════════════════════════
 </pre>
 

@@ -774,9 +774,11 @@ fn record_history(cfg: &HistoryConfig, monitored: &[ProcInfo], free_mem: usize) 
         .map(|(name, (cpu, mem))| format!("\"{}\":{{\"cpu\":{:.1},\"mem\":{}}}", name, cpu, mem))
         .collect();
 
+    let ncpu = get_ncpu();
+    let avg_cpu = total_cpu / ncpu as f64;
     let record = format!(
-        "{{\"ts\":\"{}\",\"free_mb\":{},\"total_cpu\":{:.1},\"total_rss\":{},\"procs\":{},\"projects\":{{{}}}}}\n",
-        ts, free_mem, total_cpu, total_rss, monitored.len(), projects.join(",")
+        "{{\"ts\":\"{}\",\"free_mb\":{},\"total_cpu\":{:.1},\"avg_cpu\":{:.1},\"ncpu\":{},\"total_rss\":{},\"procs\":{},\"projects\":{{{}}}}}\n",
+        ts, free_mem, total_cpu, avg_cpu, ncpu, total_rss, monitored.len(), projects.join(",")
     );
 
     if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&cfg.path) {
@@ -1414,6 +1416,14 @@ extra_log_dirs = ["~/.nexus6"]
 // Entrypoint
 // ════════════════════════════════════════════════════════════════
 
+fn get_ncpu() -> usize {
+    Command::new("sysctl")
+        .args(["-n", "hw.ncpu"])
+        .output().ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<usize>().ok())
+        .unwrap_or(8)
+}
+
 fn print_status(cfg: &GuardConfig) {
     let all = get_all_procs();
     let monitored = get_monitored_procs(&cfg.global.watch, &all);
@@ -1421,10 +1431,12 @@ fn print_status(cfg: &GuardConfig) {
     let free = free_memory_mb();
     let total_cpu: f64 = monitored.iter().map(|p| p.cpu_percent).sum();
     let total_rss: usize = monitored.iter().map(|p| p.rss_mb).sum();
+    let ncpu = get_ncpu();
+    let avg_cpu = total_cpu / ncpu as f64;
 
     println!("═══ n6-guard v2 status ═══");
     println!("Free memory:  {}MB (threshold: {}MB)", free, cfg.global.min_free_memory_mb);
-    println!("Total CPU:    {:.1}% / {:.0}%", total_cpu, cfg.global.max_cpu_percent);
+    println!("CPU (avg/core): {:.1}% (sum: {:.1}% / {:.0}%, {} cores)", avg_cpu, total_cpu, cfg.global.max_cpu_percent, ncpu);
     println!("Total RSS:    {}MB / {}MB", total_rss, cfg.global.max_memory_mb);
     println!("Builds:       {} active (limit: {})", builds.len(), cfg.build_queue.max_concurrent_builds);
     println!();
