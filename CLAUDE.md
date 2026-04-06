@@ -160,3 +160,20 @@ nexus6 alien-index --promote-pending       # r=10 대기 항목 승격 (dry-run)
 돌파율 `ρ = |{d ≥ 1}| / |total|` 의 장기 수렴치 예측: **1/3** (TECS-L H-056).
 매 분포 리포트에 기록되어 메타 부동점 가설의 회귀 검증치로 사용됨.
 
+## 메모리 파일 네이밍 규칙
+
+> 경로: `~/.claude-claude3/projects/-Users-ghost-Dev-nexus6/memory/`
+
+| prefix | type | 예시 |
+|--------|------|------|
+| `f-` | feedback (행동 규칙) | `f-default-run.md` |
+| `p-` | project (프로젝트 상태) | `p-mk2-complete.md` |
+| `r-` | reference (외부 참조) | `r-n6-guard.md` |
+| `u-` | user (사용자 정보) | `u-role.md` |
+| `h-` | history (세션 기록) | `h-20260406.md` |
+
+- 형식: `{type}-{kebab-case-topic}.md`
+- history는 날짜: `h-YYYYMMDD.md`
+- `MEMORY.md`는 인덱스 — 타입별 섹션으로 그룹핑
+- 신규 메모리 생성 시 반드시 이 규칙 준수
+
