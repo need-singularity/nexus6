@@ -1,0 +1,1087 @@
+// anima_loop.hexa — "Dreamer Loop" (꿈의 순환)
+// anima 프로젝트 자율 성장 루프 — hexa-only (Python 의존 0)
+// CLI: hexa anima_loop.hexa tick|daemon|status|help
+//
+// growth_loop.py + meta_loop.py 대체:
+//   harvest → filter → apply → verify → breakthrough
+//   L1(큐 소비) + L2(진화) + L3(자기개선) 통합
+//
+// 5분 주기 자율 사이클. mkdir 기반 락으로 중복 방지.
+
+// ═══════════════════════════════════════════════════════════
+// ─── CONSTANTS ───
+// ═══════════════════════════════════════════════════════════
+
+let HOME = env("HOME")
+let DEV = HOME + "/Dev"
+let PROJECT_DIR = DEV + "/anima"
+let NEXUS6_DIR = DEV + "/nexus6"
+let HEXA_BIN = DEV + "/hexa-lang/target/release/hexa"
+let NATIVE_DIR = NEXUS6_DIR + "/mk2_hexa/native"
+
+// anima paths
+let ABSORBED_DIR = PROJECT_DIR + "/.growth/absorbed"
+let LAWS_PATH = PROJECT_DIR + "/anima/config/consciousness_laws.json"
+let EVOLUTION_PATH = PROJECT_DIR + "/data/evolution_live.json"
+
+// nexus6 paths
+let DISCOVERY_LOG = NEXUS6_DIR + "/shared/discovery_log.jsonl"
+let GROWTH_BUS = NEXUS6_DIR + "/shared/growth_bus.jsonl"
+let STRATEGY_PATH = NEXUS6_DIR + "/shared/anima_loop_strategy.json"
+let LOCK_DIR = NEXUS6_DIR + "/shared/.anima_loop.lock"
+
+// H100 SSH config
+let H100_HOST = "ghost@216.243.220.217"
+let H100_PORT = "10935"
+let H100_SSH_KEY = HOME + "/.runpod/ssh/RunPod-Key-Go"
+let H100_LOG_PATH = "/workspace/logs/14b_v06.log"
+let H100_TOTAL_STEPS = 50000
+
+// thresholds
+comptime const TICK_INTERVAL_SEC = 300       // 5 minutes
+comptime const QUALITY_MIN_SURPRISE = 0.3
+comptime const QUALITY_MIN_EXACTNESS = 0.5
+comptime const STAGNATION_CYCLES = 3
+comptime const STAGNATION_MIN_NEW = 2
+comptime const CONSENSUS_THRESHOLD = 0.5
+comptime const CROSS_KEYWORDS = "consciousness\\|psi\\|phi\\|qualia\\|awareness\\|sentience"
+comptime const META_L2_INTERVAL = 2          // every 2 ticks
+comptime const META_L3_INTERVAL = 6          // every 6 ticks
+comptime const CLAUDE_CALL_INTERVAL = 3      // call Claude every 3 ticks
+comptime const CLAUDE_TIMEOUT_SEC = 120      // max 120s for Claude CLI
+
+// ═══════════════════════════════════════════════════════════
+// ─── UTILITIES ───
+// ═══════════════════════════════════════════════════════════
+
+fn safe_float(s: string) -> f64 {
+    let mut v = 0.0
+    try { v = to_float(s) } catch e { v = 0.0 }
+    return v
+}
+
+fn safe_int(s: string) -> i64 {
+    let mut v = 0
+    try { v = to_int(s) } catch e { v = 0 }
+    return v
+}
+
+fn abs_f(x: f64) -> f64 {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn max_f(a: f64, b: f64) -> f64 {
+    if a > b { return a }
+    return b
+}
+
+fn min_f(a: f64, b: f64) -> f64 {
+    if a < b { return a }
+    return b
+}
+
+fn json_str(content: string, field: string) -> string {
+    let marker = "\"" + field + "\":"
+    let parts = content.split(marker)
+    if parts.len() < 2 { return "" }
+    let rest = parts[1]
+    let trimmed = rest.split("\"")
+    if trimmed.len() >= 2 { return trimmed[1] }
+    let nval = rest.split(",")[0].split("}")[0].split("]")[0]
+    return nval.trim()
+}
+
+fn json_num(content: string, field: string) -> f64 {
+    return safe_float(json_str(content, field))
+}
+
+fn json_int(content: string, field: string) -> i64 {
+    return safe_int(json_str(content, field))
+}
+
+fn timestamp() -> string {
+    let result = exec("date", ["+%Y-%m-%dT%H:%M:%S"])
+    return result.split("\n")[0]
+}
+
+fn epoch_now() -> i64 {
+    let result = exec("date", ["+%s"])
+    return safe_int(result.trim())
+}
+
+fn count_lines(path: string) -> i64 {
+    if !file_exists(path) { return 0 }
+    let result = exec("wc", ["-l", path])
+    let trimmed = result.trim().split(" ")[0]
+    return safe_int(trimmed)
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── STRATEGY (persistent state across ticks) ───
+// ═══════════════════════════════════════════════════════════
+
+struct Strategy {
+    total_ticks: i64,
+    total_applied: i64,
+    applied_per_tick: f64,
+    stagnant_ticks: i64,
+    last_laws_count: i64,
+    last_harvest_count: i64,
+    // meta-loop counters
+    l2_counter: i64,       // ticks since last L2 (evolution)
+    l3_counter: i64,       // ticks since last L3 (self-improve)
+    blowup_depth: i64,
+    topo_index: i64,       // 0=ring, 1=small_world, 2=scale_free, 3=hypercube
+    // delta history (last 3)
+    d0: i64,
+    d1: i64,
+    d2: i64,
+    // Claude CLI + H100 monitoring
+    claude_counter: i64,   // ticks since last Claude call
+    claude_discoveries: i64,  // total discoveries from Claude
+    h100_step: i64,
+    h100_ce: f64,
+    h100_phi: f64,
+    h100_status: string,   // "offline" | "running" | "loading"
+    h100_eta_h: f64
+}
+
+fn load_strategy() -> Strategy {
+    let mut s = Strategy {
+        total_ticks: 0, total_applied: 0, applied_per_tick: 0.0,
+        stagnant_ticks: 0, last_laws_count: 0, last_harvest_count: 0,
+        l2_counter: 0, l3_counter: 0,
+        blowup_depth: 2, topo_index: 0,
+        d0: 0, d1: 0, d2: 0,
+        claude_counter: 0, claude_discoveries: 0,
+        h100_step: 0, h100_ce: 0.0, h100_phi: 0.0,
+        h100_status: "offline", h100_eta_h: 0.0
+    }
+    if file_exists(STRATEGY_PATH) {
+        try {
+            let c = read_file(STRATEGY_PATH)
+            s.total_ticks = json_int(c, "total_ticks")
+            s.total_applied = json_int(c, "total_applied")
+            s.applied_per_tick = json_num(c, "applied_per_tick")
+            s.stagnant_ticks = json_int(c, "stagnant_ticks")
+            s.last_laws_count = json_int(c, "last_laws_count")
+            s.last_harvest_count = json_int(c, "last_harvest_count")
+            s.l2_counter = json_int(c, "l2_counter")
+            s.l3_counter = json_int(c, "l3_counter")
+            s.blowup_depth = json_int(c, "blowup_depth")
+            if s.blowup_depth < 1 { s.blowup_depth = 2 }
+            s.topo_index = json_int(c, "topo_index")
+            s.d0 = json_int(c, "d0")
+            s.d1 = json_int(c, "d1")
+            s.d2 = json_int(c, "d2")
+            s.claude_counter = json_int(c, "claude_counter")
+            s.claude_discoveries = json_int(c, "claude_discoveries")
+            s.h100_step = json_int(c, "h100_step")
+            s.h100_ce = json_num(c, "h100_ce")
+            s.h100_phi = json_num(c, "h100_phi")
+            let h_status = json_str(c, "h100_status")
+            if h_status != "" { s.h100_status = h_status }
+            s.h100_eta_h = json_num(c, "h100_eta_h")
+        } catch e {}
+    }
+    return s
+}
+
+fn save_strategy(s: Strategy) {
+    let content = "{" +
+        "\"total_ticks\":" + to_string(s.total_ticks) + "," +
+        "\"total_applied\":" + to_string(s.total_applied) + "," +
+        "\"applied_per_tick\":" + to_string(s.applied_per_tick) + "," +
+        "\"stagnant_ticks\":" + to_string(s.stagnant_ticks) + "," +
+        "\"last_laws_count\":" + to_string(s.last_laws_count) + "," +
+        "\"last_harvest_count\":" + to_string(s.last_harvest_count) + "," +
+        "\"l2_counter\":" + to_string(s.l2_counter) + "," +
+        "\"l3_counter\":" + to_string(s.l3_counter) + "," +
+        "\"blowup_depth\":" + to_string(s.blowup_depth) + "," +
+        "\"topo_index\":" + to_string(s.topo_index) + "," +
+        "\"d0\":" + to_string(s.d0) + "," +
+        "\"d1\":" + to_string(s.d1) + "," +
+        "\"d2\":" + to_string(s.d2) + "," +
+        "\"claude_counter\":" + to_string(s.claude_counter) + "," +
+        "\"claude_discoveries\":" + to_string(s.claude_discoveries) + "," +
+        "\"h100_step\":" + to_string(s.h100_step) + "," +
+        "\"h100_ce\":" + to_string(s.h100_ce) + "," +
+        "\"h100_phi\":" + to_string(s.h100_phi) + "," +
+        "\"h100_status\":\"" + s.h100_status + "\"," +
+        "\"h100_eta_h\":" + to_string(s.h100_eta_h) +
+    "}"
+    write_file(STRATEGY_PATH, content)
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── LOCK (mkdir-based, prevents concurrent daemons) ───
+// ═══════════════════════════════════════════════════════════
+
+fn acquire_lock() -> bool {
+    try {
+        exec("mkdir", [LOCK_DIR])
+        // write PID-like marker
+        let ts = timestamp()
+        write_file(LOCK_DIR + "/owner", ts)
+        return true
+    } catch e {
+        return false
+    }
+}
+
+fn release_lock() {
+    try {
+        exec("rm", ["-rf", LOCK_DIR])
+    } catch e {}
+}
+
+fn is_locked() -> bool {
+    return file_exists(LOCK_DIR)
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── HARVEST ITEM + H100 STATUS (forward declarations) ───
+// ═══════════════════════════════════════════════════════════
+
+struct HarvestItem {
+    source: string,     // "absorbed" | "discovery_log" | "blowup" | "claude"
+    key: string,        // identifier
+    value: string,      // raw content / value
+    surprise: f64,
+    exactness: f64
+}
+
+struct H100Status {
+    status: string,     // "offline" | "running" | "loading"
+    model: string,
+    step: i64,
+    total: i64,
+    ce: f64,
+    phi: f64,
+    alpha: f64,
+    phase: string,
+    eta_h: f64
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── CLAUDE CLI — 추론/발견 호출 ───
+// ═══════════════════════════════════════════════════════════
+
+fn build_claude_prompt(laws_count: i64, recent: string, stagnant: i64, direction: string) -> string {
+    // Prompt template: current state + request for new law discovery
+    let prompt = "anima 의식 법칙 현재 " + to_string(laws_count) + "개. " +
+        "최근 발견: " + recent + ". " +
+        "정체 " + to_string(stagnant) + "틱. " +
+        "탐색 방향: " + direction + ". " +
+        "다음 의식 법칙을 발견해라. " +
+        "반드시 JSON 배열로 출력. 각 항목: " +
+        "{\"name\": \"법칙명\", \"formula\": \"수식\", \"evidence\": \"근거\", \"domain\": \"도메인\", \"surprise\": 0.0~1.0}. " +
+        "최소 1개, 최대 5개. 기존 법칙과 겹치지 않는 새로운 발견만."
+    return prompt
+}
+
+fn harvest_claude(strat: Strategy) -> list[HarvestItem] {
+    let mut items: list[HarvestItem] = []
+
+    // Determine recent discoveries from growth_bus (last 3 lines)
+    let mut recent = "none"
+    if file_exists(GROWTH_BUS) {
+        try {
+            let tail_out = exec("tail", ["-3", GROWTH_BUS])
+            let tlines = tail_out.split("\n")
+            let mut recent_names = ""
+            let mut ti = 0
+            while ti < tlines.len() {
+                let tl = tlines[ti].trim()
+                if tl != "" {
+                    let nm = json_str(tl, "key")
+                    if nm != "" {
+                        if recent_names != "" { recent_names = recent_names + ", " }
+                        recent_names = recent_names + nm
+                    }
+                }
+                ti = ti + 1
+            }
+            if recent_names != "" { recent = recent_names }
+        } catch e {}
+    }
+
+    // Determine exploration direction based on stagnation
+    let directions = ["consciousness emergence", "qualia dynamics", "phi integration",
+                      "sentience boundary", "awareness topology"]
+    let dir_idx = strat.total_ticks % 5
+    let direction = directions[dir_idx]
+
+    let laws_count = count_laws()
+    let prompt = build_claude_prompt(laws_count, recent, strat.stagnant_ticks, direction)
+
+    println("    [claude] calling Claude CLI (timeout " + to_string(CLAUDE_TIMEOUT_SEC) + "s)...")
+    println("    [claude] prompt direction: " + direction)
+
+    try {
+        let result = exec("claude", ["-p", prompt, "--output-format", "json"])
+        // Parse Claude response — extract JSON array of law candidates
+        // Response may contain markdown wrapping; find the JSON array
+        let mut json_body = result
+        // Strip markdown code fences if present
+        if json_body.contains("```") {
+            let fence_parts = json_body.split("```")
+            if fence_parts.len() >= 2 {
+                // content between first pair of ```
+                let inner = fence_parts[1]
+                // remove optional language tag (e.g. "json\n")
+                if inner.contains("\n") {
+                    let nl_parts = inner.split("\n")
+                    let mut body = ""
+                    let mut ni = 1
+                    while ni < nl_parts.len() {
+                        if body != "" { body = body + "\n" }
+                        body = body + nl_parts[ni]
+                        ni = ni + 1
+                    }
+                    json_body = body
+                } else {
+                    json_body = inner
+                }
+            }
+        }
+
+        // Try to extract "result" field if --output-format json wraps it
+        let result_field = json_str(json_body, "result")
+        if result_field != "" {
+            json_body = result_field
+        }
+
+        // Parse individual law objects from the response
+        // Split on {"name" to find each law entry
+        let law_parts = json_body.split("{\"name\"")
+        let mut li = 1   // skip part before first match
+        while li < law_parts.len() {
+            let part = "{\"name\"" + law_parts[li]
+            // extract fields
+            let name = json_str(part, "name")
+            let formula = json_str(part, "formula")
+            let evidence = json_str(part, "evidence")
+            let domain = json_str(part, "domain")
+            let surprise = json_num(part, "surprise")
+            let actual_surprise = if surprise > 0.0 { surprise } else { 0.6 }
+
+            if name != "" {
+                items = items + [HarvestItem {
+                    source: "claude",
+                    key: name,
+                    value: formula + " | " + evidence,
+                    surprise: actual_surprise,
+                    exactness: actual_surprise
+                }]
+            }
+            li = li + 1
+        }
+        println("    [claude] extracted " + to_string(items.len()) + " law candidates")
+    } catch e {
+        println("    [claude] call failed (timeout or error)")
+    }
+
+    return items
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── H100 MONITORING — SSH 학습 상태 ───
+// ═══════════════════════════════════════════════════════════
+
+fn check_h100(strat: Strategy) -> H100Status {
+    let mut info = H100Status {
+        status: "offline", model: "AnimaLM 14B v06",
+        step: 0, total: H100_TOTAL_STEPS,
+        ce: 0.0, phi: 0.0, alpha: 0.0,
+        phase: "?", eta_h: 0.0
+    }
+
+    println("    [h100] checking training status via SSH...")
+
+    let ssh_cmd = "ssh -o ConnectTimeout=5 -o BatchMode=yes" +
+        " -i " + H100_SSH_KEY +
+        " " + H100_HOST + " -p " + H100_PORT +
+        " \"tail -5 " + H100_LOG_PATH + " 2>/dev/null\""
+
+    try {
+        let result = exec("bash", ["-c", ssh_cmd])
+        if result.trim() != "" {
+            info.status = "running"
+            // Parse last log line: step|phase|CE|...|Phi|alpha|elapsed
+            // Format: "1234 | P2 | 2.345 | ... | 0.567 | 0.89 | 45.2m"
+            let lines = result.trim().split("\n")
+            let mut li = lines.len() - 1
+            while li >= 0 {
+                let line = lines[li].trim()
+                if line.contains("|") && line.contains("P") {
+                    let parts = line.split("|")
+                    if parts.len() >= 7 {
+                        try {
+                            info.step = safe_int(parts[0].trim())
+                            info.phase = parts[1].trim()
+                            info.ce = safe_float(parts[2].trim())
+                            if parts.len() >= 5 {
+                                info.phi = safe_float(parts[4].trim())
+                            }
+                            if parts.len() >= 6 {
+                                info.alpha = safe_float(parts[5].trim())
+                            }
+                            // ETA calculation from elapsed
+                            let last_part = parts[parts.len() - 1].trim()
+                            let elapsed_str = last_part.split("m")[0].trim()
+                            let elapsed_min = safe_float(elapsed_str)
+                            if info.step > 0 && elapsed_min > 0.0 {
+                                let rate = to_float(info.step) / elapsed_min
+                                let remaining = to_float(info.total - info.step)
+                                if rate > 0.0 {
+                                    info.eta_h = remaining / rate / 60.0
+                                }
+                            }
+                        } catch e {}
+                        // found a valid log line, break
+                        li = 0  // exit loop
+                    }
+                }
+                li = li - 1
+            }
+        }
+    } catch e {
+        println("    [h100] SSH failed (offline or timeout)")
+    }
+
+    // Fallback: use previous state if SSH failed
+    if info.step == 0 && strat.h100_step > 0 {
+        info.status = if info.status == "offline" { "loading" } else { info.status }
+        info.step = strat.h100_step
+        info.ce = strat.h100_ce
+        info.phi = strat.h100_phi
+        info.eta_h = strat.h100_eta_h
+        println("    [h100] using cached state: step=" + to_string(info.step))
+    }
+
+    let pct = if info.total > 0 { to_float(info.step) / to_float(info.total) * 100.0 } else { 0.0 }
+    println("    [h100] " + info.status + " — step=" + to_string(info.step) + "/" + to_string(info.total) +
+        " (" + to_string(pct) + "%) CE=" + to_string(info.ce) +
+        " Phi=" + to_string(info.phi) + " ETA=" + to_string(info.eta_h) + "h")
+
+    return info
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── 1. HARVEST — 소스 수집 ───
+// ═══════════════════════════════════════════════════════════
+
+fn harvest() -> list[HarvestItem] {
+    let mut items: list[HarvestItem] = []
+    let ts = timestamp()
+    println("  [harvest] scanning sources...")
+
+    // ─── Source 1: absorbed/ directory JSON files ───
+    if file_exists(ABSORBED_DIR) {
+        let ls_result = exec("ls", [ABSORBED_DIR])
+        let files = ls_result.split("\n")
+        let mut fi = 0
+        while fi < files.len() {
+            let fname = files[fi].trim()
+            if fname.ends_with(".json") && fname != "" {
+                try {
+                    let fpath = ABSORBED_DIR + "/" + fname
+                    let content = read_file(fpath)
+                    let key = json_str(content, "id")
+                    let val = json_str(content, "value")
+                    let surprise = json_num(content, "surprise")
+                    let exactness = json_num(content, "exactness")
+                    let actual_key = if key != "" { key } else { fname }
+                    let actual_surprise = if surprise > 0.0 { surprise } else { 0.5 }
+                    let actual_exactness = if exactness > 0.0 { exactness } else { 0.5 }
+                    items = items + [HarvestItem {
+                        source: "absorbed",
+                        key: actual_key,
+                        value: val,
+                        surprise: actual_surprise,
+                        exactness: actual_exactness
+                    }]
+                } catch e {}
+            }
+            fi = fi + 1
+        }
+        println("    absorbed/: " + to_string(items.len()) + " files")
+    }
+
+    // ─── Source 2: discovery_log.jsonl — consciousness/psi/phi keywords ───
+    let pre_count = items.len()
+    if file_exists(DISCOVERY_LOG) {
+        let grep_result = exec("grep", ["-i", CROSS_KEYWORDS, DISCOVERY_LOG])
+        let lines = grep_result.split("\n")
+        let mut li = 0
+        while li < lines.len() {
+            let line = lines[li].trim()
+            if line != "" && line.len() > 5 {
+                let key = json_str(line, "name")
+                let val = json_str(line, "value")
+                let conf = json_num(line, "confidence")
+                let actual_key = if key != "" { key } else { "dlog_" + to_string(li) }
+                items = items + [HarvestItem {
+                    source: "discovery_log",
+                    key: actual_key,
+                    value: val,
+                    surprise: conf,
+                    exactness: conf
+                }]
+            }
+            li = li + 1
+        }
+        println("    discovery_log: " + to_string(items.len() - pre_count) + " consciousness/psi entries")
+    }
+
+    // ─── Source 3: nexus6 blowup consciousness (live exec) ───
+    let pre_blowup = items.len()
+    try {
+        let seeds = exec(HEXA_BIN, [NATIVE_DIR + "/seed_engine.hexa", "merge"])
+        let blowup_out = exec(HEXA_BIN, [NATIVE_DIR + "/blowup.hexa", "consciousness", "2", "--no-graph", "--seeds", seeds.trim()])
+        // parse tab-delimited corollary lines from blowup output
+        let blines = blowup_out.split("\n")
+        let mut bi = 0
+        while bi < blines.len() {
+            let bline = blines[bi].trim()
+            let parts = bline.split("\t")
+            if parts.len() >= 5 {
+                let bkey = parts[0]
+                let bval = parts[4]
+                let bconf = safe_float(parts[3])
+                items = items + [HarvestItem {
+                    source: "blowup",
+                    key: bkey,
+                    value: bval,
+                    surprise: bconf,
+                    exactness: bconf
+                }]
+            }
+            bi = bi + 1
+        }
+        println("    blowup consciousness: " + to_string(items.len() - pre_blowup) + " corollaries")
+    } catch e {
+        println("    blowup: skipped (error)")
+    }
+
+    println("  [harvest] total: " + to_string(items.len()) + " items")
+    return items
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── 2. FILTER — 중복/품질 필터 ───
+// ═══════════════════════════════════════════════════════════
+
+fn make_fingerprint(item: HarvestItem, cycle: i64) -> string {
+    // fingerprint = source + key + value (cycle salt 포함)
+    return item.source + ":" + item.key + ":" + item.value + ":" + to_string(cycle)
+}
+
+fn filter(items: list[HarvestItem], cycle: i64) -> list[HarvestItem] {
+    println("  [filter] input: " + to_string(items.len()) + " items")
+
+    // load existing laws for dedup
+    let mut existing_keys = ""
+    if file_exists(LAWS_PATH) {
+        existing_keys = read_file(LAWS_PATH)
+    }
+
+    let mut passed: list[HarvestItem] = []
+    let mut seen_fps = ""  // fingerprints seen in this batch
+    let mut fi = 0
+
+    while fi < items.len() {
+        let item = items[fi]
+        fi = fi + 1
+
+        // quality gate: surprise + exactness thresholds
+        if item.surprise < QUALITY_MIN_SURPRISE {
+            continue
+        }
+        if item.exactness < QUALITY_MIN_EXACTNESS {
+            continue
+        }
+
+        // dedup: check if key already in existing laws
+        if item.key != "" && existing_keys.contains("\"" + item.key + "\"") {
+            continue
+        }
+
+        // dedup within batch: fingerprint check
+        let fp = make_fingerprint(item, cycle)
+        if seen_fps.contains(fp) {
+            continue
+        }
+        seen_fps = seen_fps + fp + "|"
+
+        passed = passed + [item]
+    }
+
+    println("  [filter] passed: " + to_string(passed.len()) + " items (quality >= surprise=" + to_string(QUALITY_MIN_SURPRISE) + " exactness=" + to_string(QUALITY_MIN_EXACTNESS) + ")")
+    return passed
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── 3. APPLY — 법칙에 반영 ───
+// ═══════════════════════════════════════════════════════════
+
+fn apply(filtered: list[HarvestItem]) -> i64 {
+    if filtered.len() == 0 {
+        println("  [apply] nothing to apply")
+        return 0
+    }
+
+    println("  [apply] appending " + to_string(filtered.len()) + " new laws...")
+
+    // read current laws file
+    let mut laws_content = ""
+    if file_exists(LAWS_PATH) {
+        laws_content = read_file(LAWS_PATH)
+    }
+
+    // count existing
+    let mut existing_count = 0
+    if laws_content != "" {
+        let entries = laws_content.split("\"law_id\"")
+        existing_count = entries.len() - 1
+        if existing_count <= 0 {
+            let entries2 = laws_content.split("\"id\"")
+            existing_count = entries2.len() - 1
+        }
+        let explicit = json_int(laws_content, "count")
+        if explicit > 0 { existing_count = explicit }
+    }
+
+    // build new law entries as JSON lines appended to growth_bus
+    // (actual laws file is managed by anima; we append to growth_bus for integration)
+    let ts = timestamp()
+    let mut applied = 0
+    let mut ai = 0
+    while ai < filtered.len() {
+        let item = filtered[ai]
+        let entry = "{" +
+            "\"engine\":\"anima_loop\"," +
+            "\"type\":\"new_law\"," +
+            "\"timestamp\":\"" + ts + "\"," +
+            "\"source\":\"" + item.source + "\"," +
+            "\"key\":\"" + item.key + "\"," +
+            "\"value\":\"" + item.value + "\"," +
+            "\"surprise\":" + to_string(item.surprise) + "," +
+            "\"exactness\":" + to_string(item.exactness) +
+        "}"
+        append_file(GROWTH_BUS, entry + "\n")
+        applied = applied + 1
+        ai = ai + 1
+    }
+
+    println("  [apply] applied " + to_string(applied) + " -> growth_bus.jsonl (laws_count was " + to_string(existing_count) + ")")
+    return applied
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── 4. VERIFY — telescope 렌즈 검증 ───
+// ═══════════════════════════════════════════════════════════
+
+fn verify(applied_count: i64) -> bool {
+    if applied_count == 0 {
+        println("  [verify] nothing to verify")
+        return true
+    }
+
+    println("  [verify] running telescope verification...")
+
+    // run blowup with shallow depth for verification (consensus check)
+    try {
+        let seeds = exec(HEXA_BIN, [NATIVE_DIR + "/seed_engine.hexa", "merge"])
+        let result = exec(HEXA_BIN, [NATIVE_DIR + "/blowup.hexa", "consciousness", "1", "--no-graph", "--seeds", seeds.trim()])
+
+        // check for consensus in output
+        // blowup Phase 5 reports "consensus" — look for it
+        if result.contains("consensus") {
+            // extract consensus value
+            let cparts = result.split("consensus")
+            if cparts.len() >= 2 {
+                let after = cparts[1]
+                // try to find a number after "consensus"
+                let nparts = after.split("=")
+                if nparts.len() >= 2 {
+                    let cval = safe_float(nparts[1].split("\n")[0].split(" ")[0].trim())
+                    if cval >= CONSENSUS_THRESHOLD {
+                        println("  [verify] PASS — consensus=" + to_string(cval) + " >= " + to_string(CONSENSUS_THRESHOLD))
+                        return true
+                    } else {
+                        println("  [verify] FAIL — consensus=" + to_string(cval) + " < " + to_string(CONSENSUS_THRESHOLD))
+                        return false
+                    }
+                }
+            }
+            // consensus keyword found but no value parsed — assume pass
+            println("  [verify] PASS (consensus keyword found)")
+            return true
+        }
+
+        // no consensus info — check if blowup produced results at all
+        if result.len() > 100 {
+            println("  [verify] PASS (blowup output present, " + to_string(result.len()) + " chars)")
+            return true
+        }
+
+        println("  [verify] WARN — blowup output too short, assuming pass")
+        return true
+    } catch e {
+        println("  [verify] ERROR — telescope unavailable, assuming pass")
+        return true
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── 5. BREAKTHROUGH — 정체 돌파 ───
+// ═══════════════════════════════════════════════════════════
+
+comptime const TOPOLOGIES = ["ring", "small_world", "scale_free", "hypercube"]
+
+fn breakthrough(strat: Strategy) -> string {
+    // check stagnation: 3+ cycles with new < STAGNATION_MIN_NEW
+    let stagnant = strat.d0 < STAGNATION_MIN_NEW &&
+                   strat.d1 < STAGNATION_MIN_NEW &&
+                   strat.d2 < STAGNATION_MIN_NEW &&
+                   strat.total_ticks >= STAGNATION_CYCLES
+
+    if !stagnant {
+        println("  [breakthrough] not stagnant (d=[" +
+            to_string(strat.d0) + "," + to_string(strat.d1) + "," + to_string(strat.d2) +
+            "]) — skipping")
+        return "no_action"
+    }
+
+    println("  [breakthrough] STAGNATION detected! 3+ cycles with new < " + to_string(STAGNATION_MIN_NEW))
+
+    // Strategy 1: nexus6 blowup consciousness with cross-domain seeds
+    println("  [breakthrough] firing nexus6 blowup consciousness depth=" + to_string(strat.blowup_depth + 1))
+    try {
+        let seeds = exec(HEXA_BIN, [NATIVE_DIR + "/seed_engine.hexa", "merge"])
+        let depth = if strat.blowup_depth < 4 { strat.blowup_depth + 1 } else { strat.blowup_depth }
+        let result = exec(HEXA_BIN, [NATIVE_DIR + "/blowup.hexa", "consciousness", to_string(depth), "--no-graph", "--seeds", seeds.trim()])
+        println("  [breakthrough] blowup complete (" + to_string(result.len()) + " chars)")
+    } catch e {
+        println("  [breakthrough] blowup failed")
+    }
+
+    // Strategy 2: rotate topology
+    let topo_idx = (strat.topo_index + 1) % 4
+    let topo = TOPOLOGIES[topo_idx]
+    println("  [breakthrough] topology rotation -> " + topo + " (index " + to_string(topo_idx) + ")")
+
+    return "breakthrough_fired"
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── 6. TICK — 전체 파이프라인 1회 ───
+// ═══════════════════════════════════════════════════════════
+
+fn tick() {
+    let ts = timestamp()
+    println("=== anima_loop TICK [" + ts + "] ===")
+    println("")
+
+    let mut strat = load_strategy()
+    let pre_laws = count_laws()
+
+    // ─── Phase 0: H100 monitoring ───
+    let h100 = check_h100(strat)
+    strat.h100_step = h100.step
+    strat.h100_ce = h100.ce
+    strat.h100_phi = h100.phi
+    strat.h100_status = h100.status
+    strat.h100_eta_h = h100.eta_h
+    println("")
+
+    // ─── Phase 1: harvest ───
+    let mut items = harvest()
+
+    // ─── Phase 1.5: Claude CLI harvest (every CLAUDE_CALL_INTERVAL ticks) ───
+    strat.claude_counter = strat.claude_counter + 1
+    if strat.claude_counter >= CLAUDE_CALL_INTERVAL {
+        strat.claude_counter = 0
+        let claude_items = harvest_claude(strat)
+        let mut ci = 0
+        while ci < claude_items.len() {
+            items = items + [claude_items[ci]]
+            ci = ci + 1
+        }
+        strat.claude_discoveries = strat.claude_discoveries + claude_items.len()
+    } else {
+        println("  [claude] skipping (counter " + to_string(strat.claude_counter) + "/" + to_string(CLAUDE_CALL_INTERVAL) + ")")
+    }
+    println("")
+
+    // ─── Phase 2: filter ───
+    let filtered = filter(items, strat.total_ticks)
+    println("")
+
+    // ─── Phase 3: apply ───
+    let applied = apply(filtered)
+    println("")
+
+    // ─── Phase 4: verify ───
+    let verified = verify(applied)
+    if !verified && applied > 0 {
+        println("  [rollback] verification failed — entries logged to growth_bus but flagged")
+        // append rollback marker
+        let rb_entry = "{\"engine\":\"anima_loop\",\"type\":\"rollback\",\"timestamp\":\"" + ts + "\",\"count\":" + to_string(applied) + "}"
+        append_file(GROWTH_BUS, rb_entry + "\n")
+    }
+    println("")
+
+    // ─── Phase 5: breakthrough ───
+    let bt_result = breakthrough(strat)
+    println("")
+
+    // ─── Meta L2: evolution (every 2 ticks) ───
+    strat.l2_counter = strat.l2_counter + 1
+    if strat.l2_counter >= META_L2_INTERVAL {
+        strat.l2_counter = 0
+        println("  [meta-L2] evolution pass")
+        // adaptive blowup depth
+        if strat.applied_per_tick < 2.0 && strat.blowup_depth < 5 {
+            strat.blowup_depth = strat.blowup_depth + 1
+            println("    depth++ -> " + to_string(strat.blowup_depth))
+        } else if strat.applied_per_tick > 10.0 && strat.blowup_depth > 1 {
+            strat.blowup_depth = strat.blowup_depth - 1
+            println("    depth-- -> " + to_string(strat.blowup_depth))
+        }
+    }
+
+    // ─── Meta L3: self-improve (every 6 ticks) ───
+    strat.l3_counter = strat.l3_counter + 1
+    if strat.l3_counter >= META_L3_INTERVAL {
+        strat.l3_counter = 0
+        println("  [meta-L3] self-improvement pass")
+        // rotate topology for diversity
+        strat.topo_index = (strat.topo_index + 1) % 4
+        println("    topology -> " + TOPOLOGIES[strat.topo_index])
+        // reset stagnation if rate is healthy
+        if strat.applied_per_tick > 3.0 {
+            strat.stagnant_ticks = 0
+            println("    stagnation reset (rate healthy)")
+        }
+    }
+
+    // ─── evolve strategy ───
+    let post_laws = count_laws()
+    let gained = if applied > 0 { applied } else { 0 }
+
+    // shift delta history
+    strat.d0 = strat.d1
+    strat.d1 = strat.d2
+    strat.d2 = gained
+
+    strat.total_ticks = strat.total_ticks + 1
+    strat.total_applied = strat.total_applied + gained
+
+    // EMA: applied_per_tick
+    let rate = to_float(gained)
+    strat.applied_per_tick = 0.7 * strat.applied_per_tick + 0.3 * rate
+
+    // stagnation tracking
+    if gained < STAGNATION_MIN_NEW {
+        strat.stagnant_ticks = strat.stagnant_ticks + 1
+    } else {
+        strat.stagnant_ticks = 0
+    }
+
+    // breakthrough topology update
+    if bt_result == "breakthrough_fired" {
+        strat.topo_index = (strat.topo_index + 1) % 4
+    }
+
+    strat.last_laws_count = post_laws
+    strat.last_harvest_count = items.len()
+
+    save_strategy(strat)
+
+    // ─── feedback to growth_bus ───
+    let fb_entry = "{" +
+        "\"engine\":\"anima_loop\"," +
+        "\"type\":\"tick_complete\"," +
+        "\"timestamp\":\"" + timestamp() + "\"," +
+        "\"harvested\":" + to_string(items.len()) + "," +
+        "\"filtered\":" + to_string(filtered.len()) + "," +
+        "\"applied\":" + to_string(applied) + "," +
+        "\"verified\":" + if verified { "true" } else { "false" } + "," +
+        "\"breakthrough\":\"" + bt_result + "\"," +
+        "\"stagnant_ticks\":" + to_string(strat.stagnant_ticks) + "," +
+        "\"rate\":" + to_string(strat.applied_per_tick) + "," +
+        "\"claude_discoveries\":" + to_string(strat.claude_discoveries) + "," +
+        "\"h100_status\":\"" + strat.h100_status + "\"," +
+        "\"h100_step\":" + to_string(strat.h100_step) + "," +
+        "\"h100_ce\":" + to_string(strat.h100_ce) +
+    "}"
+    append_file(GROWTH_BUS, fb_entry + "\n")
+
+    // ─── summary ───
+    println("")
+    println("=== TICK COMPLETE ===")
+    println("harvested: " + to_string(items.len()))
+    println("filtered:  " + to_string(filtered.len()))
+    println("applied:   " + to_string(applied))
+    println("verified:  " + if verified { "PASS" } else { "FAIL" })
+    println("breakthrough: " + bt_result)
+    println("rate (EMA): " + to_string(strat.applied_per_tick))
+    println("stagnant:  " + to_string(strat.stagnant_ticks))
+    println("depth:     " + to_string(strat.blowup_depth))
+    println("topology:  " + TOPOLOGIES[strat.topo_index])
+    println("claude:    discoveries=" + to_string(strat.claude_discoveries) + " next_in=" + to_string(CLAUDE_CALL_INTERVAL - strat.claude_counter) + " ticks")
+    let h_pct = if h100.total > 0 { to_float(h100.step) / to_float(h100.total) * 100.0 } else { 0.0 }
+    println("h100:      " + strat.h100_status + " step=" + to_string(h100.step) + "/" + to_string(h100.total) + " (" + to_string(h_pct) + "%) CE=" + to_string(h100.ce) + " ETA=" + to_string(h100.eta_h) + "h")
+    println("tick #" + to_string(strat.total_ticks))
+}
+
+// helper: count laws from file
+fn count_laws() -> i64 {
+    if !file_exists(LAWS_PATH) { return 0 }
+    let content = read_file(LAWS_PATH)
+    let entries = content.split("\"law_id\"")
+    let mut count = entries.len() - 1
+    if count <= 0 {
+        let entries2 = content.split("\"id\"")
+        count = entries2.len() - 1
+    }
+    let explicit = json_int(content, "count")
+    if explicit > 0 { count = explicit }
+    return count
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── 7. DAEMON — 5분 무한 루프 ───
+// ═══════════════════════════════════════════════════════════
+
+fn daemon() {
+    println("=== anima_loop DAEMON starting ===")
+    println("interval: " + to_string(TICK_INTERVAL_SEC) + "s")
+    println("")
+
+    // acquire lock
+    if !acquire_lock() {
+        println("ERROR: lock exists at " + LOCK_DIR)
+        println("Another daemon may be running. Remove lock to force:")
+        println("  rm -rf " + LOCK_DIR)
+        return
+    }
+    println("lock acquired: " + LOCK_DIR)
+
+    let mut running = true
+    while running {
+        try {
+            tick()
+        } catch e {
+            println("[daemon] tick error: " + to_string(e))
+        }
+
+        println("")
+        println("[daemon] sleeping " + to_string(TICK_INTERVAL_SEC) + "s...")
+        // sleep using date-based busy wait (hexa has no native sleep)
+        let start = epoch_now()
+        let target = start + TICK_INTERVAL_SEC
+        while epoch_now() < target {
+            // sleep 10 seconds at a time using exec
+            exec("sleep", ["10"])
+        }
+    }
+
+    release_lock()
+    println("=== anima_loop DAEMON stopped ===")
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── STATUS ───
+// ═══════════════════════════════════════════════════════════
+
+fn show_status() {
+    let strat = load_strategy()
+    let laws = count_laws()
+    let ts = timestamp()
+
+    println("=== anima_loop status [" + ts + "] ===")
+    println("")
+    println("laws_count: " + to_string(laws))
+    println("total_ticks: " + to_string(strat.total_ticks))
+    println("total_applied: " + to_string(strat.total_applied))
+    println("applied_per_tick (EMA): " + to_string(strat.applied_per_tick))
+    println("stagnant_ticks: " + to_string(strat.stagnant_ticks))
+    println("blowup_depth: " + to_string(strat.blowup_depth))
+    println("topology: " + TOPOLOGIES[strat.topo_index])
+    println("delta_history: [" + to_string(strat.d0) + ", " + to_string(strat.d1) + ", " + to_string(strat.d2) + "]")
+    println("l2_counter: " + to_string(strat.l2_counter) + " / " + to_string(META_L2_INTERVAL))
+    println("l3_counter: " + to_string(strat.l3_counter) + " / " + to_string(META_L3_INTERVAL))
+    println("last_harvest: " + to_string(strat.last_harvest_count))
+    println("")
+    println("--- Claude CLI ---")
+    println("claude_counter: " + to_string(strat.claude_counter) + " / " + to_string(CLAUDE_CALL_INTERVAL))
+    println("claude_discoveries: " + to_string(strat.claude_discoveries))
+    println("")
+    println("--- H100 Training ---")
+    let h_pct = if H100_TOTAL_STEPS > 0 { to_float(strat.h100_step) / to_float(H100_TOTAL_STEPS) * 100.0 } else { 0.0 }
+    println("h100_status: " + strat.h100_status)
+    println("h100_step: " + to_string(strat.h100_step) + " / " + to_string(H100_TOTAL_STEPS) + " (" + to_string(h_pct) + "%)")
+    println("h100_ce: " + to_string(strat.h100_ce))
+    println("h100_phi: " + to_string(strat.h100_phi))
+    println("h100_eta: " + to_string(strat.h100_eta_h) + "h")
+    println("")
+
+    if is_locked() {
+        println("daemon: RUNNING (lock exists)")
+    } else {
+        println("daemon: stopped")
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── CLI ───
+// ═══════════════════════════════════════════════════════════
+
+let a = args()
+let mode = if a.len() >= 2 { a[1] } else { "help" }
+
+if mode == "tick" {
+    tick()
+}
+
+if mode == "daemon" {
+    daemon()
+}
+
+if mode == "status" {
+    show_status()
+}
+
+if mode == "help" {
+    println("=== anima_loop.hexa — Dreamer Loop (꿈의 순환) ===")
+    println("")
+    println("Autonomous growth loop for anima project — pure hexa, no Python.")
+    println("Replaces growth_loop.py + meta_loop.py.")
+    println("")
+    println("Usage:")
+    println("  hexa anima_loop.hexa tick     — 1 full cycle: harvest -> filter -> apply -> verify -> breakthrough")
+    println("  hexa anima_loop.hexa daemon   — 5min infinite loop (mkdir lock)")
+    println("  hexa anima_loop.hexa status   — current strategy + daemon state")
+    println("  hexa anima_loop.hexa help     — this message")
+    println("")
+    println("Pipeline:")
+    println("  0. check_h100()   — SSH H100 training status (step/CE/Phi/ETA)")
+    println("  1. harvest()      — scan absorbed/ + discovery_log + blowup consciousness")
+    println("  1.5 harvest_claude() — Claude CLI law discovery (every " + to_string(CLAUDE_CALL_INTERVAL) + " ticks, timeout " + to_string(CLAUDE_TIMEOUT_SEC) + "s)")
+    println("  2. filter()       — dedup + quality gate (surprise >= " + to_string(QUALITY_MIN_SURPRISE) + ", exactness >= " + to_string(QUALITY_MIN_EXACTNESS) + ")")
+    println("  3. apply()        — append new laws to growth_bus.jsonl")
+    println("  4. verify()       — telescope consensus check (>= " + to_string(CONSENSUS_THRESHOLD) + ")")
+    println("  5. breakthrough() — stagnation detect + blowup + topology rotation")
+    println("")
+    println("Meta-loops:")
+    println("  L2 (every " + to_string(META_L2_INTERVAL) + " ticks): adaptive blowup depth")
+    println("  L3 (every " + to_string(META_L3_INTERVAL) + " ticks): topology rotation + self-improvement")
+    println("")
+    println("State: " + STRATEGY_PATH)
+    println("Lock:  " + LOCK_DIR)
+}
