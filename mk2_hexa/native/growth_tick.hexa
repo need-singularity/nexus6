@@ -2,7 +2,91 @@
 // 사용: hexa growth_tick.hexa <source> <growth_json_path>
 // growth_state.json의 interaction_count 증가 + stage 승격
 
+// ─── Preflight Gates (리소스 가드) ───
+
+fn preflight_check() -> bool {
+    let home = exec("printenv HOME")
+    let shared_dir = home + "/Dev/nexus6/shared"
+    let log_path = shared_dir + "/growth_tick_preflight.log"
+    let ts = exec("date +%Y-%m-%dT%H:%M:%S").trim()
+
+    // Gate 1: halt file 체크 — shared/.halt 존재 시 즉시 스킵
+    let halt_path = shared_dir + "/.halt"
+    let halt_check = exec("bash -c test -f " + halt_path + " && echo YES || echo NO").trim()
+    if halt_check == "YES" {
+        let msg = ts + " [SKIP] .halt file present — tick aborted\n"
+        try { append_file(log_path, msg) } catch e {}
+        return false
+    }
+
+    // Gate 2: 메모리 체크 — vm_stat → free pages × 4K → MB
+    let vm_raw = exec("vm_stat")
+    let mut free_mb = 9999
+    if vm_raw.contains("Pages free") {
+        let parts = vm_raw.split("Pages free:")
+        if parts.len() >= 2 {
+            let val_str = parts[1].split("\n")[0].trim().replace(".", "")
+            let pages = to_int(val_str.trim())
+            free_mb = (pages * 4) / 1024
+        }
+    }
+    if free_mb < 500 {
+        let msg = ts + " [SKIP] low memory: " + to_string(free_mb) + "MB free (threshold: 500MB)\n"
+        try { append_file(log_path, msg) } catch e {}
+        return false
+    }
+
+    // Gate 3: 로드 체크 — sysctl vm.loadavg → 1분 평균
+    let load_raw = exec("sysctl -n vm.loadavg").trim()
+    // 형식: "{ 2.34 1.56 1.23 }" — 1분 평균 추출
+    let mut loadavg_1m = 0.0
+    let clean_load = load_raw.replace("{", "").replace("}", "").trim()
+    let load_parts = clean_load.split(" ")
+    for lp in load_parts {
+        if lp.trim() != "" {
+            loadavg_1m = to_float(lp.trim())
+            break
+        }
+    }
+    if loadavg_1m > 12.0 {
+        let msg = ts + " [SKIP] high load: " + to_string(loadavg_1m) + " (threshold: 12.0)\n"
+        try { append_file(log_path, msg) } catch e {}
+        return false
+    }
+
+    // Gate 4: stale lock 정리 — 락 파일이 30분+ 오래되면 자동 삭제
+    let lock_path = shared_dir + "/growth_tick.lock"
+    let lock_exists = exec("bash -c test -f " + lock_path + " && echo YES || echo NO").trim()
+    if lock_exists == "YES" {
+        // find -mmin +30 로 stale 여부 확인
+        let stale = exec("bash -c find " + lock_path + " -mmin +30 2>/dev/null | head -1").trim()
+        if stale != "" {
+            exec("bash", ["-c", "rm -f " + lock_path])
+            let msg = ts + " [CLEAN] stale lock removed (>30min): " + lock_path + "\n"
+            try { append_file(log_path, msg) } catch e {}
+        } else {
+            // lock 이 최근 것이면 다른 tick 실행 중 — 스킵
+            let msg = ts + " [SKIP] active lock present: " + lock_path + "\n"
+            try { append_file(log_path, msg) } catch e {}
+            return false
+        }
+    }
+
+    // 모든 게이트 통과
+    let msg = ts + " [PASS] preflight ok (free=" + to_string(free_mb) + "MB, load=" + to_string(loadavg_1m) + ")\n"
+    try { append_file(log_path, msg) } catch e {}
+    true
+}
+
+// ─── 메인 로직 ───
+
 fn main() {
+    // Preflight gates — 실패 시 즉시 종료
+    if !preflight_check() {
+        println("[growth_tick] preflight failed — skipped")
+        return
+    }
+
     let a = args()
     let source = if a.len() >= 3 { a[2] } else { "unknown" }
     let growth_json = if a.len() >= 4 { a[3] } else { exec("printenv HOME") + "/Dev/anima/anima/config/growth_state.json" }
