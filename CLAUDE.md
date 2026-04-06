@@ -137,10 +137,16 @@ TECS-L H-056: `메타(메타(메타(...))) = 초월`
 - n6_check 테이블에 `meta_fp`, `transcendence` (0.333...) 등록됨
 - `MetaTranscendenceLens`가 데이터에서 메타 수렴 구조 자동 탐지
 
+### 세션 시작 시 자동 실행
+- 새 세션 첫 응답 전 `hexa directions.hexa brief` 출력 권장
+- 사용자가 "방향", "새방향", "다음", "directions" 요청 시 `hexa directions.hexa report` 실행
+- 돌파 완료 후 자동으로 `hexa directions.hexa update` 실행 (blowup Phase 7.1 끝에서 자동 호출)
+
 ### 키워드 → 자동 실행 (추가)
 - "마이크로사이클", "micro-cycle" → `nexus6 detect` 파이프라인 설명
 - "메타초월", "meta transcendence" → MetaTranscendenceLens 스캔
 - "재귀성장", "recursive growth" → 3-loop 자기강화 설명 + 상태 확인
+- "방향", "새방향", "다음", "directions" → `hexa directions.hexa report` (방향 리포트)
 
 ## 외계인 지수 (Alien Index)
 
