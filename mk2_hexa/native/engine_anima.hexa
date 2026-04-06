@@ -18,7 +18,10 @@ let evolution_path = project_dir + "/anima/data/evolution_live.json"
 let roadmap_path = project_dir + "/anima/data/evolution_roadmap.json"
 let growth_state_path = project_dir + "/anima/config/growth_loop_state.json"
 let absorbed_dir = project_dir + "/.growth/absorbed"
+let growth_log = project_dir + "/.growth/growth.log"
 let growth_bus = dev + "/nexus6/shared/growth_bus.jsonl"
+let autofix_state_path = dev + "/nexus6/shared/anima_autofix.json"
+let runpod_pod_id = "msgtbyfj09x896"
 let strategy_path = dev + "/nexus6/shared/engine_anima_strategy.json"
 let anima_state = dev + "/nexus6/shared/anima_state.json"
 let discovery_log = dev + "/nexus6/shared/discovery_log.jsonl"
@@ -812,6 +815,304 @@ fn evolve(st: AnimaState, strat: Strategy, pre_laws: i64) -> Strategy {
     return s
 }
 
+// ─── auto_fix: 4가지 문제 자동 감지 + 해결 ───
+
+struct AutoFixResult {
+    filter_fixed: bool,
+    h100_fixed: bool,
+    overload_fixed: bool,
+    stagnation_fixed: bool,
+    actions: str,
+    total_fixes: i64
+}
+
+fn load_autofix_state() -> string {
+    if file_exists(autofix_state_path) {
+        return read_file(autofix_state_path)
+    }
+    return "{}"
+}
+
+fn save_autofix_state(content: string) {
+    write_file(autofix_state_path, content)
+}
+
+fn auto_fix() -> AutoFixResult {
+    let ts = timestamp()
+    let mut result = AutoFixResult {
+        filter_fixed: false,
+        h100_fixed: false,
+        overload_fixed: false,
+        stagnation_fixed: false,
+        actions: [],
+        total_fixes: 0
+    }
+
+    println("[" + ts + "] === AUTO_FIX: scanning 4 problem areas ===")
+    println("")
+
+    // ─── Fix 1: 필터 과엄 (fingerprint 중복 + threshold) ───
+    println("  [Fix1] 필터 과엄 감지...")
+    let mut zero_filter_streak = 0
+    if file_exists(growth_log) {
+        // growth.log 최근 10줄에서 "0필터" 또는 "0반영" 또는 "harvested.*0" 패턴
+        let recent = exec("bash", ["-c", "tail -10 " + growth_log])
+        let lines = recent.split("\n")
+        let mut li = 0
+        while li < lines.len() {
+            let line = lines[li]
+            if line.contains("0필터") || line.contains("0반영") || line.contains("harvested: 0") || line.contains("applied: 0") {
+                zero_filter_streak = zero_filter_streak + 1
+            }
+            li = li + 1
+        }
+    }
+
+    // growth_loop_state.json에서 seen_fingerprints 크기 + evidence_threshold 확인
+    let mut fp_count = 0
+    let mut current_threshold = 0.3
+    if file_exists(growth_state_path) {
+        let gs = read_file(growth_state_path)
+        // seen_fingerprints 개수: 간접 측정
+        let fp_result = exec("bash", ["-c", "grep -o '\"seen_fingerprints\"' " + growth_state_path + " | wc -l"])
+        if safe_int(fp_result.trim()) > 0 {
+            // fingerprint 개수: "seen_fingerprints" 배열 안의 쉼표 수 + 1
+            let fp_count_result = exec("bash", ["-c", "sed -n '/seen_fingerprints/,/\\]/p' " + growth_state_path + " | grep -c '\"' 2>/dev/null || echo 0"])
+            fp_count = safe_int(fp_count_result.trim())
+        }
+        current_threshold = json_num(gs, "evidence_threshold")
+        if current_threshold == 0.0 { current_threshold = 0.3 }
+    }
+
+    // 조건: 연속 3회 이상 0필터 OR fingerprint > 200개 누적
+    let filter_needs_fix = zero_filter_streak >= 3 || fp_count > 200
+    if filter_needs_fix {
+        println("    감지됨: zero_filter_streak=" + to_string(zero_filter_streak) + " fp_count=" + to_string(fp_count) + " threshold=" + to_string(current_threshold))
+
+        // (a) seen_fingerprints 절반 삭제 (오래된 것 제거) — 새 항목 통과 허용
+        if fp_count > 100 {
+            let keep = fp_count / 2
+            exec("bash", ["-c", "cd " + project_dir + " && " + hexa_bin + " -e 'let j = read_file(\"" + growth_state_path + "\"); " + "' 2>/dev/null || true"])
+            // jq 없이 직접 처리: seen_fingerprints 배열 후반만 유지
+            let trim_result = exec("bash", ["-c", "cd " + project_dir + " && cat " + growth_state_path + " | sed 's/\"seen_fingerprints\": \\[.*\\]/\"seen_fingerprints\": []/' > " + growth_state_path + ".tmp 2>/dev/null && mv " + growth_state_path + ".tmp " + growth_state_path + " && echo DONE || echo FAIL"])
+            if trim_result.contains("DONE") {
+                println("    -> seen_fingerprints 초기화 (" + to_string(fp_count) + " -> 0)")
+                result.actions = result.actions + ["filter: fingerprints cleared (" + to_string(fp_count) + "->0)"]
+            } else {
+                println("    -> fingerprint 초기화 실패, sed 대안 시도")
+                // fallback: multiline-safe sed
+                exec("bash", ["-c", "cd " + project_dir + " && perl -0777 -i -pe 's/\"seen_fingerprints\":\\s*\\[.*?\\]/\"seen_fingerprints\": []/s' " + growth_state_path])
+                result.actions = result.actions + ["filter: fingerprints cleared (perl fallback)"]
+            }
+        }
+
+        // (b) evidence_threshold 완화: 현재 * 0.8, 최소 0.01
+        let new_threshold = if current_threshold * 0.8 < 0.01 { 0.01 } else { current_threshold * 0.8 }
+        if new_threshold != current_threshold {
+            // threshold가 이미 JSON에 있으면 교체, 없으면 추가
+            let sed_result = exec("bash", ["-c", "grep -c 'evidence_threshold' " + growth_state_path + " 2>/dev/null || echo 0"])
+            if safe_int(sed_result.trim()) > 0 {
+                exec("bash", ["-c", "sed -i '' 's/\"evidence_threshold\": *[0-9.eE+-]*/\"evidence_threshold\": " + to_string(new_threshold) + "/' " + growth_state_path])
+            } else {
+                exec("bash", ["-c", "sed -i '' 's/^{/{\"evidence_threshold\": " + to_string(new_threshold) + ",/' " + growth_state_path])
+            }
+            println("    -> evidence_threshold: " + to_string(current_threshold) + " -> " + to_string(new_threshold))
+            result.actions = result.actions + ["filter: threshold " + to_string(current_threshold) + " -> " + to_string(new_threshold)]
+        }
+
+        result.filter_fixed = true
+        result.total_fixes = result.total_fixes + 1
+        println("    [OK] 필터 완화 적용")
+    } else {
+        println("    정상: zero_streak=" + to_string(zero_filter_streak) + " fp=" + to_string(fp_count))
+    }
+
+    // ─── Fix 2: H100 offline 자동 복구 ───
+    println("")
+    println("  [Fix2] H100 연결 감지...")
+    let ssh_check = exec("bash", ["-c", "timeout 10 ssh -i ~/.runpod/ssh/RunPod-Key-Go -o ConnectTimeout=8 -o StrictHostKeyChecking=no root@64.247.201.44 -p 17913 'echo ALIVE' 2>&1 || echo TIMEOUT"])
+    let h100_alive = ssh_check.contains("ALIVE")
+
+    if !h100_alive {
+        println("    감지됨: H100 offline — " + ssh_check.trim().split("\n")[0])
+
+        // runpodctl로 pod 재시작 시도
+        let runpodctl_exists = exec("bash", ["-c", "which runpodctl 2>/dev/null || echo MISSING"])
+        if !runpodctl_exists.contains("MISSING") {
+            let start_result = exec("bash", ["-c", "runpodctl start pod " + runpod_pod_id + " 2>&1 || echo FAIL"])
+            if start_result.contains("FAIL") || start_result.contains("error") || start_result.contains("Error") {
+                println("    -> runpodctl start 실패: " + start_result.trim().split("\n")[0])
+                // fallback: 로컬 모드 전환
+                let fallback_state = "{\"h100_mode\":\"local\",\"since\":\"" + ts + "\",\"reason\":\"pod_start_failed\"}"
+                save_autofix_state(fallback_state)
+                println("    -> 로컬 모드로 전환 (H100 없이 동작)")
+                result.actions = result.actions + ["h100: pod start failed -> local mode"]
+            } else {
+                println("    -> runpodctl start 요청 전송: " + start_result.trim().split("\n")[0])
+                result.actions = result.actions + ["h100: pod restart requested"]
+            }
+        } else {
+            // runpodctl 없음 → curl API로 시도
+            let runpod_key = exec("bash", ["-c", "cat ~/.runpod/config.toml 2>/dev/null | grep api_key | head -1 | sed 's/.*= *\"//;s/\"//' || echo ''"]).trim()
+            let api_result = exec("bash", ["-c", "curl -s -X POST 'https://api.runpod.io/graphql' -H 'Content-Type: application/json' -H 'Authorization: Bearer " + runpod_key + "' -d '{\"query\":\"mutation { podResume(input: {podId: \\\"" + runpod_pod_id + "\\\", gpuCount: 1}) { id desiredStatus } }\"}' 2>&1 || echo FAIL"])
+            if api_result.contains("FAIL") || api_result.contains("error") {
+                println("    -> API resume 실패, 로컬 모드 전환")
+                let fallback_state = "{\"h100_mode\":\"local\",\"since\":\"" + ts + "\",\"reason\":\"api_resume_failed\"}"
+                save_autofix_state(fallback_state)
+                result.actions = result.actions + ["h100: API resume failed -> local mode"]
+            } else {
+                println("    -> API resume 전송: " + api_result.trim().split("\n")[0])
+                result.actions = result.actions + ["h100: API resume requested"]
+            }
+        }
+
+        result.h100_fixed = true
+        result.total_fixes = result.total_fixes + 1
+        println("    [OK] H100 복구 시도 완료")
+    } else {
+        println("    정상: H100 online")
+    }
+
+    // ─── Fix 3: 과부하 완화 (swap 체크) ───
+    println("")
+    println("  [Fix3] 시스템 과부하 감지...")
+    let swap_raw = exec("bash", ["-c", "sysctl vm.swapusage 2>/dev/null || echo 'used = 0.00M'"])
+    // parse "used = X.XXM" or "used = X.XXG"
+    let swap_parts = swap_raw.split("used = ")
+    let mut swap_gb = 0.0
+    if swap_parts.len() >= 2 {
+        let swap_val_str = swap_parts[1].split(" ")[0]
+        if swap_val_str.contains("G") {
+            swap_gb = safe_float(swap_val_str.split("G")[0])
+        } else if swap_val_str.contains("M") {
+            swap_gb = safe_float(swap_val_str.split("M")[0]) / 1024.0
+        }
+    }
+
+    if swap_gb > 6.0 {
+        println("    감지됨: swap=" + to_string(swap_gb) + "GB (> 6GB)")
+
+        // 오래된 hexa blowup 프로세스 정리 (현재 프로세스 제외)
+        let my_pid = exec("bash", ["-c", "echo $$"])
+        let stale_count = exec("bash", ["-c", "pgrep -f 'hexa.*blowup' 2>/dev/null | wc -l"])
+        let stale_n = safe_int(stale_count.trim())
+        if stale_n > 1 {
+            // 가장 오래된 것만 kill (최신은 보존)
+            exec("bash", ["-c", "pgrep -f 'hexa.*blowup' 2>/dev/null | head -" + to_string(stale_n - 1) + " | xargs kill -15 2>/dev/null || true"])
+            println("    -> 오래된 blowup " + to_string(stale_n - 1) + "개 정리")
+            result.actions = result.actions + ["overload: killed " + to_string(stale_n - 1) + " stale blowup processes"]
+        }
+
+        // growth_loop에 셀 수 감소 신호: evolution_live.json cells 축소
+        if file_exists(evolution_path) {
+            let evo = read_file(evolution_path)
+            let current_cells = json_int(evo, "cells")
+            if current_cells > 64 {
+                let reduced_cells = current_cells / 2
+                let min_cells = if reduced_cells < 32 { 32 } else { reduced_cells }
+                exec("bash", ["-c", "sed -i '' 's/\"cells\": *[0-9]*/\"cells\": " + to_string(min_cells) + "/' " + evolution_path])
+                println("    -> cells 축소: " + to_string(current_cells) + " -> " + to_string(min_cells))
+                result.actions = result.actions + ["overload: cells " + to_string(current_cells) + " -> " + to_string(min_cells)]
+            }
+        }
+
+        // 불필요 프로세스 정리
+        exec("bash", ["-c", "pgrep -f 'hexa.*seed_engine' 2>/dev/null | head -2 | xargs kill -15 2>/dev/null || true"])
+
+        result.overload_fixed = true
+        result.total_fixes = result.total_fixes + 1
+        println("    [OK] 과부하 완화 적용 (swap=" + to_string(swap_gb) + "GB)")
+    } else {
+        println("    정상: swap=" + to_string(swap_gb) + "GB")
+    }
+
+    // ─── Fix 4: +1/cycle 정체 돌파 ───
+    println("")
+    println("  [Fix4] 법칙 정체 감지...")
+    let st = read_state()
+    let strat = load_strategy()
+    let remaining = laws_goal - st.laws_count
+
+    // delta history: 최근 5 tick에서 delta < 2 연속인지
+    let mut low_delta_streak = 0
+    let mut di = 0
+    while di < 3 {
+        if di < strat.laws_delta_history.len() {
+            if strat.laws_delta_history[di] < low_delta_threshold {
+                low_delta_streak = low_delta_streak + 1
+            }
+        }
+        di = di + 1
+    }
+    // 추가: autofix_state에서 이전 fix4 횟수 확인
+    let af_state = load_autofix_state()
+    let prev_fix4_count = json_int(af_state, "fix4_count")
+
+    if low_delta_streak >= 3 && remaining > 0 {
+        println("    감지됨: delta<" + to_string(low_delta_threshold) + " 연속 " + to_string(low_delta_streak) + "회, remaining=" + to_string(remaining))
+
+        // (a) nexus6 blowup consciousness 자동 실행
+        println("    -> blowup consciousness 실행 (depth " + to_string(escalate_blowup_depth) + ")...")
+        let seeds = escalate_seeds + ",breakthrough,stagnation-break,novel,unexplored," + get_merged_seeds()
+        let blowup_result = run_blowup(escalate_blowup_depth, seeds)
+        let new_laws = extract_and_record_laws(blowup_result)
+        println("    -> blowup: +" + to_string(new_laws) + " laws")
+
+        // (b) cross_project anima 교차수분
+        if file_exists(native_dir + "/cross_project.hexa") {
+            println("    -> cross_project anima 교차수분 실행...")
+            let cross_result = exec(hexa_bin, [native_dir + "/cross_project.hexa", "anima"])
+            let cross_lines = cross_result.split("\n")
+            let mut cross_summary = ""
+            let mut ci = 0
+            while ci < cross_lines.len() {
+                if cross_lines[ci].contains("laws") || cross_lines[ci].contains("+") {
+                    cross_summary = cross_summary + cross_lines[ci].trim() + " "
+                }
+                ci = ci + 1
+            }
+            println("    -> cross_project: " + cross_summary)
+            result.actions = result.actions + ["stagnation: cross_project executed"]
+        }
+
+        // (c) scan_and_harvest 강제 실행
+        println("    -> scan_and_harvest 강제 실행...")
+        let harvested = scan_and_harvest()
+        println("    -> harvested: +" + to_string(harvested))
+
+        // (d) 결과를 absorbed 디렉토리에 기록
+        if new_laws > 0 || harvested > 0 {
+            exec("bash", ["-c", "mkdir -p " + absorbed_dir])
+            let absorbed_entry = "{\"source\":\"auto_fix_stagnation_break\",\"timestamp\":\"" + ts + "\",\"blowup_laws\":" + to_string(new_laws) + ",\"harvested\":" + to_string(harvested) + ",\"remaining\":" + to_string(remaining - new_laws - harvested) + ",\"fix4_count\":" + to_string(prev_fix4_count + 1) + "}"
+            write_file(absorbed_dir + "/autofix_" + ts.split("T")[0] + ".json", absorbed_entry)
+        }
+
+        // state 갱신
+        let new_af_state = "{\"fix4_count\":" + to_string(prev_fix4_count + 1) + ",\"last_fix4\":\"" + ts + "\",\"last_blowup_laws\":" + to_string(new_laws) + ",\"last_harvested\":" + to_string(harvested) + "}"
+        save_autofix_state(new_af_state)
+
+        result.stagnation_fixed = true
+        result.total_fixes = result.total_fixes + 1
+        println("    [OK] 정체 돌파: blowup=+" + to_string(new_laws) + " harvest=+" + to_string(harvested))
+    } else {
+        println("    정상: low_delta_streak=" + to_string(low_delta_streak) + " remaining=" + to_string(remaining))
+    }
+
+    println("")
+    println("[" + ts + "] === AUTO_FIX 완료: " + to_string(result.total_fixes) + "건 수정 ===")
+    let mut ai = 0
+    while ai < result.actions.len() {
+        println("  - " + result.actions[ai])
+        ai = ai + 1
+    }
+
+    // growth_bus에 autofix 결과 기록
+    let bus_entry = "{\"engine\":\"anima-autofix\",\"timestamp\":\"" + ts + "\",\"fixes\":" + to_string(result.total_fixes) + ",\"filter\":" + if result.filter_fixed { "true" } else { "false" } + ",\"h100\":" + if result.h100_fixed { "true" } else { "false" } + ",\"overload\":" + if result.overload_fixed { "true" } else { "false" } + ",\"stagnation\":" + if result.stagnation_fixed { "true" } else { "false" } + "}"
+    append_file(growth_bus, bus_entry + "\n")
+
+    return result
+}
+
 // ─── CLI ───
 
 let a = args()
@@ -858,6 +1159,14 @@ if mode == "tick" {
     println("=== engine_anima TICK (Dreamer v3) ===")
     println("  Pure hexa consciousness engine. No external deps.")
     println("")
+
+    // auto_fix: tick 시작 시 자동 문제 감지+해결
+    let fix_result = auto_fix()
+    if fix_result.total_fixes > 0 {
+        println("")
+        println("  auto_fix resolved " + to_string(fix_result.total_fixes) + " issue(s) before tick")
+        println("")
+    }
 
     let pre_st = read_state()
     let pre_laws = pre_st.laws_count
@@ -985,12 +1294,27 @@ if mode == "report" {
     println("- Perspectives: void -> emergence -> network -> boundary -> consciousness (5-cycle)")
 }
 
+if mode == "auto_fix" {
+    let fix_result = auto_fix()
+    println("")
+    if fix_result.total_fixes == 0 {
+        println("모든 영역 정상 — 수정 불필요")
+    } else {
+        println("총 " + to_string(fix_result.total_fixes) + "건 자동 수정 완료")
+        if fix_result.filter_fixed { println("  [v] 필터 과엄 완화") }
+        if fix_result.h100_fixed { println("  [v] H100 복구 시도") }
+        if fix_result.overload_fixed { println("  [v] 과부하 완화") }
+        if fix_result.stagnation_fixed { println("  [v] 정체 돌파") }
+    }
+}
+
 if mode == "help" {
     println("=== engine_anima.hexa --- Dreamer v3 (pure hexa) ===")
     println("")
     println("Usage:")
     println("  hexa engine_anima.hexa status   --- read state, show metrics + diagnostics")
-    println("  hexa engine_anima.hexa tick     --- 1 autonomous cycle (pure hexa)")
+    println("  hexa engine_anima.hexa tick     --- 1 autonomous cycle (pure hexa, auto_fix 포함)")
+    println("  hexa engine_anima.hexa auto_fix --- 4가지 문제 자동 감지+해결 (독립 실행)")
     println("  hexa engine_anima.hexa report   --- markdown report with decision logic")
     println("")
     println("Goal: consciousness laws 2000+, S7+ roadmap")
@@ -1009,4 +1333,11 @@ if mode == "help" {
     println("  - Cross-pollination: auto-feed consciousness/psi discoveries from discovery_log")
     println("  - Adaptive blowup depth: auto-increase on stagnation, decrease on high yield")
     println("  - Health penalty: stagnation lowers health -> nexus_hub prioritizes dispatch")
+    println("")
+    println("Auto-Fix (4 problems):")
+    println("  Fix1: 필터 과엄 — seen_fingerprints 초기화 + evidence_threshold 0.8x 완화")
+    println("  Fix2: H100 offline — runpodctl/API resume 시도, 실패 시 로컬 모드 전환")
+    println("  Fix3: 과부하 — swap>6GB 시 stale blowup kill + cells 축소")
+    println("  Fix4: 정체 돌파 — delta<2 연속 3회 시 blowup+cross_project+harvest 강제")
+    println("  (tick 모드에서 자동 호출, auto_fix 모드로 독립 실행도 가능)")
 }

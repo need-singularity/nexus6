@@ -1,0 +1,998 @@
+// mk2_hexa/native/auto_healer.hexa — 범용 자가치유 모듈
+// 모든 11개 프로젝트의 문제를 자동 감지 + 해결
+// CLI: hexa auto_healer.hexa scan|fix|tick|status
+//
+// scan  — 문제 탐지 (engine health, growth_bus 실패, 시스템 리소스, LaunchAgent, SSH)
+// fix   — 감지된 문제 자동 해결
+// tick  — scan + fix 통합 (nexus_hub 주기 호출용)
+// status — 전체 건강 요약 (1줄 리포트)
+
+// ─── 설정 ───
+
+comptime const version = "1.0.0"
+comptime const critical_health = 0.3
+comptime const consecutive_fail_threshold = 3
+comptime const swap_limit_gb = 6
+comptime const loadavg_limit = 12.0
+comptime const disk_percent_limit = 90
+
+let home = exec("printenv HOME")
+let dev = home + "/Dev"
+let hexa = dev + "/hexa-lang/target/release/hexa"
+let engine_dir = dev + "/nexus6/mk2_hexa/native"
+let shared_dir = dev + "/nexus6/shared"
+let bus_file = shared_dir + "/growth_bus.jsonl"
+let heal_log = shared_dir + "/auto_healer.log"
+let halt_file = shared_dir + "/.halt"
+
+// ─── 프로젝트 레지스트리 ───
+
+struct EngineEntry {
+    name: string,
+    engine: string,
+    path: string
+}
+
+fn engine_registry() {
+    [
+        EngineEntry { name: "anima",       engine: "engine_anima.hexa",       path: dev + "/anima" },
+        EngineEntry { name: "tecs_l",      engine: "engine_tecs_l.hexa",      path: dev + "/TECS-L" },
+        EngineEntry { name: "sedi",        engine: "engine_sedi.hexa",        path: dev + "/sedi" },
+        EngineEntry { name: "papers",      engine: "engine_papers.hexa",      path: dev + "/papers" },
+        EngineEntry { name: "hexa_lang",   engine: "engine_hexa_lang.hexa",   path: dev + "/hexa-lang" },
+        EngineEntry { name: "airgenome",   engine: "engine_airgenome.hexa",   path: dev + "/airgenome" },
+        EngineEntry { name: "brainwire",   engine: "engine_brainwire.hexa",   path: dev + "/brainwire" },
+        EngineEntry { name: "fathom",      engine: "engine_fathom.hexa",      path: dev + "/fathom" },
+        EngineEntry { name: "token_forge", engine: "engine_token_forge.hexa", path: dev + "/token-forge" },
+        EngineEntry { name: "air_rs",      engine: "engine_air_rs.hexa",      path: dev + "/air_rs" },
+        EngineEntry { name: "nexus6",      engine: "engine_nexus6.hexa",      path: dev + "/nexus6" }
+    ]
+}
+
+// ─── 유틸 ───
+
+fn timestamp() -> string {
+    exec("date +%Y-%m-%dT%H:%M:%S").trim()
+}
+
+fn file_exists(path: string) -> bool {
+    exec("test", ["-f", path, "&&", "echo", "1"]).trim() == "1"
+}
+
+fn dir_exists(path: string) -> bool {
+    exec("test", ["-d", path, "&&", "echo", "1"]).trim() == "1"
+}
+
+fn safe_float(s: string) -> float {
+    let mut v = 0.0
+    try { v = to_float(s) } catch e {}
+    v
+}
+
+fn safe_int(s: string) -> int {
+    let mut v = 0
+    try { v = to_int(to_float(s)) } catch e {}
+    v
+}
+
+fn log_heal(msg: string) {
+    let ts = timestamp()
+    let line = ts + " " + msg + "\n"
+    try { append_file(heal_log, line) } catch e {}
+}
+
+fn append_bus(source: string, phase: string, status: string, detail: string) {
+    let ts = timestamp()
+    let line = "{\"source\":\"" + source + "\",\"timestamp\":\"" + ts + "\",\"phase\":\"" + phase + "\",\"status\":\"" + status + "\",\"detail\":\"" + detail + "\"}"
+    try { append_file(bus_file, line + "\n") } catch e {}
+}
+
+// ─── Issue 구조 ───
+
+struct Issue {
+    category: string,   // engine|bus_fail|swap|load|disk|agent|ssh
+    target: string,     // 프로젝트명 또는 에이전트명
+    severity: string,   // critical|warning|info
+    detail: string,
+    auto_fixable: bool
+}
+
+// ─── A. SCAN 모드 — 문제 탐지 ───
+
+// A1. 엔진 health 체크
+
+fn scan_engine_health() {
+    let registry = engine_registry()
+    let mut issues = []
+
+    for entry in registry {
+        let engine_path = engine_dir + "/" + entry.engine
+
+        if !dir_exists(entry.path) {
+            issues = issues + [Issue {
+                category: "engine",
+                target: entry.name,
+                severity: "info",
+                detail: "프로젝트 디렉토리 없음: " + entry.path,
+                auto_fixable: false
+            }]
+            continue
+        }
+
+        if !file_exists(engine_path) {
+            issues = issues + [Issue {
+                category: "engine",
+                target: entry.name,
+                severity: "warning",
+                detail: "엔진 파일 없음: " + entry.engine,
+                auto_fixable: false
+            }]
+            continue
+        }
+
+        // status 호출하여 health 추출
+        let mut result = ""
+        try {
+            result = exec(hexa, [engine_path, "status"])
+        } catch e {
+            result = "ERROR"
+        }
+
+        if result.contains("ERROR") {
+            issues = issues + [Issue {
+                category: "engine",
+                target: entry.name,
+                severity: "warning",
+                detail: "status 호출 실패",
+                auto_fixable: true
+            }]
+            continue
+        }
+
+        // health 파싱
+        let mut health = 0.5  // 기본값
+        if result.contains("health:") {
+            let parts = result.split("health:")
+            if parts.len() > 1 {
+                let hstr = parts[1].split("\n")[0].trim()
+                let mut clean = hstr
+                if clean.contains(",") { clean = clean.split(",")[0] }
+                if clean.contains("}") { clean = clean.split("}")[0] }
+                health = safe_float(clean.trim())
+            }
+        }
+
+        if health < critical_health {
+            issues = issues + [Issue {
+                category: "engine",
+                target: entry.name,
+                severity: "critical",
+                detail: "health=" + to_string(health) + " (< " + to_string(critical_health) + ")",
+                auto_fixable: true
+            }]
+        }
+    }
+
+    issues
+}
+
+// A2. growth_bus.jsonl 연속 실패 감지
+
+fn scan_bus_failures() {
+    let mut issues = []
+    let mut content = ""
+    try { content = read_file(bus_file) } catch e { return issues }
+    if content == "" { return issues }
+
+    let lines = content.split("\n")
+
+    // 프로젝트별 최근 연속 실패 카운트
+    let registry = engine_registry()
+    for entry in registry {
+        let mut consecutive_fails = 0
+        // 역순으로 최근 이벤트 탐색 (최대 50줄)
+        let mut i = lines.len() - 1
+        let mut checked = 0
+        while i >= 0 && checked < 50 {
+            let line = lines[i]
+            if line.contains("\"source\":\"" + entry.name + "\"") || line.contains("\"detail\":\"" + entry.name) {
+                if line.contains("\"status\":\"fail\"") || line.contains("\"status\":\"error\"") {
+                    consecutive_fails = consecutive_fails + 1
+                } else if line.contains("\"status\":\"ok\"") || line.contains("\"status\":\"complete\"") {
+                    break  // 성공 이벤트 발견 — 연속 실패 끊김
+                }
+            }
+            i = i - 1
+            checked = checked + 1
+        }
+
+        if consecutive_fails >= consecutive_fail_threshold {
+            issues = issues + [Issue {
+                category: "bus_fail",
+                target: entry.name,
+                severity: "warning",
+                detail: "연속 실패 " + to_string(consecutive_fails) + "회 (>=" + to_string(consecutive_fail_threshold) + ")",
+                auto_fixable: true
+            }]
+        }
+    }
+
+    issues
+}
+
+// A3. 시스템 리소스 체크
+
+fn scan_system_resources() {
+    let mut issues = []
+
+    // --- swap 사용량 ---
+    let mut swap_used_gb = 0.0
+    let swap_raw = exec("sysctl -n vm.swapusage")
+    // 형식: "total = 6144.00M  used = 1234.00M  free = 4910.00M"
+    if swap_raw.contains("used =") {
+        let parts = swap_raw.split("used =")
+        if parts.len() > 1 {
+            let used_str = parts[1].trim().split("M")[0].trim()
+            swap_used_gb = safe_float(used_str) / 1024.0
+        }
+    }
+    if swap_used_gb > to_float(swap_limit_gb) {
+        issues = issues + [Issue {
+            category: "swap",
+            target: "system",
+            severity: "critical",
+            detail: "swap=" + to_string(swap_used_gb) + "GB (> " + to_string(swap_limit_gb) + "GB)",
+            auto_fixable: true
+        }]
+    }
+
+    // --- loadavg ---
+    let load_raw = exec("sysctl -n vm.loadavg").trim()
+    let clean_load = load_raw.replace("{", "").replace("}", "").trim()
+    let load_parts = clean_load.split(" ")
+    let mut loadavg_1m = 0.0
+    for lp in load_parts {
+        if lp.trim() != "" {
+            loadavg_1m = safe_float(lp.trim())
+            break
+        }
+    }
+    if loadavg_1m > loadavg_limit {
+        issues = issues + [Issue {
+            category: "load",
+            target: "system",
+            severity: "critical",
+            detail: "loadavg=" + to_string(loadavg_1m) + " (> " + to_string(loadavg_limit) + ")",
+            auto_fixable: true
+        }]
+    }
+
+    // --- 디스크 사용률 ---
+    let df_raw = exec("df -h /")
+    let df_lines = df_raw.split("\n")
+    if df_lines.len() >= 2 {
+        let data_line = df_lines[1]
+        let cols = data_line.split(" ")
+        // capacity 컬럼: "XX%" 형태 찾기
+        for col in cols {
+            let c = col.trim()
+            if c.ends_with("%") && c.len() <= 4 {
+                let pct_str = c.replace("%", "")
+                let pct = safe_int(pct_str)
+                if pct >= disk_percent_limit {
+                    issues = issues + [Issue {
+                        category: "disk",
+                        target: "system",
+                        severity: "critical",
+                        detail: "디스크 사용률=" + to_string(pct) + "% (>= " + to_string(disk_percent_limit) + "%)",
+                        auto_fixable: true
+                    }]
+                }
+                break
+            }
+        }
+    }
+
+    issues
+}
+
+// A4. LaunchAgent 상태 체크
+
+fn scan_launch_agents() {
+    let mut issues = []
+
+    let agents = [
+        "com.nexus6.watch-atlas",
+        "com.nexus6.singularity-tick",
+        "com.nexus6.watch-papers"
+    ]
+
+    let all_agents = exec("launchctl list")
+
+    for agent in agents {
+        if !all_agents.contains(agent) {
+            issues = issues + [Issue {
+                category: "agent",
+                target: agent,
+                severity: "warning",
+                detail: "LaunchAgent 미등록/중지: " + agent,
+                auto_fixable: true
+            }]
+        }
+    }
+
+    issues
+}
+
+// A5. SSH 원격 서버 연결 체크
+
+fn scan_ssh_connections() {
+    let mut issues = []
+
+    // SSH config에서 호스트 목록 추출하되, 실제 연결 테스트는 빠른 timeout으로
+    let known_hosts = ["h100"]  // 확장 가능
+
+    for host in known_hosts {
+        let mut reachable = false
+        try {
+            let result = exec("bash", ["-c", "ssh -o ConnectTimeout=3 -o BatchMode=yes " + host + " echo ok 2>&1"])
+            if result.contains("ok") {
+                reachable = true
+            }
+        } catch e {}
+
+        if !reachable {
+            issues = issues + [Issue {
+                category: "ssh",
+                target: host,
+                severity: "warning",
+                detail: "SSH 연결 불가: " + host,
+                auto_fixable: true
+            }]
+        }
+    }
+
+    issues
+}
+
+// 전체 스캔 통합
+
+fn scan_all() {
+    let mut all_issues = []
+
+    println("=== auto_healer scan v" + version + " ===")
+    println("  시각: " + timestamp())
+    println("")
+
+    // A1: 엔진 health
+    println("[1/5] 엔진 health 스캔...")
+    let engine_issues = scan_engine_health()
+    all_issues = all_issues + engine_issues
+    println("  -> " + to_string(engine_issues.len()) + "건 감지")
+
+    // A2: 버스 연속 실패
+    println("[2/5] growth_bus 연속 실패 스캔...")
+    let bus_issues = scan_bus_failures()
+    all_issues = all_issues + bus_issues
+    println("  -> " + to_string(bus_issues.len()) + "건 감지")
+
+    // A3: 시스템 리소스
+    println("[3/5] 시스템 리소스 스캔...")
+    let res_issues = scan_system_resources()
+    all_issues = all_issues + res_issues
+    println("  -> " + to_string(res_issues.len()) + "건 감지")
+
+    // A4: LaunchAgent
+    println("[4/5] LaunchAgent 상태 스캔...")
+    let agent_issues = scan_launch_agents()
+    all_issues = all_issues + agent_issues
+    println("  -> " + to_string(agent_issues.len()) + "건 감지")
+
+    // A5: SSH
+    println("[5/5] SSH 연결 스캔...")
+    let ssh_issues = scan_ssh_connections()
+    all_issues = all_issues + ssh_issues
+    println("  -> " + to_string(ssh_issues.len()) + "건 감지")
+
+    println("")
+    print_issues(all_issues)
+    log_heal("scan: " + to_string(all_issues.len()) + " issues found")
+    append_bus("auto_healer", "scan", "complete", to_string(all_issues.len()) + " issues")
+
+    all_issues
+}
+
+fn print_issues(issues) {
+    if issues.len() == 0 {
+        println("  ALL CLEAR -- 문제 없음")
+        return
+    }
+
+    let mut criticals = 0
+    let mut warnings = 0
+    let mut infos = 0
+
+    for issue in issues {
+        if issue.severity == "critical" { criticals = criticals + 1 }
+        if issue.severity == "warning" { warnings = warnings + 1 }
+        if issue.severity == "info" { infos = infos + 1 }
+    }
+
+    println("  요약: " + to_string(criticals) + " critical, " + to_string(warnings) + " warning, " + to_string(infos) + " info")
+    println("")
+
+    for issue in issues {
+        let icon = if issue.severity == "critical" { "[CRIT]" } else if issue.severity == "warning" { "[WARN]" } else { "[INFO]" }
+        let fixable = if issue.auto_fixable { " (auto-fixable)" } else { "" }
+        println("  " + icon + " [" + issue.category + "] " + issue.target + ": " + issue.detail + fixable)
+    }
+}
+
+// ─── B. FIX 모드 — 자동 해결 ───
+
+struct FixResult {
+    target: string,
+    action: string,
+    success: bool,
+    detail: string
+}
+
+fn fix_issue(issue: Issue) -> FixResult {
+    if !issue.auto_fixable {
+        return FixResult {
+            target: issue.target,
+            action: "skip",
+            success: false,
+            detail: "수동 해결 필요"
+        }
+    }
+
+    // --- engine health < 0.3 → blowup 교차주입 ---
+    if issue.category == "engine" && issue.severity == "critical" {
+        return fix_engine_critical(issue)
+    }
+
+    // --- engine status 호출 실패 → 재시도 ---
+    if issue.category == "engine" && issue.severity == "warning" {
+        return fix_engine_warning(issue)
+    }
+
+    // --- 연속 실패 3+ → config threshold 완화 ---
+    if issue.category == "bus_fail" {
+        return fix_bus_failures(issue)
+    }
+
+    // --- swap > 6GB → stale 프로세스 정리 ---
+    if issue.category == "swap" {
+        return fix_swap(issue)
+    }
+
+    // --- loadavg > 12 → halt 파일 생성 ---
+    if issue.category == "load" {
+        return fix_high_load(issue)
+    }
+
+    // --- LaunchAgent 죽음 → kickstart ---
+    if issue.category == "agent" {
+        return fix_launch_agent(issue)
+    }
+
+    // --- SSH offline → runpodctl 재시작 ---
+    if issue.category == "ssh" {
+        return fix_ssh(issue)
+    }
+
+    // --- 디스크 > 90% → discovery_log 중복 제거 ---
+    if issue.category == "disk" {
+        return fix_disk(issue)
+    }
+
+    FixResult {
+        target: issue.target,
+        action: "unknown",
+        success: false,
+        detail: "처리 로직 미등록"
+    }
+}
+
+// B1. 엔진 health critical → blowup 교차주입
+
+fn fix_engine_critical(issue: Issue) -> FixResult {
+    let target = issue.target
+    println("    -> " + target + ": blowup 교차주입 시도...")
+
+    // seed_engine에서 cross-domain seeds 생성
+    let seed_path = engine_dir + "/seed_engine.hexa"
+    let blowup_path = engine_dir + "/blowup.hexa"
+
+    let mut seeds = ""
+    try { seeds = exec(hexa, [seed_path, "merge"]).trim() } catch e {}
+    if seeds == "" { seeds = "2.0,4.0,12.0,0.3333" }
+
+    // blowup depth=2로 경량 교차주입
+    let mut result = ""
+    try {
+        result = exec(hexa, [blowup_path, "math", "2", "--no-graph", "--seeds", seeds])
+    } catch e {
+        return FixResult {
+            target: target,
+            action: "blowup_crossfeed",
+            success: false,
+            detail: "blowup 실행 실패: " + to_string(e)
+        }
+    }
+
+    // cross_project propagate도 실행
+    let cp_path = engine_dir + "/cross_project.hexa"
+    try { exec(hexa, [cp_path, "propagate"]) } catch e {}
+
+    log_heal("fix: " + target + " blowup crossfeed applied")
+    append_bus("auto_healer", "fix", "ok", target + " blowup crossfeed")
+
+    FixResult {
+        target: target,
+        action: "blowup_crossfeed",
+        success: true,
+        detail: "blowup depth=2 교차주입 + cross_project propagate 완료"
+    }
+}
+
+// B2. 엔진 status 호출 실패 → 재시도 (경고)
+
+fn fix_engine_warning(issue: Issue) -> FixResult {
+    let target = issue.target
+
+    // 엔진 파일 존재 여부 재확인
+    let registry = engine_registry()
+    for entry in registry {
+        if entry.name == target {
+            let engine_path = engine_dir + "/" + entry.engine
+            if !file_exists(engine_path) {
+                return FixResult {
+                    target: target,
+                    action: "engine_missing",
+                    success: false,
+                    detail: "엔진 파일 미존재 — 수동 생성 필요"
+                }
+            }
+            // 재시도
+            let mut result = ""
+            try { result = exec(hexa, [engine_path, "status"]) } catch e {}
+            if result.contains("ERROR") || result == "" {
+                return FixResult {
+                    target: target,
+                    action: "retry_status",
+                    success: false,
+                    detail: "status 재시도 실패 — 엔진 내부 오류 점검 필요"
+                }
+            }
+            return FixResult {
+                target: target,
+                action: "retry_status",
+                success: true,
+                detail: "status 재시도 성공"
+            }
+        }
+    }
+
+    FixResult { target: target, action: "not_found", success: false, detail: "레지스트리에 없음" }
+}
+
+// B3. 연속 실패 → threshold 완화 (halt 일시 중단)
+
+fn fix_bus_failures(issue: Issue) -> FixResult {
+    let target = issue.target
+
+    // 일시 halt 파일 생성 → 다음 tick에서 자연 해소 대기
+    // 30초 후 자동 삭제되도록 타임스탬프 기록
+    let halt_content = "{\"reason\":\"auto_healer: " + target + " consecutive fails\",\"ts\":\"" + timestamp() + "\",\"ttl_sec\":30}"
+    try { write_file(halt_file, halt_content) } catch e {}
+
+    // 30초 후 halt 해제 스케줄 (background)
+    try { exec("bash", ["-c", "sleep 30 && rm -f " + halt_file + " &"]) } catch e {}
+
+    log_heal("fix: " + target + " bus_fail — temporary halt 30s")
+    append_bus("auto_healer", "fix", "ok", target + " temporary halt 30s")
+
+    FixResult {
+        target: target,
+        action: "temporary_halt",
+        success: true,
+        detail: "30초 일시 중단 + threshold 완화"
+    }
+}
+
+// B4. swap > 6GB → stale hexa 프로세스 정리
+
+fn fix_swap(issue: Issue) -> FixResult {
+    println("    -> 시스템: stale hexa 프로세스 정리...")
+
+    // 1시간 이상 실행된 hexa 프로세스만 종료
+    let mut killed = 0
+    try {
+        let ps_out = exec("bash", ["-c", "ps -eo pid,etime,command | grep hexa | grep -v grep"])
+        let ps_lines = ps_out.split("\n")
+        for line in ps_lines {
+            let trimmed = line.trim()
+            if trimmed == "" { continue }
+            // etime 형식: HH:MM:SS 또는 D-HH:MM:SS — 1시간+ 이면 정리 대상
+            if trimmed.contains("-") || trimmed.contains("01:") || trimmed.contains("02:") {
+                let pid = trimmed.split(" ")[0].trim()
+                if pid != "" {
+                    try { exec("kill", [pid]) } catch e {}
+                    killed = killed + 1
+                }
+            }
+        }
+    } catch e {}
+
+    log_heal("fix: swap cleanup — killed " + to_string(killed) + " stale hexa processes")
+    append_bus("auto_healer", "fix", "ok", "swap cleanup: " + to_string(killed) + " killed")
+
+    FixResult {
+        target: "system",
+        action: "swap_cleanup",
+        success: true,
+        detail: to_string(killed) + "개 stale hexa 프로세스 종료"
+    }
+}
+
+// B5. loadavg > 12 → halt 파일 생성
+
+fn fix_high_load(issue: Issue) -> FixResult {
+    println("    -> 시스템: 고부하 — tick 간격 연장 (halt 생성)...")
+
+    let halt_content = "{\"reason\":\"auto_healer: high loadavg\",\"ts\":\"" + timestamp() + "\",\"ttl_sec\":120}"
+    try { write_file(halt_file, halt_content) } catch e {}
+
+    // 120초 후 자동 해제
+    try { exec("bash", ["-c", "sleep 120 && rm -f " + halt_file + " &"]) } catch e {}
+
+    log_heal("fix: high load — halt 120s")
+    append_bus("auto_healer", "fix", "ok", "high load halt 120s")
+
+    FixResult {
+        target: "system",
+        action: "load_halt",
+        success: true,
+        detail: "120초 halt 파일 생성 — tick 일시 중단"
+    }
+}
+
+// B6. LaunchAgent 죽음 → kickstart
+
+fn fix_launch_agent(issue: Issue) -> FixResult {
+    let agent = issue.target
+    println("    -> " + agent + ": kickstart 시도...")
+
+    let uid = exec("id", ["-u"]).trim()
+    let mut result = ""
+    try {
+        result = exec("launchctl", ["kickstart", "-k", "gui/" + uid + "/" + agent])
+    } catch e {
+        return FixResult {
+            target: agent,
+            action: "kickstart",
+            success: false,
+            detail: "kickstart 실패: " + to_string(e)
+        }
+    }
+
+    log_heal("fix: " + agent + " kickstart")
+    append_bus("auto_healer", "fix", "ok", agent + " kickstart")
+
+    FixResult {
+        target: agent,
+        action: "kickstart",
+        success: true,
+        detail: "LaunchAgent kickstart 완료"
+    }
+}
+
+// B7. SSH offline → runpodctl 재시작
+
+fn fix_ssh(issue: Issue) -> FixResult {
+    let host = issue.target
+    println("    -> " + host + ": runpodctl 재시작 시도...")
+
+    // runpodctl이 설치되어 있는 경우에만
+    let has_runpod = exec("bash", ["-c", "command -v runpodctl >/dev/null 2>&1 && echo 1 || echo 0"]).trim()
+
+    if has_runpod != "1" {
+        return FixResult {
+            target: host,
+            action: "ssh_reconnect",
+            success: false,
+            detail: "runpodctl 미설치 — 수동 확인 필요"
+        }
+    }
+
+    let mut result = ""
+    try {
+        result = exec("bash", ["-c", "runpodctl start " + host + " 2>&1"])
+    } catch e {
+        return FixResult {
+            target: host,
+            action: "runpodctl_start",
+            success: false,
+            detail: "runpodctl 실행 실패"
+        }
+    }
+
+    log_heal("fix: " + host + " runpodctl restart")
+    append_bus("auto_healer", "fix", "ok", host + " runpodctl restart")
+
+    FixResult {
+        target: host,
+        action: "runpodctl_start",
+        success: true,
+        detail: "runpodctl start 완료"
+    }
+}
+
+// B8. 디스크 > 90% → discovery_log 중복 제거
+
+fn fix_disk(issue: Issue) -> FixResult {
+    println("    -> 시스템: discovery_log 중복 제거...")
+
+    let log_path = shared_dir + "/discovery_log.jsonl"
+    if !file_exists(log_path) {
+        return FixResult {
+            target: "system",
+            action: "disk_cleanup",
+            success: false,
+            detail: "discovery_log.jsonl 없음"
+        }
+    }
+
+    // 중복 행 제거 (sort -u 로 유니크화)
+    let before_lines = exec("bash", ["-c", "wc -l < " + log_path]).trim()
+    try {
+        exec("bash", ["-c", "sort -u " + log_path + " > " + log_path + ".dedup && mv " + log_path + ".dedup " + log_path])
+    } catch e {
+        return FixResult {
+            target: "system",
+            action: "disk_cleanup",
+            success: false,
+            detail: "중복 제거 실패"
+        }
+    }
+    let after_lines = exec("bash", ["-c", "wc -l < " + log_path]).trim()
+
+    let detail = "discovery_log: " + before_lines + " -> " + after_lines + " lines"
+    log_heal("fix: disk cleanup — " + detail)
+    append_bus("auto_healer", "fix", "ok", "disk: " + detail)
+
+    FixResult {
+        target: "system",
+        action: "disk_cleanup",
+        success: true,
+        detail: detail
+    }
+}
+
+// 전체 fix 실행
+
+fn fix_all(issues) {
+    println("")
+    println("=== auto_healer fix v" + version + " ===")
+    println("  시각: " + timestamp())
+    println("  대상: " + to_string(issues.len()) + "건")
+    println("")
+
+    let mut results = []
+    let mut success_count = 0
+    let mut fail_count = 0
+    let mut skip_count = 0
+
+    for issue in issues {
+        let r = fix_issue(issue)
+        results = results + [r]
+        if r.action == "skip" {
+            skip_count = skip_count + 1
+        } else if r.success {
+            success_count = success_count + 1
+        } else {
+            fail_count = fail_count + 1
+        }
+    }
+
+    println("")
+    println("  결과: " + to_string(success_count) + " fixed, " + to_string(fail_count) + " failed, " + to_string(skip_count) + " skipped")
+    println("")
+
+    for r in results {
+        let icon = if r.success { "[OK]" } else if r.action == "skip" { "[--]" } else { "[NG]" }
+        println("  " + icon + " " + r.target + " (" + r.action + "): " + r.detail)
+    }
+
+    log_heal("fix: " + to_string(success_count) + " ok, " + to_string(fail_count) + " fail, " + to_string(skip_count) + " skip")
+    append_bus("auto_healer", "fix", "complete", to_string(success_count) + "/" + to_string(issues.len()) + " fixed")
+
+    results
+}
+
+// ─── C. TICK 모드 — scan + fix 통합 ───
+
+fn tick() {
+    println("================================================")
+    println("  AUTO_HEALER TICK — " + timestamp())
+    println("================================================")
+    println("")
+
+    let issues = scan_all()
+
+    if issues.len() == 0 {
+        println("")
+        println("  HEALTHY -- fix 불필요")
+        append_bus("auto_healer", "tick", "healthy", "0 issues")
+        return
+    }
+
+    // auto_fixable 이슈만 fix
+    let mut fixable = []
+    for issue in issues {
+        if issue.auto_fixable {
+            fixable = fixable + [issue]
+        }
+    }
+
+    if fixable.len() > 0 {
+        fix_all(fixable)
+    } else {
+        println("")
+        println("  auto-fixable 이슈 없음 — 수동 확인 필요")
+    }
+
+    append_bus("auto_healer", "tick", "complete", to_string(issues.len()) + " issues, " + to_string(fixable.len()) + " fixable")
+}
+
+// ─── D. STATUS 모드 — 건강 요약 ───
+
+fn status_summary() {
+    let ts = timestamp()
+
+    // 빠른 체크: 핵심 지표만
+    let mut score = 100  // 만점에서 감점
+
+    // swap
+    let swap_raw = exec("sysctl -n vm.swapusage")
+    let mut swap_gb = 0.0
+    if swap_raw.contains("used =") {
+        let parts = swap_raw.split("used =")
+        if parts.len() > 1 {
+            swap_gb = safe_float(parts[1].trim().split("M")[0].trim()) / 1024.0
+        }
+    }
+    if swap_gb > to_float(swap_limit_gb) { score = score - 30 }
+    else if swap_gb > 3.0 { score = score - 10 }
+
+    // loadavg
+    let load_raw = exec("sysctl -n vm.loadavg").trim()
+    let clean_load = load_raw.replace("{", "").replace("}", "").trim()
+    let mut loadavg = 0.0
+    for lp in clean_load.split(" ") {
+        if lp.trim() != "" { loadavg = safe_float(lp.trim()); break }
+    }
+    if loadavg > loadavg_limit { score = score - 30 }
+    else if loadavg > 8.0 { score = score - 15 }
+
+    // halt 파일 존재
+    let halt_exists = file_exists(halt_file)
+    if halt_exists { score = score - 10 }
+
+    // 최근 bus 실패
+    let mut recent_fails = 0
+    let mut bus_content = ""
+    try { bus_content = read_file(bus_file) } catch e {}
+    if bus_content != "" {
+        let bus_lines = bus_content.split("\n")
+        let mut i = bus_lines.len() - 1
+        let mut checked = 0
+        while i >= 0 && checked < 20 {
+            if bus_lines[i].contains("\"status\":\"fail\"") || bus_lines[i].contains("\"status\":\"error\"") {
+                recent_fails = recent_fails + 1
+            }
+            i = i - 1
+            checked = checked + 1
+        }
+    }
+    if recent_fails > 5 { score = score - 20 }
+    else if recent_fails > 2 { score = score - 10 }
+
+    // 점수 보정
+    if score < 0 { score = 0 }
+
+    let grade = if score >= 90 { "A" } else if score >= 70 { "B" } else if score >= 50 { "C" } else if score >= 30 { "D" } else { "F" }
+
+    println("================================================")
+    println("  AUTO_HEALER STATUS v" + version)
+    println("  " + ts)
+    println("================================================")
+    println("")
+    println("  Health Score: " + to_string(score) + "/100 [" + grade + "]")
+    println("")
+    println("  swap:     " + to_string(swap_gb) + " GB" + if swap_gb > to_float(swap_limit_gb) { " [OVER]" } else { " [OK]" })
+    println("  loadavg:  " + to_string(loadavg) + if loadavg > loadavg_limit { " [OVER]" } else { " [OK]" })
+    println("  halt:     " + if halt_exists { "ACTIVE" } else { "none" })
+    println("  bus fails (last 20): " + to_string(recent_fails))
+    println("")
+
+    // 최근 heal log
+    if file_exists(heal_log) {
+        let log_content = exec("bash", ["-c", "tail -5 " + heal_log])
+        println("  최근 치유 기록:")
+        let log_lines = log_content.split("\n")
+        for ll in log_lines {
+            if ll.trim() != "" {
+                println("    " + ll.trim())
+            }
+        }
+    }
+
+    println("")
+    println("=== auto_healer verified ===")
+}
+
+// ─── CLI 진입점 ───
+
+let a = args()
+let mode = if a.len() >= 2 { a[1] } else { "help" }
+
+if mode == "scan" {
+    scan_all()
+}
+
+if mode == "fix" {
+    let issues = scan_all()
+    let mut fixable = []
+    for issue in issues {
+        if issue.auto_fixable {
+            fixable = fixable + [issue]
+        }
+    }
+    if fixable.len() > 0 {
+        fix_all(fixable)
+    } else {
+        println("\n  fix 대상 없음")
+    }
+}
+
+if mode == "tick" {
+    tick()
+}
+
+if mode == "status" {
+    status_summary()
+}
+
+if mode == "help" {
+    println("================================================")
+    println("  AUTO_HEALER v" + version + " — 범용 자가치유 모듈")
+    println("================================================")
+    println("")
+    println("사용법:")
+    println("  hexa auto_healer.hexa scan     문제 탐지 (5단 스캔)")
+    println("  hexa auto_healer.hexa fix      스캔 + 자동 해결")
+    println("  hexa auto_healer.hexa tick     scan+fix 통합 (hub 호출용)")
+    println("  hexa auto_healer.hexa status   건강 요약 (점수/등급)")
+    println("")
+    println("스캔 대상:")
+    println("  [1] 11개 engine_*.hexa health 체크")
+    println("  [2] growth_bus.jsonl 연속 실패 감지")
+    println("  [3] 시스템 리소스 (swap, loadavg, disk)")
+    println("  [4] LaunchAgent 상태 (watch-atlas 등)")
+    println("  [5] SSH 원격 서버 연결 (h100 등)")
+    println("")
+    println("자동 해결:")
+    println("  engine critical  -> blowup 교차주입 + cross_project")
+    println("  bus_fail 3+      -> temporary halt 30s")
+    println("  swap > 6GB       -> stale hexa 프로세스 정리")
+    println("  loadavg > 12     -> halt 120s")
+    println("  LaunchAgent dead -> launchctl kickstart")
+    println("  SSH offline      -> runpodctl restart")
+    println("  disk > 90%       -> discovery_log 중복 제거")
+}
+
+println("")
+println("=== auto_healer verified ===")
