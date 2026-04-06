@@ -1,5 +1,16 @@
 # CLAUDE.md — nexus6 프로젝트 규칙
 
+## 🔴 절대 규칙 0: HEXA-FIRST + 부하 금지
+
+> **모든 코드는 `.hexa`로 작성한다. sh/py/rs 작성 금지.**
+> **시스템 부하를 유발하는 무거운 명령(병렬 에이전트 다수, 대용량 파일 읽기, 장시간 빌드)은 최소화한다.**
+> **기존 py/sh 스크립트도 hexa 변환 대상이다. 신규 = hexa only.**
+
+- 엔진: `mk2_hexa/native/*.hexa` (hexa-lang 컴파일러)
+- 실행: `$HOME/Dev/hexa-lang/target/release/hexa <파일.hexa>`
+- 경로: `exec("printenv HOME")` + 상대경로 (절대경로 하드코딩 금지)
+- 부하 방지: 에이전트 동시 2개 이하, 대용량 파일은 offset/limit 사용, 10초+ 명령은 `run_in_background: true`
+
 ## ⚠️ 필수 규칙 (최우선)
 
 ### -1. 하드코딩 절대 금지 (최최우선)
