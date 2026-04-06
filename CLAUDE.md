@@ -11,8 +11,9 @@
 - **n6 상수**: 공유 테이블에서 로드 (hook.hexa, blowup.hexa 등 중복 정의 금지)
 - **원칙**: 새 항목 추가 = 설정 파일 한 줄 추가. 코드 수정 0.
 
-### 0. mk2 hexa-native = 기본 엔진
+### 0. mk2 hexa-native = 기본 엔진 (sh/py/rs 작성 금지)
 - **모든 nexus6 작업은 mk2 hexa 모듈** 사용 (`mk2_hexa/native/*.hexa`)
+- **새 파일은 `.hexa`만 허용** — `.sh`, `.py`, `.rs` 등 다른 언어 파일 작성 금지
 - mk1 Rust 소스(`src/`)는 아카이브 (`archive/mk1-rust` 브랜치)
 - 경로 하드코딩 금지 — `exec("printenv HOME")` 또는 상대경로 사용
 - 새 모듈 생성 시 `mk2_hexa/native/` 에 `.hexa` 파일로
