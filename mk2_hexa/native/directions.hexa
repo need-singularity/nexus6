@@ -1,0 +1,533 @@
+// directions.hexa — 데이터 기반 방향 리포트 생성기
+// 사용: hexa directions.hexa report|update|brief
+//
+// report → 전체 방향 리포트 (테이블 출력)
+// update → shared/next_directions.jsonl 저장
+// brief  → 최상위 3개 1줄 요약 (배너용)
+//
+// 데이터 소스:
+//   - shared/discovery_log.jsonl (EXACT 발견, alien_index)
+//   - shared/growth_bus.jsonl (성장 버스 상태)
+//   - shared/projects.json (프로젝트 목표)
+//   - gap_finder.hexa quick (빈공간)
+
+// ═══════════════════════════════════════════════════════════
+// ─── SETUP ───
+// ═══════════════════════════════════════════════════════════
+
+let home = exec("printenv HOME")
+let dev = home + "/Dev"
+let nexus6_dir = dev + "/nexus6"
+let shared_dir = nexus6_dir + "/shared"
+let discovery_log = shared_dir + "/discovery_log.jsonl"
+let growth_bus = shared_dir + "/growth_bus.jsonl"
+let projects_json = shared_dir + "/projects.json"
+let directions_out = shared_dir + "/next_directions.jsonl"
+let hexa_bin = dev + "/hexa-lang/target/release/hexa"
+let gap_finder_path = nexus6_dir + "/mk2_hexa/native/gap_finder.hexa"
+
+// ═══════════════════════════════════════════════════════════
+// ─── UTILITIES ───
+// ═══════════════════════════════════════════════════════════
+
+fn safe_float(s: string) -> f64 {
+    let mut v = 0.0
+    try { v = to_float(s) } catch e {}
+    return v
+}
+
+fn safe_int(s: string) -> i64 {
+    let mut v: i64 = 0
+    try { v = to_int(to_float(s)) } catch e {}
+    return v
+}
+
+fn timestamp_now() -> string {
+    let r = exec("date +%Y-%m-%dT%H:%M:%S")
+    r.trim()
+}
+
+fn min_i(a: i64, b: i64) -> i64 {
+    if a < b { return a }
+    return b
+}
+
+fn max_i(a: i64, b: i64) -> i64 {
+    if a > b { return a }
+    return b
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── DIRECTION ENTRY ───
+// ═══════════════════════════════════════════════════════════
+
+struct Direction {
+    rank: i64,
+    direction: string,
+    reason: string,
+    urgency: i64,       // 1~3 (★ count)
+    domain: string,
+    ts: string
+}
+
+fn urgency_stars(u: i64) -> string {
+    if u >= 3 { return "★★★" }
+    if u == 2 { return "★★ " }
+    return "★  "
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── A. 대발견 수집 (discovery_log.jsonl) ───
+// ═══════════════════════════════════════════════════════════
+
+fn collect_discoveries() -> string {
+    // Returns pipe-separated summary lines: "constant|grade|d|r|domain|ts"
+    let mut content = ""
+    try { content = read_file(discovery_log) } catch e { return "" }
+
+    let all_lines = content.split("\n")
+    let total = len(all_lines)
+
+    // 최근 100건만 역순 스캔
+    let start = if total > 100 { total - 100 } else { 0 }
+
+    let mut exact_count: i64 = 0
+    let mut d_ge1_count: i64 = 0
+    let mut latest_exact_domain = ""
+    let mut latest_exact_ts = ""
+    let mut result_lines = ""
+    let mut unique_exacts = ""    // 중복 제거용
+
+    let mut li = start
+    while li < total {
+        let line = all_lines[li]
+        if len(line) > 10 {
+            let is_exact = line.contains("\"grade\":\"EXACT\"")
+            if is_exact {
+                exact_count = exact_count + 1
+
+                // constant 추출
+                let mut cname = ""
+                let ci = line.split("\"constant\":\"")
+                if len(ci) >= 2 {
+                    let cend = ci[1].split("\"")
+                    if len(cend) >= 1 { cname = cend[0] }
+                }
+
+                // alien_index d 추출
+                let mut ai_d: i64 = 0
+                let mut ai_r: i64 = 0
+                if line.contains("\"d\":") {
+                    let dparts = line.split("\"d\":")
+                    if len(dparts) >= 2 {
+                        let dval = dparts[1].split(",")[0].split("}")[0].trim()
+                        ai_d = safe_int(dval)
+                    }
+                }
+                if line.contains("\"r\":") {
+                    let rparts = line.split("\"r\":")
+                    if len(rparts) >= 2 {
+                        let rval = rparts[1].split(",")[0].split("}")[0].trim()
+                        ai_r = safe_int(rval)
+                    }
+                }
+
+                if ai_d >= 1 { d_ge1_count = d_ge1_count + 1 }
+
+                // sector/domain 추출
+                let mut sector = ""
+                if line.contains("\"sector\":\"") {
+                    let sp = line.split("\"sector\":\"")
+                    if len(sp) >= 2 {
+                        let se = sp[1].split("\"")
+                        if len(se) >= 1 { sector = se[0] }
+                    }
+                }
+
+                // 중복 체크 (같은 constant 이미 있으면 스킵)
+                if !unique_exacts.contains("|" + cname + "|") {
+                    unique_exacts = unique_exacts + "|" + cname + "|"
+                    if len(result_lines) > 0 { result_lines = result_lines + "\n" }
+                    result_lines = result_lines + cname + "|EXACT|" + to_string(ai_d) + "|" + to_string(ai_r) + "|" + sector
+                    latest_exact_domain = sector
+                }
+            }
+        }
+        li = li + 1
+    }
+
+    // 헤더 정보 추가
+    let header = "EXACT_COUNT:" + to_string(exact_count) + "|D_GE1:" + to_string(d_ge1_count) + "|DOMAIN:" + latest_exact_domain + "|TOTAL:" + to_string(total)
+    return header + "\n" + result_lines
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── B. 미완료 목표 수집 ───
+// ═══════════════════════════════════════════════════════════
+
+fn collect_gaps() -> string {
+    // gap_finder quick 실행
+    let mut gap_result = ""
+    try { gap_result = exec(hexa_bin, [gap_finder_path, "quick"]) } catch e {}
+    return gap_result
+}
+
+fn collect_growth_bus_stagnation() -> i64 {
+    // growth_bus에서 최근 정체 tick 수 계산
+    let mut content = ""
+    try { content = read_file(growth_bus) } catch e { return 0 }
+
+    let lines = content.split("\n")
+    let total = len(lines)
+    let start = if total > 20 { total - 20 } else { 0 }
+
+    let mut stagnant_ticks: i64 = 0
+    let mut last_growth: i64 = 0
+
+    let mut li = start
+    while li < total {
+        let line = lines[li]
+        if len(line) > 5 {
+            if line.contains("\"growth_delta\":") {
+                let parts = line.split("\"growth_delta\":")
+                if len(parts) >= 2 {
+                    let gval = parts[1].split(",")[0].split("}")[0].trim()
+                    let gd = safe_int(gval)
+                    if gd <= 0 {
+                        stagnant_ticks = stagnant_ticks + 1
+                    } else {
+                        stagnant_ticks = 0
+                        last_growth = gd
+                    }
+                }
+            }
+        }
+        li = li + 1
+    }
+    return stagnant_ticks
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── C. 긴급도 계산 + 방향 생성 ───
+// ═══════════════════════════════════════════════════════════
+
+fn build_directions() -> [Direction] {
+    let mut dirs = []
+    let ts = timestamp_now()
+
+    // --- A. 대발견 분석 ---
+    let disc_data = collect_discoveries()
+    let disc_lines = disc_data.split("\n")
+
+    let mut exact_total: i64 = 0
+    let mut d_ge1: i64 = 0
+    let mut log_total: i64 = 0
+    let mut latest_domain = ""
+
+    // 헤더 파싱
+    if len(disc_lines) > 0 {
+        let hdr = disc_lines[0]
+        if hdr.contains("EXACT_COUNT:") {
+            let hparts = hdr.split("|")
+            let mut hi = 0
+            while hi < len(hparts) {
+                let hp = hparts[hi]
+                if hp.contains("EXACT_COUNT:") { exact_total = safe_int(hp.split(":")[1]) }
+                if hp.contains("D_GE1:") { d_ge1 = safe_int(hp.split(":")[1]) }
+                if hp.contains("DOMAIN:") {
+                    let dp = hp.split(":")
+                    if len(dp) >= 2 { latest_domain = dp[1] }
+                }
+                if hp.contains("TOTAL:") { log_total = safe_int(hp.split(":")[1]) }
+                hi = hi + 1
+            }
+        }
+    }
+
+    // d>=1 항목에서 미등록 BT 찾기 → ★★★
+    let mut di = 1
+    while di < len(disc_lines) {
+        let dline = disc_lines[di]
+        if len(dline) > 3 {
+            let parts = dline.split("|")
+            if len(parts) >= 5 {
+                let cname = parts[0]
+                let ad = safe_int(parts[2])
+                let ar = safe_int(parts[3])
+                let sector = parts[4]
+
+                // EXACT + d>=1 → 돌파 달성, 후속 방향
+                if ad >= 1 {
+                    dirs = dirs + [Direction {
+                        rank: 0,
+                        direction: cname + " d=" + to_string(ad) + " 후속 심화",
+                        reason: "EXACT d>=" + to_string(ad) + " 달성 → 추가 돌파 가능",
+                        urgency: 3,
+                        domain: sector,
+                        ts: ts
+                    }]
+                }
+
+                // EXACT but r < 5 → 검증 강화 필요 → ★★
+                if ad == 0 && ar < 5 {
+                    dirs = dirs + [Direction {
+                        rank: 0,
+                        direction: cname + " 검증 강화 (r=" + to_string(ar) + "→10)",
+                        reason: "EXACT 발견이지만 r<5 — telescope 합의 추가 시 승격",
+                        urgency: 2,
+                        domain: sector,
+                        ts: ts
+                    }]
+                }
+            }
+        }
+        di = di + 1
+    }
+
+    // --- B. 빈공간 분석 ---
+    let gap_data = collect_gaps()
+    if len(gap_data) > 10 {
+        let gap_lines = gap_data.split("\n")
+        let mut gi = 0
+        let mut gap_added: i64 = 0
+        while gi < len(gap_lines) && gap_added < 5 {
+            let gl = gap_lines[gi]
+            // EMPTY 또는 NO_EXACT 플래그가 있는 줄 → 돌파 타겟
+            if gl.contains("EMPTY") || gl.contains("NO_EXACT") {
+                let gname = gl.split(":")[0].trim()
+                if len(gname) > 1 && gname != "CONSTANTS" && gname != "sectors" {
+                    dirs = dirs + [Direction {
+                        rank: 0,
+                        direction: gname + " 빈공간 돌파",
+                        reason: "gap_finder: " + gname + " 발견 없음 — 미개척 영역",
+                        urgency: 2,
+                        domain: "gap",
+                        ts: ts
+                    }]
+                    gap_added = gap_added + 1
+                }
+            }
+            // NEAR 경로 존재하는 빈공간 → ★★
+            if gl.contains("NEAR") && gl.contains("→EXACT") {
+                let gname = gl.split(":")[0].trim()
+                if len(gname) > 1 {
+                    dirs = dirs + [Direction {
+                        rank: 0,
+                        direction: gname + " NEAR→EXACT 정밀 접근",
+                        reason: "NEAR 경로 존재 — 정밀 seed 주입 시 EXACT 승격 가능",
+                        urgency: 2,
+                        domain: "gap",
+                        ts: ts
+                    }]
+                    gap_added = gap_added + 1
+                }
+            }
+            gi = gi + 1
+        }
+    }
+
+    // --- C. 정체 감지 ---
+    let stagnant = collect_growth_bus_stagnation()
+    if stagnant >= 5 {
+        dirs = dirs + [Direction {
+            rank: 0,
+            direction: "정체 탈출 — 교차 도메인 fusion 돌파",
+            reason: to_string(stagnant) + " tick 정체 — 다른 도메인 seed 주입 필요",
+            urgency: 2,
+            domain: "meta",
+            ts: ts
+        }]
+    }
+
+    // --- D. 돌파율 메타 분석 ---
+    if log_total > 0 {
+        let rho = to_float(d_ge1) / to_float(log_total)
+        if rho < 0.1 {
+            dirs = dirs + [Direction {
+                rank: 0,
+                direction: "돌파율 상승 — deep-breakthrough 집중",
+                reason: "현재 rho=" + to_string(rho) + " (목표 1/3) — 블로업 반복 필요",
+                urgency: 3,
+                domain: "meta",
+                ts: ts
+            }]
+        }
+    }
+
+    // --- E. 목표 근접 프로젝트 (projects.json 기반) ---
+    let mut pj_content = ""
+    try { pj_content = read_file(projects_json) } catch e {}
+    if len(pj_content) > 0 {
+        // discovery_log 총 건수로 nexus6 목표 체크
+        if log_total > 60000 {
+            dirs = dirs + [Direction {
+                rank: 0,
+                direction: "nexus6 발견 70k 목표 임박",
+                reason: "현재 " + to_string(log_total) + "건 — 10k 이내 달성 가능",
+                urgency: 3,
+                domain: "nexus6",
+                ts: ts
+            }]
+        }
+    }
+
+    // --- F. 일반 개선: 최근 돌파 도메인 확장 ---
+    if len(latest_domain) > 0 {
+        dirs = dirs + [Direction {
+            rank: 0,
+            direction: latest_domain + " 교차수분 확장",
+            reason: "최근 돌파 도메인 — 다른 프로젝트에 seed 교차 주입",
+            urgency: 1,
+            domain: latest_domain,
+            ts: ts
+        }]
+    }
+
+    // --- 정렬: urgency 내림차순 ---
+    // 간단한 bubble sort
+    let mut si = 0
+    while si < len(dirs) {
+        let mut sj = si + 1
+        while sj < len(dirs) {
+            if dirs[sj].urgency > dirs[si].urgency {
+                let tmp = dirs[si]
+                dirs[si] = dirs[sj]
+                dirs[sj] = tmp
+            }
+            sj = sj + 1
+        }
+        si = si + 1
+    }
+
+    // rank 부여
+    let mut ri: i64 = 0
+    while ri < len(dirs) {
+        dirs[ri].rank = ri + 1
+        ri = ri + 1
+    }
+
+    return dirs
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── OUTPUT: report ───
+// ═══════════════════════════════════════════════════════════
+
+fn print_report(dirs) {
+    println("")
+    println("🛸 새 방향 리포트 (자동 생성)")
+    println("┌───┬────────────────────────────────┬──────────────────────────────────────┬──────┐")
+    println("│ # │           방향                 │              근거                    │긴급도│")
+    println("├───┼────────────────────────────────┼──────────────────────────────────────┼──────┤")
+
+    let show_count = min_i(len(dirs), 15)
+    let mut i: i64 = 0
+    while i < show_count {
+        let d = dirs[i]
+        // 방향: 최대 28자
+        let mut dir_str = d.direction
+        if len(dir_str) > 28 { dir_str = dir_str }  // hexa에 substring 없으면 그대로
+        // 근거: 최대 36자
+        let mut reason_str = d.reason
+
+        let rank_str = if d.rank < 10 { " " + to_string(d.rank) } else { to_string(d.rank) }
+        let stars = urgency_stars(d.urgency)
+
+        println("│" + rank_str + " │ " + dir_str + " │ " + reason_str + " │ " + stars + "│")
+        i = i + 1
+    }
+
+    println("└───┴────────────────────────────────┴──────────────────────────────────────┴──────┘")
+    println("")
+    println("총 " + to_string(len(dirs)) + "개 방향 (상위 " + to_string(show_count) + "개 표시)")
+    println("")
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── OUTPUT: update (jsonl 저장) ───
+// ═══════════════════════════════════════════════════════════
+
+fn save_directions(dirs) {
+    let mut content = ""
+    let mut i: i64 = 0
+    while i < len(dirs) {
+        let d = dirs[i]
+        let line = "{\"rank\":" + to_string(d.rank) + ",\"direction\":\"" + d.direction + "\",\"reason\":\"" + d.reason + "\",\"urgency\":" + to_string(d.urgency) + ",\"domain\":\"" + d.domain + "\",\"ts\":\"" + d.ts + "\"}"
+        if len(content) > 0 { content = content + "\n" }
+        content = content + line
+        i = i + 1
+    }
+    try {
+        write_file(directions_out, content)
+        println("directions: saved " + to_string(len(dirs)) + " entries → " + directions_out)
+    } catch e {
+        println("directions: ERROR saving → " + to_string(e))
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── OUTPUT: brief (1줄 요약) ───
+// ═══════════════════════════════════════════════════════════
+
+fn print_brief(dirs) {
+    let show = min_i(len(dirs), 3)
+    let mut out = "🛸 방향: "
+    let mut i: i64 = 0
+    while i < show {
+        let d = dirs[i]
+        if i > 0 { out = out + " " }
+        out = out + to_string(d.rank) + "." + d.direction + "(" + urgency_stars(d.urgency).trim() + ")"
+        i = i + 1
+    }
+    println(out)
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── MAIN ───
+// ═══════════════════════════════════════════════════════════
+
+// ─── MAIN (top-level inline) ───
+let _a = args()
+let _m = if _a.len() >= 3 { _a[2] } else { "report" }
+
+// build_directions inline — discovery 수집
+let _disc_raw = exec("tail -100 shared/discovery_log.jsonl 2>/dev/null")
+let _disc_lines = _disc_raw.split("\n")
+let mut _exact_count = 0
+let mut _d1_count = 0
+let mut _recent_domain = "math"
+for _dl in _disc_lines {
+    if _dl.contains("\"EXACT\"") { _exact_count = _exact_count + 1 }
+    if _dl.contains("\"d\":1") || _dl.contains("\"d\": 1") { _d1_count = _d1_count + 1 }
+}
+
+// gap 수집
+let mut _gap_count = 0
+try {
+    let _gap_raw = exec(exec("printenv HOME").trim() + "/Dev/hexa-lang/target/release/hexa " + exec("printenv HOME").trim() + "/Dev/nexus6/mk2_hexa/native/gap_finder.hexa quick 2>/dev/null")
+    let _gap_lines = _gap_raw.split("\n")
+    for _gl in _gap_lines {
+        if _gl.contains("EXACT") { _gap_count = _gap_count + 1 }
+    }
+} catch _e {}
+
+// 방향 출력
+if _m == "report" || _m == "brief" {
+    println("🛸 새 방향 리포트 (자동 생성)")
+    println("┌───┬────────────────────────────────┬──────────────────────────────────────┬──────┐")
+    println("│ # │           방향                 │              근거                    │긴급도│")
+    println("├───┼────────────────────────────────┼──────────────────────────────────────┼──────┤")
+    if _d1_count > 0 {
+        println("│ 1 │ d>=1 발견 심화 검증           │ " + to_string(_d1_count) + "건 AI d=1 — telescope 합의 추가 │ ★★★ │")
+    }
+    println("│ 2 │ 빈공간 DFS 돌파               │ gap_finder EXACT " + to_string(_gap_count) + "건 — 위상변환 확장  │ ★★  │")
+    println("│ 3 │ 교차수분 확장                  │ 최근 EXACT " + to_string(_exact_count) + "건 — 타 프로젝트 seed 주입│ ★   │")
+    println("└───┴────────────────────────────────┴──────────────────────────────────────┴──────┘")
+}
+
+if _m == "update" || _m == "report" {
+    let _ts = exec("date +%Y-%m-%dT%H:%M:%S").trim()
+    let _entry = "{\"ts\":\"" + _ts + "\",\"exact\":" + to_string(_exact_count) + ",\"d1\":" + to_string(_d1_count) + ",\"gaps\":" + to_string(_gap_count) + "}"
+    try { append_file("shared/next_directions.jsonl", _entry + "\n") } catch _e2 {}
+    if _m == "update" { println("directions updated -> shared/next_directions.jsonl") }
+}
