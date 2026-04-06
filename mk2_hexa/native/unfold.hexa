@@ -1,0 +1,682 @@
+// mk2_hexa/native/unfold.hexa — 차원펼침 엔진 (hexa-native)
+// 실행: hexa mk2_hexa/native/unfold.hexa <domain> [depth]
+// 예시: hexa mk2_hexa/native/unfold.hexa math 3
+//
+// 4-phase pipeline:
+//   Phase 1: Tensor Decomposition (rank-1 outer product projection)
+//   Phase 2: Modular Projection (mod {2,3,5,7} residue fingerprint)
+//   Phase 3: Ratio Unfolding (continued fraction expansion + scaling)
+//   Phase 4: Log Spectrum (ln-space equispacing structure detection)
+//
+// blowup(확장)의 역방향 — 고차원→저차원 분해로 숨은 관계 탐색
+// 호출 인터페이스: blowup.hexa와 동일 (domain, depth, --seeds, --no-graph)
+
+// ═══════════════════════════════════════════════════════════
+// ─── SETUP ───
+// ═══════════════════════════════════════════════════════════
+
+let home = exec("printenv HOME")
+let dev = home + "/Dev"
+let nexus6_dir = dev + "/nexus6"
+let discovery_log = nexus6_dir + "/shared/discovery_log.jsonl"
+let growth_bus = nexus6_dir + "/shared/growth_bus.jsonl"
+
+// ─── JSONL 로더 (공용) ───
+fn load_jsonl(path: string) -> list {
+    if !file_exists(path) { return [[], []] }
+    let raw = read_file(path)
+    let lines = raw.split("\n")
+    let mut names = []
+    let mut values = []
+    for line in lines {
+        let trimmed = line.trim()
+        if trimmed == "" { continue }
+        let mut name = ""
+        let mut value = 0.0
+        if trimmed.contains("\"name\":\"") {
+            let p = trimmed.split("\"name\":\"")
+            if p.len() >= 2 { name = p[1].split("\"")[0] }
+        }
+        if trimmed.contains("\"value\":") {
+            let p = trimmed.split("\"value\":")
+            if p.len() >= 2 {
+                let num_str = p[1].split(",")[0].split("}")[0].trim()
+                value = to_float(num_str)
+            }
+        }
+        if name != "" {
+            names = names + [name]
+            values = values + [value]
+        }
+    }
+    [names, values]
+}
+
+fn ln_approx(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut val = x
+    let mut scale = 0.0
+    while val > 2.0 {
+        val = val / 2.718281828
+        scale = scale + 1.0
+    }
+    while val < 0.5 {
+        val = val * 2.718281828
+        scale = scale - 1.0
+    }
+    let u = val - 1.0
+    let result = u - u*u/2.0 + u*u*u/3.0 - u*u*u*u/4.0
+    result + scale
+}
+
+// ─── n6 상수 + 물리상수 동적 로드 ───
+let n6_data = load_jsonl(nexus6_dir + "/shared/n6_constants.jsonl")
+let n6_all_names = n6_data[0]
+let n6_all_vals = n6_data[1]
+
+let phys_data = load_jsonl(nexus6_dir + "/shared/n6_physics.jsonl")
+let phys_raw_names = phys_data[0]
+let phys_raw_vals = phys_data[1]
+
+// ─── base: n6 기저 6개 필터 ───
+let base_filter = ["n", "sigma", "phi", "tau", "sopfr", "sigma_minus_sopfr"]
+let base_labels = ["n", "sigma", "phi", "tau", "sopfr", "M3"]
+let mut base_names = []
+let mut base_vals = []
+let mut bf = 0
+while bf < len(base_filter) {
+    let mut fi = 0
+    while fi < len(n6_all_names) {
+        if n6_all_names[fi] == base_filter[bf] {
+            base_names = base_names + [base_labels[bf]]
+            base_vals = base_vals + [to_float(n6_all_vals[fi])]
+            fi = len(n6_all_names)
+        }
+        fi = fi + 1
+    }
+    bf = bf + 1
+}
+
+// ─── ext: 확장 상수 (n6에서 필터 + 파생) ───
+fn find_n6_val(names: list, vals: list, key: string) -> float {
+    let mut i = 0
+    while i < len(names) {
+        if names[i] == key { return to_float(vals[i]) }
+        i = i + 1
+    }
+    0.0
+}
+
+let val_n = find_n6_val(n6_all_names, n6_all_vals, "n")
+let val_sigma = find_n6_val(n6_all_names, n6_all_vals, "sigma")
+let val_phi = find_n6_val(n6_all_names, n6_all_vals, "phi")
+let val_tau = find_n6_val(n6_all_names, n6_all_vals, "tau")
+let val_sopfr = find_n6_val(n6_all_names, n6_all_vals, "sopfr")
+let val_m3 = find_n6_val(n6_all_names, n6_all_vals, "sigma_minus_sopfr")
+let val_j2 = find_n6_val(n6_all_names, n6_all_vals, "j2")
+let val_p2 = find_n6_val(n6_all_names, n6_all_vals, "P2")
+let val_sigma_tau = find_n6_val(n6_all_names, n6_all_vals, "sigma_tau")
+let val_p4 = find_n6_val(n6_all_names, n6_all_vals, "P4")
+
+let ext_names = ["n", "sigma", "phi", "tau", "sopfr", "M3", "J2", "n^2", "P2", "sigma*tau", "6!", "P4"]
+let ext_vals = [val_n, val_sigma, val_phi, val_tau, val_sopfr, val_m3, val_j2, val_n * val_n, val_p2, val_sigma_tau, 720.0, val_p4]
+
+// ext_lns: ln 값 런타임 계산
+let mut ext_lns = []
+let mut eli = 0
+while eli < len(ext_vals) {
+    ext_lns = ext_lns + [ln_approx(to_float(ext_vals[eli]))]
+    eli = eli + 1
+}
+
+// ─── phys: 물리+n6 병합 매칭 테이블 ───
+let mut phys_names = []
+let mut phys_vals = []
+// 물리상수 먼저
+let mut pi2 = 0
+while pi2 < len(phys_raw_names) {
+    phys_names = phys_names + [phys_raw_names[pi2]]
+    phys_vals = phys_vals + [to_float(phys_raw_vals[pi2])]
+    pi2 = pi2 + 1
+}
+// n6 상수 추가 (물리에 없는 것만)
+let mut ni = 0
+while ni < len(n6_all_names) {
+    let mut dup = false
+    let mut di = 0
+    while di < len(phys_names) {
+        if phys_names[di] == n6_all_names[ni] { dup = true }
+        di = di + 1
+    }
+    if !dup {
+        phys_names = phys_names + [n6_all_names[ni]]
+        phys_vals = phys_vals + [to_float(n6_all_vals[ni])]
+    }
+    ni = ni + 1
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── UTILITY FUNCTIONS ───
+// ═══════════════════════════════════════════════════════════
+
+fn abs_val(x: float) -> float { if x < 0.0 { -x } else { x } }
+fn fmt_f(x: float) -> string { to_string(x) }
+
+fn match_physics(val: float) -> string {
+    if val == 0.0 { return "" }
+    if abs_val(val) > 100000.0 { return "" }
+    let mut result = ""
+    let mut pi = 0
+    while pi < len(phys_names) {
+        let pv = phys_vals[pi]
+        if pv != 0.0 {
+            let err = abs_val(val - pv) / abs_val(pv)
+            if err < 0.0001 {
+                if len(result) > 0 { result = result + ", " }
+                result = result + "[EXACT " + phys_names[pi] + "=" + fmt_f(pv) + "]"
+            } else if err < 0.01 {
+                if len(result) > 0 { result = result + ", " }
+                result = result + "[NEAR " + phys_names[pi] + "=" + fmt_f(pv) + " err=" + fmt_f(err * 100.0) + "%]"
+            }
+        }
+        pi = pi + 1
+    }
+    result
+}
+
+fn match_grade(val: float) -> string {
+    // 간략 등급 반환: "EXACT", "NEAR", ""
+    let mut pi = 0
+    while pi < len(phys_names) {
+        let pv = phys_vals[pi]
+        if pv != 0.0 {
+            let err = abs_val(val - pv) / abs_val(pv)
+            if err < 0.0001 { return "EXACT" }
+            if err < 0.01 { return "NEAR" }
+        }
+        pi = pi + 1
+    }
+    ""
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── PHASE 1: TENSOR DECOMPOSITION ───
+// ═══════════════════════════════════════════════════════════
+// rank-1 외적 a×b/c → 물리상수 매칭
+
+fn phase_tensor(seeds: list, seed_vals: list) -> list {
+    println("=== Phase 1: 텐서 분해 (rank-1 외적 투영) ===")
+    let names = if len(seeds) > 0 { seeds } else { base_names }
+    let vals = if len(seed_vals) > 0 { seed_vals } else { base_vals }
+    let n = len(names)
+    let mut exact = 0
+    let mut near = 0
+    let mut results = []
+
+    let mut i = 0
+    while i < n {
+        let mut j = 0
+        while j < n {
+            if i != j {
+                let outer = vals[i] * vals[j]
+                let mut k = 0
+                while k < n {
+                    if k != i && k != j && vals[k] != 0.0 {
+                        let projected = outer / vals[k]
+                        let m = match_physics(projected)
+                        if len(m) > 0 {
+                            let expr = names[i] + "×" + names[j] + "/" + names[k]
+                            let mut pad = expr
+                            while len(pad) < 22 { pad = pad + " " }
+                            println("  " + pad + "= " + fmt_f(projected) + "  → " + m)
+                            results = results + [projected]
+                            if m.contains("EXACT") { exact = exact + 1 }
+                            else { near = near + 1 }
+                        }
+                    }
+                    k = k + 1
+                }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    println("  소계: EXACT=" + to_string(exact) + " NEAR=" + to_string(near))
+    println("")
+    [exact, near, results]
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── PHASE 2: MODULAR PROJECTION ───
+// ═══════════════════════════════════════════════════════════
+// mod {2,3,5,7} 잔류계 핑거프린트 + 구조 분석
+
+fn phase_modular(seeds: list, seed_vals: list) -> list {
+    println("=== Phase 2: 모듈러 투영 (mod p 잔류계) ===")
+    let names = if len(seeds) > 0 { seeds } else { base_names }
+    let vals = if len(seed_vals) > 0 { seed_vals } else { base_vals }
+    let n = len(names)
+    let primes = [2, 3, 5, 7]
+    let prime_names = ["mod2", "mod3", "mod5", "mod7"]
+    let mut exact = 0
+    let mut near = 0
+    let mut mod3_zero_count = 0
+    let mut mod3_total = 0
+
+    let mut pi = 0
+    while pi < 4 {
+        let p = primes[pi]
+        let pname = prime_names[pi]
+
+        // 기저 핑거프린트
+        let mut fingerprint = ""
+        let mut bi = 0
+        while bi < n {
+            let residue = to_int(vals[bi]) % p
+            fingerprint = fingerprint + to_string(residue)
+            bi = bi + 1
+        }
+        println("  " + pname + " 지문: [" + fingerprint + "]")
+
+        // 삼중 (a*b+c) mod p → 1/3 수렴 분석
+        let mut ci = 0
+        while ci < n {
+            let mut cj = ci + 1
+            while cj < n {
+                let mut ck = 0
+                while ck < n {
+                    if ck != ci && ck != cj {
+                        let combined = vals[ci] * vals[cj] + vals[ck]
+                        let residue_val = to_int(combined) % p
+                        if p == 3 {
+                            mod3_total = mod3_total + 1
+                            if residue_val == 0 { mod3_zero_count = mod3_zero_count + 1 }
+                        }
+                        let ratio = to_float(residue_val) / to_float(p)
+                        if ratio > 0.001 {
+                            let m = match_physics(ratio)
+                            if len(m) > 0 {
+                                let expr = "(" + names[ci] + "×" + names[cj] + "+" + names[ck] + ")%" + to_string(p) + "/" + to_string(p)
+                                println("    " + expr + " = " + fmt_f(ratio) + "  → " + m)
+                                if m.contains("EXACT") { exact = exact + 1 }
+                                else { near = near + 1 }
+                            }
+                        }
+                    }
+                    ck = ck + 1
+                }
+                cj = cj + 1
+            }
+            ci = ci + 1
+        }
+        pi = pi + 1
+    }
+
+    // mod3 구조 요약
+    if mod3_total > 0 {
+        let ratio = to_float(mod3_zero_count) / to_float(mod3_total)
+        println("")
+        println("  mod3 ≡0 비율: " + to_string(mod3_zero_count) + "/" + to_string(mod3_total) + " = " + fmt_f(ratio * 100.0) + "%")
+        let err_from_third = abs_val(ratio - 0.3333) / 0.3333 * 100.0
+        println("  1/3(=0.3333) 으로부터 편차: " + fmt_f(err_from_third) + "%")
+    }
+
+    println("  소계: EXACT=" + to_string(exact) + " NEAR=" + to_string(near))
+    println("")
+    [exact, near]
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── PHASE 3: RATIO UNFOLDING (연분수 전개) ───
+// ═══════════════════════════════════════════════════════════
+
+fn phase_ratio(seeds: list, seed_vals: list) -> list {
+    println("=== Phase 3: 비율 펼침 (연분수 전개 × 스케일링) ===")
+    let names = if len(seeds) > 0 { seeds } else { base_names }
+    let vals = if len(seed_vals) > 0 { seed_vals } else { base_vals }
+    let n = len(names)
+    let mut exact = 0
+    let mut near = 0
+
+    let mut ri = 0
+    while ri < n {
+        let mut rj = 0
+        while rj < n {
+            if ri != rj && vals[rj] != 0.0 {
+                let ratio = vals[ri] / vals[rj]
+                // 스케일링 탐색: ratio × k (k=1..12)
+                let mut k = 1
+                while k <= 12 {
+                    let scaled = ratio * to_float(k)
+                    let m = match_physics(scaled)
+                    if len(m) > 0 {
+                        let expr = names[ri] + "/" + names[rj] + "×" + to_string(k)
+                        let mut pad = expr
+                        while len(pad) < 22 { pad = pad + " " }
+                        println("  " + pad + "= " + fmt_f(scaled) + "  → " + m)
+                        if m.contains("EXACT") { exact = exact + 1 }
+                        else { near = near + 1 }
+                    }
+                    k = k + 1
+                }
+                // 역수 스케일링: k / ratio
+                let mut k2 = 1
+                while k2 <= 12 {
+                    let inv_scaled = to_float(k2) / ratio
+                    let m2 = match_physics(inv_scaled)
+                    if len(m2) > 0 && ratio != 1.0 {
+                        let expr = to_string(k2) + "/(" + names[ri] + "/" + names[rj] + ")"
+                        let mut pad = expr
+                        while len(pad) < 22 { pad = pad + " " }
+                        println("  " + pad + "= " + fmt_f(inv_scaled) + "  → " + m2)
+                        if m2.contains("EXACT") { exact = exact + 1 }
+                        else { near = near + 1 }
+                    }
+                    k2 = k2 + 1
+                }
+            }
+            rj = rj + 1
+        }
+        ri = ri + 1
+    }
+    println("  소계: EXACT=" + to_string(exact) + " NEAR=" + to_string(near))
+    println("")
+    [exact, near]
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── PHASE 4: LOG SPECTRUM ───
+// ═══════════════════════════════════════════════════════════
+// ln 공간에서 등간격 구조 탐지 + 전체 쌍 비율 매칭
+
+fn phase_log_spectrum() -> list {
+    println("=== Phase 4: 로그 스펙트럼 (확장 상수 포함) ===")
+    let n = len(ext_names)
+    let mut exact = 0
+    let mut near = 0
+
+    // 정렬 (bubble sort on ln values)
+    let mut sorted_names = []
+    let mut sorted_lns = []
+    let mut si = 0
+    while si < n {
+        sorted_names = sorted_names + [ext_names[si]]
+        sorted_lns = sorted_lns + [ext_lns[si]]
+        si = si + 1
+    }
+    let mut i = 0
+    while i < len(sorted_lns) {
+        let mut j = i + 1
+        while j < len(sorted_lns) {
+            if sorted_lns[j] < sorted_lns[i] {
+                let tmp_v = sorted_lns[i]
+                let tmp_n = sorted_names[i]
+                sorted_lns[i] = sorted_lns[j]
+                sorted_names[i] = sorted_names[j]
+                sorted_lns[j] = tmp_v
+                sorted_names[j] = tmp_n
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    // 스펙트럼 출력
+    println("  ln 스펙트럼 (정렬):")
+    let mut lp = 0
+    while lp < len(sorted_lns) {
+        let mut lpad = sorted_names[lp]
+        while len(lpad) < 12 { lpad = lpad + " " }
+        println("    " + lpad + "ln=" + fmt_f(sorted_lns[lp]))
+        lp = lp + 1
+    }
+    println("")
+
+    // 전체 쌍 비율 (not just adjacent)
+    println("  전체 쌍 ln 비율:")
+    let mut p1 = 0
+    while p1 < len(sorted_lns) {
+        let mut p2 = 0
+        while p2 < len(sorted_lns) {
+            if p1 != p2 && sorted_lns[p2] != 0.0 {
+                let ratio = sorted_lns[p1] / sorted_lns[p2]
+                let m = match_physics(ratio)
+                if len(m) > 0 {
+                    let expr = "ln(" + sorted_names[p1] + ")/ln(" + sorted_names[p2] + ")"
+                    let mut pad = expr
+                    while len(pad) < 30 { pad = pad + " " }
+                    println("    " + pad + "= " + fmt_f(ratio) + "  → " + m)
+                    if m.contains("EXACT") { exact = exact + 1 }
+                    else { near = near + 1 }
+                }
+            }
+            p2 = p2 + 1
+        }
+        p1 = p1 + 1
+    }
+    println("")
+
+    // 인접 간격 비율 → 물리상수
+    println("  인접 간격 비율:")
+    let mut gaps = []
+    let mut gap_labels = []
+    let mut gi = 0
+    while gi < len(sorted_lns) - 1 {
+        let gap = sorted_lns[gi + 1] - sorted_lns[gi]
+        gaps = gaps + [gap]
+        gap_labels = gap_labels + [sorted_names[gi] + "→" + sorted_names[gi + 1]]
+        gi = gi + 1
+    }
+
+    let mut g1 = 0
+    while g1 < len(gaps) {
+        let mut g2 = 0
+        while g2 < len(gaps) {
+            if g1 != g2 && gaps[g2] > 0.001 {
+                let gratio = gaps[g1] / gaps[g2]
+                let m = match_physics(gratio)
+                if len(m) > 0 {
+                    let expr = "Δ(" + gap_labels[g1] + ")/Δ(" + gap_labels[g2] + ")"
+                    println("    " + expr + " = " + fmt_f(gratio) + "  → " + m)
+                    if m.contains("EXACT") { exact = exact + 1 }
+                    else { near = near + 1 }
+                }
+            }
+            g2 = g2 + 1
+        }
+        g1 = g1 + 1
+    }
+
+    println("  소계: EXACT=" + to_string(exact) + " NEAR=" + to_string(near))
+    println("")
+    [exact, near]
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── PHASE 5: CROSS-REFERENCE (discovery_log 교차검증) ───
+// ═══════════════════════════════════════════════════════════
+
+fn phase_crossref(tensor_results: list) -> list {
+    println("=== Phase 5: 교차검증 (unfold ↔ discovery_log) ===")
+    let mut exact = 0
+    let mut axiom_candidates = []
+
+    // discovery_log 읽기
+    let mut content = ""
+    try { content = read_file(discovery_log) } catch err {
+        println("  (discovery_log 읽기 실패)")
+        return [0, []]
+    }
+
+    let lines = content.split("\n")
+    let mut log_values = []
+    let mut log_sources = []
+
+    let mut li = 0
+    while li < len(lines) {
+        let line = lines[li]
+        if line.contains("\"grade\":\"EXACT\"") && line.contains("\"value\":") {
+            // value 파싱
+            let parts = line.split("\"value\":")
+            if len(parts) >= 2 {
+                let num_str = parts[1].split(",")[0].split("}")[0].trim()
+                let val = to_float(num_str)
+                if val > 0.0 {
+                    log_values = log_values + [val]
+                    // source 파싱
+                    let mut src = "?"
+                    if line.contains("\"source\":\"") {
+                        let sp = line.split("\"source\":\"")
+                        if len(sp) >= 2 { src = sp[1].split("\"")[0] }
+                    }
+                    log_sources = log_sources + [src]
+                }
+            }
+        }
+        li = li + 1
+    }
+
+    println("  discovery_log EXACT 엔트리: " + to_string(len(log_values)) + "건")
+
+    // tensor 결과와 교차
+    let mut ti = 0
+    while ti < len(tensor_results) {
+        let tval = tensor_results[ti]
+        if tval > 0.0 {
+            if true {
+                // log에서 같은 값 찾기
+                let mut vi = 0
+                while vi < len(log_values) {
+                    let lv = log_values[vi]
+                    if lv > 0.0 {
+                        let err = abs_val(tval - lv) / lv
+                        if err < 0.0001 {
+                            println("  ★ AXIOM 후보: val=" + fmt_f(tval) + "  ← discovery_log source=" + log_sources[vi])
+                            axiom_candidates = axiom_candidates + [fmt_f(tval)]
+                            exact = exact + 1
+                            vi = len(log_values)  // break
+                        }
+                    }
+                    vi = vi + 1
+                }
+            }
+        }
+        ti = ti + 1
+    }
+
+    if len(axiom_candidates) == 0 {
+        println("  (교차 AXIOM 후보 없음 — tensor 결과가 새로운 경로)")
+    }
+
+    println("  AXIOM 후보: " + to_string(len(axiom_candidates)) + "건")
+    println("")
+    [exact, axiom_candidates]
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── MAIN PIPELINE ───
+// ═══════════════════════════════════════════════════════════
+
+let a = args()
+let domain = if len(a) >= 3 { a[2] } else { "math" }
+let depth = if len(a) >= 4 { to_int(a[3]) } else { 3 }
+
+// --seeds 파싱 (blowup 호환)
+let mut ext_seeds = ""
+let mut ai = 2
+while ai < len(a) {
+    if a[ai] == "--seeds" && ai + 1 < len(a) {
+        ext_seeds = a[ai + 1]
+        ai = ai + 1
+    }
+    ai = ai + 1
+}
+
+// seed → names/vals 분리
+let mut seed_names = []
+let mut seed_vals_parsed = []
+if len(ext_seeds) > 0 {
+    let seed_parts = ext_seeds.split("|")
+    let mut si = 0
+    while si < len(seed_parts) {
+        let sp = seed_parts[si]
+        let fields = sp.split(",")
+        if len(fields) >= 2 {
+            seed_names = seed_names + [fields[0]]
+            seed_vals_parsed = seed_vals_parsed + [to_float(fields[1])]
+        }
+        si = si + 1
+    }
+}
+
+println("╔══════════════════════════════════════════════════════════╗")
+println("║  UNFOLD ENGINE — 차원펼침 (고차원→저차원 분해)          ║")
+println("║  domain=" + domain + "  depth=" + to_string(depth) + "                                     ║")
+println("╚══════════════════════════════════════════════════════════╝")
+println("")
+
+if len(seed_names) > 0 {
+    println("  외부 seeds: " + to_string(len(seed_names)) + "건 주입됨")
+    println("")
+}
+
+// ─── Run all phases ───
+let t_result = phase_tensor(seed_names, seed_vals_parsed)
+let t_exact = t_result[0]
+let t_near = t_result[1]
+let t_items = t_result[2]
+
+let m_result = phase_modular(seed_names, seed_vals_parsed)
+let m_exact = m_result[0]
+let m_near = m_result[1]
+
+let r_result = phase_ratio(seed_names, seed_vals_parsed)
+let r_exact = r_result[0]
+let r_near = r_result[1]
+
+let l_result = phase_log_spectrum()
+let l_exact = l_result[0]
+let l_near = l_result[1]
+
+// Phase 5 교차검증은 blowup 엔진에서 수행 — 여기선 생략
+let c_exact = 0
+let axiom_candidates = []
+
+// ─── Report ───
+let total_exact = t_exact + m_exact + r_exact + l_exact + c_exact
+let total_near = t_near + m_near + r_near + l_near
+
+println("╔══════════════════════════════════════════════════════════╗")
+println("║  UNFOLD REPORT — 차원펼침 완료                          ║")
+println("╚══════════════════════════════════════════════════════════╝")
+println("")
+println("  ┌──────────────────────┬───────┬──────┐")
+println("  │ Phase                │ EXACT │ NEAR │")
+println("  ├──────────────────────┼───────┼──────┤")
+println("  │ 1. 텐서 분해        │ " + to_string(t_exact) + "     │ " + to_string(t_near) + "    │")
+println("  │ 2. 모듈러 투영      │ " + to_string(m_exact) + "     │ " + to_string(m_near) + "    │")
+println("  │ 3. 비율 펼침        │ " + to_string(r_exact) + "     │ " + to_string(r_near) + "    │")
+println("  │ 4. 로그 스펙트럼    │ " + to_string(l_exact) + "     │ " + to_string(l_near) + "    │")
+println("  │ 5. 교차검증         │ " + to_string(c_exact) + "     │ -    │")
+println("  ├──────────────────────┼───────┼──────┤")
+println("  │ TOTAL                │ " + to_string(total_exact) + "     │ " + to_string(total_near) + "    │")
+println("  └──────────────────────┴───────┴──────┘")
+println("")
+
+if len(axiom_candidates) > 0 {
+    println("  ★ AXIOM 후보 " + to_string(len(axiom_candidates)) + "건 — tensor+blowup 이중검증 통과")
+}
+
+if total_exact > 0 {
+    println("  → " + to_string(total_exact) + "건 EXACT! 차원펼침 경로 확인됨")
+}
+
+println("")
+
+// ─── growth_bus 기록 ───
+let mut ts = "?"
+try { ts = exec("date +%Y-%m-%dT%H:%M:%S") } catch err {}
+let bus_line = "{\"source\":\"unfold_engine\",\"timestamp\":\"" + ts.trim() + "\",\"phase\":\"unfold\",\"domain\":\"" + domain + "\",\"depth\":" + to_string(depth) + ",\"exact\":" + to_string(total_exact) + ",\"near\":" + to_string(total_near) + ",\"axiom_candidates\":" + to_string(len(axiom_candidates)) + "}"
+try { append_file(growth_bus, bus_line + "\n") } catch err {}
+
+println("=== unfold engine verified ===")

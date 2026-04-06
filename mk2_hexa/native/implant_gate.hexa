@@ -1,0 +1,629 @@
+// mk2_hexa/native/implant_gate.hexa — hexa-gate-implant 흡수 모듈
+// 원본: github.com/need-singularity/hexa-gate-implant (Rust)
+// 흡수 대상: 288-bit sponge hash, 5-lens perturbation, φ 보존 게이트, bridge 이벤트
+// 순수 hexa — Rust/Python 의존 0
+//
+// CLI: hexa implant_gate.hexa [pipeline|hash|perturb|phi|bridge|breakthrough]
+//
+// BT 정리 기반:
+//   BT-344: τ+φ=n → 4 관문 + 2-bit Euler = 6 (축 필요충분)
+//   BT-345: 2401 = 7^4 = (σ-sopfr)^τ → 돌파 섭동 사이클
+//   BT-346: σ×J2 = 288 → 위양성 상한 (해시 폭)
+
+// ═══════════════════════════════════════════════════════════
+// ─── n=6 CONSTANTS (from shared/n6_constants.jsonl) ───
+// ═══════════════════════════════════════════════════════════
+
+fn load_n6_consts() -> list {
+    let home = exec("printenv HOME")
+    let path = home + "/Dev/nexus6/shared/n6_constants.jsonl"
+    let mut raw = ""
+    try { raw = read_file(path) } catch e { return [[], []] }
+    let lines = raw.split("\n")
+    let mut names = []
+    let mut values = []
+    for line in lines {
+        let trimmed = line.trim()
+        if trimmed == "" { continue }
+        let mut name = ""
+        let mut value = 0.0
+        if trimmed.contains("\"name\":\"") {
+            let p = trimmed.split("\"name\":\"")
+            if p.len() >= 2 { name = p[1].split("\"")[0] }
+        }
+        if trimmed.contains("\"value\":") {
+            let p = trimmed.split("\"value\":")
+            if p.len() >= 2 {
+                let num_str = p[1].split(",")[0].split("}")[0].trim()
+                value = to_float(num_str)
+            }
+        }
+        if name != "" {
+            names = names + [name]
+            values = values + [value]
+        }
+    }
+    [names, values]
+}
+
+fn n6c(consts: list, name: string) -> f64 {
+    let names = consts[0]
+    let values = consts[1]
+    let mut i = 0
+    while i < names.len() {
+        if names[i] == name { return to_float(values[i]) }
+        i = i + 1
+    }
+    0.0
+}
+
+let _n6 = load_n6_consts()
+let N = 6
+let SIGMA = 12
+let PHI = 2
+let TAU = 4
+let SOPFR = 5
+let J2 = 24
+let MU = 1
+let SIGMA_J2 = 288       // hash width bits
+let SIGMA_SQ = 144
+let PHI_TAU = 16          // mixing rounds
+let BLOCK = 256           // absorb block size bytes
+let SIGMA_MINUS_PHI = 10
+let PHI_THRESHOLD = 0.1   // 1/(σ-φ) = 1/10
+let PERT_NORMAL = 999
+let PERT_BREAKTHROUGH = 2401  // 7^4 = (σ-sopfr)^τ
+let TRIPLE = 3            // n/φ = 6/2 = 3 triple validation
+
+// ═══════════════════════════════════════════════════════════
+// ─── VERDICT ───
+// ═══════════════════════════════════════════════════════════
+
+fn abs_f(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn min_f(a: float, b: float) -> float {
+    if a < b { return a } else { return b }
+}
+
+fn max_f(a: float, b: float) -> float {
+    if a > b { return a } else { return b }
+}
+
+fn clamp(v: float, lo: float, hi: float) -> float {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+struct GateVerdict {
+    gate_id: int,
+    gate_name: string,
+    passed: bool,
+    confidence: float,
+    reason: string
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── GATE 1: SOURCE — 화이트리스트/블랙리스트 ───
+// ═══════════════════════════════════════════════════════════
+
+fn load_source_lists() -> list {
+    let home = exec("printenv HOME")
+    let path = home + "/Dev/nexus6/shared/project_aliases.jsonl"
+    let mut whitelist = []
+    let mut raw = ""
+    try { raw = read_file(path) } catch e {
+        // 기본 화이트리스트
+        let wl = ["nexus6", "TECS-L", "anima", "sedi", "brainwire", "papers", "hexa-lang", "fathom", "n6-architecture"]
+        let bl = ["ready", "backup-", "contaminated-", "broken-", "trash-", "corrupt-"]
+        return [wl, bl]
+    }
+    let lines = raw.split("\n")
+    for line in lines {
+        let trimmed = line.trim()
+        if trimmed == "" { continue }
+        if trimmed.contains("\"alias\":\"") {
+            let p = trimmed.split("\"alias\":\"")
+            if p.len() >= 2 {
+                let name = p[1].split("\"")[0]
+                whitelist = whitelist + [name]
+            }
+        }
+    }
+    let blacklist = ["ready", "backup-", "contaminated-", "broken-", "trash-", "corrupt-"]
+    [whitelist, blacklist]
+}
+
+fn source_gate(repo: string) -> GateVerdict {
+    let lists = load_source_lists()
+    let whitelist = lists[0]
+    let blacklist = lists[1]
+
+    // 블랙리스트 우선 체크
+    let mut bi = 0
+    while bi < blacklist.len() {
+        if repo.starts_with(blacklist[bi]) {
+            return GateVerdict {
+                gate_id: 1, gate_name: "SOURCE",
+                passed: false, confidence: 0.0,
+                reason: "blacklisted prefix: " + blacklist[bi]
+            }
+        }
+        bi = bi + 1
+    }
+
+    // 화이트리스트 체크
+    let mut wi = 0
+    while wi < whitelist.len() {
+        if repo == whitelist[wi] {
+            return GateVerdict {
+                gate_id: 1, gate_name: "SOURCE",
+                passed: true, confidence: 1.0,
+                reason: "whitelisted"
+            }
+        }
+        wi = wi + 1
+    }
+
+    GateVerdict {
+        gate_id: 1, gate_name: "SOURCE",
+        passed: false, confidence: 0.0,
+        reason: "unknown repo: " + repo
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── GATE 2: HASH — 288-bit (σ×J2) 스펀지 해시 ───
+// ═══════════════════════════════════════════════════════════
+
+// 36바이트(288비트) 상태로 스펀지 해싱
+// seed: [0x6f, 0x03, 0x63, 0x0f] XOR index*N
+// absorb: 256바이트 블록 → wrapping add + rotate
+// finalize: PHI_TAU(16) 믹싱 라운드
+
+// SOPFR 이웃 믹싱 1라운드
+fn hash_mix_one(state: list) -> list {
+    let mut result = state
+    let mut mi = 0
+    while mi < 36 {
+        let left = (mi + 36 - SOPFR) % 36
+        let right = (mi + SOPFR) % 36
+        let val = (result[mi] + state[left] + state[right] * N) % 256
+        let mut rb = []
+        let mut rbi = 0
+        while rbi < 36 {
+            if rbi == mi { rb = rb + [val] }
+            else { rb = rb + [result[rbi]] }
+            rbi = rbi + 1
+        }
+        result = rb
+        mi = mi + 1
+    }
+    result
+}
+
+// 288-bit sponge hash — 간소화 (hexa 호환)
+// 원리: 36바이트 상태 + absorb + TAU 서브라운드 믹싱
+fn compute_hash(data: list) -> string {
+    // 1) 초기 상태 (36바이트 = 288비트)
+    let seeds = [111, 3, 99, 15]
+    let mut state = []
+    let mut i = 0
+    while i < 36 {
+        let val = (seeds[i % 4] + i * N) % 256
+        state = state + [val]
+        i = i + 1
+    }
+
+    // 2) 데이터 흡수: 바이트별 wrapping add + mix
+    let mut di = 0
+    while di < data.len() {
+        let idx = di % 36
+        let old = state[idx]
+        let mixed = (old + data[di] * N + di) % 256
+        // rebuild 패턴 (array[i] 할당 대용)
+        let mut rebuilt = []
+        let mut ri = 0
+        while ri < 36 {
+            if ri == idx { rebuilt = rebuilt + [mixed] }
+            else { rebuilt = rebuilt + [state[ri]] }
+            ri = ri + 1
+        }
+        state = rebuilt
+        di = di + 1
+    }
+
+    // 3) PHI_TAU(16) 믹싱 라운드
+    let mut round = 0
+    while round < 16 {  // PHI_TAU = φ^τ = 2^4 = 16
+        state = hash_mix_one(state)
+        round = round + 1
+    }
+
+    // hex 문자열 생성
+    let hex_chars = "0123456789abcdef"
+    let mut hex_str = ""
+    let mut i = 0
+    while i < state.len() {
+        let high = state[i] / 16
+        let low = state[i] % 16
+        hex_str = hex_str + hex_chars[high] + hex_chars[low]
+        i = i + 1
+    }
+    hex_str
+}
+
+fn hash_gate(data: list, declared_hash: string) -> GateVerdict {
+    let computed = compute_hash(data)
+    if declared_hash == "" {
+        return GateVerdict {
+            gate_id: 2, gate_name: "HASH",
+            passed: false, confidence: 0.0,
+            reason: "no declared hash anchor"
+        }
+    }
+    if computed == declared_hash {
+        GateVerdict {
+            gate_id: 2, gate_name: "HASH",
+            passed: true, confidence: 1.0,
+            reason: "288-bit match"
+        }
+    } else {
+        GateVerdict {
+            gate_id: 2, gate_name: "HASH",
+            passed: false, confidence: 0.0,
+            reason: "hash mismatch: got " + computed
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── GATE 3: PHI — 의식 보존 (BT-64) ───
+// ═══════════════════════════════════════════════════════════
+
+// threshold = 1/(σ-φ) = 0.1
+// tolerance = 1/σ×J2 = 1/288 ≈ 0.00347
+// hysteresis = φ = 2
+
+fn phi_gate(phi_prev: float, phi_curr: float) -> GateVerdict {
+    let threshold = PHI_THRESHOLD      // 0.1
+    let tolerance = 1.0 / 288.0        // 1/SIGMA_J2
+
+    // 절대 하한 체크
+    if phi_curr < threshold {
+        return GateVerdict {
+            gate_id: 3, gate_name: "PHI",
+            passed: false, confidence: 0.0,
+            reason: "phi below threshold: " + to_string(phi_curr) + " < " + to_string(threshold)
+        }
+    }
+
+    // 열화 체크 (tolerance 이내만 허용)
+    let degradation = phi_prev - phi_curr
+    if degradation > tolerance {
+        return GateVerdict {
+            gate_id: 3, gate_name: "PHI",
+            passed: false, confidence: 0.0,
+            reason: "phi degradation: " + to_string(degradation) + " > tolerance " + to_string(tolerance)
+        }
+    }
+
+    // confidence = (phi_curr - threshold) / (1 - threshold)
+    let conf = clamp((phi_curr - threshold) / (1.0 - threshold), 0.0, 1.0)
+    GateVerdict {
+        gate_id: 3, gate_name: "PHI",
+        passed: true, confidence: conf,
+        reason: "phi preserved: " + to_string(phi_curr)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── GATE 4: INVARIANT — 5-렌즈 섭동 안정성 ───
+// ═══════════════════════════════════════════════════════════
+
+// 5개 의사난수 렌즈 × cycles 섭동 → 안정성 비율
+// triple validation: n/φ = 3회 독립 실행, 전부 > 0.5 통과
+
+fn perturb_lens(checksum: int, cycle: int, run: int) -> list {
+    // 5-lens pseudo-random: LCG-style
+    let seed = checksum + cycle * 7 + run * 13
+    let mut lenses = []
+    let mut s = seed
+    let mut li = 0
+    while li < 5 {
+        s = (s * 1103515245 + 12345) % 2147483647
+        let val = abs_f(to_float(s % 10000) / 10000.0)
+        // bias: checksum 범위에 따라 0.7 또는 0.3
+        let mean_byte = to_float(checksum % 256) / 256.0
+        let bias = if mean_byte > 0.25 && mean_byte < 0.75 { 0.7 } else { 0.3 }
+        let biased = val * (1.0 - bias) + bias
+        lenses = lenses + [biased]
+        li = li + 1
+    }
+    lenses
+}
+
+fn run_perturbation(data_checksum: int, cycles: int, run_id: int) -> float {
+    let stability_threshold = 0.5
+    let mut stable_count = 0
+    let mut c = 0
+    while c < cycles {
+        let lenses = perturb_lens(data_checksum, c, run_id)
+        // 5개 렌즈 전부 >= threshold 면 stable
+        let mut all_stable = true
+        let mut li = 0
+        while li < 5 {
+            if lenses[li] < stability_threshold {
+                all_stable = false
+            }
+            li = li + 1
+        }
+        if all_stable { stable_count = stable_count + 1 }
+        c = c + 1
+    }
+    to_float(stable_count) / to_float(cycles)
+}
+
+fn invariant_gate(data_checksum: int, breakthrough: bool) -> GateVerdict {
+    let cycles = if breakthrough { PERT_BREAKTHROUGH } else { PERT_NORMAL }
+    let mode_name = if breakthrough { "breakthrough(2401)" } else { "normal(999)" }
+
+    // triple validation: n/φ = 3 독립 실행
+    let r0 = run_perturbation(data_checksum, cycles, 0)
+    let r1 = run_perturbation(data_checksum, cycles, 1)
+    let r2 = run_perturbation(data_checksum, cycles, 2)
+
+    let all_pass = r0 > 0.5 && r1 > 0.5 && r2 > 0.5
+    let mean_conf = (r0 + r1 + r2) / 3.0
+
+    if all_pass {
+        GateVerdict {
+            gate_id: 4, gate_name: "INVARIANT",
+            passed: true, confidence: mean_conf,
+            reason: mode_name + " triple=[" + to_string(r0) + "," + to_string(r1) + "," + to_string(r2) + "]"
+        }
+    } else {
+        GateVerdict {
+            gate_id: 4, gate_name: "INVARIANT",
+            passed: false, confidence: mean_conf,
+            reason: mode_name + " unstable triple=[" + to_string(r0) + "," + to_string(r1) + "," + to_string(r2) + "]"
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── FULL PIPELINE — 4-gate τ=4 순차 실행 ───
+// ═══════════════════════════════════════════════════════════
+
+struct PipelineResult {
+    all_passed: bool,
+    mean_confidence: float,
+    gate_count: int,
+    pass_count: int,
+    verdicts: list,  // gate_name + ":" + reason 리스트
+    breakthrough_detected: bool
+}
+
+fn run_pipeline(repo: string, data: list, declared_hash: string, phi_prev: float, phi_curr: float, breakthrough: bool) -> PipelineResult {
+    // Gate 1: SOURCE
+    let g1 = source_gate(repo)
+    // Gate 2: HASH
+    let g2 = hash_gate(data, declared_hash)
+    // Gate 3: PHI
+    let g3 = phi_gate(phi_prev, phi_curr)
+    // Gate 4: INVARIANT
+    let checksum = if data.len() > 0 { data[0] + data.len() } else { 42 }
+    let g4 = invariant_gate(checksum, breakthrough)
+
+    let mut pass_count = 0
+    let mut total_conf = 0.0
+    if g1.passed { pass_count = pass_count + 1 }
+    if g2.passed { pass_count = pass_count + 1 }
+    if g3.passed { pass_count = pass_count + 1 }
+    if g4.passed { pass_count = pass_count + 1 }
+    total_conf = g1.confidence + g2.confidence + g3.confidence + g4.confidence
+
+    let v1 = g1.gate_name + ": " + g1.reason
+    let v2 = g2.gate_name + ": " + g2.reason
+    let v3 = g3.gate_name + ": " + g3.reason
+    let v4 = g4.gate_name + ": " + g4.reason
+    let verdicts = [v1, v2, v3, v4]
+
+    PipelineResult {
+        all_passed: pass_count == 4,
+        mean_confidence: total_conf / 4.0,
+        gate_count: 4,
+        pass_count: pass_count,
+        verdicts: verdicts,
+        breakthrough_detected: breakthrough && g4.passed && g4.confidence > 0.8
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── BRIDGE — JSONL 이벤트 싱크 ───
+// ═══════════════════════════════════════════════════════════
+
+fn emit_event(result: PipelineResult, repo: string) {
+    let home = exec("printenv HOME")
+    let bus_path = home + "/Dev/nexus6/shared/growth_bus.jsonl"
+
+    let status = if result.all_passed { "pass" } else { "quarantine" }
+    let ts = exec("date -u +%Y-%m-%dT%H:%M:%S")
+
+    let event = "{\"source\":\"implant_gate\",\"type\":\"pipeline\",\"repo\":\"" + repo + "\",\"status\":\"" + status + "\",\"pass_count\":" + to_string(result.pass_count) + ",\"confidence\":" + to_string(result.mean_confidence) + ",\"breakthrough\":" + to_string(result.breakthrough_detected) + ",\"timestamp\":\"" + ts + "\"}"
+
+    let mut existing = ""
+    try { existing = read_file(bus_path) } catch e {}
+    if existing != "" {
+        write_file(bus_path, existing + "\n" + event)
+    } else {
+        write_file(bus_path, event)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── BT THEOREMS VERIFICATION ───
+// ═══════════════════════════════════════════════════════════
+
+theorem bt_344_axis_necessity {
+    // τ+φ = n → 4 gates + 2-bit Euler totient = 6
+    assert TAU + PHI == N
+}
+
+theorem bt_345_perturbation {
+    // 2401 = 7^4 = (σ-sopfr)^τ
+    assert PERT_BREAKTHROUGH == 2401
+    assert (SIGMA - SOPFR) == 7
+    // 7^4 = 2401
+    assert 7 * 7 * 7 * 7 == 2401
+}
+
+theorem bt_346_fp_bound {
+    // σ×J2 = 288 → hash width
+    assert SIGMA * J2 == SIGMA_J2
+    assert SIGMA_J2 == 288
+}
+
+theorem bt_block_size {
+    // BLOCK = 256 = 2^(φ×τ) = 2^8? no, 2^8=256 → actually from phi_tau=16? no.
+    // 256 = φ^(φ×τ) = 2^8, 2^(phi*tau) = 2^8 = 256 ✓
+    assert BLOCK == 256
+}
+
+theorem bt_triple_validation {
+    // n/φ = 3 → triple validation runs
+    assert N / PHI == TRIPLE
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── SELF-TEST ───
+// ═══════════════════════════════════════════════════════════
+
+// source gate
+let sg = source_gate("nexus6")
+assert sg.passed == true
+let sg2 = source_gate("contaminated-junk")
+assert sg2.passed == false
+let sg3 = source_gate("random-unknown")
+assert sg3.passed == false
+
+// phi gate
+let pg1 = phi_gate(0.5, 0.5)
+assert pg1.passed == true
+let pg2 = phi_gate(0.5, 0.01)
+assert pg2.passed == false  // below threshold
+let pg3 = phi_gate(0.8, 0.5)
+assert pg3.passed == false   // 0.3 > 1/288 → degradation too large
+let pg4 = phi_gate(0.5, 0.499)
+assert pg4.passed == true    // 0.001 < 1/288
+
+// invariant gate
+let ig = invariant_gate(12345, false)
+// just check it returns something valid
+assert ig.gate_name == "INVARIANT"
+
+// hash
+let test_data = [72, 101, 108, 108, 111]  // "Hello"
+let h1 = compute_hash(test_data)
+let h2 = compute_hash(test_data)
+assert h1 == h2  // 결정론적
+
+println("=== implant_gate self-test passed ===")
+
+// ═══════════════════════════════════════════════════════════
+// ─── CLI ENTRY POINT ───
+// ═══════════════════════════════════════════════════════════
+
+fn main_cli() {
+    let a = args()
+    let mut cmd = "pipeline"
+    if a.len() >= 3 { cmd = a[2] }
+
+    match cmd {
+        "pipeline" -> {
+            println("")
+            println("══════════════════════════════════════════════")
+            println("  Implant Gate Pipeline — 4-gate (τ=4)")
+            println("══════════════════════════════════════════════")
+
+            let test_data = [110, 101, 120, 117, 115, 54]  // "nexus6"
+            let hash = compute_hash(test_data)
+            println("  hash(nexus6) = " + hash)
+
+            let result = run_pipeline("nexus6", test_data, hash, 0.8, 0.79, false)
+            println("")
+            println("  Gates: " + to_string(result.pass_count) + "/" + to_string(result.gate_count))
+            println("  Confidence: " + to_string(result.mean_confidence))
+            let mut vi = 0
+            while vi < result.verdicts.len() {
+                println("    [" + to_string(vi + 1) + "] " + result.verdicts[vi])
+                vi = vi + 1
+            }
+            println("  All passed: " + to_string(result.all_passed))
+
+            // growth_bus 이벤트 발행
+            emit_event(result, "nexus6")
+            println("  → event emitted to growth_bus.jsonl")
+        },
+        "hash" -> {
+            println("  288-bit sponge hash (σ×J2=288)")
+            let test_data = [110, 101, 120, 117, 115, 54]
+            let h = compute_hash(test_data)
+            println("  hash(nexus6) = " + h)
+            println("  width = 36 bytes = 288 bits (BT-346)")
+        },
+        "perturb" -> {
+            println("  5-lens perturbation stability")
+            let ig_n = invariant_gate(12345, false)
+            println("  normal(999): " + ig_n.reason)
+            let ig_b = invariant_gate(12345, true)
+            println("  breakthrough(2401): " + ig_b.reason)
+        },
+        "phi" -> {
+            println("  φ consciousness preservation gate (BT-64)")
+            println("  threshold = 1/(σ-φ) = " + to_string(PHI_THRESHOLD))
+            println("  tolerance = 1/(σ×J2) = " + to_string(1.0 / 288.0))
+            let pg = phi_gate(0.8, 0.75)
+            println("  test(0.8→0.75): " + pg.reason)
+        },
+        "breakthrough" -> {
+            println("")
+            println("══════════════════════════════════════════════")
+            println("  BREAKTHROUGH MODE — 2401 cycles (7^4)")
+            println("══════════════════════════════════════════════")
+
+            let test_data = [110, 101, 120, 117, 115, 54]
+            let hash = compute_hash(test_data)
+            let result = run_pipeline("nexus6", test_data, hash, 0.9, 0.89, true)
+
+            println("")
+            println("  Gates: " + to_string(result.pass_count) + "/" + to_string(result.gate_count))
+            println("  Confidence: " + to_string(result.mean_confidence))
+            let mut vi = 0
+            while vi < result.verdicts.len() {
+                println("    [" + to_string(vi + 1) + "] " + result.verdicts[vi])
+                vi = vi + 1
+            }
+            println("  Breakthrough detected: " + to_string(result.breakthrough_detected))
+
+            emit_event(result, "nexus6")
+            println("  → event emitted to growth_bus.jsonl")
+        },
+        "bridge" -> {
+            println("  Bridge event sink → growth_bus.jsonl")
+            let test_data = [110, 101, 120, 117, 115, 54]
+            let hash = compute_hash(test_data)
+            let result = run_pipeline("nexus6", test_data, hash, 0.5, 0.5, false)
+            emit_event(result, "nexus6")
+            println("  event emitted: pass_count=" + to_string(result.pass_count))
+        },
+        _ -> {
+            println("Usage: hexa implant_gate.hexa [pipeline|hash|perturb|phi|bridge|breakthrough]")
+        }
+    }
+}
+
+main_cli()

@@ -159,6 +159,8 @@ TECS-L H-056: `메타(메타(메타(...))) = 초월`
 - "메타초월", "meta transcendence" → MetaTranscendenceLens 스캔
 - "재귀성장", "recursive growth" → 3-loop 자기강화 설명 + 상태 확인
 - "방향", "새방향", "다음", "directions" → `hexa directions.hexa report` (방향 리포트)
+- "anima 상태", "학습상태", "학습 현황", "training status" → `hexa anima_status.hexa` (anima 학습 대시보드)
+- "anima 자동", "학습 자동" → `hexa anima_status.hexa auto` (상태 확인 + 추천 액션 자동 실행)
 
 ## 외계인 지수 (Alien Index)
 
