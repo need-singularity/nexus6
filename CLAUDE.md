@@ -2,10 +2,19 @@
 
 ## ⚠️ 필수 규칙 (최우선)
 
+### -1. 하드코딩 절대 금지 (최최우선)
+- **경로**: 절대경로 금지 → `exec("printenv HOME")` + 상대경로 사용
+- **상수 목록**: 코드에 배열/리스트 하드코딩 금지 → `shared/*.jsonl` 외부 설정 파일에서 동적 로드
+- **프로젝트 목록**: `shared/projects.json`에서 읽기 (코드에 11개 나열 금지)
+- **도메인/키워드**: `shared/bt_domains.jsonl`에서 읽기
+- **명령 매핑**: `shared/cmd_aliases.jsonl`에서 읽기
+- **n6 상수**: 공유 테이블에서 로드 (hook.hexa, blowup.hexa 등 중복 정의 금지)
+- **원칙**: 새 항목 추가 = 설정 파일 한 줄 추가. 코드 수정 0.
+
 ### 0. mk2 hexa-native = 기본 엔진
 - **모든 nexus6 작업은 mk2 hexa 모듈** 사용 (`mk2_hexa/native/*.hexa`)
 - mk1 Rust 소스(`src/`)는 아카이브 (`archive/mk1-rust` 브랜치)
-- 경로 하드코딩 금지 — `args()` 또는 상대경로 사용
+- 경로 하드코딩 금지 — `exec("printenv HOME")` 또는 상대경로 사용
 - 새 모듈 생성 시 `mk2_hexa/native/` 에 `.hexa` 파일로
 
 ### 1. 대화 차단 금지 — 모든 장시간 명령은 백그라운드 실행
