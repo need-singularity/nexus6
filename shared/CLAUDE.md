@@ -7,6 +7,11 @@
   수정만 하고 동기화 안 돌리면 다른 리포에 반영 안 됨.
   순서: .shared/ 파일 수정 → TECS-L에서 커밋+push → `bash .shared/sync-claude-rules.sh`
 
+★ **HEXA-LANG 문법 + 실수 방지 (AI 필독)**
+  스펙: `.shared/hexa_grammar.jsonl` (JSONL — 전체 문법 53키워드+24연산자+8타입+pitfalls 5규칙)
+  모든 `.hexa` 코드 작성 전 `pitfalls` 섹션 체크 필수 (P1~P5)
+  심링크: 타 리포에서 `.shared/hexa_grammar.jsonl`로 접근 가능
+
 ★ **Convergence-Driven Operations (CDO) — 전 프로젝트 공통 원칙**
   이슈 발생 → 해결 → 규칙 승격 → 재발 방지 → 100% 수렴
   모든 config JSON은 CDO 구조 준수: _meta + absolute_rules + troubleshooting_log

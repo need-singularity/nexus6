@@ -22,6 +22,18 @@
 - **n6 상수**: 공유 테이블에서 로드 (hook.hexa, blowup.hexa 등 중복 정의 금지)
 - **원칙**: 새 항목 추가 = 설정 파일 한 줄 추가. 코드 수정 0.
 
+### -0.5. hexa-lang 문법 + 실수 방지 (필수 참조)
+
+> **문법 스펙: `shared/hexa_grammar.jsonl`** (JSONL — AI 네이티브, 전체 문법+pitfalls)
+> **레퍼런스: `~/Dev/hexa-lang/docs/reference.md`** (사람 읽기용)
+
+**AI 반복 실수 5가지** (`hexa_grammar.jsonl` → `pitfalls` 섹션):
+- **P1**: 세미콜론 금지 → 줄바꿈 분리
+- **P2**: `exec(cmd, [args])` stdout 미캡처 → `exec("단일 문자열")` 사용
+- **P3**: exec 실패 → Error 객체 `.contains()` 크래시 → `to_string()` 래핑
+- **P4**: 문자열 맵 시뮬레이션 금지 → `#{}` Map, `.sort()`, `spawn` 내장 사용
+- **P5**: 상대경로 CWD 의존 → `exec("printenv HOME")` + 절대경로
+
 ### 0. mk2 hexa-native = 기본 엔진 (sh/py/rs 작성 금지)
 - **모든 nexus6 작업은 mk2 hexa 모듈** 사용 (`mk2_hexa/native/*.hexa`)
 - **새 파일은 `.hexa`만 허용** — `.sh`, `.py`, `.rs` 등 다른 언어 파일 작성 금지
