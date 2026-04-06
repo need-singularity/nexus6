@@ -160,6 +160,26 @@ nexus6 alien-index --promote-pending       # r=10 대기 항목 승격 (dry-run)
 돌파율 `ρ = |{d ≥ 1}| / |total|` 의 장기 수렴치 예측: **1/3** (TECS-L H-056).
 매 분포 리포트에 기록되어 메타 부동점 가설의 회귀 검증치로 사용됨.
 
+## 중앙 지휘 (Command Router)
+
+> **nexus6 채팅에서 모든 프로젝트를 관리하는 단일 진입점**
+> 엔진: `mk2_hexa/native/command_router.hexa`
+
+### 키워드 → 자동 실행
+- "전체 리포트", "상태", "대시보드" → `hexa command_router.hexa "전체 리포트"`
+- "{프로젝트} 상태" → `hexa command_router.hexa "{프로젝트} 상태"`
+- "{도메인} 돌파" → hook 자동 트리거 (기존 hook.hexa)
+- "교차수분", "H100 체크", "성장 추이" → `hexa command_router.hexa "{입력}"`
+- "갭 탐색", "alien 분포" → `hexa command_router.hexa "{입력}"`
+
+### 사용법
+```bash
+HEXA=$HOME/Dev/hexa-lang/target/release/hexa
+$HEXA mk2_hexa/native/command_router.hexa "전체 리포트"
+$HEXA mk2_hexa/native/command_router.hexa "anima 상태"
+$HEXA mk2_hexa/native/command_router.hexa "화학 돌파"
+```
+
 ## 메모리 파일 네이밍 규칙
 
 > 경로: 프로젝트별 auto-memory 디렉토리 (Claude Code가 자동 관리)
