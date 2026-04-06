@@ -162,7 +162,7 @@ nexus6 alien-index --promote-pending       # r=10 대기 항목 승격 (dry-run)
 
 ## 메모리 파일 네이밍 규칙
 
-> 경로: `~/.claude-claude3/projects/-Users-ghost-Dev-nexus6/memory/`
+> 경로: 프로젝트별 auto-memory 디렉토리 (Claude Code가 자동 관리)
 
 | prefix | type | 예시 |
 |--------|------|------|
