@@ -12,14 +12,7 @@ if [ -z "${GROWTH_NAME:-}" ]; then
 fi
 
 GROWTH_DIR="${PROJECT_ROOT}/.growth"
-# 중앙 루프 상태: nexus/shared/loop/{project}.json (SSOT)
-CENTRAL_LOOP_DIR="$HOME/Dev/nexus/shared/loop"
-CENTRAL_LOOP_STATE="${CENTRAL_LOOP_DIR}/${GROWTH_NAME}.json"
-if [ -d "$CENTRAL_LOOP_DIR" ]; then
-    GROWTH_STATE="$CENTRAL_LOOP_STATE"
-else
-    GROWTH_STATE="${GROWTH_DIR}/growth_state.json"
-fi
+GROWTH_STATE="${GROWTH_DIR}/growth_state.json"
 GROWTH_LOG="${GROWTH_DIR}/growth.log"
 GROWTH_BUS="$HOME/Dev/nexus/shared/growth_bus.jsonl"
 LOCKFILE="/tmp/n6-growth-${GROWTH_NAME}.lock"
