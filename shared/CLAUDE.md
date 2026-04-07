@@ -46,6 +46,7 @@ nexus.evolve(domain)             # 자율 진화
 | `진화` / `업그레이드` | Mk.I~V 체크포인트 생성 |
 | `동기화` | 전 리포 sync → `sync-all.sh` |
 | `빈공간` / `gap` | n=6 빈공간 탐색 → `gap_finder.hexa` |
+| **`go`** | **전체 TODO 스캔 → 독립 작업 백그라운드 병렬 Agent 동시 발사 (확인 없이 즉시)** |
 
 ## 보호 체계 (Core Lockdown)
 
