@@ -64,6 +64,16 @@ EVAL_NS = {
     'abs': abs,
     'floor': math.floor,
     'ceil': math.ceil,
+    # 그리스 문자 매핑으로 추가되는 이름
+    'alpha': 1/137.036,  # 미세구조상수
+    'beta': 0.288,  # ln(4/3)
+    'delta': 0,
+    'epsilon': 1e-8,
+    'zeta': 1.6449,  # zeta(2) = pi^2/6
+    'eta': 0.5,
+    'kappa': 6,  # SLE kappa
+    'lambda_val': 2,  # Carmichael lambda(6)
+    'psi': 12,  # Dedekind psi(6)
     # 파이썬 내장
     '__builtins__': {},
 }
@@ -92,7 +102,27 @@ def normalize_expr(expr_str):
     ]):
         return None
 
-    # 유니코드 치환
+    # 등호 처리: "128 = 2^7" → 숫자면 숫자, 수식이면 수식
+    if '=' in s and '==' not in s and '>=' not in s and '<=' not in s:
+        parts = s.split('=', 1)
+        left, right = parts[0].strip(), parts[1].strip()
+        try:
+            float(left.replace(',', ''))
+            s = left.replace(',', '')
+        except ValueError:
+            s = left
+
+    # 유니코드 그리스 문자 → 영문 치환
+    greek_map = {
+        'σ': 'sigma', 'τ': 'tau', 'φ': 'phi', 'μ': 'mu',
+        'ψ': 'psi', 'η': 'eta', 'κ': 'kappa', 'λ': 'lambda_val',
+        'α': 'alpha', 'β': 'beta', 'ε': 'epsilon', 'δ': 'delta',
+        'ζ': 'zeta', 'Δ': 'delta', 'π': 'pi', 'Φ': 'phi',
+    }
+    for g, eng in greek_map.items():
+        s = s.replace(g, eng)
+
+    # 유니코드 산술 치환
     s = s.replace('×', '*').replace('·', '*').replace('÷', '/')
     s = s.replace('−', '-').replace('–', '-').replace('—', '-')
     s = s.replace('^', '**').replace('²', '**2').replace('³', '**3')
