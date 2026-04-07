@@ -86,38 +86,132 @@ RESULT_FILE = os.path.expanduser(
 )
 
 
-# 유니코드 첨자 → ASCII
+# 유니코드 아래첨자 → ASCII (K₁ → K1)
 SUB_MAP = str.maketrans({
     '₀': '0', '₁': '1', '₂': '2', '₃': '3', '₄': '4',
     '₅': '5', '₆': '6', '₇': '7', '₈': '8', '₉': '9',
-    '⁰': '0', '¹': '1', '²': '2', '³': '3', '⁴': '4',
-    '⁵': '5', '⁶': '6', '⁷': '7', '⁸': '8', '⁹': '9',
 })
 
-# 더 넓은 단위 패턴 (괄호 주석/배수/극성 포함)
+# 유니코드 윗첨자 → **N (거듭제곱)
+SUP_MAP = {
+    '⁰': '0', '¹': '1', '²': '2', '³': '3', '⁴': '4',
+    '⁵': '5', '⁶': '6', '⁷': '7', '⁸': '8', '⁹': '9',
+}
+
+
+def _convert_superscripts(s):
+    """연속된 유니코드 윗첨자를 **N 으로 변환"""
+    out = []
+    i = 0
+    while i < len(s):
+        if s[i] in SUP_MAP:
+            j = i
+            digits = ''
+            while j < len(s) and s[j] in SUP_MAP:
+                digits += SUP_MAP[s[j]]
+                j += 1
+            out.append('**' + digits)
+            i = j
+        else:
+            out.append(s[i])
+            i += 1
+    return ''.join(out)
+
+# 단위 패턴 — 선행 숫자가 반드시 있어야 함 (sigma/phi 같은 식별자 보호)
+# 대소문자 구분 (mA ≠ ma), 뒤는 word-boundary
 UNIT_RE = re.compile(
-    r'\s*(?:\([^)]*\))?\s*'
-    r'(±|~|≈)?\s*'
-    r'(ft|Hz|kHz|MHz|GHz|THz|nm|μm|um|mm|cm|m|km|eV|keV|MeV|GeV|TeV'
-    r'|W|kW|MW|GW|V|kV|MV|A|mA|T|mT|K|s|ms|us|μs|ns|ps|fs'
-    r'|MPa|GPa|Pa|bar|atm|J|kJ|MJ|Wh|kWh|MWh|°C|°F|°|deg|rad'
-    r'|bits?|bytes?|KB|MB|GB|TB|×|x|%'
+    r'(?<=[\d\)])\s*'
+    r'(?:ft|Hz|kHz|MHz|GHz|THz|nm|μm|um|mm|cm|km|eV|keV|MeV|GeV|TeV'
+    r'|kW|MW|GW|kV|MV|mA|mT|ms|us|μs|ns|ps|fs'
+    r'|MPa|GPa|Pa|bar|atm|kJ|MJ|Wh|kWh|MWh|°C|°F|°|deg|rad'
+    r'|bits?|bytes?|KB|MB|GB|TB|×|%'
     r'|channels?|layers?|classes?|types?|conditions?|properties?'
     r'|principles?|constraints?|factors?|methods?|values?|axes?|modes?'
     r'|phases?|levels?|sizes?|rounds?|suites?|stages?|weightings?'
-    r'|rings?|syntaxes?|flanges?|atoms?|bonds?|bases?|nearest|fold)\b'
-    r'.*$', re.IGNORECASE
+    r'|rings?|syntaxes?|flanges?|atoms?|bonds?|bases?|nearest|fold'
+    r'|A100|MLA|S0-S5|C0-C3|D0-D3|G0-G3)\b.*$'
 )
 
 
 def strip_units(s):
-    """단위/주석/극성 표기 제거"""
+    """단위/주석/극성 표기 제거 (순수 식별자는 보호)"""
     s = s.strip()
     s = re.sub(r'^[±~≈]+', '', s).strip()
-    # 괄호 주석 (A100), (Keepin model) 등 제거
-    s = re.sub(r'\s*\([^)]*\)\s*$', '', s).strip()
+    # 괄호 주석 (A100), (Keepin model) 등 — 앞에 숫자가 있을 때만 제거
+    s = re.sub(r'(?<=[\d\)])\s*\([^)]*\)\s*$', '', s).strip()
     s = UNIT_RE.sub('', s).strip()
     return s
+
+
+# 단순 "숫자+단위/단어" 패턴 (전체 매칭) — bare numeric value 추출
+BARE_NUM_RE = re.compile(
+    r'^\s*([+-]?\d{1,3}(?:,\d{3})+|[+-]?\d+\.?\d*|[+-]?\.\d+)'
+    r'\s*(?:%|°[CFK]?|[A-Za-zμ/·\-]+\d*)?'
+    r'(?:\s*(?:±|\+/-|\+-)\s*[\d.]+)?'
+    r'\s*$'
+)
+
+# 과학적 표기: 6×10⁻⁵, 1.5x10^-3, 6*10^-5
+SCI_NOTATION_RE = re.compile(
+    r'^\s*([+-]?\d+\.?\d*)\s*[×x*·]\s*10\s*[\^]?\s*([+-]?\d+|⁻?[⁰¹²³⁴⁵⁶⁷⁸⁹]+)\s*'
+    r'(?:[A-Za-zμ/·\-^\d]+)?\s*$'
+)
+
+
+def _parse_sup_int(s):
+    """⁻⁵ → -5 또는 일반 정수 문자열"""
+    if not s:
+        return None
+    s = s.replace('⁻', '-')
+    out = ''
+    for c in s:
+        if c in SUP_MAP:
+            out += SUP_MAP[c]
+        else:
+            out += c
+    try:
+        return int(out)
+    except ValueError:
+        return None
+
+
+def parse_bare_numeric(s):
+    """expression 셀이 사실 숫자값(단위포함)일 때 그 숫자만 추출. 실패시 None."""
+    if not s:
+        return None
+    s = s.strip()
+    # 마크다운 굵게 제거
+    s = re.sub(r'^\*\*(.+?)\*\*$', r'\1', s).strip()
+    # 선행 ± ~ ≈
+    s = re.sub(r'^[±~≈]+', '', s).strip()
+
+    # 과학적 표기 우선
+    m = SCI_NOTATION_RE.match(s)
+    if m:
+        try:
+            base = float(m.group(1))
+            exp = _parse_sup_int(m.group(2))
+            if exp is not None:
+                return base * (10 ** exp)
+        except (ValueError, OverflowError):
+            pass
+
+    # "0.0351 +/- 0.0042" 같은 표기
+    m2 = re.match(r'^([+-]?\d+\.?\d*|[+-]?\.\d+)\s*(?:±|\+/-|\+-)\s*[\d.]+', s)
+    if m2:
+        try:
+            return float(m2.group(1))
+        except ValueError:
+            pass
+
+    # 일반 숫자+단위/단어
+    m = BARE_NUM_RE.match(s)
+    if m:
+        try:
+            return float(m.group(1).replace(',', ''))
+        except ValueError:
+            return None
+    return None
 
 
 def normalize_expr(expr_str):
@@ -127,7 +221,8 @@ def normalize_expr(expr_str):
     # 마크다운 굵게 제거
     s = re.sub(r'^\*\*(.*)\*\*$', r'\1', s).strip()
 
-    # 유니코드 첨자/지수 → ASCII
+    # 유니코드 윗첨자 → **N (거듭제곱), 아래첨자 → 숫자
+    s = _convert_superscripts(s)
     s = s.translate(SUB_MAP)
 
     # 빈 문자열이나 설명 텍스트 스킵
@@ -171,9 +266,22 @@ def normalize_expr(expr_str):
     s = s.replace('−', '-').replace('–', '-').replace('—', '-')
     s = s.replace('^', '**').replace('²', '**2').replace('³', '**3')
     s = s.replace('⁴', '**4').replace('⁵', '**5')
+    s = s.replace('⁶', '**6').replace('⁷', '**7').replace('⁸', '**8').replace('⁹', '**9')
+    s = s.replace('⁰', '**0').replace('¹', '**1')
+
+    # 'x' 또는 'X' 가 곱셈 기호로 쓰인 경우 (공백 둘러쌈)
+    s = re.sub(r'(?<=[\w\)])\s+[xX]\s+(?=[\w\(])', '*', s)
+
+    # LaTeX 중괄호 제거 (10^{-(sigma-phi)} → 10**(-(sigma-phi)))
+    s = s.replace('{', '(').replace('}', ')')
 
     # J_2 -> J2
     s = s.replace('J_2', 'J2')
+
+    # sigma/phi/tau 등은 함수가 아닌 상수 — 'sigma(' 같은 사용은 곱셈으로 해석
+    # 예: σ(σ-μ) → sigma*(sigma-mu)
+    for nm in ('sigma', 'phi', 'tau', 'sopfr', 'mu', 'psi', 'eta', 'kappa'):
+        s = re.sub(rf'\b{nm}\(', f'{nm}*(', s)
 
     # "sigma-tau" 같은 연산 표현 보존 (이미 Python 호환)
 
@@ -191,6 +299,13 @@ def normalize_expr(expr_str):
     # "phi**tau" → OK
 
     # 공백 연산: "sigma - tau" → "sigma-tau" (eval OK)
+
+    # 암묵적 곱셈 삽입:
+    # 1) 숫자와 식별자/괄호: 3tau → 3*tau, 6pi → 6*pi
+    s = re.sub(r'(\d)([A-Za-z_(])', r'\1*\2', s)
+    # 2) 닫는 괄호와 여는 괄호 또는 식별자: )(  → )*(
+    s = re.sub(r'\)\s*([A-Za-z_(])', r')*\1', s)
+    # 3) 식별자 뒤 여는 괄호는 normalize 위에서 sigma( → sigma*( 처리됨
 
     # 단위/주석 제거
     s = strip_units(s)
@@ -218,7 +333,7 @@ def split_list_expr(expr_str):
     """리스트/래더 표현을 원소들로 분해. 분해 불가면 None."""
     s = expr_str.strip()
     s = re.sub(r'^\*\*(.*)\*\*$', r'\1', s).strip()
-    s = s.translate(SUB_MAP)
+    s = _convert_superscripts(s).translate(SUB_MAP)
     # {a, b, c} 또는 [a, b, c]
     m = re.match(r'^[\[\{](.+)[\]\}]$', s)
     if m:
@@ -262,6 +377,10 @@ def safe_eval(expr_str):
     """수식 문자열을 안전하게 평가"""
     normalized = normalize_expr(expr_str)
     if normalized is None:
+        # 수식 정규화 실패 — bare numeric 폴백
+        bare = parse_bare_numeric(expr_str)
+        if bare is not None:
+            return bare, f'<bare:{bare}>'
         return None, None
 
     try:
@@ -270,6 +389,10 @@ def safe_eval(expr_str):
             return result, normalized
         return None, normalized
     except Exception:
+        # eval 실패 — bare numeric 폴백
+        bare = parse_bare_numeric(expr_str)
+        if bare is not None:
+            return bare, f'<bare:{bare}>'
         return None, normalized
 
 
@@ -384,10 +507,12 @@ def extract_verification_tables(bt_num, section_text):
                 header_found = False
                 continue
 
-            # 테이블 행 파싱
+            # 테이블 행 파싱 — 앞뒤 빈 셀만 제거 (중간 보존)
             cells = [c.strip() for c in line.split('|')]
-            # 앞뒤 빈 셀 제거
-            cells = [c for c in cells if c or c == '']
+            while cells and cells[0] == '':
+                cells.pop(0)
+            while cells and cells[-1] == '':
+                cells.pop()
             if len(cells) >= 3:
                 expr = cells[0] if cells[0] else (cells[1] if len(cells) > 1 else '')
                 predicted = cells[1] if len(cells) > 1 else ''
@@ -416,9 +541,12 @@ def extract_evidence_tables(bt_num, section_text):
     # n=6 Expression/Formula 열이 있는 테이블 찾기
     for i, line in enumerate(lines):
         if '|' in line and ('n=6 Expression' in line or 'n=6 Formula' in line):
-            # 헤더 열 인덱스 파악
+            # 헤더 열 인덱스 파악 — 앞뒤 빈 셀만 제거 (중간 빈 셀은 보존)
             headers = [h.strip() for h in line.split('|')]
-            headers = [h for h in headers if h]
+            while headers and headers[0] == '':
+                headers.pop(0)
+            while headers and headers[-1] == '':
+                headers.pop()
 
             expr_col = None
             pred_col = None
@@ -448,7 +576,11 @@ def extract_evidence_tables(bt_num, section_text):
                 if not row.strip() or not row.strip().startswith('|'):
                     break
                 cells = [c.strip() for c in row.split('|')]
-                cells = [c for c in cells if c or c == '']
+                # headers와 동일한 방식: 앞뒤 빈 셀만 제거
+                while cells and cells[0] == '':
+                    cells.pop(0)
+                while cells and cells[-1] == '':
+                    cells.pop()
 
                 if len(cells) > expr_col:
                     expr_str = cells[expr_col]
@@ -475,14 +607,50 @@ _NON_FORMULA_RE = re.compile(
 )
 
 
+_KNOWN_NAMES = {
+    'sigma', 'tau', 'phi', 'sopfr', 'mu', 'n', 'J2', 'J_2', 'R',
+    'P1', 'P2', 'K_2', 'K_3',
+}
+
+
 def is_non_formula(expr_str):
-    s = expr_str.strip().translate(SUB_MAP)
+    s = _convert_superscripts(expr_str.strip()).translate(SUB_MAP)
     if not s:
         return True
-    if _NON_FORMULA_RE.match(s) and s not in (
-        'sigma', 'tau', 'phi', 'sopfr', 'mu', 'n', 'J2', 'J_2', 'R',
-        'P1', 'P2', 'K_2', 'K_3'
-    ):
+    # 마크다운 굵게/이탤릭 라벨
+    if re.match(r'^[*_]{1,2}[^*_]+[*_]{1,2}$', s):
+        return True
+    # 백슬래시 LaTeX 잔재
+    if '\\' in s:
+        return True
+    # 공백을 포함한 자연어 (단, 연산자만 있는 공백 'sigma + tau' 는 OK)
+    if ' ' in s and not re.match(r'^[\w\s+\-*/().^%]+$', s):
+        return True
+    # 한 어휘의 단순 식별자 또는 식별자(인자) (예: alpha_s(M_Z), m_t/m_W → 슬래시 포함)
+    # 식별자만(언더스코어 포함)
+    if re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', s) and s not in _KNOWN_NAMES:
+        return True
+    # 식별자(인자)
+    if re.match(r'^[A-Za-z_][A-Za-z0-9_]*\([^)]*\)$', s):
+        return True
+    # 식별자/식별자 (예: m_t/m_W, k/n)
+    if re.match(r'^[A-Za-z_][A-Za-z0-9_]*\s*/\s*[A-Za-z_][A-Za-z0-9_]*$', s):
+        return True
+    # 백분율 범위 (3-5%)
+    if re.match(r'^\d+\s*-\s*\d+\s*%?$', s):
+        return True
+    # 자연어 라벨 (영문 단어 2개+, 또는 BT-N, Si-28, top-8, layer N 등)
+    if re.match(r'^[A-Za-z]+(?:[\s\-][A-Za-z0-9]+)+$', s):
+        return True
+    # sin²θ_W 같은 그리스/삼각함수 잔재 (eval 불가능 → 라벨로 처리)
+    if 'theta' in s.lower() or re.search(r'\bsin|\bcos|\btan', s.lower()):
+        # 단, 평가 가능한 형태(sin(0))는 normalize_expr에서 처리하므로 여기선 unresolvable만
+        if not re.match(r'^[\w\s+\-*/().]+$', s):
+            return True
+    # 마크다운 굵게로 감싼 식별자 (**m_p/m_e**) — 최외곽 ** 제거 후 식별자류
+    inner = re.sub(r'^\*\*(.+?)\*\*$', r'\1', s)
+    if inner != s and (re.match(r'^[A-Za-z_][A-Za-z0-9_]*(?:/[A-Za-z_][A-Za-z0-9_]*)?$', inner)
+                       or re.match(r'^[A-Za-z_][A-Za-z0-9_]*\([^)]*\)$', inner)):
         return True
     return False
 
@@ -535,19 +703,18 @@ def audit_row(bt_num, row):
                 'reason': f'리스트 비교 대상 없음 (predicted={predicted_raw}, known={known_raw})',
             }
 
-    # 1) 비-수식 라벨 (마크다운, 식별자, 함수형 라벨)
-    if is_non_formula(expr_str):
-        return {
-            'bt': bt_num,
-            'expression': expr_str,
-            'status': 'NO_EXPR',
-            'reason': '수식이 아닌 라벨/이름',
-        }
-
-    # 2) 일반 수식 평가
+    # 1) 일반 수식 평가
     computed, normalized = safe_eval(expr_str)
 
     if computed is None:
+        # 평가 실패 → 비-수식 라벨이면 NO_EXPR, 아니면 SKIP
+        if is_non_formula(expr_str):
+            return {
+                'bt': bt_num,
+                'expression': expr_str,
+                'status': 'NO_EXPR',
+                'reason': '수식이 아닌 라벨/이름',
+            }
         return {
             'bt': bt_num,
             'expression': expr_str,
