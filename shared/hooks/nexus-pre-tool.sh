@@ -27,3 +27,19 @@ if [ "$TOOL_NAME" = "Agent" ]; then
 fi
 
 exit 0
+
+# ─── L0 가드: Write/Edit 시 파일 경로 확인 ───
+if [ "$TOOL_NAME" = "Write" ] || [ "$TOOL_NAME" = "Edit" ]; then
+  HEXA_GUARD="${HOME}/Dev/nexus/mk2_hexa/native/guard.hexa"
+  if [ -x "$HEXA" ] && [ -f "$HEXA_GUARD" ]; then
+    FILE_PATH=$(echo "$INPUT" | "$HEXA" "$HEXA_JSON_FIELD" file_path 2>/dev/null)
+    if [ -n "$FILE_PATH" ]; then
+      GUARD_OUT=$("$HEXA" "$HEXA_GUARD" check "$FILE_PATH" 2>/dev/null) || true
+      if [ -n "$GUARD_OUT" ]; then
+        echo "<user-prompt-submit-hook>"
+        echo "$GUARD_OUT"
+        echo "</user-prompt-submit-hook>"
+      fi
+    fi
+  fi
+fi
