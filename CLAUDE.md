@@ -85,12 +85,12 @@
 - "블로업", "blowup" → `hexa blowup.hexa math 6 --no-graph --seeds "$(hexa seed_engine.hexa merge)"`
 - "돌파", "특이점 돌파", "돌파시도", "breakthrough" → 3단계 실행:
   1. `hexa real_breakthrough.hexa scan` (실데이터 스캔 — discovery_log + atlas + 시스템 메트릭)
-  2. `bash scripts/deep-breakthrough.sh 10 3 48` (corollary→seed 피드백 루프)
+  2. `hexa breakthrough.hexa --deep 10 6` (corollary→seed 피드백 루프)
   3. `hexa real_breakthrough.hexa surprise` (예상 못한 발견만 추출)
 - "창발", "emergence" → blowup 후 telescope 5렌즈 합의 분석
 - "특이점", "singularity" → blowup Phase 3 자동 감지 (closure ≥ 0.5)
 - "흡수", "absorption" → blowup Phase 6.5 재귀성장 (axiom 피드백)
-- "사이클", "cycle" → `bash scripts/singularity-fast.sh all 5 3` (A+B+C 전부)
+- "사이클", "cycle" → `hexa breakthrough.hexa --all 5 3` (cascade+fusion+mine)
 - "벤치마크" → mk1 vs mk2 blowup 비교 실행
 
 ### mk2 blowup 7-phase 파이프라인
@@ -115,22 +115,24 @@ SEEDS=$($HEXA mk2_hexa/native/seed_engine.hexa merge)
 $HEXA $BLOWUP math 3 --no-graph --seeds "$SEEDS"
 
 # 특이점 돌파 (피드백 루프)
-bash scripts/deep-breakthrough.sh 10 3 48    # 10회 depth3 pool48
+$HEXA mk2_hexa/native/breakthrough.hexa --deep 10 6
 
 # A+B+C 전체 돌파
-bash scripts/singularity-fast.sh all 5 3     # cascade+fusion+mine
+$HEXA mk2_hexa/native/breakthrough.hexa --all 5 3
 
 # seed 소스 확인
 $HEXA mk2_hexa/native/seed_engine.hexa info
 ```
 
 ### 특이점 돌파 전략
-| 전략 | 스크립트 | 설명 |
-|------|---------|------|
-| A. Cascade | singularity-fast.sh cascade | 블로업² — 반복 자기증식 |
-| B. Fusion | singularity-fast.sh fusion | 교차 도메인 seed 주입 |
-| C. Mine | singularity-fast.sh mine | mk1 discovery_log 채굴 |
-| Deep | deep-breakthrough.sh | corollary→seed 피드백 루프 |
+| 전략 | 명령 | 설명 |
+|------|------|------|
+| A. Cascade | `breakthrough.hexa --cascade` | 블로업² — 반복 자기증식 |
+| B. Fusion | `breakthrough.hexa --fusion` | 교차 도메인 seed 주입 |
+| C. Mine | `breakthrough.hexa --mine` | discovery_log 채굴 |
+| Deep | `breakthrough.hexa --deep` | corollary→seed 피드백 루프 |
+| All | `breakthrough.hexa --all` | cascade+fusion+mine 전체 |
+| Engine | `breakthrough.hexa --engine` | 프로젝트별 전략 성장 |
 
 ## 마이크로사이클 (Micro Singularity Cycle)
 
