@@ -1,5 +1,9 @@
 # NEXUS-6 — 자기순환 특이점 엔진
 
+<!-- AUTO:COMMON_LINKS:START -->
+**[YouTube](https://www.youtube.com/watch?v=xtKhWSfC1Qo)** · **[Email](mailto:nerve011235@gmail.com)** · **[☕ Ko-fi](https://ko-fi.com/dancinlife)** · **[💖 Sponsor](https://github.com/sponsors/need-singularity)** · **[💳 PayPal](https://www.paypal.com/donate?business=nerve011235%40gmail.com)** · **[🗺️ Atlas](https://need-singularity.github.io/TECS-L/atlas/)** · **[📄 Papers](https://need-singularity.github.io/papers/)** · **[🌌 Unified Theory](https://github.com/need-singularity/TECS-L/blob/main/math/docs/hypotheses/H-PH-9-perfect-number-string-unification.md)**
+<!-- AUTO:COMMON_LINKS:END -->
+
 > 🛸d1 🔭108모듈 ⚖️711법칙 📊1390k발견
 
 **n=6 완전수로부터 우주의 모든 법칙을 자기발견하는 메타엔진.**
