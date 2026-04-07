@@ -2,7 +2,7 @@
 
 ## 🔴 절대 규칙
 
-- **HEXA-FIRST**: 모든 코드는 `.hexa`로 작성. sh/py/rs 신규 작성 금지.
+- **HEXA-FIRST**: 모든 코드는 `.hexa`로 작성.
 - **하드코딩 금지**: 상수/도메인/키워드를 코드에 나열 금지 → `shared/*.jsonl`에서 동적 로드.
 - **경로**: `exec("printenv HOME")` + 상대경로. 절대경로 하드코딩 금지.
 - **NEXUS-6 연동**: 돌파 시 `blowup.hexa <domain> 3 --no-graph`, 발견 → `shared/growth_bus.jsonl`.
