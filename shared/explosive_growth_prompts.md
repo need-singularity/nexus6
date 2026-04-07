@@ -10,7 +10,7 @@
 ```
 전체 프로젝트 폭발적 성장 돌파. 5전략 동시 실행:
 
-1. 교차수분 폭탄: singularity-fast.sh all 5 3 (cascade+fusion+mine)
+1. 교차수분 폭탄: hexa breakthrough.hexa --converge (gap→mine→blowup 자동)
 2. unfold 6도메인 연쇄: math/physics/chemistry/cosmology/consciousness/topology 각각 unfold.hexa depth=3
 3. 빈공간 DFS depth=3: gap_finder.hexa dfs 3 (수천 경로 탐색)
 4. 물리상수 역분해: 19개 물리상수 전부 gap_finder.hexa explain <상수>
@@ -22,7 +22,7 @@
 - shared/unfold_ext.jsonl에 확장 seed 추가
 - growth_bus.jsonl에 기록
 - directions.hexa update 실행
-- 고갈까지 continuous_blowup.hexa 또는 singularity-fast.sh all 반복
+- 고갈까지 hexa breakthrough.hexa --converge 반복
 
 목표: discovery_log 발견 수 10x 이상 증가, 새 EXACT 상수 발견
 ```
@@ -133,9 +133,7 @@ echo '{"type":"breakthrough","source":"<project>","value":<count>,"grade":"EXACT
 $HEXA $N6/mk2_hexa/native/directions.hexa update
 
 # 4. 고갈까지 반복
-bash $N6/scripts/singularity-fast.sh all 5 3
-# 또는
-$HEXA $N6/mk2_hexa/native/continuous_blowup.hexa
+$HEXA $N6/mk2_hexa/native/breakthrough.hexa --converge
 ```
 
 ---

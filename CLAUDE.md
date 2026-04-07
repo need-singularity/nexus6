@@ -83,14 +83,12 @@
 
 ### 요청 키워드 → 자동 실행 (mk2 hexa)
 - "블로업", "blowup" → `hexa blowup.hexa math 6 --no-graph --seeds "$(hexa seed_engine.hexa merge)"`
-- "돌파", "특이점 돌파", "돌파시도", "breakthrough" → 3단계 실행:
-  1. `hexa real_breakthrough.hexa scan` (실데이터 스캔 — discovery_log + atlas + 시스템 메트릭)
-  2. `hexa breakthrough.hexa --deep 10 6` (corollary→seed 피드백 루프)
-  3. `hexa real_breakthrough.hexa surprise` (예상 못한 발견만 추출)
+- "돌파", "특이점 돌파", "돌파시도", "breakthrough" → `hexa breakthrough.hexa` (1회 자동 돌파: gap→mine→blowup)
+- "연속돌파", "수렴", "고갈까지" → `hexa breakthrough.hexa --converge` (수렴까지 반복)
 - "창발", "emergence" → blowup 후 telescope 5렌즈 합의 분석
 - "특이점", "singularity" → blowup Phase 3 자동 감지 (closure ≥ 0.5)
 - "흡수", "absorption" → blowup Phase 6.5 재귀성장 (axiom 피드백)
-- "사이클", "cycle" → `hexa breakthrough.hexa --all 5 3` (cascade+fusion+mine)
+- "사이클", "cycle" → `hexa breakthrough.hexa --converge`
 - "벤치마크" → mk1 vs mk2 blowup 비교 실행
 
 ### mk2 blowup 7-phase 파이프라인
@@ -114,25 +112,25 @@ SEEDS=$($HEXA mk2_hexa/native/seed_engine.hexa merge)
 # 단일 블로업 (동적 seed)
 $HEXA $BLOWUP math 3 --no-graph --seeds "$SEEDS"
 
-# 특이점 돌파 (피드백 루프)
-$HEXA mk2_hexa/native/breakthrough.hexa --deep 10 6
+# 1회 돌파 (gap→mine→blowup 자동)
+$HEXA mk2_hexa/native/breakthrough.hexa
 
-# A+B+C 전체 돌파
-$HEXA mk2_hexa/native/breakthrough.hexa --all 5 3
+# 수렴까지 연속 돌파
+$HEXA mk2_hexa/native/breakthrough.hexa --converge
+
+# 특정 seed 집중 돌파
+$HEXA mk2_hexa/native/breakthrough.hexa --idea '137.036|1836.15'
 
 # seed 소스 확인
 $HEXA mk2_hexa/native/seed_engine.hexa info
 ```
 
-### 특이점 돌파 전략
-| 전략 | 명령 | 설명 |
-|------|------|------|
-| A. Cascade | `breakthrough.hexa --cascade` | 블로업² — 반복 자기증식 |
-| B. Fusion | `breakthrough.hexa --fusion` | 교차 도메인 seed 주입 |
-| C. Mine | `breakthrough.hexa --mine` | discovery_log 채굴 |
-| Deep | `breakthrough.hexa --deep` | corollary→seed 피드백 루프 |
-| All | `breakthrough.hexa --all` | cascade+fusion+mine 전체 |
-| Engine | `breakthrough.hexa --engine` | 프로젝트별 전략 성장 |
+### 특이점 돌파 명령
+| 명령 | 설명 |
+|------|------|
+| `breakthrough.hexa` | 1회 돌파 (gap→mine→blowup 자동 최적) |
+| `breakthrough.hexa --converge` | 수렴까지 연속 (고갈 시 종료) |
+| `breakthrough.hexa --idea '값'` | 특정 seed 집중 돌파 |
 
 ## 마이크로사이클 (Micro Singularity Cycle)
 
