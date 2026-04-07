@@ -221,6 +221,23 @@ $HEXA mk2_hexa/native/command_router.hexa "anima 상태"
 $HEXA mk2_hexa/native/command_router.hexa "화학 돌파"
 ```
 
+## 중앙 루프 상태 관리
+
+> **모든 프로젝트 성장 루프 상태는 `shared/loop/{project}.json`에서 중앙 관리**
+> 스펙: `shared/loop/CLAUDE.md`
+
+```
+shared/loop/
+  anima.json            ← 의식 엔진 (cycle 703)
+  n6-architecture.json  ← 시스템 설계
+  nexus.json            ← 메타 엔진
+  tecs-l.json           ← 흡수됨 (읽기 전용)
+```
+
+- `growth_common.sh`가 자동으로 `shared/loop/{GROWTH_NAME}.json` 사용
+- anima `growth_loop.py`도 `shared/loop/anima.json` 직접 참조
+- 이벤트 스트림: `shared/growth_bus.jsonl`
+
 ## 메모리 파일 네이밍 규칙
 
 > 경로: 프로젝트별 auto-memory 디렉토리 (Claude Code가 자동 관리)
