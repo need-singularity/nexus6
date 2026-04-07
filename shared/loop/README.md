@@ -3,6 +3,36 @@
 > 각 프로젝트의 성장 루프 실행 순서를 정의한다.
 > 엔진: `scripts/lib/growth_common.sh` → `run_growth_loop()`
 
+## 연결 구조
+
+```
+shared/loop/nexus.json ──┐
+shared/loop/anima.json ──┤── growth_common.sh가 자동 로드
+shared/loop/n6-arch.json ┘   (interval, max_cycles, domain)
+                              │
+                              ▼
+┌─────────────────────────────────────────┐
+│ nexus/scripts/infinite_growth.sh  (NEW) │
+│ anima/scripts/infinite_growth.sh        │
+│ n6-arch/scripts/infinite_growth.sh      │
+│   └── source growth_common.sh           │
+│       └── 📋 LOOP_DEF 로드             │
+│       └── domain_phases() (프로젝트별)  │
+│       └── common_* phases (공통 15개)   │
+│       └── every_3/6/10/12 phases        │
+└─────────────────────────────────────────┘
+
+┌──────────┬──────────────────────────────────┬──────────┬───────────────┐
+│ 프로젝트 │            loop JSON             │ interval │    domain     │
+├──────────┼──────────────────────────────────┼──────────┼───────────────┤
+│ nexus    │ shared/loop/nexus.json           │ 1800s    │ discovery     │
+├──────────┼──────────────────────────────────┼──────────┼───────────────┤
+│ anima    │ shared/loop/anima.json           │ 999s     │ consciousness │
+├──────────┼──────────────────────────────────┼──────────┼───────────────┤
+│ n6-arch  │ shared/loop/n6-architecture.json │ 1800s    │ architecture  │
+└──────────┴──────────────────────────────────┴──────────┴───────────────┘
+```
+
 ---
 
 ## nexus (🔭 발견 엔진)
