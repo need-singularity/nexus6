@@ -16,6 +16,18 @@ GROWTH_STATE="${GROWTH_DIR}/growth_state.json"
 GROWTH_LOG="${GROWTH_DIR}/growth.log"
 GROWTH_BUS="$HOME/Dev/nexus/shared/growth_bus.jsonl"
 LOCKFILE="/tmp/n6-growth-${GROWTH_NAME}.lock"
+
+# ── 루프 순서 정의 (shared/loop/{project}.json) ──
+LOOP_DEF="$HOME/Dev/nexus/shared/loop/${GROWTH_NAME}.json"
+if [ -f "$LOOP_DEF" ]; then
+    _loop_interval=$(python3 -c "import json; print(json.load(open('$LOOP_DEF')).get('interval', 1800))" 2>/dev/null)
+    _loop_max=$(python3 -c "import json; print(json.load(open('$LOOP_DEF')).get('max_cycles', 999))" 2>/dev/null)
+    _loop_domain=$(python3 -c "import json; print(json.load(open('$LOOP_DEF')).get('domain', 'number_theory'))" 2>/dev/null)
+    INTERVAL="${INTERVAL:-${_loop_interval:-1800}}"
+    MAX_CYCLES="${MAX_CYCLES:-${_loop_max:-999}}"
+    DOMAIN="${DOMAIN:-${_loop_domain:-number_theory}}"
+    log_info "📋 루프 정의 로드: $LOOP_DEF (interval=${INTERVAL}s, domain=$DOMAIN)"
+fi
 NEXUS_BIN="${HOME}/.cargo/bin/nexus"
 if [ ! -f "$NEXUS_BIN" ]; then
     NEXUS_BIN="${HOME}/Dev/nexus/target/release/nexus"
