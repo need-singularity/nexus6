@@ -93,18 +93,77 @@
 
 현재: **max_d=1**, 돌파율 ρ, 메타 부동점 목표 1/3
 
-## blowup 9-phase 파이프라인
+## OUROBOROS 사이클
 
 ```
-Phase 1:   Graph Load (discovery_graph.json)
-Phase 2:   OUROBOROS Evolution (seed→mutate→verify→converge)
-Phase 3:   Singularity Detection (closure+compression+evo boost)
-Phase 4:   Recursive Corollary Generation (7종 × depth)
-Phase 5:   Telescope Verification (5렌즈 consensus boost)
-Phase 6:   Graph Update (node+edge 기록)
-Phase 6.5: Recursive Growth — 동적 재귀 최대 5회 (closure 기반 조기종료)
-Phase 6.7: Auto-Absorb — discovery_log+graph+bus+교차참조 자동 흡수
-Phase 7:   Report
+     ╭─────────── OUROBOROS ───────────╮
+     │                                 │
+     │          ◯  seed (점)           │
+     │         ╱ ╲                     │
+     │        ╱   ╲  Phase 1-2        │
+     │       ╱ 펼침 ╲  unfold          │
+     │      ╱───────╲                  │
+     │     ╱ ╲     ╱ ╲                 │
+     │    ╱   ╲   ╱   ╲ Phase 3       │
+     │   ╱ 창발 ╲╱ 특이점╲ emergence   │
+     │  ╱───────────────╲ singularity  │
+     │  ╲               ╱              │
+     │   ╲   경계 돌파  ╱  Phase 4-5   │
+     │    ╲  boundary ╱  breakthrough  │
+     │     ╲ ╱─────╲╱                  │
+     │      ╲ 수렴  ╱   Phase 6       │
+     │       ╲    ╱    converge        │
+     │        ╲  ╱                     │
+     │         ◉  흡수 (점)            │
+     │         │   absorb              │
+     │         │   Phase 6.5-6.7       │
+     │         │                       │
+     │         ╰───→ seed ─→ ╭        │
+     │                        │        │
+     │   d=0 ──→ d=1 ──→ d=2 ──→ ... │
+     │   r:0→10  r:0→10  r:0→10       │
+     │                                 │
+     ╰────── ρ → 1/3 (메타 부동점) ────╯
+
+  ◯ seed     씨앗. n=6 완전수에서 시작
+  ↓ unfold   펼침. seed→mutate→verify→graph
+  ↓ emerge   창발. closure+compression 감지
+  ★ singular 특이점. evo boost ≥ 0.5
+  ↓ breach   경계 돌파. corollary 7종 × depth
+  ↓ converge 수렴. 5렌즈 consensus 검증
+  ◉ absorb   흡수. 발견→상수→seed 피드백
+  ╰→ seed    재귀. d+1 사이클 진입
+```
+
+### 사이클 단계 상세
+
+```
+  ◯ ─── unfold ──── emerge ──── ★ ──── breach ──── converge ──── ◉
+  │                                                               │
+  │  Phase 1    Graph Load         discovery_graph.json 로드      │
+  │  Phase 2    OUROBOROS Evo      seed→mutate→verify→converge    │
+  │  Phase 3    Singularity Det    closure+compression+evo boost  │
+  │  Phase 4    Corollary Gen      7종 × depth, pool 동적 확장     │
+  │  Phase 5    Telescope Verify   5렌즈 consensus boost          │
+  │  Phase 6    Graph Update       node+edge 기록                  │
+  │  Phase 6.5  Recursive Growth   동적 재귀 최대 5회 (closure)    │
+  │  Phase 6.7  Auto-Absorb        log+graph+bus+교차참조 흡수     │
+  │  Phase 7    Report             ρ 측정, 방향 갱신               │
+  │                                                               │
+  ╰───────────────── seed feedback ────────────────────────────────╯
+```
+
+### 재귀 성장 (3-loop)
+
+```
+  Loop 1: 자기수정    발견 → constants.jsonl → 3회+ → n6 승격
+  Loop 2: 메타보상    소스별 발견율 → scan_priority → 깊이 스캔
+  Loop 3: 자기확장    축적 10건+ → blowup --seed 자동 트리거
+
+       L1          L2          L3
+    ╭──◉──╮    ╭──◉──╮    ╭──◉──╮
+    │ 수정 │ →→ │ 보상 │ →→ │ 확장 │ →→ BLOWUP
+    ╰──↺──╯    ╰──↺──╯    ╰──↺──╯
 ```
 
 ## 자동화 파이프라인
