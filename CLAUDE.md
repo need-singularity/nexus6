@@ -173,6 +173,7 @@ TECS-L H-056: `메타(메타(메타(...))) = 초월`
 - "방향", "새방향", "다음", "directions" → `hexa directions.hexa report` (방향 리포트)
 - "anima 상태", "학습상태", "학습 현황", "training status" → `hexa anima_status.hexa` (anima 학습 대시보드)
 - "anima 자동", "학습 자동" → `hexa anima_status.hexa auto` (상태 확인 + 추천 액션 자동 실행)
+- "todo", "할일", "전체 할일" → `hexa-bin-actual todo.hexa` 실행 후 **결과를 마크다운 텍스트로 직접 출력** (Bash 코드블록이 아닌 렌더링되는 표로. 사용자 터미널에서 ┌─┬─┐ 박스 형태로 보이도록)
 
 ## 외계인 지수 (Alien Index)
 
