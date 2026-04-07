@@ -6,7 +6,10 @@ from fractions import Fraction
 # n=6 기본 상수
 n=6; sigma=12; tau=4; phi=2; sopfr=5; J2=24; mu=1
 
-with open("data/reality_map.json", encoding="utf-8") as f:
+import os as _os
+_dir = _os.path.dirname(_os.path.abspath(__file__))
+_path = _os.path.join(_dir, "reality_map.json")
+with open(_path, encoding="utf-8") as f:
     data = json.load(f)
 
 nodes = [x for x in data["nodes"] if not x.get("_comment")]
