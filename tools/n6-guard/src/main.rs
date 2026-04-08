@@ -381,6 +381,72 @@ fn get_build_procs(all: &[ProcInfo]) -> Vec<ProcInfo> {
         .collect()
 }
 
+/// Return absolute cwd of a pid via `lsof -a -p PID -d cwd -Fn`.
+fn get_proc_cwd(pid: u32) -> Option<String> {
+    let out = Command::new("lsof")
+        .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
+        .output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix('n') {
+            return Some(rest.to_string());
+        }
+    }
+    None
+}
+
+/// Load allowlist of absolute project root prefixes from
+/// ~/Dev/nexus/shared/projects.json. Only builds whose cwd lies under one of
+/// these roots will be managed by the build queue. Projects not listed (e.g.
+/// ~/mango/prism-manager) are left alone.
+fn load_managed_roots(dev_dir: &str) -> Vec<String> {
+    let dev = expand_tilde(dev_dir);
+    let dev = dev.trim_end_matches('/').to_string();
+    let path = expand_tilde("~/Dev/nexus/shared/projects.json");
+    let text = match fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    // Only consider lines after the `"projects":` marker to avoid picking up
+    // unrelated `"root": ...` occurrences elsewhere in the file.
+    let mut in_projects = false;
+    let mut roots = Vec::new();
+    for line in text.lines() {
+        if !in_projects {
+            if line.contains("\"projects\"") && line.contains('{') {
+                in_projects = true;
+            }
+            continue;
+        }
+        // crude extraction: `      "root": "value",`
+        if let Some(idx) = line.find("\"root\"") {
+            let after = &line[idx + 6..];
+            if let Some(q1) = after.find('"') {
+                let rest = &after[q1 + 1..];
+                if let Some(q2) = rest.find('"') {
+                    let val = &rest[..q2];
+                    if !val.is_empty() {
+                        roots.push(format!("{}/{}", dev, val));
+                    }
+                }
+            }
+        }
+    }
+    roots
+}
+
+/// Decide whether a build process belongs to a managed project.
+/// Unknown/unmanaged projects (empty cwd lookup, or cwd outside allowlist) are
+/// excluded so the build queue will not touch them.
+fn is_managed_build(pid: u32, cache: &mut HashMap<u32, Option<String>>, roots: &[String]) -> bool {
+    if roots.is_empty() { return false; }
+    let cwd = cache.entry(pid).or_insert_with(|| get_proc_cwd(pid)).clone();
+    match cwd {
+        Some(c) => roots.iter().any(|r| c == *r || c.starts_with(&format!("{}/", r))),
+        None => false,
+    }
+}
+
 fn free_memory_mb() -> usize {
     let output = Command::new("vm_stat").output().ok();
     let text = output.as_ref()
@@ -470,15 +536,23 @@ fn pid_path() -> PathBuf {
 
 struct BuildQueue {
     stopped_builds: HashMap<u32, Instant>,
+    cwd_cache: HashMap<u32, Option<String>>,
 }
 
 impl BuildQueue {
-    fn new() -> Self { Self { stopped_builds: HashMap::new() } }
+    fn new() -> Self { Self { stopped_builds: HashMap::new(), cwd_cache: HashMap::new() } }
 
-    fn enforce(&mut self, cfg: &BuildQueueConfig, all_procs: &[ProcInfo]) {
+    fn enforce(&mut self, cfg: &BuildQueueConfig, all_procs: &[ProcInfo], managed_roots: &[String]) {
         if !cfg.enabled { return; }
 
-        let builds = get_build_procs(all_procs);
+        // Drop cwd cache entries for dead pids to avoid unbounded growth.
+        let live: std::collections::HashSet<u32> = all_procs.iter().map(|p| p.pid).collect();
+        self.cwd_cache.retain(|pid, _| live.contains(pid));
+
+        let builds: Vec<ProcInfo> = get_build_procs(all_procs)
+            .into_iter()
+            .filter(|p| is_managed_build(p.pid, &mut self.cwd_cache, managed_roots))
+            .collect();
         let active: Vec<&ProcInfo> = builds.iter().filter(|p| !p.stopped).collect();
 
         // Resume builds that were stopped if under limit now
@@ -1177,6 +1251,10 @@ fn guard_loop(cfg: &GuardConfig) {
     let shutdown_clone = shutdown.clone();
     let _ = ctrlc::set_handler(move || { shutdown_clone.store(true, Ordering::SeqCst); });
 
+    let managed_roots = load_managed_roots(&cfg.global.dev_dir);
+    log_action(&format!("build_queue allowlist: {} project root(s) from nexus/shared/projects.json", managed_roots.len()));
+    for r in &managed_roots { log_action(&format!("  allow: {}", r)); }
+
     let mut stopped_pids: HashMap<u32, Instant> = HashMap::new();
     let mut build_queue = BuildQueue::new();
     let mut restart_tracker = RestartTracker::new();
@@ -1273,7 +1351,7 @@ fn guard_loop(cfg: &GuardConfig) {
         }
 
         // ── Feature: Build Queue ──
-        build_queue.enforce(&cfg.build_queue, &all_procs);
+        build_queue.enforce(&cfg.build_queue, &all_procs, &managed_roots);
 
         // ── Feature: Nice adjustments ──
         apply_nice_adjustments(cfg, &monitored);
