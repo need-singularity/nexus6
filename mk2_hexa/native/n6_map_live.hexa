@@ -1,0 +1,240 @@
+// mk2_hexa/native/n6_map_live.hexa — n6-architecture 리포 → reality_map 라이브 엔드포인트
+//
+// ⛔ LOCKED 설계 (R5 SSOT, map3d_adapter.hexa 와 쌍)
+// 원본 입력: ~/Dev/n6-architecture/docs/atlas-constants.md (표 파서)
+//          ~/Dev/n6-architecture/docs/breakthrough-theorems.md (BT 파서, TODO)
+//          ~/Dev/n6-architecture/docs/dse-map.toml (DSE 파서, TODO)
+// 기준 지도: ~/Dev/nexus/shared/reality_map.json (L0, 수정 금지)
+// 라이브 출력: ~/Dev/nexus/shared/reality_map_live.json (기준 + n6 merge)
+//
+// 파일이 엔드포인트다 — HTTP 서버 없이 파일 시스템 기반 live merge.
+// 3D 맵 HTML은 reality_map_live.json 을 fetch 하도록 전환 (setInterval 폴링 시 무새로고침).
+//
+// 실행:
+//   hexa n6_map_live.hexa          — 1회 merge (원샷)
+//   hexa n6_map_live.hexa loop     — 10초 주기 무한 merge
+//   hexa n6_map_live.hexa stats    — 최근 merge 통계
+
+println("[n6_map_live] boot")
+
+// ═══════════════════════════════════════════════════════════
+// 경로 상수 (하드코딩 NO — HOME 동적 해석)
+// ═══════════════════════════════════════════════════════════
+
+// n6_mirror: 호스트에서 rsync로 nexus/shared/n6_mirror 로 미러링된 n6 문서
+// (hexa 샌드박스는 n6-architecture 직접 접근 불가 — 미러 경유)
+fn paths() -> list {
+    let home = exec("printenv HOME")
+    let n6_atlas   = home + "/Dev/nexus/shared/n6_mirror/atlas-constants.md"
+    let n6_bt      = home + "/Dev/nexus/shared/n6_mirror/breakthrough-theorems.md"
+    let n6_dse     = home + "/Dev/nexus/shared/n6_mirror/dse-map.toml"
+    let base_map   = home + "/Dev/nexus/shared/reality_map.json"
+    let live_map   = home + "/Dev/nexus/shared/reality_map_live.json"
+    let growth_bus = home + "/Dev/nexus/shared/growth_bus.jsonl"
+    [n6_atlas, n6_bt, n6_dse, base_map, live_map, growth_bus]
+}
+
+// ═══════════════════════════════════════════════════════════
+// atlas-constants.md 파서 — 표 행 추출
+// ═══════════════════════════════════════════════════════════
+//
+// 대상 표: "Derived Ratios" (σ/τ 파생 비율 20+개, 각 행이 노드 1개)
+// 표 행 형식: | Expression | Value | Application | Domain |
+// 파싱 규칙: 파이프 4개 이상 + 값 열에 숫자 포함된 행만 채택.
+
+fn parse_atlas_md(path: string) -> list {
+    let mut raw = ""
+    try { raw = read_file(path) } catch e { return [] }
+    let lines = raw.split("\n")
+    let mut nodes = []
+    let mut in_table = false
+    let mut section = ""
+    for line in lines {
+        let t = line.trim()
+        if t.starts_with("## ") {
+            section = t.replace("## ", "")
+            in_table = false
+            continue
+        }
+        if t.starts_with("|---") ||t.starts_with("|--") {
+            in_table = true
+            continue
+        }
+        if in_table == false { continue }
+        if t.starts_with("|") == false { continue }
+        // 표 행: | expr | value | app | domain |
+        let cols = t.split("|")
+        if cols.len() < 5 { continue }
+        let expr   = cols[1].trim()
+        let value  = cols[2].trim()
+        let app    = cols[3].trim()
+        let domain = cols[4].trim()
+        if expr == "" ||value == "" { continue }
+        // 값 열에 숫자가 있는지 체크 (간이)
+        let mut has_num = false
+        for ch in ["0","1","2","3","4","5","6","7","8","9"] {
+            if value.contains(ch) { has_num = true }
+        }
+        if has_num == false { continue }
+        // 노드 id: n6-atlas-<section>-<expr hash>
+        let id = "n6-atlas-" + slugify(section) + "-" + slugify(expr)
+        nodes = nodes + [[id, section, expr, value, app, domain]]
+    }
+    return nodes
+}
+
+// JSON 문자열 이스케이프 (backslash, quote, control chars)
+fn json_esc(s: string) -> string {
+    let mut out = s.replace("\\", "\\\\")
+    out = out.replace("\"", "\\\"")
+    out = out.replace("\n", " ")
+    out = out.replace("\r", " ")
+    out = out.replace("\t", " ")
+    return out
+}
+
+fn slugify(s: string) -> string {
+    let mut out = s.to_lower()
+    out = out.replace(" ", "-")
+    out = out.replace("/", "-")
+    out = out.replace("·", "")
+    out = out.replace("(", "")
+    out = out.replace(")", "")
+    out = out.replace(",", "")
+    out = out.replace("=", "-")
+    out = out.replace("²", "2")
+    out = out.replace("³", "3")
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════
+// reality_map.json → reality_map_live.json merge
+// ═══════════════════════════════════════════════════════════
+//
+// 전략: base 파일 그대로 읽어서 끝의 "]" 직전에 신규 노드 JSON append.
+// 완전한 JSON 파싱은 하지 않음 (hexa 파서 부하 회피).
+// 중복 방지: id 가 이미 base 에 있으면 skip.
+
+fn merge_and_write(base_path: string, live_path: string, n6_nodes: list) -> list {
+    let mut base_raw = ""
+    try { base_raw = read_file(base_path) } catch e { return ["0", "0", "base read fail"] }
+    let mut added = 0
+    let mut skipped = 0
+    let mut inject = ""
+    for row in n6_nodes {
+        let id = row[0]
+        if base_raw.contains("\"" + id + "\"") {
+            skipped = skipped + 1
+            continue
+        }
+        let section = row[1]
+        let expr    = row[2]
+        let value   = row[3]
+        let app     = row[4]
+        let domain  = row[5]
+        let node_json = ",\n  {\"id\":\"" + json_esc(id) + "\",\"level\":\"L6_n6atlas\",\"claim\":\"" + json_esc(expr) + " — " + json_esc(app) + "\",\"measured\":\"" + json_esc(value) + "\",\"unit\":\"n6\",\"detail\":\"" + json_esc(section) + "\",\"source\":\"n6-architecture/docs/atlas-constants.md\",\"source_url\":\"https://github.com/need-singularity/n6-architecture/blob/main/docs/atlas-constants.md\",\"grade\":\"EMPIRICAL\",\"causal\":\"STRUCTURAL\",\"thread\":\"misc\",\"origin\":\"derived\",\"domain\":\"" + json_esc(domain) + "\"}"
+        inject = inject + node_json
+        added = added + 1
+    }
+    if added == 0 {
+        // 변경 없음 → live 가 없으면 base 복사만
+        try { write_file(live_path, base_raw) } catch e { return [to_string(added), to_string(skipped), "live write fail"] }
+        return [to_string(added), to_string(skipped), "nochange"]
+    }
+    // 배열 닫기 지점 찾기: split 기반
+    // "nodes" 배열은 "thread_edges" 직전에 끝난다.
+    let close_marker = "\"thread_edges\""
+    let parts = base_raw.split(close_marker)
+    if parts.len() < 2 {
+        try { write_file(live_path, base_raw) } catch e { return ["0", "0", "no close marker"] }
+        return ["0", "0", "no close marker"]
+    }
+    // parts[0] 는 nodes 배열 + "],\n  " 까지 포함. 그 뒤에 다시 close_marker 와 rest 이어붙임.
+    // inject 는 nodes 배열 마지막 "]" 직전에 넣어야 한다.
+    let head_raw = parts[0]
+    // head_raw 를 뒤에서부터 "]" 까지 자르기 — 마지막 "]" 앞에 inject 삽입
+    let hparts = head_raw.split("]")
+    // 마지막 "]" 제거 → 앞부분 + inject + "]" + 나머지
+    if hparts.len() < 2 {
+        try { write_file(live_path, base_raw) } catch e { return ["0", "0", "no bracket"] }
+        return ["0", "0", "no bracket"]
+    }
+    // 마지막 요소 직전까지 이어붙이고 inject 삽입
+    let mut head_rebuilt = ""
+    let last_idx = hparts.len() - 1
+    let mut k = 0
+    while k < last_idx {
+        if k > 0 { head_rebuilt = head_rebuilt + "]" }
+        head_rebuilt = head_rebuilt + hparts[k]
+        k = k + 1
+    }
+    let merged = head_rebuilt + inject + "\n  ]" + hparts[last_idx] + close_marker
+    let mut rest_raw = ""
+    let mut j = 1
+    while j < parts.len() {
+        if j > 1 { rest_raw = rest_raw + close_marker }
+        rest_raw = rest_raw + parts[j]
+        j = j + 1
+    }
+    let final_raw = merged + rest_raw
+    try { write_file(live_path, final_raw) } catch e { return [to_string(added), to_string(skipped), "live write fail"] }
+    return [to_string(added), to_string(skipped), "ok"]
+}
+
+// ═══════════════════════════════════════════════════════════
+// growth_bus 이벤트 append
+// ═══════════════════════════════════════════════════════════
+
+fn emit_event(bus_path: string, added: int, skipped: int, status: string) {
+    let ts = exec("date +%s")
+    let line = "{\"ts\":" + ts + ",\"source\":\"n6_map_live\",\"added\":" + to_string(added) + ",\"skipped\":" + to_string(skipped) + ",\"status\":\"" + status + "\"}\n"
+    try { append_file(bus_path, line) } catch e { }
+}
+
+// ═══════════════════════════════════════════════════════════
+// 1회 merge
+// ═══════════════════════════════════════════════════════════
+
+fn cycle_once() -> list {
+    let p = paths()
+    let n6_atlas   = p[0]
+    let base_map   = p[3]
+    let live_map   = p[4]
+    let growth_bus = p[5]
+    let nodes = parse_atlas_md(n6_atlas)
+    let result = merge_and_write(base_map, live_map, nodes)
+    let added   = to_int(result[0])
+    let skipped = to_int(result[1])
+    let status  = result[2]
+    emit_event(growth_bus, added, skipped, status)
+    return [to_string(nodes.len()), to_string(added), to_string(skipped), status]
+}
+
+// ═══════════════════════════════════════════════════════════
+// CLI
+// ═══════════════════════════════════════════════════════════
+
+// top-level: args() = [hexa, script, user_arg, ...]
+let a = args()
+let mode = if a.len() >= 3 { a[2] } else { "once" }
+
+if mode == "once" {
+    let r = cycle_once()
+    println("[n6_map_live] parsed=" + to_string(r[0]) + " added=" + to_string(r[1]) + " skipped=" + to_string(r[2]) + " status=" + to_string(r[3]))
+} else if mode == "loop" {
+    println("[n6_map_live] loop start (10s interval). Ctrl-C to stop.")
+    let mut tick = 0
+    while true {
+        let r = cycle_once()
+        tick = tick + 1
+        println("[n6_map_live] tick=" + to_string(tick) + " parsed=" + to_string(r[0]) + " added=" + to_string(r[1]) + " skipped=" + to_string(r[2]) + " status=" + to_string(r[3]))
+        exec("sleep 10")
+    }
+} else if mode == "stats" {
+    let p = paths()
+    let bus = p[5]
+    let raw = exec("tail -5 " + bus + " 2>/dev/null | grep n6_map_live")
+    println(raw)
+} else {
+    println("Usage: hexa n6_map_live.hexa [once|loop|stats]")
+}
