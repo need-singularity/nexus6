@@ -1,17 +1,36 @@
 #!/usr/bin/env bash
 # "go" 키워드 감지 → 모든 TODO 병렬 실행 지시
+# 하드코딩 금지 — shared/core.json에서 aliases + action 동적 로드
 set +e
 
 INPUT=$(cat)
 
-# grep/sed로 직접 추출 (HEXA 우회 — 단순 키워드 매칭에는 불필요)
 USER_TEXT=$(echo "$INPUT" | grep -o '"prompt"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"prompt"[[:space:]]*:[[:space:]]*"//;s/".*//')
 
 [ -z "$USER_TEXT" ] && exit 0
 
 TRIMMED=$(echo "$USER_TEXT" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')
 
-if [ "$TRIMMED" = "go" ] || [ "$TRIMMED" = "모두" ] || [ "$TRIMMED" = "전체실행" ] || [ "$TRIMMED" = "병렬" ]; then
+SHARED="$HOME/Dev/nexus/shared"
+
+# core.json에서 go 명령어 aliases 동적 로드
+ALIASES=$(python3 -c "
+import json
+d=json.load(open('${SHARED}/core.json'))
+cmds=d.get('commands',{})
+go=cmds.get('go',{})
+aliases=[k.lower() for k in ['go']+go.get('aliases',[])]
+print(' '.join(aliases))
+" 2>/dev/null)
+
+[ -z "$ALIASES" ] && ALIASES="go"
+
+MATCH=0
+for A in $ALIASES; do
+  [ "$TRIMMED" = "$A" ] && MATCH=1
+done
+
+if [ "$MATCH" = "1" ]; then
   cat <<'DIRECTIVE'
 <user-prompt-submit-hook>
 [GO 모드] 사용자가 "go"를 입력했습니다.
