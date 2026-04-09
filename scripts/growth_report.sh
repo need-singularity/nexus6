@@ -37,12 +37,12 @@ echo "  │ Cycle │ Tests  │  Lines  │ Lenses  │ Warns  │ Action      
 echo "  ├───────┼────────┼─────────┼─────────┼────────┼────────────────────────┤"
 
 tail -n "$last_n" "$LOG_FILE" | while IFS= read -r line; do
-    cycle=$(echo "$line" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('cycle','-'))" 2>/dev/null || echo "-")
-    tests=$(echo "$line" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('tests_pass','-'))" 2>/dev/null || echo "-")
-    lines=$(echo "$line" | python3 -c "import sys,json; d=json.load(sys.stdin); v=d.get('code_lines',0); print(f'{v/1000:.1f}K') if v else print('-')" 2>/dev/null || echo "-")
-    lenses=$(echo "$line" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('lenses_registered','-'))" 2>/dev/null || echo "-")
-    warns=$(echo "$line" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('warnings','-'))" 2>/dev/null || echo "-")
-    action=$(echo "$line" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('action','measure')[:22])" 2>/dev/null || echo "-")
+    cycle=$(echo "$line" | /usr/bin/python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('cycle','-'))" 2>/dev/null || echo "-")
+    tests=$(echo "$line" | /usr/bin/python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('tests_pass','-'))" 2>/dev/null || echo "-")
+    lines=$(echo "$line" | /usr/bin/python3 -c "import sys,json; d=json.load(sys.stdin); v=d.get('code_lines',0); print(f'{v/1000:.1f}K') if v else print('-')" 2>/dev/null || echo "-")
+    lenses=$(echo "$line" | /usr/bin/python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('lenses_registered','-'))" 2>/dev/null || echo "-")
+    warns=$(echo "$line" | /usr/bin/python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('warnings','-'))" 2>/dev/null || echo "-")
+    action=$(echo "$line" | /usr/bin/python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('action','measure')[:22])" 2>/dev/null || echo "-")
     printf "  │ %5s │ %6s │ %7s │ %7s │ %6s │ %-22s │\n" "$cycle" "$tests" "$lines" "$lenses" "$warns" "$action"
 done
 
@@ -51,7 +51,7 @@ echo "  └───────┴────────┴──────
 # Growth rate calculation
 if [[ "$total_lines" -ge 2 ]]; then
     echo ""
-    python3 -c "
+    /usr/bin/python3 -c "
 import json, sys
 
 lines = open('$LOG_FILE').readlines()

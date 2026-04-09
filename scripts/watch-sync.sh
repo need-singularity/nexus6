@@ -30,7 +30,7 @@ else
         log "📡 변경 감지 → sync 트리거"
         bash "$NEXUS_ROOT/sync/sync-all.sh" >> "$LOG" 2>&1 || true
         # nexus-bridge notify
-        python3 "$NEXUS_ROOT/nexus-bridge.py" sync 2>/dev/null || true
+        /usr/bin/python3 "$NEXUS_ROOT/nexus-bridge.py" sync 2>/dev/null || true
         log "✅ sync 완료"
     done
 fi

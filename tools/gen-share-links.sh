@@ -5,7 +5,7 @@ set -euo pipefail
 
 JSON="${1:-$(dirname "$0")/../shared/nexus-projects.json}"
 
-python3 -c "
+/usr/bin/python3 -c "
 import json, sys
 
 with open('$JSON') as f:

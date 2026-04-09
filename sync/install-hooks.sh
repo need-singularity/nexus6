@@ -110,7 +110,7 @@ if echo "$changed_files" | grep -q "tools/nexus/src/"; then
     (
         cd "$NEXUS_ROOT"
         $CARGO build --release >> "$NEXUS_STATE/rebuild.log" 2>&1
-        PATH="$HOME/.cargo/bin:$PATH" python3 -m maturin build --release --features python >> "$NEXUS_STATE/rebuild.log" 2>&1
+        PATH="$HOME/.cargo/bin:$PATH" /usr/bin/python3 -m maturin build --release --features python >> "$NEXUS_STATE/rebuild.log" 2>&1
         pip3 install "$NEXUS_ROOT/target/wheels/"nexus-*-cp*-*.whl --force-reinstall >> "$NEXUS_STATE/rebuild.log" 2>&1
         echo "[post-commit] NEXUS-6 재빌드 완료: $(date)" >> "$NEXUS_STATE/rebuild.log"
     ) &

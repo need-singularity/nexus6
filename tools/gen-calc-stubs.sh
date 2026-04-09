@@ -12,7 +12,7 @@ STATE="${NEXUS}/shared/.calc_stubs_state.json"
 [ -f "$VC" ] || exit 0
 mkdir -p "$STUBS_DIR"
 
-python3 << 'PYEOF'
+/usr/bin/python3 << 'PYEOF'
 import json, os, hashlib
 from datetime import datetime
 

@@ -19,7 +19,7 @@ echo ""
 
 # Step 1: Scan all repos
 echo "[1/3] Scanning repos..."
-CONTENT=$(python3 "$SCRIPT_DIR/scan-calculators.py" --markdown --save 2>/dev/null)
+CONTENT=$(/usr/bin/python3 "$SCRIPT_DIR/scan-calculators.py" --markdown --save 2>/dev/null)
 
 if [ -z "$CONTENT" ]; then
   echo "Error: scan produced no output"
@@ -49,7 +49,7 @@ sync_file() {
     return
   fi
 
-  python3 -c "
+  /usr/bin/python3 -c "
 import sys
 
 start_marker = '$MARKER_START'
@@ -143,7 +143,7 @@ if [ -d "$SEDI_DIR" ]; then
     # 자동 생성 시도
     if [ -f "$SEDI_DIR/scripts/auto_grade_n6.py" ]; then
       echo "  Generating SEDI grades..."
-      python3 "$SEDI_DIR/scripts/auto_grade_n6.py" --save 2>/dev/null
+      /usr/bin/python3 "$SEDI_DIR/scripts/auto_grade_n6.py" --save 2>/dev/null
       if [ -f "$SEDI_GRADES" ]; then
         cp "$SEDI_GRADES" "$SCRIPT_DIR/sedi-grades.json"
         echo "  SEDI grades generated and synced"
@@ -218,4 +218,4 @@ echo "[5/5] Done!"
 echo ""
 
 # Summary
-python3 "$SCRIPT_DIR/scan-calculators.py" --summary 2>/dev/null
+/usr/bin/python3 "$SCRIPT_DIR/scan-calculators.py" --summary 2>/dev/null

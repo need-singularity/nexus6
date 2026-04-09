@@ -5,7 +5,7 @@ set -euo pipefail
 NEXUS="${HOME}/Dev/nexus"
 OUT="${NEXUS}/shared/QUICK_STATUS.md"
 
-python3 << 'PYEOF'
+/usr/bin/python3 << 'PYEOF'
 import json, os
 from datetime import datetime
 from collections import Counter

@@ -25,7 +25,7 @@ if [[ ! -f "$LOG_FILE" ]] || [[ ! -s "$LOG_FILE" ]]; then
     exit 0
 fi
 
-python3 << 'PYEOF'
+/usr/bin/python3 << 'PYEOF'
 import json, os, sys
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict

@@ -34,7 +34,7 @@ domain_phases() {
     log_info "Phase: 렌즈 카운트"
     local lenses=0
     if [ -f "$PROJECT_ROOT/shared/discovery_graph.json" ]; then
-        lenses=$(python3 -c "import json; print(len(json.load(open('$PROJECT_ROOT/shared/discovery_graph.json')).get('nodes',[])))" 2>/dev/null || echo 0)
+        lenses=$(/usr/bin/python3 -c "import json; print(len(json.load(open('$PROJECT_ROOT/shared/discovery_graph.json')).get('nodes',[])))" 2>/dev/null || echo 0)
     fi
     write_growth_bus "lens_count" "ok" "lenses=$lenses"
 

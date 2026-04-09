@@ -14,7 +14,7 @@ TRIMMED=$(echo "$USER_TEXT" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr '[:
 SHARED="$HOME/Dev/nexus/shared"
 
 # core.json에서 go 명령어 aliases 동적 로드
-ALIASES=$(python3 -c "
+ALIASES=$(/usr/bin/python3 -c "
 import json
 d=json.load(open('${SHARED}/core.json'))
 cmds=d.get('commands',{})

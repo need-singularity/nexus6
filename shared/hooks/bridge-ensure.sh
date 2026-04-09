@@ -29,7 +29,7 @@ fi
 [ ! -f "$BRIDGE_PY" ] && return 0 2>/dev/null && exit 0
 
 # 현재 프로젝트가 이미 연결되어 있는지 확인 (python3으로 빠르게)
-CONNECTED=$(python3 -c "
+CONNECTED=$(/usr/bin/python3 -c "
 import json, sys
 try:
     state = json.load(open('$BRIDGE_STATE'))
@@ -44,7 +44,7 @@ touch "$LOCKFILE" 2>/dev/null
 
 if [ "$CONNECTED" = "no" ]; then
   # 자동 연결 시도
-  RESULT=$(python3 "$BRIDGE_PY" connect "$PROJECT" 2>/dev/null)
+  RESULT=$(/usr/bin/python3 "$BRIDGE_PY" connect "$PROJECT" 2>/dev/null)
   if [ $? -eq 0 ]; then
     echo "bridge-connect: $PROJECT"
   fi

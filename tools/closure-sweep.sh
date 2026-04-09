@@ -9,7 +9,7 @@ DL="${NEXUS}/shared/discovery_log.jsonl"
 
 [ -f "$VC" ] || { echo "no verified_constants"; exit 0; }
 
-python3 << 'PYEOF'
+/usr/bin/python3 << 'PYEOF'
 import json, os, glob, re, sqlite3
 from datetime import datetime
 

@@ -9,33 +9,33 @@ echo "=== TECS-L Discovery Loop Integration Test ==="
 
 # 1. Measure
 echo "1. Testing measure..."
-python3 "$TECS_ROOT/scripts/tecs_measure.py" || { echo "FAIL: measure"; exit 1; }
+/usr/bin/python3 "$TECS_ROOT/scripts/tecs_measure.py" || { echo "FAIL: measure"; exit 1; }
 echo "   PASS"
 
 # 2. Act
 echo "2. Testing act..."
-python3 "$TECS_ROOT/scripts/tecs_act.py" N dfs || { echo "FAIL: act"; exit 1; }
+/usr/bin/python3 "$TECS_ROOT/scripts/tecs_act.py" N dfs || { echo "FAIL: act"; exit 1; }
 echo "   PASS"
 
 # 3. Validate
 echo "3. Testing validate..."
-python3 "$TECS_ROOT/scripts/tecs_validate.py" || { echo "FAIL: validate"; exit 1; }
+/usr/bin/python3 "$TECS_ROOT/scripts/tecs_validate.py" || { echo "FAIL: validate"; exit 1; }
 echo "   PASS"
 
 # 4. Record
 echo "4. Testing record..."
-python3 "$TECS_ROOT/scripts/tecs_record.py" || { echo "FAIL: record"; exit 1; }
+/usr/bin/python3 "$TECS_ROOT/scripts/tecs_record.py" || { echo "FAIL: record"; exit 1; }
 echo "   PASS"
 
 # 5. Publish (dry-run)
 echo "5. Testing publish (dry-run)..."
-python3 "$TECS_ROOT/scripts/tecs_publish.py" --dry-run || { echo "FAIL: publish"; exit 1; }
+/usr/bin/python3 "$TECS_ROOT/scripts/tecs_publish.py" --dry-run || { echo "FAIL: publish"; exit 1; }
 echo "   PASS"
 
 # 6. Verify state files exist and are valid JSON
 echo "6. Checking state files..."
-python3 -c "import json; json.load(open('$CONFIG/domain_registry.json'))" || { echo "FAIL: registry JSON"; exit 1; }
-python3 -c "import json; json.load(open('$CONFIG/loop_state.json'))" || { echo "FAIL: loop_state JSON"; exit 1; }
+/usr/bin/python3 -c "import json; json.load(open('$CONFIG/domain_registry.json'))" || { echo "FAIL: registry JSON"; exit 1; }
+/usr/bin/python3 -c "import json; json.load(open('$CONFIG/loop_state.json'))" || { echo "FAIL: loop_state JSON"; exit 1; }
 echo "   PASS"
 
 # 7. Daemon dry-run

@@ -9,7 +9,7 @@ STATE="${NEXUS}/shared/.paper_gen_state.json"
 
 mkdir -p "$PAPERS_DIR"
 
-python3 << 'PYEOF'
+/usr/bin/python3 << 'PYEOF'
 import json, os, hashlib
 from datetime import datetime
 from collections import Counter

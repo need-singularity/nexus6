@@ -75,7 +75,7 @@ while true; do
         RUN_OK=false
         if [ -f "$SYNC_SCRIPT" ] && bash "$SYNC_SCRIPT" >> "$LOG" 2>&1; then
             RUN_OK=true
-        elif python3 "$SCAN_SCRIPT" --save --summary >> "$LOG" 2>&1; then
+        elif /usr/bin/python3 "$SCAN_SCRIPT" --save --summary >> "$LOG" 2>&1; then
             # 폴백: sync-math-atlas.sh 없거나 실패 시 scan만
             RUN_OK=true
         fi
@@ -84,7 +84,7 @@ while true; do
             ATLAS="$NEXUS_ROOT/shared/math_atlas.json"
             if [ -f "$ATLAS" ]; then
                 # stats.*.total 합산으로 총 항목 수 계산
-                ENTRIES=$(python3 -c "import json;d=json.load(open('$ATLAS'));s=d.get('stats',{});print(sum(v.get('total',0) for v in s.values()) if isinstance(s,dict) else '?')" 2>/dev/null || echo '?')
+                ENTRIES=$(/usr/bin/python3 -c "import json;d=json.load(open('$ATLAS'));s=d.get('stats',{});print(sum(v.get('total',0) for v in s.values()) if isinstance(s,dict) else '?')" 2>/dev/null || echo '?')
                 log "✅ atlas+readme synced — $ENTRIES hypotheses"
             fi
             # macOS 알림

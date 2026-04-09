@@ -13,6 +13,6 @@
 | 수렴 | `shared/convergence/nexus.json` | CDO 수렴 상태 |
 | 수렴 운영 | `shared/convergence_ops.json` | CDO 수렴 운영 원칙 |
 | 할일 | `shared/todo/nexus.json` | 우선순위별 TODO |
-| 렌즈 | `shared/lens_registry.json` | 1022종 망원경 레지스트리 |
+| 렌즈 | `shared/lens_registry.json` | 397종 망원경 레지스트리 |
 | API | `shared/CLAUDE.md` | NEXUS-6 상세 사용법 |
 | 문법 | `shared/hexa_grammar.jsonl` | hexa-lang 전체 문법 + pitfalls P1~P5 |

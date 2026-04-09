@@ -9,7 +9,7 @@ TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
 DISCOVERY_LOG="$HOME/Dev/nexus/shared/discovery_log.jsonl"
 
 # JSONL로 직접 기록 (Claude 의존 없음)
-python3 -c "
+/usr/bin/python3 -c "
 import json, os
 entry = {
     'timestamp': '$TIMESTAMP',

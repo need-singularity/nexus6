@@ -9,7 +9,7 @@
 #
 # Alternatively, run locally on Windows PC (RTX 5070):
 #   scp experiments/experiment_rc1_purefield_llm.py aiden@100.112.63.23:~/
-#   ssh aiden@100.112.63.23 "cd ~ && wsl -e python3 experiment_rc1_purefield_llm.py"
+#   ssh aiden@100.112.63.23 "cd ~ && wsl -e /usr/bin/python3 experiment_rc1_purefield_llm.py"
 
 set -euo pipefail
 
@@ -64,7 +64,7 @@ if [ -n "$RUNPOD_SSH" ]; then
     echo "[3/4] Running experiment (GPU)..."
     echo "  This should take ~5-10 minutes on A100/3090..."
     echo ""
-    $RUNPOD_SSH "cd ${REMOTE_DIR} && python3 ${EXPERIMENT} 2>&1" | tee "${SCRIPT_DIR}/rc1_output.log"
+    $RUNPOD_SSH "cd ${REMOTE_DIR} && /usr/bin/python3 ${EXPERIMENT} 2>&1" | tee "${SCRIPT_DIR}/rc1_output.log"
 
     # Download results
     echo "[4/4] Downloading results..."
@@ -87,7 +87,7 @@ elif [ -n "$POD_ID" ]; then
 
     # Run
     echo "[2/3] Running..."
-    runpodctl exec --podId "$POD_ID" -- python3 "/workspace/${EXPERIMENT}" 2>&1 | tee "${SCRIPT_DIR}/rc1_output.log"
+    runpodctl exec --podId "$POD_ID" -- /usr/bin/python3 "/workspace/${EXPERIMENT}" 2>&1 | tee "${SCRIPT_DIR}/rc1_output.log"
 
     # Download
     echo "[3/3] Downloading results..."
@@ -105,13 +105,13 @@ else
     echo "    bash $0"
     echo ""
 
-    if python3 -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
+    if /usr/bin/python3 -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
         echo "  CUDA available. Running..."
-        python3 "$EXPERIMENT_PATH" 2>&1 | tee "${SCRIPT_DIR}/rc1_output.log"
+        /usr/bin/python3 "$EXPERIMENT_PATH" 2>&1 | tee "${SCRIPT_DIR}/rc1_output.log"
     else
         echo "  WARNING: No CUDA detected. Running on CPU (will be slow)."
         echo "  Press Ctrl+C to cancel, or wait 3 seconds..."
         sleep 3
-        python3 "$EXPERIMENT_PATH" 2>&1 | tee "${SCRIPT_DIR}/rc1_output.log"
+        /usr/bin/python3 "$EXPERIMENT_PATH" 2>&1 | tee "${SCRIPT_DIR}/rc1_output.log"
     fi
 fi

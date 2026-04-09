@@ -40,7 +40,7 @@ fi
 
 export LOG_FILE DAYS TODAY
 
-python3 << 'PYEOF' > "$OUTPUT_FILE"
+/usr/bin/python3 << 'PYEOF' > "$OUTPUT_FILE"
 import json, sys, os
 from datetime import datetime, timedelta, timezone
 

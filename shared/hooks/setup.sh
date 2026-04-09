@@ -12,7 +12,7 @@ echo "=== NEXUS-6 Hook Setup v3.0-FINAL ==="
 echo ""
 
 # 1. hooks-config.json에서 화이트리스트 읽기
-PROJECTS=$(python3 -c "import json; print(' '.join(json.load(open('$CONFIG'))['whitelisted_projects']))")
+PROJECTS=$(/usr/bin/python3 -c "import json; print(' '.join(json.load(open('$CONFIG'))['whitelisted_projects']))")
 echo "[1] 화이트리스트: $PROJECTS"
 
 # 2. 심링크 생성/복구
@@ -58,7 +58,7 @@ echo "  OK — *.sh 전체 chmod +x"
 echo ""
 echo "[4] settings.json 훅 동기화"
 
-python3 - "$CONFIG" "$SETTINGS" <<'PYEOF'
+/usr/bin/python3 - "$CONFIG" "$SETTINGS" <<'PYEOF'
 import json, sys, os, shutil
 from datetime import datetime
 
@@ -107,14 +107,14 @@ echo ""
 echo "[5] 검증"
 # 배너 테스트
 BANNER=$(bash "$HOOK_DIR/nexus-banner.sh" 2>/dev/null)
-if echo "$BANNER" | python3 -c "import sys,json; json.load(sys.stdin)" 2>/dev/null; then
+if echo "$BANNER" | /usr/bin/python3 -c "import sys,json; json.load(sys.stdin)" 2>/dev/null; then
   echo "  OK — 배너 정상"
 else
   echo "  WARN — 배너 출력 확인 필요: $BANNER"
 fi
 
 # settings.json hooks 존재 확인
-HOOK_COUNT=$(python3 -c "import json; h=json.load(open('$SETTINGS')).get('hooks',{}); print(sum(len(v) for v in h.values()))")
+HOOK_COUNT=$(/usr/bin/python3 -c "import json; h=json.load(open('$SETTINGS')).get('hooks',{}); print(sum(len(v) for v in h.values()))")
 echo "  OK — settings.json에 $HOOK_COUNT hook entries"
 
 echo ""

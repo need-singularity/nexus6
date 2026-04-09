@@ -39,7 +39,7 @@ done
 # ── Targets (same as registry.rs) ────────────────────────────────────
 
 render_dashboard() {
-    python3 -c "
+    /usr/bin/python3 -c "
 import json, sys, os
 
 log_file = '$LOG_FILE'

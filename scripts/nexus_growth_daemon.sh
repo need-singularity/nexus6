@@ -88,12 +88,12 @@ measure_all_dimensions() {
 
     # Extract base values
     local tests_pass warnings lenses_registered modules code_lines test_fns
-    tests_pass=$(echo "$base_metrics" | python3 -c "import sys,json; print(json.load(sys.stdin).get('tests_pass',0))" 2>/dev/null || echo "0")
-    warnings=$(echo "$base_metrics" | python3 -c "import sys,json; print(json.load(sys.stdin).get('warnings',0))" 2>/dev/null || echo "0")
-    lenses_registered=$(echo "$base_metrics" | python3 -c "import sys,json; print(json.load(sys.stdin).get('lenses_registered',0))" 2>/dev/null || echo "0")
-    modules=$(echo "$base_metrics" | python3 -c "import sys,json; print(json.load(sys.stdin).get('modules',0))" 2>/dev/null || echo "0")
-    code_lines=$(echo "$base_metrics" | python3 -c "import sys,json; print(json.load(sys.stdin).get('code_lines',0))" 2>/dev/null || echo "0")
-    test_fns=$(echo "$base_metrics" | python3 -c "import sys,json; print(json.load(sys.stdin).get('test_fns',0))" 2>/dev/null || echo "0")
+    tests_pass=$(echo "$base_metrics" | /usr/bin/python3 -c "import sys,json; print(json.load(sys.stdin).get('tests_pass',0))" 2>/dev/null || echo "0")
+    warnings=$(echo "$base_metrics" | /usr/bin/python3 -c "import sys,json; print(json.load(sys.stdin).get('warnings',0))" 2>/dev/null || echo "0")
+    lenses_registered=$(echo "$base_metrics" | /usr/bin/python3 -c "import sys,json; print(json.load(sys.stdin).get('lenses_registered',0))" 2>/dev/null || echo "0")
+    modules=$(echo "$base_metrics" | /usr/bin/python3 -c "import sys,json; print(json.load(sys.stdin).get('modules',0))" 2>/dev/null || echo "0")
+    code_lines=$(echo "$base_metrics" | /usr/bin/python3 -c "import sys,json; print(json.load(sys.stdin).get('code_lines',0))" 2>/dev/null || echo "0")
+    test_fns=$(echo "$base_metrics" | /usr/bin/python3 -c "import sys,json; print(json.load(sys.stdin).get('test_fns',0))" 2>/dev/null || echo "0")
 
     # Performance: composite score = tests_pass * (code_lines / 100) / warnings_penalty
     local warn_penalty=1
@@ -235,7 +235,7 @@ EOF
 pick_weakest_dimension() {
     local metrics_json="$1"
     local skip_dims="${2:-}"
-    python3 -c "
+    /usr/bin/python3 -c "
 import sys, json
 
 m = json.loads('''$metrics_json''')
@@ -373,7 +373,7 @@ grow_red_team() {
 
 grow_atlas() {
     log_info "  Action: Expand math atlas"
-    $CLAUDE_CLI -p "In /Users/ghost/Dev/n6-architecture/, scan docs/ for n=6 constants that aren't in docs/atlas-constants.md yet. Add newly discovered constants with their BT references and domain tags. Then run: python3 .shared/scan_math_atlas.py --save --summary" \
+    $CLAUDE_CLI -p "In /Users/ghost/Dev/n6-architecture/, scan docs/ for n=6 constants that aren't in docs/atlas-constants.md yet. Add newly discovered constants with their BT references and domain tags. Then run: /usr/bin/python3 .shared/scan_math_atlas.py --save --summary" \
         --allowedTools Edit,Write,Read,Bash,Grep,Glob 2>/dev/null || return 1
 }
 
@@ -448,7 +448,7 @@ print_dashboard() {
     local cycle="$2"
     local dimension="$3"
 
-    python3 -c "
+    /usr/bin/python3 -c "
 import sys, json
 
 m = json.loads('''$metrics_json''')
@@ -550,7 +550,7 @@ for cycle in $(seq 1 "$MAX_CYCLES"); do
     # ── Step 0: Sync all projects + bridge ──────────────────────────
     log_info "Step 0/6: Syncing bridge + projects..."
     bash "$SCRIPT_DIR/growth_bridge.sh" full 2>/dev/null || log_warn "Bridge sync failed (continuing)"
-    python3 "$NEXUS_ROOT/nexus-bridge/bridge.py" sync 2>/dev/null || log_warn "Nexus-bridge sync failed (continuing)"
+    /usr/bin/python3 "$NEXUS_ROOT/nexus-bridge/bridge.py" sync 2>/dev/null || log_warn "Nexus-bridge sync failed (continuing)"
     # Sync shared resources if available
     if [[ -f "$NEXUS_ROOT/.shared/sync-nexus-lenses.sh" ]]; then
         bash "$NEXUS_ROOT/.shared/sync-nexus-lenses.sh" 2>/dev/null || true
@@ -574,13 +574,13 @@ for cycle in $(seq 1 "$MAX_CYCLES"); do
     # ── Consult growth intelligence ─────────────────────────────────
     if [[ -z "$FORCE_DIM" ]] && [[ -f "$SCRIPT_DIR/growth_intelligence.sh" ]]; then
         intel_json=$(bash "$SCRIPT_DIR/growth_intelligence.sh" 2>/dev/null || echo '{}')
-        intel_dim=$(echo "$intel_json" | python3 -c "import sys,json; print(json.load(sys.stdin).get('recommended_dimension',''))" 2>/dev/null || echo "")
-        skip_list=$(echo "$intel_json" | python3 -c "import sys,json; print(' '.join(json.load(sys.stdin).get('skip_list',[])))" 2>/dev/null || echo "")
+        intel_dim=$(echo "$intel_json" | /usr/bin/python3 -c "import sys,json; print(json.load(sys.stdin).get('recommended_dimension',''))" 2>/dev/null || echo "")
+        skip_list=$(echo "$intel_json" | /usr/bin/python3 -c "import sys,json; print(' '.join(json.load(sys.stdin).get('skip_list',[])))" 2>/dev/null || echo "")
 
         # If intelligence recommends a different dimension with high confidence
         if [[ -n "$intel_dim" ]] && [[ "$intel_dim" != "$dimension" ]]; then
-            intel_conf=$(echo "$intel_json" | python3 -c "import sys,json; print(json.load(sys.stdin).get('confidence',0))" 2>/dev/null || echo "0")
-            if python3 -c "exit(0 if float('$intel_conf') > 0.7 else 1)" 2>/dev/null; then
+            intel_conf=$(echo "$intel_json" | /usr/bin/python3 -c "import sys,json; print(json.load(sys.stdin).get('confidence',0))" 2>/dev/null || echo "0")
+            if /usr/bin/python3 -c "exit(0 if float('$intel_conf') > 0.7 else 1)" 2>/dev/null; then
                 log_info "  Intelligence override: $dimension -> $intel_dim (confidence: $intel_conf)"
                 dimension="$intel_dim"
             fi
@@ -599,7 +599,7 @@ for cycle in $(seq 1 "$MAX_CYCLES"); do
 
     if $DRY_RUN; then
         log_info "[DRY-RUN] Would execute growth for: $dimension"
-        echo "$metrics_json" | python3 -c "
+        echo "$metrics_json" | /usr/bin/python3 -c "
 import sys, json
 d = json.load(sys.stdin)
 d['cycle'] = $cycle
@@ -697,7 +697,7 @@ print(json.dumps(d))
 
     # Collect after-metrics and log
     after_metrics=$(measure_all_dimensions)
-    echo "$after_metrics" | python3 -c "
+    echo "$after_metrics" | /usr/bin/python3 -c "
 import sys, json
 d = json.load(sys.stdin)
 d['cycle'] = $cycle

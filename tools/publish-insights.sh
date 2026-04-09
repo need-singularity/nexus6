@@ -10,7 +10,7 @@ VC="${NEXUS_ROOT}/shared/verified_constants.jsonl"
 [ -f "$VC" ] || { echo "no verified_constants.jsonl"; exit 0; }
 [ -f "$PROJECTS_JSON" ] || { echo "no projects.json"; exit 0; }
 
-python3 << 'EOF'
+/usr/bin/python3 << 'EOF'
 import json, os
 from datetime import datetime
 HOME = os.path.expanduser('~')

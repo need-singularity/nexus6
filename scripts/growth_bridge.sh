@@ -27,7 +27,7 @@ now_iso() { date -u +"%Y-%m-%dT%H:%M:%S"; }
 
 do_scan() {
   log "Scanning all project .growth/absorbed/ directories..."
-  python3 -c "
+  /usr/bin/python3 -c "
 import json, os, glob
 
 BRIDGE = '$BRIDGE_STATE'
@@ -52,7 +52,7 @@ print(f'Total absorbed across all projects: {total}')
 
 do_digest() {
   log "Digesting absorbed data..."
-  python3 << 'PYEOF'
+  /usr/bin/python3 << 'PYEOF'
 import json, os, glob
 from collections import Counter
 from datetime import datetime
@@ -151,7 +151,7 @@ PYEOF
 
 do_grow() {
   log "Bridge self-growth tick..."
-  python3 -c "
+  /usr/bin/python3 -c "
 import json
 s = json.load(open('$BRIDGE_STATE'))
 b = s['bridge']
@@ -177,7 +177,7 @@ print(event)
 }
 
 do_status() {
-  python3 << 'PYEOF'
+  /usr/bin/python3 << 'PYEOF'
 import json, os
 BRIDGE = os.environ["BRIDGE_STATE"]
 s = json.load(open(BRIDGE))

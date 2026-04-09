@@ -7,7 +7,7 @@
 
 common_vector_clock() {
     log_info "🕐 Vector clock update"
-    python3 -c "
+    /usr/bin/python3 -c "
 import json, os, datetime
 
 vc_file = os.path.expanduser('~/.nexus/vector_clock.json')
@@ -53,7 +53,7 @@ common_metric_bus_publish() {
     mkdir -p "$bus_dir"
 
     # 현재 프로젝트 메트릭을 버스에 발행
-    python3 -c "
+    /usr/bin/python3 -c "
 import json, os, datetime
 
 bus_dir = '$bus_dir'
@@ -118,7 +118,7 @@ common_live_graph() {
 
     [ ! -f "$graph_file" ] && return
 
-    python3 -c "
+    /usr/bin/python3 -c "
 import json, os
 
 with open('$graph_file') as f:
@@ -207,7 +207,7 @@ common_growth_timeline() {
     local html_file="$HOME/.nexus/timeline.html"
     [ ! -f "$bus_file" ] && return
 
-    python3 -c "
+    /usr/bin/python3 -c "
 import json, os
 from collections import defaultdict
 
@@ -276,7 +276,7 @@ common_growth_history() {
     local bridge_json="$HOME/Dev/nexus/shared/bridge_state.json"
     [ ! -f "$bridge_json" ] && return
 
-    python3 -c "
+    /usr/bin/python3 -c "
 import json, os, glob
 from datetime import datetime, timezone
 
@@ -356,7 +356,7 @@ common_auto_actions() {
     local bridge_json="$HOME/Dev/nexus/shared/bridge_state.json"
     [ ! -f "$bridge_json" ] && return
 
-    python3 -c "
+    /usr/bin/python3 -c "
 import json, os
 from datetime import datetime, timezone
 

@@ -6,7 +6,7 @@ set -euo pipefail
 DL="${HOME}/Dev/nexus/shared/discovery_log.jsonl"
 [ -f "$DL" ] || touch "$DL"
 
-python3 << 'PYEOF'
+/usr/bin/python3 << 'PYEOF'
 import json, os
 from datetime import datetime
 

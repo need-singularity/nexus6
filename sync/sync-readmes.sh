@@ -31,7 +31,7 @@ sync_file() {
     return
   fi
 
-  python3 -c "
+  /usr/bin/python3 -c "
 import sys
 start_marker = '$MARKER_START'
 end_marker = '$MARKER_END'
@@ -74,13 +74,13 @@ SHARED_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 echo "=== [1/3] Loop Lens: actual JSON → projects.json + projects.md ==="
 if [ -f "$SHARED_DIR/sync_projects_json.py" ]; then
-  python3 "$SHARED_DIR/sync_projects_json.py" --apply
+  /usr/bin/python3 "$SHARED_DIR/sync_projects_json.py" --apply
 fi
 
 echo ""
 echo "=== [2/3] JSON SSOT → README auto-sync (all repos) ==="
 if [ -f "$SHARED_DIR/sync_readme_all.py" ]; then
-  python3 "$SHARED_DIR/sync_readme_all.py" --apply
+  /usr/bin/python3 "$SHARED_DIR/sync_readme_all.py" --apply
 fi
 echo ""
 

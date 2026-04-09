@@ -32,7 +32,7 @@ sync_file() {
     return
   fi
 
-  python3 -c "
+  /usr/bin/python3 -c "
 import sys
 start_marker = '$MARKER_START'
 end_marker = '$MARKER_END'

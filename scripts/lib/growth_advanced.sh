@@ -9,7 +9,7 @@ common_resonance_bridge() {
     local mirror_file="$HOME/.nexus/last_mirror.json"
     [ ! -f "$mirror_file" ] && return
 
-    python3 -c "
+    /usr/bin/python3 -c "
 import json, os, datetime
 
 with open('$mirror_file') as f:
@@ -50,7 +50,7 @@ common_cross_experiment() {
         [ ! -f "$pstate" ] && continue
         # growth_state에서 도메인 추출 시도
         local pdomain
-        pdomain=$(python3 -c "import json; print(json.load(open('$pstate')).get('domain',''))" 2>/dev/null || echo "")
+        pdomain=$(/usr/bin/python3 -c "import json; print(json.load(open('$pstate')).get('domain',''))" 2>/dev/null || echo "")
         [ -z "$pdomain" ] && continue
         domains="$domains $pdomain"
     done
@@ -71,7 +71,7 @@ common_cross_experiment() {
 # ── #13: 동기화 우선순위 큐 ──
 common_sync_priority_queue() {
     log_info "📊 Sync priority queue"
-    python3 -c "
+    /usr/bin/python3 -c "
 import json, os, datetime
 
 bridge_file = os.path.expanduser('~/Dev/nexus/shared/bridge_state.json')
@@ -155,7 +155,7 @@ common_connection_metrics() {
     local bridge_json="$HOME/Dev/nexus/shared/bridge_state.json"
     [ ! -f "$bridge_json" ] && return
 
-    python3 -c "
+    /usr/bin/python3 -c "
 import json, os, glob
 from datetime import datetime, timezone
 

@@ -70,24 +70,24 @@ while [[ "$RUNNING" == true ]] && [[ $CYCLE -lt $MAX_CYCLES ]]; do
     log "Step 0: Wall detection + domain evolution..."
 
     # 0a: Wall detect + depth adjustment
-    WALL_OUT=$(python3 "$SCRIPTS/tecs_wall.py" 2>&1) || true
+    WALL_OUT=$(/usr/bin/python3 "$SCRIPTS/tecs_wall.py" 2>&1) || true
     log "Wall: $WALL_OUT"
 
     # 0b: Domain forge (create new domains from clusters)
-    FORGE_OUT=$(python3 "$SCRIPTS/tecs_forge.py" 2>&1) || true
+    FORGE_OUT=$(/usr/bin/python3 "$SCRIPTS/tecs_forge.py" 2>&1) || true
     log "Forge: $FORGE_OUT"
 
     # 0c: Domain split (split oversized domains)
-    SPLIT_OUT=$(python3 "$SCRIPTS/tecs_split.py" 2>&1) || true
+    SPLIT_OUT=$(/usr/bin/python3 "$SCRIPTS/tecs_split.py" 2>&1) || true
     log "Split: $SPLIT_OUT"
 
     # 0d: Keyword absorb (expand classifiers from discoveries)
-    ABSORB_OUT=$(python3 "$SCRIPTS/tecs_absorb.py" 2>&1) || true
+    ABSORB_OUT=$(/usr/bin/python3 "$SCRIPTS/tecs_absorb.py" 2>&1) || true
     log "Absorb: $ABSORB_OUT"
 
     # Step 1: MEASURE
     log "Step 1: Measuring domain health..."
-    MEASURE_OUT=$(python3 "$SCRIPTS/tecs_measure.py" 2>&1) || {
+    MEASURE_OUT=$(/usr/bin/python3 "$SCRIPTS/tecs_measure.py" 2>&1) || {
         log "MEASURE failed: $MEASURE_OUT"
         CONSECUTIVE_FAIL=$((CONSECUTIVE_FAIL + 1))
         if [[ $CONSECUTIVE_FAIL -ge $MAX_FAIL ]]; then
@@ -100,8 +100,8 @@ while [[ "$RUNNING" == true ]] && [[ $CYCLE -lt $MAX_CYCLES ]]; do
     log "Measure result: $MEASURE_OUT"
 
     # Extract target domain and mode
-    TARGET=$(echo "$MEASURE_OUT" | python3 -c "import sys,json; print(json.load(sys.stdin)['target_domain'])" 2>/dev/null || echo "N")
-    MODE=$(python3 -c "
+    TARGET=$(echo "$MEASURE_OUT" | /usr/bin/python3 -c "import sys,json; print(json.load(sys.stdin)['target_domain'])" 2>/dev/null || echo "N")
+    MODE=$(/usr/bin/python3 -c "
 import json
 with open('$CONFIG/loop_state.json') as f:
     print(json.load(f)['loop']['mode'])
@@ -116,7 +116,7 @@ with open('$CONFIG/loop_state.json') as f:
 
     # Step 2: ACT
     log "Step 2: Running discovery action..."
-    ACT_OUT=$(python3 "$SCRIPTS/tecs_act.py" "$TARGET" "$MODE" 2>&1) || {
+    ACT_OUT=$(/usr/bin/python3 "$SCRIPTS/tecs_act.py" "$TARGET" "$MODE" 2>&1) || {
         log "ACT failed: $ACT_OUT"
         CONSECUTIVE_FAIL=$((CONSECUTIVE_FAIL + 1))
         if [[ $CONSECUTIVE_FAIL -ge $MAX_FAIL ]]; then
@@ -130,28 +130,28 @@ with open('$CONFIG/loop_state.json') as f:
 
     # Step 3: VALIDATE
     log "Step 3: Cross-validating discoveries..."
-    VALIDATE_OUT=$(python3 "$SCRIPTS/tecs_validate.py" 2>&1) || {
+    VALIDATE_OUT=$(/usr/bin/python3 "$SCRIPTS/tecs_validate.py" 2>&1) || {
         log "VALIDATE failed: $VALIDATE_OUT"
     }
     log "Validate result: $VALIDATE_OUT"
 
     # Step 4: RECORD
     log "Step 4: Recording confirmed discoveries..."
-    RECORD_OUT=$(python3 "$SCRIPTS/tecs_record.py" 2>&1) || {
+    RECORD_OUT=$(/usr/bin/python3 "$SCRIPTS/tecs_record.py" 2>&1) || {
         log "RECORD failed: $RECORD_OUT"
     }
     log "Record result: $RECORD_OUT"
 
     # Step 4b: Cross-pollinate (inject discoveries across domains)
     log "Step 4b: Cross-pollinating discoveries..."
-    POLLINATE_OUT=$(python3 "$SCRIPTS/tecs_pollinate.py" 2>&1) || true
+    POLLINATE_OUT=$(/usr/bin/python3 "$SCRIPTS/tecs_pollinate.py" 2>&1) || true
     log "Pollinate: $POLLINATE_OUT"
 
     # Step 5: BRIDGE (nexus-bridge sync)
     log "Step 5: Syncing via nexus-bridge..."
     BRIDGE_SCRIPT="$HOME/Dev/nexus/nexus-bridge.py"
     if [[ -f "$BRIDGE_SCRIPT" ]]; then
-        BRIDGE_OUT=$(python3 "$BRIDGE_SCRIPT" sync math-atlas,lenses 2>&1) || {
+        BRIDGE_OUT=$(/usr/bin/python3 "$BRIDGE_SCRIPT" sync math-atlas,lenses 2>&1) || {
             log "BRIDGE sync skipped: $BRIDGE_OUT"
         }
         log "Bridge result: $BRIDGE_OUT"
@@ -161,7 +161,7 @@ with open('$CONFIG/loop_state.json') as f:
 
     # Step 6: PUBLISH (check threshold)
     log "Step 6: Checking publish threshold..."
-    PUBLISH_OUT=$(python3 "$SCRIPTS/tecs_publish.py" 2>&1) || {
+    PUBLISH_OUT=$(/usr/bin/python3 "$SCRIPTS/tecs_publish.py" 2>&1) || {
         log "PUBLISH failed: $PUBLISH_OUT"
     }
     log "Publish result: $PUBLISH_OUT"
@@ -170,7 +170,7 @@ with open('$CONFIG/loop_state.json') as f:
     CONSECUTIVE_FAIL=0
 
     # Check if we should stop
-    FAILURES=$(python3 -c "
+    FAILURES=$(/usr/bin/python3 -c "
 import json
 with open('$CONFIG/loop_state.json') as f:
     print(json.load(f)['loop']['consecutive_failures'])
@@ -181,7 +181,7 @@ with open('$CONFIG/loop_state.json') as f:
     fi
 
     # Report (every cycle)
-    python3 "$SCRIPTS/tecs_report.py" 2>/dev/null | tee -a "$LOG_FILE"
+    /usr/bin/python3 "$SCRIPTS/tecs_report.py" 2>/dev/null | tee -a "$LOG_FILE"
 
     log "── Cycle $CYCLE complete. Sleeping ${INTERVAL}s ──"
     # Interruptible sleep
@@ -192,6 +192,6 @@ done
 log "═══ TECS-L Discovery Loop finished ($CYCLE cycles) ═══"
 
 # Final report
-python3 "$SCRIPTS/tecs_report.py" 2>/dev/null | tee -a "$LOG_FILE"
+/usr/bin/python3 "$SCRIPTS/tecs_report.py" 2>/dev/null | tee -a "$LOG_FILE"
 
 rm -f "$PID_FILE"

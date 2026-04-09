@@ -19,7 +19,7 @@ domain_phases() {
     local atlas_file="$PROJECT_ROOT/.shared/math_atlas.json"
     if [ -f "$atlas_file" ]; then
         local atlas_count
-        atlas_count=$(python3 -c "import json; d=json.load(open('$atlas_file')); print(len(d) if isinstance(d,list) else len(d.keys()))" 2>/dev/null || echo "?")
+        atlas_count=$(/usr/bin/python3 -c "import json; d=json.load(open('$atlas_file')); print(len(d) if isinstance(d,list) else len(d.keys()))" 2>/dev/null || echo "?")
         log_info "  math_atlas.json: ${atlas_count} 항목"
         write_growth_bus "math_atlas" "ok" "count=${atlas_count}"
     else
@@ -73,7 +73,7 @@ domain_phases() {
     log_info "Phase: 성장 스캔"
     local scan_script="$PROJECT_ROOT/.growth/scan.py"
     if [ -f "$scan_script" ]; then
-        python3 "$scan_script" 2>/dev/null | tail -5 | while IFS= read -r line; do
+        /usr/bin/python3 "$scan_script" 2>/dev/null | tail -5 | while IFS= read -r line; do
             log_info "  $line"
         done
         write_growth_bus "growth_scan" "ok" ""

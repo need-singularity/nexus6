@@ -202,11 +202,11 @@ for cycle in $(seq 1 "$CYCLES"); do
     # --- Step 1: Measure ---
     log_info "Step 1/6: Measuring current state..."
     before_metrics=$(collect_metrics)
-    before_tests=$(echo "$before_metrics" | python3 -c "import sys,json; print(json.load(sys.stdin).get('tests_pass',0))" 2>/dev/null || echo "0")
-    before_warnings=$(echo "$before_metrics" | python3 -c "import sys,json; print(json.load(sys.stdin).get('warnings',0))" 2>/dev/null || echo "0")
-    before_lines=$(echo "$before_metrics" | python3 -c "import sys,json; print(json.load(sys.stdin).get('code_lines',0))" 2>/dev/null || echo "0")
-    before_lenses=$(echo "$before_metrics" | python3 -c "import sys,json; print(json.load(sys.stdin).get('lenses_registered',0))" 2>/dev/null || echo "0")
-    tests_fail=$(echo "$before_metrics" | python3 -c "import sys,json; print(json.load(sys.stdin).get('tests_fail',0))" 2>/dev/null || echo "0")
+    before_tests=$(echo "$before_metrics" | /usr/bin/python3 -c "import sys,json; print(json.load(sys.stdin).get('tests_pass',0))" 2>/dev/null || echo "0")
+    before_warnings=$(echo "$before_metrics" | /usr/bin/python3 -c "import sys,json; print(json.load(sys.stdin).get('warnings',0))" 2>/dev/null || echo "0")
+    before_lines=$(echo "$before_metrics" | /usr/bin/python3 -c "import sys,json; print(json.load(sys.stdin).get('code_lines',0))" 2>/dev/null || echo "0")
+    before_lenses=$(echo "$before_metrics" | /usr/bin/python3 -c "import sys,json; print(json.load(sys.stdin).get('lenses_registered',0))" 2>/dev/null || echo "0")
+    tests_fail=$(echo "$before_metrics" | /usr/bin/python3 -c "import sys,json; print(json.load(sys.stdin).get('tests_fail',0))" 2>/dev/null || echo "0")
 
     log_info "  Tests: $before_tests pass, $tests_fail fail | Warnings: $before_warnings | Lines: $before_lines | Lenses: $before_lenses"
 
@@ -221,7 +221,7 @@ for cycle in $(seq 1 "$CYCLES"); do
         log_info "[DRY-RUN] Skipping generation, validation, commit."
 
         # Log dry-run metrics
-        echo "$before_metrics" | python3 -c "
+        echo "$before_metrics" | /usr/bin/python3 -c "
 import sys, json
 d = json.load(sys.stdin)
 d['cycle'] = $cycle
@@ -275,7 +275,7 @@ print(json.dumps(d))
 
         # Collect after metrics
         after_metrics=$(collect_metrics)
-        after_tests=$(echo "$after_metrics" | python3 -c "import sys,json; print(json.load(sys.stdin).get('tests_pass',0))" 2>/dev/null || echo "0")
+        after_tests=$(echo "$after_metrics" | /usr/bin/python3 -c "import sys,json; print(json.load(sys.stdin).get('tests_pass',0))" 2>/dev/null || echo "0")
 
         commit_msg="growth(nexus): ${action_type} — cycle ${cycle}, tests ${before_tests}->${after_tests}"
 
@@ -293,7 +293,7 @@ print(json.dumps(d))
 
     after_metrics=$(collect_metrics)
     # Append cycle info to log
-    echo "$after_metrics" | python3 -c "
+    echo "$after_metrics" | /usr/bin/python3 -c "
 import sys, json
 d = json.load(sys.stdin)
 d['cycle'] = $cycle
@@ -305,8 +305,8 @@ print(json.dumps(d))
 " >> "$LOG_FILE" 2>/dev/null || true
 
     if $validate_ok; then
-        after_tests_final=$(echo "$after_metrics" | python3 -c "import sys,json; print(json.load(sys.stdin).get('tests_pass',0))" 2>/dev/null || echo "0")
-        after_lines_final=$(echo "$after_metrics" | python3 -c "import sys,json; print(json.load(sys.stdin).get('code_lines',0))" 2>/dev/null || echo "0")
+        after_tests_final=$(echo "$after_metrics" | /usr/bin/python3 -c "import sys,json; print(json.load(sys.stdin).get('tests_pass',0))" 2>/dev/null || echo "0")
+        after_lines_final=$(echo "$after_metrics" | /usr/bin/python3 -c "import sys,json; print(json.load(sys.stdin).get('code_lines',0))" 2>/dev/null || echo "0")
         log_info "  Result: tests $before_tests -> $after_tests_final, lines $before_lines -> $after_lines_final"
     else
         log_info "  Result: cycle failed, no changes applied."

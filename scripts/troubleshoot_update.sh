@@ -25,7 +25,7 @@ record_failure() {
     local timestamp
     timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-    python3 -c "
+    /usr/bin/python3 -c "
 import json, sys
 
 with open('$TROUBLESHOOT_FILE', 'r') as f:
@@ -70,7 +70,7 @@ print(f'Recorded failure in $dimension. Reliability: {m[\"reliability_score\"]*1
 }
 
 record_success() {
-    python3 -c "
+    /usr/bin/python3 -c "
 import json
 with open('$TROUBLESHOOT_FILE', 'r') as f:
     db = json.load(f)
@@ -91,7 +91,7 @@ record_solution() {
     local timestamp
     timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-    python3 -c "
+    /usr/bin/python3 -c "
 import json
 with open('$TROUBLESHOOT_FILE', 'r') as f:
     db = json.load(f)
@@ -123,7 +123,7 @@ add_rule() {
     local timestamp
     timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-    python3 -c "
+    /usr/bin/python3 -c "
 import json
 with open('$TROUBLESHOOT_FILE', 'r') as f:
     db = json.load(f)
@@ -225,7 +225,7 @@ auto_fix() {
 
     # Read unresolved failures
     local unresolved
-    unresolved=$(python3 -c "
+    unresolved=$(/usr/bin/python3 -c "
 import json
 with open('$TROUBLESHOOT_FILE', 'r') as f:
     db = json.load(f)
@@ -247,7 +247,7 @@ for item in uf[:3]:
 }
 
 print_report() {
-    python3 -c "
+    /usr/bin/python3 -c "
 import json
 
 with open('$TROUBLESHOOT_FILE', 'r') as f:

@@ -17,13 +17,13 @@ echo ""
 
 # Step 1: Build atlas
 echo "[1/3] Building atlas..."
-python3 "$SCRIPT_DIR/scan_math_atlas.py" --save --summary
+/usr/bin/python3 "$SCRIPT_DIR/scan_math_atlas.py" --save --summary
 
 echo ""
 
 # Step 2: Generate README summary and sync to READMEs
 echo "[2/3] Syncing README markers..."
-SUMMARY=$(python3 "$SCRIPT_DIR/scan_math_atlas.py" --readme-summary)
+SUMMARY=$(/usr/bin/python3 "$SCRIPT_DIR/scan_math_atlas.py" --readme-summary)
 
 sync_readme() {
   local file="$1"
@@ -41,7 +41,7 @@ sync_readme() {
     return
   fi
 
-  python3 -c "
+  /usr/bin/python3 -c "
 import sys
 start = '$MARKER_START'
 end = '$MARKER_END'

@@ -20,9 +20,9 @@ LOCKFILE="/tmp/n6-growth-${GROWTH_NAME}.lock"
 # ── 루프 순서 정의 (shared/loop/{project}.json) ──
 LOOP_DEF="$HOME/Dev/nexus/shared/loop/${GROWTH_NAME}.json"
 if [ -f "$LOOP_DEF" ]; then
-    _loop_interval=$(python3 -c "import json; print(json.load(open('$LOOP_DEF')).get('interval', 1800))" 2>/dev/null)
-    _loop_max=$(python3 -c "import json; print(json.load(open('$LOOP_DEF')).get('max_cycles', 999))" 2>/dev/null)
-    _loop_domain=$(python3 -c "import json; print(json.load(open('$LOOP_DEF')).get('domain', 'number_theory'))" 2>/dev/null)
+    _loop_interval=$(/usr/bin/python3 -c "import json; print(json.load(open('$LOOP_DEF')).get('interval', 1800))" 2>/dev/null)
+    _loop_max=$(/usr/bin/python3 -c "import json; print(json.load(open('$LOOP_DEF')).get('max_cycles', 999))" 2>/dev/null)
+    _loop_domain=$(/usr/bin/python3 -c "import json; print(json.load(open('$LOOP_DEF')).get('domain', 'number_theory'))" 2>/dev/null)
     INTERVAL="${INTERVAL:-${_loop_interval:-1800}}"
     MAX_CYCLES="${MAX_CYCLES:-${_loop_max:-999}}"
     DOMAIN="${DOMAIN:-${_loop_domain:-number_theory}}"
@@ -156,7 +156,7 @@ common_singularity_cascade() {
 
         # 현재 공리 (n=6 상수 + 발견된 메트릭)
         local axiom_file="$GROWTH_DIR/singularity_axioms.json"
-        python3 -c "
+        /usr/bin/python3 -c "
 import json, os, datetime
 axioms = {
     'source': '$GROWTH_NAME',
@@ -244,7 +244,7 @@ common_sync() {
 # ── 공통 Phase: 성장 상태 업데이트 ──
 common_update_state() {
     local cycle="$1"
-    python3 -c "
+    /usr/bin/python3 -c "
 import json, os
 from datetime import datetime, timezone
 f = '$GROWTH_STATE'
@@ -300,7 +300,7 @@ common_shared_graph() {
     mkdir -p "$graph_dir"
 
     # 현재 프로젝트의 발견을 공유 그래프에 추가
-    python3 -c "
+    /usr/bin/python3 -c "
 import json, os, datetime
 
 graph_file = '$graph_dir/graph.json'
@@ -383,7 +383,7 @@ common_lens_recommend() {
     [ ! -f "$scan_file" ] && return
 
     # 현재 프로젝트의 top 렌즈를 형제에게 추천
-    python3 -c "
+    /usr/bin/python3 -c "
 import json, os, datetime
 
 # scan 결과에서 도메인 추출
@@ -536,7 +536,7 @@ common_cycle_report() {
 
     # growth_state에서 정보 수집
     local state_info
-    state_info=$(python3 -c "
+    state_info=$(/usr/bin/python3 -c "
 import json, os
 state_file = '$GROWTH_STATE'
 info = {'cycle': $cycle, 'name': '$GROWTH_NAME', 'domain': '${DOMAIN:-unknown}'}
@@ -572,7 +572,7 @@ print(json.dumps(info))
         echo "  ┌${line_sep}┐"
         echo "  │ 📋 ${GROWTH_NAME} Cycle $cycle $(printf '%*s' $((w - 15 - ${#GROWTH_NAME} - ${#cycle})) '')│"
         echo "  ├${line_sep}┤"
-        echo "$state_info" | python3 -c "
+        echo "$state_info" | /usr/bin/python3 -c "
 import json, sys
 info = json.load(sys.stdin)
 w = $w
@@ -597,7 +597,7 @@ common_project_dna() {
     local bridge_json="$HOME/Dev/nexus/shared/bridge_state.json"
     [ ! -f "$bridge_json" ] && return
 
-    python3 -c "
+    /usr/bin/python3 -c "
 import json, os, subprocess, glob
 from datetime import datetime, timezone
 
@@ -703,7 +703,7 @@ common_federated_growth() {
     [ ! -f "$my_state" ] && return
 
     local my_cycle
-    my_cycle=$(python3 -c "import json; print(json.load(open('$my_state')).get('cycle',0))" 2>/dev/null || echo 0)
+    my_cycle=$(/usr/bin/python3 -c "import json; print(json.load(open('$my_state')).get('cycle',0))" 2>/dev/null || echo 0)
 
     # 내 성장을 형제 프로젝트에 비례 전파 (10% 보너스)
     for proj_dir in "$HOME"/Dev/*/; do
@@ -712,7 +712,7 @@ common_federated_growth() {
         local pstate="$proj_dir/.growth/growth_state.json"
         [ ! -f "$pstate" ] && continue
 
-        python3 -c "
+        /usr/bin/python3 -c "
 import json
 f = '$pstate'
 try:
@@ -739,7 +739,7 @@ common_auto_route() {
     local blowup_file="$HOME/.nexus/last_blowup.txt"
     [ ! -f "$blowup_file" ] && return
 
-    python3 -c "
+    /usr/bin/python3 -c "
 import json, os
 # bridge_state에서 라우팅 테이블 로드
 with open('$bridge_state') as f:

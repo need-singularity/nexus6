@@ -14,7 +14,7 @@ REPO_NAME=$(basename "$REPO_ROOT")
 CONFIG="$HOOK_DIR/hooks-config.json"
 
 # 1. 화이트리���트 체크 (hooks-config.json 참조)
-WHITELIST=$(python3 -c "import json; print(' '.join(json.load(open('$CONFIG'))['whitelisted_projects']))" 2>/dev/null)
+WHITELIST=$(/usr/bin/python3 -c "import json; print(' '.join(json.load(open('$CONFIG'))['whitelisted_projects']))" 2>/dev/null)
 if ! echo " $WHITELIST " | grep -q " $REPO_NAME "; then
   return 1 2>/dev/null
   exit 0

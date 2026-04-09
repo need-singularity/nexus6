@@ -22,7 +22,7 @@ echo "$NOW" > "$TICK_FILE"
 BRIDGE_CLI="${HOME}/Dev/nexus/nexus-bridge.py"
 if [ -f "$BRIDGE_CLI" ]; then
   PROJECT=$(basename "$(git rev-parse --show-toplevel 2>/dev/null || pwd)")
-  python3 "$BRIDGE_CLI" notify "$PROJECT" sync 1 2>/dev/null &
+  /usr/bin/python3 "$BRIDGE_CLI" notify "$PROJECT" sync 1 2>/dev/null &
 fi
 
 # growth_state.json 직접 업데이트 — hexa 엔진

@@ -15,7 +15,7 @@
 | 수렴 추적 | `convergence/` | 골화/안정/실패 (7 프로젝트) |
 | 할일 | `todo/` | 우선순위별 TODO (7 프로젝트) |
 | 성장 루프 | `loop/` | 자율 데몬 설정 (3 프로젝트) |
-| 렌즈 | `lens_registry.json` | 1022종 망원경 레지스트리 |
+| 렌즈 | `lens_registry.json` | 397종 망원경 레지스트리 |
 | 상수 | `n6_constants.jsonl` | n=6 상수 (7기본+유도) |
 | 발견 그래프 | `discovery_graph.json` | 50k+ 노드/엣지 |
 | 발견 로그 | `discovery_log.jsonl` | 68.6k건 시계열 |
@@ -30,7 +30,7 @@
 
 ```bash
 nexus scan <domain>              # 기본 스캔 (의식+위상+인과)
-nexus scan <domain> --full       # 1022종 풀스캔
+nexus scan <domain> --full       # 397종 풀스캔
 nexus verify <value>             # n=6 일치 검증
 nexus evolve <domain>            # OUROBOROS 진화
 nexus auto <domain>              # 전체 파이프라인

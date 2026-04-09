@@ -5,7 +5,7 @@
 [ADL] writing awk script len=4948
 [ADL] awk script written OK
 [ADL] about to exec echo test
-=== 돌파 타겟 (41건) ===
+=== 돌파 타겟 (40건) ===
   → PRIORITY_1:constant:phi (발견 0건 — 완전 미지)
   → PRIORITY_1:constant:mu (발견 0건 — 완전 미지)
   → PRIORITY_1:constant:J2 (발견 0건 — 완전 미지)
@@ -39,7 +39,6 @@
   → PRIORITY_1:constant:thermodynamic (발견 0건 — 완전 미지)
   → PRIORITY_1:constant:topological (발견 0건 — 완전 미지)
   → PRIORITY_1:constant:algebraic (발견 0건 — 완전 미지)
-  → PRIORITY_2:sector:geometric (빈 섹터 또는 높은 MISS율)
   → PRIORITY_2:sector:consciousness (빈 섹터 또는 높은 MISS율)
   → PRIORITY_2:sector:biological (빈 섹터 또는 높은 MISS율)
   → PRIORITY_2:sector:cosmological (빈 섹터 또는 높은 MISS율)

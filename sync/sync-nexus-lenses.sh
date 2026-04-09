@@ -85,7 +85,7 @@ CHANGED=0
 
 if [ -f "$CLAUDE_MD" ]; then
   # Use Python for UTF-8 safe regex replacement (heredoc avoids escaping issues)
-  RESULT=$(python3 - "$CLAUDE_MD" "$TOTAL" <<'PYEOF'
+  RESULT=$(/usr/bin/python3 - "$CLAUDE_MD" "$TOTAL" <<'PYEOF'
 import re, sys
 
 claude_md = sys.argv[1]
@@ -146,7 +146,7 @@ echo "[4/5] Updating installed_tools.json..."
 TOOLS_JSON="$SHARED_DIR/installed_tools.json"
 if [ -f "$TOOLS_JSON" ]; then
   # Update the purpose field for nexus
-  OLD_PURPOSE=$(python3 -c "
+  OLD_PURPOSE=$(/usr/bin/python3 -c "
 import json
 with open('$TOOLS_JSON') as f:
     d = json.load(f)
@@ -166,7 +166,7 @@ print(entry.get('purpose', ''))
     if [ "$OLD_PURPOSE" = "$NEW_PURPOSE" ]; then
       echo "  Already up to date (no change)"
     else
-      python3 -c "
+      /usr/bin/python3 -c "
 import json
 with open('$TOOLS_JSON') as f:
     d = json.load(f)
@@ -195,7 +195,7 @@ echo "[5/5] Updating calculators.json..."
 
 CALC_JSON="$SHARED_DIR/calculators.json"
 if [ -f "$CALC_JSON" ]; then
-  python3 -c "
+  /usr/bin/python3 -c "
 import json
 
 with open('$CALC_JSON') as f:

@@ -15,7 +15,7 @@ fi
 REPO_NAME=$(basename "$REPO_ROOT")
 
 if [ -f "$PROJ_JSON" ]; then
-  if ! python3 -c "
+  if ! /usr/bin/python3 -c "
 import json, sys
 d = json.load(open('$PROJ_JSON'))
 names = list(d.get('projects', {}).keys())

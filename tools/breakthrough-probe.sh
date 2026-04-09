@@ -4,7 +4,7 @@
 set -euo pipefail
 NEXUS="${HOME}/Dev/nexus"
 
-python3 << 'PYEOF'
+/usr/bin/python3 << 'PYEOF'
 import json, os, random
 from datetime import datetime
 from collections import Counter
