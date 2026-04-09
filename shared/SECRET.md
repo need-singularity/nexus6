@@ -20,9 +20,33 @@
 | RunPod | `~/Dev/TECS-L/.local/runpod_api_key` | GPU 서버 |
 | Zenodo Sandbox | `~/Dev/TECS-L/.local/zenodo_sandbox_token` | 테스트용 |
 
-## 계정 정보
+## 계정 정보 (상세: ~/Dev/secret/README.md)
 
-- `~/Dev/secret/README.md` — Claude Code 계정 + API 키 테이블
+| # | 서비스 | 용도 | 위치 |
+|---|--------|------|------|
+| 1 | Claude Code ×10 | AI 코딩 세션 | `secret/README.md` §1 |
+| 2 | Cloudflare R2 | anima 모델/corpus/메모리 스토리지 | `secret/README.md` §2 |
+| 3 | fal.ai | 이미지 생성 (creator) | `secret/README.md` §3 |
+| 4 | OpenRouter | LLM API 번역 (creator) | `secret/README.md` §4 |
+| 5 | Gmail API | 논문 아웃리치 이메일 | `secret/README.md` §5 |
+| 6 | Zenodo | 논문 DOI 발행 | `secret/README.md` §6 |
+| 7 | OSF | 논문 노드 업로드 | `secret/README.md` §7 |
+| 8 | Google AI (Gemini) | LLM API | `secret/README.md` §8 |
+| 9 | Vast.ai | 4×4090 GPU 학습 | `secret/README.md` §9 |
+| 10 | RunPod | A100/H100 GPU | `secret/README.md` §10 |
+| 11 | Namecheap | 도메인 | `secret/README.md` §11+ |
+
+## 프로젝트별 사용 토큰
+
+| 프로젝트 | 사용 토큰 |
+|----------|-----------|
+| **anima** | Vast.ai (§9), R2 (§2), RunPod (§10) |
+| **papers** | Zenodo (§6), OSF (§7) |
+| **contact** | Gmail API (§5) |
+| **creator** | fal.ai (§3), OpenRouter (§4) |
+| **TECS-L** | Zenodo (§6), OSF (§7), Gmail (§5) |
+| **nexus** | — (인프라 전용, 토큰 불필요) |
+| **sedi** | Google AI (§8) |
 
 ## 사용법
 
