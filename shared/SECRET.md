@@ -40,11 +40,15 @@
 
 | 프로젝트 | 사용 토큰 |
 |----------|-----------|
-| **anima** | Vast.ai (§9), R2 (§2), RunPod (§10) |
-| **papers** | Zenodo (§6), OSF (§7) |
-| **contact** | Gmail API (§5) |
-| **creator** | fal.ai (§3), OpenRouter (§4) |
-| **nexus** | — (인프라 전용, 토큰 불필요) |
+| 🔭 **nexus** | — (인프라 전용, 토큰 불필요) |
+| 🧠 **anima** | Vast.ai (§9), R2 (§2), RunPod (§10) |
+| 🏗️ **n6-architecture** | — (설계 전용) |
+| 📄 **papers** | Zenodo (§6), OSF (§7) |
+| 💎 **hexa-lang** | — (컴파일러 전용) |
+| 🖥️ **void** | — (터미널 전용) |
+| 🧬 **airgenome** | — (스캐너 전용) |
+| 📧 **contact** (private) | Gmail API (§5) |
+| 🎨 **creator** (private) | fal.ai (§3), OpenRouter (§4) |
 
 ## 사용법
 
