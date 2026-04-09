@@ -98,19 +98,41 @@ SUP_MAP = {
     '⁵': '5', '⁶': '6', '⁷': '7', '⁸': '8', '⁹': '9',
 }
 
+# 위첨자 부호 (⁻⁵, ⁺³)
+SUP_SIGN_MAP = {'⁻': '-', '⁺': '+'}
+
+
+def normalize_expr_unicode(s):
+    """유니코드 특수기호를 ASCII 로 정규화 (parse 전처리 진입점)."""
+    if s is None:
+        return s
+    s = s.replace('\u00a0', ' ').replace('\u2009', ' ')
+    s = s.replace('\u200b', '').replace('\ufeff', '')
+    s = s.replace('×', '*').replace('·', '*').replace('÷', '/')
+    s = s.replace('−', '-').replace('–', '-').replace('—', '-')
+    s = s.replace('\u2010', '-').replace('\u2011', '-')
+    return re.sub(r'\s+', ' ', s).strip()
+
 
 def _convert_superscripts(s):
-    """연속된 유니코드 윗첨자를 **N 으로 변환"""
+    """연속된 유니코드 윗첨자(부호 포함)를 **<sign>N 으로 변환"""
     out = []
     i = 0
     while i < len(s):
-        if s[i] in SUP_MAP:
+        if s[i] in SUP_MAP or s[i] in SUP_SIGN_MAP:
             j = i
+            sign = ''
+            if s[j] in SUP_SIGN_MAP:
+                sign = SUP_SIGN_MAP[s[j]]
+                j += 1
             digits = ''
             while j < len(s) and s[j] in SUP_MAP:
                 digits += SUP_MAP[s[j]]
                 j += 1
-            out.append('**' + digits)
+            if digits:
+                out.append('**' + sign + digits)
+            elif sign:
+                out.append('**' + sign)
             i = j
         else:
             out.append(s[i])
@@ -217,6 +239,7 @@ def parse_bare_numeric(s):
 def normalize_expr(expr_str):
     """n=6 수식 문자열을 Python eval 가능한 형태로 정규화"""
     s = expr_str.strip()
+    s = normalize_expr_unicode(s)
 
     # 마크다운 굵게 제거
     s = re.sub(r'^\*\*(.*)\*\*$', r'\1', s).strip()

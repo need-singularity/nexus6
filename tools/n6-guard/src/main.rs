@@ -709,11 +709,15 @@ fn notify_macos(msg: &str, cfg: &NotifyConfig, last: &mut Instant) {
         "display notification \"{}\" with title \"n6-guard\" sound name \"Basso\"",
         msg.replace('"', "'")
     );
-    Command::new("osascript")
+    if let Ok(child) = Command::new("osascript")
         .args(["-e", &script])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .spawn().ok();
+        .spawn()
+    {
+        // reap in background to prevent zombie
+        std::thread::spawn(move || { let mut c = child; let _ = c.wait(); });
+    }
 
     *last = Instant::now();
 }
@@ -763,11 +767,14 @@ impl RestartTracker {
 
             let parts: Vec<&str> = svc.restart_cmd.split_whitespace().collect();
             if let Some((cmd, args)) = parts.split_first() {
-                let _ = Command::new(cmd)
+                if let Ok(child) = Command::new(cmd)
                     .args(args)
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
-                    .spawn();
+                    .spawn()
+                {
+                    std::thread::spawn(move || { let mut c = child; let _ = c.wait(); });
+                }
             }
 
             // Remove stale PID file
