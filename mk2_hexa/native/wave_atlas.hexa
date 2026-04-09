@@ -1,0 +1,466 @@
+// wave_atlas.hexa — 상수 파동 아틀라스 (1100+ 상수 공명/충돌 지도 자동 생성)
+// 실행: hexa wave_atlas.hexa
+// 예시: hexa wave_atlas.hexa
+//       hexa wave_atlas.hexa --hub 6    허브 상수 6개 출력
+//
+// 원리:
+//   1. n6_constants.jsonl + verified_constants.jsonl에서 상수 로드
+//   2. 상수 쌍별 비율이 n=6 관련값에 근접한 쌍 탐색
+//   3. 공명 쌍 (비율 오차 < 1%) = "강한 공명"
+//   4. 충돌 쌍 (비율이 무리수에 근접) = "충돌"
+//   5. 허브 상수 (공명 연결 3개 이상) 탐지
+//   6. ASCII 공명 지도 + growth_bus 기록
+
+let _home = exec("printenv HOME").trim()
+let _dev = _home + "/Dev"
+let _shared = _dev + "/nexus/shared"
+let _bus_path = _shared + "/growth_bus.jsonl"
+let _const_path = _shared + "/n6_constants.jsonl"
+
+fn safe_int(s: string) -> i64 {
+    let mut v: i64 = 0
+    try { v = to_int(to_float(s.trim())) } catch e {}
+    return v
+}
+
+fn safe_float(s: string) -> f64 {
+    let mut v: f64 = 0.0
+    try { v = to_float(s.trim()) } catch e {}
+    return v
+}
+
+fn abs_f(x: f64) -> f64 {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// n=6 관련 비율 목록
+let n6_ratios = [0.166667, 0.25, 0.333333, 0.5, 0.666667, 1.0, 2.0, 3.0, 4.0, 6.0, 12.0]
+let n6_ratio_names = ["1/6", "1/4", "1/3", "1/2", "2/3", "1", "2", "3", "4", "6", "12"]
+
+// 무리수 기준 (충돌 판정용)
+let irrational_sqrt2: f64 = 1.41421356
+let irrational_sqrt3: f64 = 1.73205081
+let irrational_phi: f64 = 1.61803399  // 황금비
+let irrational_e: f64 = 2.71828183
+let irrational_pi: f64 = 3.14159265
+
+// ═══════════════════════════════════════════════════════════
+// 상수 로드 (n6_constants.jsonl)
+// ═══════════════════════════════════════════════════════════
+
+fn load_constants() -> string {
+    let mut result = ""
+    try {
+        result = exec("awk -F'\"' '{\n  n=\"\"; v=\"\"\n  for(i=1;i<=NF;i++){\n    if($i==\"name\") n=$(i+2)\n    if($i==\"value\"){v=$(i+1); gsub(/[^0-9.\\-]/,\"\",v)}\n  }\n  if(n!=\"\" && v!=\"\" && v+0!=0) print n\"\\t\"v\n}' " + _const_path)
+    } catch e {}
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════
+// 메인
+// ═══════════════════════════════════════════════════════════
+
+let argv = args()
+let mut hub_limit: i64 = 6
+if len(argv) >= 4 {
+    let flag = argv[2]
+    if flag == "--hub" {
+        hub_limit = safe_int(argv[3])
+        if hub_limit <= 0 { hub_limit = 6 }
+    }
+}
+
+println("")
+println("+=======================================================+")
+println("|     상수 파동 아틀라스 (Wave Atlas)                     |")
+println("|     n=6 상수 공명/충돌 지도 자동 생성                    |")
+println("+=======================================================+")
+println("")
+
+// 1. 상수 로드
+println("  [1/4] 상수 로드 중...")
+let const_raw = load_constants()
+let const_lines = const_raw.split("\n")
+
+let mut c_names = []
+let mut c_values = []
+
+for cl in const_lines {
+    let ct = cl.trim()
+    if ct == "" { continue }
+    let cp = ct.split("\t")
+    if len(cp) >= 2 {
+        let cname = cp[0]
+        let cval = safe_float(cp[1])
+        if cval != 0.0 {
+            c_names = c_names + [cname]
+            c_values = c_values + [cval]
+        }
+    }
+}
+println("  상수: " + to_string(len(c_names)) + "개")
+println("")
+
+// 2. 쌍별 비율 분석
+println("  [2/4] 상수 쌍별 비율 분석 중...")
+
+let mut resonance_pairs = []     // "A -> B (비율명)"
+let mut resonance_a_idx = []     // A 인덱스
+let mut resonance_b_idx = []     // B 인덱스
+let mut resonance_ratio_names = []
+let mut resonance_errors = []    // 오차(%)
+
+let mut collision_pairs = []     // "A -> B (무리수명)"
+let mut collision_a_idx = []
+let mut collision_b_idx = []
+let mut collision_irr_names = []
+
+let mut total_pairs: i64 = 0
+let mut total_resonance: i64 = 0
+let mut total_collision: i64 = 0
+
+let mut ai: i64 = 0
+while ai < len(c_names) {
+    let va: f64 = c_values[ai]
+    if va <= 0.0 {
+        ai = ai + 1
+        continue
+    }
+
+    let mut bi: i64 = ai + 1
+    while bi < len(c_names) {
+        let vb: f64 = c_values[bi]
+        if vb <= 0.0 {
+            bi = bi + 1
+            continue
+        }
+
+        total_pairs = total_pairs + 1
+
+        // 비율 계산 (큰 / 작은)
+        let ratio = if va >= vb { va / vb } else { vb / va }
+
+        // n=6 관련 비율 매칭
+        let mut ri: i64 = 0
+        let mut best_err: f64 = 999.0
+        let mut best_rname = ""
+        while ri < len(n6_ratios) {
+            let target: f64 = n6_ratios[ri]
+            if target > 0.0 {
+                let err = abs_f(ratio - target) / target * 100.0
+                if err < 1.0 && err < best_err {
+                    best_err = err
+                    best_rname = n6_ratio_names[ri]
+                }
+                // 역비율도 체크
+                let inv_ratio = 1.0 / ratio
+                let inv_err = abs_f(inv_ratio - target) / target * 100.0
+                if inv_err < 1.0 && inv_err < best_err {
+                    best_err = inv_err
+                    best_rname = n6_ratio_names[ri]
+                }
+            }
+            ri = ri + 1
+        }
+
+        if best_rname != "" {
+            let na: string = c_names[ai]
+            let nb: string = c_names[bi]
+            resonance_pairs = resonance_pairs + [na + " <-> " + nb]
+            resonance_a_idx = resonance_a_idx + [ai]
+            resonance_b_idx = resonance_b_idx + [bi]
+            resonance_ratio_names = resonance_ratio_names + [best_rname]
+            resonance_errors = resonance_errors + [best_err]
+            total_resonance = total_resonance + 1
+        }
+
+        // 무리수 근접 체크 (충돌)
+        let mut is_collision = false
+        let mut irr_name = ""
+
+        let err_sqrt2 = abs_f(ratio - irrational_sqrt2) / irrational_sqrt2 * 100.0
+        let err_sqrt3 = abs_f(ratio - irrational_sqrt3) / irrational_sqrt3 * 100.0
+        let err_phi = abs_f(ratio - irrational_phi) / irrational_phi * 100.0
+        let err_e = abs_f(ratio - irrational_e) / irrational_e * 100.0
+        let err_pi = abs_f(ratio - irrational_pi) / irrational_pi * 100.0
+
+        if err_sqrt2 < 0.5 {
+            is_collision = true
+            irr_name = "sqrt(2)"
+        }
+        else if err_sqrt3 < 0.5 {
+            is_collision = true
+            irr_name = "sqrt(3)"
+        }
+        else if err_phi < 0.5 {
+            is_collision = true
+            irr_name = "phi(황금비)"
+        }
+        else if err_e < 0.5 {
+            is_collision = true
+            irr_name = "e"
+        }
+        else if err_pi < 0.5 {
+            is_collision = true
+            irr_name = "pi"
+        }
+
+        if is_collision {
+            let na2: string = c_names[ai]
+            let nb2: string = c_names[bi]
+            collision_pairs = collision_pairs + [na2 + " <-> " + nb2]
+            collision_a_idx = collision_a_idx + [ai]
+            collision_b_idx = collision_b_idx + [bi]
+            collision_irr_names = collision_irr_names + [irr_name]
+            total_collision = total_collision + 1
+        }
+
+        bi = bi + 1
+    }
+    ai = ai + 1
+}
+
+println("  분석 쌍: " + to_string(total_pairs))
+println("  강한 공명: " + to_string(total_resonance) + "쌍")
+println("  충돌: " + to_string(total_collision) + "쌍")
+println("")
+
+// 3. 허브 상수 탐지 (공명 연결 3개 이상)
+println("  [3/4] 허브 상수 탐지 중...")
+
+// 각 상수의 공명 연결 수 카운트
+let mut hub_counts = []
+let mut hi: i64 = 0
+while hi < len(c_names) {
+    hub_counts = hub_counts + [0]
+    hi = hi + 1
+}
+
+let mut ri2: i64 = 0
+while ri2 < len(resonance_a_idx) {
+    let a_idx: i64 = resonance_a_idx[ri2]
+    let b_idx: i64 = resonance_b_idx[ri2]
+    hub_counts[a_idx] = hub_counts[a_idx] + 1
+    hub_counts[b_idx] = hub_counts[b_idx] + 1
+    ri2 = ri2 + 1
+}
+
+// 허브 정렬 (연결 수 내림차순)
+let mut hub_sorted_idx = []
+hi = 0
+while hi < len(c_names) {
+    let hc: i64 = hub_counts[hi]
+    if hc >= 3 {
+        hub_sorted_idx = hub_sorted_idx + [hi]
+    }
+    hi = hi + 1
+}
+
+// 버블 정렬
+let mut si: i64 = 0
+while si < len(hub_sorted_idx) {
+    let mut sj: i64 = si + 1
+    while sj < len(hub_sorted_idx) {
+        let i1: i64 = hub_sorted_idx[si]
+        let i2: i64 = hub_sorted_idx[sj]
+        let h1: i64 = hub_counts[i1]
+        let h2: i64 = hub_counts[i2]
+        if h2 > h1 {
+            hub_sorted_idx[si] = i2
+            hub_sorted_idx[sj] = i1
+        }
+        sj = sj + 1
+    }
+    si = si + 1
+}
+
+println("  허브 상수 (공명 연결 >= 3): " + to_string(len(hub_sorted_idx)) + "개")
+println("")
+
+// ═══════════════════════════════════════════════════════════
+// 출력: 공명 쌍 테이블
+// ═══════════════════════════════════════════════════════════
+
+println("+=======================================================+")
+println("|  강한 공명 쌍 (비율 오차 < 1%)                          |")
+println("+=======================================================+")
+println("")
+println("| 상수 A | 상수 B | 비율 | 오차 |")
+println("|--------|--------|------|------|")
+
+let res_limit: i64 = if len(resonance_pairs) < 20 { len(resonance_pairs) } else { 20 }
+ri2 = 0
+while ri2 < res_limit {
+    let rpair: string = resonance_pairs[ri2]
+    let rname: string = resonance_ratio_names[ri2]
+    let rerr: f64 = resonance_errors[ri2]
+    let err_str = to_string(to_int(rerr * 100.0) / 100)
+    println("| " + rpair + " | " + rname + " | " + err_str + "% |")
+    ri2 = ri2 + 1
+}
+if len(resonance_pairs) > 20 {
+    println("| ... (" + to_string(len(resonance_pairs) - 20) + "쌍 생략) |")
+}
+println("")
+
+// ═══════════════════════════════════════════════════════════
+// 출력: 충돌 쌍 테이블
+// ═══════════════════════════════════════════════════════════
+
+if total_collision > 0 {
+    println("+=======================================================+")
+    println("|  충돌 쌍 (무리수 근접)                                  |")
+    println("+=======================================================+")
+    println("")
+    println("| 상수 쌍 | 무리수 |")
+    println("|---------|--------|")
+
+    let coll_limit: i64 = if len(collision_pairs) < 12 { len(collision_pairs) } else { 12 }
+    let mut ci: i64 = 0
+    while ci < coll_limit {
+        let cpair: string = collision_pairs[ci]
+        let cirr: string = collision_irr_names[ci]
+        println("| " + cpair + " | " + cirr + " |")
+        ci = ci + 1
+    }
+    println("")
+}
+
+// ═══════════════════════════════════════════════════════════
+// 출력: 허브 상수
+// ═══════════════════════════════════════════════════════════
+
+println("+=======================================================+")
+println("|  허브 상수 (공명 연결 중심)                              |")
+println("+=======================================================+")
+println("")
+
+let hub_show: i64 = if len(hub_sorted_idx) < hub_limit { len(hub_sorted_idx) } else { hub_limit }
+hi = 0
+while hi < hub_show {
+    let h_idx: i64 = hub_sorted_idx[hi]
+    let h_name: string = c_names[h_idx]
+    let h_val: f64 = c_values[h_idx]
+    let h_count: i64 = hub_counts[h_idx]
+
+    println("  --- " + h_name + " (값: " + to_string(h_val) + ", 연결: " + to_string(h_count) + ") ---")
+
+    // 이 허브와 연결된 상수 나열
+    let mut ri3: i64 = 0
+    let mut connected = []
+    while ri3 < len(resonance_a_idx) {
+        let ra: i64 = resonance_a_idx[ri3]
+        let rb: i64 = resonance_b_idx[ri3]
+        let rn: string = resonance_ratio_names[ri3]
+        if ra == h_idx {
+            let partner: string = c_names[rb]
+            connected = connected + [partner + "(" + rn + ")"]
+        } else if rb == h_idx {
+            let partner2: string = c_names[ra]
+            connected = connected + [partner2 + "(" + rn + ")"]
+        }
+        ri3 = ri3 + 1
+    }
+
+    // ASCII 별 그래프
+    let mut conn_str = ""
+    let mut cci: i64 = 0
+    while cci < len(connected) && cci < 8 {
+        let cc: string = connected[cci]
+        println("    |-- " + cc)
+        cci = cci + 1
+    }
+    if len(connected) > 8 {
+        println("    |-- ... (+" + to_string(len(connected) - 8) + "개)")
+    }
+    println("")
+
+    hi = hi + 1
+}
+
+if hub_show == 0 {
+    println("  (허브 상수 없음 — 상수 수 부족)")
+    println("")
+}
+
+// ═══════════════════════════════════════════════════════════
+// ASCII 공명 지도 (비율별 분포)
+// ═══════════════════════════════════════════════════════════
+
+println("+=======================================================+")
+println("|  비율별 공명 분포                                       |")
+println("+=======================================================+")
+println("")
+
+let mut ratio_counts = []
+let mut rci: i64 = 0
+while rci < len(n6_ratio_names) {
+    ratio_counts = ratio_counts + [0]
+    rci = rci + 1
+}
+
+ri2 = 0
+while ri2 < len(resonance_ratio_names) {
+    let rn2: string = resonance_ratio_names[ri2]
+    rci = 0
+    while rci < len(n6_ratio_names) {
+        let nrn: string = n6_ratio_names[rci]
+        if nrn == rn2 {
+            ratio_counts[rci] = ratio_counts[rci] + 1
+        }
+        rci = rci + 1
+    }
+    ri2 = ri2 + 1
+}
+
+rci = 0
+while rci < len(n6_ratio_names) {
+    let rn3: string = n6_ratio_names[rci]
+    let rc: i64 = ratio_counts[rci]
+
+    // 막대 (최대 30칸)
+    let max_bar: i64 = if total_resonance > 0 { (rc * 30) / (total_resonance + 1) } else { 0 }
+    let mut bar = ""
+    let mut bbi: i64 = 0
+    while bbi < max_bar && bbi < 30 {
+        bar = bar + "#"
+        bbi = bbi + 1
+    }
+
+    println("  " + rn3 + "\t" + bar + " " + to_string(rc))
+
+    rci = rci + 1
+}
+println("")
+
+// ═══════════════════════════════════════════════════════════
+// 요약 통계
+// ═══════════════════════════════════════════════════════════
+
+println("  --- 요약 ---")
+println("  상수: " + to_string(len(c_names)) + "개")
+println("  분석 쌍: " + to_string(total_pairs))
+println("  강한 공명: " + to_string(total_resonance) + "쌍")
+println("  충돌: " + to_string(total_collision) + "쌍")
+println("  허브 상수: " + to_string(len(hub_sorted_idx)) + "개")
+let resonance_pct = if total_pairs > 0 { (total_resonance * 100) / total_pairs } else { 0 }
+println("  공명 비율: " + to_string(resonance_pct) + "%")
+println("")
+
+// ═══════════════════════════════════════════════════════════
+// growth_bus 기록
+// ═══════════════════════════════════════════════════════════
+
+try {
+    let ts = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+    let top_hub = if len(hub_sorted_idx) > 0 { c_names[hub_sorted_idx[0]] } else { "none" }
+    let top_hub_conn = if len(hub_sorted_idx) > 0 { hub_counts[hub_sorted_idx[0]] } else { 0 }
+    let entry = "{\"type\":\"wave_atlas\",\"constants\":" + to_string(len(c_names)) + ",\"pairs\":" + to_string(total_pairs) + ",\"resonance\":" + to_string(total_resonance) + ",\"collision\":" + to_string(total_collision) + ",\"hubs\":" + to_string(len(hub_sorted_idx)) + ",\"top_hub\":\"" + top_hub + "\",\"top_hub_connections\":" + to_string(top_hub_conn) + ",\"resonance_pct\":" + to_string(resonance_pct) + ",\"ts\":\"" + ts + "\"}"
+    exec("echo '" + entry + "' >> " + _bus_path)
+    println("  -> growth_bus.jsonl 기록 완료")
+} catch e {}
+
+println("")
+println("[verified] wave_atlas.hexa 실행 완료")
+println("")

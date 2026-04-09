@@ -1,0 +1,403 @@
+// wave_predictions.hexa — 예측 파동 검증 (45건+ 예측에 파동 신뢰도 점수 부여)
+// 실행: hexa wave_predictions.hexa
+// 예시: hexa wave_predictions.hexa
+//       hexa wave_predictions.hexa --all   전체 출력
+//
+// 원리:
+//   1. testable-predictions.md에서 예측 항목 파싱
+//   2. 각 예측의 도메인, 관련 BT 추출
+//   3. 신뢰도 점수 계산 (BT 수 x2 + EXACT 비율 x10 + growth_bus 이벤트 x0.1)
+//   4. 신뢰도순 정렬, 상위/하위 6개 출력
+//   5. 검증 우선순위 제안 (신뢰도 높은데 미검증)
+//   6. growth_bus.jsonl 기록
+
+let _home = exec("printenv HOME").trim()
+let _dev = _home + "/Dev"
+let _shared = _dev + "/nexus/shared"
+let _bus_path = _shared + "/growth_bus.jsonl"
+let _log_path = _shared + "/discovery_log.jsonl"
+let _n6_repo = _dev + "/n6-architecture"
+let _pred_path = _n6_repo + "/docs/testable-predictions.md"
+
+fn safe_int(s: string) -> i64 {
+    let mut v: i64 = 0
+    try { v = to_int(to_float(s.trim())) } catch e {}
+    return v
+}
+
+fn safe_float(s: string) -> f64 {
+    let mut v: f64 = 0.0
+    try { v = to_float(s.trim()) } catch e {}
+    return v
+}
+
+// ═══════════════════════════════════════════════════════════
+// 예측 항목 파싱 (### P-N: 형식)
+// ═══════════════════════════════════════════════════════════
+
+fn extract_predictions() -> string {
+    let mut result = ""
+    try {
+        // 예측 ID, 제목, 상태, BT 소스를 추출
+        result = exec("awk '\n/^### P-[0-9]/{id=$0; gsub(/^### /,\"\",id); title=id}\n/\\*\\*Status\\*\\*|\\*\\*상태\\*\\*/{status=$0}\n/\\*\\*Source\\*\\*|\\*\\*소스\\*\\*/{source=$0}\n/\\*\\*Falsification\\*\\*|\\*\\*반증\\*\\*/{fals=$0}\n/^$/{if(title!=\"\") print title\"\\t\"status\"\\t\"source\"\\t\"fals; title=\"\"; status=\"\"; source=\"\"; fals=\"\"}\nEND{if(title!=\"\") print title\"\\t\"status\"\\t\"source\"\\t\"fals}\n' " + _pred_path + " 2>/dev/null")
+    } catch e {}
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════
+// BT 번호 추출 (문자열에서 BT-NNN 패턴)
+// ═══════════════════════════════════════════════════════════
+
+fn count_bt_refs(text: string) -> i64 {
+    let mut count: i64 = 0
+    // BT- 패턴 카운트
+    let parts = text.split("BT-")
+    count = len(parts) - 1
+    if count < 0 { count = 0 }
+    return count
+}
+
+// ═══════════════════════════════════════════════════════════
+// 도메인별 EXACT 비율 (discovery_log에서)
+// ═══════════════════════════════════════════════════════════
+
+fn get_domain_exact_ratios() -> string {
+    let mut result = ""
+    try {
+        result = exec("awk -F'\"' '{\n  dom=\"\"; grade=\"\"\n  for(i=1;i<=NF;i++){\n    if($i==\"domain\") dom=$(i+2)\n    if($i==\"grade\") grade=$(i+2)\n  }\n  if(dom!=\"\"){\n    total[dom]++\n    if(grade==\"EXACT\") exact[dom]++\n  }\n}\nEND{\n  for(d in total){\n    e=exact[d]+0\n    t=total[d]\n    pct=int(e*100/t)\n    print d\"\\t\"pct\"\\t\"e\"\\t\"t\n  }\n}' " + _log_path + " 2>/dev/null | sort -t'\t' -k2 -rn")
+    } catch e {}
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════
+// growth_bus에서 도메인별 이벤트 수
+// ═══════════════════════════════════════════════════════════
+
+fn get_bus_domain_counts() -> string {
+    let mut result = ""
+    try {
+        result = exec("awk -F'\"' '{\n  dom=\"\"\n  for(i=1;i<=NF;i++){\n    if($i==\"domain\") dom=$(i+2)\n  }\n  if(dom!=\"\") cnt[dom]++\n}\nEND{ for(d in cnt) print d\"\\t\"cnt[d] }' " + _bus_path + " 2>/dev/null")
+    } catch e {}
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════
+// 도메인 키워드 추출 (예측 제목에서)
+// ═══════════════════════════════════════════════════════════
+
+fn guess_domain(title: string) -> string {
+    let t = title
+    // 주요 도메인 키워드 매칭
+    let keywords = ["fusion", "chip", "battery", "energy", "quantum", "ai", "gpu", "optics", "material", "robot", "network", "crypto", "plasma", "display", "audio", "safety", "carbon", "lora", "attention", "moe", "dropout", "activation", "entropy", "boltzmann", "mertens", "egyptian", "cyclotomic", "fft"]
+    let domains = ["fusion", "chip", "battery", "energy", "quantum", "ai", "gpu", "optics", "material", "robotics", "network", "crypto", "plasma", "display", "audio", "safety", "carbon", "ai", "ai", "ai", "ai", "ai", "ai", "ai", "ai", "ai", "ai"]
+
+    let t_lower = t
+    let mut ki: i64 = 0
+    while ki < len(keywords) {
+        let kw: string = keywords[ki]
+        if t_lower.contains(kw) {
+            return domains[ki]
+        }
+        ki = ki + 1
+    }
+    return "general"
+}
+
+// ═══════════════════════════════════════════════════════════
+// 메인
+// ═══════════════════════════════════════════════════════════
+
+let argv = args()
+let show_all = if len(argv) >= 3 { argv[2] == "--all" } else { false }
+
+println("")
+println("+=======================================================+")
+println("|     예측 파동 검증 (Wave Predictions)                   |")
+println("|     예측에 파동 신뢰도 점수 부여 + 검증 우선순위         |")
+println("+=======================================================+")
+println("")
+
+// 1. 예측 항목 파싱
+println("  [1/4] 예측 항목 파싱 중...")
+let pred_raw = extract_predictions()
+let pred_lines = pred_raw.split("\n")
+
+let mut pred_ids = []
+let mut pred_titles = []
+let mut pred_statuses = []
+let mut pred_sources = []
+let mut pred_domains = []
+let mut pred_bt_counts = []
+
+for pl in pred_lines {
+    let pt = pl.trim()
+    if pt == "" { continue }
+    let parts = pt.split("\t")
+    if len(parts) < 1 { continue }
+
+    let title = parts[0]
+    let status = if len(parts) >= 2 { parts[1] } else { "" }
+    let source = if len(parts) >= 3 { parts[2] } else { "" }
+
+    // P-ID 추출
+    let id_parts = title.split(":")
+    let pred_id = if len(id_parts) >= 1 { id_parts[0].trim() } else { title }
+    let pred_title = if len(id_parts) >= 2 { id_parts[1].trim() } else { title }
+
+    // BT 참조 수
+    let bt_count = count_bt_refs(source + " " + title)
+
+    // 도메인 추측
+    let domain = guess_domain(title + " " + source)
+
+    // 상태 파싱 (검증됨/미검증)
+    let is_validated = status.contains("validated") || status.contains("Validated") || status.contains("PASS") || status.contains("검증")
+
+    pred_ids = pred_ids + [pred_id]
+    pred_titles = pred_titles + [pred_title]
+    pred_statuses = pred_statuses + [if is_validated { "검증됨" } else { "미검증" }]
+    pred_sources = pred_sources + [source]
+    pred_domains = pred_domains + [domain]
+    pred_bt_counts = pred_bt_counts + [bt_count]
+}
+
+println("  예측 항목: " + to_string(len(pred_ids)) + "건")
+println("")
+
+// 2. 도메인별 EXACT 비율 로드
+println("  [2/4] 도메인별 EXACT 비율 로드 중...")
+let exact_raw = get_domain_exact_ratios()
+let exact_lines = exact_raw.split("\n")
+
+let mut exact_dom_names = []
+let mut exact_dom_pcts = []
+
+for el in exact_lines {
+    let et = el.trim()
+    if et == "" { continue }
+    let ep = et.split("\t")
+    if len(ep) >= 2 {
+        exact_dom_names = exact_dom_names + [ep[0]]
+        exact_dom_pcts = exact_dom_pcts + [safe_int(ep[1])]
+    }
+}
+println("  도메인 EXACT 데이터: " + to_string(len(exact_dom_names)) + "개")
+
+// 3. growth_bus 도메인별 이벤트 수 로드
+println("  [3/4] growth_bus 이벤트 수 로드 중...")
+let bus_raw = get_bus_domain_counts()
+let bus_lines = bus_raw.split("\n")
+
+let mut bus_dom_names = []
+let mut bus_dom_counts = []
+
+for bl in bus_lines {
+    let bt2 = bl.trim()
+    if bt2 == "" { continue }
+    let bp = bt2.split("\t")
+    if len(bp) >= 2 {
+        bus_dom_names = bus_dom_names + [bp[0]]
+        bus_dom_counts = bus_dom_counts + [safe_int(bp[1])]
+    }
+}
+println("  growth_bus 도메인: " + to_string(len(bus_dom_names)) + "개")
+println("")
+
+// 4. 신뢰도 점수 계산
+println("  [4/4] 신뢰도 점수 계산 중...")
+
+let mut pred_scores = []
+
+let mut pi: i64 = 0
+while pi < len(pred_ids) {
+    let bt_c: i64 = pred_bt_counts[pi]
+    let dom: string = pred_domains[pi]
+
+    // 관련 BT 수 x 2
+    let mut score: f64 = to_float(bt_c) * 2.0
+
+    // 관련 도메인의 EXACT 비율 x 10
+    let mut ei: i64 = 0
+    while ei < len(exact_dom_names) {
+        let edn: string = exact_dom_names[ei]
+        if edn == dom || edn.contains(dom) || dom.contains(edn) {
+            let epct: i64 = exact_dom_pcts[ei]
+            score = score + to_float(epct) / 10.0
+        }
+        ei = ei + 1
+    }
+
+    // growth_bus 이벤트 수 x 0.1
+    let mut bi: i64 = 0
+    while bi < len(bus_dom_names) {
+        let bdn: string = bus_dom_names[bi]
+        if bdn == dom || bdn.contains(dom) || dom.contains(bdn) {
+            let bcnt: i64 = bus_dom_counts[bi]
+            score = score + to_float(bcnt) * 0.1
+        }
+        bi = bi + 1
+    }
+
+    pred_scores = pred_scores + [score]
+    pi = pi + 1
+}
+println("")
+
+// 정렬 인덱스 생성 (점수 내림차순)
+let mut sorted_idx = []
+let mut si: i64 = 0
+while si < len(pred_ids) {
+    sorted_idx = sorted_idx + [si]
+    si = si + 1
+}
+
+// 버블 정렬 (인덱스 기준)
+si = 0
+while si < len(sorted_idx) {
+    let mut sj: i64 = si + 1
+    while sj < len(sorted_idx) {
+        let idx_i: i64 = sorted_idx[si]
+        let idx_j: i64 = sorted_idx[sj]
+        let sc_i: f64 = pred_scores[idx_i]
+        let sc_j: f64 = pred_scores[idx_j]
+        if sc_j > sc_i {
+            sorted_idx[si] = idx_j
+            sorted_idx[sj] = idx_i
+        }
+        sj = sj + 1
+    }
+    si = si + 1
+}
+
+// ═══════════════════════════════════════════════════════════
+// 출력: 상위 6개
+// ═══════════════════════════════════════════════════════════
+
+println("+=======================================================+")
+println("|  신뢰도 상위 6                                         |")
+println("+=======================================================+")
+println("")
+println("| 순위 | ID | 도메인 | BT | 점수 | 상태 |")
+println("|------|----|--------|-----|------|------|")
+
+let top_limit: i64 = if show_all { len(sorted_idx) } else { if len(sorted_idx) < 6 { len(sorted_idx) } else { 6 } }
+
+si = 0
+while si < top_limit {
+    let idx: i64 = sorted_idx[si]
+    let pid: string = pred_ids[idx]
+    let pdom: string = pred_domains[idx]
+    let pbt: i64 = pred_bt_counts[idx]
+    let psc: f64 = pred_scores[idx]
+    let pst: string = pred_statuses[idx]
+
+    let score_str = to_string(to_int(psc * 10.0) / 10)
+    println("| " + to_string(si + 1) + " | " + pid + " | " + pdom + " | " + to_string(pbt) + " | " + score_str + " | " + pst + " |")
+
+    si = si + 1
+}
+println("")
+
+// ═══════════════════════════════════════════════════════════
+// 출력: 하위 6개
+// ═══════════════════════════════════════════════════════════
+
+if !show_all {
+    println("+=======================================================+")
+    println("|  신뢰도 하위 6                                         |")
+    println("+=======================================================+")
+    println("")
+    println("| 순위 | ID | 도메인 | BT | 점수 | 상태 |")
+    println("|------|----|--------|-----|------|------|")
+
+    let bottom_start: i64 = if len(sorted_idx) > 6 { len(sorted_idx) - 6 } else { 0 }
+    si = bottom_start
+    while si < len(sorted_idx) {
+        let idx2: i64 = sorted_idx[si]
+        let pid2: string = pred_ids[idx2]
+        let pdom2: string = pred_domains[idx2]
+        let pbt2: i64 = pred_bt_counts[idx2]
+        let psc2: f64 = pred_scores[idx2]
+        let pst2: string = pred_statuses[idx2]
+
+        let score_str2 = to_string(to_int(psc2 * 10.0) / 10)
+        println("| " + to_string(si + 1) + " | " + pid2 + " | " + pdom2 + " | " + to_string(pbt2) + " | " + score_str2 + " | " + pst2 + " |")
+
+        si = si + 1
+    }
+    println("")
+}
+
+// ═══════════════════════════════════════════════════════════
+// 검증 우선순위 제안 (신뢰도 높은데 미검증)
+// ═══════════════════════════════════════════════════════════
+
+println("+=======================================================+")
+println("|  검증 우선순위 (신뢰도 높음 + 미검증)                   |")
+println("+=======================================================+")
+println("")
+
+let mut priority_count: i64 = 0
+si = 0
+while si < len(sorted_idx) && priority_count < 6 {
+    let idx3: i64 = sorted_idx[si]
+    let pst3: string = pred_statuses[idx3]
+
+    if pst3 == "미검증" {
+        let pid3: string = pred_ids[idx3]
+        let ptitle3: string = pred_titles[idx3]
+        let pdom3: string = pred_domains[idx3]
+        let psc3: f64 = pred_scores[idx3]
+        let score_str3 = to_string(to_int(psc3 * 10.0) / 10)
+
+        priority_count = priority_count + 1
+        println("  #" + to_string(priority_count) + " " + pid3)
+        println("     " + ptitle3)
+        println("     도메인: " + pdom3 + " | 신뢰도: " + score_str3)
+        println("")
+    }
+    si = si + 1
+}
+
+if priority_count == 0 {
+    println("  (모든 고신뢰 예측이 이미 검증됨)")
+    println("")
+}
+
+// ═══════════════════════════════════════════════════════════
+// 요약 통계
+// ═══════════════════════════════════════════════════════════
+
+let mut validated: i64 = 0
+let mut unvalidated: i64 = 0
+for ps in pred_statuses {
+    if ps == "검증됨" { validated = validated + 1 }
+    else { unvalidated = unvalidated + 1 }
+}
+
+let mut avg_score: f64 = 0.0
+for psc4 in pred_scores { avg_score = avg_score + psc4 }
+if len(pred_scores) > 0 { avg_score = avg_score / to_float(len(pred_scores)) }
+
+println("  --- 요약 ---")
+println("  총 예측: " + to_string(len(pred_ids)) + "건")
+println("  검증됨: " + to_string(validated) + "건")
+println("  미검증: " + to_string(unvalidated) + "건")
+println("  평균 신뢰도: " + to_string(to_int(avg_score * 10.0) / 10))
+println("")
+
+// ═══════════════════════════════════════════════════════════
+// growth_bus 기록
+// ═══════════════════════════════════════════════════════════
+
+try {
+    let ts = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+    let top_score = if len(sorted_idx) > 0 { pred_scores[sorted_idx[0]] } else { 0.0 }
+    let entry = "{\"type\":\"wave_predictions\",\"total\":" + to_string(len(pred_ids)) + ",\"validated\":" + to_string(validated) + ",\"unvalidated\":" + to_string(unvalidated) + ",\"avg_score\":" + to_string(to_int(avg_score * 10.0)) + ",\"top_score\":" + to_string(to_int(top_score * 10.0)) + ",\"priority_targets\":" + to_string(priority_count) + ",\"ts\":\"" + ts + "\"}"
+    exec("echo '" + entry + "' >> " + _bus_path)
+    println("  -> growth_bus.jsonl 기록 완료")
+} catch e {}
+
+println("")
+println("[verified] wave_predictions.hexa 실행 완료")
+println("")

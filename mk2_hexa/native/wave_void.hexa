@@ -1,0 +1,316 @@
+// wave_void.hexa -- 빈공간 파동 매핑 (미탐색 영역 에너지 지형도)
+// 사용: hexa wave_void.hexa
+//       hexa wave_void.hexa --help
+//       hexa wave_void.hexa --top N     상위 N개만
+//
+// 원리:
+//   1. growth_bus.jsonl에서 활성 도메인 목록 수집
+//   2. dse-map.toml에서 322 도메인 목록 수집
+//   3. 차집합 = void 도메인 (growth_bus에 없는 DSE 도메인)
+//   4. void 도메인 이름 유사도로 클러스터링
+//   5. void 클러스터별 "잠재 에너지" 추정 (인접 활성 도메인 에너지 기반)
+//   6. 탐색 우선순위 = 잠재 에너지 높은 void 클러스터
+//   7. growth_bus.jsonl 기록
+
+let _home = exec("printenv HOME").trim()
+let _dev = _home + "/Dev"
+let _shared = _dev + "/nexus/shared"
+let _bus_path = _shared + "/growth_bus.jsonl"
+let _n6_repo = _dev + "/n6-architecture"
+let _dse_path = _n6_repo + "/docs/dse-map.toml"
+
+let args = exec("echo $@").trim().split(" ")
+
+fn safe_int(s: string) -> i64 {
+    let mut v: i64 = 0
+    try { v = to_int(to_float(s.trim())) } catch e {}
+    return v
+}
+
+fn safe_float(s: string) -> f64 {
+    let mut v: f64 = 0.0
+    try { v = to_float(s.trim()) } catch e {}
+    return v
+}
+
+// ═══════════════════════════════════════════════════════════
+// 도움말
+// ═══════════════════════════════════════════════════════════
+
+let mut show_help = false
+let mut top_n: i64 = 20
+for a in args {
+    if a == "--help" || a == "-h" { show_help = true }
+    if a == "--top" {  }
+}
+// --top N 파싱
+let mut ai: i64 = 0
+while ai < len(args) - 1 {
+    if args[ai] == "--top" {
+        top_n = safe_int(args[ai + 1])
+        if top_n <= 0 { top_n = 20 }
+    }
+    ai = ai + 1
+}
+
+if show_help {
+    println("")
+    println("  wave_void.hexa -- 빈공간 파동 매핑")
+    println("")
+    println("  사용법:")
+    println("    hexa wave_void.hexa              전체 void 매핑")
+    println("    hexa wave_void.hexa --top 10      상위 10개만")
+    println("    hexa wave_void.hexa --help        이 도움말")
+    println("")
+    println("  원리: DSE 322 도메인 - growth_bus 활성 도메인 = void 도메인")
+    println("  잠재 에너지: 인접 활성 도메인의 에너지 합산으로 추정")
+    println("")
+}
+
+if show_help {  } else {
+
+println("")
+println("===========================================================")
+println("  빈공간 파동 매핑 -- 미탐색 영역 에너지 지형도")
+println("  DSE 도메인 - 활성 도메인 = void (잠재 돌파 영역)")
+println("===========================================================")
+println("")
+
+// ═══════════════════════════════════════════════════════════
+// 1. growth_bus에서 활성 도메인 수집
+// ═══════════════════════════════════════════════════════════
+
+println("  growth_bus에서 활성 도메인 수집 중...")
+
+let mut active_domains_raw = ""
+try {
+    active_domains_raw = exec("awk -F'\"' '{for(i=1;i<=NF;i++){if($i==\"domain\") {d=$(i+2); if(d!=\"\") print d}}}' " + _bus_path + " | sort -u")
+} catch e {}
+
+let active_lines = active_domains_raw.split("\n")
+let mut active_domains = []
+for al in active_lines {
+    let at = al.trim()
+    if at != "" {
+        active_domains = active_domains + [at]
+    }
+}
+println("  활성 도메인: " + to_string(len(active_domains)) + "개")
+
+// ═══════════════════════════════════════════════════════════
+// 2. dse-map.toml에서 전체 도메인 수집
+// ═══════════════════════════════════════════════════════════
+
+println("  dse-map.toml에서 전체 도메인 수집 중...")
+
+let mut dse_domains_raw = ""
+try {
+    // [domain.xxx] 형식에서 도메인명 추출
+    dse_domains_raw = exec("awk '/^\\[domain\\./{gsub(/\\[domain\\./,\"\",$0); gsub(/\\]/,\"\",$0); print $0}' " + _dse_path + " | sort -u")
+} catch e {}
+
+let dse_lines = dse_domains_raw.split("\n")
+let mut dse_domains = []
+for dl in dse_lines {
+    let dt = dl.trim()
+    if dt != "" {
+        dse_domains = dse_domains + [dt]
+    }
+}
+println("  DSE 전체 도메인: " + to_string(len(dse_domains)) + "개")
+
+// ═══════════════════════════════════════════════════════════
+// 3. 차집합 = void 도메인
+// ═══════════════════════════════════════════════════════════
+
+let mut void_domains = []
+for dd in dse_domains {
+    let mut found = false
+    for ad in active_domains {
+        if ad == dd { found = true }
+    }
+    if !found {
+        void_domains = void_domains + [dd]
+    }
+}
+
+println("  void 도메인: " + to_string(len(void_domains)) + "개")
+println("")
+
+// ═══════════════════════════════════════════════════════════
+// 4. void 도메인 클러스터링 (접두어 기반)
+// 도메인명에서 첫 단어(하이픈 기준) = 클러스터 키
+// ═══════════════════════════════════════════════════════════
+
+println("  --- void 도메인 클러스터 ---")
+println("")
+
+// 클러스터 키 추출
+let mut cluster_keys = []
+let mut cluster_members = []   // 각 클러스터의 멤버 문자열 (쉼표 구분)
+let mut cluster_counts = []
+
+for vd in void_domains {
+    // 첫 하이픈 앞 = 클러스터 키
+    let parts = vd.split("-")
+    let key = parts[0]
+
+    // 기존 클러스터에 추가 or 새 클러스터
+    let mut found_idx: i64 = -1
+    let mut ki: i64 = 0
+    while ki < len(cluster_keys) {
+        if cluster_keys[ki] == key { found_idx = ki }
+        ki = ki + 1
+    }
+
+    if found_idx >= 0 {
+        cluster_members[found_idx] = cluster_members[found_idx] + "," + vd
+        cluster_counts[found_idx] = cluster_counts[found_idx] + 1
+    } else {
+        cluster_keys = cluster_keys + [key]
+        cluster_members = cluster_members + [vd]
+        cluster_counts = cluster_counts + [1]
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// 5. 클러스터별 잠재 에너지 추정
+// 인접 활성 도메인 = 같은 접두어를 가진 활성 도메인
+// 잠재 에너지 = 인접 활성 도메인 수 * 6 + 클러스터 크기 * 2
+// ═══════════════════════════════════════════════════════════
+
+let mut cluster_energy = []
+
+let mut ci2: i64 = 0
+while ci2 < len(cluster_keys) {
+    let ck: string = cluster_keys[ci2]
+    // 같은 접두어를 가진 활성 도메인 카운트
+    let mut adjacent: i64 = 0
+    for ad2 in active_domains {
+        let ad_parts = ad2.split("-")
+        if ad_parts[0] == ck { adjacent = adjacent + 1 }
+    }
+    let energy: i64 = adjacent * 6 + cluster_counts[ci2] * 2
+    cluster_energy = cluster_energy + [energy]
+    ci2 = ci2 + 1
+}
+
+// 에너지 기준 정렬 (버블 소트)
+let mut s1: i64 = 0
+while s1 < len(cluster_keys) - 1 {
+    let mut s2: i64 = s1 + 1
+    while s2 < len(cluster_keys) {
+        if cluster_energy[s2] > cluster_energy[s1] {
+            // swap all
+            let tk = cluster_keys[s1]
+            let tm = cluster_members[s1]
+            let tc = cluster_counts[s1]
+            let te = cluster_energy[s1]
+            cluster_keys[s1] = cluster_keys[s2]
+            cluster_members[s1] = cluster_members[s2]
+            cluster_counts[s1] = cluster_counts[s2]
+            cluster_energy[s1] = cluster_energy[s2]
+            cluster_keys[s2] = tk
+            cluster_members[s2] = tm
+            cluster_counts[s2] = tc
+            cluster_energy[s2] = te
+        }
+        s2 = s2 + 1
+    }
+    s1 = s1 + 1
+}
+
+// 출력
+println("| 순위 | 클러스터 | void 수 | 잠재 에너지 | 우선순위 | 멤버 |")
+println("|------|---------|---------|-----------|---------|------|")
+
+let mut pi: i64 = 0
+while pi < len(cluster_keys) && pi < top_n {
+    let priority = if cluster_energy[pi] >= 12 { "높음" } else if cluster_energy[pi] >= 6 { "중간" } else { "낮음" }
+    // 멤버 표시 (최대 3개)
+    let members_all = cluster_members[pi].split(",")
+    let mut members_show = ""
+    let mut mi2: i64 = 0
+    while mi2 < len(members_all) && mi2 < 3 {
+        if members_show != "" { members_show = members_show + ", " }
+        members_show = members_show + members_all[mi2]
+        mi2 = mi2 + 1
+    }
+    if len(members_all) > 3 {
+        members_show = members_show + " +" + to_string(len(members_all) - 3)
+    }
+
+    println("| " + to_string(pi + 1) + " | " + cluster_keys[pi] + " | " + to_string(cluster_counts[pi]) + " | " + to_string(cluster_energy[pi]) + " | " + priority + " | " + members_show + " |")
+    pi = pi + 1
+}
+
+println("")
+
+// ═══════════════════════════════════════════════════════════
+// ASCII 에너지 지형도
+// ═══════════════════════════════════════════════════════════
+
+println("  --- 잠재 에너지 지형도 ---")
+println("")
+
+let mut max_e: i64 = 1
+let mut mei: i64 = 0
+while mei < len(cluster_energy) && mei < top_n {
+    if cluster_energy[mei] > max_e { max_e = cluster_energy[mei] }
+    mei = mei + 1
+}
+
+mei = 0
+while mei < len(cluster_keys) && mei < top_n {
+    let ck2: string = cluster_keys[mei]
+    let ce: i64 = cluster_energy[mei]
+    let bar_len: i64 = (ce * 36) / (max_e + 1)
+    let mut bar = ""
+    let mut bi: i64 = 0
+    while bi < bar_len && bi < 36 {
+        bar = bar + "#"
+        bi = bi + 1
+    }
+    println("  " + ck2 + "\t" + bar + " " + to_string(ce))
+    mei = mei + 1
+}
+
+println("")
+
+// ═══════════════════════════════════════════════════════════
+// 요약
+// ═══════════════════════════════════════════════════════════
+
+let mut high_count: i64 = 0
+let mut mid_count: i64 = 0
+let mut low_count: i64 = 0
+let mut hi2: i64 = 0
+while hi2 < len(cluster_energy) {
+    if cluster_energy[hi2] >= 12 { high_count = high_count + 1 }
+    else if cluster_energy[hi2] >= 6 { mid_count = mid_count + 1 }
+    else { low_count = low_count + 1 }
+    hi2 = hi2 + 1
+}
+
+println("  요약: void " + to_string(len(void_domains)) + "개 / 클러스터 " + to_string(len(cluster_keys)) + "개")
+println("  우선순위: 높음 " + to_string(high_count) + " / 중간 " + to_string(mid_count) + " / 낮음 " + to_string(low_count))
+println("")
+
+// ═══════════════════════════════════════════════════════════
+// growth_bus 기록
+// ═══════════════════════════════════════════════════════════
+
+try {
+    let ts = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+    let top_cluster = if len(cluster_keys) > 0 { cluster_keys[0] } else { "none" }
+    let top_energy2 = if len(cluster_energy) > 0 { cluster_energy[0] } else { 0 }
+    let entry = "{\"type\":\"wave_void\",\"dse_total\":" + to_string(len(dse_domains)) + ",\"active\":" + to_string(len(active_domains)) + ",\"void\":" + to_string(len(void_domains)) + ",\"clusters\":" + to_string(len(cluster_keys)) + ",\"high_priority\":" + to_string(high_count) + ",\"top_cluster\":\"" + top_cluster + "\",\"top_energy\":" + to_string(top_energy2) + ",\"ts\":\"" + ts + "\"}"
+    exec("echo '" + entry + "' >> " + _bus_path)
+} catch e {}
+
+println("  growth_bus 기록 완료")
+println("")
+println("[verified] wave_void.hexa 실행 완료")
+println("")
+
+}

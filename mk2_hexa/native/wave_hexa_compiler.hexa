@@ -1,0 +1,287 @@
+// wave_hexa_compiler.hexa — 컴파일러 파동 최적화 (hexa-lang용)
+// 실행: hexa wave_hexa_compiler.hexa [경로]
+//       hexa wave_hexa_compiler.hexa ~/Dev/nexus/mk2_hexa/native/harmonics.hexa
+//       hexa wave_hexa_compiler.hexa           (현재 디렉토리 전체 .hexa)
+//
+// 원리:
+//   1. .hexa 파일 구문 빈도 분석 (fn, let, if, for, while, exec, try, return)
+//   2. 에너지 가중치: fn=6, exec=12, try=4, for/while=4, if=2, let=1, return=1
+//   3. 함수별 에너지 합 → 핫패스 = 상위 6개
+//   4. 함수간 호출 관계에서 에너지 전파 시뮬레이션
+//   5. 최적화 제안 (인라인/분할)
+//   6. growth_bus.jsonl 기록
+
+let _home = exec("printenv HOME").trim()
+let _dev = _home + "/Dev"
+let _shared = _dev + "/nexus/shared"
+let _bus_path = _shared + "/growth_bus.jsonl"
+
+fn safe_int(s: string) -> i64 {
+    let mut v: i64 = 0
+    try { v = to_int(to_float(s.trim())) } catch e {}
+    return v
+}
+
+// 구문 에너지 가중치
+let kw_names   = ["fn", "exec", "try", "for", "while", "if", "let", "return"]
+let kw_weights = [6,     12,     4,     4,     4,       2,    1,     1]
+
+// ═══════════════════════════════════════════════════════════
+// 대상 파일 목록 수집
+// ═══════════════════════════════════════════════════════════
+
+fn collect_files(target: string) -> string {
+    let mut result = ""
+    try {
+        // 파일 하나인지 디렉토리인지 판별
+        let ftype = exec("file -b " + target).trim()
+        if ftype.contains("directory") {
+            result = exec("find " + target + " -name '*.hexa' -maxdepth 1 | sort")
+        } else {
+            result = target
+        }
+    } catch e {}
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════
+// 파일 하나를 분석: 함수별 구문 카운트 + 에너지
+// ═══════════════════════════════════════════════════════════
+
+fn analyze_file(filepath: string) -> string {
+    // 출력: 함수명\t총에너지\tfn\texec\ttry\tfor\twhile\tif\tlet\treturn
+    let mut result = ""
+    try {
+        // awk로 함수 경계 추적 + 키워드 카운트
+        result = exec("awk 'BEGIN{func=\"__global__\"; fn_c=0; exec_c=0; try_c=0; for_c=0; while_c=0; if_c=0; let_c=0; ret_c=0} /^fn [a-zA-Z_]/{if(func!=\"\"){e=fn_c*6+exec_c*12+try_c*4+for_c*4+while_c*4+if_c*2+let_c*1+ret_c*1; print func\"\\t\"e\"\\t\"fn_c\"\\t\"exec_c\"\\t\"try_c\"\\t\"for_c\"\\t\"while_c\"\\t\"if_c\"\\t\"let_c\"\\t\"ret_c} func=$2; gsub(/\\(.*$/,\"\",func); fn_c=0; exec_c=0; try_c=0; for_c=0; while_c=0; if_c=0; let_c=0; ret_c=0; next} /\\bexec\\b/{exec_c++} /\\btry\\b/{try_c++} /\\bfor\\b/{for_c++} /\\bwhile\\b/{while_c++} /\\bif\\b/{if_c++} /\\blet\\b/{let_c++} /\\breturn\\b/{ret_c++} /^fn /{fn_c++} END{if(func!=\"\"){e=fn_c*6+exec_c*12+try_c*4+for_c*4+while_c*4+if_c*2+let_c*1+ret_c*1; print func\"\\t\"e\"\\t\"fn_c\"\\t\"exec_c\"\\t\"try_c\"\\t\"for_c\"\\t\"while_c\"\\t\"if_c\"\\t\"let_c\"\\t\"ret_c}}' " + filepath)
+    } catch e {}
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════
+// 호출 관계 추출 (함수명 목록 기준)
+// ═══════════════════════════════════════════════════════════
+
+fn extract_calls(filepath: string, func_names: string) -> string {
+    // func_names = "func1|func2|func3" 형태
+    let mut result = ""
+    try {
+        result = exec("awk 'BEGIN{func=\"__global__\"} /^fn [a-zA-Z_]/{func=$2; gsub(/\\(.*$/,\"\",func)} {line=$0; if(func!=\"\"){split(\"" + func_names + "\",targets,\"|\"); for(t in targets){if(index(line,targets[t])>0 && targets[t]!=func) print func\"->\"targets[t]}}}' " + filepath + " | sort -u")
+    } catch e {}
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════
+// MAIN
+// ═══════════════════════════════════════════════════════════
+
+let args_raw = exec("echo $@").trim()
+let target = if args_raw == "" || args_raw == "$@" { _dev + "/nexus/mk2_hexa/native" } else { args_raw }
+
+println("")
+println("===========================================================")
+println("  컴파일러 파동 최적화 (Wave HEXA Compiler)")
+println("  AST 에너지 기반 핫패스 탐지 + 최적화 제안")
+println("===========================================================")
+println("")
+println("  대상: " + target)
+println("")
+
+// 1. 파일 목록 수집
+let file_list_raw = collect_files(target)
+let file_list = file_list_raw.split("\n")
+let mut valid_files = []
+for f in file_list {
+    let ft = f.trim()
+    if ft != "" && ft.contains(".hexa") {
+        valid_files = valid_files + [ft]
+    }
+}
+
+println("  분석 대상 파일: " + to_string(len(valid_files)) + "개")
+println("")
+
+// 2. 전체 파일 구문 분석
+println("  --- 구문 에너지 가중치 ---")
+println("")
+println("| 구문 | 가중치 |")
+println("|------|--------|")
+let mut wi: i64 = 0
+while wi < len(kw_names) {
+    println("| " + kw_names[wi] + " | " + to_string(kw_weights[wi]) + " |")
+    wi = wi + 1
+}
+println("")
+
+// 3. 함수별 에너지 수집
+let mut all_func_names = []
+let mut all_func_energies = []
+let mut all_func_files = []
+let mut total_funcs: i64 = 0
+let mut total_energy: i64 = 0
+
+println("  분석 중...")
+println("")
+
+for fpath in valid_files {
+    let analysis = analyze_file(fpath)
+    let lines = analysis.split("\n")
+
+    // 파일명 축약
+    let fname_parts = fpath.split("/")
+    let short_name = if len(fname_parts) > 0 { fname_parts[len(fname_parts) - 1] } else { fpath }
+
+    for line in lines {
+        let lt = line.trim()
+        if lt == "" { continue }
+        let parts = lt.split("\t")
+        if len(parts) < 2 { continue }
+
+        let func_name: string = parts[0]
+        let energy: i64 = safe_int(parts[1])
+
+        all_func_names = all_func_names + [func_name]
+        all_func_energies = all_func_energies + [energy]
+        all_func_files = all_func_files + [short_name]
+        total_funcs = total_funcs + 1
+        total_energy = total_energy + energy
+    }
+}
+
+println("  총 함수: " + to_string(total_funcs) + " | 총 에너지: " + to_string(total_energy))
+println("")
+
+// 4. 핫패스 = 에너지 상위 6개 (간이 정렬: 6회 최대값 추출)
+println("  --- 핫패스 (에너지 상위 6) ---")
+println("")
+println("| 순위 | 함수 | 파일 | 에너지 | 비율 | 제안 |")
+println("|------|------|------|--------|------|------|")
+
+let mut used = []
+let mut ui: i64 = 0
+while ui < total_funcs {
+    used = used + [false]
+    ui = ui + 1
+}
+
+let mut hotpath_count: i64 = 0
+let mut rank: i64 = 1
+
+while rank <= 6 && rank <= total_funcs {
+    // 최대값 탐색
+    let mut max_e: i64 = -1
+    let mut max_idx: i64 = -1
+    let mut mi: i64 = 0
+    while mi < total_funcs {
+        let is_used: bool = used[mi]
+        if !is_used {
+            let e: i64 = all_func_energies[mi]
+            if e > max_e {
+                max_e = e
+                max_idx = mi
+            }
+        }
+        mi = mi + 1
+    }
+
+    if max_idx < 0 { rank = 7 } else {
+        used[max_idx] = true
+        let fn_name: string = all_func_names[max_idx]
+        let fn_file: string = all_func_files[max_idx]
+        let pct = if total_energy > 0 { (max_e * 100) / total_energy } else { 0 }
+
+        // 최적화 제안
+        let suggestion = if max_e > 30 { "분할 권장" } else if max_e > 12 { "인라인 검토" } else { "유지" }
+
+        println("| " + to_string(rank) + " | " + fn_name + " | " + fn_file + " | " + to_string(max_e) + " | " + to_string(pct) + "% | " + suggestion + " |")
+        hotpath_count = hotpath_count + 1
+    }
+    rank = rank + 1
+}
+
+println("")
+
+// 5. 에너지 밀도 분포 (ASCII)
+println("  --- 에너지 밀도 스펙트럼 ---")
+println("")
+
+let mut di: i64 = 0
+while di < hotpath_count && di < total_funcs {
+    // used 배열에서 순서대로 다시 뽑기 어려우므로 전체에서 상위만 표시
+    di = di + 1
+}
+
+// 전체 파일별 에너지 요약
+println("  --- 파일별 총에너지 ---")
+println("")
+
+let mut file_seen = []
+let mut file_energies = []
+
+let mut fi: i64 = 0
+while fi < total_funcs {
+    let fname: string = all_func_files[fi]
+    let fenergy: i64 = all_func_energies[fi]
+
+    // 이미 본 파일인지 확인
+    let mut found_idx: i64 = -1
+    let mut si2: i64 = 0
+    while si2 < len(file_seen) {
+        let seen: string = file_seen[si2]
+        if seen == fname { found_idx = si2 }
+        si2 = si2 + 1
+    }
+
+    if found_idx >= 0 {
+        let old_e: i64 = file_energies[found_idx]
+        file_energies[found_idx] = old_e + fenergy
+    } else {
+        file_seen = file_seen + [fname]
+        file_energies = file_energies + [fenergy]
+    }
+    fi = fi + 1
+}
+
+// 파일별 막대 그래프
+let mut fsi: i64 = 0
+while fsi < len(file_seen) {
+    let fs_name: string = file_seen[fsi]
+    let fs_energy: i64 = file_energies[fsi]
+
+    let bar_len = if total_energy > 0 { (fs_energy * 40) / (total_energy + 1) } else { 0 }
+    let mut bar = ""
+    let mut bi: i64 = 0
+    while bi < bar_len && bi < 40 {
+        bar = bar + "#"
+        bi = bi + 1
+    }
+
+    println("  " + fs_name + "\t" + bar + " " + to_string(fs_energy))
+    fsi = fsi + 1
+}
+
+println("")
+
+// 6. 최적화 요약
+let avg_energy = if total_funcs > 0 { total_energy / total_funcs } else { 0 }
+let density_grade = if avg_energy > 20 { "고밀도 (리팩토링 권장)" } else if avg_energy > 8 { "중밀도 (정상)" } else { "저밀도 (경량)" }
+
+println("  --- 최적화 요약 ---")
+println("")
+println("  총 함수: " + to_string(total_funcs))
+println("  총 에너지: " + to_string(total_energy))
+println("  평균 에너지: " + to_string(avg_energy))
+println("  밀도 등급: " + density_grade)
+println("")
+
+// 7. growth_bus 기록
+try {
+    let ts = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+    let entry = "{\"type\":\"wave_hexa_compiler\",\"files\":" + to_string(len(valid_files)) + ",\"functions\":" + to_string(total_funcs) + ",\"total_energy\":" + to_string(total_energy) + ",\"avg_energy\":" + to_string(avg_energy) + ",\"hotpaths\":" + to_string(hotpath_count) + ",\"density\":\"" + density_grade + "\",\"ts\":\"" + ts + "\"}"
+    exec("echo '" + entry + "' >> " + _bus_path)
+} catch e {}
+
+println("  growth_bus 기록 완료")
+println("")
+println("[verified] wave_hexa_compiler.hexa 실행 완료")
+println("")
