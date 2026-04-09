@@ -192,11 +192,130 @@ function adaptSchema(raw) {
   return {nodes, edges};
 }
 
+// ── Parse atlas.n6 ──
+const DOMAIN_TO_LAYER = {
+  foundation: 0, architecture: 1, meta: 0, consciousness: 2,
+  topology: 0, physics: 1, number_theory: 0, algebra: 0,
+  geometry: 0, convergence: 4, cosmology: 4, crossing: 3
+};
+const TYPE_LABEL = {P:'primitive',C:'constant',L:'law',F:'formula',R:'relation',S:'symmetry',X:'crossing','?':'unknown'};
+
+function parseAtlasN6(text) {
+  const nodes = [];
+  const edges = [];
+  const nodeIds = new Set();
+  let cur = null;
+
+  for (const raw of text.split('\n')) {
+    const line = raw.trimEnd();
+    if (!line || line.startsWith('#') && !cur) {
+      // section comment or blank — skip
+      if (line.startsWith('# ══') || line.startsWith('# ──')) cur = null;
+      continue;
+    }
+
+    // New node: @T id = expr :: domain [grade]
+    const nm = line.match(/^@(\S)\s+(\S+)\s*(?:=\s*(.+?))?\s*::\s*(\S+)\s*(?:\[([^\]]+)\])?/);
+    if (nm) {
+      const [, type, id, expr, domain, gradeRaw] = nm;
+      const grade = gradeRaw && gradeRaw.includes('*') ? 'EXACT'
+                  : gradeRaw && gradeRaw.includes('!') ? 'EXACT'
+                  : gradeRaw && gradeRaw.includes('?') ? 'CONJECTURE'
+                  : gradeRaw && parseInt(gradeRaw) >= 8 ? 'CLOSE' : 'EMPIRICAL';
+      cur = {
+        id, label: id, layer: DOMAIN_TO_LAYER[domain] ?? 3,
+        type: TYPE_LABEL[type] || type, level: domain,
+        description: expr || '', grade, n6_expr: expr || '',
+        _src: 'atlas.n6'
+      };
+      nodes.push(cur);
+      nodeIds.add(id);
+      continue;
+    }
+
+    if (!cur) continue;
+
+    // Description string
+    const desc = line.match(/^\s+"(.+)"/);
+    if (desc) { cur.description = desc[1]; continue; }
+
+    // Dependency edges: <- id1, id2
+    const dep = line.match(/^\s+<-\s+(.+)/);
+    if (dep) {
+      dep[1].split(',').map(s => s.trim()).filter(Boolean).forEach(src => {
+        edges.push({from: src, to: cur.id, type: 'depends'});
+      });
+      continue;
+    }
+
+    // Derives: -> id1, id2
+    const der = line.match(/^\s+->\s+(.+)/);
+    if (der) {
+      der[1].split(',').map(s => s.trim()).filter(Boolean).forEach(tgt => {
+        edges.push({from: cur.id, to: tgt, type: 'derives'});
+      });
+      continue;
+    }
+
+    // Converges: ~> expr
+    const conv = line.match(/^\s+~>\s+(.+)/);
+    if (conv) {
+      // convergence annotation — attach to description
+      cur.description += ' | ' + conv[1];
+      continue;
+    }
+
+    // Application: => text
+    const app = line.match(/^\s+=>\s+"?(.+)"?/);
+    if (app && !cur._app) { cur._app = app[1]; continue; }
+
+    // Equivalence: == expr (check for id references)
+    const eq = line.match(/^\s+==\s+(.+)/);
+    if (eq) {
+      // try to extract id references
+      eq[1].split(/[+\-*/=\s,()]+/).filter(s => /^[a-z_]\w+$/.test(s)).forEach(ref => {
+        edges.push({from: ref, to: cur.id, type: 'equivalent'});
+      });
+    }
+  }
+
+  // Filter edges to only existing node ids
+  const validEdges = edges.filter(e => nodeIds.has(e.from) && nodeIds.has(e.to) && e.from !== e.to);
+  return {nodes, edges: validEdges};
+}
+
 // ── Load data ──
 async function loadData() {
-  const resp = await fetch('reality_map_live.json');
-  const raw = await resp.json();
+  const [jsonResp, atlasResp] = await Promise.all([
+    fetch('reality_map_live.json'),
+    fetch('atlas.n6').catch(() => null)
+  ]);
+  const raw = await jsonResp.json();
   mapData = adaptSchema(raw);
+
+  // Merge atlas.n6 nodes+edges
+  if (atlasResp && atlasResp.ok) {
+    const atlasText = await atlasResp.text();
+    const atlas = parseAtlasN6(atlasText);
+    const existingIds = new Set(mapData.nodes.map(n => n.id));
+    // Add new atlas nodes not in JSON
+    atlas.nodes.forEach(n => {
+      if (!existingIds.has(n.id)) {
+        mapData.nodes.push(n);
+        existingIds.add(n.id);
+      }
+    });
+    // Add atlas edges
+    const edgeSet = new Set(mapData.edges.map(e => e.from + '>' + e.to));
+    atlas.edges.forEach(e => {
+      const key = e.from + '>' + e.to;
+      if (!edgeSet.has(key) && existingIds.has(e.from) && existingIds.has(e.to)) {
+        mapData.edges.push(e);
+        edgeSet.add(key);
+      }
+    });
+  }
+
   buildScene();
   document.getElementById('loading').style.display = 'none';
   updateStats();
