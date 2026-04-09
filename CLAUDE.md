@@ -59,6 +59,7 @@ P1: 세미콜론 금지 / P2: `exec("단일 문자열")` / P3: Error→`to_strin
 
 - "todo", "할일" → `$HOME/Dev/hexa-lang/target/release/hexa $HOME/Dev/nexus/mk2_hexa/native/todo.hexa nexus` 실행 후 **결과를 마크다운 텍스트로 그대로 출력** (재포맷 금지)
 - "전체 할일" → `$HOME/Dev/hexa-lang/target/release/hexa $HOME/Dev/nexus/mk2_hexa/native/todo.hexa` 실행 후 **결과를 마크다운 텍스트로 그대로 출력** (재포맷 금지)
+- "loop", "루프" → `bash $HOME/Dev/nexus/scripts/infinite_growth.sh` **반드시 `run_in_background: true`** (현재 프로젝트 리포에서 실행 시 해당 리포의 `scripts/infinite_growth.sh`, 정의는 `shared/loop/{project}.json`)
 
 ## 특이점 사이클
 
