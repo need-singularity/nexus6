@@ -1,0 +1,197 @@
+// mk2_hexa/native/model_utils.hexa
+// 포팅 원본: tecs-l/model_utils.py (259 LOC)
+// 범위: ML(torch/nn) 이외의 순수 부분 포팅
+//  - n6 상수 동적 로드 (SSOT shared/n6_constants.py)
+//  - compare_results() 리포터
+//  - count_params(dims) — [in,hid,out] 리스트에서 파라미터 수
+//  - softmax, topk (pure math; torch 의존 없음)
+//  - BoltzmannGate/TopKGate: 순수 수치 시뮬레이션
+// 제외: Expert/BaseMoE/DenseModel/load_cifar10/load_mnist/train_and_evaluate
+//       → torch 의존, hexa 재구현 불가. Python 유지.
+
+// ─── n6 상수 동적 로드 (하드코딩 금지) ───
+fn load_n6_const(name: string) -> string {
+    let home = exec("printenv HOME").trim()
+    let py = "python3 -c \"import sys; sys.path.insert(0,'" + home + "/Dev/nexus/shared'); from n6_constants import " + name + "; print(float(" + name + "))\""
+    let mut out = ""
+    try { out = exec(py).trim() } catch e { out = to_string(e) }
+    return out
+}
+
+// ─── 수학 빌트인 대체 ───
+fn expf(x: float) -> float {
+    // exp 빌트인 부재 → pow(E, x)
+    let E = 2.718281828459045
+    return pow(E, x)
+}
+
+fn lnf(x: float) -> float {
+    // 자연로그: python 위임 (hexa 부재 시 fallback)
+    let mut s = ""
+    try { s = exec("python3 -c \"import math; print(math.log(" + to_string(x) + "))\"").trim() } catch e { s = "0" }
+    return to_float(s)
+}
+
+// ─── softmax ───
+fn softmax(xs: any) -> any {
+    let n = xs.len()
+    let mut out = []
+    if n == 0 { return out }
+    let mut mx = xs[0]
+    let mut i = 1
+    while i < n { if xs[i] > mx { mx = xs[i] }  i = i + 1 }
+    let mut sum = 0.0
+    let mut exps = []
+    i = 0
+    while i < n {
+        let e = expf(xs[i] - mx)
+        exps = exps + [e]
+        sum = sum + e
+        i = i + 1
+    }
+    i = 0
+    while i < n { out = out + [exps[i] / sum]  i = i + 1 }
+    return out
+}
+
+// ─── topk 인덱스 (단순 선택; k ≤ n) ───
+fn topk_idx(xs: any, k: int) -> any {
+    let n = xs.len()
+    let mut taken = []
+    let mut idxs = []
+    let mut c = 0
+    while c < k && c < n {
+        let mut best = -1
+        let mut bv = 0.0
+        let mut i = 0
+        while i < n {
+            let mut skip = false
+            let mut t = 0
+            while t < taken.len() {
+                if taken[t] == i { skip = true }
+                t = t + 1
+            }
+            if !skip {
+                if best < 0 || xs[i] > bv { best = i  bv = xs[i] }
+            }
+            i = i + 1
+        }
+        if best >= 0 { taken = taken + [best]  idxs = idxs + [best] }
+        c = c + 1
+    }
+    return idxs
+}
+
+// ─── TopKGate (수치 시뮬: scores 입력 → 게이트 가중치) ───
+fn topk_gate(scores: any, k: int) -> any {
+    let n = scores.len()
+    let idxs = topk_idx(scores, k)
+    let sm = softmax(scores)
+    let mut w = []
+    let mut i = 0
+    while i < n {
+        let mut hit = false
+        let mut j = 0
+        while j < idxs.len() { if idxs[j] == i { hit = true }  j = j + 1 }
+        if hit { w = w + [sm[i]] } else { w = w + [0.0] }
+        i = i + 1
+    }
+    // 정규화
+    let mut s = 0.0
+    i = 0
+    while i < w.len() { s = s + w[i]  i = i + 1 }
+    if s <= 0.0 { s = 0.00000001 }
+    let mut out = []
+    i = 0
+    while i < w.len() { out = out + [w[i] / s]  i = i + 1 }
+    return out
+}
+
+// ─── BoltzmannGate ───
+fn boltzmann_gate(scores: any, temperature: float, active_ratio: float) -> any {
+    let n = scores.len()
+    let mut scaled = []
+    let mut i = 0
+    while i < n { scaled = scaled + [scores[i] / temperature]  i = i + 1 }
+    let probs = softmax(scaled)
+    let mut n_active = 1
+    let na = int_from_float(to_float(n) * active_ratio)
+    if na > n_active { n_active = na }
+    return topk_gate(probs, n_active)
+}
+
+fn int_from_float(x: float) -> int {
+    // 정수 변환: to_string → split "." → to_int
+    let s = to_string(x)
+    let parts = s.split(".")
+    let mut r = 0
+    try { r = to_int(parts[0]) } catch e { r = 0 }
+    return r
+}
+
+// ─── count_params: Dense/Expert (입력, 은닉, 출력) 구조의 파라미터 수 ───
+fn count_params_linear(in_dim: int, out_dim: int) -> int {
+    return in_dim * out_dim + out_dim   // weight + bias
+}
+
+fn count_params_dense(in_dim: int, hidden: int, out_dim: int) -> int {
+    return count_params_linear(in_dim, hidden) + count_params_linear(hidden, out_dim)
+}
+
+// ─── compare_results: name|acc|loss|params 리포트 ───
+fn compare_results(names: any, accs: any, losses: any, params: any) {
+    let n = names.len()
+    print("\n" + "=".repeat(70))
+    print("  Model                            Accuracy     Loss  Parameters")
+    print("-".repeat(70))
+    // best acc 찾기
+    let mut best = 0.0
+    let mut i = 0
+    while i < n { if accs[i] > best { best = accs[i] }  i = i + 1 }
+    i = 0
+    while i < n {
+        let marker = if accs[i] == best { " <-- best" } else { "" }
+        let line = "  " + names[i] + "  " + to_string(accs[i] * 100.0) + "%  " + to_string(losses[i]) + "  " + to_string(params[i]) + marker
+        print(line)
+        i = i + 1
+    }
+    print("=".repeat(70))
+}
+
+// ─── 자가검증 (top-level) ───
+print("=== model_utils.hexa (port of model_utils.py) ===")
+
+    // n6 상수 로드 시험
+    let sigma_s = load_n6_const("SIGMA")
+    let tau_s   = load_n6_const("TAU")
+    let phi_s   = load_n6_const("PHI")
+    print("n6 SIGMA = " + sigma_s + "  TAU = " + tau_s + "  PHI = " + phi_s)
+
+    // softmax/topk
+    let xs = [1.0, 2.0, 3.0, 0.5, 2.5]
+    let sm = softmax(xs)
+    let mut s = 0.0
+    let mut i = 0
+    while i < sm.len() { s = s + sm[i]  i = i + 1 }
+    print("softmax sum = " + to_string(s) + " (expect 1.0)")
+
+    let idx = topk_idx(xs, 2)
+    print("topk(2) idx = " + to_string(idx) + " (expect [2,4])")
+
+    // gates
+    let tg = topk_gate(xs, 2)
+    print("topk_gate = " + to_string(tg))
+    let bg = boltzmann_gate(xs, 2.718281828, 0.6)
+    print("boltzmann_gate = " + to_string(bg))
+
+    // count_params: 784 → 128 → 10 (MNIST dense)
+    let p = count_params_dense(784, 128, 10)
+    print("dense(784,128,10) params = " + to_string(p) + " (expect 101770)")
+
+    // compare_results 데모
+    let nm = ["TopK-MoE", "Boltzmann-MoE", "Dense"]
+    let ac = [0.9234, 0.9187, 0.9012]
+    let lo = [0.24, 0.27, 0.33]
+    let pr = [120000, 120000, 101770]
+compare_results(nm, ac, lo, pr)
+print("=== done ===")
