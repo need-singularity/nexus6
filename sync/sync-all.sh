@@ -94,6 +94,13 @@ if [ -f "$SYNC_DIR/sync-dse.sh" ]; then
   bash "$SYNC_DIR/sync-dse.sh" 2>/dev/null && echo "  ✅ 완료" || echo "  ⚠️ 스킵"
 fi
 
+# 9. 원격 동기화
+echo ""
+echo "🌐 [+] 원격 동기화 (htz/vast)..."
+if [ -f "$SYNC_DIR/sync-remote.sh" ]; then
+  bash "$SYNC_DIR/sync-remote.sh" both all 2>/dev/null && echo "  ✅ 완료" || echo "  ⚠️ 스킵 (원격 미연결)"
+fi
+
 # Summary
 echo ""
 echo "════════════════════════════════════════"
