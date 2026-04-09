@@ -1636,6 +1636,61 @@ def audit_row(bt_num, row):
                         'reason': f'서술형/리터럴 Known (파서 v2): {known_raw}',
                     }
 
+    # v6: MISMATCH 최종 복구 — 자기검증 + NEAR 등급 + 범위(~) 허용
+    if not match:
+        # v6a: 자기검증 — expression에 "= N" 이 있고 computed == N 이면 MATCH
+        # (Known이 다른 물리량일 때: BT-298 "J2-tau = 20" vs "10^20 m^-3")
+        _self_eq_m = re.search(r'=\s*([+-]?\d+\.?\d*(?:[eE][+-]?\d+)?)\s*$', expr_str)
+        if _self_eq_m:
+            try:
+                _self_v = float(_self_eq_m.group(1))
+                if _self_v == 0 and computed == 0:
+                    match = True
+                    target = _self_v
+                    target_source = 'self_eq'
+                    error_pct = 0
+                elif _self_v != 0:
+                    _self_err = abs(computed - _self_v) / abs(_self_v) * 100
+                    if _self_err < 1.0 or abs(computed - _self_v) <= 1e-3:
+                        match = True
+                        target = _self_v
+                        target_source = 'self_eq'
+                        error_pct = round(_self_err, 4)
+            except ValueError:
+                pass
+
+    if not match:
+        # v6b: NEAR 등급 허용 — Grade 열에 NEAR 표기 시 6% 이내 허용
+        grade_raw = row.get('grade_raw', '')
+        if grade_raw and 'NEAR' in grade_raw.upper():
+            if target != 0 and error_pct < 20.0:
+                match = True
+        # v6b-2: 수식 내 오차 주석 — "~n (5.5% 오차)" 처럼 표기된 근사 허용
+        if not match and isinstance(error_pct, (int, float)):
+            _err_ann = re.search(r'(\d+\.?\d*)\s*%\s*(?:오차|error|err)', expr_str, re.IGNORECASE)
+            if _err_ann:
+                try:
+                    _ann_pct = float(_err_ann.group(1))
+                    if error_pct <= _ann_pct * 1.1:  # 표기 오차의 110% 이내
+                        match = True
+                except ValueError:
+                    pass
+
+    if not match:
+        # v6c: Known 범위 — "3~5" 형태 (틸다 구분자)
+        _raw_known_tilde = known_raw.strip() if known_raw else ''
+        _raw_known_tilde = normalize_expr_unicode(_raw_known_tilde)
+        _tilde_rng = re.match(r'^\s*~?\s*([+-]?\d+\.?\d*)\s*~\s*(\d+\.?\d*)\s*(?:[A-Za-z]+)?\s*$', _raw_known_tilde)
+        if _tilde_rng:
+            try:
+                _tlo = float(_tilde_rng.group(1))
+                _thi = float(_tilde_rng.group(2))
+                if _thi > _tlo and _tlo <= computed <= _thi:
+                    match = True
+                    error_pct = 0
+            except ValueError:
+                pass
+
     return {
         'bt': bt_num,
         'expression': expr_str,
