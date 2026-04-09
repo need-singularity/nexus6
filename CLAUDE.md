@@ -57,8 +57,8 @@ P1: 세미콜론 금지 / P2: `exec("단일 문자열")` / P3: Error→`to_strin
 
 ## 할일
 
-- "todo", "할일" → `hexa-bin-actual $HOME/Dev/nexus/mk2_hexa/native/todo.hexa nexus` 실행 후 **결과를 마크다운 텍스트로 그대로 출력** (재포맷 금지)
-- "전체 할일" → `hexa-bin-actual $HOME/Dev/nexus/mk2_hexa/native/todo.hexa` 실행 후 **결과를 마크다운 텍스트로 그대로 출력** (재포맷 금지)
+- "todo", "할일" → `$HOME/Dev/hexa-lang/target/release/hexa $HOME/Dev/nexus/mk2_hexa/native/todo.hexa nexus` 실행 후 **결과를 마크다운 텍스트로 그대로 출력** (재포맷 금지)
+- "전체 할일" → `$HOME/Dev/hexa-lang/target/release/hexa $HOME/Dev/nexus/mk2_hexa/native/todo.hexa` 실행 후 **결과를 마크다운 텍스트로 그대로 출력** (재포맷 금지)
 
 ## 특이점 사이클
 
