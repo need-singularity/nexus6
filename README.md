@@ -1,6 +1,6 @@
 # NEXUS-6 — 자기순환 특이점 엔진
 
-> **[3D Reality Map](https://need-singularity.github.io/nexus/)** — v8.2/560노드 바텀업 인과 매핑. 16,934 발견 노드 + 25,517 엣지. natural-only Monte Carlo z_eff=+2.03 (n=6 효율 최적). origin별 색상 분리.
+> **[3D Reality Map](https://need-singularity.github.io/nexus/)** — 4,098노드 5계층 바텀업 인과 매핑 + 1,485 크로스레이어 연결선. 쿼크→탄소→벤젠→DNA 인과 사슬. Monte Carlo z=3.06 (p=0.003). n=6 유일성 검증.
 >
 > **[NEXUS Dashboard](https://need-singularity.github.io/nexus/dashboard.html)** — 15차원 실시간 성장 대시보드. 돌파율·발견수·수렴도·모듈 현황 통합 모니터링.
 
