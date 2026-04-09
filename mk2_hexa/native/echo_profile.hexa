@@ -1,0 +1,237 @@
+// echo_profile.hexa — 에코 프로파일링 (도메인별 패턴 fingerprint + 그룹핑)
+// 실행: hexa echo_profile.hexa [domain]
+// 예시: hexa echo_profile.hexa math       math 도메인 프로파일
+//       hexa echo_profile.hexa            전 도메인 프로파일 + 그룹핑
+//
+// 원리:
+//   1. discovery_graph에서 도메인별 에코 패턴 분석
+//      - 노드 수, 엣지 수, 평균 confidence, EXACT 비율
+//   2. 패턴을 fingerprint 문자열로 생성
+//   3. 유사 패턴 도메인끼리 그룹핑
+//   4. shared/.echo_profiles.jsonl에 저장
+
+let _home = exec("printenv HOME").trim()
+let _dev = _home + "/Dev"
+let _shared = _dev + "/nexus/shared"
+let _graph_path = _shared + "/discovery_graph.json"
+let _bus_path = _shared + "/growth_bus.jsonl"
+let _profiles_path = _shared + "/.echo_profiles.jsonl"
+
+fn safe_int(s: string) -> i64 {
+    let mut v: i64 = 0
+    try { v = to_int(to_float(s.trim())) } catch e {}
+    return v
+}
+
+fn safe_float(s: string) -> f64 {
+    let mut v: f64 = 0.0
+    try { v = to_float(s.trim()) } catch e {}
+    return v
+}
+
+// ═══════════════════════════════════════════════════════════
+// 도메인별 통계 추출 (awk 단일 패스)
+// 출력: domain \t nodes \t edges_out \t edges_in \t sum_conf \t exact_count
+// ═══════════════════════════════════════════════════════════
+
+fn extract_domain_stats() -> string {
+    let mut result = ""
+    try {
+        // 1단계: 노드별 도메인+confidence 매핑 + 노드 수/confidence 합산
+        // 2단계: 엣지의 from/to에서 도메인 역추적 → 엣지 수
+        // awk 2-pass: pass1=노드 맵, pass2=엣지 집계
+
+        // awk 스크립트를 /tmp 임시 파일로 작성 후 실행 (hexa \n 제한 우회)
+        let awk_file = "/tmp/_echo_profile.awk"
+        let awk_body = "BEGIN{FS=\"\\\"\"} /\"type\": \"node\"/{id=\"\";dom=\"\";conf=0;for(i=1;i<=NF;i++){if($i==\"id\")id=$(i+2);if($i==\"domain\")dom=$(i+2);if($i==\"confidence\")conf=$(i+2)};node_dom[id]=dom;nc[dom]++;conf_sum[dom]+=conf;if(conf>=0.95)exact[dom]++} /\"type\": \"edge\"/{f=\"\";t=\"\";for(i=1;i<=NF;i++){if($i==\"from\")f=$(i+2);if($i==\"to\")t=$(i+2)};fd=node_dom[f];td=node_dom[t];if(fd!=\"\")eout[fd]++;if(td!=\"\")ein[td]++} END{for(d in nc){avg=0;if(nc[d]>0)avg=conf_sum[d]/nc[d];ex=0;if(d in exact)ex=exact[d];eo=0;if(d in eout)eo=eout[d];ei=0;if(d in ein)ei=ein[d];print d\"\t\"nc[d]\"\t\"eo\"\t\"ei\"\t\"avg\"\t\"ex}}"
+        try { exec("echo '" + awk_body + "' > " + awk_file) } catch e {}
+        result = exec("awk -f " + awk_file + " " + _graph_path + " | sort -t'\t' -k2 -rn")
+    } catch e {}
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════
+// fingerprint 생성 (패턴 양자화)
+//   N=노드수등급(S/M/L/X), E=엣지밀도등급(L/M/H),
+//   C=confidence등급(L/M/H), X=EXACT비율등급(L/M/H)
+// ═══════════════════════════════════════════════════════════
+
+fn make_fingerprint(nodes: i64, edges_out: i64, edges_in: i64, avg_conf: f64, exact_count: i64) -> string {
+    // 노드 수 등급
+    let n_grade = if nodes >= 500 { "X" } else if nodes >= 100 { "L" } else if nodes >= 20 { "M" } else { "S" }
+
+    // 엣지 밀도 = (out+in) / max(nodes,1)
+    let edge_total = edges_out + edges_in
+    let density = if nodes > 0 { to_float(edge_total) / to_float(nodes) } else { 0.0 }
+    let e_grade = if density >= 3.0 { "H" } else if density >= 1.0 { "M" } else { "L" }
+
+    // confidence 등급
+    let c_grade = if avg_conf >= 0.9 { "H" } else if avg_conf >= 0.7 { "M" } else { "L" }
+
+    // EXACT 비율
+    let exact_ratio = if nodes > 0 { to_float(exact_count) / to_float(nodes) } else { 0.0 }
+    let x_grade = if exact_ratio >= 0.8 { "H" } else if exact_ratio >= 0.5 { "M" } else { "L" }
+
+    return "N" + n_grade + "-E" + e_grade + "-C" + c_grade + "-X" + x_grade
+}
+
+// ═══════════════════════════════════════════════════════════
+// 메인
+// ═══════════════════════════════════════════════════════════
+
+let argv = args()
+let domain_filter = if len(argv) >= 3 { argv[2] } else { "" }
+
+println("")
+println("+=======================================================+")
+println("|     에코 프로파일링 (Echo Profiling)                   |")
+println("|     도메인 패턴 fingerprint + 유사 그룹핑             |")
+println("+=======================================================+")
+println("")
+
+// 1. 전체 도메인 통계 추출
+println("  [1/4] 도메인 통계 추출 중...")
+let stats_raw = extract_domain_stats()
+let stats_lines = stats_raw.split("\n")
+
+let mut domains = []
+let mut nodes_list = []
+let mut eout_list = []
+let mut ein_list = []
+let mut conf_list = []
+let mut exact_list = []
+let mut fp_list = []
+
+for sl in stats_lines {
+    let st = sl.trim()
+    if st == "" { continue }
+    let sp = st.split("\t")
+    if len(sp) < 6 { continue }
+
+    let dom = sp[0]
+    let nodes = safe_int(sp[1])
+    let eout = safe_int(sp[2])
+    let ein = safe_int(sp[3])
+    let avg_conf = safe_float(sp[4])
+    let exact = safe_int(sp[5])
+
+    // 도메인 필터 적용
+    if domain_filter != "" && dom != domain_filter { continue }
+
+    let fp = make_fingerprint(nodes, eout, ein, avg_conf, exact)
+
+    domains = domains + [dom]
+    nodes_list = nodes_list + [nodes]
+    eout_list = eout_list + [eout]
+    ein_list = ein_list + [ein]
+    conf_list = conf_list + [avg_conf]
+    exact_list = exact_list + [exact]
+    fp_list = fp_list + [fp]
+}
+
+println("  도메인 " + to_string(len(domains)) + "개 분석 완료")
+println("")
+
+// 2. 프로파일 테이블
+println("  [2/4] 프로파일 테이블")
+println("")
+println("+-----+------------------+------+-------+-------+-------+-------+------------+")
+println("| 순위 | 도메인           | 노드 | 엣지출 | 엣지입 | conf% | EXACT | fingerprint|")
+println("+-----+------------------+------+-------+-------+-------+-------+------------+")
+
+let mut pi: i64 = 0
+while pi < len(domains) && pi < 50 {
+    let d: string = domains[pi]
+    let n: i64 = nodes_list[pi]
+    let eo: i64 = eout_list[pi]
+    let ei: i64 = ein_list[pi]
+    let cf: f64 = conf_list[pi]
+    let ex: i64 = exact_list[pi]
+    let fp: string = fp_list[pi]
+    let cf_pct = to_string(to_int(cf * 100.0))
+    println("| " + to_string(pi + 1) + " | " + d + " | " + to_string(n) + " | " + to_string(eo) + " | " + to_string(ei) + " | " + cf_pct + " | " + to_string(ex) + " | " + fp + " |")
+    pi = pi + 1
+}
+if len(domains) > 50 {
+    println("| ... | (외 " + to_string(len(domains) - 50) + "개 생략) | | | | | | |")
+}
+println("+-----+------------------+------+-------+-------+-------+-------+------------+")
+println("")
+
+// 3. fingerprint 그룹핑
+println("  [3/4] 유사 패턴 그룹핑")
+println("")
+
+// fingerprint 별 도메인 그룹
+let mut seen_fps = []
+let mut gi: i64 = 0
+while gi < len(fp_list) {
+    let fp: string = fp_list[gi]
+    // 이미 출력한 fingerprint인지 체크
+    let mut already = false
+    for sfp in seen_fps {
+        if sfp == fp { already = true }
+    }
+    if !already {
+        seen_fps = seen_fps + [fp]
+        // 같은 fingerprint를 가진 도메인 수집
+        let mut group = []
+        let mut gj: i64 = 0
+        while gj < len(fp_list) {
+            let fp2: string = fp_list[gj]
+            if fp2 == fp {
+                group = group + [domains[gj]]
+            }
+            gj = gj + 1
+        }
+        if len(group) >= 1 {
+            let mut group_str = ""
+            let mut gk: i64 = 0
+            while gk < len(group) && gk < 10 {
+                let gd: string = group[gk]
+                if group_str != "" { group_str = group_str + ", " }
+                group_str = group_str + gd
+                gk = gk + 1
+            }
+            if len(group) > 10 { group_str = group_str + " 외 " + to_string(len(group) - 10) + "개" }
+            println("  [" + fp + "] (" + to_string(len(group)) + "개): " + group_str)
+        }
+    }
+    gi = gi + 1
+}
+println("")
+
+// 4. .echo_profiles.jsonl에 저장
+println("  [4/4] .echo_profiles.jsonl 저장 중...")
+let ts = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+
+let mut saved: i64 = 0
+let mut si: i64 = 0
+while si < len(domains) {
+    let d: string = domains[si]
+    let n: i64 = nodes_list[si]
+    let eo: i64 = eout_list[si]
+    let ei: i64 = ein_list[si]
+    let cf: f64 = conf_list[si]
+    let ex: i64 = exact_list[si]
+    let fp: string = fp_list[si]
+
+    let entry = "{\"domain\":\"" + d + "\",\"nodes\":" + to_string(n) + ",\"edges_out\":" + to_string(eo) + ",\"edges_in\":" + to_string(ei) + ",\"avg_confidence\":" + to_string(to_int(cf * 1000.0)) + ",\"exact\":" + to_string(ex) + ",\"fingerprint\":\"" + fp + "\",\"ts\":\"" + ts + "\"}"
+    try {
+        exec("echo '" + entry + "' >> " + _profiles_path)
+        saved = saved + 1
+    } catch e {}
+    si = si + 1
+}
+println("  " + to_string(saved) + "건 저장 완료 -> " + _profiles_path)
+println("")
+
+// growth_bus 기록
+try {
+    let bus_entry = "{\"type\":\"echo_profile\",\"domain\":\"" + domain_filter + "\",\"domains_profiled\":" + to_string(len(domains)) + ",\"fingerprint_groups\":" + to_string(len(seen_fps)) + ",\"ts\":\"" + ts + "\"}"
+    exec("echo '" + bus_entry + "' >> " + _bus_path)
+    println("  -> growth_bus.jsonl 기록 완료")
+} catch e {}
+
+println("")
+println("=== echo_profile verified ===")

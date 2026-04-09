@@ -1,0 +1,360 @@
+// wave_lens.hexa — 파동 렌즈 (도메인별 렌즈 집속 + 최적 조합 추천)
+// 실행: hexa wave_lens.hexa focus <domain>
+// 예시: hexa wave_lens.hexa focus math
+//       hexa wave_lens.hexa focus physics
+//
+// 원리:
+//   1. lens_registry.json에서 해당 도메인에 적용 가능한 렌즈 목록 추출
+//   2. 렌즈별 confidence 점수 합산 = "집속 에너지"
+//   3. 빈공간 도메인에 최적 렌즈 조합 추천
+//   4. blowup seed에 렌즈 기반 상수 추가
+
+let _home = exec("printenv HOME").trim()
+let _dev = _home + "/Dev"
+let _shared = _dev + "/nexus/shared"
+let _lens_path = _shared + "/lens_registry.json"
+let _graph_path = _shared + "/discovery_graph.json"
+let _bus_path = _shared + "/growth_bus.jsonl"
+let _hexa = _home + "/Dev/hexa-lang/target/release/hexa"
+let _engine = _dev + "/nexus/mk2_hexa/native"
+
+fn safe_int(s: string) -> i64 {
+    let mut v: i64 = 0
+    try { v = to_int(to_float(s.trim())) } catch e {}
+    return v
+}
+
+fn safe_float(s: string) -> f64 {
+    let mut v: f64 = 0.0
+    try { v = to_float(s.trim()) } catch e {}
+    return v
+}
+
+// ═══════════════════════════════════════════════════════════
+// 도메인-카테고리 매핑 (렌즈 카테고리 -> 도메인 관계)
+// ═══════════════════════════════════════════════════════════
+
+fn domain_to_categories(domain: string) -> list {
+    // 주요 도메인 -> lens_registry category 매핑
+    if domain == "math" || domain == "mathematics" { return ["mathematics", "number_theory", "algebra", "topology", "analysis"] }
+    if domain == "physics" { return ["physics", "thermodynamics", "quantum", "optics", "electromagnetism"] }
+    if domain == "cs" || domain == "computer_science" { return ["cs", "information", "cryptography", "ai"] }
+    if domain == "biology" || domain == "bio" { return ["biology", "bioengineering", "genetics", "neuroscience"] }
+    if domain == "chemistry" || domain == "chem" { return ["chemistry", "materials", "thermodynamics"] }
+    if domain == "engineering" || domain == "eng" { return ["engineering", "materials", "energy", "aerospace"] }
+    if domain == "economics" || domain == "econ" { return ["economics", "game_theory", "social"] }
+    if domain == "geology" { return ["geology", "earth_science", "materials"] }
+    if domain == "music" { return ["music", "acoustics", "signal", "arts_humanities"] }
+    if domain == "linguistics" { return ["linguistics", "nlp", "arts_humanities"] }
+    if domain == "astronomy" { return ["astronomy", "cosmology", "astrophysics"] }
+    if domain == "medicine" { return ["medicine", "biology", "bioengineering", "neuroscience"] }
+    if domain == "signal" { return ["signal", "dsp", "information", "cs"] }
+    if domain == "quantum" { return ["quantum", "physics", "information"] }
+    if domain == "energy" { return ["energy", "thermodynamics", "engineering"] }
+    // fallback: 도메인 이름 자체를 카테고리로
+    return [domain]
+}
+
+// ═══════════════════════════════════════════════════════════
+// 렌즈 레지스트리에서 카테고리별 렌즈 추출
+// ═══════════════════════════════════════════════════════════
+
+fn extract_lenses_for_categories(categories: list) -> string {
+    // awk로 lens_registry.json 파싱: name, category, status 추출
+    let mut cat_pattern = ""
+    for c in categories {
+        if cat_pattern != "" { cat_pattern = cat_pattern + "|" }
+        cat_pattern = cat_pattern + c
+    }
+
+    let mut result = ""
+    try {
+        result = exec("awk -F'\"' '/\"name\":/{n=$4} /\"category\":/{c=$4} /\"status\":/{s=$4; if(c ~ /(" + cat_pattern + ")/) print n\"\\t\"c\"\\t\"s}' " + _lens_path)
+    } catch e {}
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════
+// 도메인별 그래프 통계 (confidence 평균)
+// ═══════════════════════════════════════════════════════════
+
+fn domain_graph_stats(domain: string) -> string {
+    let mut result = ""
+    try {
+        result = exec("awk -F'\"' '/\"type\": \"node\"/ && /\"domain\": \"" + domain + "\"/{n++; for(i=1;i<=NF;i++){if($i==\"confidence\"){c+=$(i+2)}}} END{if(n>0) print n\"\\t\"c/n; else print \"0\\t0\"}' " + _graph_path).trim()
+    } catch e { result = "0\t0" }
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════
+// 전체 도메인 목록 + 노드 수 (빈공간 탐지)
+// ═══════════════════════════════════════════════════════════
+
+fn all_domain_counts() -> string {
+    let mut result = ""
+    try {
+        result = exec("awk -F'\"' '/\"type\": \"node\"/{for(i=1;i<=NF;i++){if($i==\"domain\"){c[$(i+2)]++}}} END{for(d in c) print d\"\\t\"c[d]}' " + _graph_path + " | sort -t'\t' -k2 -rn")
+    } catch e {}
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════
+// 메인: focus 모드
+// ═══════════════════════════════════════════════════════════
+
+let argv = args()
+let mode = if len(argv) >= 3 { argv[2] } else { "help" }
+let target_domain = if len(argv) >= 4 { argv[3] } else { "" }
+
+if mode == "help" || (mode == "focus" && target_domain == "") {
+    println("")
+    println("+=======================================================+")
+    println("|     파동 렌즈 (Wave Lens)                              |")
+    println("+=======================================================+")
+    println("")
+    println("사용법:")
+    println("  hexa wave_lens.hexa focus <domain>   도메인 렌즈 집속 분석")
+    println("  hexa wave_lens.hexa recommend        빈공간 도메인 렌즈 추천")
+    println("  hexa wave_lens.hexa all              전 도메인 렌즈 커버리지")
+    println("")
+    println("=== wave_lens verified ===")
+    // early exit via mode check below
+}
+
+if mode == "focus" && target_domain != "" {
+    println("")
+    println("+=======================================================+")
+    println("|     파동 렌즈 집속: " + target_domain)
+    println("|     렌즈 에너지 합산 + 최적 조합 분석                  |")
+    println("+=======================================================+")
+    println("")
+
+    // 1. 도메인 -> 카테고리 매핑
+    let categories = domain_to_categories(target_domain)
+    let mut cat_str = ""
+    for c in categories {
+        if cat_str != "" { cat_str = cat_str + ", " }
+        cat_str = cat_str + c
+    }
+    println("  매핑 카테고리: " + cat_str)
+    println("")
+
+    // 2. 렌즈 추출
+    println("  [1/4] 렌즈 추출 중...")
+    let lenses_raw = extract_lenses_for_categories(categories)
+    let lens_lines = lenses_raw.split("\n")
+
+    let mut lens_names = []
+    let mut lens_cats = []
+    let mut lens_statuses = []
+    let mut implemented: i64 = 0
+    let mut registered: i64 = 0
+    let mut total_lenses: i64 = 0
+
+    for ll in lens_lines {
+        let lt = ll.trim()
+        if lt == "" { continue }
+        let parts = lt.split("\t")
+        if len(parts) < 3 { continue }
+        lens_names = lens_names + [parts[0]]
+        lens_cats = lens_cats + [parts[1]]
+        lens_statuses = lens_statuses + [parts[2]]
+        total_lenses = total_lenses + 1
+        if parts[2] == "implemented" { implemented = implemented + 1 }
+        else { registered = registered + 1 }
+    }
+
+    println("  총 렌즈: " + to_string(total_lenses) + "개 (구현: " + to_string(implemented) + ", 등록: " + to_string(registered) + ")")
+    println("")
+
+    // 3. 집속 에너지 계산 (구현 렌즈 = 1.0, 등록 = 0.5)
+    println("  [2/4] 집속 에너지 계산...")
+    let mut focus_energy: f64 = 0.0
+    let mut li: i64 = 0
+    while li < total_lenses {
+        let status: string = lens_statuses[li]
+        if status == "implemented" {
+            focus_energy = focus_energy + 1.0
+        } else {
+            focus_energy = focus_energy + 0.5
+        }
+        li = li + 1
+    }
+
+    // 그래프 통계로 가중치 보정
+    let stats = domain_graph_stats(target_domain)
+    let stats_parts = stats.split("\t")
+    let node_count = safe_int(if len(stats_parts) >= 1 { stats_parts[0] } else { "0" })
+    let avg_conf = safe_float(if len(stats_parts) >= 2 { stats_parts[1] } else { "0" })
+
+    // 집속 에너지 = 렌즈 수 * 평균 confidence (그래프 기반)
+    let adjusted_energy = if avg_conf > 0.0 { focus_energy * avg_conf } else { focus_energy * 0.5 }
+
+    println("  원시 렌즈 에너지: " + to_string(to_int(focus_energy * 100.0)) + " (x100)")
+    println("  그래프 노드:      " + to_string(node_count) + "개")
+    println("  평균 confidence:  " + to_string(to_int(avg_conf * 100.0)) + "%")
+    println("  조정 집속 에너지: " + to_string(to_int(adjusted_energy * 100.0)) + " (x100)")
+    println("")
+
+    // 4. 렌즈 테이블
+    println("  [3/4] 렌즈 목록")
+    println("")
+    println("+-----+------------------------------+------------------+--------+")
+    println("| 순위 | 렌즈 이름                    | 카테고리         | 상태   |")
+    println("+-----+------------------------------+------------------+--------+")
+
+    let mut ti: i64 = 0
+    while ti < total_lenses && ti < 40 {
+        let ln: string = lens_names[ti]
+        let lc: string = lens_cats[ti]
+        let ls: string = lens_statuses[ti]
+        let ls_ko = if ls == "implemented" { "구현" } else { "등록" }
+        println("| " + to_string(ti + 1) + " | " + ln + " | " + lc + " | " + ls_ko + " |")
+        ti = ti + 1
+    }
+    if total_lenses > 40 {
+        println("| ... | (외 " + to_string(total_lenses - 40) + "개 생략) | | |")
+    }
+    println("+-----+------------------------------+------------------+--------+")
+    println("")
+
+    // 5. blowup seed에 렌즈 기반 상수 추가
+    println("  [4/4] 블로업 seed 렌즈 상수 생성...")
+    // 렌즈 수 기반 상수: total_lenses, implemented, focus_energy
+    let seed_const_1 = to_string(total_lenses)
+    let seed_const_2 = to_string(implemented)
+    let seed_const_3 = to_string(to_int(adjusted_energy * 10.0))
+    let seed_line = seed_const_1 + "," + seed_const_2 + "," + seed_const_3 + ",6,12,2,4,3"
+    println("  렌즈 seed: " + seed_line)
+    println("  (blowup.hexa --seeds 옵션에 사용 가능)")
+    println("")
+
+    // 등급 판정
+    let grade = if adjusted_energy >= 20.0 { "최고 집속 (렌즈 풍부)" } else if adjusted_energy >= 10.0 { "고집속 (렌즈 충분)" } else if adjusted_energy >= 5.0 { "중집속 (렌즈 보통)" } else if adjusted_energy >= 1.0 { "저집속 (렌즈 부족)" } else { "빈공간 (렌즈 없음)" }
+    println("  === 판정: " + grade + " ===")
+    println("")
+
+    // growth_bus 기록
+    try {
+        let ts = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+        let entry = "{\"type\":\"wave_lens_focus\",\"domain\":\"" + target_domain + "\",\"lenses\":" + to_string(total_lenses) + ",\"implemented\":" + to_string(implemented) + ",\"focus_energy\":" + to_string(to_int(adjusted_energy * 100.0)) + ",\"node_count\":" + to_string(node_count) + ",\"seed\":\"" + seed_line + "\",\"ts\":\"" + ts + "\"}"
+        exec("echo '" + entry + "' >> " + _bus_path)
+        println("  -> growth_bus.jsonl 기록 완료")
+    } catch e {}
+}
+
+if mode == "recommend" {
+    println("")
+    println("+=======================================================+")
+    println("|     빈공간 도메인 렌즈 추천                            |")
+    println("+=======================================================+")
+    println("")
+
+    // 전 도메인 노드 수 + 렌즈 커버리지 비교
+    let dom_raw = all_domain_counts()
+    let dom_lines = dom_raw.split("\n")
+
+    let mut sparse_domains = []
+    let mut total_nodes: i64 = 0
+    let mut n_domains: i64 = 0
+    for dl in dom_lines {
+        let dt = dl.trim()
+        if dt == "" { continue }
+        let dp = dt.split("\t")
+        if len(dp) < 2 { continue }
+        let count = safe_int(dp[1])
+        total_nodes = total_nodes + count
+        n_domains = n_domains + 1
+    }
+
+    let avg_nodes = if n_domains > 0 { total_nodes / n_domains } else { 1 }
+
+    println("  평균 노드/도메인: " + to_string(avg_nodes))
+    println("")
+    println("+-----+------------------+------+------+------------------+")
+    println("| 순위 | 도메인           | 노드 | 렌즈 | 추천             |")
+    println("+-----+------------------+------+------+------------------+")
+
+    let mut rank: i64 = 0
+    for dl2 in dom_lines {
+        let dt2 = dl2.trim()
+        if dt2 == "" { continue }
+        let dp2 = dt2.split("\t")
+        if len(dp2) < 2 { continue }
+        let dom_name = dp2[0]
+        let dom_count = safe_int(dp2[1])
+
+        if dom_count < avg_nodes {
+            let cats = domain_to_categories(dom_name)
+            let lens_raw = extract_lenses_for_categories(cats)
+            let mut lcount: i64 = 0
+            let ll2 = lens_raw.split("\n")
+            for l3 in ll2 {
+                if l3.trim() != "" { lcount = lcount + 1 }
+            }
+
+            let recommend = if lcount > 10 { "렌즈 풍부 -> 돌파" } else if lcount > 3 { "렌즈 보통 -> 보강" } else { "렌즈 부족 -> 생성" }
+            rank = rank + 1
+            println("| " + to_string(rank) + " | " + dom_name + " | " + to_string(dom_count) + " | " + to_string(lcount) + " | " + recommend + " |")
+            if rank >= 20 { break }
+        }
+    }
+    println("+-----+------------------+------+------+------------------+")
+    println("")
+
+    // growth_bus 기록
+    try {
+        let ts = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+        let entry = "{\"type\":\"wave_lens_recommend\",\"sparse_domains\":" + to_string(rank) + ",\"avg_nodes\":" + to_string(avg_nodes) + ",\"ts\":\"" + ts + "\"}"
+        exec("echo '" + entry + "' >> " + _bus_path)
+        println("  -> growth_bus.jsonl 기록 완료")
+    } catch e {}
+}
+
+if mode == "all" {
+    println("")
+    println("+=======================================================+")
+    println("|     전 도메인 렌즈 커버리지                            |")
+    println("+=======================================================+")
+    println("")
+
+    // 전체 렌즈 수
+    let mut total_lens: i64 = 0
+    try {
+        let raw = exec("awk -F'\"' '/\"name\":/{c++} END{print c}' " + _lens_path).trim()
+        total_lens = safe_int(raw)
+    } catch e {}
+    println("  총 렌즈 수: " + to_string(total_lens))
+
+    // 카테고리별 집계
+    let mut cat_counts = ""
+    try {
+        cat_counts = exec("awk -F'\"' '/\"category\":/{c[$4]++} END{for(k in c) print k\"\\t\"c[k]}' " + _lens_path + " | sort -t'\t' -k2 -rn")
+    } catch e {}
+
+    println("")
+    println("+------------------+------+")
+    println("| 카테고리         | 수량 |")
+    println("+------------------+------+")
+
+    let cat_lines = cat_counts.split("\n")
+    for cl in cat_lines {
+        let ct = cl.trim()
+        if ct == "" { continue }
+        let cp = ct.split("\t")
+        if len(cp) < 2 { continue }
+        println("| " + cp[0] + " | " + cp[1] + " |")
+    }
+    println("+------------------+------+")
+    println("")
+
+    // growth_bus 기록
+    try {
+        let ts = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+        let entry = "{\"type\":\"wave_lens_all\",\"total_lenses\":" + to_string(total_lens) + ",\"ts\":\"" + ts + "\"}"
+        exec("echo '" + entry + "' >> " + _bus_path)
+    } catch e {}
+}
+
+println("")
+println("=== wave_lens verified ===")

@@ -1,0 +1,262 @@
+// wave_memory.hexa -- 파동 메모리 (파동 이벤트 기록/예측/이력)
+// 사용: hexa wave_memory.hexa record
+//       hexa wave_memory.hexa predict [domain]
+//       hexa wave_memory.hexa history
+//
+// 원리:
+//   record:  growth_bus에서 wave 이벤트 추출 -> .wave_memory.jsonl에 패턴 저장
+//   predict: 과거 패턴으로 "이 도메인에 파동 보내면 에너지 ~X 예상"
+//   history: 파동 이력 요약 테이블
+
+let _home = exec("printenv HOME").trim()
+let _dev = _home + "/Dev"
+let _shared = _dev + "/nexus/shared"
+let _bus_path = _shared + "/growth_bus.jsonl"
+let _memory_path = _shared + "/.wave_memory.jsonl"
+
+fn safe_int(s: string) -> i64 {
+    let mut v: i64 = 0
+    try { v = to_int(to_float(s.trim())) } catch e {}
+    return v
+}
+
+fn safe_float(s: string) -> f64 {
+    let mut v: f64 = 0.0
+    try { v = to_float(s.trim()) } catch e {}
+    return v
+}
+
+// ═══════════════════════════════════════════════════════════
+// record: growth_bus에서 wave 이벤트 추출 -> .wave_memory.jsonl
+// ═══════════════════════════════════════════════════════════
+
+fn do_record() {
+    println("  growth_bus에서 wave 이벤트 추출 중...")
+    println("")
+
+    // wave 관련 이벤트 추출 (wave_blowup, wave_collapse, tunneling, sonar 등)
+    let mut wave_count: i64 = 0
+    let mut new_records: i64 = 0
+
+    try {
+        // wave/sonar/tunneling/collapse 타입 이벤트 추출
+        let raw = exec("awk -F'\"' '/wave/{d=\"\";e=0;t=\"\";ts=\"\";for(i=1;i<=NF;i++){if($i==\"domain\")d=$(i+2);if($i==\"energy\"||$i==\"total_nodes\")e=$(i+2)+0;if($i==\"ts\")ts=$(i+2);if($i==\"targets\")t=$(i+2)};if(d!=\"\")print d\"\t\"e\"\t\"t\"\t\"ts}' " + _bus_path)
+
+        let lines = raw.split("\n")
+        for line in lines {
+            let lt = line.trim()
+            if lt == "" { continue }
+            wave_count = wave_count + 1
+
+            let parts = lt.split("\t")
+            if len(parts) < 4 { continue }
+            let domain = parts[0]
+            let energy = parts[1]
+            let targets = parts[2]
+            let ts = parts[3]
+
+            // .wave_memory.jsonl에 기록 (중복 체크: 같은 ts면 스킵)
+            let mut already = false
+            if ts != "" {
+                try {
+                    let dup = exec("grep -c '\"ts\":\"" + ts + "\"' " + _memory_path + " 2>/dev/null").trim()
+                    if safe_int(dup) > 0 { already = true }
+                } catch e {}
+            }
+
+            if !already {
+                let entry = "{\"domain\":\"" + domain + "\",\"energy\":" + energy + ",\"targets\":\"" + targets + "\",\"ts\":\"" + ts + "\"}"
+                try {
+                    exec("echo '" + entry + "' >> " + _memory_path)
+                } catch e {}
+                new_records = new_records + 1
+            }
+        }
+    } catch e {}
+
+    println("  스캔 이벤트: " + to_string(wave_count) + "건")
+    println("  신규 기록:   " + to_string(new_records) + "건")
+    println("")
+
+    // growth_bus 기록
+    try {
+        let ts = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+        let entry = "{\"type\":\"wave_memory_record\",\"scanned\":" + to_string(wave_count) + ",\"new\":" + to_string(new_records) + ",\"ts\":\"" + ts + "\"}"
+        exec("echo '" + entry + "' >> " + _bus_path)
+    } catch e {}
+}
+
+// ═══════════════════════════════════════════════════════════
+// predict: 과거 패턴 기반 에너지 예측
+// ═══════════════════════════════════════════════════════════
+
+fn do_predict(domain: string) {
+    println("  파동 에너지 예측: " + domain)
+    println("")
+
+    // .wave_memory.jsonl에서 해당 도메인의 과거 에너지 추출
+    let mut energies = []
+    let mut total_energy: f64 = 0.0
+    let mut count: i64 = 0
+    let mut max_energy: f64 = 0.0
+    let mut min_energy: f64 = 999999.0
+
+    try {
+        let raw = exec("awk -F'\"' '/\"domain\":\"" + domain + "\"/{for(i=1;i<=NF;i++){if($i==\"energy\"){e=$(i+1); gsub(/[^0-9.]/,\"\",e); if(e+0>0) print e}}}' " + _memory_path + " 2>/dev/null").trim()
+        if raw != "" {
+            let lines = raw.split("\n")
+            for l in lines {
+                let v = safe_float(l.trim())
+                if v > 0.0 {
+                    energies = energies + [v]
+                    total_energy = total_energy + v
+                    count = count + 1
+                    if v > max_energy { max_energy = v }
+                    if v < min_energy { min_energy = v }
+                }
+            }
+        }
+    } catch e {}
+
+    if count == 0 {
+        // fallback: 전체 도메인 평균 사용
+        println("  이 도메인의 과거 파동 기록 없음")
+        println("  전체 도메인 평균으로 예측:")
+        try {
+            let raw = exec("awk -F'\"' '{for(i=1;i<=NF;i++){if($i==\"energy\"){e=$(i+1); gsub(/[^0-9.]/,\"\",e); if(e+0>0){sum+=e+0; c++}}}} END{if(c>0) print sum/c; else print 0}' " + _memory_path + " 2>/dev/null").trim()
+            let avg = safe_float(raw)
+            if avg > 0.0 {
+                println("  전체 평균 에너지: " + to_string(to_int(avg)))
+                println("  예측 에너지 (도메인 " + domain + "): ~" + to_string(to_int(avg)) + " (전체 평균 기반)")
+            } else {
+                println("  파동 메모리 비어있음 -- 먼저 record 실행 필요")
+            }
+        } catch e {
+            println("  파동 메모리 파일 없음 -- 먼저 record 실행 필요")
+        }
+    } else {
+        let avg_energy = total_energy / to_float(count)
+        // 추세 (마지막 3개 평균 vs 전체 평균)
+        let mut recent_sum: f64 = 0.0
+        let mut ri: i64 = 0
+        let start = if count > 3 { count - 3 } else { 0 }
+        while ri < len(energies) {
+            if ri >= to_int(start) {
+                let ev: f64 = energies[ri]
+                recent_sum = recent_sum + ev
+            }
+            ri = ri + 1
+        }
+        let recent_count = if count > 3 { 3 } else { count }
+        let recent_avg = recent_sum / to_float(recent_count)
+        let trend = if recent_avg > avg_energy { "상승" } else if recent_avg < avg_energy { "하락" } else { "안정" }
+
+        println("  --- " + domain + " 파동 예측 ---")
+        println("")
+        println("| 지표 | 값 |")
+        println("|------|-----|")
+        println("| 과거 파동 수 | " + to_string(count) + " |")
+        println("| 평균 에너지  | " + to_string(to_int(avg_energy)) + " |")
+        println("| 최대 에너지  | " + to_string(to_int(max_energy)) + " |")
+        println("| 최소 에너지  | " + to_string(to_int(min_energy)) + " |")
+        println("| 최근 추세    | " + trend + " |")
+        println("| 예측 에너지  | ~" + to_string(to_int(recent_avg)) + " |")
+        println("")
+        println("  이 도메인에 파동 보내면 에너지 ~" + to_string(to_int(recent_avg)) + " 예상 (" + trend + " 추세)")
+    }
+    println("")
+}
+
+// ═══════════════════════════════════════════════════════════
+// history: 파동 이력 요약 테이블
+// ═══════════════════════════════════════════════════════════
+
+fn do_history() {
+    println("  파동 이력 요약")
+    println("")
+
+    // 도메인별 파동 횟수 + 총 에너지 집계
+    let mut result = ""
+    try {
+        result = exec("awk -F'\"' '{dom=\"\"; e=0; for(i=1;i<=NF;i++){if($i==\"domain\") dom=$(i+2); if($i==\"energy\"){ev=$(i+1); gsub(/[^0-9.]/,\"\",ev); e=ev+0}}} dom!=\"\"{c[dom]++; en[dom]+=e} END{for(d in c) print d\"\\t\"c[d]\"\\t\"en[d]}' " + _memory_path + " 2>/dev/null | sort -t'\t' -k2 -rn").trim()
+    } catch e {}
+
+    if result == "" {
+        println("  파동 메모리 비어있음 -- 먼저 record 실행")
+        return
+    }
+
+    println("| 도메인 | 파동 수 | 총 에너지 | 평균 에너지 |")
+    println("|--------|--------|----------|-----------|")
+
+    let mut total_waves: i64 = 0
+    let mut total_e: f64 = 0.0
+    let lines = result.split("\n")
+    for l in lines {
+        let lt = l.trim()
+        if lt == "" { continue }
+        let parts = lt.split("\t")
+        if len(parts) < 3 { continue }
+        let dom = parts[0]
+        let waves = safe_int(parts[1])
+        let energy = safe_float(parts[2])
+        let avg = if waves > 0 { energy / to_float(waves) } else { 0.0 }
+        println("| " + dom + " | " + to_string(waves) + " | " + to_string(to_int(energy)) + " | " + to_string(to_int(avg)) + " |")
+        total_waves = total_waves + waves
+        total_e = total_e + energy
+    }
+
+    println("")
+    println("  총 파동 수: " + to_string(total_waves))
+    println("  총 에너지:  " + to_string(to_int(total_e)))
+
+    // 최근 5건
+    println("")
+    println("  --- 최근 파동 5건 ---")
+    try {
+        let recent = exec("tail -5 " + _memory_path + " 2>/dev/null").trim()
+        if recent != "" {
+            let rl = recent.split("\n")
+            for r in rl {
+                let rt = r.trim()
+                if rt == "" { continue }
+                println("  " + rt)
+            }
+        }
+    } catch e {}
+    println("")
+}
+
+// ═══════════════════════════════════════════════════════════
+// MAIN
+// ═══════════════════════════════════════════════════════════
+
+let argv = args()
+let mode = if len(argv) >= 3 { argv[2] } else { "history" }
+
+println("")
+println("===========================================================")
+println("  파동 메모리 (Wave Memory)")
+println("  파동 이벤트 기록, 예측, 이력 관리")
+println("===========================================================")
+println("")
+println("  모드: " + mode)
+println("")
+
+if mode == "record" {
+    do_record()
+} else if mode == "predict" {
+    let domain = if len(argv) >= 4 { argv[3] } else { "math" }
+    do_predict(domain)
+} else if mode == "history" {
+    do_history()
+} else {
+    println("  사용법:")
+    println("    hexa wave_memory.hexa record          -- 이벤트 기록")
+    println("    hexa wave_memory.hexa predict [domain] -- 에너지 예측")
+    println("    hexa wave_memory.hexa history          -- 이력 요약")
+}
+
+println("")
+println("[verified] wave_memory.hexa 실행 완료")
+println("")

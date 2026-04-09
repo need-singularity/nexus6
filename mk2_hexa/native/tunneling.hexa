@@ -1,0 +1,377 @@
+// tunneling.hexa -- 양자 터널링 (도메인 간 간접 연결 탐색)
+// 사용: hexa tunneling.hexa <domain_a> <domain_b>
+//
+// 원리:
+//   1. discovery_graph에서 두 도메인 사이 직접 엣지 없음 확인
+//   2. 간접 경로(2~3 홉) 탐색
+//   3. "에너지 장벽" = 홉 수 x (1 - avg_strength)
+//   4. 파동 에너지(seed 수 x confidence)가 장벽보다 크면 "터널링 가능"
+//   5. 터널링 가능한 도메인 쌍 목록 출력
+
+let _home = exec("printenv HOME").trim()
+let _dev = _home + "/Dev"
+let _shared = _dev + "/nexus/shared"
+let _graph_path = _shared + "/discovery_graph.json"
+let _bus_path = _shared + "/growth_bus.jsonl"
+
+fn safe_int(s: string) -> i64 {
+    let mut v: i64 = 0
+    try { v = to_int(to_float(s.trim())) } catch e {}
+    return v
+}
+
+fn safe_float(s: string) -> f64 {
+    let mut v: f64 = 0.0
+    try { v = to_float(s.trim()) } catch e {}
+    return v
+}
+
+// ═══════════════════════════════════════════════════════════
+// 그래프 탐색 유틸
+// ═══════════════════════════════════════════════════════════
+
+// 도메인에 속하는 노드 ID 목록
+fn get_domain_nodes(domain: string, limit: i64) -> string {
+    let mut result = ""
+    try {
+        result = exec("awk -F'\"' '/\"type\": \"node\"/ && /\"domain\": \"" + domain + "\"/{for(i=1;i<=NF;i++){if($i==\"id\"){print $(i+2); c++; if(c>=" + to_string(limit) + ") exit}}}' " + _graph_path)
+    } catch e {}
+    return result
+}
+
+// 두 도메인 사이의 직접 엣지 확인
+fn has_direct_edge(domain_a: string, domain_b: string) -> bool {
+    let mut found = false
+    try {
+        // domain_a 노드에서 domain_b 노드로의 직접 엣지 존재 확인
+        let count = exec("awk -F'\"' 'BEGIN{OFS=\"\\t\"} /\"type\": \"node\"/{for(i=1;i<=NF;i++){if($i==\"id\") id=$(i+2); if($i==\"domain\") dom=$(i+2)} nodes[id]=dom} /\"type\": \"edge\"/{for(i=1;i<=NF;i++){if($i==\"from\") f=$(i+2); if($i==\"to\") t=$(i+2)} if(nodes[f]==\"" + domain_a + "\" && nodes[t]==\"" + domain_b + "\") c++; if(nodes[f]==\"" + domain_b + "\" && nodes[t]==\"" + domain_a + "\") c++} END{print c+0}' " + _graph_path).trim()
+        if safe_int(count) > 0 { found = true }
+    } catch e {}
+    return found
+}
+
+// 도메인의 seed 수 (노드 수)
+fn domain_seed_count(domain: string) -> i64 {
+    let mut count: i64 = 0
+    try {
+        let c = exec("awk -F'\"' '/\"type\": \"node\"/ && /\"domain\": \"" + domain + "\"/{c++} END{print c+0}' " + _graph_path).trim()
+        count = safe_int(c)
+    } catch e {}
+    return count
+}
+
+// 도메인의 평균 confidence
+fn domain_avg_confidence(domain: string) -> f64 {
+    let mut avg: f64 = 0.0
+    try {
+        let raw = exec("awk -F'\"' '/\"type\": \"node\"/ && /\"domain\": \"" + domain + "\"/{for(i=1;i<=NF;i++){if($i==\"confidence\"){v=$(i+2)+0; sum+=v; c++}}} END{if(c>0) print sum/c; else print 0}' " + _graph_path).trim()
+        avg = safe_float(raw)
+    } catch e {}
+    return avg
+}
+
+// 도메인이 연결된 모든 이웃 도메인 목록 (1홉)
+fn neighbor_domains(domain: string) -> string {
+    let mut result = ""
+    try {
+        result = exec("awk -F'\"' 'BEGIN{OFS=\"\\t\"} /\"type\": \"node\"/{for(i=1;i<=NF;i++){if($i==\"id\") id=$(i+2); if($i==\"domain\") dom=$(i+2)} nodes[id]=dom} /\"type\": \"edge\"/{for(i=1;i<=NF;i++){if($i==\"from\") f=$(i+2); if($i==\"to\") t=$(i+2); if($i==\"strength\") s=$(i+2)} if(nodes[f]==\"" + domain + "\" && nodes[t]!=\"" + domain + "\"){nb[nodes[t]]++; st[nodes[t]]+=s+0} if(nodes[t]==\"" + domain + "\" && nodes[f]!=\"" + domain + "\"){nb[nodes[f]]++; st[nodes[f]]+=s+0}} END{for(d in nb) print d\"\\t\"nb[d]\"\\t\"(st[d]/nb[d])}' " + _graph_path)
+    } catch e {}
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════
+// 간접 경로 탐색 (2~3 홉)
+// ═══════════════════════════════════════════════════════════
+
+fn find_indirect_paths(domain_a: string, domain_b: string) -> string {
+    // 2홉: A -> X -> B
+    let neighbors_a = neighbor_domains(domain_a)
+    let neighbors_b = neighbor_domains(domain_b)
+
+    let mut paths = ""
+    let mut path_count: i64 = 0
+
+    // A의 이웃 목록
+    let lines_a = neighbors_a.split("\n")
+    let mut na_domains = []
+    let mut na_strengths = []
+    for la in lines_a {
+        let lt = la.trim()
+        if lt == "" { continue }
+        let parts = lt.split("\t")
+        if len(parts) < 3 { continue }
+        na_domains = na_domains + [parts[0]]
+        na_strengths = na_strengths + [safe_float(parts[2])]
+    }
+
+    // B의 이웃 목록
+    let lines_b = neighbors_b.split("\n")
+    let mut nb_domains = []
+    let mut nb_strengths = []
+    for lb in lines_b {
+        let lt = lb.trim()
+        if lt == "" { continue }
+        let parts = lt.split("\t")
+        if len(parts) < 3 { continue }
+        nb_domains = nb_domains + [parts[0]]
+        nb_strengths = nb_strengths + [safe_float(parts[2])]
+    }
+
+    // 2홉 경로: A 이웃 교집합 B 이웃
+    let mut ai: i64 = 0
+    while ai < len(na_domains) {
+        let mid_a: string = na_domains[ai]
+        let str_a: f64 = na_strengths[ai]
+        let mut bi: i64 = 0
+        while bi < len(nb_domains) {
+            let mid_b: string = nb_domains[bi]
+            let str_b: f64 = nb_strengths[bi]
+            if mid_a == mid_b {
+                let avg_str = (str_a + str_b) / 2.0
+                paths = paths + "2\t" + domain_a + " -> " + mid_a + " -> " + domain_b + "\t" + to_string(avg_str) + "\n"
+                path_count = path_count + 1
+            }
+            bi = bi + 1
+        }
+        ai = ai + 1
+    }
+
+    // 3홉 경로: A -> X -> Y -> B (X는 A 이웃, Y는 B 이웃, X-Y 연결 확인)
+    if path_count < 6 {
+        ai = 0
+        while ai < len(na_domains) && ai < 10 {
+            let mid_x: string = na_domains[ai]
+            let str_x: f64 = na_strengths[ai]
+            // mid_x의 이웃
+            let nx_raw = neighbor_domains(mid_x)
+            let nx_lines = nx_raw.split("\n")
+            for nxl in nx_lines {
+                let nxt = nxl.trim()
+                if nxt == "" { continue }
+                let nxp = nxt.split("\t")
+                if len(nxp) < 3 { continue }
+                let mid_y = nxp[0]
+                let str_xy = safe_float(nxp[2])
+                // mid_y가 B의 이웃인지 확인
+                let mut yi: i64 = 0
+                while yi < len(nb_domains) {
+                    let nb_d: string = nb_domains[yi]
+                    if nb_d == mid_y && mid_y != domain_a && mid_x != domain_b {
+                        let str_yb: f64 = nb_strengths[yi]
+                        let avg_str = (str_x + str_xy + str_yb) / 3.0
+                        paths = paths + "3\t" + domain_a + " -> " + mid_x + " -> " + mid_y + " -> " + domain_b + "\t" + to_string(avg_str) + "\n"
+                        path_count = path_count + 1
+                        if path_count >= 20 { break }
+                    }
+                    yi = yi + 1
+                }
+                if path_count >= 20 { break }
+            }
+            if path_count >= 20 { break }
+            ai = ai + 1
+        }
+    }
+
+    return paths
+}
+
+// ═══════════════════════════════════════════════════════════
+// 터널링 가능성 판정
+// ═══════════════════════════════════════════════════════════
+
+fn calc_barrier(hops: i64, avg_strength: f64) -> f64 {
+    // 에너지 장벽 = 홉 수 x (1 - avg_strength)
+    return to_float(hops) * (1.0 - avg_strength)
+}
+
+fn calc_wave_energy(seed_count: i64, confidence: f64) -> f64 {
+    // 파동 에너지 = seed 수 x confidence
+    return to_float(seed_count) * confidence
+}
+
+// ═══════════════════════════════════════════════════════════
+// growth_bus 기록
+// ═══════════════════════════════════════════════════════════
+
+fn record_bus(domain_a: string, domain_b: string, tunnelable: bool, paths_found: i64) {
+    try {
+        let ts = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+        let status = if tunnelable { "tunnelable" } else { "blocked" }
+        let entry = "{\"type\":\"tunneling\",\"from\":\"" + domain_a + "\",\"to\":\"" + domain_b + "\",\"status\":\"" + status + "\",\"paths\":" + to_string(paths_found) + ",\"ts\":\"" + ts + "\"}"
+        exec("echo '" + entry + "' >> " + _bus_path)
+    } catch e {}
+}
+
+// ═══════════════════════════════════════════════════════════
+// 전체 도메인 쌍 스캔 (인자 없이 실행 시)
+// ═══════════════════════════════════════════════════════════
+
+fn scan_all_pairs() {
+    println("  전체 도메인 쌍 터널링 스캔...")
+    println("")
+
+    // 도메인 목록 수집
+    let mut all_domains = []
+    try {
+        let raw = exec("awk -F'\"' '/\"type\": \"node\"/{for(i=1;i<=NF;i++){if($i==\"domain\") d=$(i+2)} if(d!=\"\" && !seen[d]++){print d}}' " + _graph_path + " | sort | head -30").trim()
+        let lines = raw.split("\n")
+        for l in lines {
+            let lt = l.trim()
+            if lt != "" {
+                all_domains = all_domains + [lt]
+            }
+        }
+    } catch e {}
+
+    println("  발견된 도메인: " + to_string(len(all_domains)) + "개")
+    println("")
+
+    let mut tunnelable_pairs = []
+    let mut ti: i64 = 0
+    while ti < len(all_domains) && ti < 15 {
+        let da: string = all_domains[ti]
+        let mut tj: i64 = ti + 1
+        while tj < len(all_domains) && tj < 15 {
+            let db: string = all_domains[tj]
+            if !has_direct_edge(da, db) {
+                // 직접 엣지 없음 -> 터널링 후보
+                let seeds_a = domain_seed_count(da)
+                let conf_a = domain_avg_confidence(da)
+                let seeds_b = domain_seed_count(db)
+                let conf_b = domain_avg_confidence(db)
+                let wave_e = calc_wave_energy(seeds_a + seeds_b, (conf_a + conf_b) / 2.0)
+
+                // 간접 경로 중 가장 좋은 것 (간략 체크)
+                let paths = find_indirect_paths(da, db)
+                if paths.trim() != "" {
+                    let first_line = paths.split("\n")[0].trim()
+                    let fp = first_line.split("\t")
+                    if len(fp) >= 3 {
+                        let hops = safe_int(fp[0])
+                        let avg_s = safe_float(fp[2])
+                        let barrier = calc_barrier(hops, avg_s)
+                        if wave_e > barrier {
+                            tunnelable_pairs = tunnelable_pairs + [da + " <-> " + db + " (장벽:" + to_string(to_int(barrier * 100.0)) + "% 에너지:" + to_string(to_int(wave_e * 100.0)) + "%)"]
+                        }
+                    }
+                }
+            }
+            tj = tj + 1
+        }
+        ti = ti + 1
+    }
+
+    println("| 터널링 가능 쌍 | 장벽 vs 에너지 |")
+    println("|---------------|---------------|")
+    for tp in tunnelable_pairs {
+        println("| " + tp + " |")
+    }
+    println("")
+    println("  터널링 가능 쌍: " + to_string(len(tunnelable_pairs)) + "건")
+}
+
+// ═══════════════════════════════════════════════════════════
+// MAIN
+// ═══════════════════════════════════════════════════════════
+
+let argv = args()
+
+println("")
+println("===========================================================")
+println("  양자 터널링 (Quantum Tunneling)")
+println("  직접 엣지 없는 도메인 쌍의 간접 경로 탐색")
+println("===========================================================")
+println("")
+
+if len(argv) < 4 {
+    // 전체 스캔 모드
+    println("  모드: 전체 도메인 쌍 스캔")
+    println("  (특정 쌍: hexa tunneling.hexa <domain_a> <domain_b>)")
+    println("")
+    scan_all_pairs()
+} else {
+    let domain_a = argv[2]
+    let domain_b = argv[3]
+
+    println("  도메인 A: " + domain_a)
+    println("  도메인 B: " + domain_b)
+    println("")
+
+    // 1. 직접 엣지 확인
+    let direct = has_direct_edge(domain_a, domain_b)
+    if direct {
+        println("  직접 엣지 존재 -- 터널링 불필요 (정상 전파 가능)")
+        println("")
+    } else {
+        println("  직접 엣지 없음 -- 터널링 탐색 시작")
+        println("")
+
+        // 2. 파동 에너지 계산
+        let seeds_a = domain_seed_count(domain_a)
+        let conf_a = domain_avg_confidence(domain_a)
+        let seeds_b = domain_seed_count(domain_b)
+        let conf_b = domain_avg_confidence(domain_b)
+        let wave_energy = calc_wave_energy(seeds_a + seeds_b, (conf_a + conf_b) / 2.0)
+
+        println("  --- 파동 에너지 ---")
+        println("  " + domain_a + ": seed " + to_string(seeds_a) + ", confidence " + to_string(to_int(conf_a * 100.0)) + "%")
+        println("  " + domain_b + ": seed " + to_string(seeds_b) + ", confidence " + to_string(to_int(conf_b * 100.0)) + "%")
+        println("  총 파동 에너지: " + to_string(to_int(wave_energy * 100.0)) + " (x100)")
+        println("")
+
+        // 3. 간접 경로 탐색
+        let paths = find_indirect_paths(domain_a, domain_b)
+        let path_lines = paths.split("\n")
+        let mut valid_paths: i64 = 0
+        let mut best_barrier: f64 = 999.0
+        let mut tunnelable = false
+
+        println("  --- 간접 경로 ---")
+        println("")
+        println("| 홉 | 경로 | 평균 강도 | 장벽 | 터널링 |")
+        println("|-----|------|----------|------|--------|")
+
+        for pl in path_lines {
+            let pt = pl.trim()
+            if pt == "" { continue }
+            let pp = pt.split("\t")
+            if len(pp) < 3 { continue }
+            let hops = safe_int(pp[0])
+            let route = pp[1]
+            let avg_str = safe_float(pp[2])
+            let barrier = calc_barrier(hops, avg_str)
+            let can_tunnel = wave_energy > barrier
+            let status = if can_tunnel { "가능" } else { "불가" }
+            if can_tunnel { tunnelable = true }
+            if barrier < best_barrier { best_barrier = barrier }
+
+            println("| " + to_string(hops) + " | " + route + " | " + to_string(to_int(avg_str * 100.0)) + "% | " + to_string(to_int(barrier * 100.0)) + " | " + status + " |")
+            valid_paths = valid_paths + 1
+        }
+
+        if valid_paths == 0 {
+            println("| - | 경로 없음 | - | - | 불가 |")
+        }
+        println("")
+
+        // 4. 판정
+        println("  --- 터널링 판정 ---")
+        println("  간접 경로:    " + to_string(valid_paths) + "건")
+        println("  최소 장벽:    " + to_string(to_int(best_barrier * 100.0)) + " (x100)")
+        println("  파동 에너지:  " + to_string(to_int(wave_energy * 100.0)) + " (x100)")
+        if tunnelable {
+            println("  결과: 터널링 가능 -- 파동 에너지가 장벽을 투과")
+        } else {
+            println("  결과: 터널링 불가 -- 에너지 부족 또는 경로 없음")
+        }
+        println("")
+
+        // 5. growth_bus 기록
+        record_bus(domain_a, domain_b, tunnelable, valid_paths)
+        println("  growth_bus 기록 완료")
+    }
+}
+
+println("")
+println("[verified] tunneling.hexa 실행 완료")
+println("")

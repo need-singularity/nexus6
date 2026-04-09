@@ -1,0 +1,237 @@
+// standing_wave.hexa — 정상파 수렴 탐지기 (양방향 엣지 = 수렴 확정)
+// 실행: hexa standing_wave.hexa [domain]
+// 예시: hexa standing_wave.hexa math
+//       hexa standing_wave.hexa              (전체 스캔)
+//
+// 원리:
+//   discovery_graph.json에서 양방향 엣지(A→B, B→A) 검색
+//   양방향 연결 = "정상파" = 수렴 확정 포인트
+//   convergence 폴더의 기존 골화 항목과 비교
+//   결과 테이블 + growth_bus 기록
+
+let _home = exec("printenv HOME").trim()
+let _dev = _home + "/Dev"
+let _shared = _dev + "/nexus/shared"
+let _graph_path = _shared + "/discovery_graph.json"
+let _bus_path = _shared + "/growth_bus.jsonl"
+let _conv_dir = _shared + "/convergence"
+
+fn safe_int(s: string) -> i64 {
+    let mut v: i64 = 0
+    try { v = to_int(to_float(s.trim())) } catch e {}
+    return v
+}
+
+fn safe_float(s: string) -> f64 {
+    let mut v: f64 = 0.0
+    try { v = to_float(s.trim()) } catch e {}
+    return v
+}
+
+// ═══════════════════════════════════════════════════════════
+// 양방향 엣지 추출 (from→to 쌍 중 역방향도 존재하는 것)
+// awk로 엣지 전체 추출 후 양방향 매칭
+// ═══════════════════════════════════════════════════════════
+
+fn extract_bidirectional_edges(domain_filter: string) -> string {
+    // 1단계: 모든 엣지를 "from\tto\tstrength" 형태로 추출
+    let mut awk_cmd = "awk -F'\"' '/\"type\": \"edge\"/{f=\"\"; t=\"\"; s=\"0\"; for(i=1;i<=NF;i++){if($i==\"from\") f=$(i+2); if($i==\"to\") t=$(i+2); if($i==\"strength\") s=$(i+2)} print f\"\\t\"t\"\\t\"s}' " + _graph_path
+
+    let mut edges_raw = ""
+    try { edges_raw = exec(awk_cmd) } catch e { return "" }
+    if edges_raw.trim() == "" { return "" }
+
+    // 2단계: 도메인 필터가 있으면 해당 도메인 노드 ID 추출
+    let mut domain_nodes_set = ""
+    if domain_filter != "" {
+        try {
+            domain_nodes_set = exec("awk -F'\"' '/\"type\": \"node\"/ && /\"domain\": \"" + domain_filter + "\"/{for(i=1;i<=NF;i++){if($i==\"id\"){print $(i+2)}}}' " + _graph_path)
+        } catch e {}
+    }
+
+    // 3단계: awk로 양방향 매칭 — from→to가 있고 to→from도 있는 쌍 추출
+    // /tmp에 엣지 파일 쓰고 self-join
+    let tmp_edges = "/tmp/_sw_edges_" + exec("date +%s").trim()
+    let tmp_nodes = "/tmp/_sw_nodes_" + exec("date +%s").trim()
+
+    try { exec("bash", ["-c", "awk -F'\"' '/\"type\": \"edge\"/{f=\"\"; t=\"\"; s=\"0\"; for(i=1;i<=NF;i++){if($i==\"from\") f=$(i+2); if($i==\"to\") t=$(i+2); if($i==\"strength\") s=$(i+2)} print f\"\\t\"t\"\\t\"s}' " + _graph_path + " > " + tmp_edges]) } catch e {}
+
+    if domain_filter != "" {
+        try { exec("bash", ["-c", "awk -F'\"' '/\"type\": \"node\"/ && /\"domain\": \"" + domain_filter + "\"/{for(i=1;i<=NF;i++){if($i==\"id\"){print $(i+2)}}}' " + _graph_path + " > " + tmp_nodes]) } catch e {}
+    }
+
+    // 4단계: 양방향 쌍 추출 (awk self-join)
+    let mut result = ""
+    try {
+        if domain_filter != "" {
+            result = exec("bash", ["-c", "awk 'NR==FNR{e[$1\"\\t\"$2]=$3; next} {if(($2\"\\t\"$1) in e) print $1\"\\t\"$2\"\\t\"$3\"\\t\"e[$2\"\\t\"$1]}' " + tmp_edges + " " + tmp_edges + " | awk 'NR==FNR{d[$1]=1; next} {if(($1 in d) || ($2 in d)) print}' " + tmp_nodes + " - | sort -u"])
+        } else {
+            result = exec("bash", ["-c", "awk 'NR==FNR{e[$1\"\\t\"$2]=$3; next} {if(($2\"\\t\"$1) in e) print $1\"\\t\"$2\"\\t\"$3\"\\t\"e[$2\"\\t\"$1]}' " + tmp_edges + " " + tmp_edges + " | sort -u"])
+        }
+    } catch e {}
+
+    // 정리
+    try { exec("rm -f " + tmp_edges + " " + tmp_nodes) } catch e {}
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════
+// 노드 도메인 조회
+// ═══════════════════════════════════════════════════════════
+
+fn get_node_domain(node_id: string) -> string {
+    let mut domain = ""
+    try {
+        domain = exec("awk -F'\"' '/\"type\": \"node\"/ && /\"id\": \"" + node_id + "\"/{for(i=1;i<=NF;i++){if($i==\"domain\"){print $(i+2); exit}}}' " + _graph_path).trim()
+    } catch e {}
+    return domain
+}
+
+// ═══════════════════════════════════════════════════════════
+// 기존 골화 항목 로드 (convergence/*.json)
+// ═══════════════════════════════════════════════════════════
+
+fn load_ossified_ids() -> string {
+    let mut result = ""
+    try {
+        result = exec("bash", ["-c", "cat " + _conv_dir + "/*.json 2>/dev/null | awk -F'\"' '/\"ossified\"/{for(i=1;i<=NF;i++){if($i==\"id\") print $(i+2)}}' | sort -u"])
+    } catch e {}
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════
+// 메인
+// ═══════════════════════════════════════════════════════════
+
+let argv = args()
+let domain_filter = if len(argv) >= 3 { argv[2] } else { "" }
+
+println("")
+println("+=======================================================+")
+println("|     정상파 수렴 탐지기 (Standing Wave Detector)        |")
+println("|     양방향 엣지 = 수렴 확정 포인트                     |")
+println("+=======================================================+")
+println("")
+
+if domain_filter != "" {
+    println("  도메인 필터: " + domain_filter)
+} else {
+    println("  모드: 전체 스캔")
+}
+println("")
+
+// 1. 양방향 엣지 추출
+println("  [1/4] 양방향 엣지 추출 중...")
+let bidir_raw = extract_bidirectional_edges(domain_filter)
+let bidir_lines = bidir_raw.split("\n")
+
+let mut standing_waves = []
+let mut sw_strengths = []
+let mut sw_count: i64 = 0
+let mut total_strength: f64 = 0.0
+
+for line in bidir_lines {
+    let t = line.trim()
+    if t == "" { continue }
+    let parts = t.split("\t")
+    if len(parts) < 4 { continue }
+    let from_node = parts[0]
+    let to_node = parts[1]
+    let s_fwd = safe_float(parts[2])
+    let s_bwd = safe_float(parts[3])
+    // 중복 제거: from < to인 쌍만 취급
+    if from_node >= to_node { continue }
+    let combined = s_fwd + s_bwd
+    standing_waves = standing_waves + [from_node + " <-> " + to_node]
+    sw_strengths = sw_strengths + [combined]
+    total_strength = total_strength + combined
+    sw_count = sw_count + 1
+}
+
+println("  정상파 " + to_string(sw_count) + "건 감지")
+println("")
+
+// 2. 기존 골화 항목 비교
+println("  [2/4] 골화 항목 비교 중...")
+let ossified_raw = load_ossified_ids()
+let ossified_ids = ossified_raw.split("\n")
+let mut ossified_count: i64 = 0
+for oid in ossified_ids {
+    if oid.trim() != "" { ossified_count = ossified_count + 1 }
+}
+println("  기존 골화: " + to_string(ossified_count) + "건")
+println("")
+
+// 3. 신규 정상파 = 골화에 없는 수렴 포인트
+println("  [3/4] 신규 수렴 포인트 분류 중...")
+let mut new_waves = []
+let mut new_strengths = []
+let mut confirmed_waves = []
+let mut ni: i64 = 0
+
+while ni < sw_count {
+    let sw: string = standing_waves[ni]
+    let strength: f64 = sw_strengths[ni]
+    // 골화 목록에 포함되는지 체크
+    let mut is_ossified = false
+    for oid in ossified_ids {
+        let ot = oid.trim()
+        if ot != "" && sw.contains(ot) { is_ossified = true }
+    }
+    if is_ossified {
+        confirmed_waves = confirmed_waves + [sw]
+    } else {
+        new_waves = new_waves + [sw]
+        new_strengths = new_strengths + [strength]
+    }
+    ni = ni + 1
+}
+
+println("  이미 골화 확인: " + to_string(len(confirmed_waves)) + "건")
+println("  신규 수렴 후보: " + to_string(len(new_waves)) + "건")
+println("")
+
+// 4. 결과 테이블
+println("  [4/4] 결과 테이블")
+println("")
+println("+-----+--------------------------------------------+----------+--------+")
+println("| 순위 | 정상파 쌍                                  | 합산강도 | 상태   |")
+println("+-----+--------------------------------------------+----------+--------+")
+
+let mut display_count: i64 = 0
+let mut di: i64 = 0
+while di < len(new_waves) && display_count < 30 {
+    let nw: string = new_waves[di]
+    let ns: f64 = new_strengths[di]
+    let ns_str = to_string(to_int(ns * 100.0)) + "%"
+    let status = if ns >= 1.8 { "확정" } else if ns >= 1.0 { "유력" } else { "후보" }
+    display_count = display_count + 1
+    println("| " + to_string(display_count) + " | " + nw + " | " + ns_str + " | " + status + " |")
+    di = di + 1
+}
+
+if len(new_waves) > 30 {
+    println("| ... | (외 " + to_string(len(new_waves) - 30) + "건 생략)  |          |        |")
+}
+println("+-----+--------------------------------------------+----------+--------+")
+println("")
+
+// 요약
+let avg_strength = if sw_count > 0 { total_strength / to_float(sw_count) } else { 0.0 }
+println("  === 요약 ===")
+println("  총 정상파:      " + to_string(sw_count) + "건")
+println("  평균 합산강도:  " + to_string(to_int(avg_strength * 100.0)) + "%")
+println("  신규 수렴:      " + to_string(len(new_waves)) + "건")
+println("  기존 골화 확인: " + to_string(len(confirmed_waves)) + "건")
+println("")
+
+// growth_bus 기록
+try {
+    let ts = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+    let entry = "{\"type\":\"standing_wave\",\"domain\":\"" + domain_filter + "\",\"total\":" + to_string(sw_count) + ",\"new\":" + to_string(len(new_waves)) + ",\"confirmed\":" + to_string(len(confirmed_waves)) + ",\"avg_strength\":" + to_string(to_int(avg_strength * 100.0)) + ",\"ts\":\"" + ts + "\"}"
+    exec("echo '" + entry + "' >> " + _bus_path)
+    println("  -> growth_bus.jsonl 기록 완료")
+} catch e {}
+
+println("")
+println("=== standing_wave verified ===")
