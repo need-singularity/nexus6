@@ -26,7 +26,6 @@ if [ "$TOOL_NAME" = "Agent" ]; then
   fi
 fi
 
-exit 0
 
 # ─── L0 가드: Write/Edit 시 파일 경로 확인 ───
 if [ "$TOOL_NAME" = "Write" ] || [ "$TOOL_NAME" = "Edit" ]; then
