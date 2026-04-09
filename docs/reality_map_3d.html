@@ -65,7 +65,9 @@ canvas{display:block}
   <span class="dot" style="background:#66ff99"></span>natural
   <span class="dot" style="background:#ffaa55;margin-left:6px"></span>engineering
   <span class="dot" style="background:#aaaaaa;margin-left:6px"></span>convention<br>
-  <b>조작</b>: 좌클릭 회전 · 우클릭 이동 · 휠 줌
+  <b>조작</b>: 좌클릭 회전 · 우클릭 이동 · 휠 줌<br>
+  <b>인과</b>: C 토글 · 클릭 BFS 시작
+  <div id="causal-badge" style="color:#f77;font-size:10px;margin-top:2px;display:none">CAUSAL MODE ON</div>
 </div>
 <script type="importmap">
 {"imports":{"three":"https://unpkg.com/three@0.160.0/build/three.module.js","three/addons/":"https://unpkg.com/three@0.160.0/examples/jsm/"}}
@@ -91,6 +93,19 @@ const tooltipEl=document.getElementById('tooltip');
 let scene,camera,renderer,controls,raycaster,mouse;
 let nodeMeshes=[]; let edgeLines={parent:null,sibling:null,thread:null};
 let DATA=null;
+
+// ═══ CAUSAL BFS STATE ═══
+let causalMode=false;
+let causalSource=null;       // id of BFS source node
+let causalPaths=[];          // [{from,to,depth,strength}]  BFS edge list
+let causalVisited=new Set();
+let causalAnimT0=0;          // animation start time
+const CAUSAL_STEP_MS=320;    // ms per BFS depth step
+const CAUSAL_EDGE_COLOR=0xff4466;
+const CAUSAL_GLOW_COLOR=0xff6688;
+let causalEdgeMesh=null;     // LineSegments for causal path
+let causalParticles=null;    // Points mesh for flowing particles
+let causalParticleData=[];   // [{pos,dir,speed,edgeIdx,t}]
 
 init();
 loadData();
@@ -189,6 +204,9 @@ function colorFor(n,mode){
 
 function rebuild(){
   if(!DATA) return;
+  // clear causal overlays on rebuild
+  clearCausalVisuals();
+  causalPaths=[]; causalVisited.clear(); causalSource=null;
   // wipe
   nodeMeshes.forEach(m=>{scene.remove(m);m.geometry.dispose();m.material.dispose();});
   nodeMeshes=[];
@@ -321,9 +339,257 @@ function animate(){
     });
     if(t>=1) TWEEN_FROM.clear();
   }
+  // Causal BFS animation
+  updateCausalAnim();
+
   controls.update();
   renderer.render(scene,camera);
 }
+
+// ═══ CAUSAL BFS ENGINE ═══
+function buildAdjacency(){
+  // Build adjacency from all edge lists, with causal weight
+  const adj={};  // id -> [{to, strength}]
+  function addEdge(a,b,strength){
+    if(!adj[a]) adj[a]=[];
+    if(!adj[b]) adj[b]=[];
+    adj[a].push({to:b,strength});
+    adj[b].push({to:a,strength});
+  }
+  const causalFields=['STRUCTURAL','EMPIRICAL','CAUSAL'];
+  function edgeStrength(a,b){
+    // Higher if both nodes have causal fields
+    const na=(DATA.nodes||[]).find(n=>n.id===a);
+    const nb=(DATA.nodes||[]).find(n=>n.id===b);
+    let s=0.3;
+    if(na&&nb){
+      if(causalFields.includes(na.causal)) s+=0.25;
+      if(causalFields.includes(nb.causal)) s+=0.25;
+      if(na.grade==='EXACT'&&nb.grade==='EXACT') s+=0.2;
+    }
+    return Math.min(s,1.0);
+  }
+  (DATA.parent_edges||[]).forEach(e=>{
+    const a=e.from||e[0]||e.parent||e.src||e.source;
+    const b=e.to  ||e[1]||e.child ||e.dst||e.target;
+    if(a&&b) addEdge(a,b,edgeStrength(a,b));
+  });
+  (DATA.sibling_edges||[]).forEach(e=>{
+    const a=e.from||e[0]||e.src||e.source;
+    const b=e.to  ||e[1]||e.dst||e.target;
+    if(a&&b) addEdge(a,b,edgeStrength(a,b)*0.7);
+  });
+  (DATA.thread_edges||[]).forEach(e=>{
+    const a=e.from||e[0]||e.src||e.source;
+    const b=e.to  ||e[1]||e.dst||e.target;
+    if(a&&b) addEdge(a,b,edgeStrength(a,b)*0.5);
+  });
+  return adj;
+}
+
+// node id -> posMap entry (from rebuild)
+function getPosMap(){
+  const pm={};
+  if(!DATA) return pm;
+  (DATA.nodes||[]).forEach((n,i)=>{ pm[n.id]=nodePos(n,i,(DATA.nodes||[]).length); });
+  return pm;
+}
+
+function runCausalBFS(sourceId){
+  const adj=buildAdjacency();
+  causalPaths=[];
+  causalVisited=new Set();
+  causalVisited.add(sourceId);
+  let frontier=[sourceId];
+  let depth=0;
+  while(frontier.length>0 && depth<12){
+    const next=[];
+    for(const cur of frontier){
+      const neighbors=adj[cur]||[];
+      for(const {to,strength} of neighbors){
+        if(causalVisited.has(to)) continue;
+        causalVisited.add(to);
+        causalPaths.push({from:cur,to,depth:depth+1,strength});
+        next.push(to);
+      }
+    }
+    frontier=next;
+    depth++;
+  }
+  causalAnimT0=performance.now();
+}
+
+function clearCausalVisuals(){
+  if(causalEdgeMesh){ scene.remove(causalEdgeMesh); causalEdgeMesh.geometry.dispose(); causalEdgeMesh.material.dispose(); causalEdgeMesh=null; }
+  if(causalParticles){ scene.remove(causalParticles); causalParticles.geometry.dispose(); causalParticles.material.dispose(); causalParticles=null; }
+  causalParticleData=[];
+  // restore node colors
+  nodeMeshes.forEach(m=>{
+    if(m.userData&&m.userData._causalHL){
+      m.material.emissiveIntensity=0.35;
+      m.material.emissive.setHex(colorFor(m.userData,document.querySelector('input[name=cmode]:checked').value));
+      m.userData._causalHL=false;
+    }
+  });
+}
+
+function buildCausalVisuals(){
+  clearCausalVisuals();
+  if(!causalPaths.length) return;
+  const pm=getPosMap();
+  const maxDepth=causalPaths.reduce((m,e)=>Math.max(m,e.depth),1);
+
+  // Build thick edge segments with colors based on strength
+  const positions=[];
+  const colors=[];
+  const edgeEndpoints=[]; // for particles
+  causalPaths.forEach(e=>{
+    const pa=pm[e.from], pb=pm[e.to];
+    if(!pa||!pb) return;
+    positions.push(pa[0],pa[1],pa[2], pb[0],pb[1],pb[2]);
+    // Color: red-hot for strong, dim for weak
+    const r=0.6+0.4*e.strength;
+    const g=0.15+0.15*(1-e.strength);
+    const b=0.2+0.2*(1-e.strength);
+    colors.push(r,g,b, r,g,b);
+    edgeEndpoints.push({a:new THREE.Vector3(pa[0],pa[1],pa[2]), b:new THREE.Vector3(pb[0],pb[1],pb[2]), depth:e.depth, strength:e.strength});
+  });
+
+  if(!positions.length) return;
+
+  const geom=new THREE.BufferGeometry();
+  geom.setAttribute('position',new THREE.Float32BufferAttribute(positions,3));
+  geom.setAttribute('color',new THREE.Float32BufferAttribute(colors,3));
+  const mat=new THREE.LineBasicMaterial({vertexColors:true,transparent:true,opacity:0.0,linewidth:1});
+  causalEdgeMesh=new THREE.LineSegments(geom,mat);
+  scene.add(causalEdgeMesh);
+
+  // Particle system — flowing dots along edges
+  const PARTICLES_PER_EDGE=3;
+  const pCount=edgeEndpoints.length*PARTICLES_PER_EDGE;
+  const pPos=new Float32Array(pCount*3);
+  const pCol=new Float32Array(pCount*3);
+  const pSiz=new Float32Array(pCount);
+  causalParticleData=[];
+  let pi=0;
+  edgeEndpoints.forEach((ep,ei)=>{
+    for(let k=0;k<PARTICLES_PER_EDGE;k++){
+      const t0=k/PARTICLES_PER_EDGE;
+      const speed=0.4+0.6*ep.strength;
+      causalParticleData.push({a:ep.a,b:ep.b,t:t0,speed,depth:ep.depth,strength:ep.strength,idx:pi});
+      pPos[pi*3]=ep.a.x; pPos[pi*3+1]=ep.a.y; pPos[pi*3+2]=ep.a.z;
+      pCol[pi*3]=1.0; pCol[pi*3+1]=0.35; pCol[pi*3+2]=0.4;
+      pSiz[pi]=2.5+2.5*ep.strength;
+      pi++;
+    }
+  });
+  const pGeom=new THREE.BufferGeometry();
+  pGeom.setAttribute('position',new THREE.Float32BufferAttribute(pPos,3));
+  pGeom.setAttribute('color',new THREE.Float32BufferAttribute(pCol,3));
+  pGeom.setAttribute('size',new THREE.Float32BufferAttribute(pSiz,1));
+  const pMat=new THREE.PointsMaterial({size:3.5,vertexColors:true,transparent:true,opacity:0.0,sizeAttenuation:true,blending:THREE.AdditiveBlending,depthWrite:false});
+  causalParticles=new THREE.Points(pGeom,pMat);
+  scene.add(causalParticles);
+}
+
+function updateCausalAnim(){
+  if(!causalMode||!causalPaths.length) return;
+  const elapsed=performance.now()-causalAnimT0;
+  const maxDepth=causalPaths.reduce((m,e)=>Math.max(m,e.depth),1);
+  const revealedDepth=elapsed/CAUSAL_STEP_MS;
+
+  // Fade in edges by depth
+  if(causalEdgeMesh){
+    const posArr=causalEdgeMesh.geometry.attributes.position.array;
+    const colArr=causalEdgeMesh.geometry.attributes.color.array;
+    // We need to track which segments are revealed
+    let si=0;
+    const pm=getPosMap();
+    causalPaths.forEach((e,i)=>{
+      const pa=pm[e.from], pb=pm[e.to];
+      if(!pa||!pb){ si++; return; }
+      const depthFade=Math.max(0,Math.min(1,(revealedDepth-e.depth+1)));
+      // Pulse effect
+      const pulse=0.7+0.3*Math.sin(elapsed*0.004+e.depth);
+      const alpha=depthFade*pulse;
+      const r=(0.6+0.4*e.strength)*alpha;
+      const g=(0.15+0.15*(1-e.strength))*alpha;
+      const b=(0.2+0.2*(1-e.strength))*alpha;
+      colArr[si*6]=r; colArr[si*6+1]=g; colArr[si*6+2]=b;
+      colArr[si*6+3]=r; colArr[si*6+4]=g; colArr[si*6+5]=b;
+      si++;
+    });
+    causalEdgeMesh.geometry.attributes.color.needsUpdate=true;
+    causalEdgeMesh.material.opacity=1.0;
+  }
+
+  // Animate particles flowing along edges
+  if(causalParticles&&causalParticleData.length){
+    const posArr=causalParticles.geometry.attributes.position.array;
+    const colArr=causalParticles.geometry.attributes.color.array;
+    const dt=elapsed*0.001;
+    causalParticleData.forEach(p=>{
+      const depthFade=Math.max(0,Math.min(1,(revealedDepth-p.depth+1)));
+      if(depthFade<=0){
+        posArr[p.idx*3]=p.a.x; posArr[p.idx*3+1]=p.a.y; posArr[p.idx*3+2]=p.a.z;
+        colArr[p.idx*3]=0; colArr[p.idx*3+1]=0; colArr[p.idx*3+2]=0;
+        return;
+      }
+      // Parametric position along edge, cycling
+      const rawT=(p.t+dt*p.speed)%1.0;
+      const x=p.a.x+(p.b.x-p.a.x)*rawT;
+      const y=p.a.y+(p.b.y-p.a.y)*rawT;
+      const z=p.a.z+(p.b.z-p.a.z)*rawT;
+      posArr[p.idx*3]=x; posArr[p.idx*3+1]=y; posArr[p.idx*3+2]=z;
+      const bright=depthFade*(0.6+0.4*Math.sin(dt*3+p.idx));
+      colArr[p.idx*3]=1.0*bright; colArr[p.idx*3+1]=0.3*bright; colArr[p.idx*3+2]=0.4*bright;
+    });
+    causalParticles.geometry.attributes.position.needsUpdate=true;
+    causalParticles.geometry.attributes.color.needsUpdate=true;
+    causalParticles.material.opacity=0.85;
+  }
+
+  // Highlight BFS-visited nodes with glow by depth
+  const nodeById={};
+  nodeMeshes.forEach(m=>{ if(m.userData&&m.userData.id) nodeById[m.userData.id]=m; });
+  // Source node: bright white glow
+  if(causalSource&&nodeById[causalSource]){
+    const src=nodeById[causalSource];
+    src.material.emissive.setHex(0xffffff);
+    src.material.emissiveIntensity=0.8+0.2*Math.sin(elapsed*0.005);
+    src.userData._causalHL=true;
+  }
+  causalPaths.forEach(e=>{
+    const depthFade=Math.max(0,Math.min(1,(revealedDepth-e.depth+1)));
+    if(depthFade<=0) return;
+    const m=nodeById[e.to];
+    if(!m) return;
+    const hue=e.depth/maxDepth;
+    // Red -> orange -> yellow gradient by depth
+    const r=1.0;
+    const g=Math.min(1,hue*1.5);
+    const b=0.1;
+    m.material.emissive.setRGB(r*depthFade,g*depthFade,b*depthFade);
+    m.material.emissiveIntensity=0.5+0.3*depthFade;
+    m.userData._causalHL=true;
+  });
+}
+
+// Click handler for BFS start
+addEventListener('click',ev=>{
+  if(!causalMode||!DATA) return;
+  const clickMouse=new THREE.Vector2((ev.clientX/innerWidth)*2-1,-(ev.clientY/innerHeight)*2+1);
+  const rc=new THREE.Raycaster();
+  rc.setFromCamera(clickMouse,camera);
+  const hits=rc.intersectObjects(nodeMeshes);
+  if(!hits.length) return;
+  const n=hits[0].object.userData;
+  if(!n||!n.id||n.grade==='GAP') return;
+  clearCausalVisuals();
+  causalSource=n.id;
+  runCausalBFS(n.id);
+  buildCausalVisuals();
+});
 
 // ═══ LAYOUT SWITCH ═══
 function setLayout(mode){
@@ -342,5 +608,16 @@ document.querySelectorAll('button[data-layout]').forEach(b=>{
 addEventListener('keydown',e=>{
   const map={'1':'3d_default','2':'1d_spine','3':'2d_grid','4':'3d_cube','5':'hyperroll'};
   if(map[e.key]) setLayout(map[e.key]);
+  if(e.key==='c'||e.key==='C'){
+    causalMode=!causalMode;
+    const badge=document.getElementById('causal-badge');
+    badge.style.display=causalMode?'block':'none';
+    if(!causalMode){
+      clearCausalVisuals();
+      causalSource=null;
+      causalPaths=[];
+      causalVisited.clear();
+    }
+  }
 });
 </script></body></html>
