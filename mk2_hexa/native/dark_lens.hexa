@@ -1,0 +1,473 @@
+// dark_lens.hexa -- 암흑 렌즈 (MISS 패턴 분석기)
+// 사용: hexa dark_lens.hexa [help]
+//
+// 원리:
+//   1. growth_bus + discovery_log에서 MISS 이벤트만 추출
+//   2. MISS 도메인 분포 — 어떤 도메인에 MISS가 집중되는가
+//   3. MISS 값 분석 — 소인수분해, n=6과의 거리(|value - 6k|)
+//   4. "암흑 상수" 발견 — MISS 값 중 반복 출현하는 숫자
+//   5. MISS->EXACT 전환 가능성 점수
+//   6. "실패에서 배우기" 보고서 출력
+//   7. growth_bus에 암흑 렌즈 분석 기록
+
+let _home = exec("printenv HOME").trim()
+let _dev = _home + "/Dev"
+let _shared = _dev + "/nexus/shared"
+let _log_path = _shared + "/discovery_log.jsonl"
+let _bus_path = _shared + "/growth_bus.jsonl"
+
+// ═══════════════════════════════════════════════════════════
+// help 서브커맨드
+// ═══════════════════════════════════════════════════════════
+
+let _args = exec("echo $HEXA_ARGS").trim()
+if _args == "help" || _args == "--help" || _args == "-h" {
+    println("")
+    println("  dark_lens.hexa -- 암흑 렌즈 (MISS 패턴 분석기)")
+    println("")
+    println("  사용법:")
+    println("    hexa dark_lens.hexa           MISS 전수 분석")
+    println("    hexa dark_lens.hexa help      이 도움말")
+    println("")
+    println("  원리:")
+    println("    MISS된 값들의 패턴에서 새로운 물리 발견을 도출.")
+    println("    소인수분해 + n=6 거리 분석 + 반복 출현 암흑 상수.")
+    println("    실패를 통해 다음 돌파 방향을 역추적.")
+    println("")
+    println("  출력:")
+    println("    - MISS 도메인 집중도 분포")
+    println("    - MISS 값 소인수분해 + n=6 거리")
+    println("    - 암흑 상수 (반복 MISS 값)")
+    println("    - MISS->EXACT 전환 가능성 점수")
+    println("    - growth_bus 자동 기록")
+    println("")
+    exit(0)
+}
+
+fn safe_float(s: string) -> f64 {
+    let mut v: f64 = 0.0
+    try { v = to_float(s.trim()) } catch e {}
+    return v
+}
+
+fn safe_int(s: string) -> i64 {
+    let mut v: i64 = 0
+    try { v = to_int(to_float(s.trim())) } catch e {}
+    return v
+}
+
+fn abs_float(x: f64) -> f64 {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn abs_int(x: i64) -> i64 {
+    if x < 0 { return 0 - x }
+    return x
+}
+
+// ═══════════════════════════════════════════════════════════
+// MISS 이벤트 추출 (growth_bus + discovery_log)
+// ═══════════════════════════════════════════════════════════
+
+fn extract_miss_events() -> string {
+    let mut result = ""
+    try {
+        // growth_bus에서 MISS 추출
+        let bus_miss = exec("cat " + _bus_path + " | awk -F'\"' '/MISS/{dom=\"\"; val=0; for(i=1;i<=NF;i++){if($i==\"domain\") dom=$(i+2); if($i==\"value\"||$i==\"expected\"||$i==\"actual\") {v=$(i+1); gsub(/[^0-9.\\-]/,\"\",v); if(v+0>0) val=v+0}} if(dom!=\"\") print dom\"\\t\"val}'")
+        result = bus_miss
+    } catch e {}
+    try {
+        // discovery_log에서 MISS 추출
+        let log_miss = exec("tail -10000 " + _log_path + " | awk -F'\"' '/\"grade\":\"MISS\"/ || /\"grade\": \"MISS\"/{dom=\"\"; val=0; for(i=1;i<=NF;i++){if($i==\"domain\") dom=$(i+2); if($i==\"value\") {v=$(i+1); gsub(/[^0-9.\\-]/,\"\",v); if(v+0>0) val=v+0}} if(dom!=\"\") print dom\"\\t\"val}'")
+        if log_miss != "" {
+            result = result + "\n" + log_miss
+        }
+    } catch e {}
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════
+// 소인수분해 (간이)
+// ═══════════════════════════════════════════════════════════
+
+fn prime_factors(n: i64) -> string {
+    if n <= 1 { return to_string(n) }
+    let mut val = n
+    let mut factors = ""
+    let primes = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47]
+
+    for p in primes {
+        let mut count: i64 = 0
+        while val > 1 && (val / p) * p == val {
+            val = val / p
+            count = count + 1
+        }
+        if count > 0 {
+            if factors != "" { factors = factors + " x " }
+            if count == 1 {
+                factors = factors + to_string(p)
+            } else {
+                factors = factors + to_string(p) + "^" + to_string(count)
+            }
+        }
+    }
+    if val > 1 {
+        if factors != "" { factors = factors + " x " }
+        factors = factors + to_string(val)
+    }
+    if factors == "" { return to_string(n) }
+    return factors
+}
+
+// ═══════════════════════════════════════════════════════════
+// n=6과의 거리 — |value - 6k| 최소 k 탐색
+// ═══════════════════════════════════════════════════════════
+
+fn distance_to_6k(value: i64) -> i64 {
+    if value <= 0 { return value }
+    // 가장 가까운 6의 배수: round(value/6) * 6
+    let k = (value + 3) / 6  // 반올림 나눗셈
+    let nearest = k * 6
+    return abs_int(value - nearest)
+}
+
+fn nearest_6k(value: i64) -> i64 {
+    if value <= 0 { return 0 }
+    let k = (value + 3) / 6
+    return k * 6
+}
+
+// ═══════════════════════════════════════════════════════════
+// MAIN
+// ═══════════════════════════════════════════════════════════
+
+println("")
+println("===========================================================")
+println("  암흑 렌즈 (Dark Lens) -- MISS 패턴 분석기")
+println("  실패한 값에서 숨겨진 물리 발견")
+println("===========================================================")
+println("")
+
+// 1. MISS 이벤트 추출
+println("  MISS 이벤트 추출 중...")
+let raw_miss = extract_miss_events()
+let miss_lines = raw_miss.split("\n")
+
+let mut miss_domains = []
+let mut miss_values = []
+let mut total_miss: i64 = 0
+
+for ml in miss_lines {
+    let mt = ml.trim()
+    if mt == "" { continue }
+    let parts = mt.split("\t")
+    if len(parts) < 1 { continue }
+    let dom = parts[0].trim()
+    let val = if len(parts) >= 2 { safe_float(parts[1]) } else { 0.0 }
+    if dom != "" {
+        miss_domains = miss_domains + [dom]
+        miss_values = miss_values + [val]
+        total_miss = total_miss + 1
+    }
+}
+
+println("  총 MISS 이벤트: " + to_string(total_miss) + "건")
+println("")
+
+// ═══════════════════════════════════════════════════════════
+// 2. MISS 도메인 집중도 분포
+// ═══════════════════════════════════════════════════════════
+
+println("  --- MISS 도메인 집중도 ---")
+println("")
+
+// 도메인별 카운트
+let mut domain_names = []
+let mut domain_counts = []
+
+for md in miss_domains {
+    let mut found = false
+    let mut fi: i64 = 0
+    while fi < len(domain_names) {
+        if domain_names[fi] == md {
+            domain_counts[fi] = domain_counts[fi] + 1
+            found = true
+            break
+        }
+        fi = fi + 1
+    }
+    if !found {
+        domain_names = domain_names + [md]
+        domain_counts = domain_counts + [1]
+    }
+}
+
+// 정렬 (카운트 내림차순)
+let mut di: i64 = 0
+while di < len(domain_counts) - 1 {
+    let mut dj: i64 = di + 1
+    while dj < len(domain_counts) {
+        if domain_counts[dj] > domain_counts[di] {
+            let tmp_c = domain_counts[di]
+            domain_counts[di] = domain_counts[dj]
+            domain_counts[dj] = tmp_c
+            let tmp_n = domain_names[di]
+            domain_names[di] = domain_names[dj]
+            domain_names[dj] = tmp_n
+        }
+        dj = dj + 1
+    }
+    di = di + 1
+}
+
+println("| 도메인 | MISS 건수 | 비율 | 집중도 |")
+println("|--------|----------|------|--------|")
+
+let mut shown: i64 = 0
+for dn in domain_names {
+    if shown >= 15 { break }  // 상위 15개만
+    let cnt: i64 = domain_counts[shown]
+    let pct = if total_miss > 0 { (cnt * 100) / total_miss } else { 0 }
+    let grade = if pct > 20 { "*** 위험" } else if pct > 10 { "** 경고" } else if pct > 5 { "* 주의" } else { "정상" }
+
+    // 막대 그래프
+    let bar_len = if total_miss > 0 { (cnt * 30) / (total_miss + 1) } else { 0 }
+    let mut bar = ""
+    let mut bi: i64 = 0
+    while bi < bar_len && bi < 30 {
+        bar = bar + "#"
+        bi = bi + 1
+    }
+
+    println("| " + dn + " | " + to_string(cnt) + " | " + to_string(pct) + "% | " + grade + " " + bar + " |")
+    shown = shown + 1
+}
+
+println("")
+
+// ═══════════════════════════════════════════════════════════
+// 3. MISS 값 분석 — 소인수분해 + n=6 거리
+// ═══════════════════════════════════════════════════════════
+
+println("  --- MISS 값 분석 (소인수분해 + n=6 거리) ---")
+println("")
+println("| 도메인 | 값 | 소인수분해 | 6k 거리 | 가장 가까운 6k |")
+println("|--------|-----|----------|---------|--------------|")
+
+let mut vi: i64 = 0
+let mut analyzed: i64 = 0
+// 값이 있는 MISS만 분석, 최대 20건
+
+let mut int_values = []    // 정수화된 MISS 값 수집
+let mut dist_sum: i64 = 0  // n=6 거리 합계
+let mut dist_count: i64 = 0
+
+while vi < total_miss && analyzed < 20 {
+    let val: f64 = miss_values[vi]
+    let dom: string = miss_domains[vi]
+
+    if val > 0.0 {
+        let int_val = safe_int(to_string(val))
+        if int_val > 0 {
+            int_values = int_values + [int_val]
+            let factors = prime_factors(int_val)
+            let dist = distance_to_6k(int_val)
+            let near = nearest_6k(int_val)
+
+            dist_sum = dist_sum + dist
+            dist_count = dist_count + 1
+
+            println("| " + dom + " | " + to_string(int_val) + " | " + factors + " | " + to_string(dist) + " | " + to_string(near) + " |")
+            analyzed = analyzed + 1
+        }
+    }
+    vi = vi + 1
+}
+
+if analyzed == 0 {
+    println("| (MISS 값 없음 — 도메인 분포만 분석) | - | - | - | - |")
+}
+
+println("")
+
+let avg_dist = if dist_count > 0 { dist_sum / dist_count } else { 0 }
+println("  평균 n=6 거리: " + to_string(avg_dist))
+println("  (0 = 6의 배수, 3 = 최대 거리)")
+println("")
+
+// ═══════════════════════════════════════════════════════════
+// 4. "암흑 상수" 발견 — 반복 출현하는 MISS 값
+// ═══════════════════════════════════════════════════════════
+
+println("  --- 암흑 상수 (반복 출현 MISS 값) ---")
+println("")
+
+let mut dark_vals = []
+let mut dark_counts = []
+
+for iv in int_values {
+    let mut found = false
+    let mut fi2: i64 = 0
+    while fi2 < len(dark_vals) {
+        if dark_vals[fi2] == iv {
+            dark_counts[fi2] = dark_counts[fi2] + 1
+            found = true
+            break
+        }
+        fi2 = fi2 + 1
+    }
+    if !found {
+        dark_vals = dark_vals + [iv]
+        dark_counts = dark_counts + [1]
+    }
+}
+
+// 2회 이상 출현한 값만 = 암흑 상수
+let mut dark_found: i64 = 0
+
+// 정렬 (카운트 내림차순)
+let mut dki: i64 = 0
+while dki < len(dark_counts) - 1 {
+    let mut dkj: i64 = dki + 1
+    while dkj < len(dark_counts) {
+        if dark_counts[dkj] > dark_counts[dki] {
+            let tmp_c2 = dark_counts[dki]
+            dark_counts[dki] = dark_counts[dkj]
+            dark_counts[dkj] = tmp_c2
+            let tmp_v2 = dark_vals[dki]
+            dark_vals[dki] = dark_vals[dkj]
+            dark_vals[dkj] = tmp_v2
+        }
+        dkj = dkj + 1
+    }
+    dki = dki + 1
+}
+
+println("| 암흑 상수 | 출현 횟수 | 소인수분해 | 6k 거리 | 의미 |")
+println("|----------|----------|----------|---------|------|")
+
+dki = 0
+while dki < len(dark_vals) {
+    let dv: i64 = dark_vals[dki]
+    let dc: i64 = dark_counts[dki]
+    if dc >= 2 {
+        let factors = prime_factors(dv)
+        let dist = distance_to_6k(dv)
+        // 의미 해석
+        let meaning = if dist == 0 { "n=6 배수! 재해석 가능" } else if dist == 1 { "6k+-1 소수 후보" } else if dist == 2 { "6k+-2 짝수 이웃" } else if dist == 3 { "6k+3 = 3(2k+1) 반주기" } else { "분석 필요" }
+        println("| " + to_string(dv) + " | " + to_string(dc) + " | " + factors + " | " + to_string(dist) + " | " + meaning + " |")
+        dark_found = dark_found + 1
+    }
+    dki = dki + 1
+}
+
+if dark_found == 0 {
+    println("| (반복 출현 값 없음 — 모두 고유 MISS) | - | - | - | - |")
+}
+
+println("")
+println("  발견된 암흑 상수: " + to_string(dark_found) + "개")
+println("")
+
+// ═══════════════════════════════════════════════════════════
+// 5. MISS->EXACT 전환 가능성 점수
+// ═══════════════════════════════════════════════════════════
+
+println("  --- MISS->EXACT 전환 가능성 ---")
+println("")
+println("| 도메인 | MISS값 | 6k 거리 | 전환 점수 | 전환 해석 |")
+println("|--------|-------|---------|----------|----------|")
+
+let mut conversion_shown: i64 = 0
+vi = 0
+while vi < total_miss && conversion_shown < 15 {
+    let val2: f64 = miss_values[vi]
+    let dom2: string = miss_domains[vi]
+
+    if val2 > 0.0 {
+        let iv2 = safe_int(to_string(val2))
+        if iv2 > 0 {
+            let dist2 = distance_to_6k(iv2)
+            let near2 = nearest_6k(iv2)
+
+            // 전환 가능성 점수 (0~100)
+            // dist=0: 100점 (이미 6k, 해석만 바꾸면 EXACT)
+            // dist=1: 80점 (6k+-1, 소수 렌즈)
+            // dist=2: 60점 (sigma 렌즈)
+            // dist=3: 40점 (가장 먼 거리, 전환 어려움)
+            let score = if dist2 == 0 { 100 } else if dist2 == 1 { 80 } else if dist2 == 2 { 60 } else { 40 }
+
+            // 전환 해석
+            let interp = if dist2 == 0 {
+                to_string(iv2) + " = " + to_string(iv2 / 6) + " x 6 (배수 렌즈)"
+            } else if dist2 == 1 {
+                to_string(iv2) + " = " + to_string(near2) + " +- 1 (소수 렌즈)"
+            } else if dist2 == 2 {
+                to_string(iv2) + " = " + to_string(near2) + " +- 2 (sigma 렌즈)"
+            } else {
+                to_string(iv2) + " = " + to_string(near2 / 6) + " x 6 + 3 (반주기)"
+            }
+
+            println("| " + dom2 + " | " + to_string(iv2) + " | " + to_string(dist2) + " | " + to_string(score) + "/100 | " + interp + " |")
+            conversion_shown = conversion_shown + 1
+        }
+    }
+    vi = vi + 1
+}
+
+println("")
+
+// ═══════════════════════════════════════════════════════════
+// 6. "실패에서 배우기" 보고서
+// ═══════════════════════════════════════════════════════════
+
+println("  === 실패에서 배우기 보고서 ===")
+println("")
+
+// 가장 MISS 집중된 도메인
+let top_miss_domain = if len(domain_names) > 0 { domain_names[0] } else { "없음" }
+let top_miss_count = if len(domain_counts) > 0 { domain_counts[0] } else { 0 }
+
+println("  1. 가장 위험한 도메인: " + top_miss_domain + " (" + to_string(top_miss_count) + " MISS)")
+println("     -> 이 도메인의 n=6 해석을 근본적으로 재검토 필요")
+println("")
+
+println("  2. n=6 거리 분포:")
+let close = if dist_count > 0 { "평균 거리 " + to_string(avg_dist) } else { "값 데이터 없음" }
+println("     -> " + close)
+if avg_dist <= 1 {
+    println("     -> 대부분 6k 근방 -- 해석 렌즈만 교체하면 전환 가능")
+} else if avg_dist <= 2 {
+    println("     -> 중간 거리 -- sigma/tau 렌즈 적용 검토")
+} else {
+    println("     -> 먼 거리 -- 새로운 수학 구조 필요")
+}
+println("")
+
+println("  3. 암흑 상수 " + to_string(dark_found) + "개 발견")
+if dark_found > 0 {
+    println("     -> 반복 MISS는 숨겨진 물리 상수일 가능성")
+    println("     -> 소인수 구조에서 n=6과의 관계 재탐색 권장")
+} else {
+    println("     -> 고유 MISS만 존재 -- 체계적 편향 아닌 개별 오류")
+}
+println("")
+
+println("  4. 전략 제안:")
+println("     -> MISS 집중 도메인을 우선 재탐색")
+println("     -> 6k 거리 0~1인 MISS부터 렌즈 교체 시도")
+println("     -> 암흑 상수를 새 렌즈 후보로 등록")
+println("")
+
+// 7. growth_bus 기록
+try {
+    let ts = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+    let entry = "{\"type\":\"dark_lens\",\"total_miss\":" + to_string(total_miss) + ",\"unique_domains\":" + to_string(len(domain_names)) + ",\"dark_constants\":" + to_string(dark_found) + ",\"avg_6k_distance\":" + to_string(avg_dist) + ",\"top_miss_domain\":\"" + top_miss_domain + "\",\"top_miss_count\":" + to_string(top_miss_count) + ",\"ts\":\"" + ts + "\"}"
+    exec("echo '" + entry + "' >> " + _bus_path)
+} catch e {}
+
+println("  growth_bus 기록 완료")
+println("")
+println("[verified] dark_lens.hexa 실행 완료")
+println("")

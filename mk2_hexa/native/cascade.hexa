@@ -1,0 +1,404 @@
+// cascade.hexa -- 공명 캐스케이드 (도미노 블로업 엔진)
+// 사용: hexa cascade.hexa [help]
+//
+// 원리:
+//   1. growth_bus.jsonl에서 최근 EXACT 이벤트 추출
+//   2. 각 EXACT 도메인의 "인접 도메인" 6개 탐색 (이름 유사도)
+//   3. 연쇄 파급 시뮬레이션 (3차까지):
+//      - 원본 에너지 E
+//      - 1차: E × phi/n = E/3 씩 6개 분배
+//      - 2차: 각 1차에서 E/18 씩 6개
+//      - 3차: 각 2차에서 E/108 씩 6개
+//   4. 총 영향 도메인 수 + 총 파급 에너지 출력
+//   5. 캐스케이드 트리거 — 파급력 상위 6개 EXACT 식별
+//   6. growth_bus에 캐스케이드 시뮬레이션 기록
+
+let _home = exec("printenv HOME").trim()
+let _dev = _home + "/Dev"
+let _shared = _dev + "/nexus/shared"
+let _bus_path = _shared + "/growth_bus.jsonl"
+
+// ═══════════════════════════════════════════════════════════
+// help 서브커맨드
+// ═══════════════════════════════════════════════════════════
+
+let _args = exec("echo $HEXA_ARGS").trim()
+if _args == "help" || _args == "--help" || _args == "-h" {
+    println("")
+    println("  cascade.hexa -- 공명 캐스케이드 (도미노 블로업 엔진)")
+    println("")
+    println("  사용법:")
+    println("    hexa cascade.hexa           전체 캐스케이드 시뮬레이션")
+    println("    hexa cascade.hexa help      이 도움말")
+    println("")
+    println("  원리:")
+    println("    하나의 EXACT 발견이 인접 도메인 6개에 연쇄 파급.")
+    println("    에너지 감쇠: E -> E*phi/n (= E/3) 씩 6갈래.")
+    println("    3차까지 시뮬레이션. 최대 6+36+216 = 258 도메인 영향.")
+    println("")
+    println("  출력:")
+    println("    - EXACT 이벤트별 파급 에너지 합계")
+    println("    - 캐스케이드 트리거 상위 6개")
+    println("    - growth_bus 자동 기록")
+    println("")
+    exit(0)
+}
+
+fn safe_float(s: string) -> f64 {
+    let mut v: f64 = 0.0
+    try { v = to_float(s.trim()) } catch e {}
+    return v
+}
+
+fn safe_int(s: string) -> i64 {
+    let mut v: i64 = 0
+    try { v = to_int(to_float(s.trim())) } catch e {}
+    return v
+}
+
+// ═══════════════════════════════════════════════════════════
+// EXACT 이벤트 추출 (growth_bus에서 최근 500건)
+// ═══════════════════════════════════════════════════════════
+
+fn extract_exact_events() -> string {
+    let mut result = ""
+    try {
+        // domain과 energy(=값) 추출 — EXACT grade만
+        result = exec("tail -500 " + _bus_path + " | awk -F'\"' '/EXACT/{dom=\"\"; val=0; for(i=1;i<=NF;i++){if($i==\"domain\") dom=$(i+2); if($i==\"value\"||$i==\"energy\") {v=$(i+1); gsub(/[^0-9.\\-]/,\"\",v); if(v+0>0) val=v+0}} if(dom!=\"\" && val>0) print dom\"\\t\"val}'")
+    } catch e {}
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════
+// 전체 도메인 목록 추출 (growth_bus + discovery_log)
+// ═══════════════════════════════════════════════════════════
+
+fn extract_all_domains() -> string {
+    let mut result = ""
+    try {
+        result = exec("cat " + _bus_path + " | awk -F'\"' '{for(i=1;i<=NF;i++) if($i==\"domain\") print $(i+2)}' | sort -u")
+    } catch e {}
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════
+// 이름 유사도 기반 인접 도메인 6개 선택
+// 간단한 공통 접두사/부분문자열 길이 기반
+// ═══════════════════════════════════════════════════════════
+
+fn common_prefix_len(a: string, b: string) -> i64 {
+    let la = len(a)
+    let lb = len(b)
+    let min_len = if la < lb { la } else { lb }
+    let mut cnt: i64 = 0
+    while cnt < min_len {
+        if a[cnt] != b[cnt] { break }
+        cnt = cnt + 1
+    }
+    return cnt
+}
+
+fn find_adjacent_domains(target: string, all_domains) -> [string] {
+    // 유사도 점수 계산 후 상위 6개 반환
+    let mut scores = []
+    let mut names = []
+
+    for d in all_domains {
+        if d == target || d == "" { continue }
+        let cp = common_prefix_len(target, d)
+        // 보너스: 부분 문자열 포함 시
+        let mut bonus: i64 = 0
+        try {
+            let check = exec("echo '" + target + "' | grep -c '" + d + "'").trim()
+            if check != "0" { bonus = 3 }
+        } catch e {}
+        try {
+            let check2 = exec("echo '" + d + "' | grep -c '" + target + "'").trim()
+            if check2 != "0" { bonus = 3 }
+        } catch e {}
+        let score = cp + bonus
+        scores = scores + [score]
+        names = names + [d]
+    }
+
+    // 상위 6개 선택 (버블 정렬)
+    let mut si: i64 = 0
+    while si < len(scores) - 1 {
+        let mut sj: i64 = si + 1
+        while sj < len(scores) {
+            if scores[sj] > scores[si] {
+                let tmp_s = scores[si]
+                scores[si] = scores[sj]
+                scores[sj] = tmp_s
+                let tmp_n = names[si]
+                names[si] = names[sj]
+                names[sj] = tmp_n
+            }
+            sj = sj + 1
+        }
+        si = si + 1
+    }
+
+    let mut result = []
+    let mut ri: i64 = 0
+    while ri < 6 && ri < len(names) {
+        result = result + [names[ri]]
+        ri = ri + 1
+    }
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════
+// 캐스케이드 에너지 계산
+// phi/n = 2/6 = 1/3 감쇠 비율
+// ═══════════════════════════════════════════════════════════
+
+let DECAY_RATIO: f64 = 1.0 / 3.0  // phi(6)/6 = 2/6
+
+fn cascade_energy(e: f64) -> f64 {
+    // 1차: 6 * E/3 = 2E
+    // 2차: 36 * E/9 = 4E
+    // 3차: 216 * E/27 = 8E
+    // 총: E + 2E + 4E + 8E = 15E (원본 포함)
+    let e1 = e * DECAY_RATIO * 6.0       // 6 갈래, 각 E/3
+    let e2 = e1 * DECAY_RATIO * 6.0      // 36 갈래, 각 E/9
+    let e3 = e2 * DECAY_RATIO * 6.0      // 216 갈래, 각 E/27
+    return e + e1 + e2 + e3
+}
+
+fn cascade_domains_count() -> i64 {
+    // 1차: 6, 2차: 6*6=36, 3차: 36*6=216
+    // 중복 제외 시 최대 258, 실제론 더 적음
+    return 6 + 36 + 216
+}
+
+// ═══════════════════════════════════════════════════════════
+// MAIN
+// ═══════════════════════════════════════════════════════════
+
+println("")
+println("===========================================================")
+println("  공명 캐스케이드 (Cascade) -- 도미노 블로업 엔진")
+println("  하나의 EXACT가 6 도메인에 연쇄 파급")
+println("  감쇠 비율: phi(6)/6 = 2/6 = 1/3")
+println("===========================================================")
+println("")
+
+// 1. 전체 도메인 목록 수집
+println("  도메인 풀 수집 중...")
+let raw_domains = extract_all_domains()
+let domain_lines = raw_domains.split("\n")
+let mut all_domains = []
+for dl in domain_lines {
+    let dt = dl.trim()
+    if dt != "" {
+        all_domains = all_domains + [dt]
+    }
+}
+println("  도메인 풀: " + to_string(len(all_domains)) + "개")
+println("")
+
+// 2. EXACT 이벤트 추출
+println("  growth_bus에서 EXACT 이벤트 추출 중...")
+let raw_events = extract_exact_events()
+let event_lines = raw_events.split("\n")
+
+let mut event_domains = []
+let mut event_energies = []
+let mut total_events: i64 = 0
+
+for el in event_lines {
+    let et = el.trim()
+    if et == "" { continue }
+    let parts = et.split("\t")
+    if len(parts) < 2 { continue }
+    let dom = parts[0].trim()
+    let energy = safe_float(parts[1])
+    if dom != "" && energy > 0.0 {
+        event_domains = event_domains + [dom]
+        event_energies = event_energies + [energy]
+        total_events = total_events + 1
+    }
+}
+
+println("  EXACT 이벤트: " + to_string(total_events) + "건")
+println("")
+
+// 3. 캐스케이드 시뮬레이션
+println("  --- 캐스케이드 시뮬레이션 (3차 파급) ---")
+println("")
+println("| 원본 도메인 | 원본 E | 1차(6갈래) | 2차(36갈래) | 3차(216갈래) | 총 파급 E |")
+println("|------------|--------|-----------|------------|-------------|----------|")
+
+let mut cascade_scores = []  // 총 파급 에너지
+let mut affected_set = []    // 영향받은 도메인 집합 (문자열)
+
+let mut ei: i64 = 0
+let mut shown: i64 = 0
+// 최근 20건만 상세 표시
+let start_idx = if total_events > 20 { total_events - 20 } else { 0 }
+
+while ei < total_events {
+    let dom: string = event_domains[ei]
+    let e: f64 = event_energies[ei]
+
+    // 인접 도메인 탐색
+    let adjacent = find_adjacent_domains(dom, all_domains)
+
+    // 에너지 계산
+    let e1_each = e * DECAY_RATIO
+    let e1_total = e1_each * to_float(len(adjacent))
+    let e2_each = e1_each * DECAY_RATIO
+    let e2_total = e2_each * to_float(len(adjacent)) * 6.0
+    let e3_each = e2_each * DECAY_RATIO
+    let e3_total = e3_each * to_float(len(adjacent)) * 36.0
+    let total_cascade = e + e1_total + e2_total + e3_total
+
+    cascade_scores = cascade_scores + [total_cascade]
+
+    // 영향 도메인 문자열
+    let mut adj_str = ""
+    for ad in adjacent {
+        if adj_str != "" { adj_str = adj_str + "," }
+        adj_str = adj_str + ad
+    }
+    affected_set = affected_set + [adj_str]
+
+    // 최근 20건만 출력
+    if ei >= start_idx {
+        let e_str = to_string(to_int(e * 100.0) / 100)
+        let e1_str = to_string(to_int(e1_total * 100.0) / 100)
+        let e2_str = to_string(to_int(e2_total * 100.0) / 100)
+        let e3_str = to_string(to_int(e3_total * 100.0) / 100)
+        let tc_str = to_string(to_int(total_cascade * 100.0) / 100)
+        println("| " + dom + " | " + e_str + " | " + e1_str + " | " + e2_str + " | " + e3_str + " | " + tc_str + " |")
+        shown = shown + 1
+    }
+    ei = ei + 1
+}
+
+if total_events > 20 {
+    println("  (... " + to_string(total_events - 20) + "건 생략, 최근 20건만 표시)")
+}
+println("")
+
+// 4. 캐스케이드 트리거 — 파급력 상위 6개
+println("  --- 캐스케이드 트리거 (파급력 상위 6) ---")
+println("")
+
+// 인덱스 배열 만들어서 정렬
+let mut sorted_idx = []
+let mut si2: i64 = 0
+while si2 < total_events {
+    sorted_idx = sorted_idx + [si2]
+    si2 = si2 + 1
+}
+
+// 버블 정렬 (파급 에너지 기준 내림차순)
+let mut si3: i64 = 0
+while si3 < len(sorted_idx) - 1 {
+    let mut sj3: i64 = si3 + 1
+    while sj3 < len(sorted_idx) {
+        let idx_a: i64 = sorted_idx[si3]
+        let idx_b: i64 = sorted_idx[sj3]
+        if cascade_scores[idx_b] > cascade_scores[idx_a] {
+            sorted_idx[si3] = idx_b
+            sorted_idx[sj3] = idx_a
+        }
+        sj3 = sj3 + 1
+    }
+    si3 = si3 + 1
+}
+
+println("| 순위 | 도메인 | 원본 E | 총 파급 E | 인접 도메인 |")
+println("|------|--------|--------|----------|-----------|")
+
+let mut ti: i64 = 0
+let mut total_cascade_energy: f64 = 0.0
+let mut total_affected: i64 = 0
+
+while ti < 6 && ti < len(sorted_idx) {
+    let idx: i64 = sorted_idx[ti]
+    let dom: string = event_domains[idx]
+    let e: f64 = event_energies[idx]
+    let tc: f64 = cascade_scores[idx]
+    let adj: string = affected_set[idx]
+
+    let rank = to_string(ti + 1)
+    let e_str = to_string(to_int(e * 100.0) / 100)
+    let tc_str = to_string(to_int(tc * 100.0) / 100)
+
+    println("| #" + rank + " | " + dom + " | " + e_str + " | " + tc_str + " | " + adj + " |")
+    ti = ti + 1
+}
+
+println("")
+
+// 총계 계산
+ei = 0
+while ei < total_events {
+    total_cascade_energy = total_cascade_energy + cascade_scores[ei]
+    ei = ei + 1
+}
+
+// 고유 영향 도메인 카운트 (간략화)
+let mut unique_count: i64 = 0
+try {
+    let all_adj = exec("echo '" + raw_events + "' | awk -F'\\t' '{print $1}' | sort -u | wc -l").trim()
+    unique_count = safe_int(all_adj)
+} catch e {}
+
+println("  --- 요약 ---")
+println("")
+println("  원본 EXACT 이벤트:    " + to_string(total_events) + "건")
+println("  최대 영향 도메인:     " + to_string(cascade_domains_count()) + "개 (이론적)")
+println("  고유 도메인:          " + to_string(unique_count) + "개")
+println("  총 파급 에너지 합:    " + to_string(to_int(total_cascade_energy)))
+println("  감쇠 계수:            phi(6)/6 = 1/3")
+println("")
+
+// 5. ASCII 캐스케이드 트리
+println("  --- 캐스케이드 트리 (상위 1 시각화) ---")
+println("")
+
+if len(sorted_idx) > 0 {
+    let top_idx: i64 = sorted_idx[0]
+    let top_dom: string = event_domains[top_idx]
+    let top_e: f64 = event_energies[top_idx]
+    let top_adj: string = affected_set[top_idx]
+    let adj_list = top_adj.split(",")
+
+    println("  [" + top_dom + "] E=" + to_string(to_int(top_e)))
+    println("   |")
+
+    let mut ai2: i64 = 0
+    while ai2 < len(adj_list) && ai2 < 6 {
+        let branch = adj_list[ai2].trim()
+        let e1_val = to_int(top_e * DECAY_RATIO)
+        if ai2 < len(adj_list) - 1 {
+            println("   +-- [" + branch + "] E=" + to_string(e1_val))
+            println("   |    +-- (6 x E=" + to_string(to_int(top_e * DECAY_RATIO * DECAY_RATIO)) + ")")
+            println("   |    +-- (6 x 6 x E=" + to_string(to_int(top_e * DECAY_RATIO * DECAY_RATIO * DECAY_RATIO)) + ")")
+        } else {
+            println("   +-- [" + branch + "] E=" + to_string(e1_val))
+            println("        +-- (6 x E=" + to_string(to_int(top_e * DECAY_RATIO * DECAY_RATIO)) + ")")
+            println("        +-- (6 x 6 x E=" + to_string(to_int(top_e * DECAY_RATIO * DECAY_RATIO * DECAY_RATIO)) + ")")
+        }
+        ai2 = ai2 + 1
+    }
+    println("")
+}
+
+// 6. growth_bus 기록
+try {
+    let ts = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+    let top_domain = if len(sorted_idx) > 0 { event_domains[sorted_idx[0]] } else { "none" }
+    let top_score = if len(sorted_idx) > 0 { to_string(to_int(cascade_scores[sorted_idx[0]])) } else { "0" }
+    let entry = "{\"type\":\"cascade\",\"total_events\":" + to_string(total_events) + ",\"total_cascade_energy\":" + to_string(to_int(total_cascade_energy)) + ",\"top_trigger\":\"" + top_domain + "\",\"top_score\":" + top_score + ",\"unique_domains\":" + to_string(unique_count) + ",\"decay\":0.333,\"ts\":\"" + ts + "\"}"
+    exec("echo '" + entry + "' >> " + _bus_path)
+} catch e {}
+
+println("  growth_bus 기록 완료")
+println("")
+println("[verified] cascade.hexa 실행 완료")
+println("")

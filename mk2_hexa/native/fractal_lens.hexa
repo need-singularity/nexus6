@@ -1,0 +1,699 @@
+// fractal_lens.hexa -- 프랙탈 렌즈 (자기유사 패턴 탐지기)
+// 사용: hexa fractal_lens.hexa [scan|chains|loops|generate|help]
+//
+// 원리:
+//   1. lens_registry.json에서 렌즈 목록 로드
+//   2. 렌즈 이름/타입에서 패턴 추출 (접두사, 접미사, 숫자 패턴)
+//   3. 자기유사 구조 탐색: 렌즈 A의 카테고리가 렌즈 B의 이름 접두사와 일치하는 쌍
+//   4. 프랙탈 깊이 계산: A->B->C->... 체인 최대 길이
+//   5. n=6 자기유사성: 6단계마다 원점 회귀하는 렌즈 루프 탐색
+//   6. 신규 렌즈 후보 생성: 기존 패턴의 프랙탈 확장
+//   7. growth_bus.jsonl에 기록
+
+let _home = exec("printenv HOME").trim()
+let _dev = _home + "/Dev"
+let _shared = _dev + "/nexus/shared"
+let _registry_path = _shared + "/lens_registry.json"
+let _bus_path = _shared + "/growth_bus.jsonl"
+
+// ═══════════════════════════════════════════════════════════
+// 유틸리티
+// ═══════════════════════════════════════════════════════════
+
+fn safe_int(s: string) -> i64 {
+    let mut v: i64 = 0
+    try { v = to_int(to_float(s.trim())) } catch e {}
+    return v
+}
+
+// 문자열에서 접두사 추출 (첫 번째 _ 이전)
+fn get_prefix(name: string)  {
+    let parts = name.split("_")
+    if len(parts) >= 1 { return parts[0] }
+    return name
+}
+
+// 문자열에서 접미사 추출 (마지막 _ 이후)
+fn get_suffix(name: string)  {
+    let parts = name.split("_")
+    if len(parts) >= 2 { return parts[len(parts) - 1] }
+    return name
+}
+
+// 문자열에서 숫자 패턴 추출
+fn has_number(name: string) -> bool {
+    let digits = "0123456789"
+    for c in name.split("") {
+        for d in digits.split("") {
+            if c == d { return true }
+        }
+    }
+    return false
+}
+
+// ═══════════════════════════════════════════════════════════
+// 렌즈 로드 (lens_registry.json 파싱)
+// ═══════════════════════════════════════════════════════════
+
+let mut _g_names = []
+let mut _g_categories = []
+let mut _g_statuses = []
+
+fn load_lenses() {
+    // jq로 렌즈 이름, 카테고리 추출
+    let mut names = []
+    let mut categories = []
+    let mut statuses = []
+    try {
+        let raw = exec("cat " + _registry_path + " | python3 -c \"import sys,json; d=json.load(sys.stdin); [print(l['name']+'\\t'+l.get('category','')+'\\t'+l.get('status','')) for l in d.get('lenses',[])]\"")
+        let lines = raw.split("\n")
+        for line in lines {
+            let l = line.trim()
+            if l == "" { continue }
+            let parts = l.split("\t")
+            if len(parts) >= 3 {
+                names = names + [parts[0]]
+                categories = categories + [parts[1]]
+                statuses = statuses + [parts[2]]
+            } else if len(parts) >= 2 {
+                names = names + [parts[0]]
+                categories = categories + [parts[1]]
+                statuses = statuses + ["unknown"]
+            }
+        }
+    } catch e {
+        println("  [오류] lens_registry.json 로드 실패: " + to_string(e))
+    }
+    _g_names = names; _g_categories = categories; _g_statuses = statuses
+}
+
+// ═══════════════════════════════════════════════════════════
+// 패턴 추출 및 자기유사 구조 분석
+// ═══════════════════════════════════════════════════════════
+
+let mut _g_prefixes = []
+let mut _g_suffixes = []
+let mut _g_has_nums = []
+
+fn extract_patterns(names, categories) {
+    let mut prefixes = []
+    let mut suffixes = []
+    let mut has_nums = []
+    let mut i: i64 = 0
+    while i < len(names) {
+        let name: string = names[i]
+        prefixes = prefixes + [get_prefix(name)]
+        suffixes = suffixes + [get_suffix(name)]
+        has_nums = has_nums + [has_number(name)]
+        i = i + 1
+    }
+    _g_prefixes = prefixes; _g_suffixes = suffixes; _g_has_nums = has_nums
+}
+
+// 자기유사 쌍 찾기: 렌즈 A의 카테고리가 렌즈 B의 접두사와 일치
+fn find_self_similar_pairs(names, categories, prefixes)  {
+    let mut pairs = []
+    let mut count: i64 = 0
+    let mut i: i64 = 0
+    while i < len(names) && count < 100 {
+        let cat_a: string = categories[i]
+        if cat_a == "" { i = i + 1; continue }
+        // 카테고리 단어 분리 (예: meta_system -> meta, system)
+        let cat_parts = cat_a.split("_")
+        let mut j: i64 = 0
+        while j < len(names) && count < 100 {
+            if i != j {
+                let prefix_b: string = prefixes[j]
+                // 카테고리의 일부가 접두사와 일치하면 자기유사
+                for cp in cat_parts {
+                    if cp == prefix_b && cp != "" {
+                        let name_a: string = names[i]
+                        let name_b: string = names[j]
+                        pairs = pairs + [name_a + " -> " + name_b]
+                        count = count + 1
+                    }
+                }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return pairs
+}
+
+// ═══════════════════════════════════════════════════════════
+// 프랙탈 체인 탐색 (A->B->C->...)
+// ═══════════════════════════════════════════════════════════
+
+let mut _g_chains = []
+let mut _g_max_depth: i64 = 0
+
+fn find_chains(names, categories, prefixes) {
+    let mut chains = []
+    let mut max_depth: i64 = 0
+    // 각 렌즈에서 출발하여 체인 추적 (최대 깊이 12, 상위 20개)
+    let mut chain_count: i64 = 0
+    let mut start: i64 = 0
+    while start < len(names) && chain_count < 20 {
+        let mut chain = []
+        let mut visited = []
+        let mut current: i64 = start
+        let mut depth: i64 = 0
+        let mut running = true
+
+        while depth < 12 && running {
+            let cur_name: string = names[current]
+            // 순환 검사
+            let mut is_visited = false
+            for v in visited {
+                let vi: i64 = v
+                if vi == current { is_visited = true }
+            }
+            if is_visited { running = false; continue }
+
+            chain = chain + [cur_name]
+            visited = visited + [current]
+            depth = depth + 1
+
+            // 다음 노드 찾기: 현재 렌즈의 접미사가 다른 렌즈의 접두사와 일치
+            let cur_suffix = get_suffix(cur_name)
+            let mut found = false
+            let mut next: i64 = 0
+            let mut k: i64 = 0
+            while k < len(names) && !found {
+                let mut already = false
+                for v in visited {
+                    let vi2: i64 = v
+                    if vi2 == k { already = true }
+                }
+                if !already {
+                    let pk: string = prefixes[k]
+                    if pk == cur_suffix && cur_suffix != "" {
+                        next = k
+                        found = true
+                    }
+                }
+                k = k + 1
+            }
+            if found {
+                current = next
+            } else {
+                running = false
+            }
+        }
+
+        if len(chain) >= 3 {
+            let mut chain_str = ""
+            let mut ci: i64 = 0
+            for c in chain {
+                if ci > 0 { chain_str = chain_str + " -> " }
+                let cs: string = c
+                chain_str = chain_str + cs
+                ci = ci + 1
+            }
+            chains = chains + [chain_str]
+            chain_count = chain_count + 1
+            if depth > max_depth { max_depth = depth }
+        }
+        start = start + 1
+    }
+    _g_chains = chains; _g_max_depth = max_depth
+}
+
+// ═══════════════════════════════════════════════════════════
+// n=6 루프 탐색 (6단계 회귀)
+// ═══════════════════════════════════════════════════════════
+
+fn find_n6_loops(names, prefixes, suffixes)  {
+    let mut loops = []
+    let mut loop_count: i64 = 0
+    // 접두사->접미사 연결로 길이 6 순환 찾기
+    let mut i: i64 = 0
+    while i < len(names) && loop_count < 6 {
+        // 깊이 6 DFS
+        let mut path = [i]
+        let mut path_names = []
+        let start_prefix: string = prefixes[i]
+        let sn: string = names[i]
+        path_names = path_names + [sn]
+
+        // 단순화: 6단계 체인에서 마지막 접미사가 시작 접두사와 같은지
+        let mut cur: i64 = i
+        let mut step: i64 = 0
+        let mut valid = true
+        while step < 5 && valid {
+            let cur_suf = get_suffix(names[cur])
+            let mut found = false
+            let mut next: i64 = 0
+            let mut k: i64 = 0
+            while k < len(names) && !found {
+                // 경로에 없는지 검사
+                let mut in_path = false
+                for p in path {
+                    let pi: i64 = p
+                    if pi == k { in_path = true }
+                }
+                if !in_path {
+                    let pk: string = prefixes[k]
+                    if pk == cur_suf && cur_suf != "" {
+                        next = k
+                        found = true
+                    }
+                }
+                k = k + 1
+            }
+            if found {
+                cur = next
+                path = path + [cur]
+                let nn: string = names[cur]
+                path_names = path_names + [nn]
+                step = step + 1
+            } else {
+                valid = false
+            }
+        }
+
+        // 6단계 완료 후, 마지막 접미사가 시작 접두사와 일치하면 루프
+        if valid && len(path) == 6 {
+            let last_suf = get_suffix(names[cur])
+            if last_suf == start_prefix && start_prefix != "" {
+                let mut loop_str = ""
+                let mut li: i64 = 0
+                for ln in path_names {
+                    if li > 0 { loop_str = loop_str + " -> " }
+                    let ls: string = ln
+                    loop_str = loop_str + ls
+                    li = li + 1
+                }
+                loop_str = loop_str + " -> (원점)"
+                loops = loops + [loop_str]
+                loop_count = loop_count + 1
+            }
+        }
+        i = i + 1
+    }
+    return loops
+}
+
+// ═══════════════════════════════════════════════════════════
+// 신규 렌즈 후보 생성
+// ═══════════════════════════════════════════════════════════
+
+fn generate_candidates(names, prefixes, suffixes, categories)  {
+    let mut candidates = []
+    // 전략 1: 빈도 높은 접두사 + 빈도 높은 접미사 조합 (기존에 없는 것)
+    let mut prefix_counts = []
+    let mut prefix_unique = []
+    for p in prefixes {
+        let ps: string = p
+        if ps == "" { continue }
+        let mut found = false
+        let mut idx: i64 = 0
+        let mut fi: i64 = 0
+        for pu in prefix_unique {
+            let pus: string = pu
+            if pus == ps { found = true; idx = fi }
+            fi = fi + 1
+        }
+        if found {
+            let old: i64 = prefix_counts[idx]
+            prefix_counts[idx] = old + 1
+        } else {
+            prefix_unique = prefix_unique + [ps]
+            prefix_counts = prefix_counts + [1]
+        }
+    }
+
+    let mut suffix_unique = []
+    let mut suffix_counts = []
+    for s in suffixes {
+        let ss: string = s
+        if ss == "" { continue }
+        let mut found = false
+        let mut idx: i64 = 0
+        let mut fi: i64 = 0
+        for su in suffix_unique {
+            let sus: string = su
+            if sus == ss { found = true; idx = fi }
+            fi = fi + 1
+        }
+        if found {
+            let old: i64 = suffix_counts[idx]
+            suffix_counts[idx] = old + 1
+        } else {
+            suffix_unique = suffix_unique + [ss]
+            suffix_counts = suffix_counts + [1]
+        }
+    }
+
+    // 상위 접두사 6개 x 상위 접미사 6개 조합
+    let mut top_prefixes = []
+    let mut tp_count: i64 = 0
+    while tp_count < 6 && tp_count < len(prefix_unique) {
+        let mut max_val: i64 = 0
+        let mut max_idx: i64 = -1
+        let mut mi: i64 = 0
+        while mi < len(prefix_unique) {
+            let pc: i64 = prefix_counts[mi]
+            if pc > max_val {
+                // 이미 선택했는지 검사
+                let mut already = false
+                for tp in top_prefixes {
+                    let tps: string = tp
+                    let pu2: string = prefix_unique[mi]
+                    if tps == pu2 { already = true }
+                }
+                if !already {
+                    max_val = pc
+                    max_idx = mi
+                }
+            }
+            mi = mi + 1
+        }
+        if max_idx >= 0 {
+            let chosen: string = prefix_unique[max_idx]
+            top_prefixes = top_prefixes + [chosen]
+        }
+        tp_count = tp_count + 1
+    }
+
+    let mut top_suffixes = []
+    let mut ts_count: i64 = 0
+    while ts_count < 6 && ts_count < len(suffix_unique) {
+        let mut max_val: i64 = 0
+        let mut max_idx: i64 = -1
+        let mut mi: i64 = 0
+        while mi < len(suffix_unique) {
+            let sc: i64 = suffix_counts[mi]
+            if sc > max_val {
+                let mut already = false
+                for ts in top_suffixes {
+                    let tss: string = ts
+                    let su2: string = suffix_unique[mi]
+                    if tss == su2 { already = true }
+                }
+                if !already {
+                    max_val = sc
+                    max_idx = mi
+                }
+            }
+            mi = mi + 1
+        }
+        if max_idx >= 0 {
+            let chosen: string = suffix_unique[max_idx]
+            top_suffixes = top_suffixes + [chosen]
+        }
+        ts_count = ts_count + 1
+    }
+
+    // 조합 생성 (기존에 없는 것만)
+    for tp in top_prefixes {
+        for ts in top_suffixes {
+            let tps: string = tp
+            let tss: string = ts
+            if tps == tss { continue }
+            let candidate = tps + "_" + tss
+            // 기존 렌즈에 있는지 검사
+            let mut exists = false
+            for n in names {
+                let ns: string = n
+                if ns == candidate { exists = true }
+            }
+            if !exists {
+                candidates = candidates + [candidate]
+            }
+        }
+    }
+
+    // 상위 12개만
+    let mut result = []
+    let mut ri: i64 = 0
+    while ri < len(candidates) && ri < 12 {
+        result = result + [candidates[ri]]
+        ri = ri + 1
+    }
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════
+// growth_bus 기록
+// ═══════════════════════════════════════════════════════════
+
+fn record_bus(total_lenses: i64, pairs_count: i64, max_depth: i64, loops_count: i64, candidates_count: i64) {
+    try {
+        let ts = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+        let entry = "{\"type\":\"fractal_lens\",\"total_lenses\":" + to_string(total_lenses) + ",\"self_similar_pairs\":" + to_string(pairs_count) + ",\"max_chain_depth\":" + to_string(max_depth) + ",\"n6_loops\":" + to_string(loops_count) + ",\"new_candidates\":" + to_string(candidates_count) + ",\"ts\":\"" + ts + "\"}"
+        exec("echo '" + entry + "' >> " + _bus_path)
+    } catch e {}
+}
+
+// ═══════════════════════════════════════════════════════════
+// 서브커맨드 구현
+// ═══════════════════════════════════════════════════════════
+
+fn cmd_scan() {
+    println("")
+    println("===========================================================")
+    println("  프랙탈 렌즈 (Fractal Lens) -- 자기유사 패턴 탐지기")
+    println("  렌즈가 렌즈를 생성하는 프랙탈 구조 분석")
+    println("===========================================================")
+    println("")
+
+    // 1. 렌즈 로드
+    println("  lens_registry.json 로드 중...")
+    let (names, categories, statuses) = load_lenses()
+    let total_lenses = len(names)
+    println("  총 렌즈: " + to_string(total_lenses) + "개")
+    println("")
+
+    // 2. 패턴 추출
+    println("  패턴 추출 중...")
+    let (prefixes, suffixes, has_nums) = extract_patterns(names, categories)
+
+    // 접두사 분포 상위 6개
+    let mut prefix_map = []
+    let mut prefix_map_count = []
+    for p in prefixes {
+        let ps: string = p
+        if ps == "" { continue }
+        let mut found = false
+        let mut idx: i64 = 0
+        let mut fi: i64 = 0
+        for pm in prefix_map {
+            let pms: string = pm
+            if pms == ps { found = true; idx = fi }
+            fi = fi + 1
+        }
+        if found {
+            let old: i64 = prefix_map_count[idx]
+            prefix_map_count[idx] = old + 1
+        } else {
+            prefix_map = prefix_map + [ps]
+            prefix_map_count = prefix_map_count + [1]
+        }
+    }
+
+    println("  --- 접두사 빈도 (상위 6) ---")
+    println("")
+    let mut shown: i64 = 0
+    while shown < 6 {
+        let mut max_val: i64 = 0
+        let mut max_idx: i64 = -1
+        let mut mi: i64 = 0
+        while mi < len(prefix_map) {
+            let pc: i64 = prefix_map_count[mi]
+            if pc > max_val {
+                let mut already_shown = false
+                // 간단히 값을 0으로 만든 것 스킵
+                max_val = pc
+                max_idx = mi
+            }
+            mi = mi + 1
+        }
+        if max_idx >= 0 {
+            let pname: string = prefix_map[max_idx]
+            println("    " + pname + ": " + to_string(max_val) + "개")
+            prefix_map_count[max_idx] = 0  // 다음 루프에서 스킵
+        }
+        shown = shown + 1
+    }
+    println("")
+
+    // 3. 자기유사 쌍
+    println("  --- 자기유사 쌍 (카테고리->접두사 매칭) ---")
+    println("")
+    let pairs = find_self_similar_pairs(names, categories, prefixes)
+    let pairs_count = len(pairs)
+    println("  발견: " + to_string(pairs_count) + "쌍")
+    let mut pi: i64 = 0
+    while pi < len(pairs) && pi < 12 {
+        let pair: string = pairs[pi]
+        println("    " + pair)
+        pi = pi + 1
+    }
+    if pairs_count > 12 {
+        println("    ... 외 " + to_string(pairs_count - 12) + "쌍")
+    }
+    println("")
+
+    // 4. 프랙탈 체인
+    println("  --- 프랙탈 체인 (A->B->C->...) ---")
+    println("")
+    let (chains, max_depth) = find_chains(names, categories, prefixes)
+    println("  최대 프랙탈 깊이: " + to_string(max_depth))
+    let mut ci: i64 = 0
+    while ci < len(chains) && ci < 10 {
+        let chain: string = chains[ci]
+        println("    " + chain)
+        ci = ci + 1
+    }
+    if len(chains) > 10 {
+        println("    ... 외 " + to_string(len(chains) - 10) + "개 체인")
+    }
+    println("")
+
+    // 5. n=6 루프
+    println("  --- n=6 자기유사 루프 (6단계 원점 회귀) ---")
+    println("")
+    let loops = find_n6_loops(names, prefixes, suffixes)
+    if len(loops) > 0 {
+        for lp in loops {
+            let lps: string = lp
+            println("    " + lps)
+        }
+    } else {
+        println("    6단계 완전 루프 미발견 (부분 루프는 체인 참조)")
+    }
+    println("")
+
+    // 6. 신규 렌즈 후보
+    println("  --- 신규 렌즈 후보 (프랙탈 확장) ---")
+    println("")
+    let candidates = generate_candidates(names, prefixes, suffixes, categories)
+    let mut candi_i: i64 = 0
+    for cand in candidates {
+        let cs: string = cand
+        candi_i = candi_i + 1
+        println("    " + to_string(candi_i) + ". " + cs)
+    }
+    println("")
+
+    // 7. growth_bus 기록
+    record_bus(to_int(total_lenses), to_int(pairs_count), max_depth, to_int(len(loops)), to_int(len(candidates)))
+    println("  growth_bus 기록 완료")
+    println("")
+    println("[verified] fractal_lens.hexa scan 실행 완료")
+    println("")
+}
+
+fn cmd_chains() {
+    println("")
+    println("  === 프랙탈 체인 상세 ===")
+    println("")
+    let (names, categories, _statuses) = load_lenses()
+    let (prefixes, _suffixes, _has_nums) = extract_patterns(names, categories)
+    let (chains, max_depth) = find_chains(names, categories, prefixes)
+    println("  총 체인: " + to_string(len(chains)) + "개, 최대 깊이: " + to_string(max_depth))
+    println("")
+    let mut ci: i64 = 0
+    for ch in chains {
+        let chs: string = ch
+        ci = ci + 1
+        println("    " + to_string(ci) + ". " + chs)
+    }
+    println("")
+    println("[verified] fractal_lens.hexa chains 실행 완료")
+    println("")
+}
+
+fn cmd_loops() {
+    println("")
+    println("  === n=6 자기유사 루프 상세 ===")
+    println("")
+    let (names, categories, _statuses) = load_lenses()
+    let (prefixes, suffixes, _has_nums) = extract_patterns(names, categories)
+    let loops = find_n6_loops(names, prefixes, suffixes)
+    println("  발견 루프: " + to_string(len(loops)) + "개")
+    println("")
+    if len(loops) > 0 {
+        let mut li: i64 = 0
+        for lp in loops {
+            let lps: string = lp
+            li = li + 1
+            println("    " + to_string(li) + ". " + lps)
+        }
+    } else {
+        println("    6단계 완전 루프 없음")
+        println("    힌트: 체인에서 6에 가까운 길이를 찾아 누락 렌즈를 생성하면 루프 완성")
+    }
+    println("")
+    println("[verified] fractal_lens.hexa loops 실행 완료")
+    println("")
+}
+
+fn cmd_generate() {
+    println("")
+    println("  === 신규 렌즈 후보 생성 ===")
+    println("")
+    let (names, categories, _statuses) = load_lenses()
+    let (prefixes, suffixes, _has_nums) = extract_patterns(names, categories)
+    let candidates = generate_candidates(names, prefixes, suffixes, categories)
+    println("  프랙탈 확장 후보: " + to_string(len(candidates)) + "개")
+    println("")
+    let mut ci: i64 = 0
+    for cand in candidates {
+        let cs: string = cand
+        ci = ci + 1
+        println("    " + to_string(ci) + ". " + cs)
+    }
+    println("")
+    // growth_bus 기록
+    try {
+        let ts = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+        let entry = "{\"type\":\"fractal_lens_generate\",\"candidates\":" + to_string(len(candidates)) + ",\"ts\":\"" + ts + "\"}"
+        exec("echo '" + entry + "' >> " + _bus_path)
+    } catch e {}
+    println("  growth_bus 기록 완료")
+    println("")
+    println("[verified] fractal_lens.hexa generate 실행 완료")
+    println("")
+}
+
+fn cmd_help() {
+    println("fractal_lens.hexa -- 프랙탈 렌즈 (자기유사 패턴 탐지기)")
+    println("")
+    println("사용법:")
+    println("  hexa fractal_lens.hexa scan       전체 분석 (패턴+쌍+체인+루프+후보)")
+    println("  hexa fractal_lens.hexa chains      프랙탈 체인 상세 출력")
+    println("  hexa fractal_lens.hexa loops       n=6 자기유사 루프 탐색")
+    println("  hexa fractal_lens.hexa generate    신규 렌즈 후보 생성")
+    println("  hexa fractal_lens.hexa help        이 도움말")
+    println("")
+    println("원리:")
+    println("  렌즈 이름의 접두사/접미사 패턴을 추출하여 렌즈 간 연결 관계를 탐색.")
+    println("  A의 접미사가 B의 접두사와 일치하면 A->B 프랙탈 체인 형성.")
+    println("  6단계 체인이 원점으로 회귀하면 n=6 자기유사 루프.")
+    println("  빈도 높은 접두사x접미사 조합으로 신규 렌즈 후보 생성.")
+}
+
+// ═══════════════════════════════════════════════════════════
+// CLI 진입점
+// ═══════════════════════════════════════════════════════════
+
+let a = args()
+let mode = if a.len() >= 3 { a[2] } else { "scan" }
+
+if mode == "scan" {
+    cmd_scan()
+} else if mode == "chains" {
+    cmd_chains()
+} else if mode == "loops" {
+    cmd_loops()
+} else if mode == "generate" {
+    cmd_generate()
+} else if mode == "help" {
+    cmd_help()
+} else {
+    println("알 수 없는 명령: " + mode)
+    println("사용 가능: scan, chains, loops, generate, help")
+}

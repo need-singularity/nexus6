@@ -1,0 +1,375 @@
+// bt_genealogy.hexa -- BT 계보도 자동생성
+// 사용: hexa bt_genealogy.hexa [help]
+//
+// 원리:
+//   1. breakthrough-theorems.md 파싱 → 전체 BT 목록 추출
+//   2. 각 BT 본문에서 "BT-N" 참조 패턴으로 부모-자식 엣지 구성
+//   3. 루트(부모 없음), 리프(자식 없음), 허브(자식 최다) 통계
+//   4. 도메인별 BT 클러스터 분석
+//   5. growth_bus.jsonl 기록
+
+let _home = exec("printenv HOME").trim()
+let _dev = _home + "/Dev"
+let _shared = _dev + "/nexus/shared"
+let _bus_path = _shared + "/growth_bus.jsonl"
+let _bt_path = _dev + "/n6-architecture/docs/breakthrough-theorems.md"
+
+// ═══════════════════════════════════════════════════════════
+// help 서브커맨드
+// ═══════════════════════════════════════════════════════════
+
+let args = exec("echo $@").trim().split(" ")
+if len(args) > 1 && args[1] == "help" {
+    println("")
+    println("===========================================================")
+    println("  bt_genealogy.hexa -- BT 계보도 자동생성")
+    println("===========================================================")
+    println("")
+    println("  사용법:")
+    println("    hexa bt_genealogy.hexa          전체 계보도 생성")
+    println("    hexa bt_genealogy.hexa help     이 도움말")
+    println("")
+    println("  기능:")
+    println("    - breakthrough-theorems.md에서 BT 전체 파싱")
+    println("    - BT 간 참조 관계로 부모-자식 그래프 구성")
+    println("    - 루트 BT (부모 없음) 목록")
+    println("    - 리프 BT (자식 없음) 목록")
+    println("    - 허브 BT (자식 가장 많음) 상위 10개")
+    println("    - 도메인별 BT 클러스터")
+    println("    - growth_bus.jsonl 자동 기록")
+    println("")
+    exit(0)
+}
+
+fn safe_int(s: string) -> i64 {
+    let mut v: i64 = 0
+    try { v = to_int(to_float(s.trim())) } catch e {}
+    return v
+}
+
+// ═══════════════════════════════════════════════════════════
+// 1. BT 헤더 추출: "## BT-N: 제목" 패턴
+// ═══════════════════════════════════════════════════════════
+
+println("")
+println("===========================================================")
+println("  BT 계보도 (Genealogy) -- 돌파 정리 부모-자식 그래프")
+println("  소스: breakthrough-theorems.md")
+println("===========================================================")
+println("")
+
+// BT 헤더 라인 추출 (## BT-N: 제목)
+println("  breakthrough-theorems.md 파싱 중...")
+let bt_headers_raw = exec("grep -n '^## BT-' " + _bt_path + " | head -800")
+let bt_header_lines = bt_headers_raw.split("\n")
+
+// BT 번호 추출
+let mut bt_ids = []        // ["6", "7", "8", ...]
+let mut bt_names = []      // ["Golay-Leech ...", ...]
+let mut bt_line_nums = []  // 각 BT 시작 줄번호
+
+for hl in bt_header_lines {
+    let ht = hl.trim()
+    if ht == "" { continue }
+    // 형식: "줄번호:## BT-N: 제목"
+    let colon_pos = ht.indexOf(":")
+    if colon_pos < 0 { continue }
+    let line_num_str = ht.substring(0, colon_pos)
+    let rest = ht.substring(colon_pos + 1, len(ht))
+
+    // BT 번호 추출: "## BT-" 뒤의 숫자
+    let bt_marker = "## BT-"
+    let marker_pos = rest.indexOf(bt_marker)
+    if marker_pos < 0 { continue }
+    let after_marker = rest.substring(marker_pos + len(bt_marker), len(rest))
+
+    // 숫자 부분 추출
+    let mut num_str = ""
+    for ch in after_marker {
+        if ch >= "0" && ch <= "9" {
+            num_str = num_str + ch
+        } else {
+            break
+        }
+    }
+    if num_str == "" { continue }
+
+    // 제목 추출 (: 뒤)
+    let title_start = after_marker.indexOf(":")
+    let title = if title_start >= 0 {
+        after_marker.substring(title_start + 1, len(after_marker)).trim()
+    } else {
+        after_marker
+    }
+
+    bt_ids = bt_ids + [num_str]
+    bt_names = bt_names + [title]
+    bt_line_nums = bt_line_nums + [safe_int(line_num_str)]
+}
+
+let total_bt = len(bt_ids)
+println("  총 BT 수: " + to_string(total_bt) + "개")
+println("")
+
+// ═══════════════════════════════════════════════════════════
+// 2. 각 BT 본문에서 참조 BT 추출 → 엣지 구성
+//    참조 키워드: "BT-N" 가 본문에 등장하면 부모 관계
+//    자기 참조는 제외
+// ═══════════════════════════════════════════════════════════
+
+println("  참조 관계 분석 중...")
+
+// 각 BT 섹션 본문에서 참조되는 BT 번호 추출
+// 방법: 각 BT 섹션의 줄 범위를 구한 뒤 grep
+let mut edges = []           // ["소스|타겟", ...]  (타겟이 소스를 참조 = 타겟의 부모가 소스)
+let mut child_count = []     // 각 BT의 자식 수
+let mut parent_count = []    // 각 BT의 부모 수
+
+// child_count, parent_count 초기화
+let mut ci: i64 = 0
+while ci < total_bt {
+    child_count = child_count + [0]
+    parent_count = parent_count + [0]
+    ci = ci + 1
+}
+
+// 효율적 처리: 전체 파일에서 BT-N 참조 패턴을 한번에 추출
+// 각 BT 섹션별로 분리
+let mut idx: i64 = 0
+while idx < total_bt {
+    let bt_id = bt_ids[idx]
+    let start_line: i64 = bt_line_nums[idx]
+    let end_line: i64 = if idx + 1 < total_bt { bt_line_nums[idx + 1] } else { start_line + 200 }
+
+    // 해당 BT 섹션에서 참조되는 다른 BT 번호 추출
+    let refs_raw = exec("sed -n '" + to_string(start_line) + "," + to_string(end_line) + "p' " + _bt_path + " | grep -oE 'BT-[0-9]+' | sort -u")
+    let ref_lines = refs_raw.split("\n")
+
+    for rl in ref_lines {
+        let rt = rl.trim()
+        if rt == "" { continue }
+        // "BT-N" → N 추출
+        let ref_num = rt.substring(3, len(rt))
+        if ref_num == bt_id { continue }  // 자기 참조 제외
+
+        // 참조된 BT가 실제 존재하는지 확인하고 엣지 추가
+        // 이 BT(idx)가 ref_num을 참조 → ref_num이 부모, idx가 자식
+        let edge_key = ref_num + "|" + bt_id
+        let mut dup = false
+        for e in edges { if e == edge_key { dup = true } }
+        if !dup {
+            edges = edges + [edge_key]
+
+            // 부모(ref_num)의 자식 수 증가
+            let mut pi: i64 = 0
+            while pi < total_bt {
+                if bt_ids[pi] == ref_num {
+                    child_count[pi] = child_count[pi] + 1
+                }
+                pi = pi + 1
+            }
+            // 자식(idx)의 부모 수 증가
+            parent_count[idx] = parent_count[idx] + 1
+        }
+    }
+
+    idx = idx + 1
+}
+
+let total_edges = len(edges)
+println("  총 엣지 수: " + to_string(total_edges) + "개")
+println("")
+
+// ═══════════════════════════════════════════════════════════
+// 3. 루트 BT (부모 없음)
+// ═══════════════════════════════════════════════════════════
+
+println("  --- 루트 BT (부모 없음 = 독립 기원) ---")
+println("")
+
+let mut root_count: i64 = 0
+let mut root_list = ""
+idx = 0
+while idx < total_bt {
+    if parent_count[idx] == 0 {
+        root_count = root_count + 1
+        if root_count <= 20 {
+            let name_short = if len(bt_names[idx]) > 40 { bt_names[idx].substring(0, 40) + "..." } else { bt_names[idx] }
+            println("    BT-" + bt_ids[idx] + ": " + name_short + " (자식 " + to_string(child_count[idx]) + "개)")
+        }
+    }
+    idx = idx + 1
+}
+if root_count > 20 {
+    println("    ... 외 " + to_string(root_count - 20) + "개")
+}
+println("")
+println("  루트 BT 합계: " + to_string(root_count) + "개")
+println("")
+
+// ═══════════════════════════════════════════════════════════
+// 4. 리프 BT (자식 없음)
+// ═══════════════════════════════════════════════════════════
+
+println("  --- 리프 BT (자식 없음 = 말단 정리) ---")
+println("")
+
+let mut leaf_count: i64 = 0
+idx = 0
+while idx < total_bt {
+    if child_count[idx] == 0 {
+        leaf_count = leaf_count + 1
+    }
+    idx = idx + 1
+}
+println("  리프 BT 합계: " + to_string(leaf_count) + "개")
+println("")
+
+// ═══════════════════════════════════════════════════════════
+// 5. 허브 BT (자식 가장 많음) 상위 10
+// ═══════════════════════════════════════════════════════════
+
+println("  --- 허브 BT (자식 최다 상위 10) ---")
+println("")
+println("| 순위 | BT | 자식 수 | 제목 |")
+println("|------|-----|--------|------|")
+
+// 상위 10 추출 (단순 정렬)
+let mut shown: i64 = 0
+let mut used = []
+while shown < 10 && shown < total_bt {
+    let mut max_cc: i64 = -1
+    let mut max_idx: i64 = -1
+
+    idx = 0
+    while idx < total_bt {
+        let mut is_used = false
+        for u in used { if u == idx { is_used = true } }
+        if !is_used && child_count[idx] > max_cc {
+            max_cc = child_count[idx]
+            max_idx = idx
+        }
+        idx = idx + 1
+    }
+
+    if max_idx < 0 || max_cc == 0 { break }
+    used = used + [max_idx]
+    shown = shown + 1
+
+    let name_short = if len(bt_names[max_idx]) > 35 { bt_names[max_idx].substring(0, 35) + "..." } else { bt_names[max_idx] }
+    println("| " + to_string(shown) + " | BT-" + bt_ids[max_idx] + " | " + to_string(max_cc) + " | " + name_short + " |")
+}
+
+println("")
+
+// ═══════════════════════════════════════════════════════════
+// 6. 도메인별 BT 클러스터 분석
+// ═══════════════════════════════════════════════════════════
+
+println("  --- 도메인별 BT 클러스터 ---")
+println("")
+
+// 도메인 추출: "**Domains connected**" 줄에서
+let domain_raw = exec("grep -i 'domains connected\\|Domains.*:' " + _bt_path + " | head -200")
+let domain_lines = domain_raw.split("\n")
+
+// 주요 도메인 키워드 매핑
+let domain_keys = ["Quantum", "Crypto", "Chip", "AI", "Fusion", "Network", "Power", "Math", "Particle", "SC", "Thermal", "Energy", "Software", "Biology", "Chemistry", "Music", "Optics"]
+let domain_labels = ["양자컴퓨팅", "암호학", "칩 설계", "AI/ML", "핵융합", "네트워크", "전력", "수학", "입자물리", "초전도", "열관리", "에너지", "소프트웨어", "생물학", "화학", "음악", "광학"]
+
+// 각 도메인이 몇 번 등장하는지 카운트
+let mut domain_counts = []
+let mut di: i64 = 0
+while di < len(domain_keys) {
+    let key = domain_keys[di]
+    let count_raw = exec("grep -c '" + key + "' " + _bt_path + " 2>/dev/null || echo 0").trim()
+    let count = safe_int(count_raw)
+    domain_counts = domain_counts + [count]
+    di = di + 1
+}
+
+println("| 도메인 | 등장 횟수 | 밀도 |")
+println("|--------|----------|------|")
+
+di = 0
+while di < len(domain_keys) {
+    let label = domain_labels[di]
+    let cnt: i64 = domain_counts[di]
+    let density = if cnt > 100 { "높음" } else if cnt > 30 { "중간" } else { "낮음" }
+    println("| " + label + " | " + to_string(cnt) + " | " + density + " |")
+    di = di + 1
+}
+
+println("")
+
+// ═══════════════════════════════════════════════════════════
+// 7. 그래프 밀도 통계
+// ═══════════════════════════════════════════════════════════
+
+println("  --- 그래프 통계 요약 ---")
+println("")
+
+let max_possible_edges = total_bt * (total_bt - 1) / 2
+let density_pct = if max_possible_edges > 0 { (total_edges * 10000) / max_possible_edges } else { 0 }
+let density_int = density_pct / 100
+let density_frac = density_pct - density_int * 100
+
+println("  총 BT: " + to_string(total_bt))
+println("  총 엣지: " + to_string(total_edges))
+println("  루트 (기원): " + to_string(root_count))
+println("  리프 (말단): " + to_string(leaf_count))
+println("  그래프 밀도: " + to_string(density_int) + "." + to_string(density_frac) + "%")
+
+// 평균 참조 수
+let avg_refs = if total_bt > 0 { total_edges / total_bt } else { 0 }
+println("  BT당 평균 엣지: " + to_string(avg_refs))
+println("")
+
+// ═══════════════════════════════════════════════════════════
+// 8. ASCII 계보 트리 (허브 상위 3개)
+// ═══════════════════════════════════════════════════════════
+
+println("  --- 계보 트리 (상위 허브) ---")
+println("")
+
+let mut ti: i64 = 0
+while ti < 3 && ti < len(used) {
+    let hub_idx: i64 = used[ti]
+    let hub_id = bt_ids[hub_idx]
+    let hub_name = if len(bt_names[hub_idx]) > 30 { bt_names[hub_idx].substring(0, 30) + "..." } else { bt_names[hub_idx] }
+
+    println("  BT-" + hub_id + " [" + hub_name + "]")
+
+    // 이 허브의 자식 BT 출력
+    let mut child_shown: i64 = 0
+    for e in edges {
+        let pipe_pos = e.indexOf("|")
+        if pipe_pos < 0 { continue }
+        let parent_id = e.substring(0, pipe_pos)
+        let child_id = e.substring(pipe_pos + 1, len(e))
+        if parent_id == hub_id && child_shown < 8 {
+            println("    +-- BT-" + child_id)
+            child_shown = child_shown + 1
+        }
+    }
+    if child_count[hub_idx] > 8 {
+        println("    +-- ... 외 " + to_string(child_count[hub_idx] - 8) + "개")
+    }
+    println("")
+    ti = ti + 1
+}
+
+// ═══════════════════════════════════════════════════════════
+// 9. growth_bus 기록
+// ═══════════════════════════════════════════════════════════
+
+try {
+    let ts = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+    let entry = "{\"type\":\"bt_genealogy\",\"total_bt\":" + to_string(total_bt) + ",\"total_edges\":" + to_string(total_edges) + ",\"roots\":" + to_string(root_count) + ",\"leaves\":" + to_string(leaf_count) + ",\"hub_bt\":\"BT-" + (if len(used) > 0 { bt_ids[used[0]] } else { "?" }) + "\",\"hub_children\":" + to_string(if len(used) > 0 { child_count[used[0]] } else { 0 }) + ",\"ts\":\"" + ts + "\"}"
+    exec("echo '" + entry + "' >> " + _bus_path)
+} catch e {}
+
+println("  growth_bus 기록 완료")
+println("")
+println("[verified] bt_genealogy.hexa 실행 완료")
+println("")

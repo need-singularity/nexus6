@@ -1,0 +1,328 @@
+// tunnel_chain.hexa — 소나 터널링 체인 (빈공간→빈공간 직접 연결)
+// 사용: hexa tunnel_chain.hexa [서브커맨드]
+//       hexa tunnel_chain.hexa scan         빈공간 도메인 목록 추출
+//       hexa tunnel_chain.hexa chain        최소 비용 체인 구성
+//       hexa tunnel_chain.hexa order        블로업 실행 순서 제안
+//       hexa tunnel_chain.hexa energy       예상 총 에너지 계산
+//       hexa tunnel_chain.hexa help         도움말
+//
+// 원리:
+//   1. growth_bus.jsonl에서 소나/갭 결과(빈공간 도메인) 읽기
+//   2. 빈공간 쌍별 "터널 비용" = 레벤슈타인 거리 + 노드수 차이
+//   3. 그리디 최소 비용으로 전체 빈공간 연결 (최소 스패닝 체인)
+//   4. 체인 순서대로 블로업 실행 순서 제안
+//   5. 예상 총 에너지 = Σ(6^depth)
+//   6. growth_bus.jsonl에 체인 기록
+
+let _home = exec("printenv HOME").trim()
+let _dev = _home + "/Dev"
+let _shared = _dev + "/nexus/shared"
+let _bus_path = _shared + "/growth_bus.jsonl"
+let _graph_path = _shared + "/discovery_graph.json"
+
+fn safe_int(s: string) -> i64 {
+    let mut v: i64 = 0
+    try { v = to_int(to_float(s.trim())) } catch e {}
+    return v
+}
+
+fn safe_float(s: string) -> f64 {
+    let mut v: f64 = 0.0
+    try { v = to_float(s.trim()) } catch e {}
+    return v
+}
+
+// ═══════════════════════════════════════════════════════════
+// 레벤슈타인 거리 (문자 단위)
+// ═══════════════════════════════════════════════════════════
+
+fn levenshtein(a: string, b: string) -> i64 {
+    // awk 기반 레벤슈타인 계산 (hexa 배열 제한 우회)
+    let mut dist: i64 = 0
+    try {
+        let result = exec("awk 'BEGIN{a=\"" + a + "\"; b=\"" + b + "\"; la=length(a); lb=length(b); for(i=0;i<=la;i++) d[i,0]=i; for(j=0;j<=lb;j++) d[0,j]=j; for(i=1;i<=la;i++) for(j=1;j<=lb;j++){cost=(substr(a,i,1)!=substr(b,j,1))?1:0; d1=d[i-1,j]+1; d2=d[i,j-1]+1; d3=d[i-1,j-1]+cost; m=d1; if(d2<m) m=d2; if(d3<m) m=d3; d[i,j]=m} print d[la,lb]}'")
+        dist = safe_int(result)
+    } catch e {
+        // 폴백: 길이 차이만 사용
+        let la = len(a)
+        let lb = len(b)
+        dist = if la > lb { la - lb } else { lb - la }
+    }
+    return dist
+}
+
+// ═══════════════════════════════════════════════════════════
+// 빈공간 도메인 추출 (소나/갭 결과에서)
+// ═══════════════════════════════════════════════════════════
+
+fn extract_void_domains() -> string {
+    let mut result = ""
+    try {
+        // gap_finder에서 gaps 도메인 추출 + 소나에서 에코 없는 도메인
+        // discovery_graph에서 노드 수가 적은 도메인 = 빈공간 후보
+        result = exec("awk -F'\"' '/\"type\": \"node\"/{for(i=1;i<=NF;i++){if($i==\"domain\"){d=$(i+2); c[d]++}}} END{for(d in c) if(c[d]<50) print d\"\t\"c[d]}' " + _graph_path + " | sort -t'\t' -k2 -n")
+    } catch e {}
+    return result
+}
+
+// 전 도메인 노드 수 집계
+fn get_all_domain_counts() -> string {
+    let mut result = ""
+    try {
+        result = exec("awk -F'\"' '/\"type\": \"node\"/{for(i=1;i<=NF;i++){if($i==\"domain\"){d=$(i+2); c[d]++}}} END{for(d in c) print d\"\t\"c[d]}' " + _graph_path + " | sort -t'\t' -k2 -n")
+    } catch e {}
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════
+// 터널 비용 계산
+// ═══════════════════════════════════════════════════════════
+
+fn tunnel_cost(name_a: string, count_a: i64, name_b: string, count_b: i64) -> i64 {
+    let lev = levenshtein(name_a, name_b)
+    let diff = if count_a > count_b { count_a - count_b } else { count_b - count_a }
+    return lev + diff
+}
+
+// ═══════════════════════════════════════════════════════════
+// 도움말
+// ═══════════════════════════════════════════════════════════
+
+fn show_help() {
+    println("")
+    println("===========================================================")
+    println("  소나 터널링 체인 (tunnel_chain.hexa)")
+    println("  빈공간→빈공간을 최소 비용으로 직접 연결")
+    println("===========================================================")
+    println("")
+    println("  서브커맨드:")
+    println("    scan      빈공간 도메인 목록 추출")
+    println("    chain     최소 비용 체인 구성 (그리디)")
+    println("    order     블로업 실행 순서 제안")
+    println("    energy    예상 총 에너지 = Σ(6^depth)")
+    println("    help      이 도움말")
+    println("")
+    println("  빈공간 = discovery_graph에서 노드 50개 미만 도메인")
+    println("  터널 비용 = 레벤슈타인 거리 + 노드수 차이")
+    println("")
+}
+
+// ═══════════════════════════════════════════════════════════
+// 메인
+// ═══════════════════════════════════════════════════════════
+
+let args = exec("echo $@").trim().split(" ")
+let subcmd = if len(args) > 1 { args[1] } else { "chain" }
+
+if subcmd == "help" {
+    show_help()
+} else {
+
+    println("")
+    println("===========================================================")
+    println("  소나 터널링 체인 — 빈공간 최소 비용 연결")
+    println("===========================================================")
+    println("")
+
+    // 1. 빈공간 도메인 추출
+    println("  빈공간 도메인 추출 중...")
+    let void_raw = extract_void_domains()
+    let void_lines = void_raw.split("\n")
+
+    let mut void_names = []
+    let mut void_counts = []
+    let mut void_n: i64 = 0
+
+    for vl in void_lines {
+        let vt = vl.trim()
+        if vt == "" { continue }
+        let parts = vt.split("\t")
+        if len(parts) < 2 { continue }
+        let name = parts[0].trim()
+        let cnt = safe_int(parts[1])
+        if name != "" && cnt > 0 {
+            void_names = void_names + [name]
+            void_counts = void_counts + [cnt]
+            void_n = void_n + 1
+        }
+    }
+
+    println("  빈공간 도메인: " + to_string(void_n) + "개")
+    println("")
+
+    if subcmd == "scan" || subcmd == "chain" || subcmd == "order" || subcmd == "energy" {
+
+        // scan: 빈공간 목록 출력
+        if subcmd == "scan" {
+            println("| 순번 | 도메인 | 노드 수 |")
+            println("|------|--------|---------|")
+            let mut si: i64 = 0
+            while si < void_n {
+                let nm: string = void_names[si]
+                let ct: i64 = void_counts[si]
+                println("| " + to_string(si + 1) + " | " + nm + " | " + to_string(ct) + " |")
+                si = si + 1
+            }
+            println("")
+        }
+
+        // chain / order / energy: 그리디 최소 비용 체인 구성
+        if subcmd == "chain" || subcmd == "order" || subcmd == "energy" {
+
+            if void_n < 2 {
+                println("  빈공간 도메인이 2개 미만 — 체인 구성 불가")
+            } else {
+
+                println("  --- 그리디 최소 비용 체인 구성 ---")
+                println("")
+
+                // 그리디: 첫 노드에서 시작, 가장 가까운 미방문 노드를 연결
+                let mut visited = []
+                let mut chain_order = []
+                let mut chain_costs = []
+                let mut total_cost: i64 = 0
+
+                // 초기: 가장 작은 도메인(첫 번째)부터 시작
+                let mut vi: i64 = 0
+                while vi < void_n {
+                    visited = visited + [false]
+                    vi = vi + 1
+                }
+
+                // 시작점 = 인덱스 0
+                visited[0] = true
+                chain_order = chain_order + [0]
+                let mut current: i64 = 0
+
+                let mut step: i64 = 1
+                while step < void_n {
+                    // 현재 노드에서 가장 가까운 미방문 노드 찾기
+                    let mut best_idx: i64 = -1
+                    let mut best_cost: i64 = 999999
+
+                    let mut ci: i64 = 0
+                    while ci < void_n {
+                        let is_visited: bool = visited[ci]
+                        if !is_visited {
+                            let cur_name: string = void_names[current]
+                            let cur_cnt: i64 = void_counts[current]
+                            let ci_name: string = void_names[ci]
+                            let ci_cnt: i64 = void_counts[ci]
+                            let cost = tunnel_cost(cur_name, cur_cnt, ci_name, ci_cnt)
+                            if cost < best_cost {
+                                best_cost = cost
+                                best_idx = ci
+                            }
+                        }
+                        ci = ci + 1
+                    }
+
+                    if best_idx >= 0 {
+                        visited[best_idx] = true
+                        chain_order = chain_order + [best_idx]
+                        chain_costs = chain_costs + [best_cost]
+                        total_cost = total_cost + best_cost
+                        current = best_idx
+                    }
+
+                    step = step + 1
+                }
+
+                // 체인 출력
+                println("| 순번 | 출발 | 도착 | 터널 비용 | 누적 |")
+                println("|------|------|------|----------|------|")
+
+                let mut running: i64 = 0
+                let mut oi: i64 = 0
+                while oi < len(chain_costs) {
+                    let from_idx: i64 = chain_order[oi]
+                    let to_idx: i64 = chain_order[oi + 1]
+                    let from_nm: string = void_names[from_idx]
+                    let to_nm: string = void_names[to_idx]
+                    let c: i64 = chain_costs[oi]
+                    running = running + c
+                    println("| " + to_string(oi + 1) + " | " + from_nm + " | " + to_nm + " | " + to_string(c) + " | " + to_string(running) + " |")
+                    oi = oi + 1
+                }
+
+                println("")
+                println("  총 터널 비용: " + to_string(total_cost))
+                println("  체인 길이: " + to_string(void_n) + "개 도메인, " + to_string(len(chain_costs)) + "개 터널")
+                println("")
+
+                // 블로업 실행 순서 제안
+                if subcmd == "order" || subcmd == "chain" {
+                    println("  --- 블로업 실행 순서 제안 ---")
+                    println("")
+                    let mut pi: i64 = 0
+                    while pi < len(chain_order) {
+                        let idx: i64 = chain_order[pi]
+                        let nm: string = void_names[idx]
+                        let ct: i64 = void_counts[idx]
+                        let depth = if ct < 10 { 3 } else if ct < 30 { 2 } else { 1 }
+                        println("  " + to_string(pi + 1) + ". blowup " + nm + " " + to_string(depth) + "  (현재 노드 " + to_string(ct) + "개)")
+                        pi = pi + 1
+                    }
+                    println("")
+                }
+
+                // 에너지 계산
+                if subcmd == "energy" || subcmd == "chain" {
+                    println("  --- 예상 총 에너지 ---")
+                    println("")
+                    let mut total_energy: i64 = 0
+                    let mut ei: i64 = 0
+                    while ei < len(chain_order) {
+                        let idx: i64 = chain_order[ei]
+                        let ct: i64 = void_counts[idx]
+                        let depth = if ct < 10 { 3 } else if ct < 30 { 2 } else { 1 }
+                        // 6^depth
+                        let energy = if depth == 3 { 216 } else if depth == 2 { 36 } else { 6 }
+                        let nm: string = void_names[idx]
+                        println("  " + nm + ": 6^" + to_string(depth) + " = " + to_string(energy))
+                        total_energy = total_energy + energy
+                        ei = ei + 1
+                    }
+                    println("")
+                    println("  총 예상 에너지: " + to_string(total_energy) + " (= Σ 6^depth)")
+                    println("")
+                }
+
+                // growth_bus 기록
+                try {
+                    let ts = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+
+                    // 체인 순서 문자열 구성
+                    let mut chain_str = ""
+                    let mut qi: i64 = 0
+                    while qi < len(chain_order) {
+                        let idx: i64 = chain_order[qi]
+                        let nm: string = void_names[idx]
+                        if chain_str != "" { chain_str = chain_str + "," }
+                        chain_str = chain_str + nm
+                        qi = qi + 1
+                    }
+
+                    let mut total_energy2: i64 = 0
+                    let mut ei2: i64 = 0
+                    while ei2 < len(chain_order) {
+                        let idx2: i64 = chain_order[ei2]
+                        let ct2: i64 = void_counts[idx2]
+                        let d2 = if ct2 < 10 { 3 } else if ct2 < 30 { 2 } else { 1 }
+                        let e2 = if d2 == 3 { 216 } else if d2 == 2 { 36 } else { 6 }
+                        total_energy2 = total_energy2 + e2
+                        ei2 = ei2 + 1
+                    }
+
+                    let entry = "{\"type\":\"tunnel_chain\",\"voids\":" + to_string(void_n) + ",\"tunnels\":" + to_string(len(chain_costs)) + ",\"total_cost\":" + to_string(total_cost) + ",\"total_energy\":" + to_string(total_energy2) + ",\"chain\":\"" + chain_str + "\",\"ts\":\"" + ts + "\"}"
+                    exec("echo '" + entry + "' >> " + _bus_path)
+                    println("  growth_bus 기록 완료")
+                } catch e {}
+            }
+        }
+    }
+
+    println("")
+    println("[verified] tunnel_chain.hexa 실행 완료")
+    println("")
+}

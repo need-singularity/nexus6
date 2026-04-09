@@ -1,0 +1,465 @@
+// domain_fusion.hexa -- 도메인 융합로 (핵융합식 도메인 합성)
+// 사용: hexa domain_fusion.hexa [scan|fuse|golden|help]
+//
+// 원리:
+//   1. growth_bus.jsonl에서 기존 도메인 목록 수집
+//   2. 도메인 쌍별 "융합 에너지" 계산
+//      - 이름 접두사 공유 = 낮은 에너지 (쉬운 융합)
+//      - 완전 다른 카테고리 = 높은 에너지 (어려운 융합, 큰 발견)
+//   3. 융합 결과 도메인 이름 생성: domain_a + "_" + domain_b 핵심 키워드
+//   4. 에너지가 n=6 배수인 융합쌍 = "황금 융합"
+//   5. 상위 12개 융합 후보 출력
+//   6. growth_bus.jsonl에 융합 후보 기록
+
+let _home = exec("printenv HOME").trim()
+let _dev = _home + "/Dev"
+let _shared = _dev + "/nexus/shared"
+let _bus_path = _shared + "/growth_bus.jsonl"
+
+// ═══════════════════════════════════════════════════════════
+// 유틸리티
+// ═══════════════════════════════════════════════════════════
+
+fn safe_int(s: string) -> i64 {
+    let mut v: i64 = 0
+    try { v = to_int(to_float(s.trim())) } catch e {}
+    return v
+}
+
+// 문자열에서 접두사 추출 (첫 번째 _ 이전 또는 첫 5자)
+fn get_prefix(name: string)  {
+    let parts = name.split("_")
+    if len(parts) >= 1 { return parts[0] }
+    return name
+}
+
+// 문자열에서 핵심 키워드 추출 (가장 긴 부분)
+fn get_core_keyword(name: string)  {
+    let parts = name.split("_")
+    if len(parts) == 0 { return name }
+    let mut longest = ""
+    for p in parts {
+        let ps: string = p
+        if len(ps) > len(longest) { longest = ps }
+    }
+    return longest
+}
+
+// 두 문자열의 공통 접두사 길이
+fn common_prefix_len(a: string, b: string) -> i64 {
+    let a_chars = a.split("")
+    let b_chars = b.split("")
+    let mut count: i64 = 0
+    let limit = if len(a_chars) < len(b_chars) { len(a_chars) } else { len(b_chars) }
+    let mut i: i64 = 0
+    while i < limit {
+        let ac: string = a_chars[i]
+        let bc: string = b_chars[i]
+        if ac == bc {
+            count = count + 1
+        } else {
+            return count
+        }
+        i = i + 1
+    }
+    return count
+}
+
+// ═══════════════════════════════════════════════════════════
+// 도메인 수집 (growth_bus.jsonl에서)
+// ═══════════════════════════════════════════════════════════
+
+fn collect_domains()  {
+    let mut domains = []
+    try {
+        // growth_bus에서 domain 필드 추출 + type이 도메인 관련인 것에서 추출
+        let raw = exec("cat " + _bus_path + " | python3 -c \"\nimport sys, json\ndomains = set()\nfor line in sys.stdin:\n    line = line.strip()\n    if not line: continue\n    try:\n        d = json.loads(line)\n        if 'domain' in d and d['domain']:\n            domains.add(d['domain'])\n        if 'domains' in d and isinstance(d['domains'], list):\n            for dm in d['domains']: domains.add(dm)\n    except: pass\nfor dm in sorted(domains):\n    print(dm)\n\"")
+        let lines = raw.split("\n")
+        for line in lines {
+            let l = line.trim()
+            if l != "" {
+                // 중복 검사
+                let mut dup = false
+                for d in domains {
+                    let ds: string = d
+                    if ds == l { dup = true }
+                }
+                if !dup {
+                    domains = domains + [l]
+                }
+            }
+        }
+    } catch e {
+        println("  [오류] growth_bus.jsonl 로드 실패: " + to_string(e))
+    }
+
+    // 도메인이 부족하면 discovery_log에서도 수집
+    if len(domains) < 10 {
+        try {
+            let raw2 = exec("tail -5000 " + _shared + "/discovery_log.jsonl | python3 -c \"\nimport sys, json\ndomains = set()\nfor line in sys.stdin:\n    line = line.strip()\n    if not line: continue\n    try:\n        d = json.loads(line)\n        if 'domain' in d and d['domain']:\n            domains.add(d['domain'])\n    except: pass\nfor dm in sorted(domains):\n    print(dm)\n\"")
+            let lines2 = raw2.split("\n")
+            for line in lines2 {
+                let l = line.trim()
+                if l != "" {
+                    let mut dup = false
+                    for d in domains {
+                        let ds: string = d
+                        if ds == l { dup = true }
+                    }
+                    if !dup {
+                        domains = domains + [l]
+                    }
+                }
+            }
+        } catch e2 {}
+    }
+
+    return domains
+}
+
+// ═══════════════════════════════════════════════════════════
+// 융합 에너지 계산
+// ═══════════════════════════════════════════════════════════
+
+// 에너지 = 이름 거리. 공통 접두사가 길면 에너지 낮음 (쉬운 융합).
+// 완전히 다르면 에너지 높음 (어려운 융합, 큰 발견).
+fn calc_fusion_energy(domain_a: string, domain_b: string) -> i64 {
+    let prefix_a = get_prefix(domain_a)
+    let prefix_b = get_prefix(domain_b)
+    let common = common_prefix_len(prefix_a, prefix_b)
+
+    // 기본 에너지 = 두 이름 길이의 합 (다양성 반영)
+    let base_energy = len(domain_a) + len(domain_b)
+
+    // 공통 접두사가 길면 에너지 감소
+    let shared_reduction = common * 3
+
+    // 에너지 = base - shared (최소 1)
+    let energy = base_energy - shared_reduction
+    if energy < 1 { return 1 }
+    return to_int(energy)
+}
+
+// n=6 배수 체크
+fn is_n6_multiple(v: i64) -> bool {
+    if v <= 0 { return false }
+    return (v % 6) == 0
+}
+
+// ═══════════════════════════════════════════════════════════
+// 융합 이름 생성
+// ═══════════════════════════════════════════════════════════
+
+fn make_fusion_name(domain_a: string, domain_b: string)  {
+    let core_a = get_core_keyword(domain_a)
+    let core_b = get_core_keyword(domain_b)
+    return core_a + "_" + core_b
+}
+
+// ═══════════════════════════════════════════════════════════
+// 융합 쌍 계산 및 정렬
+// ═══════════════════════════════════════════════════════════
+
+let mut _g_fnames = []
+let mut _g_fenergies = []
+let mut _g_fpairs = []
+let mut _g_fgolden = []
+
+fn compute_fusions(domains) {
+    let mut fusion_names = []
+    let mut fusion_energies = []
+    let mut fusion_pairs = []
+    let mut fusion_golden = []
+    let n = len(domains)
+    // 쌍별 계산 (너무 많으면 제한)
+    let max_pairs = if n > 50 { 50 } else { n }
+    let mut i: i64 = 0
+    while i < max_pairs {
+        let mut j: i64 = i + 1
+        while j < max_pairs {
+            let da: string = domains[i]
+            let db: string = domains[j]
+            let energy = calc_fusion_energy(da, db)
+            let fname = make_fusion_name(da, db)
+            let golden = is_n6_multiple(energy)
+
+            fusion_names = fusion_names + [fname]
+            fusion_energies = fusion_energies + [energy]
+            fusion_pairs = fusion_pairs + [da + " + " + db]
+            fusion_golden = fusion_golden + [golden]
+
+            j = j + 1
+        }
+        i = i + 1
+    }
+    _g_fnames = fusion_names; _g_fenergies = fusion_energies; _g_fpairs = fusion_pairs; _g_fgolden = fusion_golden
+}
+
+// 상위 12개 (에너지 높은 순 = 큰 발견)
+fn top_n_fusions(fusion_names, fusion_energies, fusion_pairs, fusion_golden, n: i64)  {
+    let mut top_names = []
+    let mut top_energies = []
+    let mut top_pairs = []
+    let mut top_golden = []
+    let mut used = []
+    let mut count: i64 = 0
+
+    while count < n && count < len(fusion_names) {
+        let mut max_e: i64 = -1
+        let mut max_idx: i64 = -1
+        let mut mi: i64 = 0
+        while mi < len(fusion_energies) {
+            let e: i64 = fusion_energies[mi]
+            if e > max_e {
+                let mut is_used = false
+                for u in used {
+                    let ui: i64 = u
+                    if ui == mi { is_used = true }
+                }
+                if !is_used {
+                    max_e = e
+                    max_idx = mi
+                }
+            }
+            mi = mi + 1
+        }
+        if max_idx >= 0 {
+            used = used + [max_idx]
+            let fn2: string = fusion_names[max_idx]
+            let fp2: string = fusion_pairs[max_idx]
+            let fg2: bool = fusion_golden[max_idx]
+            top_names = top_names + [fn2]
+            top_energies = top_energies + [max_e]
+            top_pairs = top_pairs + [fp2]
+            top_golden = top_golden + [fg2]
+        }
+        count = count + 1
+    }
+    _g_fnames = top_names; _g_fenergies = top_energies; _g_fpairs = top_pairs; _g_fgolden = top_golden
+}
+
+// ═══════════════════════════════════════════════════════════
+// growth_bus 기록
+// ═══════════════════════════════════════════════════════════
+
+fn record_bus(total_domains: i64, total_fusions: i64, golden_count: i64, top_names) {
+    try {
+        let ts = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+        let mut names_str = ""
+        let mut ni: i64 = 0
+        for tn in top_names {
+            let tns: string = tn
+            if ni > 0 { names_str = names_str + "," }
+            names_str = names_str + "\"" + tns + "\""
+            ni = ni + 1
+        }
+        let entry = "{\"type\":\"domain_fusion\",\"total_domains\":" + to_string(total_domains) + ",\"total_fusions\":" + to_string(total_fusions) + ",\"golden_fusions\":" + to_string(golden_count) + ",\"top_candidates\":[" + names_str + "],\"ts\":\"" + ts + "\"}"
+        exec("echo '" + entry + "' >> " + _bus_path)
+    } catch e {}
+}
+
+// ═══════════════════════════════════════════════════════════
+// 서브커맨드 구현
+// ═══════════════════════════════════════════════════════════
+
+fn cmd_scan() {
+    println("")
+    println("===========================================================")
+    println("  도메인 융합로 (Domain Fusion) -- 핵융합식 도메인 합성")
+    println("  두 도메인을 융합하여 신규 도메인 창발")
+    println("===========================================================")
+    println("")
+
+    // 1. 도메인 수집
+    println("  growth_bus + discovery_log에서 도메인 수집 중...")
+    let domains = collect_domains()
+    let total_domains = len(domains)
+    println("  총 도메인: " + to_string(total_domains) + "개")
+    println("")
+
+    // 도메인 목록 (상위 20)
+    println("  --- 수집된 도메인 (상위 20) ---")
+    let mut di: i64 = 0
+    while di < len(domains) && di < 20 {
+        let d: string = domains[di]
+        println("    " + d)
+        di = di + 1
+    }
+    if total_domains > 20 {
+        println("    ... 외 " + to_string(total_domains - 20) + "개")
+    }
+    println("")
+
+    // 2. 융합 계산
+    println("  융합 에너지 계산 중...")
+    let (fusion_names, fusion_energies, fusion_pairs, fusion_golden) = compute_fusions(domains)
+    let total_fusions = len(fusion_names)
+    println("  총 융합 쌍: " + to_string(total_fusions) + "개")
+
+    // 황금 융합 카운트
+    let mut golden_count: i64 = 0
+    for fg in fusion_golden {
+        let fgb: bool = fg
+        if fgb { golden_count = golden_count + 1 }
+    }
+    println("  황금 융합 (에너지 = n*6): " + to_string(golden_count) + "개")
+    println("")
+
+    // 3. 상위 12개 출력
+    println("  --- 상위 12 융합 후보 (높은 에너지 = 큰 발견) ---")
+    println("")
+    println("| 순위 | 융합 쌍 | 에너지 | 결과 도메인 | 황금 |")
+    println("|------|---------|--------|------------|------|")
+    let (top_names, top_energies, top_pairs, top_golden) = top_n_fusions(fusion_names, fusion_energies, fusion_pairs, fusion_golden, 12)
+    let mut ti: i64 = 0
+    while ti < len(top_names) {
+        let tn: string = top_names[ti]
+        let te: i64 = top_energies[ti]
+        let tp: string = top_pairs[ti]
+        let tg: bool = top_golden[ti]
+        let gold_mark = if tg { "** **" } else { "" }
+        println("| " + to_string(ti + 1) + " | " + tp + " | " + to_string(te) + " | " + tn + " | " + gold_mark + " |")
+        ti = ti + 1
+    }
+    println("")
+
+    // 4. 에너지 분포 ASCII
+    println("  --- 융합 에너지 분포 ---")
+    println("")
+    // 6구간 히스토그램
+    let mut max_energy: i64 = 0
+    for fe in fusion_energies {
+        let fei: i64 = fe
+        if fei > max_energy { max_energy = fei }
+    }
+    let bin_size = if max_energy > 0 { (max_energy / 6) + 1 } else { 1 }
+
+    let mut bins = [0, 0, 0, 0, 0, 0]
+    for fe in fusion_energies {
+        let fei: i64 = fe
+        let bin_idx = fei / bin_size
+        if bin_idx >= 6 { continue }
+        let old: i64 = bins[bin_idx]
+        bins[bin_idx] = old + 1
+    }
+
+    let mut bi: i64 = 0
+    while bi < 6 {
+        let lo = bi * bin_size
+        let hi = (bi + 1) * bin_size - 1
+        let count: i64 = bins[bi]
+        let bar_len = if total_fusions > 0 { (count * 40) / (total_fusions + 1) } else { 0 }
+        let mut bar = ""
+        let mut bj: i64 = 0
+        while bj < bar_len && bj < 40 {
+            bar = bar + "#"
+            bj = bj + 1
+        }
+        println("  " + to_string(lo) + "-" + to_string(hi) + "\t" + bar + " " + to_string(count))
+        bi = bi + 1
+    }
+    println("")
+
+    // 5. growth_bus 기록
+    record_bus(to_int(total_domains), to_int(total_fusions), golden_count, top_names)
+    println("  growth_bus 기록 완료")
+    println("")
+    println("[verified] domain_fusion.hexa scan 실행 완료")
+    println("")
+}
+
+fn cmd_fuse() {
+    println("")
+    println("  === 전체 융합 쌍 (에너지순) ===")
+    println("")
+    let domains = collect_domains()
+    let (fusion_names, fusion_energies, fusion_pairs, fusion_golden) = compute_fusions(domains)
+    let (top_names, top_energies, top_pairs, top_golden) = top_n_fusions(fusion_names, fusion_energies, fusion_pairs, fusion_golden, to_int(len(fusion_names)))
+
+    let mut ti: i64 = 0
+    while ti < len(top_names) && ti < 50 {
+        let tn: string = top_names[ti]
+        let te: i64 = top_energies[ti]
+        let tp: string = top_pairs[ti]
+        let tg: bool = top_golden[ti]
+        let gold_mark = if tg { " [황금]" } else { "" }
+        println("  " + to_string(ti + 1) + ". " + tp + " -> " + tn + " (E=" + to_string(te) + ")" + gold_mark)
+        ti = ti + 1
+    }
+    println("")
+    println("[verified] domain_fusion.hexa fuse 실행 완료")
+    println("")
+}
+
+fn cmd_golden() {
+    println("")
+    println("  === 황금 융합 (에너지 = n*6 배수) ===")
+    println("")
+    let domains = collect_domains()
+    let (fusion_names, fusion_energies, fusion_pairs, fusion_golden) = compute_fusions(domains)
+
+    let mut count: i64 = 0
+    let mut i: i64 = 0
+    while i < len(fusion_names) {
+        let fg: bool = fusion_golden[i]
+        if fg {
+            let tn: string = fusion_names[i]
+            let te: i64 = fusion_energies[i]
+            let tp: string = fusion_pairs[i]
+            count = count + 1
+            println("  " + to_string(count) + ". " + tp + " -> " + tn + " (E=" + to_string(te) + ", " + to_string(te / 6) + "*6)")
+        }
+        i = i + 1
+    }
+    println("")
+    println("  총 황금 융합: " + to_string(count) + "개")
+    println("")
+
+    // growth_bus 기록
+    try {
+        let ts = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+        let entry = "{\"type\":\"domain_fusion_golden\",\"golden_count\":" + to_string(count) + ",\"ts\":\"" + ts + "\"}"
+        exec("echo '" + entry + "' >> " + _bus_path)
+    } catch e {}
+    println("  growth_bus 기록 완료")
+    println("")
+    println("[verified] domain_fusion.hexa golden 실행 완료")
+    println("")
+}
+
+fn cmd_help() {
+    println("domain_fusion.hexa -- 도메인 융합로 (핵융합식 도메인 합성)")
+    println("")
+    println("사용법:")
+    println("  hexa domain_fusion.hexa scan      전체 분석 (도메인 수집+융합+황금+분포)")
+    println("  hexa domain_fusion.hexa fuse       전체 융합 쌍 목록 (에너지 내림차순)")
+    println("  hexa domain_fusion.hexa golden     황금 융합만 출력 (에너지 = n*6)")
+    println("  hexa domain_fusion.hexa help       이 도움말")
+    println("")
+    println("원리:")
+    println("  growth_bus + discovery_log에서 기존 도메인을 수집한 뒤,")
+    println("  도메인 쌍별로 이름 거리 기반 '융합 에너지'를 계산.")
+    println("  공통 접두사가 길면 에너지 낮음 (쉬운 융합),")
+    println("  완전 다른 이름이면 에너지 높음 (어려운 융합 = 큰 발견).")
+    println("  에너지가 6의 배수인 쌍 = 황금 융합 (n=6 공명).")
+}
+
+// ═══════════════════════════════════════════════════════════
+// CLI 진입점
+// ═══════════════════════════════════════════════════════════
+
+let a = args()
+let mode = if a.len() >= 3 { a[2] } else { "scan" }
+
+if mode == "scan" {
+    cmd_scan()
+} else if mode == "fuse" {
+    cmd_fuse()
+} else if mode == "golden" {
+    cmd_golden()
+} else if mode == "help" {
+    cmd_help()
+} else {
+    println("알 수 없는 명령: " + mode)
+    println("사용 가능: scan, fuse, golden, help")
+}
