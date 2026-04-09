@@ -22,7 +22,8 @@ else
   HOSTS=("$TARGET")
 fi
 
-RSYNC_OPTS=(-azP --delete --exclude='.DS_Store' --exclude='SECRET.md' --exclude='.tmp_*' --timeout=30)
+RSYNC_OPTS=(-azP --exclude='.DS_Store' --exclude='SECRET.md' --exclude='.tmp_*' --timeout=30)
+RSYNC_DIR_OPTS=("${RSYNC_OPTS[@]}" --delete)
 
 SYNC_FILES=(
   "reality_map_live.json"
@@ -41,13 +42,21 @@ for host in "${HOSTS[@]}"; do
     for f in "${SYNC_FILES[@]}"; do
       src="$SHARED/$f"
       [[ -e "$src" ]] || continue
-      rsync "${RSYNC_OPTS[@]}" "$src" "$REMOTE/$f" 2>/dev/null && echo "  ↑ $f" || echo "  ⚠ $f (skip)"
+      if [[ "$f" == */ ]]; then
+        rsync "${RSYNC_DIR_OPTS[@]}" "$src" "$REMOTE/$f" 2>/dev/null && echo "  ↑ $f" || echo "  ⚠ $f (skip)"
+      else
+        rsync "${RSYNC_OPTS[@]}" "$src" "$REMOTE/$f" 2>/dev/null && echo "  ↑ $f" || echo "  ⚠ $f (skip)"
+      fi
     done
   fi
 
   if [[ "$MODE" == "pull" || "$MODE" == "both" ]]; then
     for f in "${SYNC_FILES[@]}"; do
-      rsync "${RSYNC_OPTS[@]}" "$REMOTE/$f" "$SHARED/$f" 2>/dev/null && echo "  ↓ $f" || echo "  ⚠ $f (skip)"
+      if [[ "$f" == */ ]]; then
+        rsync "${RSYNC_DIR_OPTS[@]}" "$REMOTE/$f" "$SHARED/$f" 2>/dev/null && echo "  ↓ $f" || echo "  ⚠ $f (skip)"
+      else
+        rsync "${RSYNC_OPTS[@]}" "$REMOTE/$f" "$SHARED/$f" 2>/dev/null && echo "  ↓ $f" || echo "  ⚠ $f (skip)"
+      fi
     done
   fi
 
@@ -56,11 +65,13 @@ done
 
 # infra_state에 last_sync 기록
 python3 -c "
-import json,sys
+import json, os
 p='$INFRA'
 d=json.load(open(p))
 d['last_sync']={'ts':'$TS','mode':'$MODE','targets':'$TARGET'}
-json.dump(d,open(p,'w'),ensure_ascii=False)
+tmp=p+'.tmp'
+json.dump(d,open(tmp,'w'),ensure_ascii=False,indent=2)
+os.replace(tmp,p)
 " 2>/dev/null || true
 
 echo "═══ sync-remote done ($TS) ═══"
