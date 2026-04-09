@@ -53,6 +53,14 @@ if [[ "$FILE" =~ dse/.*\.toml$ ]] && [[ "$FILE" != *"$NEXUS/"* ]]; then
   exit 2
 fi
 
+# shared/hooks/ 신규 .sh/.py 작성 금지
+if [[ "$FILE" =~ shared/hooks/.*\.(sh|py)$ ]]; then
+  if [[ ! -f "$FILE" ]]; then
+    echo "BLOCKED: $FILE — shared/hooks/에 새 .sh/.py 작성 금지. .hexa로 작성하세요." >&2
+    exit 2
+  fi
+fi
+
 # ─── HEXA-FIRST: .py/.rs/.sh 신규 작성 금지 ───
 if [[ "$FILE" =~ \.(py|rs|sh)$ ]] && [[ ! "$FILE" =~ /src/ ]]; then
   echo "BLOCKED: $FILE — .py/.rs/.sh 신규 작성 금지. .hexa로 작성하세요. (CLAUDE.md 규칙 0)" >&2
