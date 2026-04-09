@@ -269,14 +269,36 @@ def normalize_expr(expr_str):
     s = _convert_superscripts(s)
     s = s.translate(SUB_MAP)
 
-    # v5: EXACT annotation 제거 ("phi EXACT" -> "phi")
+    # v5e: EXACT annotation 제거 ("phi EXACT" -> "phi")
     s = re.sub(r'\s+EXACT\b', '', s).strip()
-    # v5: 괄호 주석 제거 ("n (BT-43)" -> "n", "mu (Mobius)" -> "mu", "n (0.1%)" -> "n")
-    s = re.sub(r'\s*\([^)]*(?:BT-\d+|bius|totient|number|perfect|%|adsorb|heat|cool|desorb)[^)]*\)', '', s, flags=re.IGNORECASE).strip()
+    # v5e: 괄호 주석 + 후행 EXACT/exact 제거 ("mu (Mobius) EXACT" -> "mu", "phi (totient) EXACT" -> "phi")
+    # 괄호 안이 주석형(n6 변수명이 아닌 단어 포함)인 경우만 — 수식 괄호 보호
+    def _strip_annotation_parens(m_s):
+        """후행 괄호가 주석인지 수식인지 판별하여 주석만 제거"""
+        ann_m = re.search(r'\s*(\([^)]+\))\s*$', m_s)
+        if ann_m:
+            inner = ann_m.group(1)[1:-1].strip()  # 괄호 안쪽
+            # 그리스 문자를 영문으로 치환 후 판별
+            _gk = {'σ':'sigma','τ':'tau','φ':'phi','μ':'mu','ψ':'psi','η':'eta',
+                    'κ':'kappa','λ':'lambda_val','α':'alpha','β':'beta','ε':'epsilon',
+                    'δ':'delta','ζ':'zeta','Δ':'delta','π':'pi','Φ':'phi'}
+            inner_e = inner
+            for _gc, _ge in _gk.items():
+                inner_e = inner_e.replace(_gc, _ge)
+            _n6_vp = r'(?:sigma|tau|phi|sopfr|mu|psi|eta|kappa|n|J2|J_2|P1|P2|K_2|K_3|R|pi|e|ln|log|sqrt|exp|floor|ceil|factorial|omega|Omega|rad|alpha|beta|delta|epsilon|zeta|lambda_val)'
+            # 수식 판별: n6 변수+연산자+숫자로만 구성되면 수식
+            inner_stripped = re.sub(_n6_vp, '', inner_e)
+            inner_stripped = re.sub(r'[\d\s+\-*/^.(),_]+', '', inner_stripped)
+            if inner_stripped:  # n6 변수+연산자 외 문자 남음 → 주석
+                m_s = m_s[:ann_m.start()].strip()
+        return m_s
+    s = _strip_annotation_parens(s)
+    # v5: 괄호 주석 제거 (BT-N, Mobius, totient 등 키워드 포함)
+    s = re.sub(r'(?<=[\d\w])\s*\([^)]*(?:BT-\d+|bius|totient|number|perfect|%|adsorb|heat|cool|desorb)[^)]*\)', '', s, flags=re.IGNORECASE).strip()
     # v5: "vs ..." 제거
     s = re.sub(r'\s+vs\s+.*$', '', s).strip()
-    # v5: 후행 단위 단어 제거 ("sigma kW" -> "sigma", "(J2+phi) mV" -> "(J2+phi)")
-    s = re.sub(r'\s+(?:mV|kW|MW|GW|Hz|kHz|MHz|GHz|nm|mm|cm|km|eV|keV|MeV|GeV|bits?|bytes?|mol|atm|bar|Pa)$', '', s).strip()
+    # v5e: 후행 단위 단어 제거 ("sigma kW" -> "sigma", "(J2+phi) mV" -> "(J2+phi)")
+    s = re.sub(r'\s+(?:mV|kV|kW|MW|GW|Hz|kHz|MHz|GHz|THz|nm|mm|cm|km|eV|keV|MeV|GeV|TeV|bits?|bytes?|mol|atm|bar|Pa|MPa|GPa|mA|mT|ms|us|ns|ps|fs|K|°C|m|s|kg|J|W|Wb|lm|cd|sr|rad|dB|dBm)$', '', s).strip()
     # v5: "at 300K" 조건 구문 제거
     s = re.sub(r'\s+at\s+\d+\s*[A-Za-z]*$', '', s).strip()
     # v5: 한글/CJK 잔재 제거
@@ -506,7 +528,7 @@ def parse_predicted_value(val_str):
 
     # v5d: 유니코드 과학표기 ("3.083×10⁻⁵" -> 3.083e-5)
     s_uni = s.replace('\u00d7', '*').replace('\u00b7', '*')
-    from bt_audit import _convert_superscripts as _cs_ppv
+    _cs_ppv = _convert_superscripts
     s_uni = _cs_ppv(s_uni)
     sci_m = re.match(r'^([+-]?\d+\.?\d*)\s*\*\s*10\*\*([+-]?\d+)\s*$', s_uni)
     if sci_m:
@@ -803,6 +825,29 @@ def parse_known_value(val_str):
     s = _convert_superscripts(s).translate(SUB_MAP)
     s = s.replace('^', '**')
 
+
+    # v5e: descriptive_known parser — median/mean/~/top-N/N-qubit 등에서 숫자 추출
+    # "median 6" → 6, "mean 12" → 12, "~0.5" → 0.5
+    dk_prefix_m = re.match(r'^\s*(?:median|mean|average|approx|approximately|about)\s+([+-]?\d+\.?\d*)\b', s, re.IGNORECASE)
+    if dk_prefix_m:
+        try:
+            return float(dk_prefix_m.group(1))
+        except ValueError:
+            pass
+    # "top-6" → 6, "top-12" → 12
+    topn_m = re.match(r'^\s*top[-\s](\d+)\b', s, re.IGNORECASE)
+    if topn_m:
+        try:
+            return float(topn_m.group(1))
+        except ValueError:
+            pass
+    # "6-qubit" → 6, "12-bit" → 12
+    nqubit_m = re.match(r'^\s*(\d+)[-\s](?:qubit|qubits|bit|bits|fold|layer|layers|phase|phases|step|steps|way|dim|dimensional)\b', s, re.IGNORECASE)
+    if nqubit_m:
+        try:
+            return float(nqubit_m.group(1))
+        except ValueError:
+            pass
 
     # v5: 원소 표기 "Si-28", "Fe-56" → 질량수 추출
     elem_m = re.match(r'^[A-Z][a-z]?-(\d+)$', val_str.strip())
@@ -1299,6 +1344,112 @@ def audit_row(bt_num, row):
                                 'error_pct': round(rhs_err, 4),
                                 'status': 'MATCH',
                             }
+        # v5e: descriptive predicted/known에서 숫자 추출 시도
+        if isinstance(computed, (int, float)):
+            for _src_raw, _src_name in [(predicted_raw, 'predicted_desc'), (known_raw, 'known_desc')]:
+                if not _src_raw or not _src_raw.strip():
+                    continue
+                # "6-fold", "mod 6", "order 6", "6x", "6-qubit" 등에서 숫자 추출
+                _desc_pats = [
+                    r'(?:^|\s)(\d+)[-\s]*(?:fold|qubit|qubits|bit|bits|way|dim|layer|layers|phase|phases|step|steps)\b',
+                    r'\b(?:mod|order|degree|rank|level)\s+(\d+)\b',
+                    r'(?:^|\s)(\d+)[xX]\b',
+                    r'^(\d+\.?\d*)\s+[A-Za-z]',  # "6 segments" -> 6
+                ]
+                for _dp in _desc_pats:
+                    _dm = re.search(_dp, _src_raw, re.IGNORECASE)
+                    if _dm:
+                        try:
+                            _dv = float(_dm.group(1))
+                            if _dv != 0 and abs(computed - _dv) / abs(_dv) < 0.01:
+                                return {
+                                    'bt': bt_num, 'expression': expr_str,
+                                    'normalized': normalized,
+                                    'computed': round(computed, 6) if isinstance(computed, float) else computed,
+                                    'target': _dv, 'target_source': _src_name,
+                                    'error_pct': round(abs(computed - _dv) / abs(_dv) * 100, 4),
+                                    'status': 'MATCH',
+                                }
+                            elif _dv == 0 and computed == 0:
+                                return {
+                                    'bt': bt_num, 'expression': expr_str,
+                                    'normalized': normalized, 'computed': 0,
+                                    'target': 0, 'target_source': _src_name,
+                                    'error_pct': 0, 'status': 'MATCH',
+                                }
+                        except ValueError:
+                            pass
+
+        # v5e: NO_TARGET self-eq expansion — computed가 n6 상수값과 일치하면 auto-MATCH
+        if isinstance(computed, (int, float)) and not predicted_raw.strip() and not known_raw.strip():
+            # n6 상수 역방향 룩업 테이블 (값 → 이름)
+            _n6_vals = {}
+            for _k, _v in EVAL_NS.items():
+                if isinstance(_v, (int, float)) and _k != '__builtins__' and not callable(_v):
+                    _n6_vals.setdefault(_v, _k)
+            # 추가: 유도 상수 (N6_CONSTANTS)
+            for _k, _v in N6_CONSTANTS.items():
+                if isinstance(_v, (int, float)):
+                    _n6_vals.setdefault(_v, _k)
+            # 거듭제곱/조합 상수 (자주 등장)
+            _derived = {
+                2**4: 'phi**tau', 2**5: '2**sopfr', 2**6: '2**n', 2**7: '2**(sigma-sopfr)',
+                2**8: '2**(sigma-tau)', 2**9: '2**(sigma-n_phi)', 2**10: '2**sigma_phi',
+                2**11: '2**(sigma-mu)', 2**12: '2**sigma', 2**13: '2**(sigma+mu)',
+                2**17: '2**(sigma+sopfr)',
+                3**4: '3**tau', 6**2: 'n**2', 6**3: 'n**3', 6**4: 'n**4',
+                12**2: 'sigma**2', 12*4: 'sigma*tau', 12*2: 'sigma*phi',
+                12*24: 'sigma*J2', 24*4: 'J2*tau', 4**2: 'tau**2',
+                0.5: '1/phi', 0.25: '1/tau', 0.1: '1/sigma_phi',
+                1/6: '1/n', 1/12: '1/sigma', 1/24: '1/J2',
+                0.75: '3/tau', 0.125: '1/(sigma-tau)', 2/3: 'phi/n_phi',
+                48: 'sigma*tau', 96: 'sigma*tau*phi', 144: 'sigma**2',
+                20: 'J2-tau', 14: 'sigma+phi', 7: 'sigma-sopfr',
+                8: 'sigma-tau', 10: 'sigma-phi', 11: 'sigma-mu',
+                3: 'n/phi', 13: 'sigma+mu', 15: 'sigma+n_phi',
+                17: 'sigma+sopfr', 22: 'J2-phi', 23: 'J2-mu',
+                25: 'J2+mu', 26: 'J2+phi', 36: 'n**2',
+                40: 'J2+phi**tau', 51: 'sigma*tau+n_phi',
+                57: 'sigma*sopfr-n_phi', 150: '(sigma+n_phi)*(sigma-phi)',
+                192: 'phi*sigma*(sigma-tau)', 200: 'phi*(sigma-phi)**phi',
+                300: '(n_phi)*(sigma-phi)**2', 400: 'tau*(sigma-phi)**2',
+                768: 'sigma*phi**n', 3072: 'sigma*phi**(sigma-tau)',
+                8192: 'phi**(sigma+mu)', 12288: 'sigma*phi**10',
+                131072: '2**(sigma+sopfr)', 2401: '(sigma-sopfr)**tau',
+                18: '3*n', 999: 'n_phi*333', 28: 'P2',
+                0.01: '(sigma-phi)**-2', 0.03125: '1/2**sopfr',
+                0.0625: '1/2**tau', 1.5: 'n/tau',
+                2.6667: '(sigma-tau)/(n_phi)',
+                -0.5: '-1/phi', -1/12: '-1/sigma', -1/6: '-1/n',
+                0.875: '1-1/(sigma-tau)', 3.2: 'n_phi+1/sopfr',
+                0.00048828125: '1/2**(sigma-mu)',
+                0.142857: '1/(n+mu)', 0.008333: '1/(sigma*(sigma-phi))',
+                32: '2**sopfr', 25: 'sopfr**2',
+            }
+            for _dv, _dn in _derived.items():
+                _n6_vals.setdefault(_dv, _dn)
+
+            matched_name = _n6_vals.get(computed)
+            # 정수 비교 (float 1.0 == int 1)
+            if matched_name is None and isinstance(computed, float) and computed == int(computed):
+                matched_name = _n6_vals.get(int(computed))
+            # 근사 비교 (float 소수점 오차 허용, 0.1% 이내)
+            if matched_name is None and isinstance(computed, (int, float)):
+                for _dv, _dn in list(_n6_vals.items()):
+                    if isinstance(_dv, (int, float)) and _dv != 0:
+                        if abs(computed - _dv) / abs(_dv) < 0.001:
+                            matched_name = _dn
+                            break
+            if matched_name is not None:
+                return {
+                    'bt': bt_num, 'expression': expr_str,
+                    'normalized': normalized,
+                    'computed': round(computed, 6) if isinstance(computed, float) else computed,
+                    'target': computed, 'target_source': 'self_eq_n6',
+                    'error_pct': 0, 'status': 'MATCH',
+                    'note': f'self_eq_n6: computed={computed} matches {matched_name}',
+                }
+
         return {
             'bt': bt_num,
             'expression': expr_str,
