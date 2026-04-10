@@ -1,1 +1,1 @@
-singularity/singularity_recursion_prediction_verified.md
+discovery/singularity/singularity_recursion_prediction_verified.md

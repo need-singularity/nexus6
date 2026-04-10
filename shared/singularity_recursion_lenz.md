@@ -1,1 +1,1 @@
-singularity/singularity_recursion_lenz.md
+discovery/singularity/singularity_recursion_lenz.md

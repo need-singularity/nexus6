@@ -1,1 +1,1 @@
-singularity/singularity_recursion_closure.md
+discovery/singularity/singularity_recursion_closure.md

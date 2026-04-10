@@ -1,1 +1,1 @@
-papers/pages-deploy-verify.md
+discovery/papers/pages-deploy-verify.md

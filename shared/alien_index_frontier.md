@@ -1,1 +1,1 @@
-alien/alien_index_frontier.md
+discovery/alien/alien_index_frontier.md

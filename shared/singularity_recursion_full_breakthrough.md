@@ -1,1 +1,1 @@
-singularity/singularity_recursion_full_breakthrough.md
+discovery/singularity/singularity_recursion_full_breakthrough.md

@@ -1,1 +1,1 @@
-singularity/singularity_recursion_three_axes.md
+discovery/singularity/singularity_recursion_three_axes.md

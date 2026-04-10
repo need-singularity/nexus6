@@ -1,1 +1,1 @@
-singularity/singularity_recursion_topology_structure.md
+discovery/singularity/singularity_recursion_topology_structure.md

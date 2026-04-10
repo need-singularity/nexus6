@@ -1,1 +1,1 @@
-singularity/singularity_recursion_algebra.md
+discovery/singularity/singularity_recursion_algebra.md

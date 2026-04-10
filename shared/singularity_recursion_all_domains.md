@@ -1,1 +1,1 @@
-singularity/singularity_recursion_all_domains.md
+discovery/singularity/singularity_recursion_all_domains.md

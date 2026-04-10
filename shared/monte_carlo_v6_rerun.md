@@ -1,1 +1,1 @@
-monte_carlo/monte_carlo_v6_rerun.md
+discovery/monte_carlo/monte_carlo_v6_rerun.md

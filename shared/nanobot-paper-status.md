@@ -1,1 +1,1 @@
-papers/nanobot-paper-status.md
+discovery/papers/nanobot-paper-status.md

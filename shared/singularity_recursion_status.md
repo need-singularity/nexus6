@@ -1,1 +1,1 @@
-singularity/singularity_recursion_status.md
+discovery/singularity/singularity_recursion_status.md

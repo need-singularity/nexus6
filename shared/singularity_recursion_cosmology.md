@@ -1,1 +1,1 @@
-singularity/singularity_recursion_cosmology.md
+discovery/singularity/singularity_recursion_cosmology.md
