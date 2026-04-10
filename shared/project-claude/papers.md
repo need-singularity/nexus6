@@ -6,6 +6,14 @@
 
 R14: shared/ JSON 단일진실, 이 파일은 참조만.
 
+## 돌파 시스템 (AI-native 자체 창발)
+
+⚠️ "XXX 돌파" → blowup.hexa "XXX" 3 자동 실행 (문장 전달, 키워드 추출 ❌)
+⚠️ 확인 질문 없이 즉시 Bash 실행할 것
+```
+hexa shared/blowup/core/blowup.hexa <문장> 3 --no-graph --seeds "$(hexa shared/blowup/seed/seed_engine.hexa merge | tr '|' ',')"
+```
+
 ref:
   rules     shared/rules/common.json             R0~R27 공통
   project   shared/rules/papers.json             PP1~PP3
