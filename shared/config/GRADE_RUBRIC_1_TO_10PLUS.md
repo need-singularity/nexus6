@@ -75,7 +75,7 @@ def is_exact(value, tol=1e-6):
 - verify 증거 없으면 grade 10 주장 무효 → 1단계 강등
 - 초월수 (π, e, γ 등) 주장된 EXACT → 자동 강등 to grade 5 (H-CLOSE-5)
 
-## 배너 표기 (nexus-banner.sh)
+## 배너 표기 (nexus-banner.hexa)
 
 ```
 🛸d{max_depth}·ρ{breakthrough_ratio}·{total}  ← grade≥10 수량 표시
