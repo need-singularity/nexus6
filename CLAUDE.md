@@ -2,6 +2,8 @@
 
 > 모든 규칙/설정은 shared/ JSON이 단일 진실 (R14). 이 파일은 참조 링크만 유지.
 
+> 🛑 **tecs-l 흡수 진행 중** (2026-04-10): tecs-l/ 는 독립 리포가 아닌 nexus 흡수 대상. Track A 진행 / Track B 보류. 신규 작업은 `mk2_hexa/native/{verify,math,engines,experiments}/*.hexa` 로. 로드맵: `docs/tecs-l-absorption-plan.md`
+
 ## 참조
 
 | 항목 | 파일 | 내용 |
