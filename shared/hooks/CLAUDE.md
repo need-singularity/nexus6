@@ -1,4 +1,4 @@
-# hooks/ — 공유 훅 스크립트
+# hooks/ — 공유 Claude Code 훅 (.hexa)
 
-전 리포 Claude Code 훅 (.hexa). block-forbidden-ext, nexus-prompt-scan, nexus-pre-tool 등.
-L0 잠금: `../core-lockdown.json` 참조. 수정 시 전 리포 영향.
+hooks:  block-forbidden-ext | nexus-prompt-scan | nexus-pre-tool | hexa-only-{guard,prompt}
+lock:   ../config/core-lockdown.json (L0 — 수정 시 전 리포 영향)

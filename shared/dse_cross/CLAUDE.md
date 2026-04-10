@@ -1,3 +1,3 @@
-# dse_cross/ — Cross-DSE 교차 탐색
+# dse_cross/ — Cross-DSE 교차 탐색 결과
 
-도메인 간 교차 DSE 결과. 규칙: N64 (`../absolute_rules.json`).
+ref: ../config/absolute_rules.json (N64)

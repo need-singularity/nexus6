@@ -1,4 +1,5 @@
 # convergence/ — CDO 수렴 추적
 
-골화(ossified)/안정(stable)/실패(failed) 상태 추적. 프로젝트별 JSON 7개.
-운영 원칙: `../convergence_ops.json` | 규칙: R4, R9~R11 (`../absolute_rules.json`)
+states: ossified | stable | failed
+files:  프로젝트별 7 JSON
+ref:    ../config/convergence_ops.json | ../config/absolute_rules.json (R4,R9~R11)
