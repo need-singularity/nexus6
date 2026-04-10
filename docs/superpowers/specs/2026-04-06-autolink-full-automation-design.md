@@ -48,10 +48,8 @@ let SHARED = NEXUS + "/shared"
 let SCRIPTS = NEXUS + "/scripts"
 
 // 핵심 데이터 파일
-let BUS_FILE = SHARED + "/growth_bus.jsonl"
-let DISCOVERY_LOG = SHARED + "/discovery_log.jsonl"
-let GRAPH_FILE = SHARED + "/discovery_graph.json"
-let GRAPH_BACKUP = SHARED + "/discovery_graph.json.bak2"
+let ATLAS = SHARED + "/n6/atlas.n6"
+let ATLAS_BACKUP = SHARED + "/n6/atlas.n6.bak2"
 let CONSCIOUSNESS_LAWS = SHARED + "/consciousness_laws.json"
 let CUSTOM_LENSES = SHARED + "/custom_lenses.jsonl"
 let LENS_REGISTRY = SHARED + "/installed_tools.json"
@@ -59,7 +57,7 @@ let ALIEN_INDEX_DIST = SHARED + "/alien_index_distribution.json"
 let ALIEN_INDEX_RECORDS = SHARED + "/alien_index_records.jsonl"
 let PROJECTS_JSON = SHARED + "/projects.json"
 let GROWTH_REGISTRY = SHARED + "/growth-registry.json"
-let VERIFIED_CONSTANTS = SHARED + "/verified_constants.jsonl"
+// verified_constants → atlas.n6 통합
 let SELF_IMPROVE_LOG = SHARED + "/self_improve_log.jsonl"
 let PAPER_CANDIDATES = SHARED + "/paper_candidates.json"
 
@@ -97,9 +95,9 @@ hexa autolink.hexa tick              # scan + link + report (nexus_hub 연동)
 
 | ID | 설명 | 감지 방법 | 자동 복구 |
 |----|------|----------|----------|
-| C01 | discovery_graph.json 존재+유효 | 파일 존재 + JSON 파싱 + nodes 배열 비어있지 않음 | `GRAPH_BACKUP`에서 복원, 없으면 `{"nodes":[],"edges":[]}` 생성 |
-| C02 | growth_bus.jsonl 쓰기 가능 | 파일 존재 + 마지막 줄 JSON 파싱 | 빈 파일 생성, 디렉토리 권한 확인 |
-| C03 | discovery_log.jsonl 신선도 | 파일 존재 + 최신 엔트리 timestamp < 24시간 | 경고만 (데이터 생성은 blowup 책임) |
+| C01 | atlas.n6 존재+유효 | 파일 존재 + 파싱 + nodes 섹션 비어있지 않음 | `ATLAS_BACKUP`에서 복원, 없으면 빈 atlas 생성 |
+| C02 | atlas.n6 growth_bus 섹션 쓰기 가능 | 섹션 존재 + 마지막 엔트리 파싱 | 빈 섹션 초기화 |
+| C03 | atlas.n6 discovery_log 섹션 신선도 | 섹션 존재 + 최신 엔트리 timestamp < 24시간 | 경고만 (데이터 생성은 blowup 책임) |
 | C04 | consciousness_laws.json 스키마 | 파일 존재 + `laws` 배열 + 각 항목에 `id`,`statement` 필드 | 백업에서 복원, 없으면 빈 `{"laws":[]}` |
 | C05 | custom_lenses.jsonl ↔ lens_registry 동기화 | 양쪽 파일의 lens ID 집합 비교 | custom_lenses에만 있는 렌즈를 lens_registry에 추가 |
 | C06 | alien_index_distribution.json 최신성 | 파일 존재 + 마지막 업데이트 timestamp < 1시간 | `hexa alien_index.hexa distribution` 실행 |
@@ -111,7 +109,7 @@ hexa autolink.hexa tick              # scan + link + report (nexus_hub 연동)
 | C12 | blowup 후 alien_index 평가 | 새 발견에 AI grade 존재 확인 | `hexa alien_index.hexa assess` 배치 실행 |
 | C13 | cross_project resonance 데이터 | cross_intel.hexa 출력 파일 신선도 < 6시간 | `hexa cross_intel.hexa scan` 실행 |
 | C14 | seed_engine merge 유효성 | `hexa seed_engine.hexa merge` 결과 비어있지 않음 | seed 소스 파일 존재 확인 + 복원 |
-| C15 | verified_constants.jsonl 정합성 | discovery_log의 EXACT grade 항목과 verified_constants 교차 비교 | 누락된 EXACT 항목을 verified_constants에 추가 |
+| C15 | atlas.n6 verified_constants 정합성 | atlas.n6 discovery_log의 EXACT grade 항목과 verified_constants 섹션 교차 비교 | 누락된 EXACT 항목을 atlas.n6에 추가 |
 | C16 | paper_candidates.json 신선도 | 파일 존재 + 마지막 갱신 < 24시간 | `hexa engine_papers.hexa scan` 실행 |
 | C17 | growth-registry.json 타겟 정합성 | 실제 수치 (발견 수, 모듈 수, 법칙 수)와 registry 타겟 비교 | 실제 > 타겟이면 타겟 = 실제 * 2 갱신 |
 

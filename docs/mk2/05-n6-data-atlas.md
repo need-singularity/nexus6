@@ -1,12 +1,12 @@
 # 05 — n=6 데이터 아틀라스 (Data Atlas)
 
-> 작성: 2026-04-06 | 소스: `shared/discovery/discovery_log.jsonl`, `shared/discovery/math_atlas.json`, `shared/discovery/alien/alien_index_distribution.json`, `src/mk2/compat.rs`
+> 작성: 2026-04-06 | 소스: `shared/n6/atlas.n6`, `shared/discovery/math_atlas.json`, `shared/discovery/alien/alien_index_distribution.json`, `src/mk2/compat.rs`
 
 ---
 
 ## 1. Discovery Log 상수 요약
 
-**파일**: `shared/discovery/discovery_log.jsonl`
+**파일**: `shared/n6/atlas.n6`
 - 총 레코드: **21,400**건
 - 상수 필드 있는 레코드: **21,184**건
 - 고유 상수명: **15,766**종 (대부분 `topo-*` 위상 탐색 결과)
@@ -216,7 +216,7 @@
 
 **파일**: `shared/discovery/alien/alien_index_distribution.json`
 
-### 5.1 검증 상수 풀 (verified_constants.jsonl 기준)
+### 5.1 검증 상수 풀 (atlas.n6 기준)
 
 | 항목 | 값 |
 |------|----|
@@ -288,7 +288,7 @@
 
 | 파일 | 역할 |
 |------|------|
-| `shared/discovery/discovery_log.jsonl` | 실시간 상수 발견 로그 (21,400건) |
+| `shared/n6/atlas.n6` | 실시간 상수 발견 로그 (21,400건) |
 | `shared/discovery/math_atlas.json` | 가설 698건 카탈로그 |
 | `shared/n6/math_atlas.db` | SQLite 쿼리용 |
 | `shared/discovery/alien/alien_index_distribution.json` | AI 분포 현황 |

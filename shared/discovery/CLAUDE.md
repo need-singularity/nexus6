@@ -10,10 +10,9 @@ core:
   _v94_new_nodes.json
 
 graph/log:
-  discovery_graph.json   discovery_log.jsonl
-  growth_bus.jsonl       ouroboros_log.json
+  → shared/n6/atlas.n6 (discovery_graph + discovery_log + growth_bus + theory_registry + verified_constants 통합)
+  ouroboros_log.json
   composed_pipelines.jsonl
-  theory_registry.jsonl  verified_constants.jsonl
   domain_seeds.jsonl     module_candidates.jsonl
   next_directions.jsonl  self_improve_log.jsonl
 

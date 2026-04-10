@@ -20,18 +20,11 @@ open ~/Dev/nexus/shared/dashboard.html
 
 ### Closure 상세 조회
 ```bash
-# 현재 카운트
-wc -l ~/Dev/nexus/shared/discovery/verified_constants.jsonl
+# 현재 카운트 (atlas.n6 통합 조회)
+hexa shared/n6/atlas.n6 query --section verified_constants --count
 
 # Status 분포
-python3 -c "
-import json
-from collections import Counter
-c = Counter()
-for l in open('$HOME/Dev/nexus/shared/discovery/verified_constants.jsonl'):
-    c[json.loads(l).get('status','?')] += 1
-print(c.most_common())
-"
+hexa shared/n6/atlas.n6 query --section verified_constants --group-by status
 ```
 
 ## 🛸 CLI 명령 (nexus binary)
@@ -128,12 +121,11 @@ bash ~/Dev/nexus/tools/auto-commit-push.sh
 ```
 ~/Dev/nexus/
 ├── shared/
-│   ├── verified_constants.jsonl       # 닫힘 원장
+│   ├── n6/atlas.n6                    # 닫힘 원장 + 발견 로그 (통합)
 │   ├── cycle/
 │   │   ├── topology.jsonl             # topology points
 │   │   ├── edges.jsonl                # 그래프 edges
 │   │   └── halt                       # 정지 플래그
-│   ├── discovery_log.jsonl            # 발견 로그
 │   ├── closure_quality_report.json    # 품질 분류
 │   ├── dashboard.html                 # 실시간 대시보드
 │   ├── self_improve_log.jsonl         # 메타 모니터링
@@ -174,8 +166,8 @@ touch shared/discovery/cycle/topology.jsonl
 
 ### verified_constants 되돌리기
 ```bash
-git log --oneline shared/discovery/verified_constants.jsonl  # 커밋 확인
-git checkout <sha> -- shared/discovery/verified_constants.jsonl
+git log --oneline shared/n6/atlas.n6  # 커밋 확인
+git checkout <sha> -- shared/n6/atlas.n6
 ```
 
 ---
