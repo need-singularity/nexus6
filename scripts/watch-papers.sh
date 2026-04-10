@@ -19,7 +19,8 @@ INTERVAL="${INTERVAL:-300}"
 NEXUS_ROOT="${NEXUS_ROOT:-$HOME/Dev/nexus}"
 PROJECTS_JSON="${PROJECTS_JSON:-$NEXUS_ROOT/shared/projects.json}"
 PAPERS_REPO="${PAPERS_REPO:-$HOME/Dev/papers}"
-REGISTER_SCRIPT="$NEXUS_ROOT/scripts/paper-gen/register_paper.py"
+REGISTER_SCRIPT="$NEXUS_ROOT/scripts/paper-gen/register_paper.hexa"
+HEXA_BIN="${HEXA_BIN:-$HOME/Dev/hexa-lang/target/release/hexa}"
 AUTO_COMMIT="${AUTO_COMMIT:-1}"           # 1=자동 commit+push, 0=생성만
 AUTO_REGISTER="${AUTO_REGISTER:-1}"       # 1=manifest.json 자동 등록
 LOG="$HOME/Library/Logs/nexus/watch-papers.log"
@@ -59,7 +60,12 @@ while true; do
 
         # 실행 (python 또는 bash 자동 판별)
         REPORT=""
-        if [[ "$gen_path" == *.py ]]; then
+        if [[ "$gen_path" == *.hexa ]]; then
+            REPORT=$("$HEXA_BIN" "$gen_path" 2>>"$LOG") || {
+                log "⚠️ [$proj_name] generator failed (hexa)"
+                continue
+            }
+        elif [[ "$gen_path" == *.py ]]; then
             REPORT=$(/usr/bin/python3 "$gen_path" 2>>"$LOG") || {
                 log "⚠️ [$proj_name] generator failed (python)"
                 continue
@@ -91,7 +97,7 @@ while true; do
             if [ "$AUTO_REGISTER" = "1" ] && [ -f "$REGISTER_SCRIPT" ]; then
                 echo "$REPORT" | jq -r --arg dir "$OUTPUT_DIR" '.created[] | "\($dir)/\(.).md"' 2>/dev/null | while read -r md; do
                     [ -f "$md" ] || continue
-                    RESULT=$(/usr/bin/python3 "$REGISTER_SCRIPT" --file "$md" --repo "$proj_name" --tier 2 2>&1)
+                    RESULT=$("$HEXA_BIN" "$REGISTER_SCRIPT" --file "$md" --repo "$proj_name" --tier 2 2>&1)
                     STATUS=$(echo "$RESULT" | jq -r '.status' 2>/dev/null || echo "error")
                     if [ "$STATUS" = "registered" ]; then
                         ID=$(echo "$RESULT" | jq -r '.entry.id')

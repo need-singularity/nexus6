@@ -1,0 +1,335 @@
+// scripts/paper-gen/register_paper.hexa
+// 논문 .md 파일을 ~/Dev/papers/manifest.json에 등록
+//
+// Usage:
+//   hexa register_paper.hexa --file <md_path> --repo <repo_name> [--tier N] [--id-prefix P] [--id EXPLICIT]
+//
+// stdout: JSON 결과
+//   { "status": "registered", "entry": {...} }
+//   { "status": "skipped", "reason": "already registered", "file": "..." }
+//   { "status": "error", "reason": "..." }
+
+let home = exec("printenv HOME").trim()
+let papers_dir = home + "/Dev/papers"
+let manifest_path = papers_dir + "/manifest.json"
+
+// ───────────────────────────────────────────────────────────
+// 인수 파싱
+// ───────────────────────────────────────────────────────────
+
+let argv = args()
+let argc = argv.len()
+
+fn get_arg(argv, argc: i64, name: string) -> string {
+    let mut i: i64 = 0
+    while i < argc {
+        if argv[i] == name && i + 1 < argc {
+            return argv[i + 1]
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn has_arg(argv, argc: i64, name: string) -> bool {
+    let mut i: i64 = 0
+    while i < argc {
+        if argv[i] == name { return true }
+        i = i + 1
+    }
+    return false
+}
+
+let file_arg = get_arg(argv, argc, "--file")
+let repo = get_arg(argv, argc, "--repo")
+let tier_str = get_arg(argv, argc, "--tier")
+let id_prefix_arg = get_arg(argv, argc, "--id-prefix")
+let explicit_id = get_arg(argv, argc, "--id")
+
+let mut tier: i64 = 2
+if tier_str != "" {
+    try { tier = to_int(tier_str) } catch e {}
+}
+let mut id_prefix = "ALIEN10"
+if id_prefix_arg != "" { id_prefix = id_prefix_arg }
+
+fn emit_error(reason: string) {
+    let msg = "{\"status\":\"error\",\"reason\":\"" + reason + "\"}"
+    println(msg)
+    exit(1)
+}
+
+if file_arg == "" { emit_error("missing --file") }
+if repo == "" { emit_error("missing --repo") }
+
+// ───────────────────────────────────────────────────────────
+// 경로 해석 — md 파일이 papers_dir 하위에 있어야 함
+// ───────────────────────────────────────────────────────────
+
+// realpath 수행 (존재 확인 겸용)
+let abs_md = exec("/bin/sh -c 'cd \"$(dirname \"" + file_arg + "\")\" 2>/dev/null && printf \"%s/%s\" \"$(pwd)\" \"$(basename \"" + file_arg + "\")\"'").trim()
+
+if abs_md == "" || !file_exists(abs_md) {
+    emit_error("file not found: " + file_arg)
+}
+
+let prefix = papers_dir + "/"
+if !abs_md.starts_with(prefix) {
+    emit_error("file not under " + papers_dir + ": " + abs_md)
+}
+let rel_path = abs_md.substring(prefix.len(), abs_md.len())
+
+// 파일명 stem (확장자 제거)
+fn basename(p: string) -> string {
+    let parts = p.split("/")
+    return parts[parts.len() - 1]
+}
+fn stem(name: string) -> string {
+    let dot = name.split(".")
+    if dot.len() <= 1 { return name }
+    let mut out = ""
+    let mut i: i64 = 0
+    while i < dot.len() - 1 {
+        if i > 0 { out = out + "." }
+        out = out + dot[i]
+        i = i + 1
+    }
+    return out
+}
+
+let md_name = basename(abs_md)
+let md_stem = stem(md_name)
+
+// ───────────────────────────────────────────────────────────
+// frontmatter 파싱 — title, generated_at 추출
+// ───────────────────────────────────────────────────────────
+
+let text = read_file(abs_md)
+
+fn strip_quotes(s: string) -> string {
+    let mut out = s
+    // leading/trailing double-quote 제거 (multibyte 안전: char 단위 rebuild)
+    let chars = out.chars()
+    let n = chars.len()
+    if n >= 2 {
+        let first = to_string(chars[0])
+        let last = to_string(chars[n - 1])
+        if (first == "\"" && last == "\"") || (first == "'" && last == "'") {
+            let mut buf = ""
+            let mut i: i64 = 1
+            while i < n - 1 {
+                buf = buf + to_string(chars[i])
+                i = i + 1
+            }
+            out = buf
+        }
+    }
+    return out
+}
+
+fn parse_fm(text: string) -> map {
+    let mut fm = #{}
+    if !text.starts_with("---") { return fm }
+    let lines = text.split("\n")
+    let mut i: i64 = 1
+    // 첫 줄은 '---'; 다음 '---'까지 key: value 파싱
+    while i < lines.len() {
+        let line = lines[i].trim()
+        i = i + 1
+        if line == "---" { break }
+        if line == "" { continue }
+        let colon = line.index_of(":")
+        if colon <= 0 { continue }
+        let key = line.substring(0, colon).trim()
+        let mut val = line.substring(colon + 1, line.len()).trim()
+        val = strip_quotes(val)
+        fm[key] = val
+    }
+    return fm
+}
+
+let fm = parse_fm(text)
+let fmk = fm.keys()
+
+let mut title = md_stem
+if fmk.contains("title") { title = to_string(fm["title"]) }
+title = strip_quotes(title)
+
+let mut date_str = ""
+if fmk.contains("generated_at") { date_str = to_string(fm["generated_at"]) }
+if date_str == "" { date_str = exec("date '+%Y-%m-%d'").trim() }
+
+// ───────────────────────────────────────────────────────────
+// Abstract 첫 라인 추출
+// ───────────────────────────────────────────────────────────
+
+fn extract_first_para(text: string) -> string {
+    let lines = text.split("\n")
+    let mut in_fm = false
+    let mut fm_done = false
+    let mut i: i64 = 0
+    if text.starts_with("---") {
+        in_fm = true
+        i = 1
+    }
+    while i < lines.len() {
+        let raw = lines[i]
+        i = i + 1
+        if in_fm && !fm_done {
+            if raw.trim() == "---" { fm_done = true; in_fm = false }
+            continue
+        }
+        let s = raw.trim()
+        if s == "" { continue }
+        if s.starts_with("#") { continue }
+        if s.starts_with(">") { continue }
+        if s.starts_with("<!--") { continue }
+        if s.len() > 200 {
+            return s.substring(0, 200)
+        }
+        return s
+    }
+    return ""
+}
+
+let first_para = extract_first_para(text)
+
+// ───────────────────────────────────────────────────────────
+// manifest.json 로드
+// ───────────────────────────────────────────────────────────
+
+if !file_exists(manifest_path) {
+    emit_error("manifest not found: " + manifest_path)
+}
+let mraw = read_file(manifest_path)
+let manifest = json_parse(mraw)
+let mk = manifest.keys()
+
+let mut papers = []
+if mk.contains("papers") { papers = manifest["papers"] }
+
+// 중복 체크 (file 기준)
+let mut i: i64 = 0
+while i < papers.len() {
+    let p = papers[i]
+    let pk = p.keys()
+    if pk.contains("file") {
+        if to_string(p["file"]) == rel_path {
+            let msg = "{\"status\":\"skipped\",\"reason\":\"already registered\",\"file\":\"" + rel_path + "\"}"
+            println(msg)
+            exit(0)
+        }
+    }
+    i = i + 1
+}
+
+// ───────────────────────────────────────────────────────────
+// id 생성 — explicit_id 우선, 없으면 AUTO-<prefix>-<NNN>
+// ───────────────────────────────────────────────────────────
+
+fn next_auto_id(papers, prefix: string) -> string {
+    let marker = "AUTO-" + prefix + "-"
+    let mut max_n: i64 = 0
+    let mut i: i64 = 0
+    while i < papers.len() {
+        let p = papers[i]
+        i = i + 1
+        let pk = p.keys()
+        if !pk.contains("id") { continue }
+        let eid = to_string(p["id"])
+        if !eid.starts_with(marker) { continue }
+        let tail = eid.substring(marker.len(), eid.len())
+        // tail 에서 선행 숫자 추출 (digit lookup via string)
+        let digit_set = "0123456789"
+        let mut digits = ""
+        let chars = tail.chars()
+        let mut j: i64 = 0
+        while j < chars.len() {
+            let c = to_string(chars[j])
+            if digit_set.contains(c) { digits = digits + c }
+            else { break }
+            j = j + 1
+        }
+        if digits != "" {
+            let mut n: i64 = 0
+            try { n = to_int(digits) } catch e {}
+            if n > max_n { max_n = n }
+        }
+    }
+    let next = max_n + 1
+    let mut numstr = to_string(next)
+    while numstr.len() < 3 { numstr = "0" + numstr }
+    return marker + numstr
+}
+
+let mut entry_id = ""
+if explicit_id != "" {
+    entry_id = explicit_id
+} else {
+    entry_id = next_auto_id(papers, id_prefix)
+}
+
+// ───────────────────────────────────────────────────────────
+// entry 생성 및 manifest 저장
+// ───────────────────────────────────────────────────────────
+
+// JSON 안전 escape
+fn esc(s: string) -> string {
+    let mut out = s.replace("\\", "\\\\")
+    out = out.replace("\"", "\\\"")
+    out = out.replace("\n", "\\n")
+    out = out.replace("\r", "\\r")
+    out = out.replace("\t", "\\t")
+    return out
+}
+
+let mut new_entry_json = "{\n"
+new_entry_json = new_entry_json + "  \"id\": \"" + esc(entry_id) + "\",\n"
+new_entry_json = new_entry_json + "  \"title\": \"" + esc(title) + "\",\n"
+new_entry_json = new_entry_json + "  \"repo\": \"" + esc(repo) + "\",\n"
+new_entry_json = new_entry_json + "  \"file\": \"" + esc(rel_path) + "\",\n"
+new_entry_json = new_entry_json + "  \"status\": \"Draft\",\n"
+new_entry_json = new_entry_json + "  \"doi\": null,\n"
+new_entry_json = new_entry_json + "  \"date\": \"" + esc(date_str) + "\",\n"
+new_entry_json = new_entry_json + "  \"tier\": " + to_string(tier) + ",\n"
+new_entry_json = new_entry_json + "  \"keywords\": [],\n"
+new_entry_json = new_entry_json + "  \"abstract_first_line\": \"" + esc(first_para) + "\"\n"
+new_entry_json = new_entry_json + "}"
+
+// manifest 원본 텍스트에 새 entry를 append — Python json.dump와 유사한 2-space indent를 유지하기 위해
+// 기존 manifest를 재직렬화하는 대신, Python register_paper.py와 같이 json_parse → append → json_stringify 를 쓴다.
+// hexa의 json_stringify는 indent 옵션이 없어 Python 포맷과 다를 수 있다 → shared/CLAUDE.md 포맷 일관성 위해
+// jq 로 포맷팅 후 재저장.
+
+// 새 entry 를 map 으로 파싱하여 append
+let new_entry = json_parse(new_entry_json)
+papers = papers.push(new_entry)
+manifest["papers"] = papers
+
+let mut metadata = #{}
+if mk.contains("metadata") { metadata = manifest["metadata"] }
+metadata["total_papers"] = papers.len()
+manifest["metadata"] = metadata
+
+// 일관된 indent를 위해 jq 로 포맷
+let raw_out = json_stringify(manifest)
+let tmp_path = manifest_path + ".tmp"
+write_file(tmp_path, raw_out)
+try {
+    let formatted = exec("jq --indent 2 '.' '" + tmp_path + "' 2>/dev/null").trim()
+    if formatted != "" {
+        write_file(manifest_path, formatted + "\n")
+    } else {
+        write_file(manifest_path, raw_out + "\n")
+    }
+} catch e {
+    write_file(manifest_path, raw_out + "\n")
+}
+exec("rm -f '" + tmp_path + "'")
+
+// ───────────────────────────────────────────────────────────
+// 결과 출력 (stdout JSON — watch-papers.sh가 파싱)
+// ───────────────────────────────────────────────────────────
+
+let result = "{\n  \"status\": \"registered\",\n  \"entry\": " + new_entry_json + "\n}"
+println(result)
