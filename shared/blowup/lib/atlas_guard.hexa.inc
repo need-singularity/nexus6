@@ -46,6 +46,8 @@ fn _guarded_append_atlas(path: string, content: string) -> i64 {
         println("  [schema guard] rejected " + to_string(rejected) + " invalid lines -> " + path)
     }
     if len(clean) > 0 {
+        // 불변식 강제: 말미 newline 보장 (다음 append 간 line boundary 보존)
+        if !clean.ends_with("\n") { clean = clean + "\n" }
         try { append_file(path, clean) } catch e {}
     }
     return rejected
