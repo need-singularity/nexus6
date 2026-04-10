@@ -1,0 +1,356 @@
+// monte_carlo_v6_engine.hexa — 몬테카를로 v6.0 엔진
+// 목적: reality_map의 n=2..12 상수 적중률을 몬테카를로 시뮬레이션으로 비교
+// R1 HEXA-FIRST | R5 SSOT | R14 shared/ 단일진실
+// 실행: hexa shared/discovery/monte_carlo/monte_carlo_v6_engine.hexa <map_path> <out_path> <report_path> <n_trials> [diagnose]
+
+comptime const SEED = 20260409
+
+fn n_constants(n) {
+    // n의 7대 산술함수: [n, sigma, tau, phi, sopfr, J2, mu=1]
+    let divs = []
+    for d in range(1, n + 1) { if n % d == 0 { divs.push(d) } }
+    let sigma = sum(divs)
+    let tau = divs.len()
+    let phi = 0
+    for k in range(1, n + 1) { if gcd(k, n) == 1 { phi = phi + 1 } }
+    let sopfr = 0
+    let tmp = n
+    for p in range(2, n + 1) {
+        while tmp % p == 0 { sopfr = sopfr + p; tmp = tmp / p }
+    }
+    let j2 = n * n
+    let tmp2 = n
+    for p in range(2, n + 1) {
+        if tmp2 % p == 0 {
+            j2 = int(round(float(j2) * (1.0 - 1.0 / float(p * p))))
+            while tmp2 % p == 0 { tmp2 = tmp2 / p }
+        }
+    }
+    let vals = set([n, sigma, tau, phi, sopfr, j2, 1])
+    return vals.to_list().sort()
+}
+
+fn reachable(constants, max_r, max_exp) {
+    // 상수 조합으로 도달 가능한 정수 집합 계산 (2-연산)
+    if max_r == nil { max_r = 10000 }
+    if max_exp == nil { max_exp = 10 }
+    let reach = set()
+    for a in constants {
+        if a > 0 and a <= max_r { reach.add(a) }
+    }
+    for a in constants {
+        for b in constants {
+            for v in [a + b, a - b, a * b] {
+                if v > 0 and v <= max_r { reach.add(v) }
+            }
+            if b != 0 and a % b == 0 {
+                let v = a / b
+                if v > 0 and v <= max_r { reach.add(v) }
+            }
+            if b > 0 and b <= max_exp and a > 0 {
+                let v = pow(a, b)
+                if v > 0 and v <= max_r { reach.add(v) }
+            }
+            if b >= 0 and b <= a {
+                let c = comb(a, b)
+                if c > 0 and c <= max_r { reach.add(c) }
+            }
+        }
+    }
+    return reach
+}
+
+fn load_targets(path) {
+    // reality_map에서 정수 타겟 추출
+    let data = load_json(path)
+    let nodes = data.get("nodes", [])
+    let natural_int = []
+    let all_int = []
+    let origin_counts = {}
+    let origin_hits = {}
+
+    for nd in nodes {
+        let origin = nd.get("origin", "unknown")
+        origin_counts[origin] = origin_counts.get(origin, 0) + 1
+        let m = nd.get("measured")
+        let v = nil
+        if is_int(m) and m > 0 { v = m }
+        else if is_float(m) and m == int(m) and m > 0 { v = int(m) }
+        if v != nil and v <= 10000 {
+            all_int.push(v)
+            if not origin_hits.has(origin) { origin_hits[origin] = [] }
+            origin_hits[origin].push(v)
+            if origin == "natural" { natural_int.push(v) }
+        }
+    }
+    return (natural_int, all_int, origin_counts, origin_hits, data.get("_meta", {}))
+}
+
+fn stats(xs) {
+    // 평균, 표준편차 계산
+    let n = xs.len()
+    if n == 0 { return (0.0, 0.0) }
+    let m = sum(xs) / float(n)
+    let v = sum(xs.map(fn(x) { (x - m) * (x - m) })) / float(n)
+    return (m, sqrt(v))
+}
+
+fn z_and_p(obs, dist) {
+    // z-점수와 p-값 계산
+    let (m, s) = stats(dist)
+    let z = if s > 0 { (obs - m) / s } else { if obs > m { inf } else { 0.0 } }
+    let cnt = dist.count(fn(v) { v >= obs })
+    let p = if dist.len() > 0 { float(cnt) / float(dist.len()) } else { 1.0 }
+    return (z, p, m, s)
+}
+
+fn bootstrap_ci(hits, reach_size, trial_effs, n_boot) {
+    // 부트스트랩 신뢰구간 계산
+    if n_boot == nil { n_boot = 5000 }
+    let eff = if reach_size > 0 { float(hits) / float(reach_size) } else { 0.0 }
+    let rng = random_seed(42)
+    let boot_zs = []
+    for _ in range(n_boot) {
+        let sample = []
+        for _ in range(trial_effs.len()) { sample.push(trial_effs[rng.randint(0, trial_effs.len() - 1)]) }
+        let (m, s) = stats(sample)
+        if s > 0 { boot_zs.push((eff - m) / s) }
+    }
+    if boot_zs.len() == 0 { return { "eff": eff, "z_lo": 0, "z_hi": 0, "p_boot": 1.0 } }
+    boot_zs = boot_zs.sort()
+    let lo = boot_zs[int(0.005 * float(boot_zs.len()))]
+    let hi = boot_zs[int(0.995 * float(boot_zs.len()))]
+    let p_boot = float(boot_zs.count(fn(z) { z <= 0 })) / float(boot_zs.len())
+    return { "eff": eff, "z_lo": lo, "z_hi": hi, "p_boot": p_boot }
+}
+
+fn run_mc(label, constants, targets, n_trials) {
+    // 단일 상수 집합에 대한 몬테카를로 시행
+    let reach = reachable(constants, nil, nil)
+    let reach_size = reach.len()
+    let hits = targets.count(fn(t) { reach.contains(t) })
+    let eff = if reach_size > 0 { float(hits) / float(reach_size) } else { 0.0 }
+    let rng = random_seed(SEED)
+    let trial_hits = []
+    let trial_effs = []
+    let trial_sizes = []
+
+    for _ in range(n_trials) {
+        let rc = []
+        for _ in range(7) { rc.push(rng.randint(1, 30)) }
+        let rr = reachable(rc, nil, nil)
+        let sz = rr.len()
+        let h = targets.count(fn(t) { rr.contains(t) })
+        trial_hits.push(h)
+        trial_sizes.push(sz)
+        trial_effs.push(if sz > 0 { float(h) / float(sz) } else { 0.0 })
+    }
+
+    let (z_hit, p_hit, mu_h, sig_h) = z_and_p(float(hits), trial_hits.map(fn(x) { float(x) }))
+    let (z_eff, p_eff, mu_e, sig_e) = z_and_p(eff, trial_effs)
+
+    // 크기 매칭 z-점수
+    let tol_sz = max(5, int(float(reach_size) * 0.10))
+    let matched = []
+    for i in range(n_trials) {
+        if abs(trial_sizes[i] - reach_size) <= tol_sz { matched.push(trial_hits[i]) }
+    }
+    let z_sm = 0.0
+    let p_sm = 1.0
+    if matched.len() >= 30 {
+        let (z, p, _, _) = z_and_p(float(hits), matched.map(fn(x) { float(x) }))
+        z_sm = z
+        p_sm = p
+    }
+
+    let boot = bootstrap_ci(hits, reach_size, trial_effs, nil)
+
+    return {
+        "label": label, "constants": constants, "reach_size": reach_size,
+        "hits": hits, "hit_rate": if targets.len() > 0 { float(hits) / float(targets.len()) } else { 0.0 },
+        "eff": eff, "z_hit": z_hit, "p_hit": p_hit,
+        "z_eff": z_eff, "p_eff": p_eff,
+        "z_sm": z_sm, "p_sm": p_sm, "n_matched": matched.len(),
+        "bootstrap": boot, "mu_h": mu_h, "sig_h": sig_h,
+        "mu_e": mu_e, "sig_e": sig_e, "trial_effs": trial_effs
+    }
+}
+
+fn diagnose(targets, all_int) {
+    // z>3 갭 분석 리포트 생성
+    let n6r = reachable([6, 12, 4, 2, 5, 24, 1], nil, nil)
+    let small = targets.count(fn(t) { t <= 24 })
+    let lines = [
+        "## z>3 갭 분석", "",
+        "n=6 reach=" + str(n6r.len()) + ", natural targets=" + str(targets.len()) + ", all=" + str(all_int.len()), "",
+        "### 원인 1: reach 크기 편향",
+        "n=6 상수 최대값=24, 랜덤 1-30 범위 유사 → 높은 겹침.", "",
+        "### 원인 2: 타겟 분포",
+        "targets<=24: " + str(small) + "/" + str(targets.len()) + " (" + str(round(float(small) / float(targets.len()) * 100, 1)) + "%)",
+        "작은 정수 지배 → 모든 소수 집합이 잘 수행.", "",
+        "### 원인 3: 2-연산 한계",
+        "6 연산 x 49 쌍 → ~51 고유 reach. 낮은 판별력.", "",
+        "### 원인 4: 다중 비교",
+        "n=2..12 (11 후보) → 본페로니: p_adj = p*11",
+        "z=2.03→p=0.021→p_adj=0.23 (보정 후 유의하지 않음).", "",
+        "### 해결책",
+        "1. 3-연산 확장: (a op b) op c",
+        "2. 랜덤 범위를 max(상수)에 맞춤",
+        "3. 유일 타겟만 사용 (중복 제거)",
+        "4. STRUCTURAL/CAUSAL만 필터 (CONVENTION 제외)",
+        "5. z_eff + z_size_matched 결합 지표"
+    ]
+    return lines.join("\n")
+}
+
+fn main() {
+    let args = get_args()
+    if args.len() < 4 {
+        println("사용법: hexa monte_carlo_v6_engine.hexa <map_path> <out_path> <report_path> <n_trials> [diagnose]")
+        return
+    }
+
+    let map_path = args[0]
+    let out_path = args[1]
+    let report_path = args[2]
+    let n_trials = int(args[3])
+    let do_diagnose = if args.len() > 4 { args[4] == "1" } else { false }
+
+    let t0 = now()
+    let (nat_int, all_int, org_cnt, org_hits, meta) = load_targets(map_path)
+    let ver = meta.get("version", "?")
+    let tot = meta.get("node_count", 0)
+    println("reality_map " + ver + ", " + str(tot) + " 노드")
+    println("origin: " + str(org_cnt))
+    println("natural 정수 타겟: " + str(nat_int.len()) + " (유일 " + str(set(nat_int).len()) + ")")
+    println()
+
+    let n6r = reachable([6, 12, 4, 2, 5, 24, 1], nil, nil)
+    let org_st = {}
+    for org in org_hits.keys().sort() {
+        let vals = org_hits[org]
+        let h = vals.count(fn(v) { n6r.contains(v) })
+        org_st[org] = { "count": vals.len(), "unique": set(vals).len(), "n6_hits": h, "rate": if vals.len() > 0 { float(h) / float(vals.len()) } else { 0.0 } }
+        println("  " + org.pad_right(15) + ": " + str(vals.len()).pad_right(5) + " tgt, " + str(set(vals).len()).pad_right(4) + " uniq, n6=" + str(h) + " (" + str(round(float(h) / float(vals.len()) * 100, 1)) + "%)")
+    }
+    println()
+
+    if do_diagnose {
+        let d = diagnose(nat_int, all_int)
+        println(d)
+        write_file(report_path, d)
+        return
+    }
+
+    let tgt_u = set(nat_int).to_list().sort()
+    let tgt_a = nat_int
+    println("-- n=2..12 비교 (N=" + str(n_trials) + ") --")
+    let res_u = {}
+    let res_a = {}
+
+    for n in range(2, 13) {
+        let c = n_constants(n)
+        println("  n=" + str(n).pad_right(2) + " c=" + str(c))
+        let ru = run_mc("n=" + str(n) + "(u)", c, tgt_u, n_trials)
+        let ra = run_mc("n=" + str(n) + "(a)", c, tgt_a, n_trials)
+        ru.remove("trial_effs")
+        ra.remove("trial_effs")
+        res_u[n] = ru
+        res_a[n] = ra
+        println("    unique: hit=" + str(ru["hits"]) + "/" + str(tgt_u.len()) + " z_h=" + format(ru["z_hit"], "+.2f") + " z_e=" + format(ru["z_eff"], "+.2f") + " z_sm=" + format(ru["z_sm"], "+.2f"))
+        println("    all:    hit=" + str(ra["hits"]) + "/" + str(tgt_a.len()) + " z_h=" + format(ra["z_hit"], "+.2f") + " z_e=" + format(ra["z_eff"], "+.2f") + " z_sm=" + format(ra["z_sm"], "+.2f"))
+    }
+
+    // 본페로니 보정
+    let nc = 11
+    for n in range(2, 13) {
+        res_u[n]["p_bonf"] = min(1.0, res_u[n]["p_eff"] * float(nc))
+        res_a[n]["p_bonf"] = min(1.0, res_a[n]["p_eff"] * float(nc))
+    }
+
+    // 특수 집합 비교
+    let sp = { "primes": [2, 3, 5, 7, 11, 13, 17], "fib": [1, 1, 2, 3, 5, 8, 13], "pow2": [1, 2, 4, 8, 16, 32, 64] }
+    let sp_res = {}
+    for nm, cs in sp {
+        let r = run_mc(nm, cs, tgt_u, n_trials)
+        r.remove("trial_effs")
+        sp_res[nm] = r
+        println("  " + nm.pad_right(12) + ": hit=" + str(r["hits"]) + " z_eff=" + format(r["z_eff"], "+.2f"))
+    }
+
+    let n6u = res_u[6]
+    let bz = max(n6u["z_eff"], max(n6u["z_sm"], n6u["z_hit"]))
+    let rk = res_u.entries().sort_by(fn(a, b) { b.1["z_eff"] - a.1["z_eff"] })
+    let r6 = rk.find_index(fn(x) { x.0 == 6 }) + 1
+    let el = elapsed(t0)
+
+    println()
+    println("=" * 60)
+    println("  n=6 (unique tgt=" + str(tgt_u.len()) + "):")
+    println("    z_hit=" + format(n6u["z_hit"], "+.3f") + " z_eff=" + format(n6u["z_eff"], "+.3f") + " z_sm=" + format(n6u["z_sm"], "+.3f"))
+    println("    best_z=" + format(bz, "+.3f") + " rank=" + str(r6) + "/11 z>3=" + str(bz > 3))
+    println("    p_bonf=" + format(n6u["p_bonf"], ".4f"))
+    println("  경과 시간: " + format(el, ".1f") + "초")
+    println("=" * 60)
+
+    // 리포트 생성
+    let rpt = [
+        "# 몬테카를로 v6.0 재실행", "",
+        "- 날짜: " + now_format("%Y-%m-%d %H:%M"),
+        "- 데이터: reality_map_live.json (" + ver + ", " + str(tot) + " 노드)",
+        "- natural 정수 타겟: " + str(nat_int.len()) + " (유일 " + str(tgt_u.len()) + ")",
+        "- N=" + str(n_trials), "",
+        "## n=2..12 (유일 타겟)", "",
+        "| n | 상수 | reach | hits | hit% | eff | z_hit | z_eff | z_sm | p_bonf |",
+        "|---|------|-------|------|------|-----|-------|-------|------|--------|"
+    ]
+    for n in range(2, 13) {
+        let r = res_u[n]
+        rpt.push("| " + str(n) + " | " + str(r["constants"]) + " | " + str(r["reach_size"]) + " | " + str(r["hits"]) + " | " + str(round(r["hit_rate"] * 100, 1)) + "% | " + format(r["eff"], ".3f") + " | " + format(r["z_hit"], "+.2f") + " | " + format(r["z_eff"], "+.2f") + " | " + format(r["z_sm"], "+.2f") + " | " + format(r["p_bonf"], ".4f") + " |")
+    }
+    rpt.push("")
+    rpt.push("## 특수 집합")
+    rpt.push("")
+    rpt.push("| 집합 | reach | hits | z_eff |")
+    rpt.push("|------|-------|------|-------|")
+    for nm, r in sp_res {
+        rpt.push("| " + nm + " | " + str(r["reach_size"]) + " | " + str(r["hits"]) + " | " + format(r["z_eff"], "+.2f") + " |")
+    }
+    rpt.push("")
+    rpt.push("## 판정")
+    rpt.push("")
+    rpt.push("- **best z = " + format(bz, "+.3f") + "**")
+    rpt.push("- **z>3: " + (if bz > 3 { "YES" } else { "NO" }) + "**")
+    rpt.push("- n=6 eff 순위: " + str(r6) + "/11")
+    rpt.push("- p_bonf: " + format(n6u["p_bonf"], ".4f"))
+    rpt.push("")
+    rpt.push(diagnose(nat_int, all_int))
+
+    write_file(report_path, rpt.join("\n"))
+
+    // JSON 출력 저장
+    let out = {
+        "meta": {
+            "script": "monte_carlo_v6_engine.hexa",
+            "generated": now_format("%Y-%m-%dT%H:%M:%S"),
+            "version": ver, "total_nodes": tot,
+            "natural_targets": nat_int.len(),
+            "unique_targets": tgt_u.len(),
+            "n_trials": n_trials, "seed": SEED, "elapsed": el
+        },
+        "origin_stats": org_st,
+        "n_comparison": res_u.map_keys(fn(k) { str(k) }),
+        "n_comparison_all": res_a.map_keys(fn(k) { str(k) }),
+        "special": sp_res,
+        "verdict": {
+            "best_z": bz, "z_gt_3": bz > 3, "rank": r6,
+            "z_eff": n6u["z_eff"], "z_hit": n6u["z_hit"], "z_sm": n6u["z_sm"],
+            "prev": 2.03, "gap": "small-number-bias+2op-overlap+target-dist"
+        }
+    }
+    write_json(out_path, out)
+    println("저장: " + out_path)
+    println("리포트: " + report_path)
+}
+
+main()

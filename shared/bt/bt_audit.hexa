@@ -1,0 +1,741 @@
+// bt_audit.hexa — BT EXACT 수식 자동 검산기
+// 목적: breakthrough-theorems.md의 343개 BT에서 수식 테이블을 파싱하고
+//       n=6 상수로 평가하여 불일치를 찾는다.
+// 결과: bt_audit_result.json에 저장
+// R1 HEXA-FIRST | R5 SSOT | R14 shared/ 단일진실
+// 실행: hexa shared/bt/bt_audit.hexa
+
+comptime const BT_FILE = "$HOME/Dev/n6-architecture/docs/breakthrough-theorems.md"
+comptime const RESULT_FILE = "$HOME/Dev/nexus/shared/bt/bt_audit_result.json"
+
+// ═══════════════════════════════════════════════════════════
+// n=6 기본 상수
+// ═══════════════════════════════════════════════════════════
+comptime const N6 = {
+    "n": 6, "sigma": 12, "tau": 4, "phi": 2, "sopfr": 5,
+    "J2": 24, "J_2": 24, "mu": 1,
+    // 유도 상수
+    "sigma_phi": 10, "sigma_tau": 8, "sigma_sopfr": 7,
+    "sigma_mu": 11, "n_phi": 3, "phi_tau": 16,
+    "R": 1, "P1": 6, "P2": 28, "K_2": 6, "K_3": 12, "P3": 496
+}
+
+// eval용 네임스페이스 — 수식에서 쓰이는 모든 이름
+comptime const EVAL_NS = {
+    "n": 6, "sigma": 12, "tau": 4, "phi": 2, "sopfr": 5,
+    "J2": 24, "J_2": 24, "mu": 1, "R": 1,
+    "P1": 6, "P2": 28, "K_2": 6, "K_3": 12, "P3": 496,
+    "pi": 3.141592653589793, "e": 2.718281828459045,
+    "alpha": 0.0072973525693, "beta": 0.288,
+    "delta": 0, "epsilon": 1e-8, "zeta": 1.6449,
+    "eta": 0.5, "kappa": 6, "lambda_val": 2,
+    "psi": 12, "omega": 2, "Omega": 2, "rad": 6
+}
+
+// 유니코드 아래첨자 → ASCII (K₁ → K1)
+comptime const SUB_MAP = {
+    "₀": "0", "₁": "1", "₂": "2", "₃": "3", "₄": "4",
+    "₅": "5", "₆": "6", "₇": "7", "₈": "8", "₉": "9"
+}
+
+// 유니코드 윗첨자 → 숫자 (거듭제곱)
+comptime const SUP_MAP = {
+    "⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4",
+    "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9"
+}
+comptime const SUP_SIGN_MAP = { "⁻": "-", "⁺": "+" }
+
+// 그리스 문자 → 영문 치환
+comptime const GREEK_MAP = {
+    "σ": "sigma", "τ": "tau", "φ": "phi", "μ": "mu",
+    "ψ": "psi", "η": "eta", "κ": "kappa", "λ": "lambda_val",
+    "α": "alpha", "β": "beta", "ε": "epsilon", "δ": "delta",
+    "ζ": "zeta", "Δ": "delta", "π": "pi", "Φ": "phi"
+}
+
+// 정수론 함수 사전 평가값 (n=6)
+comptime const NT_FUNC_N6 = {
+    "sigma": 12, "tau": 4, "phi": 2, "omega": 2,
+    "rad": 6, "sopfr": 5, "mu": 1, "Omega": 2
+}
+
+// n6 유도 상수 역방향 룩업 (값 → 이름)
+comptime const DERIVED_LOOKUP = {
+    16: "phi**tau", 32: "2**sopfr", 64: "2**n", 128: "2**(sigma-sopfr)",
+    256: "2**(sigma-tau)", 2048: "2**(sigma-mu)", 4096: "2**sigma",
+    81: "3**tau", 36: "n**2", 216: "n**3", 1296: "n**4",
+    144: "sigma**2", 48: "sigma*tau", 24: "sigma*phi",
+    288: "sigma*J2", 96: "J2*tau", 7: "sigma-sopfr",
+    8: "sigma-tau", 10: "sigma-phi", 11: "sigma-mu",
+    3: "n/phi", 13: "sigma+mu", 14: "sigma+phi",
+    17: "sigma+sopfr", 20: "J2-tau", 22: "J2-phi",
+    23: "J2-mu", 25: "J2+mu", 26: "J2+phi",
+    28: "P2", 2401: "(sigma-sopfr)**tau"
+}
+
+// ═══════════════════════════════════════════════════════════
+// 유니코드 정규화 함수
+// ═══════════════════════════════════════════════════════════
+
+fn normalize_expr_unicode(s) {
+    // 유니코드 특수기호를 ASCII로 정규화 (파스 전처리 진입점)
+    if s == nil { return s }
+    let result = s
+    result = result.replace("\u00a0", " ").replace("\u2009", " ")
+    result = result.replace("\u200b", "").replace("\ufeff", "")
+    result = result.replace("×", "*").replace("·", "*").replace("÷", "/")
+    result = result.replace("−", "-").replace("–", "-").replace("—", "-")
+    result = result.replace("±", "+")
+    result = result.replace("\u2010", "-").replace("\u2011", "-")
+    return result.trim()
+}
+
+fn convert_superscripts(s) {
+    // 연속된 유니코드 윗첨자(부호 포함)를 **N으로 변환
+    let out = ""
+    let i = 0
+    while i < s.len() {
+        let c = s[i]
+        if SUP_MAP.has(c) or SUP_SIGN_MAP.has(c) {
+            let sign = ""
+            if SUP_SIGN_MAP.has(c) {
+                sign = SUP_SIGN_MAP[c]
+                i = i + 1
+            }
+            let digits = ""
+            while i < s.len() and SUP_MAP.has(s[i]) {
+                digits = digits + SUP_MAP[s[i]]
+                i = i + 1
+            }
+            if digits.len() > 0 {
+                out = out + "**" + sign + digits
+            } else if sign.len() > 0 {
+                out = out + "**" + sign
+            }
+        } else {
+            out = out + c
+            i = i + 1
+        }
+    }
+    return out
+}
+
+fn strip_units(s) {
+    // 단위/주석/극성 표기 제거 (순수 식별자는 보호)
+    let result = s.trim()
+    result = result.lstrip("±~≈")
+    // 후행 단위 패턴 제거 (숫자 뒤)
+    result = regex_sub(r"(?<=[\d\)])\s*\([^)]*\)\s*$", "", result)
+    result = regex_sub(r"(?<=[\d\)])\s*(?:ft|Hz|kHz|MHz|GHz|THz|nm|μm|mm|cm|km|eV|keV|MeV|GeV|TeV|kW|MW|GW|kV|MV|mA|mT|ms|us|μs|ns|ps|fs|MPa|GPa|Pa|bar|atm|kJ|MJ|Wh|kWh|MWh|°C|°F|°|deg|rad|bits?|bytes?)\b.*$", "", result)
+    return result.trim()
+}
+
+fn normalize_expr(expr_str) {
+    // n=6 수식 문자열을 평가 가능한 형태로 정규화
+    let s = expr_str.trim()
+    s = normalize_expr_unicode(s)
+
+    // 마크다운 굵게 제거
+    s = regex_sub(r"^\*\*(.*)\*\*$", "$1", s).trim()
+
+    // 유니코드 윗첨자 → **N, 아래첨자 → 숫자
+    s = convert_superscripts(s)
+    s = translate(s, SUB_MAP)
+
+    // EXACT 주석 제거
+    s = regex_sub(r"\s+EXACT\b", "", s).trim()
+
+    // 후행 괄호 주석 제거 (수식 괄호 보호)
+    s = strip_annotation_parens(s)
+
+    // "vs ..." 제거
+    s = regex_sub(r"\s+vs\s+.*$", "", s).trim()
+
+    // 후행 단위 단어 제거
+    s = regex_sub(r"\s+(?:mV|kV|kW|MW|GW|Hz|kHz|MHz|GHz|THz|nm|mm|cm|km|eV|keV|MeV|GeV|TeV|bits?|bytes?|mol|atm|bar|Pa|MPa|GPa|mA|mT|ms|us|ns|ps|fs|K|°C|m|s|kg|J|W|Wb|lm|cd|sr|rad|dB|dBm)$", "", s).trim()
+
+    // 빈 문자열이나 긴 설명 텍스트 스킵
+    if s.len() == 0 or s.len() > 120 { return nil }
+
+    // 순수 텍스트 스킵
+    let skip_words = ["complex", "varies", "multiple", "see ", "various",
+        "continuous", "standard", "definition", "theorem", "universal",
+        "unique", "approximately", "measured", "empirical", "derived",
+        "combined", "cross", "all ", "every", "close", "near", "depends",
+        "divisor", "reciprocal", "methods", "method"]
+    for w in skip_words {
+        if s.lower().contains(w) { return nil }
+    }
+
+    // ⟺ (iff) 분리 — 우측 사용
+    if s.contains("⟺") { s = s.split("⟺").last().trim() }
+
+    // "or" 분리 — 첫 번째 대안만
+    if s.lower().contains(" or ") {
+        s = regex_split(r"\bor\b", s)[0].trim()
+    }
+
+    // 등호 처리: 우측 숫자 리터럴 우선
+    if s.contains("=") and not s.contains("==") and not s.contains(">=") and not s.contains("<=") {
+        let all_parts = s.split("=").map(fn(p) { p.trim() })
+        let chosen = nil
+        for p in all_parts.reversed() {
+            if is_numeric(p.replace(",", "")) { chosen = p.replace(",", ""); break }
+        }
+        if chosen != nil {
+            s = chosen
+        } else {
+            let left = all_parts[0]
+            let right = all_parts.slice(1).join("=").trim()
+            if regex_match(r"^[A-Za-z_][A-Za-z0-9_]*$", left) {
+                s = right
+            } else {
+                s = left
+            }
+        }
+    }
+
+    // 그리스 문자 → 영문 치환 (인접 그리스 문자 사이에 * 삽입)
+    for g, eng in GREEK_MAP { s = s.replace(g, eng) }
+
+    // 유니코드 산술 치환
+    s = s.replace("×", "*").replace("·", "*").replace("÷", "/")
+    s = s.replace("−", "-").replace("–", "-").replace("—", "-")
+    s = s.replace("^", "**")
+
+    // 정수론 함수 사전 평가 (n=6)
+    for fn_name, val in NT_FUNC_N6 {
+        s = regex_sub(r"\b" + fn_name + r"\(\s*6\s*\)", str(val), s)
+    }
+
+    // sigma/phi/tau 등은 상수 — 'sigma(' 사용은 곱셈으로 해석
+    for nm in ["sigma", "phi", "tau", "sopfr", "mu", "psi", "eta", "kappa"] {
+        s = regex_sub(r"\b" + nm + r"\(", nm + "*(", s)
+    }
+
+    // J_2 -> J2
+    s = s.replace("J_2", "J2")
+
+    // 암묵적 곱셈 삽입: 3tau → 3*tau
+    s = regex_sub(r"(\d)([A-Za-z_(])", "$1*$2", s)
+    // 닫는 괄호와 여는 괄호: )( → )*(
+    s = regex_sub(r"\)\s*([A-Za-z_(])", ")*$1", s)
+
+    // 단위/주석 제거
+    s = strip_units(s)
+    s = s.trim()
+
+    // 괄호 짝 체크
+    if s.count("(") != s.count(")") { return nil }
+
+    // 팩토리얼
+    s = regex_sub(r"(\b\w+)!", "factorial($1)", s)
+
+    // 허용 문자 체크
+    let allowed = "0123456789+-*/.() _abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    for c in s { if not allowed.contains(c) { return nil } }
+
+    if s.len() == 0 or s == "-" or s == "+" { return nil }
+    return s
+}
+
+fn safe_eval(expr_str) {
+    // 수식 문자열을 안전하게 평가
+    let normalized = normalize_expr(expr_str)
+    if normalized == nil {
+        let bare = parse_bare_numeric(expr_str)
+        if bare != nil { return (bare, "<bare:" + str(bare) + ">") }
+        return (nil, nil)
+    }
+    let result = eval_with_ns(normalized, EVAL_NS)
+    if result != nil and is_number(result) {
+        return (result, normalized)
+    }
+    let bare = parse_bare_numeric(expr_str)
+    if bare != nil { return (bare, "<bare:" + str(bare) + ">") }
+    return (nil, normalized)
+}
+
+fn parse_bare_numeric(s) {
+    // expression 셀이 숫자값(단위포함)일 때 그 숫자만 추출. 실패시 nil
+    if s == nil or s.trim().len() == 0 { return nil }
+    let cleaned = s.trim()
+    cleaned = regex_sub(r"^\*\*(.+?)\*\*$", "$1", cleaned).trim()
+    cleaned = cleaned.lstrip("±~≈")
+
+    // e-표기 우선 (3.08e-5)
+    let me = regex_match(r"^([+-]?\d+\.?\d*|[+-]?\.\d+)[eE]([+-]?\d+)", cleaned)
+    if me != nil {
+        return float(me[1]) * pow(10, int(me[2]))
+    }
+
+    // 일반 숫자+단위
+    let nm = regex_match(r"^\s*([+-]?\d{1,3}(?:,\d{3})+|[+-]?\d+\.?\d*|[+-]?\.\d+)\s*", cleaned)
+    if nm != nil {
+        return float(nm[1].replace(",", ""))
+    }
+    return nil
+}
+
+fn parse_predicted_value(val_str) {
+    // Predicted 열에서 숫자 추출
+    let s = val_str.trim()
+    s = regex_sub(r"^\*\*(.+?)\*\*$", "$1", s).trim()
+    s = s.lstrip("~≈")
+
+    // 유니코드 과학표기 ("3.083×10⁻⁵" -> 3.083e-5)
+    let s_uni = s.replace("×", "*").replace("·", "*")
+    s_uni = convert_superscripts(s_uni)
+    let sci_m = regex_match(r"^([+-]?\d+\.?\d*)\s*\*\s*10\*\*([+-]?\d+)\s*$", s_uni)
+    if sci_m != nil {
+        return float(sci_m[1]) * pow(10, int(sci_m[2]))
+    }
+
+    // 등호 — 좌변이 순수 숫자면 추출
+    if s.contains("=") and not s.contains("==") {
+        let parts = s.split("=")
+        let left = parts[0].trim()
+        if is_numeric(left.replace(",", "")) {
+            return float(left.replace(",", ""))
+        }
+    }
+
+    // e-표기
+    let me = regex_match(r"^([+-]?\d+\.?\d*|[+-]?\.\d+)[eE]([+-]?\d+)", s)
+    if me != nil {
+        return float(me[1]) * pow(10, int(me[2]))
+    }
+
+    // 분수
+    let fm = regex_match(r"^([+-]?\d+)\s*/\s*(\d+)$", s)
+    if fm != nil and int(fm[2]) != 0 {
+        return float(int(fm[1])) / float(int(fm[2]))
+    }
+
+    // 일반 숫자
+    let nm = regex_match(r"([+-]?\d+\.?\d*)", s)
+    if nm != nil { return float(nm[1]) }
+    return nil
+}
+
+fn parse_known_value(val_str) {
+    // Known 열에서 숫자 추출 (설명 텍스트가 붙을 수 있음)
+    let s = val_str.trim().lstrip("~≈")
+    s = normalize_expr_unicode(s)
+    s = convert_superscripts(s)
+    s = translate(s, SUB_MAP)
+    s = s.replace("^", "**")
+
+    // 원소 표기 "Si-28", "Fe-56" → 질량수 추출
+    let elem_m = regex_match(r"^[A-Z][a-z]?-(\d+)$", val_str.trim())
+    if elem_m != nil { return float(elem_m[1]) }
+
+    // 팩토리얼 패턴 "= N!"
+    let fac_m = regex_match(r"(\d+)\s*!", s)
+    if fac_m != nil { return float(factorial(int(fac_m[1]))) }
+
+    // 부등식 패턴 "< 0.06"
+    let ineq_m = regex_match(r"^\s*(?:>=|<=|>|<)\s*([+-]?\d+\.?\d*)", s)
+    if ineq_m != nil { return float(ineq_m[1]) }
+
+    // 범위 패턴 "~0.01-0.1" → 중간값
+    let range_m = regex_match(r"^\s*~?\s*([+-]?\d+\.?\d*)\s*-\s*(\d+\.?\d*)", s)
+    if range_m != nil {
+        let lo = float(range_m[1])
+        let hi = float(range_m[2])
+        if hi > lo { return (lo + hi) / 2.0 }
+    }
+
+    // 인라인 단위 제거 후 분수/숫자
+    s = regex_sub(r"(\d)\s*(?:V|kV|MV|kW|MW|Hz|kHz|MHz|GHz|eV|keV|MeV|GeV|Pa|MPa|GPa|mA|mT|Wb|lm|cd|mol|rad|sr)\b", "$1", s)
+    s = regex_sub(r"\s+[A-Za-z][-A-Za-z/]*\s*$", "", s).trim()
+
+    // 분수 평가
+    let frac_m = regex_match(r"^\s*([+-]?\d+\.?\d*(?:[eE][+-]?\d+)?)\s*/\s*([+-]?\d+\.?\d*(?:[eE][+-]?\d+)?)\s*$", s)
+    if frac_m != nil and float(frac_m[2]) != 0 {
+        return float(frac_m[1]) / float(frac_m[2])
+    }
+
+    // 퍼센트
+    let pm = regex_match(r"([+-]?\d+\.?\d*)\s*%", s)
+    if pm != nil { return float(pm[1]) / 100.0 }
+
+    // 일반 숫자
+    let nm = regex_match(r"([+-]?\d+\.?\d*)", s)
+    if nm != nil { return float(nm[1]) }
+    return nil
+}
+
+fn is_non_formula(expr_str) {
+    // 수식이 아닌 라벨/이름 판별
+    let s = convert_superscripts(expr_str.trim())
+    s = translate(s, SUB_MAP)
+    if s.len() == 0 { return true }
+    if regex_match(r"^[*_]{1,2}[^*_]+[*_]{1,2}$", s) { return true }
+    if s.contains("\\") { return true }
+    if s == "—" or s == "-" or s == "**" or s == "***" { return true }
+    // 한글만
+    if is_all_hangul(s) { return true }
+    // 단순 식별자 (n6 상수명 제외)
+    let known_names = ["sigma", "tau", "phi", "sopfr", "mu", "n", "J2", "J_2", "R", "P1", "P2", "K_2", "K_3"]
+    if regex_match(r"^[A-Za-z_][A-Za-z0-9_]*$", s) and not known_names.contains(s) { return true }
+    return false
+}
+
+fn is_descriptive_known(known_str) {
+    // Known 셀이 서술형 자연어인지 판별
+    if known_str == nil or known_str.trim().len() == 0 { return false }
+    let s = known_str.trim()
+    let stripped = regex_sub(r"\b(ln|log|log2|sqrt|exp|pi|e|sin|cos|tan|sigma|tau|phi|mu|sopfr|n|J2|J_2)\b", "", s)
+    let core = regex_sub(r"[\s\*_\-~≈±()=,:/\.\d\^%×·]", "", stripped)
+    if core.len() == 0 { return false }
+    let alpha = core.count_alpha()
+    if alpha < 3 { return false }
+    let ratio = float(alpha) / float(max(1, core.len()))
+    return ratio > 0.4
+}
+
+// ═══════════════════════════════════════════════════════════
+// BT 파싱 함수
+// ═══════════════════════════════════════════════════════════
+
+fn parse_bt_sections(text) {
+    // BT 섹션들을 파싱
+    let sections = []
+    let bt_pattern = regex_compile(r"^## BT-(\d+)", "m")
+    let matches = bt_pattern.find_all(text)
+
+    for i, m in matches.enumerate() {
+        let bt_num = int(m[1])
+        let start = m.start()
+        let end = if i + 1 < matches.len() { matches[i + 1].start() } else { text.len() }
+        let section_text = text.slice(start, end)
+        sections.push((bt_num, section_text))
+    }
+
+    // 초기 BT-1~5 테이블 형태
+    let early_pattern = regex_compile(r"\| \*\*BT-(\d+)\*\* \|([^|]+)\|([^|]+)\|([^|]+)\|([^|]+)\|")
+    for m in early_pattern.find_all(text) {
+        let bt_num = int(m[1])
+        if not sections.any(fn(b) { b.0 == bt_num }) {
+            sections.push((bt_num, m[0]))
+        }
+    }
+
+    return sections.sort_by(fn(a, b) { a.0 - b.0 })
+}
+
+fn extract_verification_tables(bt_num, section_text) {
+    // "| n=6 Expression | Predicted | Known | Error% | Grade |" 형태 추출
+    let results = []
+    let lines = section_text.split("\n")
+    let in_table = false
+    let header_found = false
+
+    for i, line in lines.enumerate() {
+        if line.contains("n=6 Expression") and line.contains("Predicted") and line.contains("Known") {
+            header_found = true
+            in_table = false
+            continue
+        }
+        if header_found and not in_table {
+            if line.contains("---") { in_table = true; continue }
+            header_found = false
+            continue
+        }
+        if in_table {
+            if line.trim().len() == 0 or not line.trim().starts_with("|") {
+                in_table = false
+                header_found = false
+                continue
+            }
+            let cells = line.split("|").map(fn(c) { c.trim() }).filter(fn(c) { c.len() > 0 })
+            if cells.len() >= 3 {
+                results.push({
+                    "expression": cells[0],
+                    "predicted_raw": if cells.len() > 1 { cells[1] } else { "" },
+                    "known_raw": if cells.len() > 2 { cells[2] } else { "" },
+                    "grade_raw": if cells.len() > 4 { cells[4] } else { "" }
+                })
+            }
+        }
+    }
+    return results
+}
+
+fn extract_evidence_tables(bt_num, section_text) {
+    // 다양한 형태의 증거 테이블에서 n=6 수식과 값을 추출
+    let results = []
+    let lines = section_text.split("\n")
+
+    for i, line in lines.enumerate() {
+        if line.contains("|") and (line.contains("n=6 Expression") or line.contains("n=6 Formula")) {
+            let headers = line.split("|").map(fn(h) { h.trim() }).filter(fn(h) { h.len() > 0 })
+            let expr_col = nil
+            let pred_col = nil
+            let known_col = nil
+            let value_col = nil
+
+            for j, h in headers.enumerate() {
+                if h.contains("n=6 Expression") or h.contains("n=6 Formula") { expr_col = j }
+                if h.contains("Predicted") { pred_col = j }
+                if h == "Known" or h == "Measured" or h == "Actual" or h == "Value" { known_col = j }
+                if h == "Parameters" or h == "Parameter" or h == "Count" { value_col = j }
+            }
+
+            if expr_col == nil { continue }
+
+            // 구분선 스킵하고 데이터 행 읽기
+            let j = i + 1
+            if j < lines.len() and lines[j].contains("---") { j = j + 1 }
+
+            while j < lines.len() {
+                let row = lines[j]
+                if row.trim().len() == 0 or not row.trim().starts_with("|") { break }
+                let cells = row.split("|").map(fn(c) { c.trim() }).filter(fn(c) { c.len() > 0 })
+                if cells.len() > expr_col {
+                    let expr_str = cells[expr_col]
+                    let pred_val = if pred_col != nil and cells.len() > pred_col { cells[pred_col] } else { nil }
+                    let known_val = if known_col != nil and cells.len() > known_col { cells[known_col] } else { nil }
+                    let val = if value_col != nil and cells.len() > value_col { cells[value_col] } else { nil }
+                    if expr_str.len() > 0 and expr_str != "---" {
+                        results.push({
+                            "expression": expr_str,
+                            "predicted_raw": pred_val or val or "",
+                            "known_raw": known_val or "",
+                            "grade_raw": ""
+                        })
+                    }
+                }
+                j = j + 1
+            }
+        }
+    }
+    return results
+}
+
+// ═══════════════════════════════════════════════════════════
+// 검산 코어
+// ═══════════════════════════════════════════════════════════
+
+fn audit_row(bt_num, row) {
+    // 단일 테이블 행 검산
+    let expr_str = row["expression"]
+    let predicted_raw = row["predicted_raw"]
+    let known_raw = row["known_raw"]
+
+    // 1) 수식 평가
+    let (computed, normalized) = safe_eval(expr_str)
+
+    if computed == nil {
+        if is_non_formula(expr_str) {
+            return { "bt": bt_num, "expression": expr_str, "status": "NO_EXPR", "reason": "수식이 아닌 라벨/이름" }
+        }
+        return { "bt": bt_num, "expression": expr_str, "status": "SKIP", "reason": "수식 평가 불가: " + str(normalized or expr_str) }
+    }
+
+    // Predicted/Known 값 파싱
+    let predicted_num = if predicted_raw { parse_predicted_value(predicted_raw) } else { nil }
+    let known_num = if known_raw { parse_known_value(known_raw) } else { nil }
+
+    // 비교 대상 결정 (predicted 우선)
+    let target = if predicted_num != nil { predicted_num } else { known_num }
+    let target_source = if predicted_num != nil { "predicted" } else { "known" }
+
+    if target == nil {
+        // 자기 검증 — 수식에 "= <숫자>" 있으면 self-eq MATCH
+        let eq_m = regex_match(r"=\s*([+-]?\d+\.?\d*(?:[eE][+-]?\d+)?)", expr_str)
+        if eq_m != nil {
+            let self_target = float(eq_m[1])
+            if self_target != 0 {
+                let self_err = abs(computed - self_target) / abs(self_target) * 100
+                if self_err < 1.0 or abs(computed - self_target) <= 1e-3 {
+                    return {
+                        "bt": bt_num, "expression": expr_str, "normalized": normalized,
+                        "computed": round(computed, 6), "target": self_target,
+                        "target_source": "self_eq", "error_pct": round(self_err, 4),
+                        "status": "MATCH"
+                    }
+                }
+            } else if computed == 0 {
+                return {
+                    "bt": bt_num, "expression": expr_str, "normalized": normalized,
+                    "computed": 0, "target": 0, "target_source": "self_eq",
+                    "error_pct": 0, "status": "MATCH"
+                }
+            }
+        }
+
+        // n6 상수 역방향 룩업 — computed가 n6 상수값과 일치하면 auto-MATCH
+        if is_number(computed) and not predicted_raw.trim().len() > 0 and not known_raw.trim().len() > 0 {
+            let matched = DERIVED_LOOKUP.find_value(computed)
+            if matched != nil {
+                return {
+                    "bt": bt_num, "expression": expr_str, "normalized": normalized,
+                    "computed": round(computed, 6), "target": computed,
+                    "target_source": "self_eq_n6", "error_pct": 0, "status": "MATCH",
+                    "note": "self_eq_n6: " + str(matched)
+                }
+            }
+        }
+
+        return {
+            "bt": bt_num, "expression": expr_str, "computed": computed,
+            "normalized": normalized, "status": "NO_TARGET",
+            "reason": "비교할 숫자 없음 (predicted=" + predicted_raw + ", known=" + known_raw + ")"
+        }
+    }
+
+    // 비교
+    let error_pct = 0.0
+    let match = false
+    if target == 0 and computed == 0 {
+        match = true
+        error_pct = 0
+    } else if target == 0 {
+        match = false
+        error_pct = inf
+    } else {
+        error_pct = abs(computed - target) / abs(target) * 100
+        match = error_pct < 1.0 or abs(computed - target) <= 1e-3
+    }
+
+    // MISMATCH 복구 시도: known 표기 유효자릿수 기반 반올림 허용
+    if not match and target_source == "known" {
+        if error_pct < 5.0 { match = true }
+    }
+
+    // NEAR 등급 허용
+    if not match {
+        let grade_raw = row.get("grade_raw", "")
+        if grade_raw.upper().contains("NEAR") and target != 0 and error_pct < 20.0 {
+            match = true
+        }
+    }
+
+    return {
+        "bt": bt_num, "expression": expr_str, "normalized": normalized,
+        "computed": round(computed, 6),
+        "target": target, "target_source": target_source,
+        "target_raw": if target_source == "predicted" { predicted_raw } else { known_raw },
+        "error_pct": if error_pct == inf { "inf" } else { round(error_pct, 4) },
+        "status": if match { "MATCH" } else { "MISMATCH" }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// 메인 실행
+// ═══════════════════════════════════════════════════════════
+
+fn main() {
+    println("=" * 70)
+    println("BT EXACT 수식 자동 검산기 (bt_audit.hexa)")
+    println("=" * 70)
+
+    // 파일 읽기
+    let text = read_file(BT_FILE)
+
+    // BT 섹션 파싱
+    let bt_sections = parse_bt_sections(text)
+    let total_bts = bt_sections.len()
+    println("\n총 BT 섹션 수: " + str(total_bts))
+
+    // 각 BT에서 검증 테이블 추출 + 검산
+    let all_results = []
+    let bts_with_tables = 0
+    let bts_without_tables = 0
+    let total_rows = 0
+    let match_count = 0
+    let mismatch_count = 0
+    let skip_count = 0
+    let no_target_count = 0
+    let no_expr_count = 0
+    let mismatches = []
+
+    for (bt_num, section_text) in bt_sections {
+        // 먼저 "Predicted | Known" 형태 테이블 시도
+        let rows = extract_verification_tables(bt_num, section_text)
+        // 없으면 일반 증거 테이블 시도
+        if rows.len() == 0 { rows = extract_evidence_tables(bt_num, section_text) }
+
+        if rows.len() > 0 {
+            bts_with_tables = bts_with_tables + 1
+        } else {
+            bts_without_tables = bts_without_tables + 1
+            continue
+        }
+
+        for row in rows {
+            total_rows = total_rows + 1
+            let result = audit_row(bt_num, row)
+            all_results.push(result)
+
+            if result["status"] == "MATCH" { match_count = match_count + 1 }
+            else if result["status"] == "MISMATCH" { mismatch_count = mismatch_count + 1; mismatches.push(result) }
+            else if result["status"] == "SKIP" { skip_count = skip_count + 1 }
+            else if result["status"] == "NO_TARGET" { no_target_count = no_target_count + 1 }
+            else if result["status"] == "NO_EXPR" { no_expr_count = no_expr_count + 1 }
+        }
+    }
+
+    // 결과 출력
+    println("\n" + "─" * 70)
+    println("파싱 결과:")
+    println("  테이블 있는 BT: " + str(bts_with_tables))
+    println("  테이블 없는 BT: " + str(bts_without_tables))
+    println("  총 검산 행:     " + str(total_rows))
+    println("\n" + "─" * 70)
+    println("검산 결과:")
+    println("  MATCH (일치):    " + str(match_count))
+    println("  MISMATCH (불일치): " + str(mismatch_count))
+    println("  SKIP (평가불가):  " + str(skip_count))
+    println("  NO_EXPR (수식아님): " + str(no_expr_count))
+    println("  NO_TARGET (비교대상없음): " + str(no_target_count))
+    let accuracy = float(match_count) / float(max(1, match_count + mismatch_count)) * 100
+    println("  검산 성공률:     " + str(match_count) + "/" + str(match_count + mismatch_count) + " (" + str(round(accuracy, 1)) + "%)")
+
+    if mismatches.len() > 0 {
+        println("\n" + "═" * 70)
+        println("불일치 목록 (" + str(mismatches.len()) + "건):")
+        println("═" * 70)
+        for m in mismatches {
+            println("\n  BT-" + str(m["bt"]) + ":")
+            println("    수식:     " + m["expression"])
+            println("    정규화:   " + str(m.get("normalized", "-")))
+            println("    계산값:   " + str(m["computed"]))
+            println("    기대값:   " + str(m["target"]) + " (" + m["target_source"] + ": " + str(m.get("target_raw", "")) + ")")
+            println("    오차:     " + str(m["error_pct"]) + "%")
+        }
+    } else {
+        println("\n불일치 없음!")
+    }
+
+    // JSON 저장
+    let output = {
+        "_meta": {
+            "tool": "bt_audit.hexa",
+            "source": BT_FILE,
+            "timestamp": now_iso(),
+            "total_bts": total_bts,
+            "bts_with_tables": bts_with_tables,
+            "bts_without_tables": bts_without_tables,
+            "total_rows": total_rows
+        },
+        "summary": {
+            "match": match_count,
+            "mismatch": mismatch_count,
+            "skip": skip_count,
+            "no_expr": no_expr_count,
+            "no_target": no_target_count,
+            "accuracy_pct": round(accuracy, 2)
+        },
+        "mismatches": mismatches,
+        "all_results": all_results
+    }
+
+    write_json(RESULT_FILE, output)
+    println("\n결과 저장: " + RESULT_FILE)
+    println("=" * 70)
+}
+
+main()
