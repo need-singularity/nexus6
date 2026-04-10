@@ -12,3 +12,8 @@ verifiers:
   extreme_hypothesis_verifier.py   17 도메인 통합               337
 tools:
   hypothesis_verifier.py r_spectrum.py statistical_tester.py experimental_protocol.py validate_calculators.py
+sub:
+  auto_stubs/  verify_*.py (137) — 자동 생성 스텁
+  data/MNIST   검증 데이터셋
+
+parent: ../CLAUDE.md → "calc"
