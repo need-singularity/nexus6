@@ -27,7 +27,7 @@
 ### Task 1: 미커밋 변경사항 정리 및 커밋
 
 **Files:**
-- Staged: `mk2_hexa/native/command_router.hexa`, `shared/dashboard.html`, `shared/discovery/reality_map.json`, `shared/discovery/growth_bus.jsonl`, etc.
+- Staged: `mk2_hexa/native/command_router.hexa`, `shared/dashboard.html`, `shared/discovery/reality_map.json`, `shared/n6/atlas.n6`, etc.
 - New: `mk2_hexa/native/sync_reality_map.hexa`
 
 - [ ] **Step 1: git status 확인 — 변경 파일 목록 확인**
@@ -46,8 +46,8 @@ git commit -m "feat: command_router 확장 + sync_reality_map + dashboard 업데
 - [ ] **Step 3: 데이터 파일 커밋 (growth_bus 등 상태 파일)**
 
 ```bash
-git add shared/discovery/growth_bus.jsonl shared/.calc_stubs_state.json shared/.gap_cooldown shared/.paper_gen_state.json
-git commit -m "chore: growth_bus + 상태 파일 동기화"
+git add shared/n6/atlas.n6 shared/.calc_stubs_state.json shared/.gap_cooldown shared/.paper_gen_state.json
+git commit -m "chore: atlas.n6 + 상태 파일 동기화"
 ```
 
 - [ ] **Step 4: anima/airgenome 상태 파일 커밋**
