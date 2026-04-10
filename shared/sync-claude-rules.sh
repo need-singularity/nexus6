@@ -1,1 +1,0 @@
-scripts/sync-claude-rules.sh

@@ -1,1 +1,0 @@
-scripts/sync-nexus-lenses.sh

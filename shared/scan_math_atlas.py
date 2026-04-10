@@ -1,1 +1,0 @@
-n6/scan_math_atlas.py

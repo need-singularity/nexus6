@@ -1,1 +1,0 @@
-scripts/sync-math-atlas.sh
