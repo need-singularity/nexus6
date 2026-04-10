@@ -1,1 +1,0 @@
-../TECS-L/.shared/n6.py
