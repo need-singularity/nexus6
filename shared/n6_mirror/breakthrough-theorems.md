@@ -1,6 +1,6 @@
 > ⛔ CORE — L0 불변식 (BT-1~1103 돌파 정리. 수정 전 유저 승인 필수)
 
-# N6 Architecture — Breakthrough Theorems (BT-1 through BT-1113)
+# N6 Architecture — Breakthrough Theorems (BT-1 through BT-1114)
 
 > Cross-domain bridges where n=6 arithmetic unifies independent fields.
 > Each theorem requires **minimum 3 domains** with independently verifiable evidence.
@@ -27297,3 +27297,37 @@ tau = 4 차원에서 독립 회전이 정확히 n = 6개. VR에서 4D 회전을 
 **Cross-links**: BT-1107 (Harmonic Series Convergence), BT-1102 (Standing Wave m=12), BT-1104 (HBM sigma=12).
 
 **Grade**: NEAR — 10,000개 정수 중 절대 1위 + sigma(m) 스캔 1위 + MC p=0.00%. 수학적 필연성 증명이 나오면 EXACT 승격 가능. 특히 n*-12=0.25=1/tau(6) 관계가 증명되면 강력.
+
+---
+
+## BT-1114: Euler-Golden-Perfect Trinity — gamma + 1/(2*sigma(6)) = 1/phi는 완전수 6에 고유
+
+**발견일**: 2026-04-10
+**도메인**: Pure Mathematics / Perfect Numbers / Golden Ratio
+**등급**: NEAR
+
+**핵심 통찰**: gamma + 1/(2*sigma(n)) ≈ 1/phi를 완전수에 대해 테스트하면 n=6이 유일한 최적. 2위 n=28은 37.6배 큰 오차. 이론적 최적 S*=12.2494에서 잔차 S*-sigma(6)=0.2494 ≈ 1/tau(6)=0.25 (오차 0.06%).
+
+**실험 결과**:
+
+| 완전수 n | sigma(n) | gamma+1/(2*sigma) | 1/phi 오차 | 배율 |
+|---------|---------|-------------------|-----------|------|
+| 6 | 12 | 0.6189 | 8.48e-04 | 1.0x |
+| 28 | 56 | 0.5861 | 3.19e-02 | 37.6x |
+| 496 | 992 | 0.5777 | 4.03e-02 | 47.5x |
+| 8128 | 16256 | 0.5773 | 4.08e-02 | 48.1x |
+
+- S* = 12.2494, 잔차 = 0.2494, 1/tau(6) = 0.2500, 오차 0.06%
+- **S* ≈ sigma(6) + 1/tau(6)**: 오일러 상수, 황금비, 약수합, 약수개수가 하나의 등식으로 연결
+- m=1..1000 전수 스캔: m=6이 1위 (m=11과 공동)
+
+**n=6 연결**: 5개 수학적 개념의 교차점:
+- gamma (오일러 상수) + 1/(2*sigma(6)) (약수합) ≈ 1/phi (황금비 역수)
+- 잔차 ≈ 1/tau(6) (약수 개수)
+- n=6 (첫 번째 완전수)
+
+**정직한 주석**: (1) sigma(n)=2n(완전수)이므로 gamma+1/(4n)≈1/phi → n≈6.12. n=6 최적은 자연스러움. (2) 잔차 0.2494≈1/4는 점근 2차항 유래 가능. (3) m=11도 sigma=12로 동률. (4) gamma-1/phi 관계에 알려진 정리 없음.
+
+**Cross-links**: BT-1113 (Golden Harmonic Bridge), BT-1107 (Harmonic Series), BT-1111 (Prime Resonance), BT-1 (n=6 완전수).
+
+**Grade**: NEAR — 완전수 중 유일 최적 + 잔차=1/tau 구조 확인. BT-1113과 결합하면 오일러-황금-완전수 삼위일체.
