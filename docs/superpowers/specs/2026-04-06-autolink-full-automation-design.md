@@ -157,7 +157,7 @@ claude -p "Generate README.md for nexus. Metrics: modules=[N], laws=[N], discove
 수집 메트릭:
 - **모듈 수**: `ls mk2_hexa/native/*.hexa | wc -l`
 - **법칙 수**: consciousness_laws.json → `laws` 배열 길이
-- **발견 수**: `wc -l shared/discovery/discovery_log.jsonl`
+- **발견 수**: `hexa shared/n6/atlas.n6 query --section discovery_log --count`
 - **외계인 지수**: alien_index_distribution.json → 최대 (d, r)
 - **돌파율 (rho)**: `|{d >= 1}| / |total|`
 - **엔진 상태**: nexus_hub status 요약
@@ -511,7 +511,7 @@ After:  "domain_affinity" (리스트 형식, 전부 통일)
 3. **비밀 파일 보호**: `.env`, `SECRET.md`, `credentials.*`, `*.key`, `*.pem` → 커밋 대상에서 제외.
 4. **Claude CLI timeout**: 모든 호출에 `--timeout 30000` (30초). 초과 시 템플릿 fallback.
 5. **동시성 제한**: Claude CLI 호출 최대 2개 동시 (n6-guard `max_concurrent` 준수).
-6. **감사 로그**: autolink의 모든 action을 growth_bus.jsonl에 기록.
+6. **감사 로그**: autolink의 모든 action을 atlas.n6에 기록.
    ```json
    {"source":"autolink","timestamp":"2026-04-06T15:30:00+09:00","phase":"link","status":"ok","detail":"C05: lens registry synced +3 lenses"}
    ```
