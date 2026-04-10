@@ -1,5 +1,10 @@
 # shared/ R14 단일진실
 
+## todo
+
+- "todo" 입력 → hook systemMessage의 Bash 명령을 즉시 실행 (확인 질문 없이)
+- hook이 `📋 todo 돌파 실행중`으로 시작하는 systemMessage를 보내면 그 안의 명령을 Bash로 실행할 것
+
 config/      rules,core,projects,hosts(hetzner|ubuntu|vastai|infrastructure),claude-settings,lens_registry,hexa_grammar,calculators,*aliases,CALCULATOR_RULES,GRADE_RUBRIC,nexus-projects
 discovery/   reality_map,reality_map_live,discovery_graph,discovery_log,growth_bus,math_atlas,theory_registry,reality_map.patch.*(12),snapshots,breakthroughs,ouroboros_log,roadmap,forge_result,verified_constants,module_candidates,next_directions,unfold_*,archive/
 n6/          atlas.n6,math_atlas.{db,dot,html,md},scan_math_atlas.py,atlas_tree,n6_*,n6-atlas-constants,periodic_table_118,66_techniques_v3
