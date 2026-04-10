@@ -5,6 +5,5 @@
   설정:     shared/project_config.json (CLI/빌드/인프라/관례)
   코어:     shared/core.json (시스템맵 + 명령어 14종)
   수렴:     shared/convergence/ (골화/안정/실패 — 7 프로젝트)
-  할일:     shared/todo/ (수동 + 돌파 엔진 자동)
   렌즈:     shared/lens_registry.json (1022종)
   API:      shared/CLAUDE.md (NEXUS-6 상세 사용법)

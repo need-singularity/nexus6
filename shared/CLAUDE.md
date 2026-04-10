@@ -15,7 +15,6 @@
 | 시스템 코어 | `core.json` | 시스템맵 + 명령어 14종 + 폴더 구조 |
 | 수렴 운영 | `convergence_ops.json` | CDO 수렴 운영 원칙 |
 | 수렴 추적 | `convergence/` | 골화/안정/실패 (7 프로젝트) |
-| 할일 | `todo/` | 우선순위별 TODO (7 프로젝트) |
 | 성장 루프 | `loop/` | 자율 데몬 설정 (3 프로젝트) |
 | 렌즈 | `lens_registry.json` | 397종 망원경 레지스트리 |
 | 상수 | `n6_constants.jsonl` | n=6 상수 (7기본+유도) |
