@@ -1,0 +1,764 @@
+// mk2_hexa/native/papers_adaptive.hexa — PAPERS v3 적응형 논문 엔진
+// Adaptive papers: evolve based on feedback, auto-update from discoveries
+// 실행: hexa papers_adaptive.hexa update <paper_id>  — 논문 적응형 업데이트
+//       hexa papers_adaptive.hexa rank                — 영향력 순위
+//       hexa papers_adaptive.hexa lineage <paper_id>  — 버전 계보 추적
+//       hexa papers_adaptive.hexa feedback <paper_id> <score> — 독자 피드백
+
+// ─── 설정 ───
+comptime const growth_bus_path   = "shared/growth_bus.jsonl"
+comptime const reality_map_path  = "shared/reality_map.json"
+comptime const discovery_log     = "shared/discovery_log.jsonl"
+comptime const papers_dir        = "shared/papers"
+comptime const adaptive_dir      = "shared/papers/adaptive"
+comptime const lineage_path      = "shared/papers/adaptive/lineage.jsonl"
+comptime const feedback_path     = "shared/papers/adaptive/feedback.jsonl"
+comptime const impact_path       = "shared/papers/adaptive/impact.jsonl"
+comptime const drafts_dir        = "shared/papers/drafts"
+
+// ─── n=6 핵심 상수 ───
+comptime const n6_foundation = "sigma(n) * phi(n) = n * tau(n)  <==>  n = 6"
+comptime const n6_sigma  = 12.0
+comptime const n6_tau    = 4.0
+comptime const n6_phi    = 2.0
+comptime const n6_j2     = 24.0
+comptime const n6_n      = 6.0
+comptime const n6_sopfr  = 5.0
+
+// 적응형 상수
+comptime const n6_sections       = 6
+comptime const n6_max_mutations  = 6
+comptime const n6_feedback_decay = 0.166666
+comptime const n6_impact_weights = 6
+comptime const n6_version_cap    = 66
+comptime const n6_min_score      = 0.6
+
+// 영향력 가중치 (6개)
+comptime const w_citation   = 0.25
+comptime const w_download   = 0.20
+comptime const w_discovery  = 0.25
+comptime const w_feedback   = 0.15
+comptime const w_freshness  = 0.10
+comptime const w_lineage    = 0.05
+
+// 품질 임계값
+comptime const min_confidence     = 0.85
+comptime const auto_update_thresh = 0.80
+comptime const paper_version      = "v3.0"
+
+// ─── 구조체 ───
+struct AdaptivePaper {
+    paper_id: string,
+    title: string,
+    version: int,
+    parent_version: int,
+    domain: string,
+    confidence: float,
+    sections: string,
+    mutation_log: string,
+    created_at: string,
+    updated_at: string,
+    discovery_ids: string,
+    status: string
+}
+
+struct PaperSection {
+    index: int,
+    name: string,
+    content: string,
+    word_count: int,
+    last_updated: string
+}
+
+struct MutationEntry {
+    paper_id: string,
+    from_version: int,
+    to_version: int,
+    mutation_type: string,
+    reason: string,
+    diff_summary: string,
+    timestamp: string
+}
+
+struct ImpactScore {
+    paper_id: string,
+    citation_count: int,
+    download_count: int,
+    discovery_rate: float,
+    feedback_avg: float,
+    freshness: float,
+    lineage_depth: int,
+    total_score: float
+}
+
+struct FeedbackEntry {
+    paper_id: string,
+    reader_id: string,
+    score: float,
+    comment: string,
+    timestamp: string,
+    section_index: int
+}
+
+struct VersionNode {
+    paper_id: string,
+    version: int,
+    parent: int,
+    children: string,
+    mutation_type: string,
+    timestamp: string
+}
+
+// ─── JSON 유틸리티 ───
+fn jstr(json: string, key: string) -> string {
+    let needle = "\"" + key + "\":\""
+    let idx = json.index_of(needle)
+    if idx < 0 { return "" }
+    let after = json.split(needle)[1]
+    let end = after.index_of("\"")
+    if end < 0 { return "" }
+    after.split("\"")[0]
+}
+
+fn jnum(json: string, key: string) -> float {
+    let needle = "\"" + key + "\":"
+    let idx = json.index_of(needle)
+    if idx < 0 { return 0.0 }
+    let after = json.split(needle)[1]
+    let trimmed = after.trim()
+    let chunk = ""
+    if trimmed.starts_with("\"") {
+        chunk = trimmed.split("\"")[1]
+    } else {
+        let i = 0
+        let buf = ""
+        while i < trimmed.len() {
+            let ch = trimmed.char_at(i)
+            if ch == "," { break }
+            if ch == "}" { break }
+            if ch == " " { break }
+            buf = buf + ch
+            i = i + 1
+        }
+        chunk = buf
+    }
+    chunk.to_float()
+}
+
+fn jint(json: string, key: string) -> int {
+    jnum(json, key).to_int()
+}
+
+fn timestamp_now() -> string {
+    exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+// ─── 섹션 이름 매핑 (n=6) ───
+fn section_name(idx: int) -> string {
+    if idx == 0 { return "abstract" }
+    if idx == 1 { return "introduction" }
+    if idx == 2 { return "methodology" }
+    if idx == 3 { return "results" }
+    if idx == 4 { return "discussion" }
+    if idx == 5 { return "conclusion" }
+    "unknown"
+}
+
+// ─── 디렉토리 초기화 ───
+fn ensure_dirs() -> int {
+    if !file_exists(adaptive_dir) {
+        exec("mkdir -p " + adaptive_dir)
+    }
+    if !file_exists(drafts_dir) {
+        exec("mkdir -p " + drafts_dir)
+    }
+    if !file_exists(lineage_path) {
+        write_file(lineage_path, "")
+    }
+    if !file_exists(feedback_path) {
+        write_file(feedback_path, "")
+    }
+    if !file_exists(impact_path) {
+        write_file(impact_path, "")
+    }
+    1
+}
+
+// ─── 영향력 스코어 계산 ───
+fn compute_impact(paper_id: string) -> float {
+    let citation_count = 0.0
+    let download_count = 0.0
+    let discovery_rate = 0.0
+    let feedback_avg   = 0.0
+    let freshness      = 1.0
+    let lineage_depth  = 0.0
+
+    // 영향력 로그에서 기존 데이터 읽기
+    if file_exists(impact_path) {
+        let lines = read_file(impact_path).split("\n")
+        let i = 0
+        while i < lines.len() {
+            let line = lines[i].trim()
+            if line.len() > 0 {
+                let pid = jstr(line, "paper_id")
+                if pid == paper_id {
+                    citation_count = jnum(line, "citation_count")
+                    download_count = jnum(line, "download_count")
+                    discovery_rate = jnum(line, "discovery_rate")
+                    lineage_depth  = jnum(line, "lineage_depth")
+                }
+            }
+            i = i + 1
+        }
+    }
+
+    // 피드백 평균 계산
+    if file_exists(feedback_path) {
+        let fb_lines = read_file(feedback_path).split("\n")
+        let fb_sum = 0.0
+        let fb_cnt = 0
+        let j = 0
+        while j < fb_lines.len() {
+            let fb_line = fb_lines[j].trim()
+            if fb_line.len() > 0 {
+                let fb_pid = jstr(fb_line, "paper_id")
+                if fb_pid == paper_id {
+                    fb_sum = fb_sum + jnum(fb_line, "score")
+                    fb_cnt = fb_cnt + 1
+                }
+            }
+            j = j + 1
+        }
+        if fb_cnt > 0 {
+            feedback_avg = fb_sum / fb_cnt.to_float()
+        }
+    }
+
+    // n=6 가중합
+    let norm_cite = citation_count / (citation_count + n6_n)
+    let norm_dl   = download_count / (download_count + n6_j2)
+    let norm_disc = discovery_rate
+    let norm_fb   = feedback_avg / 5.0
+    let norm_fr   = freshness
+    let norm_lin  = lineage_depth / n6_version_cap.to_float()
+
+    let score = w_citation * norm_cite + w_download * norm_dl + w_discovery * norm_disc + w_feedback * norm_fb + w_freshness * norm_fr + w_lineage * norm_lin
+
+    score
+}
+
+// ─── 논문 로드 ───
+fn load_paper(paper_id: string) -> string {
+    let paper_path = adaptive_dir + "/" + paper_id + ".json"
+    if !file_exists(paper_path) {
+        return ""
+    }
+    read_file(paper_path)
+}
+
+// ─── 논문 저장 ───
+fn save_paper(paper_id: string, json_content: string) -> int {
+    let paper_path = adaptive_dir + "/" + paper_id + ".json"
+    write_file(paper_path, json_content)
+    1
+}
+
+// ─── 돌연변이 로그 기록 ───
+fn log_mutation(paper_id: string, from_v: int, to_v: int, mtype: string, reason: string, diff: string) -> int {
+    let ts = timestamp_now()
+    let entry = "{\"paper_id\":\"" + paper_id + "\",\"from_version\":" + from_v.to_string() + ",\"to_version\":" + to_v.to_string() + ",\"mutation_type\":\"" + mtype + "\",\"reason\":\"" + reason + "\",\"diff_summary\":\"" + diff + "\",\"timestamp\":\"" + ts + "\"}"
+    let existing = ""
+    if file_exists(lineage_path) {
+        existing = read_file(lineage_path)
+    }
+    if existing.len() > 0 {
+        write_file(lineage_path, existing + "\n" + entry)
+    } else {
+        write_file(lineage_path, entry)
+    }
+    1
+}
+
+// ─── growth_bus 기록 ───
+fn emit_growth(tag: string, msg: string) -> int {
+    let ts = timestamp_now()
+    let entry = "{\"ts\":\"" + ts + "\",\"src\":\"papers_adaptive\",\"tag\":\"" + tag + "\",\"msg\":\"" + msg + "\",\"ver\":\"" + paper_version + "\"}"
+    let existing = ""
+    if file_exists(growth_bus_path) {
+        existing = read_file(growth_bus_path)
+    }
+    if existing.len() > 0 {
+        write_file(growth_bus_path, existing + "\n" + entry)
+    } else {
+        write_file(growth_bus_path, entry)
+    }
+    1
+}
+
+// ─── 새 발견 스캔: 자동 업데이트 대상 검색 ───
+fn scan_new_discoveries(paper_id: string) -> string {
+    let paper_json = load_paper(paper_id)
+    if paper_json.len() == 0 {
+        return "[]"
+    }
+    let domain = jstr(paper_json, "domain")
+    let existing_ids = jstr(paper_json, "discovery_ids")
+
+    let matches = "["
+    let count = 0
+
+    if file_exists(discovery_log) {
+        let lines = read_file(discovery_log).split("\n")
+        let i = 0
+        while i < lines.len() {
+            let line = lines[i].trim()
+            if line.len() > 0 {
+                let d_domain = jstr(line, "domain")
+                let d_id = jstr(line, "id")
+                let d_conf = jnum(line, "confidence")
+                if d_domain == domain {
+                    if d_conf >= auto_update_thresh {
+                        if existing_ids.index_of(d_id) < 0 {
+                            if count > 0 {
+                                matches = matches + ","
+                            }
+                            matches = matches + "\"" + d_id + "\""
+                            count = count + 1
+                        }
+                    }
+                }
+            }
+            i = i + 1
+        }
+    }
+
+    matches = matches + "]"
+    matches
+}
+
+// ─── 섹션 업데이트 (적응형) ───
+fn update_section(paper_json: string, sec_idx: int, new_content: string) -> string {
+    let sec_key = "section_" + sec_idx.to_string()
+    let old_content = jstr(paper_json, sec_key)
+    let ts = timestamp_now()
+
+    // 기존 내용에 새 발견 추가
+    let merged = old_content
+    if new_content.len() > 0 {
+        if old_content.len() > 0 {
+            merged = old_content + " [UPDATE " + ts + "] " + new_content
+        } else {
+            merged = new_content
+        }
+    }
+
+    // paper_json에서 해당 섹션 교체
+    let before_key = "\"" + sec_key + "\":\""
+    let idx = paper_json.index_of(before_key)
+    if idx < 0 {
+        return paper_json
+    }
+    let prefix = paper_json.split(before_key)[0]
+    let after_needle = paper_json.split(before_key)[1]
+    let old_end = after_needle.index_of("\"")
+    let suffix = ""
+    if old_end >= 0 {
+        suffix = after_needle.substring(old_end)
+    }
+    let result = prefix + before_key + merged + suffix
+    result
+}
+
+// ─── 적응형 업데이트 실행 ───
+fn do_update(paper_id: string) -> int {
+    ensure_dirs()
+    println("[papers_adaptive] 업데이트 시작: " + paper_id)
+
+    let paper_json = load_paper(paper_id)
+    if paper_json.len() == 0 {
+        println("[papers_adaptive] 논문 없음: " + paper_id + " — 신규 생성")
+        return create_new_paper(paper_id)
+    }
+
+    let current_version = jint(paper_json, "version")
+    if current_version >= n6_version_cap {
+        println("[papers_adaptive] 버전 한도 도달 (v" + current_version.to_string() + "/" + n6_version_cap.to_string() + ")")
+        return 0
+    }
+
+    // 새 발견 스캔
+    let new_disc = scan_new_discoveries(paper_id)
+    let has_new = new_disc.len() > 4
+
+    // 피드백 기반 섹션 분석
+    let weak_sections = find_weak_sections(paper_id)
+    let has_weak = weak_sections.len() > 4
+
+    if !has_new {
+        if !has_weak {
+            println("[papers_adaptive] 업데이트 불필요 — 변경 없음")
+            return 0
+        }
+    }
+
+    let new_version = current_version + 1
+    let ts = timestamp_now()
+    let mut updated_json = paper_json
+    let mutation_reason = ""
+
+    // 새 발견 → results/discussion 자동 업데이트
+    if has_new {
+        println("[papers_adaptive] 새 발견 감지: " + new_disc)
+        let disc_summary = "New discoveries appended: " + new_disc
+        updated_json = update_section(updated_json, 3, disc_summary)
+        updated_json = update_section(updated_json, 4, "Discussion updated with " + new_disc)
+        mutation_reason = "auto_discovery"
+        emit_growth("paper_update", paper_id + " v" + new_version.to_string() + " auto-discovery update")
+    }
+
+    // 약한 섹션 → 피드백 기반 보강
+    if has_weak {
+        println("[papers_adaptive] 약한 섹션: " + weak_sections)
+        let sec_ids = weak_sections.split(",")
+        let k = 0
+        while k < sec_ids.len() {
+            let sec_id = sec_ids[k].trim()
+            if sec_id.len() > 0 {
+                let sidx = sec_id.to_int()
+                let sname = section_name(sidx)
+                updated_json = update_section(updated_json, sidx, "[Reinforced based on reader feedback]")
+                println("[papers_adaptive]   섹션 보강: " + sname)
+            }
+            k = k + 1
+        }
+        if mutation_reason.len() == 0 {
+            mutation_reason = "feedback_adaptation"
+        } else {
+            mutation_reason = mutation_reason + "+feedback"
+        }
+    }
+
+    // 버전 갱신
+    let ver_needle = "\"version\":" + current_version.to_string()
+    let ver_replace = "\"version\":" + new_version.to_string()
+    updated_json = updated_json.replace(ver_needle, ver_replace)
+
+    let ts_needle = "\"updated_at\":\""
+    let old_ts = jstr(updated_json, "updated_at")
+    updated_json = updated_json.replace(ts_needle + old_ts, ts_needle + ts)
+
+    save_paper(paper_id, updated_json)
+    log_mutation(paper_id, current_version, new_version, mutation_reason, "adaptive update", "sections modified")
+
+    println("[papers_adaptive] 업데이트 완료: " + paper_id + " v" + current_version.to_string() + " → v" + new_version.to_string())
+    emit_growth("paper_evolved", paper_id + " v" + new_version.to_string() + " reason=" + mutation_reason)
+    1
+}
+
+// ─── 약한 섹션 탐색 (피드백 기반) ───
+fn find_weak_sections(paper_id: string) -> string {
+    if !file_exists(feedback_path) {
+        return ""
+    }
+    let lines = read_file(feedback_path).split("\n")
+
+    // n=6 섹션별 피드백 누적
+    let mut sec_sum_0 = 0.0
+    let mut sec_sum_1 = 0.0
+    let mut sec_sum_2 = 0.0
+    let mut sec_sum_3 = 0.0
+    let mut sec_sum_4 = 0.0
+    let mut sec_sum_5 = 0.0
+    let mut sec_cnt_0 = 0
+    let mut sec_cnt_1 = 0
+    let mut sec_cnt_2 = 0
+    let mut sec_cnt_3 = 0
+    let mut sec_cnt_4 = 0
+    let mut sec_cnt_5 = 0
+
+    let i = 0
+    while i < lines.len() {
+        let line = lines[i].trim()
+        if line.len() > 0 {
+            let pid = jstr(line, "paper_id")
+            if pid == paper_id {
+                let sidx = jint(line, "section_index")
+                let sc = jnum(line, "score")
+                if sidx == 0 { sec_sum_0 = sec_sum_0 + sc ; sec_cnt_0 = sec_cnt_0 + 1 }
+                if sidx == 1 { sec_sum_1 = sec_sum_1 + sc ; sec_cnt_1 = sec_cnt_1 + 1 }
+                if sidx == 2 { sec_sum_2 = sec_sum_2 + sc ; sec_cnt_2 = sec_cnt_2 + 1 }
+                if sidx == 3 { sec_sum_3 = sec_sum_3 + sc ; sec_cnt_3 = sec_cnt_3 + 1 }
+                if sidx == 4 { sec_sum_4 = sec_sum_4 + sc ; sec_cnt_4 = sec_cnt_4 + 1 }
+                if sidx == 5 { sec_sum_5 = sec_sum_5 + sc ; sec_cnt_5 = sec_cnt_5 + 1 }
+            }
+        }
+        i = i + 1
+    }
+
+    let mut weak = ""
+    if sec_cnt_0 > 0 { if sec_sum_0 / sec_cnt_0.to_float() < 3.0 { weak = weak + "0," } }
+    if sec_cnt_1 > 0 { if sec_sum_1 / sec_cnt_1.to_float() < 3.0 { weak = weak + "1," } }
+    if sec_cnt_2 > 0 { if sec_sum_2 / sec_cnt_2.to_float() < 3.0 { weak = weak + "2," } }
+    if sec_cnt_3 > 0 { if sec_sum_3 / sec_cnt_3.to_float() < 3.0 { weak = weak + "3," } }
+    if sec_cnt_4 > 0 { if sec_sum_4 / sec_cnt_4.to_float() < 3.0 { weak = weak + "4," } }
+    if sec_cnt_5 > 0 { if sec_sum_5 / sec_cnt_5.to_float() < 3.0 { weak = weak + "5," } }
+
+    weak
+}
+
+// ─── 신규 논문 생성 ───
+fn create_new_paper(paper_id: string) -> int {
+    ensure_dirs()
+    let ts = timestamp_now()
+
+    let json = "{" + "\"paper_id\":\"" + paper_id + "\"," + "\"title\":\"Adaptive Paper: " + paper_id + "\"," + "\"version\":1," + "\"parent_version\":0," + "\"domain\":\"general\"," + "\"confidence\":0.90," + "\"section_0\":\"[Abstract placeholder — awaiting discovery data]\"," + "\"section_1\":\"[Introduction — n=6 foundation: " + n6_foundation + "]\"," + "\"section_2\":\"[Methodology — adaptive pipeline v3]\"," + "\"section_3\":\"[Results — pending]\"," + "\"section_4\":\"[Discussion — pending]\"," + "\"section_5\":\"[Conclusion — pending]\"," + "\"mutation_log\":\"created\"," + "\"created_at\":\"" + ts + "\"," + "\"updated_at\":\"" + ts + "\"," + "\"discovery_ids\":\"[]\"," + "\"status\":\"draft\"" + "}"
+
+    save_paper(paper_id, json)
+    log_mutation(paper_id, 0, 1, "creation", "new adaptive paper", "6 sections initialized")
+    emit_growth("paper_created", paper_id + " v1 adaptive n6-structure")
+    println("[papers_adaptive] 신규 논문 생성: " + paper_id + " (6 섹션)")
+    1
+}
+
+// ─── 영향력 순위 출력 ───
+fn do_rank() -> int {
+    ensure_dirs()
+    println("[papers_adaptive] ═══ PAPERS v3 영향력 순위 ═══")
+    println("[papers_adaptive] 가중치: cite=" + w_citation.to_string() + " dl=" + w_download.to_string() + " disc=" + w_discovery.to_string() + " fb=" + w_feedback.to_string() + " fresh=" + w_freshness.to_string() + " lin=" + w_lineage.to_string())
+    println("")
+
+    // adaptive 디렉토리의 모든 논문 수집
+    let listing = exec("ls " + adaptive_dir + "/*.json 2>/dev/null").trim()
+    if listing.len() == 0 {
+        println("[papers_adaptive] 논문 없음")
+        return 0
+    }
+
+    let files = listing.split("\n")
+    let mut ranked_ids  = ["", "", "", "", "", ""]
+    let mut ranked_scores = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    let mut total = 0
+
+    let i = 0
+    while i < files.len() {
+        let fpath = files[i].trim()
+        if fpath.len() > 0 {
+            let fname = fpath.split("/")
+            let last = fname[fname.len() - 1]
+            let pid = last.replace(".json", "")
+
+            let score = compute_impact(pid)
+            let paper_json = load_paper(pid)
+            let ver = jint(paper_json, "version")
+            let title = jstr(paper_json, "title")
+
+            // 상위 6개 삽입 정렬
+            let slot = -1
+            let s = 0
+            while s < n6_sections {
+                if score > ranked_scores[s] {
+                    slot = s
+                    break
+                }
+                s = s + 1
+            }
+            if slot >= 0 {
+                let shift = n6_sections - 1
+                while shift > slot {
+                    ranked_ids[shift] = ranked_ids[shift - 1]
+                    ranked_scores[shift] = ranked_scores[shift - 1]
+                    shift = shift - 1
+                }
+                ranked_ids[slot] = pid
+                ranked_scores[slot] = score
+            }
+            total = total + 1
+        }
+        i = i + 1
+    }
+
+    // 출력
+    let r = 0
+    while r < n6_sections {
+        if ranked_ids[r].len() > 0 {
+            let rp = load_paper(ranked_ids[r])
+            let rv = jint(rp, "version")
+            let rt = jstr(rp, "title")
+            println("  #" + (r + 1).to_string() + "  [" + ranked_scores[r].to_string() + "]  " + ranked_ids[r] + " v" + rv.to_string() + "  " + rt)
+        }
+        r = r + 1
+    }
+
+    println("")
+    println("[papers_adaptive] 총 " + total.to_string() + "편 분석 완료")
+    emit_growth("paper_rank", total.to_string() + " papers ranked")
+    total
+}
+
+// ─── 버전 계보 추적 ───
+fn do_lineage(paper_id: string) -> int {
+    ensure_dirs()
+    println("[papers_adaptive] ═══ 버전 계보: " + paper_id + " ═══")
+
+    if !file_exists(lineage_path) {
+        println("[papers_adaptive] 계보 데이터 없음")
+        return 0
+    }
+
+    let lines = read_file(lineage_path).split("\n")
+    let mut count = 0
+    let i = 0
+    while i < lines.len() {
+        let line = lines[i].trim()
+        if line.len() > 0 {
+            let pid = jstr(line, "paper_id")
+            if pid == paper_id {
+                let fv = jint(line, "from_version")
+                let tv = jint(line, "to_version")
+                let mt = jstr(line, "mutation_type")
+                let rs = jstr(line, "reason")
+                let ts = jstr(line, "timestamp")
+                println("  v" + fv.to_string() + " → v" + tv.to_string() + "  [" + mt + "]  " + rs + "  @" + ts)
+                count = count + 1
+            }
+        }
+        i = i + 1
+    }
+
+    if count == 0 {
+        println("[papers_adaptive] " + paper_id + ": 계보 없음")
+    } else {
+        println("[papers_adaptive] 총 " + count.to_string() + "건 돌연변이 기록")
+    }
+    count
+}
+
+// ─── 피드백 등록 ───
+fn do_feedback(paper_id: string, score_str: string) -> int {
+    ensure_dirs()
+    let score = score_str.to_float()
+    if score < 0.0 {
+        println("[papers_adaptive] 점수는 0~5 사이")
+        return 0
+    }
+    if score > 5.0 {
+        println("[papers_adaptive] 점수는 0~5 사이")
+        return 0
+    }
+
+    let ts = timestamp_now()
+    let entry = "{\"paper_id\":\"" + paper_id + "\",\"reader_id\":\"cli\",\"score\":" + score_str + ",\"comment\":\"CLI feedback\",\"timestamp\":\"" + ts + "\",\"section_index\":-1}"
+
+    let existing = ""
+    if file_exists(feedback_path) {
+        existing = read_file(feedback_path)
+    }
+    if existing.len() > 0 {
+        write_file(feedback_path, existing + "\n" + entry)
+    } else {
+        write_file(feedback_path, entry)
+    }
+
+    println("[papers_adaptive] 피드백 등록: " + paper_id + " score=" + score_str)
+    emit_growth("paper_feedback", paper_id + " score=" + score_str)
+    1
+}
+
+// ─── 전체 자동 업데이트 (모든 논문) ───
+fn do_update_all() -> int {
+    ensure_dirs()
+    println("[papers_adaptive] ═══ 전체 적응형 업데이트 ═══")
+
+    let listing = exec("ls " + adaptive_dir + "/*.json 2>/dev/null").trim()
+    if listing.len() == 0 {
+        println("[papers_adaptive] 논문 없음")
+        return 0
+    }
+
+    let files = listing.split("\n")
+    let mut updated = 0
+    let i = 0
+    while i < files.len() {
+        let fpath = files[i].trim()
+        if fpath.len() > 0 {
+            let fname = fpath.split("/")
+            let last = fname[fname.len() - 1]
+            let pid = last.replace(".json", "")
+            let result = do_update(pid)
+            if result > 0 {
+                updated = updated + 1
+            }
+        }
+        i = i + 1
+    }
+
+    println("[papers_adaptive] " + updated.to_string() + "편 업데이트 완료")
+    updated
+}
+
+// ─── 메인 ───
+fn main() -> int {
+    let cli = args()
+    if cli.len() < 3 {
+        println("PAPERS v3 적응형 논문 엔진")
+        println("사용법:")
+        println("  hexa papers_adaptive.hexa update <paper_id>       — 적응형 업데이트")
+        println("  hexa papers_adaptive.hexa update_all              — 전체 업데이트")
+        println("  hexa papers_adaptive.hexa rank                    — 영향력 순위")
+        println("  hexa papers_adaptive.hexa lineage <paper_id>      — 버전 계보")
+        println("  hexa papers_adaptive.hexa feedback <paper_id> <score>  — 피드백 등록")
+        println("  hexa papers_adaptive.hexa create <paper_id>       — 신규 논문")
+        println("")
+        println("n=6 구조: " + n6_foundation)
+        println("섹션 (6): abstract | introduction | methodology | results | discussion | conclusion")
+        println("버전: " + paper_version)
+        return 0
+    }
+
+    let cmd = cli[2]
+
+    if cmd == "update" {
+        if cli.len() < 4 {
+            println("[papers_adaptive] paper_id 필요")
+            return 1
+        }
+        return do_update(cli[3])
+    }
+
+    if cmd == "update_all" {
+        return do_update_all()
+    }
+
+    if cmd == "rank" {
+        return do_rank()
+    }
+
+    if cmd == "lineage" {
+        if cli.len() < 4 {
+            println("[papers_adaptive] paper_id 필요")
+            return 1
+        }
+        return do_lineage(cli[3])
+    }
+
+    if cmd == "feedback" {
+        if cli.len() < 5 {
+            println("[papers_adaptive] paper_id 와 score 필요")
+            return 1
+        }
+        return do_feedback(cli[3], cli[4])
+    }
+
+    if cmd == "create" {
+        if cli.len() < 4 {
+            println("[papers_adaptive] paper_id 필요")
+            return 1
+        }
+        return create_new_paper(cli[3])
+    }
+
+    println("[papers_adaptive] 알 수 없는 명령: " + cmd)
+    1
+}
+
+main()

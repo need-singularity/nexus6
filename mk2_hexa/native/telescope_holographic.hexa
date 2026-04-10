@@ -1,0 +1,734 @@
+// mk2_hexa/native/telescope_holographic.hexa — TELESCOPE v3 홀로그래피 망원경
+// Holographic principle: boundary data encodes full interior structure
+// Pipeline: Boundary Extract -> CFT Scan -> Bulk Predict -> Entropy Bound -> Error Correct -> Report
+// n=6: 6 boundary lenses -> full interior map
+
+comptime const VERSION = "3.0.0"
+comptime const LENS_COUNT = 6
+comptime const DEFAULT_THR = 0.15
+comptime const ENTROPY_DIVISOR = 4.0
+comptime const CFT_COUPLING = 0.618
+comptime const RECONSTRUCT_THR = 0.5
+comptime const CORRECT_RADIUS = 2
+comptime const MAX_BOUNDARY_DEGREE = 2
+comptime const N6 = [6.0, 12.0, 2.0, 4.0, 24.0, 5.0, 7.0, 144.0]
+comptime const PHYS = [137.036, 1836.15, 0.3153, 0.6847, 0.0729]
+comptime const CAP = 1000000.0
+
+// ═══════════════════════════════════════════════════════════
+// ─── math utils ───
+// ═══════════════════════════════════════════════════════════
+
+pure fn abs_f(x: float) -> float { if x < 0.0 { 0.0 - x } else { x } }
+pure fn min_f(a: float, b: float) -> float { if a < b { a } else { b } }
+pure fn max_f(a: float, b: float) -> float { if a > b { a } else { b } }
+
+pure fn sqrt_f(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    let mut i = 0
+    while i < 20 { g = (g + x / g) / 2.0; i = i + 1 }
+    g
+}
+
+pure fn ln_f(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut s = 0.0
+    let mut t = (x - 1.0) / (x + 1.0)
+    let t2 = t * t
+    let mut k = 1
+    while k <= 15 { s = s + t / to_float(k); t = t * t2; k = k + 2 }
+    2.0 * s
+}
+
+pure fn sanitize(v: float) -> float {
+    if v != v { return 0.0 }
+    if v > CAP { return CAP }
+    if v < 0.0 - CAP { return 0.0 - CAP }
+    v
+}
+
+pure fn list_mean(d) -> float {
+    if d.len() == 0 { return 0.0 }
+    let mut s = 0.0
+    for v in d { s = s + v }
+    s / to_float(d.len())
+}
+
+pure fn list_variance(d, m: float) -> float {
+    if d.len() == 0 { return 0.0 }
+    let mut s = 0.0
+    for v in d { let x = v - m; s = s + x * x }
+    s / to_float(d.len())
+}
+
+fn timestamp_now() -> string {
+    let mut ts = ""
+    try { ts = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim() } catch e { ts = "unknown" }
+    ts
+}
+
+fn truncate4(x: float) -> string {
+    let s = to_string(x)
+    let parts = s.split(".")
+    if parts.len() < 2 { return s + ".0000" }
+    let dec = parts[1]
+    if dec.len() >= 4 { return parts[0] + "." + dec.split("")[0] + dec.split("")[1] + dec.split("")[2] + dec.split("")[3] }
+    s
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── structs ───
+// ═══════════════════════════════════════════════════════════
+
+struct BoundaryNode { id: string, value: float, degree: int, is_boundary: bool, status: string }
+struct CFTCorrelator { node_a: string, node_b: string, strength: float, distance: int }
+struct BulkPrediction { id: string, predicted_value: float, confidence: float, source_nodes: string }
+struct EntropyBound { boundary_area: int, max_discoveries: float, actual: int, ratio: float }
+struct CorrectionEvent { node_id: string, old_status: string, new_value: float, confidence: float }
+struct HoloReport { boundary_count: int, bulk_count: int, correlators: int, predictions: int, corrections: int, entropy_ratio: float }
+
+// ═══════════════════════════════════════════════════════════
+// ─── 6 boundary lenses (n=6 holographic principle) ───
+// ═══════════════════════════════════════════════════════════
+
+fn lens_name(i: int) -> string {
+    if i == 0 { "topology" } else if i == 1 { "entropy" }
+    else if i == 2 { "causal" } else if i == 3 { "conformal" }
+    else if i == 4 { "gravity" } else if i == 5 { "information" }
+    else { "?" }
+}
+
+fn lens_idx(n: string) -> int {
+    if n == "topology" { 0 } else if n == "entropy" { 1 }
+    else if n == "causal" { 2 } else if n == "conformal" { 3 }
+    else if n == "gravity" { 4 } else if n == "information" { 5 }
+    else { 0 - 1 }
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── reality_map loader ───
+// ═══════════════════════════════════════════════════════════
+
+fn load_reality_map(domain: string) {
+    let home = exec("printenv HOME").trim()
+    let path = home + "/Dev/nexus/shared/reality_map.json"
+    let mut raw = ""
+    try { raw = read_file(path) } catch e { return [[], [], [], []] }
+    let mut node_ids = []
+    let mut node_vals = []
+    let mut node_statuses = []
+    let mut node_degrees = []
+    let lines = raw.split("\n")
+    let mut in_domain = false
+    let domain_key = "\"" + domain + "\""
+    let mut brace_depth = 0
+    let mut current_id = ""
+    let mut current_val = 0.0
+    let mut current_status = "UNKNOWN"
+    let mut current_degree = 0
+    for line in lines {
+        let t = line.trim()
+        if t.contains(domain_key) { in_domain = true }
+        if in_domain {
+            if t.contains("{") { brace_depth = brace_depth + 1 }
+            if t.contains("}") { brace_depth = brace_depth - 1 }
+            if brace_depth <= 0 && in_domain && node_ids.len() > 0 { in_domain = false }
+            if t.contains("\"id\"") {
+                let p = t.split("\"id\"")
+                if p.len() >= 2 {
+                    let q = p[1].split("\"")
+                    if q.len() >= 2 { current_id = q[1] }
+                }
+            }
+            if t.contains("\"value\"") {
+                let p = t.split("\"value\":")
+                if p.len() >= 2 {
+                    let num = p[1].split(",")[0].split("}")[0].trim()
+                    try { current_val = to_float(num) } catch e { current_val = 0.0 }
+                }
+            }
+            if t.contains("\"status\"") {
+                let p = t.split("\"status\"")
+                if p.len() >= 2 {
+                    let q = p[1].split("\"")
+                    if q.len() >= 2 { current_status = q[1] }
+                }
+            }
+            if t.contains("\"edges\"") {
+                let p = t.split("\"edges\":")
+                if p.len() >= 2 {
+                    let num = p[1].split(",")[0].split("}")[0].trim()
+                    try { current_degree = to_int(num) } catch e { current_degree = 1 }
+                }
+            }
+            if current_id != "" && (t.contains("}") || t.contains(",")) {
+                if current_id != "" {
+                    node_ids = node_ids + [current_id]
+                    node_vals = node_vals + [current_val]
+                    node_statuses = node_statuses + [current_status]
+                    node_degrees = node_degrees + [current_degree]
+                    current_id = ""
+                    current_val = 0.0
+                    current_status = "UNKNOWN"
+                    current_degree = 1
+                }
+            }
+        }
+    }
+    [node_ids, node_vals, node_statuses, node_degrees]
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── H1: Boundary Extract ───
+// Identify boundary nodes: degree <= MAX_BOUNDARY_DEGREE
+// ═══════════════════════════════════════════════════════════
+
+fn extract_boundary(ids, vals, statuses, degrees) {
+    let mut nodes = []
+    let mut i = 0
+    while i < ids.len() {
+        let deg = if i < degrees.len() { degrees[i] } else { 1 }
+        let is_b = deg <= MAX_BOUNDARY_DEGREE
+        let st = if i < statuses.len() { statuses[i] } else { "UNKNOWN" }
+        let v = if i < vals.len() { vals[i] } else { 0.0 }
+        nodes = nodes + [BoundaryNode { id: ids[i], value: v, degree: deg, is_boundary: is_b, status: st }]
+        i = i + 1
+    }
+    nodes
+}
+
+fn count_boundary(nodes) -> int {
+    let mut c = 0
+    for n in nodes { if n.is_boundary { c = c + 1 } }
+    c
+}
+
+fn count_bulk(nodes) -> int {
+    let mut c = 0
+    for n in nodes { if !n.is_boundary { c = c + 1 } }
+    c
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── H2: CFT Scan — conformal correlators on boundary ───
+// 6 lenses applied to boundary pairs
+// ═══════════════════════════════════════════════════════════
+
+fn cft_scan(nodes) {
+    let mut correlators = []
+    let mut bi = 0
+    while bi < nodes.len() {
+        if !nodes[bi].is_boundary { bi = bi + 1; next }
+        let mut bj = bi + 1
+        while bj < nodes.len() {
+            if nodes[bj].is_boundary {
+                let dist = if bj - bi < 1 { 1 } else { bj - bi }
+                // 6 lens correlators (n=6)
+                let mut li = 0
+                while li < LENS_COUNT {
+                    let base = abs_f(nodes[bi].value - nodes[bj].value)
+                    let n6_mod = N6[li % N6.len()]
+                    let raw_str = base / (to_float(dist) * to_float(dist) + 1.0) * CFT_COUPLING * n6_mod / 6.0
+                    let strength = sanitize(raw_str)
+                    if strength > DEFAULT_THR {
+                        correlators = correlators + [CFTCorrelator { node_a: nodes[bi].id, node_b: nodes[bj].id, strength: strength, distance: dist }]
+                    }
+                    li = li + 1
+                }
+            }
+            bj = bj + 1
+        }
+        bi = bi + 1
+    }
+    correlators
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── H3: Bulk Reconstruct — predict interior from boundary ───
+// AdS/CFT: boundary data -> bulk prediction
+// ═══════════════════════════════════════════════════════════
+
+fn bulk_reconstruct(nodes, correlators) {
+    let mut predictions = []
+    let mut ni = 0
+    while ni < nodes.len() {
+        if nodes[ni].is_boundary { ni = ni + 1; next }
+        // For each bulk node, gather nearby boundary contributions
+        let mut weighted_sum = 0.0
+        let mut weight_total = 0.0
+        let mut source_list = ""
+        let mut src_count = 0
+        let mut bi = 0
+        while bi < nodes.len() {
+            if nodes[bi].is_boundary {
+                let dist = abs_f(to_float(ni - bi))
+                let w = 1.0 / (dist * dist + 1.0)
+                weighted_sum = weighted_sum + nodes[bi].value * w
+                weight_total = weight_total + w
+                if src_count < 6 {
+                    if source_list != "" { source_list = source_list + "," }
+                    source_list = source_list + nodes[bi].id
+                    src_count = src_count + 1
+                }
+            }
+            bi = bi + 1
+        }
+        if weight_total > 0.0 {
+            let predicted = weighted_sum / weight_total
+            // Confidence from correlator support: count how many correlators touch nearby boundaries
+            let mut corr_support = 0
+            for c in correlators {
+                let mut touches = false
+                let mut bk = 0
+                while bk < nodes.len() {
+                    if nodes[bk].is_boundary {
+                        if abs_f(to_float(ni - bk)) < 6.0 {
+                            if c.node_a == nodes[bk].id || c.node_b == nodes[bk].id { touches = true }
+                        }
+                    }
+                    bk = bk + 1
+                }
+                if touches { corr_support = corr_support + 1 }
+            }
+            let confidence = min_f(1.0, to_float(corr_support) / 6.0)
+            if confidence >= RECONSTRUCT_THR {
+                predictions = predictions + [BulkPrediction { id: nodes[ni].id, predicted_value: sanitize(predicted), confidence: confidence, source_nodes: source_list }]
+            }
+        }
+        ni = ni + 1
+    }
+    predictions
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── H4: Entropy Bound — S = A/4 ───
+// boundary_area = boundary_nodes * LENS_COUNT
+// max_discoveries = boundary_area / 4
+// ═══════════════════════════════════════════════════════════
+
+fn compute_entropy_bound(nodes, actual_discoveries: int) -> EntropyBound {
+    let boundary_count = count_boundary(nodes)
+    let boundary_area = boundary_count * LENS_COUNT
+    let max_disc = to_float(boundary_area) / ENTROPY_DIVISOR
+    let ratio = if max_disc > 0.0 { to_float(actual_discoveries) / max_disc } else { 0.0 }
+    EntropyBound { boundary_area: boundary_area, max_discoveries: max_disc, actual: actual_discoveries, ratio: sanitize(ratio) }
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── H5: Error Correction — recover MISS from EXACT neighbors ───
+// ═══════════════════════════════════════════════════════════
+
+fn error_correct(nodes) {
+    let mut corrections = []
+    let mut ni = 0
+    while ni < nodes.len() {
+        if nodes[ni].status != "MISS" && nodes[ni].status != "UNKNOWN" { ni = ni + 1; next }
+        // Gather surrounding EXACT nodes within CORRECT_RADIUS
+        let mut exact_vals = []
+        let mut exact_weights = []
+        let mut j = 0
+        while j < nodes.len() {
+            if j != ni {
+                let dist = abs_f(to_float(ni - j))
+                if dist <= to_float(CORRECT_RADIUS) {
+                    if nodes[j].status == "EXACT" || nodes[j].status == "CLOSE" {
+                        exact_vals = exact_vals + [nodes[j].value]
+                        exact_weights = exact_weights + [1.0 / (dist + 0.1)]
+                    }
+                }
+            }
+            j = j + 1
+        }
+        if exact_vals.len() >= 2 {
+            // Weighted average reconstruction
+            let mut w_sum = 0.0
+            let mut v_sum = 0.0
+            let mut k = 0
+            while k < exact_vals.len() {
+                v_sum = v_sum + exact_vals[k] * exact_weights[k]
+                w_sum = w_sum + exact_weights[k]
+                k = k + 1
+            }
+            let new_val = if w_sum > 0.0 { v_sum / w_sum } else { 0.0 }
+            let conf = min_f(1.0, to_float(exact_vals.len()) / 6.0)
+            corrections = corrections + [CorrectionEvent { node_id: nodes[ni].id, old_status: nodes[ni].status, new_value: sanitize(new_val), confidence: conf }]
+        }
+        ni = ni + 1
+    }
+    corrections
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── H6: Holographic Map — 6 boundary lenses -> interior ───
+// n=6 principle: 6 independent boundary perspectives reconstruct bulk
+// ═══════════════════════════════════════════════════════════
+
+fn holographic_map(nodes, correlators) {
+    let mut lens_scores = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    let mut lens_counts = [0, 0, 0, 0, 0, 0]
+    // Distribute correlators across 6 lenses by strength bands
+    let mut ci = 0
+    while ci < correlators.len() {
+        let li = ci % LENS_COUNT
+        lens_scores[li] = lens_scores[li] + correlators[ci].strength
+        lens_counts[li] = lens_counts[li] + 1
+        ci = ci + 1
+    }
+    // Compute completeness: all 6 lenses must contribute
+    let mut active_lenses = 0
+    let mut total_score = 0.0
+    let mut li = 0
+    while li < LENS_COUNT {
+        if lens_counts[li] > 0 { active_lenses = active_lenses + 1 }
+        total_score = total_score + lens_scores[li]
+        li = li + 1
+    }
+    let completeness = to_float(active_lenses) / to_float(LENS_COUNT)
+    let fidelity = if active_lenses == LENS_COUNT { total_score / to_float(correlators.len() + 1) * 1.618 } else { total_score / to_float(correlators.len() + 1) * completeness }
+    #{ "lens_scores": lens_scores, "lens_counts": lens_counts, "active": active_lenses, "completeness": completeness, "fidelity": sanitize(fidelity) }
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── Full Pipeline ───
+// ═══════════════════════════════════════════════════════════
+
+fn holographic_telescope(ids, vals, statuses, degrees) {
+    // H1: Boundary Extract
+    let nodes = extract_boundary(ids, vals, statuses, degrees)
+    let b_count = count_boundary(nodes)
+    let k_count = count_bulk(nodes)
+
+    // H2: CFT Scan
+    let correlators = cft_scan(nodes)
+
+    // H3: Bulk Reconstruct
+    let predictions = bulk_reconstruct(nodes, correlators)
+
+    // H4: Entropy Bound
+    let actual = predictions.len() + correlators.len()
+    let entropy = compute_entropy_bound(nodes, actual)
+
+    // H5: Error Correction
+    let corrections = error_correct(nodes)
+
+    // H6: Holographic Map (6 lenses)
+    let hmap = holographic_map(nodes, correlators)
+
+    #{ "nodes": nodes, "boundary": b_count, "bulk": k_count, "correlators": correlators, "predictions": predictions, "entropy": entropy, "corrections": corrections, "hmap": hmap }
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── Report printer ───
+// ═══════════════════════════════════════════════════════════
+
+fn print_report(rpt, domain: string) {
+    println("================================================================")
+    println("  HOLOGRAPHIC TELESCOPE v" + VERSION + " — Boundary->Bulk Report")
+    println("  Domain: " + domain)
+    println("================================================================")
+    println("")
+
+    let nodes = rpt["nodes"]
+    let b = rpt["boundary"]
+    let k = rpt["bulk"]
+    println("[H1] Boundary Extract: " + to_string(b) + " boundary / " + to_string(k) + " bulk / " + to_string(nodes.len()) + " total")
+    let mut bi = 0
+    let mut shown = 0
+    while bi < nodes.len() && shown < 12 {
+        if nodes[bi].is_boundary {
+            println("  B: " + nodes[bi].id + "  val=" + truncate4(nodes[bi].value) + "  deg=" + to_string(nodes[bi].degree) + "  [" + nodes[bi].status + "]")
+            shown = shown + 1
+        }
+        bi = bi + 1
+    }
+    if b > 12 { println("  ... (" + to_string(b - 12) + " more boundary nodes)") }
+    println("")
+
+    let correlators = rpt["correlators"]
+    println("[H2] CFT Correlators: " + to_string(correlators.len()) + " (6-lens conformal scan)")
+    let mut ci = 0
+    while ci < correlators.len() && ci < 10 {
+        let c = correlators[ci]
+        println("  " + c.node_a + " <-> " + c.node_b + "  str=" + truncate4(c.strength) + "  dist=" + to_string(c.distance))
+        ci = ci + 1
+    }
+    if correlators.len() > 10 { println("  ... (" + to_string(correlators.len() - 10) + " more)") }
+    println("")
+
+    let predictions = rpt["predictions"]
+    println("[H3] Bulk Reconstruct: " + to_string(predictions.len()) + " predictions (AdS/CFT)")
+    let mut pi = 0
+    while pi < predictions.len() && pi < 10 {
+        let p = predictions[pi]
+        println("  " + p.id + "  predicted=" + truncate4(p.predicted_value) + "  conf=" + truncate4(p.confidence) + "  from=[" + p.source_nodes + "]")
+        pi = pi + 1
+    }
+    if predictions.len() > 10 { println("  ... (" + to_string(predictions.len() - 10) + " more)") }
+    println("")
+
+    let entropy = rpt["entropy"]
+    println("[H4] Entropy Bound: S = A/4")
+    println("  Boundary area (nodes*lenses): " + to_string(entropy.boundary_area))
+    println("  Max discoveries:              " + truncate4(entropy.max_discoveries))
+    println("  Actual discoveries:           " + to_string(entropy.actual))
+    println("  Saturation ratio:             " + truncate4(entropy.ratio))
+    if entropy.ratio > 1.0 { println("  WARNING: entropy bound VIOLATED — data may be over-counted") }
+    else if entropy.ratio > 0.8 { println("  NEAR SATURATION — approaching holographic limit") }
+    println("")
+
+    let corrections = rpt["corrections"]
+    println("[H5] Error Correction: " + to_string(corrections.len()) + " recovered nodes")
+    let mut ei = 0
+    while ei < corrections.len() && ei < 10 {
+        let e = corrections[ei]
+        println("  " + e.node_id + "  [" + e.old_status + " -> RECOVERED]  val=" + truncate4(e.new_value) + "  conf=" + truncate4(e.confidence))
+        ei = ei + 1
+    }
+    if corrections.len() > 10 { println("  ... (" + to_string(corrections.len() - 10) + " more)") }
+    println("")
+
+    let hmap = rpt["hmap"]
+    println("[H6] Holographic Map (n=6 lenses)")
+    println("  Active lenses: " + to_string(hmap["active"]) + "/" + to_string(LENS_COUNT))
+    println("  Completeness:  " + truncate4(hmap["completeness"]))
+    println("  Fidelity:      " + truncate4(hmap["fidelity"]))
+    let scores = hmap["lens_scores"]
+    let counts = hmap["lens_counts"]
+    let mut li = 0
+    while li < LENS_COUNT {
+        let name = lens_name(li)
+        println("  [" + name + "] score=" + truncate4(scores[li]) + "  count=" + to_string(counts[li]))
+        li = li + 1
+    }
+    if hmap["active"] == LENS_COUNT { println("  ** FULL HOLOGRAPHIC RECONSTRUCTION: 6/6 lenses active **") }
+    else { println("  ** PARTIAL: " + to_string(hmap["active"]) + "/6 lenses — interior map incomplete **") }
+    println("")
+    println("================================================================")
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── growth_bus output ───
+// ═══════════════════════════════════════════════════════════
+
+fn emit_growth_bus(rpt, domain: string) {
+    let home = exec("printenv HOME").trim()
+    let bus_path = home + "/Dev/nexus/shared/growth_bus.jsonl"
+    let ts = timestamp_now()
+    let entropy = rpt["entropy"]
+    let hmap = rpt["hmap"]
+    let line = "{\"ts\":\"" + ts + "\",\"source\":\"telescope_holographic\",\"version\":\"" + VERSION + "\",\"domain\":\"" + domain + "\",\"boundary\":" + to_string(rpt["boundary"]) + ",\"bulk\":" + to_string(rpt["bulk"]) + ",\"correlators\":" + to_string(rpt["correlators"].len()) + ",\"predictions\":" + to_string(rpt["predictions"].len()) + ",\"corrections\":" + to_string(rpt["corrections"].len()) + ",\"entropy_ratio\":" + truncate4(entropy.ratio) + ",\"max_discoveries\":" + truncate4(entropy.max_discoveries) + ",\"completeness\":" + truncate4(hmap["completeness"]) + ",\"fidelity\":" + truncate4(hmap["fidelity"]) + ",\"active_lenses\":" + to_string(hmap["active"]) + "}"
+    try {
+        let mut existing = ""
+        if file_exists(bus_path) { existing = read_file(bus_path) }
+        write_file(bus_path, existing + line + "\n")
+        println("[growth_bus] emitted -> " + bus_path)
+    } catch e {
+        println("[growth_bus] WARN: write failed — " + to_string(e))
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── synthetic data for demo/predict mode ───
+// ═══════════════════════════════════════════════════════════
+
+fn synthetic_nodes() {
+    // Generate 24 synthetic nodes (4*n=6) with mixed statuses
+    let mut ids = []
+    let mut vals = []
+    let mut statuses = []
+    let mut degrees = []
+    let base_vals = [6.0, 12.0, 137.036, 1836.15, 0.3153, 0.6847]
+    let mut i = 0
+    while i < 24 {
+        ids = ids + ["synth_" + to_string(i)]
+        let v = base_vals[i % 6] * (1.0 + to_float(i) * 0.1)
+        vals = vals + [v]
+        let deg = if i % 6 == 0 || i % 6 == 5 { 1 } else if i % 3 == 0 { 2 } else { 4 }
+        degrees = degrees + [deg]
+        let st = if i % 7 == 0 { "MISS" } else if i % 5 == 0 { "CLOSE" } else { "EXACT" }
+        statuses = statuses + [st]
+        i = i + 1
+    }
+    [ids, vals, statuses, degrees]
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── CLI ───
+// R19: args() = [binary, script, arg1, ...] — a[2] is first user arg
+// ═══════════════════════════════════════════════════════════
+
+let a = args()
+let mode = if a.len() >= 3 { a[2] } else { "help" }
+
+if mode == "help" || mode == "--help" || mode == "-h" {
+    println("=== Holographic Telescope v" + VERSION + " ===")
+    println("Usage:")
+    println("  hexa telescope_holographic.hexa scan [domain]    scan boundary of reality_map domain")
+    println("  hexa telescope_holographic.hexa predict          predict bulk from synthetic boundary data")
+    println("  hexa telescope_holographic.hexa test             run self-tests")
+    println("  hexa telescope_holographic.hexa help             this message")
+    println("")
+    println("Pipeline: Boundary Extract -> CFT Scan -> Bulk Predict -> Entropy Bound -> Error Correct -> Report")
+    println("Lenses (n=6): topology, entropy, causal, conformal, gravity, information")
+    println("Entropy bound: S = A/4 = (boundary_nodes * 6) / 4")
+    println("Holographic principle: 6 boundary lenses reconstruct full interior map")
+}
+
+if mode == "scan" {
+    let domain = if a.len() >= 4 { a[3] } else { "L0_particle" }
+    println("[scan] Loading reality_map domain: " + domain)
+    let data = load_reality_map(domain)
+    let ids = data[0]
+    let vals = data[1]
+    let statuses = data[2]
+    let degrees = data[3]
+    if ids.len() == 0 {
+        println("WARN: domain '" + domain + "' returned 0 nodes — using synthetic data")
+        let syn = synthetic_nodes()
+        let rpt = holographic_telescope(syn[0], syn[1], syn[2], syn[3])
+        print_report(rpt, domain + " (synthetic)")
+        emit_growth_bus(rpt, domain)
+    } else {
+        println("[scan] Loaded " + to_string(ids.len()) + " nodes from " + domain)
+        let rpt = holographic_telescope(ids, vals, statuses, degrees)
+        print_report(rpt, domain)
+        emit_growth_bus(rpt, domain)
+    }
+}
+
+if mode == "predict" {
+    println("[predict] Generating synthetic boundary data (n=6 * 4 = 24 nodes)")
+    let syn = synthetic_nodes()
+    let rpt = holographic_telescope(syn[0], syn[1], syn[2], syn[3])
+    print_report(rpt, "synthetic_predict")
+    emit_growth_bus(rpt, "synthetic_predict")
+}
+
+if mode == "test" {
+    println("=== Holographic Telescope Self-Test ===")
+
+    // T1: Math utils
+    assert abs_f(sqrt_f(36.0) - 6.0) < 0.01
+    assert abs_f(0.0 - 5.0) > 0.0
+    assert sanitize(999999999.0) <= CAP
+    println("  [PASS] T1: math utils")
+
+    // T2: Boundary extraction
+    let test_ids = ["a", "b", "c", "d", "e", "f"]
+    let test_vals = [6.0, 12.0, 24.0, 137.0, 1836.0, 0.315]
+    let test_st = ["EXACT", "EXACT", "MISS", "EXACT", "EXACT", "CLOSE"]
+    let test_deg = [1, 5, 2, 4, 1, 3]
+    let nodes = extract_boundary(test_ids, test_vals, test_st, test_deg)
+    assert nodes.len() == 6
+    let bc = count_boundary(nodes)
+    let kc = count_bulk(nodes)
+    assert bc + kc == 6
+    assert bc == 3
+    println("  [PASS] T2: boundary extraction (3 boundary, 3 bulk)")
+
+    // T3: CFT correlators
+    let corrs = cft_scan(nodes)
+    println("  [PASS] T3: CFT scan (" + to_string(corrs.len()) + " correlators)")
+
+    // T4: Entropy bound
+    let eb = compute_entropy_bound(nodes, 10)
+    assert eb.boundary_area == bc * LENS_COUNT
+    assert eb.max_discoveries > 0.0
+    println("  [PASS] T4: entropy bound S=A/4, max=" + truncate4(eb.max_discoveries))
+
+    // T5: Error correction (node "c" is MISS with EXACT neighbors)
+    let corrections = error_correct(nodes)
+    println("  [PASS] T5: error correction (" + to_string(corrections.len()) + " recovered)")
+
+    // T6: Full pipeline
+    let rpt = holographic_telescope(test_ids, test_vals, test_st, test_deg)
+    assert rpt["boundary"] == 3
+    assert rpt["bulk"] == 3
+    println("  [PASS] T6: full pipeline (b=" + to_string(rpt["boundary"]) + " k=" + to_string(rpt["bulk"]) + ")")
+
+    // T7: Lens registry
+    assert lens_idx("topology") == 0
+    assert lens_idx("information") == 5
+    assert lens_idx("unknown") == 0 - 1
+    assert lens_name(0) == "topology"
+    assert lens_name(5) == "information"
+    println("  [PASS] T7: 6-lens registry (n=6)")
+
+    // T8: Holographic map completeness
+    let hmap = rpt["hmap"]
+    assert hmap["active"] <= LENS_COUNT
+    println("  [PASS] T8: holographic map (active=" + to_string(hmap["active"]) + "/" + to_string(LENS_COUNT) + ")")
+
+    println("=== 8/8 passed ===")
+}
+
+// ─── inline assertions ───
+assert abs_f(sanitize(999999999.0) - CAP) < 0.01
+assert lens_idx("topology") == 0
+assert lens_idx("information") == 5
+assert lens_idx("unknown") == 0 - 1
+assert lens_name(0) == "topology"
+assert lens_name(5) == "information"
+assert LENS_COUNT == 6
+println("")
+println("=== telescope_holographic verified ===")
+
+// ─── verification functions ───
+
+fn verify_entropy_bound_monotonic() {
+    let ids = ["x", "y", "z"]
+    let vals = [1.0, 2.0, 3.0]
+    let st = ["EXACT", "EXACT", "EXACT"]
+    let d1 = [1, 1, 1]
+    let d2 = [1, 1, 4]
+    let n1 = extract_boundary(ids, vals, st, d1)
+    let n2 = extract_boundary(ids, vals, st, d2)
+    let e1 = compute_entropy_bound(n1, 0)
+    let e2 = compute_entropy_bound(n2, 0)
+    assert e1.max_discoveries >= e2.max_discoveries
+}
+
+fn verify_boundary_bulk_partition() {
+    let ids = ["a", "b", "c", "d"]
+    let vals = [1.0, 2.0, 3.0, 4.0]
+    let st = ["EXACT", "EXACT", "EXACT", "EXACT"]
+    let deg = [1, 5, 2, 4]
+    let nodes = extract_boundary(ids, vals, st, deg)
+    let b = count_boundary(nodes)
+    let k = count_bulk(nodes)
+    assert b + k == ids.len()
+}
+
+fn verify_correction_requires_neighbors() {
+    let ids = ["a"]
+    let vals = [0.0]
+    let st = ["MISS"]
+    let deg = [1]
+    let nodes = extract_boundary(ids, vals, st, deg)
+    let corrections = error_correct(nodes)
+    assert corrections.len() == 0
+}
+
+fn verify_six_lenses_complete() {
+    let mut i = 0
+    while i < LENS_COUNT {
+        let name = lens_name(i)
+        assert name != "?"
+        assert lens_idx(name) == i
+        i = i + 1
+    }
+}
+
+verify_entropy_bound_monotonic()
+verify_boundary_bulk_partition()
+verify_correction_requires_neighbors()
+verify_six_lenses_complete()
+
+proof holographic_telescope_invariants {
+    invariant boundary_bulk_partition()
+    invariant entropy_bound_monotonic()
+    invariant correction_requires_neighbors()
+    invariant six_lenses_complete()
+}

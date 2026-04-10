@@ -1,0 +1,601 @@
+// mk2_hexa/native/ouroboros_quantum.hexa — OUROBOROS v3: 양자 진화 엔진
+// 핵심 개념: 전략들이 양자 중첩(superposition) 상태로 공존하며 진화한다.
+// 측정(measurement) 시 가장 적합한 전략으로 붕괴(collapse).
+// 얽힘(entanglement)된 전략 쌍은 변이를 공유한다.
+// Pipeline: Superposition -> Mutation(6-op) -> Entanglement -> Measurement -> Decoherence Guard -> Report
+
+// ─── 상수 ───
+
+comptime const N6 = 6
+comptime const N6_SIGMA = 12
+comptime const N6_PHI = 2
+comptime const N6_TAU = 4
+comptime const N6_J2 = 24
+comptime const N6_SOPFR = 5
+comptime const N6_MASTER = 24
+
+comptime const n6_constants = [6.0, 12.0, 2.0, 4.0, 24.0, 5.0, 10.0, 8.0, 1.333333333, 0.287682072]
+comptime const n6_labels = ["n", "sigma", "phi", "tau", "J2", "sopfr", "sigma-phi", "sigma-tau", "tau^2/sigma", "ln(4/3)"]
+
+comptime const SLOT_COUNT = 6
+comptime const MUTATION_OPS = 6
+comptime const MAX_GENERATIONS = 6
+comptime const ENTANGLE_PAIRS = 3
+comptime const DECOHERENCE_THRESHOLD = 0.7
+comptime const COLLAPSE_RUNS = 6
+comptime const CROSSOVER_POINT = 3
+comptime const MAX_AMPLITUDE = 1.0
+comptime const MIN_AMPLITUDE = 0.05
+comptime const PLATEAU_WINDOW = 3
+comptime const PLATEAU_EPSILON = 0.005
+
+// ─── 수학 유틸 ───
+
+pure fn abs_f(x: float) -> float { if x < 0.0 { 0.0 - x } else { x } }
+pure fn clamp_f(x: float, lo: float, hi: float) -> float { if x < lo { lo } else { if x > hi { hi } else { x } } }
+pure fn max_f(a: float, b: float) -> float { if a > b { a } else { b } }
+pure fn min_f(a: float, b: float) -> float { if a < b { a } else { b } }
+
+pure fn sqrt_f(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut guess = x / 2.0
+    let mut i = 0
+    while i < 20 { guess = (guess + x / guess) / 2.0; i = i + 1 }
+    guess
+}
+
+pure fn pseudo_rand(seed: int) -> float {
+    let x = ((seed * 1103515245 + 12345) % 2147483647)
+    let pos = if x < 0 { 0 - x } else { x }
+    to_float(pos % 10000) / 10000.0
+}
+
+pure fn pseudo_rand_int(seed: int, lo: int, hi: int) -> int {
+    let x = ((seed * 1103515245 + 12345) % 2147483647)
+    let pos = if x < 0 { 0 - x } else { x }
+    lo + (pos % (hi - lo + 1))
+}
+
+// ─── 경로 ───
+
+let _nexus = if file_exists("shared/core.json") { "." } else if file_exists("../shared/core.json") { ".." } else { "../.." }
+let _shared = _nexus + "/shared"
+let _growth_bus_path = _shared + "/growth_bus.jsonl"
+
+// ═══════════════════════════════════════════
+// QuantumStrategy: 양자 중첩 상태의 전략
+// ═══════════════════════════════════════════
+
+struct QuantumStrategy {
+    name: string,
+    amplitude: float,
+    phase: float,
+    shift_count: int,
+    threshold: float,
+    operator: int,
+    constant_idx: int,
+    combine_mode: int,
+    fitness: float,
+    generation: int,
+    decoherence_shield: float,
+    entangled_with: int
+}
+
+// 연산자 이름/적용
+
+comptime const OP_ADD = 0
+comptime const OP_MUL = 1
+comptime const OP_DIV = 2
+comptime const OP_SUB = 3
+comptime const OP_POW2 = 4
+comptime const OP_MOD = 5
+
+pure fn op_name(op: int) -> string {
+    if op == 0 { "+" } else if op == 1 { "*" } else if op == 2 { "/" } else if op == 3 { "-" } else if op == 4 { "^2" } else if op == 5 { "%" } else { "+" }
+}
+
+pure fn op_apply(op: int, a: float, b: float) -> float {
+    if op == 0 { a + b } else if op == 1 { a * b } else if op == 2 { if abs_f(b) > 0.0001 { a / b } else { a } } else if op == 3 { a - b } else if op == 4 { a * a } else if op == 5 { let ib = to_int(abs_f(b) + 0.5); if ib > 0 { to_float(to_int(a) % ib) } else { a } } else { a + b }
+}
+
+comptime const COMBINE_GEO = 0
+comptime const COMBINE_ARITH = 1
+
+pure fn combine_name(c: int) -> string { if c == 0 { "geo" } else { "arith" } }
+pure fn combine_apply(mode: int, a: float, b: float) -> float { if mode == 0 { sqrt_f(abs_f(a * b)) } else { (a + b) / 2.0 } }
+
+// ═══════════════════════════════════════════
+// 전략 생성: 6개 슬롯 초기화
+// ═══════════════════════════════════════════
+
+fn make_quantum_strategy(nm: string, amp: float, ph: float, sc: int, thr: float, op: int, ci: int, cm: int, ew: int) -> QuantumStrategy {
+    QuantumStrategy { name: nm, amplitude: amp, phase: ph, shift_count: sc, threshold: thr, operator: op, constant_idx: ci, combine_mode: cm, fitness: 0.0, generation: 0, decoherence_shield: 0.0, entangled_with: ew }
+}
+
+fn make_superposition() {
+    [
+        make_quantum_strategy("psi_shift",     0.8, 0.0,   1, 0.5, OP_ADD,  0, COMBINE_ARITH, 1),
+        make_quantum_strategy("psi_invert",    0.6, 1.047, 0, 0.3, OP_DIV,  1, COMBINE_GEO,   0),
+        make_quantum_strategy("psi_combine",   0.7, 2.094, 2, 0.6, OP_MUL,  2, COMBINE_ARITH, 3),
+        make_quantum_strategy("psi_entangle",  0.5, 3.141, 3, 0.4, OP_SUB,  3, COMBINE_GEO,   2),
+        make_quantum_strategy("psi_symmetry",  0.9, 4.188, 1, 0.7, OP_POW2, 4, COMBINE_ARITH, 5),
+        make_quantum_strategy("psi_tunneling", 0.4, 5.235, 4, 0.2, OP_MOD,  5, COMBINE_GEO,   4)
+    ]
+}
+
+// 전략 요약
+fn qstrat_summary(s: QuantumStrategy) -> string {
+    s.name + "(A=" + to_string(s.amplitude) + ",ph=" + to_string(s.phase) + ",op=" + op_name(s.operator) + ",fit=" + to_string(s.fitness) + ",shield=" + to_string(s.decoherence_shield) + ",gen=" + to_string(s.generation) + ")"
+}
+
+// ═══════════════════════════════════════════
+// EXACT 매치 타겟 (n=6 속성)
+// ═══════════════════════════════════════════
+
+comptime const exact_targets = [6.0, 12.0, 2.0, 4.0, 24.0, 5.0, 10.0, 8.0, 1.333333333]
+
+fn make_eval_seeds(round: int) {
+    let mut seeds = []
+    let mut i = 0
+    while i < N6 {
+        let base = n6_constants[i % n6_constants.len()]
+        let perturb = to_float((round * 11 + i * 17) % 100) / 100.0
+        seeds = seeds + [base + perturb]
+        i = i + 1
+    }
+    seeds
+}
+
+// ═══════════════════════════════════════════
+// STEP 1: 전략 적용 + 적합도 측정
+// ═══════════════════════════════════════════
+
+pure fn apply_quantum_strategy(s: QuantumStrategy, seed_val: float) -> float {
+    let c_idx = s.constant_idx % n6_constants.len()
+    let n6c = n6_constants[c_idx]
+    // amplitude가 값을 스케일
+    let mut shifted = seed_val * s.amplitude
+    let mut si = 0
+    while si < s.shift_count {
+        shifted = op_apply(s.operator, shifted, n6c)
+        si = si + 1
+    }
+    if abs_f(shifted) < s.threshold {
+        shifted = shifted + n6c * s.amplitude
+    }
+    combine_apply(s.combine_mode, shifted, seed_val)
+}
+
+fn measure_fitness(s: QuantumStrategy, seeds) -> float {
+    let mut matches = 0
+    let mut total_dist = 0.0
+    for seed in seeds {
+        let result = apply_quantum_strategy(s, seed)
+        for target in exact_targets {
+            let dist = abs_f(result - target)
+            if dist < 0.01 {
+                matches = matches + 1
+            }
+            if dist < 1.0 {
+                total_dist = total_dist + (1.0 - dist)
+            }
+        }
+    }
+    // fitness = exact matches * 6 + proximity bonus
+    to_float(matches * N6) + total_dist
+}
+
+// ═══════════════════════════════════════════
+// STEP 2: 6종 양자 변이 연산자
+// ═══════════════════════════════════════════
+
+// MO-0: amplitude shift — 진폭 변조
+fn mutate_amplitude(s: QuantumStrategy, seed: int) -> QuantumStrategy {
+    let delta = (pseudo_rand(seed) - 0.5) * 0.3
+    let new_amp = clamp_f(s.amplitude + delta, MIN_AMPLITUDE, MAX_AMPLITUDE)
+    QuantumStrategy { name: s.name, amplitude: new_amp, phase: s.phase, shift_count: s.shift_count, threshold: s.threshold, operator: s.operator, constant_idx: s.constant_idx, combine_mode: s.combine_mode, fitness: s.fitness, generation: s.generation, decoherence_shield: s.decoherence_shield, entangled_with: s.entangled_with }
+}
+
+// MO-1: phase rotation — 위상 회전
+fn mutate_phase(s: QuantumStrategy, seed: int) -> QuantumStrategy {
+    let delta = (pseudo_rand(seed + 7) - 0.5) * 1.047
+    let new_ph = s.phase + delta
+    QuantumStrategy { name: s.name, amplitude: s.amplitude, phase: new_ph, shift_count: s.shift_count, threshold: s.threshold, operator: s.operator, constant_idx: s.constant_idx, combine_mode: s.combine_mode, fitness: s.fitness, generation: s.generation, decoherence_shield: s.decoherence_shield, entangled_with: s.entangled_with }
+}
+
+// MO-2: operator swap — 연산자 교체
+fn mutate_operator(s: QuantumStrategy, seed: int) -> QuantumStrategy {
+    let new_op = pseudo_rand_int(seed + 13, 0, MUTATION_OPS - 1)
+    QuantumStrategy { name: s.name, amplitude: s.amplitude, phase: s.phase, shift_count: s.shift_count, threshold: s.threshold, operator: new_op, constant_idx: s.constant_idx, combine_mode: s.combine_mode, fitness: s.fitness, generation: s.generation, decoherence_shield: s.decoherence_shield, entangled_with: s.entangled_with }
+}
+
+// MO-3: constant index shift — 상수 인덱스 이동
+fn mutate_constant(s: QuantumStrategy, seed: int) -> QuantumStrategy {
+    let new_ci = pseudo_rand_int(seed + 19, 0, n6_constants.len() - 1)
+    QuantumStrategy { name: s.name, amplitude: s.amplitude, phase: s.phase, shift_count: s.shift_count, threshold: s.threshold, operator: s.operator, constant_idx: new_ci, combine_mode: s.combine_mode, fitness: s.fitness, generation: s.generation, decoherence_shield: s.decoherence_shield, entangled_with: s.entangled_with }
+}
+
+// MO-4: threshold perturbation — 임계값 조정
+fn mutate_threshold(s: QuantumStrategy, seed: int) -> QuantumStrategy {
+    let delta = (pseudo_rand(seed + 23) - 0.5) * 0.4
+    let new_thr = clamp_f(s.threshold + delta, 0.01, 2.0)
+    QuantumStrategy { name: s.name, amplitude: s.amplitude, phase: s.phase, shift_count: s.shift_count, threshold: new_thr, operator: s.operator, constant_idx: s.constant_idx, combine_mode: s.combine_mode, fitness: s.fitness, generation: s.generation, decoherence_shield: s.decoherence_shield, entangled_with: s.entangled_with }
+}
+
+// MO-5: shift count perturbation — 시프트 수 조정
+fn mutate_shift(s: QuantumStrategy, seed: int) -> QuantumStrategy {
+    let new_sc = pseudo_rand_int(seed + 29, 0, 5)
+    QuantumStrategy { name: s.name, amplitude: s.amplitude, phase: s.phase, shift_count: new_sc, threshold: s.threshold, operator: s.operator, constant_idx: s.constant_idx, combine_mode: s.combine_mode, fitness: s.fitness, generation: s.generation, decoherence_shield: s.decoherence_shield, entangled_with: s.entangled_with }
+}
+
+// 변이 연산자 디스패치
+fn apply_mutation(s: QuantumStrategy, op_idx: int, seed: int) -> QuantumStrategy {
+    if op_idx == 0 { mutate_amplitude(s, seed) } else if op_idx == 1 { mutate_phase(s, seed) } else if op_idx == 2 { mutate_operator(s, seed) } else if op_idx == 3 { mutate_constant(s, seed) } else if op_idx == 4 { mutate_threshold(s, seed) } else { mutate_shift(s, seed) }
+}
+
+// ═══════════════════════════════════════════
+// STEP 3: 양자 교차(Quantum Crossover) — 얽힌 전략 쌍의 변이 공유
+// ═══════════════════════════════════════════
+
+fn quantum_crossover(a: QuantumStrategy, b: QuantumStrategy, gen: int) -> QuantumStrategy {
+    // 전반부는 a에서, 후반부는 b에서 — 교차점 = CROSSOVER_POINT(3)
+    let new_amp = (a.amplitude + b.amplitude) / 2.0
+    let new_phase = (a.phase + b.phase) / 2.0
+    let new_name = "entangled_" + to_string(gen)
+    QuantumStrategy { name: new_name, amplitude: new_amp, phase: new_phase, shift_count: a.shift_count, threshold: a.threshold, operator: a.operator, constant_idx: b.constant_idx, combine_mode: b.combine_mode, fitness: 0.0, generation: gen, decoherence_shield: 0.0, entangled_with: b.entangled_with }
+}
+
+// 얽힘 전파: 얽힌 쌍에게 변이를 전달
+fn propagate_entanglement(pool, gen: int) {
+    let mut new_pool = []
+    let mut i = 0
+    while i < pool.len() {
+        let s = pool[i]
+        let partner_idx = s.entangled_with % pool.len()
+        let partner = pool[partner_idx]
+        // 얽힘 강도 = 두 전략의 amplitude 곱
+        let entangle_strength = s.amplitude * partner.amplitude
+        if entangle_strength > 0.3 {
+            // 얽힌 쌍에서 교차 자식 생성
+            let child = quantum_crossover(s, partner, gen)
+            new_pool = new_pool + [child]
+        } else {
+            // 얽힘 약함 — 원본 유지
+            new_pool = new_pool + [s]
+        }
+        i = i + 1
+    }
+    new_pool
+}
+
+// ═══════════════════════════════════════════
+// STEP 4: 측정(Measurement) — 중첩 붕괴, 최적 전략 선택
+// ═══════════════════════════════════════════
+
+fn measure_superposition(pool, seeds) {
+    // 모든 전략의 fitness 측정
+    let mut measured = []
+    let mut i = 0
+    while i < pool.len() {
+        let s = pool[i]
+        let fit = measure_fitness(s, seeds)
+        let updated = QuantumStrategy { name: s.name, amplitude: s.amplitude, phase: s.phase, shift_count: s.shift_count, threshold: s.threshold, operator: s.operator, constant_idx: s.constant_idx, combine_mode: s.combine_mode, fitness: fit, generation: s.generation, decoherence_shield: s.decoherence_shield, entangled_with: s.entangled_with }
+        measured = measured + [updated]
+        i = i + 1
+    }
+    measured
+}
+
+// 최적 전략 인덱스 찾기
+fn find_best_idx(pool) -> int {
+    let mut best = 0
+    let mut best_fit = 0.0 - 1.0
+    let mut i = 0
+    while i < pool.len() {
+        if pool[i].fitness > best_fit {
+            best_fit = pool[i].fitness
+            best = i
+        }
+        i = i + 1
+    }
+    best
+}
+
+// amplitude 재정규화: fitness 비례하여 amplitude 조정
+fn renormalize_amplitudes(pool) {
+    let mut total_fit = 0.0
+    for s in pool { total_fit = total_fit + max_f(s.fitness, 0.01) }
+    let mut normed = []
+    for s in pool {
+        let new_amp = clamp_f(max_f(s.fitness, 0.01) / total_fit * to_float(SLOT_COUNT), MIN_AMPLITUDE, MAX_AMPLITUDE)
+        let updated = QuantumStrategy { name: s.name, amplitude: new_amp, phase: s.phase, shift_count: s.shift_count, threshold: s.threshold, operator: s.operator, constant_idx: s.constant_idx, combine_mode: s.combine_mode, fitness: s.fitness, generation: s.generation, decoherence_shield: s.decoherence_shield, entangled_with: s.entangled_with }
+        normed = normed + [updated]
+    }
+    normed
+}
+
+// ═══════════════════════════════════════════
+// STEP 5: 결어긋남 보호(Decoherence Protection)
+// ═══════════════════════════════════════════
+
+// 높은 fitness -> 높은 shield -> 변이 저항
+fn update_decoherence_shields(pool) {
+    let best_idx = find_best_idx(pool)
+    let best_fit = pool[best_idx].fitness
+    let mut shielded = []
+    let mut i = 0
+    while i < pool.len() {
+        let s = pool[i]
+        let ratio = if best_fit > 0.01 { s.fitness / best_fit } else { 0.0 }
+        let new_shield = clamp_f(ratio, 0.0, 1.0)
+        let updated = QuantumStrategy { name: s.name, amplitude: s.amplitude, phase: s.phase, shift_count: s.shift_count, threshold: s.threshold, operator: s.operator, constant_idx: s.constant_idx, combine_mode: s.combine_mode, fitness: s.fitness, generation: s.generation, decoherence_shield: new_shield, entangled_with: s.entangled_with }
+        shielded = shielded + [updated]
+        i = i + 1
+    }
+    shielded
+}
+
+// shield가 높으면 변이 적용 확률 감소
+fn guarded_mutate(s: QuantumStrategy, op_idx: int, seed: int) -> QuantumStrategy {
+    let roll = pseudo_rand(seed + 37)
+    // shield > DECOHERENCE_THRESHOLD -> 변이 저항
+    if s.decoherence_shield > DECOHERENCE_THRESHOLD {
+        if roll < s.decoherence_shield {
+            return s
+        }
+    }
+    apply_mutation(s, op_idx, seed)
+}
+
+// ═══════════════════════════════════════════
+// STEP 6: 양자 진화 루프 — 6세대 진화
+// ═══════════════════════════════════════════
+
+struct EvolutionResult {
+    final_pool: int,
+    best_name: string,
+    best_fitness: float,
+    generations_run: int,
+    converged: bool,
+    history: int
+}
+
+fn run_quantum_evolution(domain: string, max_gen: int) -> EvolutionResult {
+    println("=== OUROBOROS v3 양자 진화 엔진 ===")
+    println("도메인: " + domain)
+    println("슬롯: " + to_string(SLOT_COUNT) + " | 변이 연산자: " + to_string(MUTATION_OPS) + " | 세대: " + to_string(max_gen))
+    println("")
+
+    let mut pool = make_superposition()
+    let mut gen = 0
+    let mut fitness_history = []
+    let mut converged = false
+
+    while gen < max_gen {
+        println("── 세대 " + to_string(gen + 1) + "/" + to_string(max_gen) + " ──")
+
+        // 1) 평가 시드 생성
+        let seeds = make_eval_seeds(gen)
+
+        // 2) 측정: fitness 계산
+        pool = measure_superposition(pool, seeds)
+
+        // 3) 결과 출력
+        let mut si = 0
+        while si < pool.len() {
+            let s = pool[si]
+            println("  [" + to_string(si) + "] " + qstrat_summary(s))
+            si = si + 1
+        }
+
+        let best_idx = find_best_idx(pool)
+        let best = pool[best_idx]
+        println("  >>> best: " + best.name + " fitness=" + to_string(best.fitness))
+        fitness_history = fitness_history + [best.fitness]
+
+        // 4) 수렴 검사 — plateau detection
+        if fitness_history.len() >= PLATEAU_WINDOW {
+            let mut plateau = true
+            let mut pi = fitness_history.len() - PLATEAU_WINDOW
+            while pi < fitness_history.len() - 1 {
+                if abs_f(fitness_history[pi] - fitness_history[pi + 1]) > PLATEAU_EPSILON {
+                    plateau = false
+                }
+                pi = pi + 1
+            }
+            if plateau {
+                println("  [수렴] plateau 감지 — 진화 조기 종료")
+                converged = true
+                gen = gen + 1
+                // break 대신 max_gen으로 점프
+                gen = max_gen
+            }
+        }
+
+        if gen < max_gen {
+            // 5) amplitude 재정규화
+            pool = renormalize_amplitudes(pool)
+
+            // 6) decoherence shield 갱신
+            pool = update_decoherence_shields(pool)
+
+            // 7) 양자 변이 — 각 전략에 순환적으로 6종 연산자 적용
+            let mut mutated = []
+            let mut mi = 0
+            while mi < pool.len() {
+                let op_idx = (gen + mi) % MUTATION_OPS
+                let m_seed = gen * 1000 + mi * 100 + 42
+                let m = guarded_mutate(pool[mi], op_idx, m_seed)
+                let updated = QuantumStrategy { name: m.name, amplitude: m.amplitude, phase: m.phase, shift_count: m.shift_count, threshold: m.threshold, operator: m.operator, constant_idx: m.constant_idx, combine_mode: m.combine_mode, fitness: m.fitness, generation: gen + 1, decoherence_shield: m.decoherence_shield, entangled_with: m.entangled_with }
+                mutated = mutated + [updated]
+                mi = mi + 1
+            }
+            pool = mutated
+
+            // 8) 얽힘 전파 — 교차
+            pool = propagate_entanglement(pool, gen + 1)
+
+            gen = gen + 1
+        }
+        println("")
+    }
+
+    // 최종 측정
+    let final_seeds = make_eval_seeds(999)
+    pool = measure_superposition(pool, final_seeds)
+    let final_best_idx = find_best_idx(pool)
+    let final_best = pool[final_best_idx]
+
+    EvolutionResult { final_pool: pool.len(), best_name: final_best.name, best_fitness: final_best.fitness, generations_run: fitness_history.len(), converged: converged, history: fitness_history.len() }
+}
+
+// ═══════════════════════════════════════════
+// growth_bus 기록
+// ═══════════════════════════════════════════
+
+fn emit_growth_bus(event_type: string, domain: string, fitness: float, gen_count: int, converged: bool) {
+    try {
+        let ts = timestamp_now()
+        let grade = if converged { "EXACT" } else { "NEAR" }
+        let entry = "{\"ts\":\"" + ts + "\",\"source\":\"ouroboros_quantum\",\"event\":\"" + event_type + "\",\"domain\":\"" + domain + "\",\"type\":\"quantum_evolution\",\"phase\":\"v3\",\"value\":" + to_string(fitness) + ",\"grade\":\"" + grade + "\",\"generations\":" + to_string(gen_count) + ",\"slots\":" + to_string(SLOT_COUNT) + ",\"timestamp\":\"" + ts + "\"}"
+        append_file(_growth_bus_path, entry + "\n")
+        println("[growth_bus] recorded: " + event_type)
+    } catch e {
+        println("[growth_bus] write failed: " + to_string(e))
+    }
+}
+
+// ═══════════════════════════════════════════
+// status 명령 — 현재 superposition 상태 표시
+// ═══════════════════════════════════════════
+
+fn show_status() {
+    println("=== OUROBOROS v3 양자 중첩 상태 ===")
+    println("")
+    let pool = make_superposition()
+    let seeds = make_eval_seeds(0)
+    let measured = measure_superposition(pool, seeds)
+    println("슬롯 수: " + to_string(SLOT_COUNT))
+    println("변이 연산자: " + to_string(MUTATION_OPS) + " [" + op_name(0) + ", " + op_name(1) + ", " + op_name(2) + ", " + op_name(3) + ", " + op_name(4) + ", " + op_name(5) + "]")
+    println("결어긋남 임계: " + to_string(DECOHERENCE_THRESHOLD))
+    println("")
+    println("── 초기 중첩 (측정 전) ──")
+    let mut i = 0
+    while i < measured.len() {
+        let s = measured[i]
+        let partner = measured[s.entangled_with % measured.len()]
+        println("  |" + s.name + "> A=" + to_string(s.amplitude) + " fit=" + to_string(s.fitness) + " entangled->" + partner.name)
+        i = i + 1
+    }
+    let best_idx = find_best_idx(measured)
+    println("")
+    println("가장 높은 확률: |" + measured[best_idx].name + "> (fitness=" + to_string(measured[best_idx].fitness) + ")")
+    println("n=6 상수: [" + to_string(N6) + ", " + to_string(N6_SIGMA) + ", " + to_string(N6_PHI) + ", " + to_string(N6_TAU) + ", " + to_string(N6_J2) + ", " + to_string(N6_SOPFR) + "]")
+}
+
+// ═══════════════════════════════════════════
+// 최종 리포트
+// ═══════════════════════════════════════════
+
+fn print_final_report(result: EvolutionResult, domain: string) {
+    println("═══════════════════════════════════════════")
+    println(" OUROBOROS v3 양자 진화 — 최종 리포트")
+    println("═══════════════════════════════════════════")
+    println("도메인:       " + domain)
+    println("슬롯:         " + to_string(result.final_pool))
+    println("세대 실행:    " + to_string(result.generations_run))
+    println("수렴:         " + if result.converged { "YES (plateau)" } else { "NO (max gen)" })
+    println("최적 전략:    " + result.best_name)
+    println("최고 적합도:  " + to_string(result.best_fitness))
+    println("n=6 master:   " + to_string(N6_MASTER))
+    println("═══════════════════════════════════════════")
+}
+
+// ═══════════════════════════════════════════
+// CLI 진입점
+// ═══════════════════════════════════════════
+
+let a = args()
+let mode = if a.len() >= 3 { a[2] } else { "help" }
+
+if mode == "evolve" {
+    let domain = if a.len() >= 4 { a[3] } else { "nexus" }
+    let max_gen = if a.len() >= 5 { to_int(a[4]) } else { MAX_GENERATIONS }
+    let result = run_quantum_evolution(domain, max_gen)
+    print_final_report(result, domain)
+    emit_growth_bus("quantum_evolve_complete", domain, result.best_fitness, result.generations_run, result.converged)
+}
+
+if mode == "status" {
+    show_status()
+}
+
+if mode == "help" {
+    println("=== ouroboros_quantum.hexa — OUROBOROS v3: 양자 진화 엔진 ===")
+    println("")
+    println("개념: 전략들이 양자 중첩 상태로 공존하며 진화한다.")
+    println("      측정 시 가장 적합한 전략으로 붕괴. 얽힘된 쌍은 변이를 공유.")
+    println("")
+    println("사용법:")
+    println("  hexa ouroboros_quantum.hexa evolve [domain]         양자 진화 (기본 6세대)")
+    println("  hexa ouroboros_quantum.hexa evolve [domain] [gen]   지정 세대 진화")
+    println("  hexa ouroboros_quantum.hexa status                  현재 중첩 상태")
+    println("  hexa ouroboros_quantum.hexa help                    이 도움말")
+    println("")
+    println("파이프라인: Superposition(6) -> Mutation(6-op) -> Entanglement -> Measurement -> Decoherence Guard -> Report")
+    println("양자 전략: {amplitude, phase, shift, threshold, operator(+|*|/|-|^2|%), constant_idx, combine(geo|arith)}")
+    println("n=6: sigma=12, phi=2, tau=4, J2=24, sopfr=5, master=24")
+}
+
+// ─── 검증 ───
+
+assert abs_f(0.0 - 3.14) > 3.0
+assert clamp_f(5.0, 0.0, 1.0) == 1.0
+assert clamp_f(0.0 - 1.0, 0.0, 1.0) == 0.0
+assert max_f(3.0, 5.0) == 5.0
+assert min_f(3.0, 5.0) == 3.0
+assert op_name(OP_ADD) == "+"
+assert op_name(OP_SUB) == "-"
+assert op_name(OP_POW2) == "^2"
+assert op_name(OP_MOD) == "%"
+assert op_apply(OP_MUL, 3.0, 4.0) == 12.0
+assert op_apply(OP_SUB, 10.0, 4.0) == 6.0
+assert combine_apply(COMBINE_ARITH, 4.0, 8.0) == 6.0
+
+let test_pool = make_superposition()
+assert test_pool.len() == SLOT_COUNT
+
+let test_seeds = make_eval_seeds(0)
+assert test_seeds.len() == N6
+
+let test_measured = measure_superposition(test_pool, test_seeds)
+assert test_measured.len() == SLOT_COUNT
+assert test_measured[0].fitness >= 0.0
+
+let test_m0 = mutate_amplitude(test_pool[0], 42)
+assert test_m0.amplitude >= MIN_AMPLITUDE
+assert test_m0.amplitude <= MAX_AMPLITUDE
+
+let test_m2 = mutate_operator(test_pool[0], 42)
+assert test_m2.operator >= 0
+assert test_m2.operator < MUTATION_OPS
+
+let test_child = quantum_crossover(test_pool[0], test_pool[1], 1)
+assert test_child.shift_count == test_pool[0].shift_count
+assert test_child.constant_idx == test_pool[1].constant_idx
+assert test_child.combine_mode == test_pool[1].combine_mode
+
+let test_normed = renormalize_amplitudes(test_measured)
+assert test_normed.len() == SLOT_COUNT
+
+let test_shielded = update_decoherence_shields(test_measured)
+assert test_shielded[find_best_idx(test_measured)].decoherence_shield == 1.0
+
+proof ouroboros_quantum_invariants {
+    invariant superposition_slot_count_preserved()
+    invariant measurement_fitness_non_negative()
+    invariant amplitude_bounded()
+    invariant decoherence_shield_bounded()
+    invariant entanglement_crossover_consistent()
+    invariant mutation_operators_complete()
+}

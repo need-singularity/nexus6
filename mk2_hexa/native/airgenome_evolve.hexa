@@ -1,0 +1,838 @@
+// airgenome_evolve.hexa — AIRGENOME v3 진화적 스캔 엔진
+// 사용: hexa airgenome_evolve.hexa evolve <path>   — 진화적 패턴 스캔
+//       hexa airgenome_evolve.hexa status           — 진화 상태 출력
+//       hexa airgenome_evolve.hexa help             — 도움말
+//
+// 원리:
+//   1. 자기진화 패턴: 시그니처가 돌연변이+선택으로 자동 적응
+//   2. 적합도 함수: 실제 위협 탐지 패턴 생존, 오탐 패턴 도태
+//   3. 패턴 교차: 성공 패턴끼리 교배 → 하이브리드 탐지기 생성
+//   4. n=6 진화: 6세대, 세대당 6패턴, 6종 돌연변이 연산자
+//   5. 패턴 DNA: 6요소 시그니처 (hash, size, permissions, timestamp, content, context)
+//   6. growth_bus.jsonl 출력
+
+// ═══════════════════════════════════════════════════════════
+// §1. n=6 상수 및 경로 설정
+// ═══════════════════════════════════════════════════════════
+
+let _home = exec("printenv HOME").trim()
+let _dev = _home + "/Dev"
+let _nexus = _dev + "/nexus"
+let _shared = _nexus + "/shared"
+let _bus_path = _shared + "/growth_bus.jsonl"
+let _genome_dir = _nexus + "/airgenome"
+let _evolve_state = _genome_dir + "/evolve_state.json"
+
+// n=6 핵심 상수
+comptime const N6 = 6
+comptime const N6_PERFECT = 6
+comptime const N6_FACTORIAL = 720
+comptime const N6_DIVISOR_SUM = 12
+comptime const N6_PARTITIONS = 11
+comptime const N6_PRIME_COUNTING = 3
+
+// 진화 상수 (모두 6 기반)
+comptime const GENERATIONS = 6
+comptime const PATTERNS_PER_GEN = 6
+comptime const MUTATION_OPS = 6
+comptime const DNA_COMPONENTS = 6
+comptime const SELECTION_PRESSURE = 0.6
+comptime const MUTATION_RATE = 0.16667       // 1/6
+comptime const CROSSOVER_RATE = 0.66         // 4/6
+comptime const ELITE_KEEP = 2               // 상위 2 보존
+comptime const FITNESS_DECAY = 0.06          // 세대당 6% 감쇠
+comptime const EXTINCTION_THRESHOLD = 0.16   // 1/6 이하 도태
+
+// DNA 6요소 명칭
+comptime const DNA_NAMES = ["hash", "size", "permissions", "timestamp", "content", "context"]
+
+// 돌연변이 연산자 6종 명칭
+comptime const MUT_NAMES = ["point", "insert", "delete", "invert", "swap", "duplicate"]
+
+// ═══════════════════════════════════════════════════════════
+// §2. 수학 / 유틸리티
+// ═══════════════════════════════════════════════════════════
+
+fn abs_f(x: f64) -> f64 {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn max_f(a: f64, b: f64) -> f64 {
+    if a >= b { return a }
+    return b
+}
+
+fn min_f(a: f64, b: f64) -> f64 {
+    if a <= b { return a }
+    return b
+}
+
+fn clamp_f(x: f64, lo: f64, hi: f64) -> f64 {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+fn safe_float(s: string) -> f64 {
+    let mut v = 0.0
+    try { v = to_float(s.trim()) } catch e { v = 0.0 }
+    return v
+}
+
+fn safe_int(s: string) -> i64 {
+    let mut v: i64 = 0
+    try { v = to_int(to_float(s.trim())) } catch e {}
+    return v
+}
+
+fn timestamp_now() -> string {
+    return exec("date -u '+%Y-%m-%dT%H:%M:%SZ'").trim()
+}
+
+// 간단한 해시 (문자열 → 0.0~1.0 부동소수)
+fn str_hash_f(s: string) -> f64 {
+    let mut h: i64 = 0
+    let mut i = 0
+    while i < s.len() {
+        h = (h * 31 + s[i]) % 1000003
+        i = i + 1
+    }
+    let result = to_float(h) / 1000003.0
+    return result
+}
+
+// 의사 난수 (시드 기반, 0.0~1.0)
+fn pseudo_rand(seed: i64, step: i64) -> f64 {
+    let combined = seed * 6364136223846793005 + step * 1442695040888963407
+    let positive = abs_f(to_float(combined % 1000000))
+    return positive / 1000000.0
+}
+
+fn ensure_dir(path: string) -> bool {
+    try {
+        exec("mkdir -p " + path)
+        return true
+    } catch e {
+        return false
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// §3. 패턴 DNA 구조체 시뮬레이션
+// ═══════════════════════════════════════════════════════════
+// 패턴 DNA = 6개 f64 벡터 [hash, size, permissions, timestamp, content, context]
+// 적합도(fitness), 세대(generation), 생존(alive) 속성 추가
+
+// DNA 벡터를 문자열로 인코딩
+fn dna_encode(d0: f64, d1: f64, d2: f64, d3: f64, d4: f64, d5: f64) -> string {
+    return to_string(d0) + "," + to_string(d1) + "," + to_string(d2) + "," + to_string(d3) + "," + to_string(d4) + "," + to_string(d5)
+}
+
+// DNA 문자열에서 i번째 요소 추출
+fn dna_get(encoded: string, idx: i64) -> f64 {
+    let parts = encoded.split(",")
+    if idx >= 0 {
+        if idx < parts.len() {
+            return safe_float(parts[idx])
+        }
+    }
+    return 0.0
+}
+
+// ═══════════════════════════════════════════════════════════
+// §4. 시드 패턴 생성 — 최초 6개 패턴 (Generation 0)
+// ═══════════════════════════════════════════════════════════
+
+fn create_seed_pattern(idx: i64) -> string {
+    // 각 시드 패턴은 서로 다른 위협 영역에 특화
+    let mut d0 = pseudo_rand(idx * 6 + 0, 1)     // hash 민감도
+    let mut d1 = pseudo_rand(idx * 6 + 1, 2)     // size 민감도
+    let mut d2 = pseudo_rand(idx * 6 + 2, 3)     // permissions 민감도
+    let mut d3 = pseudo_rand(idx * 6 + 3, 4)     // timestamp 민감도
+    let mut d4 = pseudo_rand(idx * 6 + 4, 5)     // content 민감도
+    let mut d5 = pseudo_rand(idx * 6 + 5, 6)     // context 민감도
+    return dna_encode(d0, d1, d2, d3, d4, d5)
+}
+
+fn seed_pattern_label(idx: i64) -> string {
+    if idx == 0 { return "hash_specialist" }
+    if idx == 1 { return "size_anomaly" }
+    if idx == 2 { return "perm_escalation" }
+    if idx == 3 { return "time_tamper" }
+    if idx == 4 { return "content_malicious" }
+    if idx == 5 { return "context_outlier" }
+    return "unknown"
+}
+
+// ═══════════════════════════════════════════════════════════
+// §5. 적합도 함수 (Fitness Function)
+// ═══════════════════════════════════════════════════════════
+// 실제 파일 시스템을 스캔 → 패턴 매칭 → 적합도 점수 계산
+// 진짜 위협 탐지 = +점수, 오탐 = -점수
+
+fn compute_file_signal(filepath: string) -> string {
+    // 파일에서 6개 DNA 신호 추출
+    let mut h_sig = 0.0
+    let mut s_sig = 0.0
+    let mut p_sig = 0.0
+    let mut t_sig = 0.0
+    let mut c_sig = 0.0
+    let mut x_sig = 0.0
+
+    try {
+        // hash 신호: 파일 해시 앞 6자리 기반
+        let md5_raw = exec("md5 -q " + filepath + " 2>/dev/null || md5sum " + filepath + " 2>/dev/null | cut -d' ' -f1").trim()
+        h_sig = str_hash_f(md5_raw)
+
+        // size 신호: 파일 크기 정규화
+        let size_str = exec("stat -f%z " + filepath + " 2>/dev/null || stat -c%s " + filepath + " 2>/dev/null").trim()
+        let size_val = safe_float(size_str)
+        s_sig = clamp_f(size_val / 1000000.0, 0.0, 1.0)
+
+        // permissions 신호: 실행 권한/setuid 등 위험도
+        let perm_str = exec("stat -f%Lp " + filepath + " 2>/dev/null || stat -c%a " + filepath + " 2>/dev/null").trim()
+        let perm_val = safe_float(perm_str)
+        p_sig = clamp_f(perm_val / 777.0, 0.0, 1.0)
+        if perm_val > 755.0 { p_sig = p_sig * 1.6 }
+
+        // timestamp 신호: 최근 수정 여부
+        let mod_epoch = exec("stat -f%m " + filepath + " 2>/dev/null || stat -c%Y " + filepath + " 2>/dev/null").trim()
+        let now_epoch = exec("date +%s").trim()
+        let age = safe_float(now_epoch) - safe_float(mod_epoch)
+        t_sig = clamp_f(1.0 - age / 86400.0, 0.0, 1.0)  // 24시간 내 수정 = 높은 신호
+
+        // content 신호: 의심 키워드 수
+        let susp_count = exec("grep -cE '(eval|exec|chmod|curl.*\\|.*sh|base64.*decode|rm.*-rf)' " + filepath + " 2>/dev/null || echo 0").trim()
+        c_sig = clamp_f(safe_float(susp_count) / 6.0, 0.0, 1.0)
+
+        // context 신호: 파일 위치 기반 (숨김 파일, tmp 등)
+        let is_hidden = exec("echo " + filepath + " | grep -c '/\\.' 2>/dev/null || echo 0").trim()
+        let is_tmp = exec("echo " + filepath + " | grep -cE '(/tmp/|/var/tmp/)' 2>/dev/null || echo 0").trim()
+        x_sig = clamp_f((safe_float(is_hidden) + safe_float(is_tmp)) / 2.0, 0.0, 1.0)
+    } catch e {}
+
+    return dna_encode(h_sig, s_sig, p_sig, t_sig, c_sig, x_sig)
+}
+
+fn pattern_match_score(pattern_dna: string, file_signal: string) -> f64 {
+    // 6차원 내적 유사도 — 패턴과 파일 신호의 정합도
+    let mut score = 0.0
+    let mut i = 0
+    while i < N6 {
+        let pw = dna_get(pattern_dna, i)
+        let fs = dna_get(file_signal, i)
+        score = score + pw * fs
+        i = i + 1
+    }
+    return score / to_float(N6)
+}
+
+fn evaluate_fitness(pattern_dna: string, target_path: string) -> f64 {
+    // 대상 경로 내 파일 스캔 → 적합도 집계
+    let file_list_raw = exec("find " + target_path + " -type f -maxdepth 3 2>/dev/null | head -36").trim()
+    if file_list_raw.len() == 0 { return 0.0 }
+
+    let files = file_list_raw.split("\n")
+    let mut total_score = 0.0
+    let mut threat_hits = 0.0
+    let mut false_pos = 0.0
+    let mut fi = 0
+
+    while fi < files.len() {
+        if fi >= 36 { fi = files.len() }
+        if fi < files.len() {
+            let fpath = files[fi].trim()
+            if fpath.len() > 0 {
+                let signal = compute_file_signal(fpath)
+                let match_score = pattern_match_score(pattern_dna, signal)
+
+                if match_score > SELECTION_PRESSURE {
+                    // 높은 매칭 = 위협 탐지 후보
+                    let content_sig = dna_get(signal, 4)
+                    let perm_sig = dna_get(signal, 2)
+                    if content_sig > 0.1 {
+                        // 실제 의심 콘텐츠 존재 → 진양성
+                        threat_hits = threat_hits + match_score
+                    } else {
+                        if perm_sig > 0.9 {
+                            threat_hits = threat_hits + match_score * 0.6
+                        } else {
+                            // 의심 없음에 높은 매칭 → 오탐 패널티
+                            false_pos = false_pos + match_score * 0.5
+                        }
+                    }
+                }
+                total_score = total_score + match_score
+            }
+            fi = fi + 1
+        }
+    }
+
+    // 적합도 = 위협 탐지 보상 - 오탐 패널티
+    let fitness = clamp_f(threat_hits - false_pos * 1.6, 0.0, 1.0)
+    return fitness
+}
+
+// ═══════════════════════════════════════════════════════════
+// §6. 돌연변이 연산자 6종
+// ═══════════════════════════════════════════════════════════
+
+// MUT-0: 점 돌연변이 — 단일 DNA 요소 소폭 변경
+fn mutate_point(dna: string, seed: i64) -> string {
+    let target = seed % N6
+    let mut vals = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    let mut i = 0
+    while i < N6 {
+        vals[i] = dna_get(dna, i)
+        i = i + 1
+    }
+    let delta = (pseudo_rand(seed, 42) - 0.5) * 0.2
+    vals[target] = clamp_f(vals[target] + delta, 0.0, 1.0)
+    return dna_encode(vals[0], vals[1], vals[2], vals[3], vals[4], vals[5])
+}
+
+// MUT-1: 삽입 돌연변이 — 특정 요소를 강화 (값 증가)
+fn mutate_insert(dna: string, seed: i64) -> string {
+    let target = seed % N6
+    let mut vals = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    let mut i = 0
+    while i < N6 {
+        vals[i] = dna_get(dna, i)
+        i = i + 1
+    }
+    vals[target] = clamp_f(vals[target] + 0.16, 0.0, 1.0)
+    return dna_encode(vals[0], vals[1], vals[2], vals[3], vals[4], vals[5])
+}
+
+// MUT-2: 삭제 돌연변이 — 특정 요소 약화 (값 감소)
+fn mutate_delete(dna: string, seed: i64) -> string {
+    let target = seed % N6
+    let mut vals = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    let mut i = 0
+    while i < N6 {
+        vals[i] = dna_get(dna, i)
+        i = i + 1
+    }
+    vals[target] = clamp_f(vals[target] - 0.16, 0.0, 1.0)
+    return dna_encode(vals[0], vals[1], vals[2], vals[3], vals[4], vals[5])
+}
+
+// MUT-3: 역위 돌연변이 — DNA 요소 순서 반전 (부분)
+fn mutate_invert(dna: string, seed: i64) -> string {
+    let start = seed % 3
+    let mut vals = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    let mut i = 0
+    while i < N6 {
+        vals[i] = dna_get(dna, i)
+        i = i + 1
+    }
+    // start ~ start+2 범위 반전
+    let tmp = vals[start]
+    vals[start] = vals[start + 2]
+    vals[start + 2] = tmp
+    return dna_encode(vals[0], vals[1], vals[2], vals[3], vals[4], vals[5])
+}
+
+// MUT-4: 교환 돌연변이 — 두 DNA 요소 위치 교환
+fn mutate_swap(dna: string, seed: i64) -> string {
+    let a = seed % N6
+    let b = (seed + 3) % N6
+    let mut vals = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    let mut i = 0
+    while i < N6 {
+        vals[i] = dna_get(dna, i)
+        i = i + 1
+    }
+    let tmp = vals[a]
+    vals[a] = vals[b]
+    vals[b] = tmp
+    return dna_encode(vals[0], vals[1], vals[2], vals[3], vals[4], vals[5])
+}
+
+// MUT-5: 복제 돌연변이 — 최강 요소를 최약 요소에 복제
+fn mutate_duplicate(dna: string, seed: i64) -> string {
+    let mut vals = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    let mut i = 0
+    while i < N6 {
+        vals[i] = dna_get(dna, i)
+        i = i + 1
+    }
+    // 최대/최소 인덱스 탐색
+    let mut max_idx: i64 = 0
+    let mut min_idx: i64 = 0
+    let mut j = 1
+    while j < N6 {
+        if vals[j] > vals[max_idx] { max_idx = j }
+        if vals[j] < vals[min_idx] { min_idx = j }
+        j = j + 1
+    }
+    vals[min_idx] = vals[max_idx] * 0.8
+    return dna_encode(vals[0], vals[1], vals[2], vals[3], vals[4], vals[5])
+}
+
+// 돌연변이 디스패처
+fn apply_mutation(dna: string, op: i64, seed: i64) -> string {
+    if op == 0 { return mutate_point(dna, seed) }
+    if op == 1 { return mutate_insert(dna, seed) }
+    if op == 2 { return mutate_delete(dna, seed) }
+    if op == 3 { return mutate_invert(dna, seed) }
+    if op == 4 { return mutate_swap(dna, seed) }
+    if op == 5 { return mutate_duplicate(dna, seed) }
+    return dna
+}
+
+// ═══════════════════════════════════════════════════════════
+// §7. 교차 (Crossover) — 두 부모 DNA 교배
+// ═══════════════════════════════════════════════════════════
+
+fn crossover(parent_a: string, parent_b: string, cut_point: i64) -> string {
+    // cut_point 기준 앞쪽은 A, 뒤쪽은 B에서 유전
+    let mut child = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    let mut i = 0
+    while i < N6 {
+        if i < cut_point {
+            child[i] = dna_get(parent_a, i)
+        } else {
+            child[i] = dna_get(parent_b, i)
+        }
+        i = i + 1
+    }
+    return dna_encode(child[0], child[1], child[2], child[3], child[4], child[5])
+}
+
+fn crossover_uniform(parent_a: string, parent_b: string, seed: i64) -> string {
+    // 유니폼 교차: 각 요소를 독립적으로 부모 중 하나에서 선택
+    let mut child = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    let mut i = 0
+    while i < N6 {
+        let pick = pseudo_rand(seed + i, i * 7)
+        if pick > 0.5 {
+            child[i] = dna_get(parent_a, i)
+        } else {
+            child[i] = dna_get(parent_b, i)
+        }
+        i = i + 1
+    }
+    return dna_encode(child[0], child[1], child[2], child[3], child[4], child[5])
+}
+
+// ═══════════════════════════════════════════════════════════
+// §8. 선택 (Selection) — 토너먼트 선택 + 엘리트 보존
+// ═══════════════════════════════════════════════════════════
+
+// 적합도 배열에서 상위 인덱스 반환 (간단한 버블 정렬)
+fn rank_by_fitness(f0: f64, f1: f64, f2: f64, f3: f64, f4: f64, f5: f64) -> string {
+    // 인덱스를 적합도 내림차순으로 정렬하여 반환
+    let mut idx = [0, 1, 2, 3, 4, 5]
+    let mut fit = [f0, f1, f2, f3, f4, f5]
+    let mut si = 0
+    while si < 5 {
+        let mut sj = si + 1
+        while sj < 6 {
+            if fit[sj] > fit[si] {
+                let tf = fit[si]
+                fit[si] = fit[sj]
+                fit[sj] = tf
+                let ti = idx[si]
+                idx[si] = idx[sj]
+                idx[sj] = ti
+            }
+            sj = sj + 1
+        }
+        si = si + 1
+    }
+    return to_string(idx[0]) + "," + to_string(idx[1]) + "," + to_string(idx[2]) + "," + to_string(idx[3]) + "," + to_string(idx[4]) + "," + to_string(idx[5])
+}
+
+// ═══════════════════════════════════════════════════════════
+// §9. 메인 진화 루프
+// ═══════════════════════════════════════════════════════════
+
+fn run_evolution(target_path: string) -> bool {
+    println("╔══════════════════════════════════════════════════════╗")
+    println("║  AIRGENOME v3 — 진화적 스캔 엔진                    ║")
+    println("║  Generations: 6 | Patterns/Gen: 6 | Mutations: 6   ║")
+    println("╚══════════════════════════════════════════════════════╝")
+    println("")
+    println("▶ 대상 경로: " + target_path)
+    println("▶ 시작 시각: " + timestamp_now())
+    println("")
+
+    ensure_dir(_genome_dir)
+
+    // Phase 1: 시드 패턴 생성 (Generation 0)
+    println("═══ Phase 1: 시드 패턴 생성 (6개) ═══")
+    let mut pop = ["", "", "", "", "", ""]
+    let mut fitness = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    let mut labels = ["", "", "", "", "", ""]
+
+    let mut pi = 0
+    while pi < PATTERNS_PER_GEN {
+        pop[pi] = create_seed_pattern(pi)
+        labels[pi] = seed_pattern_label(pi)
+        println("  [P" + to_string(pi) + "] " + labels[pi] + " → DNA: " + pop[pi])
+        pi = pi + 1
+    }
+    println("")
+
+    // Phase 2~7: 6세대 진화 루프
+    let mut gen = 0
+    let mut best_ever_fitness = 0.0
+    let mut best_ever_dna = ""
+    let mut best_ever_label = ""
+    let mut total_mutations: i64 = 0
+    let mut total_crossovers: i64 = 0
+    let mut total_extinctions: i64 = 0
+
+    while gen < GENERATIONS {
+        println("═══ Generation " + to_string(gen + 1) + "/" + to_string(GENERATIONS) + " ═══")
+
+        // 2a. 적합도 평가
+        let mut fi2 = 0
+        while fi2 < PATTERNS_PER_GEN {
+            fitness[fi2] = evaluate_fitness(pop[fi2], target_path)
+            // 세대 감쇠 적용
+            fitness[fi2] = fitness[fi2] * (1.0 - FITNESS_DECAY * to_float(gen))
+            println("  [P" + to_string(fi2) + "] fitness=" + to_string(fitness[fi2]) + " label=" + labels[fi2])
+            fi2 = fi2 + 1
+        }
+
+        // 2b. 순위 정렬
+        let ranked = rank_by_fitness(fitness[0], fitness[1], fitness[2], fitness[3], fitness[4], fitness[5])
+        let rank_parts = ranked.split(",")
+        let idx_0 = safe_int(rank_parts[0])
+        let idx_1 = safe_int(rank_parts[1])
+        let idx_last = safe_int(rank_parts[5])
+
+        println("  ★ 최적: P" + to_string(idx_0) + " (fitness=" + to_string(fitness[idx_0]) + ")")
+        println("  ✗ 최약: P" + to_string(idx_last) + " (fitness=" + to_string(fitness[idx_last]) + ")")
+
+        // 최고 기록 갱신
+        if fitness[idx_0] > best_ever_fitness {
+            best_ever_fitness = fitness[idx_0]
+            best_ever_dna = pop[idx_0]
+            best_ever_label = labels[idx_0]
+        }
+
+        // 2c. 도태 — 임계 이하 패턴 제거
+        let mut ei = 0
+        while ei < PATTERNS_PER_GEN {
+            if fitness[ei] < EXTINCTION_THRESHOLD {
+                if ei != idx_0 {
+                    if ei != idx_1 {
+                        println("  ☠ 도태: P" + to_string(ei) + " (" + labels[ei] + ")")
+                        total_extinctions = total_extinctions + 1
+                    }
+                }
+            }
+            ei = ei + 1
+        }
+
+        // 2d. 교차 — 상위 2개 엘리트로 자식 생성
+        let mut new_pop = ["", "", "", "", "", ""]
+        let mut new_labels = ["", "", "", "", "", ""]
+
+        // 엘리트 보존 (상위 2)
+        new_pop[0] = pop[idx_0]
+        new_labels[0] = labels[idx_0]
+        new_pop[1] = pop[idx_1]
+        new_labels[1] = labels[idx_1]
+
+        // 교차로 4개 자식 생성
+        let mut ci = 2
+        while ci < PATTERNS_PER_GEN {
+            let cut = (gen + ci) % N6
+            if ci % 2 == 0 {
+                new_pop[ci] = crossover(pop[idx_0], pop[idx_1], cut)
+            } else {
+                new_pop[ci] = crossover_uniform(pop[idx_0], pop[idx_1], gen * 6 + ci)
+            }
+            new_labels[ci] = "hybrid_g" + to_string(gen + 1) + "_c" + to_string(ci)
+            total_crossovers = total_crossovers + 1
+            println("  ⚗ 교차: P" + to_string(ci) + " ← " + new_labels[ci] + " (cut=" + to_string(cut) + ")")
+            ci = ci + 1
+        }
+
+        // 2e. 돌연변이 — 엘리트 제외 나머지에 적용
+        let mut mi = 2
+        while mi < PATTERNS_PER_GEN {
+            let r = pseudo_rand(gen * 100 + mi, mi * 13)
+            if r < MUTATION_RATE {
+                let op = (gen + mi) % MUTATION_OPS
+                new_pop[mi] = apply_mutation(new_pop[mi], op, gen * 6 + mi)
+                total_mutations = total_mutations + 1
+                println("  ⚡ 돌연변이: P" + to_string(mi) + " op=" + MUT_NAMES[op])
+            }
+            mi = mi + 1
+        }
+
+        // 세대 교체
+        let mut ri = 0
+        while ri < PATTERNS_PER_GEN {
+            pop[ri] = new_pop[ri]
+            labels[ri] = new_labels[ri]
+            ri = ri + 1
+        }
+
+        println("")
+        gen = gen + 1
+    }
+
+    // Phase 8: 최종 결과
+    println("╔══════════════════════════════════════════════════════╗")
+    println("║  진화 완료 — 최종 리포트                             ║")
+    println("╚══════════════════════════════════════════════════════╝")
+    println("")
+    println("▶ 총 세대: " + to_string(GENERATIONS))
+    println("▶ 총 돌연변이: " + to_string(total_mutations))
+    println("▶ 총 교차: " + to_string(total_crossovers))
+    println("▶ 총 도태: " + to_string(total_extinctions))
+    println("▶ 최적 패턴: " + best_ever_label)
+    println("▶ 최적 적합도: " + to_string(best_ever_fitness))
+    println("▶ 최적 DNA: " + best_ever_dna)
+    println("")
+
+    // 최종 세대 전체 출력
+    println("── 최종 세대 패턴 ──")
+    let mut fp = 0
+    while fp < PATTERNS_PER_GEN {
+        let final_fit = evaluate_fitness(pop[fp], target_path)
+        let alive_str = "alive"
+        if final_fit < EXTINCTION_THRESHOLD {
+            println("  [P" + to_string(fp) + "] " + labels[fp] + " fitness=" + to_string(final_fit) + " (도태 위험)")
+        } else {
+            println("  [P" + to_string(fp) + "] " + labels[fp] + " fitness=" + to_string(final_fit) + " (" + alive_str + ")")
+        }
+        fp = fp + 1
+    }
+    println("")
+
+    // Phase 9: 진화 상태 저장
+    save_evolve_state(best_ever_dna, best_ever_fitness, best_ever_label, total_mutations, total_crossovers, total_extinctions)
+
+    // Phase 10: growth_bus 출력
+    let detail = "path=" + target_path + " best_fitness=" + to_string(best_ever_fitness) + " mutations=" + to_string(total_mutations) + " crossovers=" + to_string(total_crossovers) + " extinctions=" + to_string(total_extinctions) + " best_label=" + best_ever_label
+    emit_growth_bus("airgenome_evolve", detail, best_ever_fitness)
+    println("✓ growth_bus.jsonl 기록 완료")
+    println("✓ 진화 상태 저장 완료: " + _evolve_state)
+
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════
+// §10. 상태 저장 / 로드
+// ═══════════════════════════════════════════════════════════
+
+fn save_evolve_state(best_dna: string, best_fit: f64, best_label: string, muts: i64, crosses: i64, extincts: i64) -> bool {
+    let ts = timestamp_now()
+    let json = "{" + "\"ts\":\"" + ts + "\",\"engine\":\"airgenome_evolve_v3\",\"generations\":" + to_string(GENERATIONS) + ",\"patterns_per_gen\":" + to_string(PATTERNS_PER_GEN) + ",\"mutation_ops\":" + to_string(MUTATION_OPS) + ",\"best_dna\":\"" + best_dna + "\",\"best_fitness\":" + to_string(best_fit) + ",\"best_label\":\"" + best_label + "\",\"total_mutations\":" + to_string(muts) + ",\"total_crossovers\":" + to_string(crosses) + ",\"total_extinctions\":" + to_string(extincts) + ",\"n6\":true}"
+    try {
+        ensure_dir(_genome_dir)
+        write_file(_evolve_state, json + "\n")
+        return true
+    } catch e {
+        println("⚠ 상태 저장 실패: " + e)
+        return false
+    }
+}
+
+fn load_evolve_state() -> string {
+    try {
+        if file_exists(_evolve_state) {
+            return read_file(_evolve_state).trim()
+        }
+    } catch e {}
+    return ""
+}
+
+// ═══════════════════════════════════════════════════════════
+// §11. growth_bus 출력
+// ═══════════════════════════════════════════════════════════
+
+fn emit_growth_bus(event_type: string, detail: string, score: f64) -> bool {
+    let ts = timestamp_now()
+    let line = "{\"ts\":\"" + ts + "\",\"src\":\"airgenome_evolve\",\"type\":\"" + event_type + "\",\"detail\":\"" + detail + "\",\"score\":" + to_string(score) + ",\"n6\":true}"
+    try {
+        let mut existing = ""
+        try { existing = read_file(_bus_path) } catch e {}
+        write_file(_bus_path, existing + line + "\n")
+        return true
+    } catch e {
+        println("⚠ growth_bus 쓰기 실패: " + e)
+        return false
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// §12. status 명령 — 진화 상태 조회
+// ═══════════════════════════════════════════════════════════
+
+fn show_status() -> bool {
+    println("╔══════════════════════════════════════════════════════╗")
+    println("║  AIRGENOME v3 — 진화 상태                           ║")
+    println("╚══════════════════════════════════════════════════════╝")
+    println("")
+
+    let state = load_evolve_state()
+    if state.len() == 0 {
+        println("⚠ 진화 상태 없음 — 먼저 evolve 명령을 실행하세요")
+        println("  사용법: hexa airgenome_evolve.hexa evolve <path>")
+        return false
+    }
+
+    println("── 저장된 진화 상태 ──")
+
+    // JSON 필드 수동 파싱
+    let mut fields = ["ts", "engine", "generations", "best_fitness", "best_label", "total_mutations", "total_crossovers", "total_extinctions"]
+    let mut fi3 = 0
+    while fi3 < fields.len() {
+        let key = fields[fi3]
+        let search = "\"" + key + "\":"
+        let idx = state.find(search)
+        if idx >= 0 {
+            let after = state.substr(idx + search.len(), state.len())
+            let mut val = ""
+            if after[0] == "\"" {
+                let end = after.find("\"", 1)
+                if end > 0 {
+                    val = after.substr(1, end)
+                }
+            } else {
+                let end_comma = after.find(",")
+                let end_brace = after.find("}")
+                let mut end2 = end_comma
+                if end_brace >= 0 {
+                    if end_brace < end2 { end2 = end_brace }
+                    if end2 < 0 { end2 = end_brace }
+                }
+                if end2 > 0 { val = after.substr(0, end2) }
+            }
+            println("  " + key + ": " + val)
+        }
+        fi3 = fi3 + 1
+    }
+
+    // DNA 구성요소 표시
+    let dna_search = "\"best_dna\":\""
+    let dna_idx = state.find(dna_search)
+    if dna_idx >= 0 {
+        let dna_after = state.substr(dna_idx + dna_search.len(), state.len())
+        let dna_end = dna_after.find("\"")
+        if dna_end > 0 {
+            let dna_str = dna_after.substr(0, dna_end)
+            println("")
+            println("── 최적 패턴 DNA 분석 ──")
+            let mut di = 0
+            while di < N6 {
+                let val = dna_get(dna_str, di)
+                let bar_len = to_int(val * 20.0)
+                let mut bar = ""
+                let mut bi = 0
+                while bi < bar_len {
+                    bar = bar + "█"
+                    bi = bi + 1
+                }
+                while bi < 20 {
+                    bar = bar + "░"
+                    bi = bi + 1
+                }
+                println("  " + DNA_NAMES[di] + ": [" + bar + "] " + to_string(val))
+                di = di + 1
+            }
+        }
+    }
+
+    println("")
+    emit_growth_bus("evolve_status", "status_check", 1.0)
+    println("✓ growth_bus.jsonl 기록 완료")
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════
+// §13. 도움말
+// ═══════════════════════════════════════════════════════════
+
+fn show_help() -> bool {
+    println("╔══════════════════════════════════════════════════════╗")
+    println("║  AIRGENOME v3 — 진화적 스캔 엔진 (도움말)           ║")
+    println("╚══════════════════════════════════════════════════════╝")
+    println("")
+    println("사용법:")
+    println("  hexa airgenome_evolve.hexa evolve <path>   진화적 패턴 스캔 실행")
+    println("  hexa airgenome_evolve.hexa status           진화 상태 조회")
+    println("  hexa airgenome_evolve.hexa help             이 도움말 표시")
+    println("")
+    println("원리:")
+    println("  1. 시드 패턴 6개 생성 (각 위협 영역 특화)")
+    println("  2. 6세대 진화 루프:")
+    println("     a. 적합도 평가 (실제 파일 스캔)")
+    println("     b. 선택 (토너먼트 + 엘리트 보존)")
+    println("     c. 교차 (1점/유니폼)")
+    println("     d. 돌연변이 (6종 연산자)")
+    println("     e. 도태 (임계 이하 제거)")
+    println("  3. 최적 패턴 DNA 저장")
+    println("")
+    println("패턴 DNA 6요소:")
+    let mut hi = 0
+    while hi < N6 {
+        println("  [" + to_string(hi) + "] " + DNA_NAMES[hi])
+        hi = hi + 1
+    }
+    println("")
+    println("돌연변이 연산자 6종:")
+    let mut mi2 = 0
+    while mi2 < MUTATION_OPS {
+        println("  [" + to_string(mi2) + "] " + MUT_NAMES[mi2])
+        mi2 = mi2 + 1
+    }
+    println("")
+    println("n=6 상수: 6세대 × 6패턴 × 6돌연변이 = 216 조합 공간")
+    println("적합도: 진양성 +score, 오탐 -1.6×score, 도태 임계 1/6")
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════
+// §14. CLI 엔트리포인트
+// ═══════════════════════════════════════════════════════════
+
+fn main() -> i64 {
+    let argv = args()
+    let argc = argv.len()
+
+    if argc < 3 {
+        show_help()
+        return 0
+    }
+
+    let cmd = argv[2]
+
+    if cmd == "evolve" {
+        if argc < 4 {
+            println("⚠ 대상 경로를 지정하세요")
+            println("  사용법: hexa airgenome_evolve.hexa evolve <path>")
+            return 1
+        }
+        let target = argv[3]
+        let ok = run_evolution(target)
+        if ok { return 0 }
+        return 1
+    }
+
+    if cmd == "status" {
+        let ok = show_status()
+        if ok { return 0 }
+        return 1
+    }
+
+    if cmd == "help" {
+        show_help()
+        return 0
+    }
+
+    println("⚠ 알 수 없는 명령: " + cmd)
+    show_help()
+    return 1
+}
+
+main()
