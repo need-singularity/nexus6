@@ -1097,8 +1097,8 @@ git commit -m "test(alien_index): end-to-end flow (promotion, monotonic d, ratio
 #!/usr/bin/env python3
 """MATH_ATLAS grade → alien_index (d=0, r) 일회성 마이그레이션.
 
-Input:  shared/math_atlas.json
-Output: shared/alien_index_records.jsonl  (한 가설당 한 줄)
+Input:  shared/discovery/math_atlas.json
+Output: shared/alien/alien_index_records.jsonl  (한 가설당 한 줄)
 
 사용법:
   python3 tools/migrate_grades_to_alien_index.py
@@ -1130,8 +1130,8 @@ def rank_from_grade(g: str):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--atlas", default="shared/math_atlas.json")
-    ap.add_argument("--out", default="shared/alien_index_records.jsonl")
+    ap.add_argument("--atlas", default="shared/discovery/math_atlas.json")
+    ap.add_argument("--out", default="shared/alien/alien_index_records.jsonl")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -1193,16 +1193,16 @@ Expected: 매핑 통계 출력 (Mapped ~660+, Skipped ~27, r별 분포).
 - [ ] **Step 3: 실제 파일 생성**
 
 Run: `python3 tools/migrate_grades_to_alien_index.py`
-Expected: `Wrote N records to shared/alien_index_records.jsonl`.
+Expected: `Wrote N records to shared/alien/alien_index_records.jsonl`.
 
 - [ ] **Step 4: 생성물 검증**
 
-Run: `head -3 shared/alien_index_records.jsonl && wc -l shared/alien_index_records.jsonl`
+Run: `head -3 shared/alien/alien_index_records.jsonl && wc -l shared/alien/alien_index_records.jsonl`
 Expected: JSON 레코드 3개 표시 + 총 라인 수.
 
 - [ ] **Step 5: CLI로 분포 확인**
 
-Run: `NEXUS_DISCOVERY_LOG=shared/alien_index_records.jsonl cargo run --bin nexus -- alien-index --distribution`
+Run: `NEXUS_DISCOVERY_LOG=shared/alien/alien_index_records.jsonl cargo run --bin nexus -- alien-index --distribution`
 Expected: 분포 출력 (총 레코드 수 일치).
 
 > ⚠️ 현재 loader가 `alien_index` 필드를 가진 discovery_log 형식을 기대하지만, migration 출력은 레코드가 **곧 그 필드 내용**이므로 load 경로를 하나 더 맞춰야 함.
@@ -1237,16 +1237,16 @@ fn load_all_records() -> Vec<AlienIndexRecord> {
 Run: `cargo build --bin nexus 2>&1 | tail -10`
 Expected: 빌드 성공.
 
-Run: `NEXUS_DISCOVERY_LOG=shared/alien_index_records.jsonl cargo run --bin nexus -- alien-index --distribution`
+Run: `NEXUS_DISCOVERY_LOG=shared/alien/alien_index_records.jsonl cargo run --bin nexus -- alien-index --distribution`
 Expected: Total records > 0, (0, r) 버킷들.
 
-Run: `NEXUS_DISCOVERY_LOG=shared/alien_index_records.jsonl cargo run --bin nexus -- alien-index --leaderboard --limit 10`
+Run: `NEXUS_DISCOVERY_LOG=shared/alien/alien_index_records.jsonl cargo run --bin nexus -- alien-index --leaderboard --limit 10`
 Expected: r=9 항목들 상위 출력.
 
 - [ ] **Step 7: 커밋**
 
 ```bash
-git add tools/migrate_grades_to_alien_index.py src/cli/alien_index_cmd.rs shared/alien_index_records.jsonl
+git add tools/migrate_grades_to_alien_index.py src/cli/alien_index_cmd.rs shared/alien/alien_index_records.jsonl
 git commit -m "feat(alien_index): migration script (grade→r) + loader supports bare records"
 ```
 
@@ -1379,7 +1379,7 @@ fn distribution() -> Result<(), String> {
     for ((d, r), n) in &hist {
         println!("  ({}, {:>2})  {}", d, r, n);
     }
-    // Side-effect: write to shared/alien_index_distribution.json if env set or path exists
+    // Side-effect: write to shared/alien/alien_index_distribution.json if env set or path exists
     let out = crate::alien_index::record::distribution_json_path();
     if let Err(e) = write_distribution_json(&records, &out) {
         eprintln!("warn: failed to write {}: {}", out.display(), e);
@@ -1433,7 +1433,7 @@ Expected: 2 PASS.
 
 Run:
 ```bash
-NEXUS_DISCOVERY_LOG=shared/alien_index_records.jsonl \
+NEXUS_DISCOVERY_LOG=shared/alien/alien_index_records.jsonl \
 NEXUS_AI_DISTRIBUTION=/tmp/ai_dist.json \
 NEXUS_AI_FRONTIER=/tmp/ai_frontier.md \
 cargo run --bin nexus -- alien-index --distribution
@@ -1473,7 +1473,7 @@ Expected: 빌드 성공.
 
 Run:
 ```bash
-NEXUS_DISCOVERY_LOG=shared/alien_index_records.jsonl \
+NEXUS_DISCOVERY_LOG=shared/alien/alien_index_records.jsonl \
 ./target/release/nexus alien-index --distribution
 ```
 
@@ -1481,7 +1481,7 @@ Expected: Total records == 마이그레이션 수, ρ 출력, 버킷 분포.
 
 Run:
 ```bash
-NEXUS_DISCOVERY_LOG=shared/alien_index_records.jsonl \
+NEXUS_DISCOVERY_LOG=shared/alien/alien_index_records.jsonl \
 ./target/release/nexus alien-index --leaderboard --limit 5
 ```
 

@@ -175,8 +175,8 @@ nexus.alien_index_distribution()  # dict: {(0,5): 239, (0,7): 131, ...}
 
 ## 9. 관측 가능성 (Observability)
 
-- `shared/alien_index_distribution.json` — (d, r) 히스토그램 매 동기화마다 갱신
-- `shared/alien_index_frontier.md` — 현재 최고 d 대상들의 리더보드
+- `shared/alien/alien_index_distribution.json` — (d, r) 히스토그램 매 동기화마다 갱신
+- `shared/alien/alien_index_frontier.md` — 현재 최고 d 대상들의 리더보드
 - Watcher: `discovery_log.jsonl` 신규 엔트리 감지 시 AI 자동 재계산
 
 ### 메타 부동점 추적

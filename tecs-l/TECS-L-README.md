@@ -382,10 +382,10 @@ Details: [Pure mathematics](math/) | [Golden Zone model](docs/golden-zone/) | [V
 > | Pure Math Proofs | 28 |
 > | Confirmed | 298 |
 >
-> **[Interactive Atlas](https://need-singularity.github.io/TECS-L/atlas/)** | **[Full Listing](.shared/MATH_ATLAS.md)** | **[SQLite](.shared/math_atlas.db)** | Rebuild: `python3 .shared/scan_math_atlas.py --save --summary`
+> **[Interactive Atlas](https://need-singularity.github.io/TECS-L/atlas/)** | **[Full Listing](.shared/n6/MATH_ATLAS.md)** | **[SQLite](.shared/n6/math_atlas.db)** | Rebuild: `python3 .shared/n6/scan_math_atlas.py --save --summary`
 
 > **438 frontier hypotheses** verified across 4 rounds + 28 super-discoveries.
-> **[Full Discovery Tree](.shared/atlas_tree.txt)** | **[Interactive Atlas](https://need-singularity.github.io/TECS-L/atlas/)**
+> **[Full Discovery Tree](.shared/n6/atlas_tree.txt)** | **[Interactive Atlas](https://need-singularity.github.io/TECS-L/atlas/)**
 >
 > | Tier | Count | Description |
 > |------|-------|-------------|
@@ -930,12 +930,12 @@ Details: [docs/eeg-experiment.md](docs/eeg-experiment.md)
 
 **Cross-Repo Unified Explorer** ⭐️⭐️⭐️
 ```
-/ralph-loop:ralph-loop Unified cross-repo research agent. SCOPE: all 7 repos -- TECS-L math engine and anima consciousness agent and SEDI physics verification and golden-moe MoE routing and conscious-lm language model and energy-efficiency AI optimization and ph-training topology training. STRATEGY: 1-read .shared/math_atlas.json to get full atlas of 1700 hypotheses and 300 constant maps across all repos. 2-identify the strongest CROSS-REPO connection opportunity -- a proven result in one repo that predicts an untested outcome in another. 3-design experiment that bridges the two repos. 4-run verification with python3 in background. 5-grade per CLAUDE.md rules with Texas sharpshooter and ad-hoc check and n=28 generalization. 6-if bridge confirmed then create hypothesis doc in BOTH repos and update atlas. 7-if not then record white circle. 8-update README progress trackers in affected repos. 9-git add commit push in each affected repo. PRIORITY: math proofs to physics predictions -- consciousness metrics to LM architecture -- energy techniques to golden-moe routing -- anima Phi to conscious-lm tension. Each iteration must touch at least 2 repos. Rebuild atlas after discoveries. Do not stop until complete.
+/ralph-loop:ralph-loop Unified cross-repo research agent. SCOPE: all 7 repos -- TECS-L math engine and anima consciousness agent and SEDI physics verification and golden-moe MoE routing and conscious-lm language model and energy-efficiency AI optimization and ph-training topology training. STRATEGY: 1-read .shared/discovery/math_atlas.json to get full atlas of 1700 hypotheses and 300 constant maps across all repos. 2-identify the strongest CROSS-REPO connection opportunity -- a proven result in one repo that predicts an untested outcome in another. 3-design experiment that bridges the two repos. 4-run verification with python3 in background. 5-grade per CLAUDE.md rules with Texas sharpshooter and ad-hoc check and n=28 generalization. 6-if bridge confirmed then create hypothesis doc in BOTH repos and update atlas. 7-if not then record white circle. 8-update README progress trackers in affected repos. 9-git add commit push in each affected repo. PRIORITY: math proofs to physics predictions -- consciousness metrics to LM architecture -- energy techniques to golden-moe routing -- anima Phi to conscious-lm tension. Each iteration must touch at least 2 repos. Rebuild atlas after discoveries. Do not stop until complete.
 ```
 
 **Proof Upgrade — Promote to Pure Math** 🟦
 ```
-/ralph-loop:ralph-loop Proof upgrade agent. GOAL: promote hypotheses from empirical grades to pure math blue square grade. Read .shared/math_atlas.json and filter all hypotheses graded green square or orange square or orange star. For each candidate: 1-read the hypothesis doc and identify the core claim. 2-attempt rigorous mathematical proof using only number theory and analysis and algebra -- no simulation or numerical evidence. 3-if proof succeeds then verify for all n up to 10000 with python3 and check n=28 and n=496 generalization. 4-if proof is complete and general then upgrade grade to blue square and record proof in hypothesis doc. 5-if proof attempt fails then record what was tried and move to next candidate. PRIORITY: start with orange star structural results that have Texas p less than 0.01 -- these are most likely to be provable. Then green square confirmed results. Each iteration must attempt at least 3 proof upgrades. Update README grade counts. Git add commit push.
+/ralph-loop:ralph-loop Proof upgrade agent. GOAL: promote hypotheses from empirical grades to pure math blue square grade. Read .shared/discovery/math_atlas.json and filter all hypotheses graded green square or orange square or orange star. For each candidate: 1-read the hypothesis doc and identify the core claim. 2-attempt rigorous mathematical proof using only number theory and analysis and algebra -- no simulation or numerical evidence. 3-if proof succeeds then verify for all n up to 10000 with python3 and check n=28 and n=496 generalization. 4-if proof is complete and general then upgrade grade to blue square and record proof in hypothesis doc. 5-if proof attempt fails then record what was tried and move to next candidate. PRIORITY: start with orange star structural results that have Texas p less than 0.01 -- these are most likely to be provable. Then green square confirmed results. Each iteration must attempt at least 3 proof upgrades. Update README grade counts. Git add commit push.
 ```
 
 **Consciousness Engine Connection Explorer** ⭐️
@@ -1014,7 +1014,7 @@ python3 dfs_engine.py --depth 2 --threshold 0.001
 
 ## Tools & Atlas
 
-> **232 tools** across 7 repos -- [Full Calculator Registry](.shared/calculators.json) | **[Math Atlas](https://need-singularity.github.io/TECS-L/atlas/)** (1,700 hypotheses + 300 constant maps)
+> **232 tools** across 7 repos -- [Full Calculator Registry](.shared/config/calculators.json) | **[Math Atlas](https://need-singularity.github.io/TECS-L/atlas/)** (1,700 hypotheses + 300 constant maps)
 
 <!-- SHARED:CALCULATORS:START -->
 | Repo | Tools | Categories |

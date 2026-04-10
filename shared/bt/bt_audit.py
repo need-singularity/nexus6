@@ -88,7 +88,7 @@ BT_FILE = os.path.expanduser(
     '~/Dev/n6-architecture/docs/breakthrough-theorems.md'
 )
 RESULT_FILE = os.path.expanduser(
-    '~/Dev/nexus/shared/bt_audit_result.json'
+    '~/Dev/nexus/shared/bt/bt_audit_result.json'
 )
 
 

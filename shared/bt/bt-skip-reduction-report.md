@@ -1,7 +1,7 @@
 # BT SKIP 해소 보고 (TODO #10)
 
 날짜: 2026-04-08
-대상: `shared/bt_audit.py` / `shared/bt_audit_result.json`
+대상: `shared/bt/bt_audit.py` / `shared/bt/bt_audit_result.json`
 원본: `~/Dev/n6-architecture/docs/breakthrough-theorems.md`
 
 ## 결과 요약
@@ -67,12 +67,12 @@ expression 셀이 사실 숫자값(단위 포함)일 때도 그 값으로 평가
 
 ## 주의
 
-- mismatch 분류 결과 파일(`shared/bt-mismatch-classification.md`, `shared/bt-consistency-report.md`)은 수정하지 않음.
+- mismatch 분류 결과 파일(`shared/bt/bt-mismatch-classification.md`, `shared/bt/bt-consistency-report.md`)은 수정하지 않음.
 - `bt_audit_result.json`은 갱신되었으며 `mismatches` 리스트는 209건으로 늘었으나(추출률 증가의 부산물) 분류 작업 자체는 A3 Agent 영역.
 - 신규 mismatch는 대부분 `extract_evidence_tables` 컬럼 정렬 수정으로 새로 들어온 비교 가능 행에서 발생. 일부는 `~128K`(약식 표기) → `129280`(정확값) 같은 정상 mismatch이며, 일부는 단위 mismatch (예: `19` vs `6 segments`)이므로 분류 단계에서 처리되어야 함.
 
 ## 파일
 
-- `/Users/ghost/Dev/nexus/shared/bt_audit.py` (수정)
-- `/Users/ghost/Dev/nexus/shared/bt_audit_result.json` (갱신)
-- `/Users/ghost/Dev/nexus/shared/bt-skip-reduction-report.md` (이 보고서)
+- `/Users/ghost/Dev/nexus/shared/bt/bt_audit.py` (수정)
+- `/Users/ghost/Dev/nexus/shared/bt/bt_audit_result.json` (갱신)
+- `/Users/ghost/Dev/nexus/shared/bt/bt-skip-reduction-report.md` (이 보고서)

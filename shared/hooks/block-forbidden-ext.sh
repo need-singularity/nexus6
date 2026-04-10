@@ -25,7 +25,7 @@ fi
 
 # 상수 데이터 → nexus shared/
 if [[ "$FILE" =~ constant ]] && [[ "$FILE" =~ \.(json|jsonl|toml|csv)$ ]] && [[ "$FILE" != *"$NEXUS/shared/"* ]]; then
-  echo "BLOCKED: $FILE — 상수 데이터는 nexus에 중앙 관리. ${NEXUS}/shared/n6_constants.jsonl 또는 n6_physics.jsonl" >&2
+  echo "BLOCKED: $FILE — 상수 데이터는 nexus에 중앙 관리. ${NEXUS}/shared/n6/n6_constants.jsonl 또는 n6_physics.jsonl" >&2
   exit 2
 fi
 

@@ -2,7 +2,7 @@
 
 > 이 파일은 TECS-L family 전체 리포에서 공유하는 계산기 개발 규칙입니다.
 > 모든 리포의 CLAUDE.md에서 이 파일을 참조하세요.
-> 소스 경로: `~/Dev/TECS-L/.shared/CALCULATOR_RULES.md`
+> 소스 경로: `~/Dev/TECS-L/.shared/config/CALCULATOR_RULES.md`
 
 ---
 
@@ -67,7 +67,7 @@ HEXA 프로젝트 구조 (리포별):
 ```bash
   cd ~/Dev/TECS-L
   python3 .shared/scan-calculators.py          # 스캔 (JSON 출력)
-  bash .shared/sync-calculators.sh             # README 동기화
+  bash .shared/scripts/sync-calculators.sh             # README 동기화
 ```
 
 지원 파일 형식:

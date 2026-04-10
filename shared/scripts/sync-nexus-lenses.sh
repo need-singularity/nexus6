@@ -2,7 +2,7 @@
 # sync-nexus-lenses.sh — NEXUS-6 렌즈 수 동기화
 # Source of truth: nexus telescope_test.rs assertions
 #
-# Usage: cd ~/Dev/TECS-L && bash .shared/sync-nexus-lenses.sh
+# Usage: cd ~/Dev/TECS-L && bash .shared/scripts/sync-nexus-lenses.sh
 # Run from TECS-L repo root (or anywhere — paths are absolute)
 
 set -e
@@ -235,7 +235,7 @@ echo ""
 if [ "$CHANGED" = "1" ]; then
   echo "=== Committing changes ==="
   cd "$BASE"
-  git add .shared/CLAUDE.md .shared/installed_tools.json .shared/calculators.json 2>/dev/null || true
+  git add .shared/CLAUDE.md .shared/config/installed_tools.json .shared/config/calculators.json 2>/dev/null || true
   if ! git diff --cached --quiet 2>/dev/null; then
     git commit -m "sync: NEXUS-6 lens count → ${TOTAL} (auto-sync)"
     echo "  Committed! (no push — run 'git push' manually)"
@@ -254,4 +254,4 @@ echo "  Extended: ${EXTENDED:-?}"
 echo ""
 echo "Next steps:"
 echo "  1. cd ~/Dev/TECS-L && git push  (if committed)"
-echo "  2. bash .shared/sync-claude-rules.sh  (propagate to all repos)"
+echo "  2. bash .shared/scripts/sync-claude-rules.sh  (propagate to all repos)"

@@ -26,7 +26,7 @@
 
 ```bash
 # 전체 동기화
-cd ~/Dev/TECS-L && bash .shared/sync-calculators.sh
+cd ~/Dev/TECS-L && bash .shared/scripts/sync-calculators.sh
 
 # DSE 역동기화 (n6→TECS-L)
 cp ~/Dev/n6-architecture/tools/universal-dse/domains/*.toml .shared/dse/domains/

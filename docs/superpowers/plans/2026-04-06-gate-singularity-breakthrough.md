@@ -6,7 +6,7 @@
 
 **Architecture:** hexa-lang 네이티브 구현 (air_rs 완전 폐기). mk2 엔진(cycle, gate, classify, absorb, effects) 전부 활용. 3접근이 각각 독립 실행 후, 발견을 상호 교차 주입하는 메타 구조.
 
-**Tech Stack:** hexa-lang, nexus CLI (Rust), mk2_hexa/native/, shared/discovery_log.jsonl
+**Tech Stack:** hexa-lang, nexus CLI (Rust), mk2_hexa/native/, shared/discovery/discovery_log.jsonl
 
 ---
 

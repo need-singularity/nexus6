@@ -14,7 +14,7 @@ fi
 GROWTH_DIR="${PROJECT_ROOT}/.growth"
 GROWTH_STATE="${GROWTH_DIR}/growth_state.json"
 GROWTH_LOG="${GROWTH_DIR}/growth.log"
-GROWTH_BUS="$HOME/Dev/nexus/shared/growth_bus.jsonl"
+GROWTH_BUS="$HOME/Dev/nexus/shared/discovery/growth_bus.jsonl"
 LOCKFILE="/tmp/n6-growth-${GROWTH_NAME}.lock"
 
 # ── 루프 순서 정의 (shared/loop/{project}.json) ──
@@ -491,7 +491,7 @@ h1{color:#0ff}h2{color:#ff0}.ts{color:#888}</style></head>
 <p class="ts">Updated: ${ts} | Project: ${GROWTH_NAME} | Cycle: ${cycle}</p>
 <h2>Daemon Status</h2><pre>$(cat "$status_file" 2>/dev/null || echo "No daemon running")</pre>
 <h2>Last Loop Report</h2><pre>$(cat "$loop_report" 2>/dev/null || echo "No report yet")</pre>
-<h2>Growth Bus (last 10)</h2><pre>$(tail -10 "$HOME/Dev/nexus/shared/growth_bus.jsonl" 2>/dev/null || echo "Empty")</pre>
+<h2>Growth Bus (last 10)</h2><pre>$(tail -10 "$HOME/Dev/nexus/shared/discovery/growth_bus.jsonl" 2>/dev/null || echo "Empty")</pre>
 </body></html>
 DASH
 }

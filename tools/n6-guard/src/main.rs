@@ -402,7 +402,7 @@ fn get_proc_cwd(pid: u32) -> Option<String> {
 fn load_managed_roots(dev_dir: &str) -> Vec<String> {
     let dev = expand_tilde(dev_dir);
     let dev = dev.trim_end_matches('/').to_string();
-    let path = expand_tilde("~/Dev/nexus/shared/projects.json");
+    let path = expand_tilde("~/Dev/nexus/shared/config/projects.json");
     let text = match fs::read_to_string(&path) {
         Ok(t) => t,
         Err(_) => return Vec::new(),
@@ -1061,7 +1061,7 @@ impl TaskRunner {
             }
         }
         // discovery_log.jsonl에 최근 60초 내 새 발견이 있으면 burst
-        let sig_path = format!("{}/Dev/nexus/shared/discovery_log.jsonl", home());
+        let sig_path = format!("{}/Dev/nexus/shared/discovery/discovery_log.jsonl", home());
         if let Ok(meta) = fs::metadata(&sig_path) {
             if let Ok(modified) = meta.modified() {
                 if let Ok(elapsed) = SystemTime::now().duration_since(modified) {
@@ -1259,7 +1259,7 @@ fn guard_loop(cfg: &GuardConfig) {
     let _ = ctrlc::set_handler(move || { shutdown_clone.store(true, Ordering::SeqCst); });
 
     let managed_roots = load_managed_roots(&cfg.global.dev_dir);
-    log_action(&format!("build_queue allowlist: {} project root(s) from nexus/shared/projects.json", managed_roots.len()));
+    log_action(&format!("build_queue allowlist: {} project root(s) from nexus/shared/config/projects.json", managed_roots.len()));
     for r in &managed_roots { log_action(&format!("  allow: {}", r)); }
 
     let mut stopped_pids: HashMap<u32, Instant> = HashMap::new();

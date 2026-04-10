@@ -203,7 +203,7 @@ print(f'Live graph: {len(nodes)} nodes, {len(edges)} edges')
 
 common_growth_timeline() {
     log_info "📈 Growth timeline"
-    local bus_file="$HOME/Dev/nexus/shared/growth_bus.jsonl"
+    local bus_file="$HOME/Dev/nexus/shared/discovery/growth_bus.jsonl"
     local html_file="$HOME/.nexus/timeline.html"
     [ ! -f "$bus_file" ] && return
 

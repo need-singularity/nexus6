@@ -6,7 +6,7 @@
 # DSE is already shared automatically. This script now only
 # syncs to repos with their OWN dse copies (e.g. n6-architecture/tools/).
 #
-# Usage: bash .shared/sync-dse.sh
+# Usage: bash .shared/scripts/sync-dse.sh
 
 set -e
 

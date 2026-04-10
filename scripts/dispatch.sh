@@ -64,7 +64,7 @@ dispatch_one() {
     fi
 
     # 결과 요약을 growth_bus에 기록
-    local bus="$HOME/Dev/nexus/shared/growth_bus.jsonl"
+    local bus="$HOME/Dev/nexus/shared/discovery/growth_bus.jsonl"
     printf '{"ts":"%s","repo":"%s","phase":"dispatch","status":"%s","detail":"%s"}\n' \
         "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$name" \
         "$([ $rc -eq 0 ] && echo ok || echo fail)" \

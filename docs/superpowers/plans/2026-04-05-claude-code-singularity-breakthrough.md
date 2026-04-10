@@ -29,7 +29,7 @@
 - `shared/breakthroughs/.gitkeep`
 
 **수정**:
-- `shared/projects.json` — `claude_efficiency` 엔트리 추가 (C2)
+- `shared/config/projects.json` — `claude_efficiency` 엔트리 추가 (C2)
 
 ---
 
@@ -606,13 +606,13 @@ git commit -m "feat(miner): add CLI entry point with session glob + output write
 ### Task 8: projects.json에 claude_efficiency 엔트리 추가
 
 **Files:**
-- Modify: `shared/projects.json`
+- Modify: `shared/config/projects.json`
 
 - [ ] **Step 1: 엔트리 추가**
 
 기존 `projects` 딕셔너리에 `claude_efficiency` 키를 추가 (Edit 도구 사용). 기존 엔트리 예시(TECS-L)를 참고해 구조 맞춤:
 
-`shared/projects.json`의 `"projects": { ... }` 블록 끝에 추가할 내용:
+`shared/config/projects.json`의 `"projects": { ... }` 블록 끝에 추가할 내용:
 ```json
     "claude_efficiency": {
       "root": "nexus",
@@ -630,7 +630,7 @@ git commit -m "feat(miner): add CLI entry point with session glob + output write
 - [ ] **Step 2: JSON 유효성 확인**
 
 ```bash
-python3 -c "import json; d=json.load(open('shared/projects.json')); print('OK:', 'claude_efficiency' in d['projects'])"
+python3 -c "import json; d=json.load(open('shared/config/projects.json')); print('OK:', 'claude_efficiency' in d['projects'])"
 ```
 Expected: `OK: True`
 
@@ -643,7 +643,7 @@ launchctl kickstart -k "gui/$(id -u)/com.nexus.watch-atlas" 2>/dev/null || echo 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add shared/projects.json
+git add shared/config/projects.json
 git commit -m "feat(projects): register claude_efficiency domain for atlas scan"
 ```
 
@@ -949,7 +949,7 @@ def _cli():
     ap = argparse.ArgumentParser(description="Cycle breakthrough interpreter")
     ap.add_argument("breakthrough_json", help="path to cycle output JSON")
     ap.add_argument(
-        "--discovery", default="shared/discovery_log.jsonl",
+        "--discovery", default="shared/discovery/discovery_log.jsonl",
         help="discovery_log.jsonl path",
     )
     ap.add_argument(
@@ -1035,11 +1035,11 @@ echo "[1/4] mining Claude Code sessions..."
 python3 tools/cc_session_miner.py --sessions 20
 
 echo "[2/4] syncing math atlas..."
-if [ -x "shared/sync-math-atlas.sh" ]; then
-  bash shared/sync-math-atlas.sh
+if [ -x "shared/scripts/sync-math-atlas.sh" ]; then
+  bash shared/scripts/sync-math-atlas.sh
   sleep 2
 else
-  echo "WARN: shared/sync-math-atlas.sh not found or not executable, skipping" >&2
+  echo "WARN: shared/scripts/sync-math-atlas.sh not found or not executable, skipping" >&2
 fi
 
 echo "[3/4] running nexus auto (claude_efficiency) with 30min timeout..."

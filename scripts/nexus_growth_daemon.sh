@@ -373,7 +373,7 @@ grow_red_team() {
 
 grow_atlas() {
     log_info "  Action: Expand math atlas"
-    $CLAUDE_CLI -p "In /Users/ghost/Dev/n6-architecture/, scan docs/ for n=6 constants that aren't in docs/atlas-constants.md yet. Add newly discovered constants with their BT references and domain tags. Then run: /usr/bin/python3 .shared/scan_math_atlas.py --save --summary" \
+    $CLAUDE_CLI -p "In /Users/ghost/Dev/n6-architecture/, scan docs/ for n=6 constants that aren't in docs/atlas-constants.md yet. Add newly discovered constants with their BT references and domain tags. Then run: /usr/bin/python3 .shared/n6/scan_math_atlas.py --save --summary" \
         --allowedTools Edit,Write,Read,Bash,Grep,Glob 2>/dev/null || return 1
 }
 
@@ -552,8 +552,8 @@ for cycle in $(seq 1 "$MAX_CYCLES"); do
     bash "$SCRIPT_DIR/growth_bridge.sh" full 2>/dev/null || log_warn "Bridge sync failed (continuing)"
     /usr/bin/python3 "$NEXUS_ROOT/nexus-bridge/bridge.py" sync 2>/dev/null || log_warn "Nexus-bridge sync failed (continuing)"
     # Sync shared resources if available
-    if [[ -f "$NEXUS_ROOT/.shared/sync-nexus-lenses.sh" ]]; then
-        bash "$NEXUS_ROOT/.shared/sync-nexus-lenses.sh" 2>/dev/null || true
+    if [[ -f "$NEXUS_ROOT/.shared/scripts/sync-nexus-lenses.sh" ]]; then
+        bash "$NEXUS_ROOT/.shared/scripts/sync-nexus-lenses.sh" 2>/dev/null || true
     fi
     log_info "  Sync complete."
 

@@ -3,7 +3,7 @@
 # private 프로젝트는 자동 제외
 set -euo pipefail
 
-JSON="${1:-$(dirname "$0")/../shared/nexus-projects.json}"
+JSON="${1:-$(dirname "$0")/../shared/config/nexus-projects.json}"
 
 /usr/bin/python3 -c "
 import json, sys

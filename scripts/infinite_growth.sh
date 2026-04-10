@@ -17,24 +17,24 @@ domain_phases() {
     # 1. 발견 로그 스캔
     log_info "Phase: 발견 로그 스캔"
     local disc_count=0
-    if [ -f "$PROJECT_ROOT/shared/discovery_log.jsonl" ]; then
-        disc_count=$(wc -l < "$PROJECT_ROOT/shared/discovery_log.jsonl" | tr -d ' ')
+    if [ -f "$PROJECT_ROOT/shared/discovery/discovery_log.jsonl" ]; then
+        disc_count=$(wc -l < "$PROJECT_ROOT/shared/discovery/discovery_log.jsonl" | tr -d ' ')
     fi
     write_growth_bus "discovery_scan" "ok" "discoveries=$disc_count"
 
     # 2. 검증 상수 체크
     log_info "Phase: 검증 상수 체크"
     local verified=0
-    if [ -f "$PROJECT_ROOT/shared/verified_constants.jsonl" ]; then
-        verified=$(wc -l < "$PROJECT_ROOT/shared/verified_constants.jsonl" | tr -d ' ')
+    if [ -f "$PROJECT_ROOT/shared/discovery/verified_constants.jsonl" ]; then
+        verified=$(wc -l < "$PROJECT_ROOT/shared/discovery/verified_constants.jsonl" | tr -d ' ')
     fi
     write_growth_bus "verified_check" "ok" "constants=$verified"
 
     # 3. 렌즈 카운트
     log_info "Phase: 렌즈 카운트"
     local lenses=0
-    if [ -f "$PROJECT_ROOT/shared/discovery_graph.json" ]; then
-        lenses=$(/usr/bin/python3 -c "import json; print(len(json.load(open('$PROJECT_ROOT/shared/discovery_graph.json')).get('nodes',[])))" 2>/dev/null || echo 0)
+    if [ -f "$PROJECT_ROOT/shared/discovery/discovery_graph.json" ]; then
+        lenses=$(/usr/bin/python3 -c "import json; print(len(json.load(open('$PROJECT_ROOT/shared/discovery/discovery_graph.json')).get('nodes',[])))" 2>/dev/null || echo 0)
     fi
     write_growth_bus "lens_count" "ok" "lenses=$lenses"
 

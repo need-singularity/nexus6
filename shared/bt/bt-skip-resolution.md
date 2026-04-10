@@ -1,8 +1,8 @@
 # BT Audit SKIP 해소 보고서
 
 - 일자: 2026-04-08
-- 대상: `shared/bt_audit.py` (BT EXACT 수식 자동 검산기)
-- 산출물: `shared/bt_audit_result.json`
+- 대상: `shared/bt/bt_audit.py` (BT EXACT 수식 자동 검산기)
+- 산출물: `shared/bt/bt_audit_result.json`
 - 작업 범위: SKIP 613건만 (mismatch 141건은 별도 A 에이전트 담당)
 
 ## 1. SKIP 사유별 분류 (개선 전 613건)
@@ -88,6 +88,6 @@ SKIP 이 아니라 별도 NO_EXPR 로 분류 (검산 대상이 아님을 명시)
 
 ## 6. 변경 파일
 
-- `shared/bt_audit.py` — 정규화 보강 + NO_EXPR 도입 + 리스트 분해
-- `shared/bt_audit_result.json` — 재실행 산출물 (SKIP 397)
-- `shared/bt-skip-resolution.md` — 본 보고서
+- `shared/bt/bt_audit.py` — 정규화 보강 + NO_EXPR 도입 + 리스트 분해
+- `shared/bt/bt_audit_result.json` — 재실행 산출물 (SKIP 397)
+- `shared/bt/bt-skip-resolution.md` — 본 보고서

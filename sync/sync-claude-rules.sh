@@ -2,7 +2,7 @@
 # Sync shared work rules across all repo CLAUDE.md files
 # Source of truth: TECS-L/.shared/shared_work_rules.md
 #
-# Usage: bash .shared/sync-claude-rules.sh
+# Usage: bash .shared/scripts/sync-claude-rules.sh
 # Run from TECS-L repo root
 
 set -e

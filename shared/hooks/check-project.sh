@@ -4,7 +4,7 @@
 set +e
 
 NEXUS_SKIP=0
-PROJ_JSON="$HOME/Dev/nexus/shared/nexus-projects.json"
+PROJ_JSON="$HOME/Dev/nexus/shared/config/nexus-projects.json"
 REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
 
 if [ -z "$REPO_ROOT" ]; then

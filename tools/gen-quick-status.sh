@@ -19,14 +19,14 @@ def count(p):
     try: return sum(1 for _ in open(p))
     except: return 0
 
-closed = count(f'{NX}/shared/verified_constants.jsonl')
+closed = count(f'{NX}/shared/discovery/verified_constants.jsonl')
 topo = count(f'{NX}/shared/cycle/topology.jsonl')
-disc = count(f'{NX}/shared/discovery_log.jsonl')
+disc = count(f'{NX}/shared/discovery/discovery_log.jsonl')
 stubs = len(os.listdir(f'{NX}/shared/calc/auto_stubs')) if os.path.isdir(f'{NX}/shared/calc/auto_stubs') else 0
 
 status = Counter()
 source_proj = Counter()
-for l in open(f'{NX}/shared/verified_constants.jsonl'):
+for l in open(f'{NX}/shared/discovery/verified_constants.jsonl'):
     try:
         j = json.loads(l)
         status[j.get('status','?')] += 1

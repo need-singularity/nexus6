@@ -3,7 +3,7 @@
 # Scans TECS-L, anima, SEDI hypothesis files → builds unified atlas
 # Then injects summary into README files via markers
 #
-# Usage: bash .shared/sync-math-atlas.sh
+# Usage: bash .shared/scripts/sync-math-atlas.sh
 # Run from TECS-L repo root
 
 set -e
@@ -66,7 +66,7 @@ echo ""
 # Step 3: Commit generated files
 echo "[3/3] Committing..."
 cd "$BASE"
-ATLAS_FILES=".shared/math_atlas.json .shared/math_atlas.db .shared/math_atlas.dot"
+ATLAS_FILES=".shared/discovery/math_atlas.json .shared/n6/math_atlas.db .shared/n6/math_atlas.dot"
 
 if git diff --quiet $ATLAS_FILES 2>/dev/null && \
    git diff --cached --quiet $ATLAS_FILES 2>/dev/null; then

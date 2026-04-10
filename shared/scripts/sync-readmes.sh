@@ -1,8 +1,8 @@
 #!/bin/bash
 # Sync shared project descriptions across all repos
-# Source of truth: TECS-L/.shared/projects.md
+# Source of truth: TECS-L/.shared/config/projects.md
 #
-# Usage: bash .shared/sync-readmes.sh
+# Usage: bash .shared/scripts/sync-readmes.sh
 # Run from TECS-L repo root
 
 set -e

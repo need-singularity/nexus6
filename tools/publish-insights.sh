@@ -4,8 +4,8 @@
 set -euo pipefail
 
 NEXUS_ROOT="${HOME}/Dev/nexus"
-PROJECTS_JSON="${NEXUS_ROOT}/shared/projects.json"
-VC="${NEXUS_ROOT}/shared/verified_constants.jsonl"
+PROJECTS_JSON="${NEXUS_ROOT}/shared/config/projects.json"
+VC="${NEXUS_ROOT}/shared/discovery/verified_constants.jsonl"
 
 [ -f "$VC" ] || { echo "no verified_constants.jsonl"; exit 0; }
 [ -f "$PROJECTS_JSON" ] || { echo "no projects.json"; exit 0; }
@@ -15,8 +15,8 @@ import json, os
 from datetime import datetime
 HOME = os.path.expanduser('~')
 
-vc_path = f'{HOME}/Dev/nexus/shared/verified_constants.jsonl'
-proj_path = f'{HOME}/Dev/nexus/shared/projects.json'
+vc_path = f'{HOME}/Dev/nexus/shared/discovery/verified_constants.jsonl'
+proj_path = f'{HOME}/Dev/nexus/shared/config/projects.json'
 
 # Load EXACT closures, dedup by value
 exact = []

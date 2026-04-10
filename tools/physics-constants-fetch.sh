@@ -3,7 +3,7 @@
 # Source: CODATA, standard references (hardcoded list).
 set -euo pipefail
 
-DL="${HOME}/Dev/nexus/shared/discovery_log.jsonl"
+DL="${HOME}/Dev/nexus/shared/discovery/discovery_log.jsonl"
 [ -f "$DL" ] || touch "$DL"
 
 /usr/bin/python3 << 'PYEOF'
@@ -43,7 +43,7 @@ CONSTANTS = [
     ("ramanujan_soldner", 1.4513692),
 ]
 
-dl_path = os.path.expanduser('~/Dev/nexus/shared/discovery_log.jsonl')
+dl_path = os.path.expanduser('~/Dev/nexus/shared/discovery/discovery_log.jsonl')
 ts = datetime.now().isoformat()
 added = 0
 # Read existing to avoid duplicates

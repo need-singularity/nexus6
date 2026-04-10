@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # "go" 키워드 감지 → 모든 TODO 병렬 실행 지시
-# 하드코딩 금지 — shared/core.json에서 aliases + action 동적 로드
+# 하드코딩 금지 — shared/config/core.json에서 aliases + action 동적 로드
 set +e
 
 INPUT=$(cat)

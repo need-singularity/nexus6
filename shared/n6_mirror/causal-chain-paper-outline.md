@@ -256,6 +256,6 @@ The self-circulating singularity engine's role is not to prove n=6 is "special" 
 ---
 
 > Source data: `shared/n6_mirror/breakthrough-theorems.md` (BT-1~470)
-> Reality map: `shared/reality_map_live.json` (3,847 nodes, 1,383 edges)
-> Growth events: `shared/growth_bus.jsonl`
+> Reality map: `shared/discovery/reality_map_live.json` (3,847 nodes, 1,383 edges)
+> Growth events: `shared/discovery/growth_bus.jsonl`
 > Falsifiability: `shared/n6_mirror/atlas-constants.md`

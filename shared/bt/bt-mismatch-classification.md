@@ -1,11 +1,11 @@
 # BT mismatch 154건 3범주 분류 보고서
 
 - 일자: 2026-04-08 (재실행 v2)
-- 입력: `shared/bt_audit_result.json` (`bt_audit.py` 산출, n=6 정수 검산)
+- 입력: `shared/bt/bt_audit_result.json` (`bt_audit.py` 산출, n=6 정수 검산)
 - 대상 BT: 356개 / 검증행 2,370개 / MATCH **1,100** · MISMATCH **154** · SKIP 453 · NO_EXPR 36 · NO_TARGET 628
 - 현재 정확도: **87.79%** (목표 95%+)
 - 분류 스크립트: `shared/_classify_bt.py` (정규식 + 패턴 매칭)
-- 산출 JSON: `shared/bt_audit_classification.json` (154건 전수 분류)
+- 산출 JSON: `shared/bt/bt_audit_classification.json` (154건 전수 분류)
 
 ## 요약
 
@@ -85,8 +85,8 @@ BT-89: '48'   comp=48   tgt=14 raw='14'
 
 ## 산출물
 
-- 본 보고서: `shared/bt-mismatch-classification.md`
-- 분류 결과 JSON (154건 전수): `shared/bt_audit_classification.json`
+- 본 보고서: `shared/bt/bt-mismatch-classification.md`
+- 분류 결과 JSON (154건 전수): `shared/bt/bt_audit_classification.json`
 - 분류 스크립트: `shared/_classify_bt.py`
-- 원본 감사 결과: `shared/bt_audit_result.json`
-- 감사 도구: `shared/bt_audit.py`
+- 원본 감사 결과: `shared/bt/bt_audit_result.json`
+- 감사 도구: `shared/bt/bt_audit.py`

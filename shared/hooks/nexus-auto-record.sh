@@ -6,7 +6,7 @@ VALUE="$1"
 CONSTANT="$2"
 SOURCE="$3"
 TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
-DISCOVERY_LOG="$HOME/Dev/nexus/shared/discovery_log.jsonl"
+DISCOVERY_LOG="$HOME/Dev/nexus/shared/discovery/discovery_log.jsonl"
 
 # JSONL로 직접 기록 (Claude 의존 없음)
 /usr/bin/python3 -c "

@@ -14,9 +14,9 @@ set -euo pipefail
 
 INTERVAL="${INTERVAL:-30}"
 NEXUS_ROOT="${NEXUS_ROOT:-$HOME/Dev/nexus}"
-PROJECTS_JSON="${PROJECTS_JSON:-$NEXUS_ROOT/shared/projects.json}"
-SCAN_SCRIPT="$NEXUS_ROOT/shared/scan_math_atlas.py"
-SYNC_SCRIPT="$NEXUS_ROOT/shared/sync-math-atlas.sh"
+PROJECTS_JSON="${PROJECTS_JSON:-$NEXUS_ROOT/shared/config/projects.json}"
+SCAN_SCRIPT="$NEXUS_ROOT/shared/n6/scan_math_atlas.py"
+SYNC_SCRIPT="$NEXUS_ROOT/shared/scripts/sync-math-atlas.sh"
 STAMP_FILE="$HOME/.config/n6-watch-atlas.stamp"
 LOG="$HOME/Library/Logs/nexus/watch-atlas.log"
 mkdir -p "$(dirname "$LOG")" "$(dirname "$STAMP_FILE")"
@@ -81,7 +81,7 @@ while true; do
         fi
 
         if [ "$RUN_OK" = true ]; then
-            ATLAS="$NEXUS_ROOT/shared/math_atlas.json"
+            ATLAS="$NEXUS_ROOT/shared/discovery/math_atlas.json"
             if [ -f "$ATLAS" ]; then
                 # stats.*.total 합산으로 총 항목 수 계산
                 ENTRIES=$(/usr/bin/python3 -c "import json;d=json.load(open('$ATLAS'));s=d.get('stats',{});print(sum(v.get('total',0) for v in s.values()) if isinstance(s,dict) else '?')" 2>/dev/null || echo '?')

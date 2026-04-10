@@ -2,7 +2,7 @@
 
 - 실행일: 2026-04-08
 - 스크립트: `shared/monte_carlo_n6_pi_e_phi.py`
-- 데이터: `shared/reality_map.json` (v8.0 / 492 노드, natural 276) — Monte Carlo agent (B)와 동일
+- 데이터: `shared/discovery/reality_map.json` (v8.0 / 492 노드, natural 276) — Monte Carlo agent (B)와 동일
 - 정수 measured 타겟: **427개 (고유 95)** — 전체
 - **[2026-04-08 재실행]** origin=natural 필터: **227개 (고유 53)** — 결과는 `monte_carlo_v6_result.md` 참조
   - natural-only 하에서 n=6: z_HIT=+1.14, z_eff=+2.03 (효율 1위 유지, z>3 여전히 미달)
@@ -58,4 +58,4 @@
 
 - `shared/monte_carlo_n6_pi_e_phi.py` — MC 스크립트
 - `shared/n6_uniqueness_pi_e_phi.json` — 원시 결과 JSON
-- `shared/n6_uniqueness_pi_e_phi.md` — 본 보고서
+- `shared/n6/n6_uniqueness_pi_e_phi.md` — 본 보고서

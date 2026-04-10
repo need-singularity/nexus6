@@ -99,7 +99,7 @@ Claude Code JSONL logs (~/.claude-claude9/projects/.../*.jsonl)
 
 **에러 처리**: 손상 JSONL 라인 try/except skip + stderr 경고 카운트 출력. 권한 에러는 종료 코드 2.
 
-### C2. `shared/projects.json` 엔트리 추가 (편집)
+### C2. `shared/config/projects.json` 엔트리 추가 (편집)
 
 ```json
 {
@@ -122,7 +122,7 @@ Claude Code JSONL logs (~/.claude-claude9/projects/.../*.jsonl)
 # 1) miner 실행
 python3 tools/cc_session_miner.py --sessions 20
 # 2) atlas 동기화 (watch-atlas 기다리지 않고 수동)
-bash shared/sync-math-atlas.sh
+bash shared/scripts/sync-math-atlas.sh
 sleep 2
 # 3) nexus 사이클 (30분 타임아웃)
 timeout 1800 nexus auto claude_efficiency --meta-cycles 5 --ouroboros-cycles 3 \
@@ -139,7 +139,7 @@ python3 tools/interpret_breakthrough.py \
 
 **입력**:
 - 원시 사이클 JSON 경로
-- `shared/discovery_log.jsonl` 최근 엔트리 (사이클 도중 추가된 것)
+- `shared/discovery/discovery_log.jsonl` 최근 엔트리 (사이클 도중 추가된 것)
 
 **처리**:
 - 수렴 패턴별 강도(strength) 랭킹

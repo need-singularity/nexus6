@@ -1818,7 +1818,7 @@ Replace placeholder values in `~/Dev/papers/tecs-l/P-369-tesla-theorem.md`.
 - [ ] **Step 4: Update Math Atlas**
 
 ```bash
-python3 .shared/scan_math_atlas.py --save --summary
+python3 .shared/n6/scan_math_atlas.py --save --summary
 ```
 
 - [ ] **Step 5: Register in README.md hypothesis table**

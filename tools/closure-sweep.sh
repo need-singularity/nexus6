@@ -4,8 +4,8 @@
 set -euo pipefail
 
 NEXUS="${HOME}/Dev/nexus"
-VC="${NEXUS}/shared/verified_constants.jsonl"
-DL="${NEXUS}/shared/discovery_log.jsonl"
+VC="${NEXUS}/shared/discovery/verified_constants.jsonl"
+DL="${NEXUS}/shared/discovery/discovery_log.jsonl"
 
 [ -f "$VC" ] || { echo "no verified_constants"; exit 0; }
 
@@ -92,7 +92,7 @@ for expr,val in KNOWN.items():
 
 # Existing closures — dedup by unique value
 existing_vals = set()
-for line in open(f'{NX}/shared/verified_constants.jsonl'):
+for line in open(f'{NX}/shared/discovery/verified_constants.jsonl'):
     try:
         j = json.loads(line)
         if j.get('status')=='EXACT':
@@ -122,7 +122,7 @@ def try_add(val, src_name, source_path, tag):
         existing_vals.add(key)
 
 # Source 1: discovery_log.jsonl
-for line in open(f'{NX}/shared/discovery_log.jsonl'):
+for line in open(f'{NX}/shared/discovery/discovery_log.jsonl'):
     try:
         j = json.loads(line)
         try_add(float(j.get('value','')), 'dl', 'discovery_log', 'DL')
@@ -146,7 +146,7 @@ for root in [f'{HOME}/Dev/TECS-L/docs/hypotheses',
 
 # Source 3: atlas DB
 try:
-    conn = sqlite3.connect(f'{NX}/shared/math_atlas.db')
+    conn = sqlite3.connect(f'{NX}/shared/n6/math_atlas.db')
     cur = conn.cursor()
     cur.execute("SELECT title FROM hypotheses")
     for row in cur.fetchall():
@@ -159,11 +159,11 @@ try:
 except: pass
 
 if new:
-    with open(f'{NX}/shared/verified_constants.jsonl', 'a') as f:
+    with open(f'{NX}/shared/discovery/verified_constants.jsonl', 'a') as f:
         for c in new:
             f.write(json.dumps(c, ensure_ascii=False) + '\n')
 
-ex = sum(1 for l in open(f'{NX}/shared/verified_constants.jsonl') if json.loads(l).get('status')=='EXACT')
-pas = sum(1 for l in open(f'{NX}/shared/verified_constants.jsonl') if json.loads(l).get('status')=='PASS')
+ex = sum(1 for l in open(f'{NX}/shared/discovery/verified_constants.jsonl') if json.loads(l).get('status')=='EXACT')
+pas = sum(1 for l in open(f'{NX}/shared/discovery/verified_constants.jsonl') if json.loads(l).get('status')=='PASS')
 print(f"[{ts}] +{len(new)} EXACT → total closed={ex+pas}, EXACT={ex}, unique={len(existing_vals)}")
 PYEOF

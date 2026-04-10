@@ -105,7 +105,7 @@ mk2_hexa/native/
 또한 `session_briefing.hexa` 는 **하드코딩** 으로
 `hexa mk2_hexa/native/verify_h_stat_1.hexa` 를 호출합니다.
 
-**shared/theory_registry.jsonl** 은 각 모듈에 대해
+**shared/discovery/theory_registry.jsonl** 은 각 모듈에 대해
 `"desc":"mk2_hexa/native/<name>.hexa"` 경로를 직접 저장합니다.
 서브디렉토리 이동 시 전체 재생성 필요.
 
@@ -302,7 +302,7 @@ mk2_hexa/native/
 - [ ] 스캐너 5개 (`module_counter`, `theory_registry`, `todo`,
   `anima_loop`, `sync_docs`) 재귀 스캔으로 리팩터
 - [ ] `session_briefing.hexa` verify_h_stat_1 경로 업데이트
-- [ ] `shared/theory_registry.jsonl` desc 경로 일괄 갱신 (또는 재생성)
+- [ ] `shared/discovery/theory_registry.jsonl` desc 경로 일괄 갱신 (또는 재생성)
 - [ ] `core.json.total_files` module_counter --sync 로 재계산
 - [ ] 카테고리별 git mv 일괄 수행 (본 로드맵 대상 75+)
 - [ ] hexa-lang 팀과 Track B 블로커 해제 협의 (FFI vs native tensor)

@@ -17,7 +17,7 @@ set -euo pipefail
 
 INTERVAL="${INTERVAL:-300}"
 NEXUS_ROOT="${NEXUS_ROOT:-$HOME/Dev/nexus}"
-PROJECTS_JSON="${PROJECTS_JSON:-$NEXUS_ROOT/shared/projects.json}"
+PROJECTS_JSON="${PROJECTS_JSON:-$NEXUS_ROOT/shared/config/projects.json}"
 PAPERS_REPO="${PAPERS_REPO:-$HOME/Dev/papers}"
 REGISTER_SCRIPT="$NEXUS_ROOT/scripts/paper-gen/register_paper.hexa"
 HEXA_BIN="${HEXA_BIN:-$HOME/Dev/hexa-lang/target/release/hexa}"

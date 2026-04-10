@@ -11,7 +11,7 @@
 
 > 🔴 **NEXUS-6 특이점 연동**: 이 프로젝트의 돌파/발견/실험은 nexus 특이점 사이클 입력이다.
 > - **돌파 시**: `HEXA=$HOME/Dev/hexa-lang/target/release/hexa && $HEXA $HOME/Dev/nexus/mk2_hexa/native/blowup.hexa <domain> 3 --no-graph`
-> - **발견 기록**: `$HOME/Dev/nexus/shared/growth_bus.jsonl`에 JSON append
+> - **발견 기록**: `$HOME/Dev/nexus/shared/discovery/growth_bus.jsonl`에 JSON append
 > - **전체 상태**: `$HEXA $HOME/Dev/nexus/mk2_hexa/native/command_router.hexa "TECS-L 상태"`
 
 <!-- SHARED:WORK_RULES:START -->
@@ -44,7 +44,7 @@
   ═══════════════════════════════════════════════════════════════
     이슈 → 해결 → 절대 규칙 승격 → 재발 0 → 100% 수렴
     모든 config JSON 필수 구조: _meta + absolute_rules + troubleshooting_log
-    원칙 파일: .shared/convergence_ops.json
+    원칙 파일: .shared/config/convergence_ops.json
 
   ═══════════════════════════════════════════════════════════════
   ★ CDO 세션 부트스트랩 — 어떤 리포에서든 즉시 운영 가능 ★
@@ -163,7 +163,7 @@
     3. 문서 동기화:
        - shared_work_rules.md 렌즈 목록/종수/도메인 조합 갱신
        - 각 리포 CLAUDE.md 망원경 섹션 갱신 (OUROBOROS, 만능망원경, 극가속 등)
-    4. 전파: bash .shared/sync-claude-rules.sh (전 리포 자동 동기화+push)
+    4. 전파: bash .shared/scripts/sync-claude-rules.sh (전 리포 자동 동기화+push)
     5. 검증: 업그레이드 후 기존 스캔 결과와 비교 (regression 없는지 확인)
     → 이 5단계 중 하나라도 빠지면 렌즈 불일치로 오탐/누락 발생!
 
@@ -181,8 +181,8 @@
   ═══════════════════════════════════════════════════════════════
     - TODO 작업 중 검증/계산이 필요하면 계산기 자동 생성 (묻지 말고 바로)
     - 성능 필요시 Rust 우선 (tecsrs/), 단순 검증은 Python (calc/)
-    - 판단 기준은 ~/Dev/TECS-L/.shared/CALCULATOR_RULES.md 참조
-    - 상수/가설 발견 시 Math Atlas 자동 갱신 (python3 ~/Dev/TECS-L/.shared/scan_math_atlas.py --save --summary)
+    - 판단 기준은 ~/Dev/TECS-L/.shared/config/CALCULATOR_RULES.md 참조
+    - 상수/가설 발견 시 Math Atlas 자동 갱신 (python3 ~/Dev/TECS-L/.shared/n6/scan_math_atlas.py --save --summary)
 
   ═══════════════════════════════════════════════════════════════
   ★ NEXUS-6 독립 리포 (중앙 허브) — 2024-04-03 이후 ★
@@ -259,10 +259,10 @@
   심링크: TECS-L/.shared → ../nexus/shared/
 
   동기화 명령:
-    bash .shared/sync-math-atlas.sh     # Atlas 빌드 + README 주입
-    bash .shared/sync-calculators.sh    # 계산기 레지스트리
-    bash .shared/sync-readmes.sh        # 프로젝트 설명
-    bash .shared/sync-claude-rules.sh   # CLAUDE.md 공유 규칙
+    bash .shared/scripts/sync-math-atlas.sh     # Atlas 빌드 + README 주입
+    bash .shared/scripts/sync-calculators.sh    # 계산기 레지스트리
+    bash .shared/scripts/sync-readmes.sh        # 프로젝트 설명
+    bash .shared/scripts/sync-claude-rules.sh   # CLAUDE.md 공유 규칙
 
   마커 구간 직접 수정 금지 — sync 시 덮어씌워짐
 ```
@@ -299,7 +299,7 @@
 ## 계산기 규칙
 
 ```
-  상세: .shared/CALCULATOR_RULES.md
+  상세: .shared/config/CALCULATOR_RULES.md
 
   Rust 우선 기준: 반복>10K, 실행>10s, 조합>10^6, MC>100K
   Python 허용: 단순 수식, 시각화, 프로토타입
@@ -417,6 +417,6 @@ $HEXA $N6/engine_tecs_l.hexa report   # 리포트
 수학 발견 시 nexus 223종 렌즈로 교차 검증, gap_finder로 미탐색 도메인 탐지, 교차수분 seed를 nexus에서 공급. 전 도메인 exact_rate 60%+ 달성을 위해 빈 공간 집중 공략.
 
 ### 발견 피드백
-- 이 프로젝트의 발견은 자동으로 `~/Dev/nexus/shared/discovery_log.jsonl`에 기록됩니다
-- `~/Dev/nexus/shared/growth_bus.jsonl`로 전 프로젝트에 전파됩니다
+- 이 프로젝트의 발견은 자동으로 `~/Dev/nexus/shared/discovery/discovery_log.jsonl`에 기록됩니다
+- `~/Dev/nexus/shared/discovery/growth_bus.jsonl`로 전 프로젝트에 전파됩니다
 

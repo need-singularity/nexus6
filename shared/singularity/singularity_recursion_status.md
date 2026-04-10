@@ -24,7 +24,7 @@
 | `nexus singularity-daemon --interval 30 --base-dir <path>` | 실시간 흡수 + airgenome Mac vitals |
 
 ### 흡수 도메인 (캡 없음, u64::MAX)
-- `discovery_log` — `shared/discovery_log.jsonl` 각 라인
+- `discovery_log` — `shared/discovery/discovery_log.jsonl` 각 라인
 - `hypothesis` — `docs/hypotheses/**/*.md` 각 파일
 - `memory` — `~/.claude-claude9/projects/*/memory/*.md` 각 파일
 - `architecture_design` — daemon 전용, 실시간 Mac vitals

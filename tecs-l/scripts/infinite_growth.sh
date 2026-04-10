@@ -16,7 +16,7 @@ domain_phases() {
 
     # 1. 수학 아틀라스 상태
     log_info "Phase: 수학 아틀라스 상태"
-    local atlas_file="$PROJECT_ROOT/.shared/math_atlas.json"
+    local atlas_file="$PROJECT_ROOT/.shared/discovery/math_atlas.json"
     if [ -f "$atlas_file" ]; then
         local atlas_count
         atlas_count=$(/usr/bin/python3 -c "import json; d=json.load(open('$atlas_file')); print(len(d) if isinstance(d,list) else len(d.keys()))" 2>/dev/null || echo "?")

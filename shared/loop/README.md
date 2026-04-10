@@ -151,6 +151,6 @@ shared/loop/n6-arch.json ┘   (interval, max_cycles, domain)
 | 파일 | 역할 |
 |------|------|
 | `scripts/lib/growth_common.sh` | 공통 phase 함수 + 루프 오케스트레이터 |
-| `shared/growth_bus.jsonl` | 이벤트 스트림 (append-only) |
+| `shared/discovery/growth_bus.jsonl` | 이벤트 스트림 (append-only) |
 | `shared/loop/{project}.json` | 루프 순서 정의 (이 디렉토리) |
 | `.growth/growth_state.json` | 각 프로젝트 로컬 상태 (cycle, last_run) |

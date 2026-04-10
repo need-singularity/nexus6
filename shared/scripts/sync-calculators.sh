@@ -2,7 +2,7 @@
 # Sync calculator registry tables across all repos
 # Source of truth: auto-generated from scan-calculators.py
 #
-# Usage: bash .shared/sync-calculators.sh
+# Usage: bash .shared/scripts/sync-calculators.sh
 # Run from TECS-L repo root
 
 set -e
@@ -26,7 +26,7 @@ if [ -z "$CONTENT" ]; then
   exit 1
 fi
 
-echo "  Registry saved to .shared/calculators.json"
+echo "  Registry saved to .shared/config/calculators.json"
 echo ""
 
 # Step 2: Sync to READMEs
@@ -79,7 +79,7 @@ commit_and_push() {
   if git diff --quiet README.md 2>/dev/null; then
     echo "  No changes"
   else
-    git add README.md .shared/calculators.json 2>/dev/null || git add README.md
+    git add README.md .shared/config/calculators.json 2>/dev/null || git add README.md
     git pull --rebase --quiet 2>/dev/null || true
     git commit -m "Sync calculator registry from TECS-L"
     git push
@@ -134,7 +134,7 @@ echo "[3/5] Reverse sync: SEDI → TECS-L..."
 
 SEDI_DIR="$PARENT/sedi"
 if [ -d "$SEDI_DIR" ]; then
-  # SEDI 가설 등급 → TECS-L/.shared/sedi-grades.json
+  # SEDI 가설 등급 → TECS-L/.shared/discovery/sedi-grades.json
   SEDI_GRADES="$SEDI_DIR/data/sedi-grades.json"
   if [ -f "$SEDI_GRADES" ]; then
     cp "$SEDI_GRADES" "$SCRIPT_DIR/sedi-grades.json"
@@ -161,8 +161,8 @@ if [ -d "$SEDI_DIR" ]; then
 
   # TECS-L 커밋 (SEDI 역동기화분)
   cd "$BASE"
-  if ! git diff --quiet .shared/sedi-grades.json 2>/dev/null; then
-    git add .shared/sedi-grades.json
+  if ! git diff --quiet .shared/discovery/sedi-grades.json 2>/dev/null; then
+    git add .shared/discovery/sedi-grades.json
     git commit -m "sync: SEDI→TECS-L reverse sync (hypothesis grades)"
     git push
     echo "  Pushed SEDI reverse sync!"

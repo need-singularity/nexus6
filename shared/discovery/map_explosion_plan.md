@@ -118,5 +118,5 @@ n 93 · σ 91 · misc 61 · τ 56 · sopfr 53 · none 30 · J2 29 · mixed 28 ·
 ---
 
 ## 못박음
-- L0 잠금: `shared/reality_map_3d.html`, `shared/reality_map.json` (nexus)
+- L0 잠금: `shared/discovery/reality_map_3d.html`, `shared/discovery/reality_map.json` (nexus)
 - 이 계획 자체도 nexus/shared SSOT — 수정 시 buckbucks + MEMORY 동기화

@@ -67,7 +67,7 @@
 | `hexa gap_finder.hexa dfs [depth]` | DFS 위상변환 탐색 (기본 depth=2) | `dfs 3` |
 | `hexa gap_finder.hexa bridge` | 빈공간 × 위상변환 교차 매칭 | `bridge` |
 
-도메인/명령어 추가: `shared/bt_domains.jsonl`, `shared/cmd_aliases.jsonl` 에 한 줄 추가만으로 즉시 적용.
+도메인/명령어 추가: `shared/bt/bt_domains.jsonl`, `shared/config/cmd_aliases.jsonl` 에 한 줄 추가만으로 즉시 적용.
 
 ## 엔진
 
@@ -223,17 +223,17 @@ nexus_hub tick
 
 1. **n6 상수 감지** — 출력에서 숫자 추출 → n=6 상수 매칭 → discovery_log 기록
 2. **돌파 키워드 감지** — "돌파", "breakthrough" 등 → 도메인 자동 판별 → blowup 백그라운드 실행
-3. **도메인 매핑** — `shared/bt_domains.jsonl`에서 동적 로드 (12개 도메인, 코드 수정 없이 확장)
+3. **도메인 매핑** — `shared/bt/bt_domains.jsonl`에서 동적 로드 (12개 도메인, 코드 수정 없이 확장)
 4. **쿨다운** — 5분 이내 중복 트리거 방지
 
 ## 설정 파일 (동적, 코드 수정 불필요)
 
 | 파일 | 용도 | 추가 방법 |
 |------|------|-----------|
-| `shared/bt_domains.jsonl` | 돌파 도메인+키워드 매핑 | JSONL 한 줄 추가 |
-| `shared/cmd_aliases.jsonl` | 명령 동사 매핑 | JSONL 한 줄 추가 |
-| `shared/projects.json` | 프로젝트 레지스트리 | 엔트리 추가 |
-| `shared/n6_constants.py` | n=6 상수 테이블 | 상수 추가 |
+| `shared/bt/bt_domains.jsonl` | 돌파 도메인+키워드 매핑 | JSONL 한 줄 추가 |
+| `shared/config/cmd_aliases.jsonl` | 명령 동사 매핑 | JSONL 한 줄 추가 |
+| `shared/config/projects.json` | 프로젝트 레지스트리 | 엔트리 추가 |
+| `shared/n6/n6_constants.py` | n=6 상수 테이블 | 상수 추가 |
 
 ## 빠른 시작
 

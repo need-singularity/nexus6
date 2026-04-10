@@ -109,7 +109,7 @@ echo ""
 echo "  리포: ${#REPOS[@]}개"
 echo "  렌즈: $(grep -c 'Box::new' "$NEXUS_ROOT/src/telescope/mod.rs" 2>/dev/null || echo '?')개"
 echo "  계산기: $(find "$NEXUS_ROOT/shared/calc" -name '*.py' -o -name '*.rs' 2>/dev/null | wc -l | tr -d ' ')개"
-ATLAS="$NEXUS_ROOT/shared/math_atlas.json"
+ATLAS="$NEXUS_ROOT/shared/discovery/math_atlas.json"
 if [ -f "$ATLAS" ]; then
   echo "  아틀라스: $(/usr/bin/python3 -c "import json;print(len(json.load(open('$ATLAS')).get('entries',{})))" 2>/dev/null || echo '?') 항목"
 fi

@@ -4,7 +4,7 @@
 set -euo pipefail
 
 NEXUS="${HOME}/Dev/nexus"
-VC="${NEXUS}/shared/verified_constants.jsonl"
+VC="${NEXUS}/shared/discovery/verified_constants.jsonl"
 CALC_DIR="${NEXUS}/shared/calc"
 STUBS_DIR="${CALC_DIR}/auto_stubs"
 STATE="${NEXUS}/shared/.calc_stubs_state.json"
@@ -17,7 +17,7 @@ import json, os, hashlib
 from datetime import datetime
 
 HOME = os.path.expanduser('~')
-VC = f'{HOME}/Dev/nexus/shared/verified_constants.jsonl'
+VC = f'{HOME}/Dev/nexus/shared/discovery/verified_constants.jsonl'
 STUBS = f'{HOME}/Dev/nexus/shared/calc/auto_stubs'
 STATE_PATH = f'{HOME}/Dev/nexus/shared/.calc_stubs_state.json'
 

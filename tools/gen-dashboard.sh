@@ -30,13 +30,13 @@ def count_md(root):
     return n
 
 # ═══ NEXUS stats ═══
-closed = cnt(f'{NX}/shared/verified_constants.jsonl')
+closed = cnt(f'{NX}/shared/discovery/verified_constants.jsonl')
 topo = cnt(f'{NX}/shared/cycle/topology.jsonl')
-disc = cnt(f'{NX}/shared/discovery_log.jsonl')
+disc = cnt(f'{NX}/shared/discovery/discovery_log.jsonl')
 stubs = len(os.listdir(f'{NX}/shared/calc/auto_stubs')) if os.path.isdir(f'{NX}/shared/calc/auto_stubs') else 0
 status = Counter()
 source_proj = Counter()
-for l in open(f'{NX}/shared/verified_constants.jsonl'):
+for l in open(f'{NX}/shared/discovery/verified_constants.jsonl'):
     try:
         j = json.loads(l)
         status[j.get('status','?')] += 1
@@ -108,7 +108,7 @@ calc_dir = f'{tecsl_root}/.shared/calc'
 if os.path.isdir(calc_dir):
     tecsl_calc = sum(1 for f in os.listdir(calc_dir) if f.endswith('.py'))
 tecsl_atlas_total = 0
-atlas_json = f'{tecsl_root}/.shared/math_atlas.json'
+atlas_json = f'{tecsl_root}/.shared/discovery/math_atlas.json'
 if os.path.exists(atlas_json):
     try:
         d = json.loads(open(atlas_json).read())
@@ -421,7 +421,7 @@ P-manual             ████░░░░ 🔄 ({n6a_papers-14-n6a_nexus_pap
       <div class="row"><span class="k">Σ points</span><span class="v hi">{topo:,}</span></div>
       <div class="row"><span class="k">Discovery log</span><span class="v">{disc:,}</span></div>
       <div class="row"><span class="k">Calc stubs</span><span class="v">{stubs}</span></div>
-      <div class="row"><span class="k">VC file size</span><span class="v">{fsize(f'{NX}/shared/verified_constants.jsonl')}</span></div>
+      <div class="row"><span class="k">VC file size</span><span class="v">{fsize(f'{NX}/shared/discovery/verified_constants.jsonl')}</span></div>
     </div>
     <div class="panel-section">
       <div class="section-hdr">Autonomous Pipeline</div>

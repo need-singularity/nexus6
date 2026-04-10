@@ -5,7 +5,7 @@
 **Status**: DRAFT_LOCAL (no DOI, no upload)
 
 ## Source data
-- `shared/reality_map.json` — 7 nodes tagged `nanobot`
+- `shared/discovery/reality_map.json` — 7 nodes tagged `nanobot`
   - BIG-PEG-MW-2000, BIG-IgG-halflife-21d, BIG-albumin-halflife-20d,
     BIG-dendrimer-G5-128, BIG-tumor-pore-600nm, BIG-spleen-slit-200nm,
     BIG-lymph-nodes-600
@@ -38,6 +38,6 @@ Metadata block prepared inside the draft. No `upload_zenodo.sh` invoked.
 DOI = pending user approval.
 
 ## Next actions (manual, on user command)
-1. Promote BT-404~410 into `shared/reality_map.json` `bt_refs`.
+1. Promote BT-404~410 into `shared/discovery/reality_map.json` `bt_refs`.
 2. Register BT-411~413 as derived nodes.
 3. Run `upload_zenodo.sh` from `~/Dev/papers/` only after explicit approval.

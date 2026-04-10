@@ -15,10 +15,10 @@
 | File | Responsibility |
 |------|---------------|
 | `.shared/scan-math-atlas.py` | Main scanner — regex parsers per repo, schema normalization, all 3 output formats |
-| `.shared/sync-math-atlas.sh` | Shell wrapper — runs scanner, commits, pushes (mirrors `sync-calculators.sh`) |
-| `.shared/math_atlas.json` | Generated — full hypothesis registry |
-| `.shared/math_atlas.db` | Generated — SQLite with hypotheses + edges tables |
-| `.shared/math_atlas.dot` | Generated — cross-ref graph for Graphviz |
+| `.shared/scripts/sync-math-atlas.sh` | Shell wrapper — runs scanner, commits, pushes (mirrors `sync-calculators.sh`) |
+| `.shared/discovery/math_atlas.json` | Generated — full hypothesis registry |
+| `.shared/n6/math_atlas.db` | Generated — SQLite with hypotheses + edges tables |
+| `.shared/n6/math_atlas.dot` | Generated — cross-ref graph for Graphviz |
 | `tests/test_atlas_parser.py` | Unit tests for regex parsers |
 
 ---
@@ -131,7 +131,7 @@ Expected: ImportError — `scan_math_atlas` module not found
 - [ ] **Step 3: Implement `parse_hypothesis_md` function**
 
 ```python
-# .shared/scan_math_atlas.py
+# .shared/n6/scan_math_atlas.py
 """Math Atlas Scanner — Scans TECS-L, anima, SEDI repos and builds unified hypothesis registry."""
 
 import re
@@ -290,7 +290,7 @@ Expected: All 12 tests PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add tests/test_atlas_parser.py .shared/scan_math_atlas.py
+git add tests/test_atlas_parser.py .shared/n6/scan_math_atlas.py
 git commit -m "feat: add math atlas hypothesis parser with regex extraction"
 ```
 
@@ -299,7 +299,7 @@ git commit -m "feat: add math atlas hypothesis parser with regex extraction"
 ### Task 2: Anima Python Adapter
 
 **Files:**
-- Modify: `.shared/scan_math_atlas.py` (add `parse_anima_recommender` function)
+- Modify: `.shared/n6/scan_math_atlas.py` (add `parse_anima_recommender` function)
 - Modify: `tests/test_atlas_parser.py` (add anima tests)
 
 Anima stores hypotheses in Python dataclasses inside `hypothesis_recommender.py`. We parse these using regex on the source (not AST — the file is too large and has runtime deps).
@@ -350,7 +350,7 @@ Expected: ImportError — `parse_anima_recommender` not found
 
 - [ ] **Step 3: Implement anima parser**
 
-Add to `.shared/scan_math_atlas.py`:
+Add to `.shared/n6/scan_math_atlas.py`:
 
 ```python
 def parse_anima_recommender(source_text):
@@ -390,7 +390,7 @@ Expected: All 13 tests PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add .shared/scan_math_atlas.py tests/test_atlas_parser.py
+git add .shared/n6/scan_math_atlas.py tests/test_atlas_parser.py
 git commit -m "feat: add anima hypothesis_recommender.py parser"
 ```
 
@@ -399,7 +399,7 @@ git commit -m "feat: add anima hypothesis_recommender.py parser"
 ### Task 3: Full Scanner — Repo Walking + JSON Output
 
 **Files:**
-- Modify: `.shared/scan_math_atlas.py` (add repo scanning, JSON output, CLI)
+- Modify: `.shared/n6/scan_math_atlas.py` (add repo scanning, JSON output, CLI)
 
 - [ ] **Step 1: Write failing test for full scan**
 
@@ -437,7 +437,7 @@ Expected: ImportError — `build_atlas` not found
 
 - [ ] **Step 3: Implement repo scanner and build_atlas**
 
-Add to `.shared/scan_math_atlas.py`:
+Add to `.shared/n6/scan_math_atlas.py`:
 
 ```python
 import json
@@ -561,7 +561,7 @@ Expected: All 16 tests PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add .shared/scan_math_atlas.py tests/test_atlas_parser.py
+git add .shared/n6/scan_math_atlas.py tests/test_atlas_parser.py
 git commit -m "feat: add full repo scanner and build_atlas for JSON output"
 ```
 
@@ -570,7 +570,7 @@ git commit -m "feat: add full repo scanner and build_atlas for JSON output"
 ### Task 4: SQLite Output
 
 **Files:**
-- Modify: `.shared/scan_math_atlas.py` (add `write_sqlite` function)
+- Modify: `.shared/n6/scan_math_atlas.py` (add `write_sqlite` function)
 
 - [ ] **Step 1: Write failing test for SQLite output**
 
@@ -616,7 +616,7 @@ Expected: ImportError — `write_sqlite` not found
 
 - [ ] **Step 3: Implement write_sqlite**
 
-Add to `.shared/scan_math_atlas.py`:
+Add to `.shared/n6/scan_math_atlas.py`:
 
 ```python
 import sqlite3
@@ -696,7 +696,7 @@ Expected: All 17 tests PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add .shared/scan_math_atlas.py tests/test_atlas_parser.py
+git add .shared/n6/scan_math_atlas.py tests/test_atlas_parser.py
 git commit -m "feat: add SQLite output for math atlas"
 ```
 
@@ -705,7 +705,7 @@ git commit -m "feat: add SQLite output for math atlas"
 ### Task 5: Graphviz DOT Output
 
 **Files:**
-- Modify: `.shared/scan_math_atlas.py` (add `write_dot` function)
+- Modify: `.shared/n6/scan_math_atlas.py` (add `write_dot` function)
 
 - [ ] **Step 1: Write failing test for DOT output**
 
@@ -736,7 +736,7 @@ Expected: ImportError — `write_dot` not found
 
 - [ ] **Step 3: Implement write_dot**
 
-Add to `.shared/scan_math_atlas.py`:
+Add to `.shared/n6/scan_math_atlas.py`:
 
 ```python
 def write_dot(atlas, dotpath):
@@ -816,7 +816,7 @@ Expected: All 18 tests PASS
 - [ ] **Step 5: Commit**
 
 ```bash
-git add .shared/scan_math_atlas.py tests/test_atlas_parser.py
+git add .shared/n6/scan_math_atlas.py tests/test_atlas_parser.py
 git commit -m "feat: add Graphviz DOT output for math atlas"
 ```
 
@@ -825,11 +825,11 @@ git commit -m "feat: add Graphviz DOT output for math atlas"
 ### Task 6: CLI + main()
 
 **Files:**
-- Modify: `.shared/scan_math_atlas.py` (add argparse CLI and main)
+- Modify: `.shared/n6/scan_math_atlas.py` (add argparse CLI and main)
 
 - [ ] **Step 1: Implement CLI**
 
-Add to `.shared/scan_math_atlas.py`:
+Add to `.shared/n6/scan_math_atlas.py`:
 
 ```python
 def main():
@@ -909,23 +909,23 @@ if __name__ == "__main__":
 
 - [ ] **Step 2: Test CLI end-to-end**
 
-Run: `cd /Users/ghost/Dev/TECS-L && python3 .shared/scan_math_atlas.py --summary`
+Run: `cd /Users/ghost/Dev/TECS-L && python3 .shared/n6/scan_math_atlas.py --summary`
 Expected: Prints stats showing ~1,750+ hypotheses across 3 repos
 
 - [ ] **Step 3: Test save outputs**
 
-Run: `cd /Users/ghost/Dev/TECS-L && python3 .shared/scan_math_atlas.py --save --summary`
-Expected: Creates `.shared/math_atlas.json`, `.shared/math_atlas.db`, `.shared/math_atlas.dot`
+Run: `cd /Users/ghost/Dev/TECS-L && python3 .shared/n6/scan_math_atlas.py --save --summary`
+Expected: Creates `.shared/discovery/math_atlas.json`, `.shared/n6/math_atlas.db`, `.shared/n6/math_atlas.dot`
 
 - [ ] **Step 4: Test query**
 
-Run: `cd /Users/ghost/Dev/TECS-L && python3 .shared/scan_math_atlas.py --query "grade=⭐"`
+Run: `cd /Users/ghost/Dev/TECS-L && python3 .shared/n6/scan_math_atlas.py --query "grade=⭐"`
 Expected: Lists hypotheses with star grades
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add .shared/scan_math_atlas.py
+git add .shared/n6/scan_math_atlas.py
 git commit -m "feat: add CLI with --save, --summary, --query, --json, --repo"
 ```
 
@@ -934,7 +934,7 @@ git commit -m "feat: add CLI with --save, --summary, --query, --json, --repo"
 ### Task 7: Shell Wrapper + .gitignore
 
 **Files:**
-- Create: `.shared/sync-math-atlas.sh`
+- Create: `.shared/scripts/sync-math-atlas.sh`
 - Modify: `.gitignore` (add generated atlas files)
 
 - [ ] **Step 1: Create sync-math-atlas.sh**
@@ -944,7 +944,7 @@ git commit -m "feat: add CLI with --save, --summary, --query, --json, --repo"
 # Sync math atlas across all repos
 # Scans TECS-L, anima, SEDI hypothesis files → builds unified atlas
 #
-# Usage: bash .shared/sync-math-atlas.sh
+# Usage: bash .shared/scripts/sync-math-atlas.sh
 # Run from TECS-L repo root
 
 set -e
@@ -964,7 +964,7 @@ echo ""
 # Step 2: Commit generated files
 echo "[2/2] Committing..."
 cd "$BASE"
-ATLAS_FILES=".shared/math_atlas.json .shared/math_atlas.db .shared/math_atlas.dot"
+ATLAS_FILES=".shared/discovery/math_atlas.json .shared/n6/math_atlas.db .shared/n6/math_atlas.dot"
 
 if git diff --quiet $ATLAS_FILES 2>/dev/null && \
    git diff --cached --quiet $ATLAS_FILES 2>/dev/null; then
@@ -981,20 +981,20 @@ echo "Done!"
 
 - [ ] **Step 2: Make executable and add atlas outputs to .gitignore exception**
 
-Run: `chmod +x .shared/sync-math-atlas.sh`
+Run: `chmod +x .shared/scripts/sync-math-atlas.sh`
 
 Check `.gitignore` — the generated `.db` and `.dot` files should be tracked (they're the deliverable). If `.gitignore` has `*.db`, add an exception:
 
 ```
 # Math Atlas outputs (tracked)
-!.shared/math_atlas.json
-!.shared/math_atlas.db
-!.shared/math_atlas.dot
+!.shared/discovery/math_atlas.json
+!.shared/n6/math_atlas.db
+!.shared/n6/math_atlas.dot
 ```
 
 - [ ] **Step 3: Test full sync**
 
-Run: `cd /Users/ghost/Dev/TECS-L && bash .shared/sync-math-atlas.sh`
+Run: `cd /Users/ghost/Dev/TECS-L && bash .shared/scripts/sync-math-atlas.sh`
 Expected: Builds atlas, shows summary, commits if changed
 
 - [ ] **Step 4: Verify outputs**
@@ -1002,13 +1002,13 @@ Expected: Builds atlas, shows summary, commits if changed
 Run: `ls -lh .shared/math_atlas.*`
 Expected: 3 files — `.json` (largest), `.db`, `.dot`
 
-Run: `sqlite3 .shared/math_atlas.db "SELECT repo, COUNT(*) FROM hypotheses GROUP BY repo"`
+Run: `sqlite3 .shared/n6/math_atlas.db "SELECT repo, COUNT(*) FROM hypotheses GROUP BY repo"`
 Expected: Shows counts per repo
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add .shared/sync-math-atlas.sh .gitignore
+git add .shared/scripts/sync-math-atlas.sh .gitignore
 git commit -m "feat: add sync-math-atlas.sh shell wrapper"
 ```
 
@@ -1025,25 +1025,25 @@ Expected: All 18 tests PASS
 
 - [ ] **Step 2: Run full sync pipeline**
 
-Run: `cd /Users/ghost/Dev/TECS-L && bash .shared/sync-math-atlas.sh`
+Run: `cd /Users/ghost/Dev/TECS-L && bash .shared/scripts/sync-math-atlas.sh`
 Expected: Completes without error, shows summary with ~1,750+ hypotheses
 
 - [ ] **Step 3: Verify JSON structure**
 
-Run: `python3 -c "import json; a=json.load(open('.shared/math_atlas.json')); print(f'Total: {a[\"total\"]}'); print(json.dumps(a['hypotheses'][0], indent=2, ensure_ascii=False))"`
+Run: `python3 -c "import json; a=json.load(open('.shared/discovery/math_atlas.json')); print(f'Total: {a[\"total\"]}'); print(json.dumps(a['hypotheses'][0], indent=2, ensure_ascii=False))"`
 Expected: Shows total count and a sample hypothesis entry with all fields
 
 - [ ] **Step 4: Verify SQLite queries**
 
 Run:
 ```bash
-sqlite3 .shared/math_atlas.db "SELECT repo, COUNT(*) FROM hypotheses GROUP BY repo"
-sqlite3 .shared/math_atlas.db "SELECT id, grade, title FROM hypotheses WHERE grade LIKE '%⭐%' LIMIT 10"
-sqlite3 .shared/math_atlas.db "SELECT COUNT(*) FROM edges"
+sqlite3 .shared/n6/math_atlas.db "SELECT repo, COUNT(*) FROM hypotheses GROUP BY repo"
+sqlite3 .shared/n6/math_atlas.db "SELECT id, grade, title FROM hypotheses WHERE grade LIKE '%⭐%' LIMIT 10"
+sqlite3 .shared/n6/math_atlas.db "SELECT COUNT(*) FROM edges"
 ```
 Expected: Repo counts match JSON, star-graded hypotheses listed, edges > 0
 
 - [ ] **Step 5: Verify DOT graph**
 
-Run: `head -20 .shared/math_atlas.dot && wc -l .shared/math_atlas.dot`
+Run: `head -20 .shared/n6/math_atlas.dot && wc -l .shared/n6/math_atlas.dot`
 Expected: Valid DOT syntax starting with `digraph math_atlas {`

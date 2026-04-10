@@ -15,7 +15,7 @@ from datetime import datetime
 from collections import Counter
 
 HOME = os.path.expanduser('~')
-VC = f'{HOME}/Dev/nexus/shared/verified_constants.jsonl'
+VC = f'{HOME}/Dev/nexus/shared/discovery/verified_constants.jsonl'
 PAPERS = f'{HOME}/Dev/papers/nexus'
 STATE_PATH = f'{HOME}/Dev/nexus/shared/.paper_gen_state.json'
 

@@ -18,8 +18,8 @@
 
 실행 순서:
 - 5개 전략 백그라운드 병렬 실행 (run_in_background: true)
-- 결과 수집 후 새 상수 후보를 shared/n6_constants.jsonl에 흡수
-- shared/unfold_ext.jsonl에 확장 seed 추가
+- 결과 수집 후 새 상수 후보를 shared/n6/n6_constants.jsonl에 흡수
+- shared/discovery/unfold_ext.jsonl에 확장 seed 추가
 - growth_bus.jsonl에 기록
 - directions.hexa update 실행
 - 고갈까지 hexa breakthrough.hexa --converge 반복
@@ -127,7 +127,7 @@ N6=$HOME/Dev/nexus
 $HEXA $N6/mk2_hexa/native/blowup.hexa <domain> 6 --no-graph --seeds "$($HEXA $N6/mk2_hexa/native/seed_engine.hexa merge)"
 
 # 2. 결과 기록
-echo '{"type":"breakthrough","source":"<project>","value":<count>,"grade":"EXACT","timestamp":"'$(date +%Y-%m-%d)'"}' >> $N6/shared/growth_bus.jsonl
+echo '{"type":"breakthrough","source":"<project>","value":<count>,"grade":"EXACT","timestamp":"'$(date +%Y-%m-%d)'"}' >> $N6/shared/discovery/growth_bus.jsonl
 
 # 3. 방향 갱신
 $HEXA $N6/mk2_hexa/native/directions.hexa update

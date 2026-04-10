@@ -21,14 +21,14 @@ open ~/Dev/nexus/shared/dashboard.html
 ### Closure 상세 조회
 ```bash
 # 현재 카운트
-wc -l ~/Dev/nexus/shared/verified_constants.jsonl
+wc -l ~/Dev/nexus/shared/discovery/verified_constants.jsonl
 
 # Status 분포
 python3 -c "
 import json
 from collections import Counter
 c = Counter()
-for l in open('$HOME/Dev/nexus/shared/verified_constants.jsonl'):
+for l in open('$HOME/Dev/nexus/shared/discovery/verified_constants.jsonl'):
     c[json.loads(l).get('status','?')] += 1
 print(c.most_common())
 "
@@ -101,7 +101,7 @@ tail -f ~/Library/Logs/nexus/singularity-daemon.log
 tail -f ~/Library/Logs/nexus/auto-commit.log
 
 # self-improve 델타
-tail -5 ~/Dev/nexus/shared/self_improve_log.jsonl
+tail -5 ~/Dev/nexus/shared/discovery/self_improve_log.jsonl
 ```
 
 ## 🔄 수동 실행
@@ -152,7 +152,7 @@ bash ~/Dev/nexus/tools/auto-commit-push.sh
 2. `launchctl list | grep nexus` — 15 agents 확인
 3. `git log --oneline -10` — 최근 auto-commits
 4. `open ~/Dev/nexus/shared/dashboard.html` — 대시보드
-5. `tail ~/Dev/nexus/shared/self_improve_log.jsonl` — 델타 추이
+5. `tail ~/Dev/nexus/shared/discovery/self_improve_log.jsonl` — 델타 추이
 
 ---
 
@@ -174,8 +174,8 @@ touch shared/cycle/topology.jsonl
 
 ### verified_constants 되돌리기
 ```bash
-git log --oneline shared/verified_constants.jsonl  # 커밋 확인
-git checkout <sha> -- shared/verified_constants.jsonl
+git log --oneline shared/discovery/verified_constants.jsonl  # 커밋 확인
+git checkout <sha> -- shared/discovery/verified_constants.jsonl
 ```
 
 ---

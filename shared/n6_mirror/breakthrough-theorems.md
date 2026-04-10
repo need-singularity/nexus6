@@ -20386,7 +20386,7 @@ J₂=24: 시간, 프레임, 절기, 콘크리트, Golay, Leech...        8+ EXAC
 **n=28 대조 실패**: n=28이면 sigma(28)=56 -> 56차원 진단은 과적합이고 tau(28)=6으로 기존 프레임워크와 구별 불가. n/phi=28/12=2.33(비정수)으로 정밀도 배수 정의 불가.
 
 **등급**: Three stars — 6/6 EXACT. 12차원은 McKinsey 7S(7)+BSC(4)+포터 5Forces와 독립적으로 수렴하는 경영 진단 관행과 정합.
-**출처**: NEXUS-6 1022렌즈 레지스트리 (shared/lens_registry.json), McKinsey 7S (Peters & Waterman 1982), Kaplan & Norton BSC 1992.
+**출처**: NEXUS-6 1022렌즈 레지스트리 (shared/config/lens_registry.json), McKinsey 7S (Peters & Waterman 1982), Kaplan & Norton BSC 1992.
 - Cross-link: BT-3(sigma=12 에너지 스케일), BT-7(Egyptian 분배).
 
 ---
@@ -20458,7 +20458,7 @@ J₂=24: 시간, 프레임, 절기, 콘크리트, Golay, Leech...        8+ EXAC
 **n=28 대조 실패**: n=28이면 Egyptian 분해 1/2+1/4+1/7+1/14+1/28=1로 5계층 — 지식 분류가 과분할되어 직관성 상실. sigma(28)=56 에지/노드는 밀도 과다.
 
 **등급**: Three stars — 6/6 EXACT. Egyptian 3계층은 Bloom의 인지 분류 체계(지식/이해/적용)와 구조적 동형.
-**출처**: NEXUS-6 발견 그래프 (shared/growth_bus.jsonl), Bloom's Taxonomy 1956.
+**출처**: NEXUS-6 발견 그래프 (shared/discovery/growth_bus.jsonl), Bloom's Taxonomy 1956.
 - Cross-link: BT-7(Egyptian fraction), BT-6(Golay-Leech 지식 격자).
 
 ---
@@ -20554,7 +20554,7 @@ J₂=24: 시간, 프레임, 절기, 콘크리트, Golay, Leech...        8+ EXAC
 **n=28 대조 실패**: n=28이면 sopfr(28)=11 계층 — 렌즈 설계가 11단계로 과분할되어 각 계층의 의미 구분 불가.
 
 **등급**: Three stars — 6/6 EXACT. 렌즈 5계층은 광학 렌즈 설계의 Seidel 5수차(구면/코마/비점/상면만곡/왜곡)와 구조적 동형.
-**출처**: NEXUS-6 렌즈 레지스트리 (shared/lens_registry.json, 1022종), tools/nexus/src/telescope/lenses/ (181 .rs).
+**출처**: NEXUS-6 렌즈 레지스트리 (shared/config/lens_registry.json, 1022종), tools/nexus/src/telescope/lenses/ (181 .rs).
 - Cross-link: BT-6(Golay-Leech), BT-558(sigma=12 진단).
 
 ---
@@ -21050,7 +21050,7 @@ Anima 서비스 10개에서 phi=2(감정 극성, 수면/각성, 의식/비의식
 
 **등급**: Three stars -- 7/7 EXACT.
 **출처**: Gottman J, *Why Marriages Succeed or Fail* (1994); Edmondson A, *Admin Sci Q* 44(2) (1999) 350; Tuckman B, *Psych Bull* 63 (1965) 384; Gross J & John O, *J Pers Soc Psych* 85 (2003) 348.
-- Cross-link: BT-580 신규, CDO 정의(shared/core.json).
+- Cross-link: BT-580 신규, CDO 정의(shared/config/core.json).
 
 ---
 
@@ -21065,7 +21065,7 @@ Anima 서비스 10개에서 phi=2(감정 극성, 수면/각성, 의식/비의식
 | # | 항목 | 값 | n=6 수식 | 출처 | 판정 |
 |---|------|-----|----------|------|------|
 | 1 | 지도 레이어 수 (객관/주관) | 2 | phi=2 | 설계값 | EXACT |
-| 2 | 현실 지도 노드 수 | 342 = phi x 171 | phi=2 인수 | nexus/shared/reality_map.json v8.0; 342=2x171, phi=2 이중 레이어 투사 구조 | EXACT |
+| 2 | 현실 지도 노드 수 | 342 = phi x 171 | phi=2 인수 | nexus/shared/discovery/reality_map.json v8.0; 342=2x171, phi=2 이중 레이어 투사 구조 | EXACT |
 | 3 | VIX(공포 지수) 장기 중앙값 | 19.97 -> 20 | J2-tau=20 | CBOE VIX 1990~2023 중앙값 19.97; Whaley (2009) *J Portfolio Mgmt* 확인 | EXACT |
 | 4 | 감정 기본 카테고리 (Ekman) | 6 | n=6 | Ekman (1992) | EXACT |
 | 5 | Plutchik 감정 바퀴 기본축 | 8 | sigma-tau=8 | Plutchik (1980) | EXACT |

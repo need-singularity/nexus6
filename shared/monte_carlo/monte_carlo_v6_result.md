@@ -2,7 +2,7 @@
 
 - 실행일: 2026-04-08 (재실행)
 - 스크립트: `shared/monte_carlo_n6_pi_e_phi.py` (NATURAL_ONLY=1 지원 추가)
-- 데이터: `shared/reality_map.json` (version v8.0, 492 노드)
+- 데이터: `shared/discovery/reality_map.json` (version v8.0, 492 노드)
   - **주의**: 사용자 요청은 "v6.0 247노드"였으나 리포에 별도 v6.0 스냅샷 없음. 가장 가까운 백업 `reality_map.json.bak-t12-20260408-032047`도 v8.0/342노드. 현 최신본(v8.0/492)에 `origin=natural` 필터를 적용하여 재실행.
   - origin=natural 노드: 276 / 492
   - 정수 measured 타겟 (natural only): **227개 (고유 53)** — "247" 요청치와 근접
@@ -45,4 +45,4 @@
 
 - `shared/monte_carlo_n6_pi_e_phi.py` — NATURAL_ONLY 환경변수 지원
 - `shared/n6_uniqueness_pi_e_phi.json` — natural-only MC 원시 결과
-- `shared/monte_carlo_v6_result.md` — 본 보고서 (재작성)
+- `shared/monte_carlo/monte_carlo_v6_result.md` — 본 보고서 (재작성)

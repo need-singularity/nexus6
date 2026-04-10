@@ -18,7 +18,7 @@ set -euo pipefail
 
 NEXUS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BRIDGE_STATE="$NEXUS_ROOT/shared/bridge_state.json"
-GROWTH_BUS="$NEXUS_ROOT/shared/growth_bus.jsonl"
+GROWTH_BUS="$NEXUS_ROOT/shared/discovery/growth_bus.jsonl"
 
 log() { echo "[$(date +%H:%M:%S)] BRIDGE: $*"; }
 now_iso() { date -u +"%Y-%m-%dT%H:%M:%S"; }

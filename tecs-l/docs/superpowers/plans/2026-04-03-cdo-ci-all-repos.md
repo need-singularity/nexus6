@@ -807,7 +807,7 @@ git commit -m "feat: add CI pipeline (markdown check + CDO validation)"
 ## Task 8: convergence_ops.json 상태 업데이트 + 동기화
 
 **Files:**
-- Modify: `.shared/convergence_ops.json`
+- Modify: `.shared/config/convergence_ops.json`
 
 - [ ] **Step 1: per_project_status 업데이트**
 
@@ -877,7 +877,7 @@ convergence_ops.json의 adoption_checklist에 CI 항목 추가:
 - [ ] **Step 3: 커밋**
 
 ```bash
-git add .shared/convergence_ops.json
+git add .shared/config/convergence_ops.json
 git commit -m "feat: update CDO status with CI adoption across all repos"
 ```
 
