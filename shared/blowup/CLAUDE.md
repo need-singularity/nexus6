@@ -15,7 +15,7 @@ root         commands.hexa  todo.hexa(bd323be 자연창발 통합)
 
 quantum 축: modules,lens,ouroboros,seed 횡단
 
-ex: hexa blowup.hexa math 3 --no-graph
+ex: hexa blowup.hexa math 3
     hexa blowup.hexa <d> <n> --seeds "$(hexa seed_engine.hexa merge)"
 
 parent: ../CLAUDE.md → "blowup"
