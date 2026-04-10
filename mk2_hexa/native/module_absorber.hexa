@@ -1,0 +1,335 @@
+// mk2_hexa/native/module_absorber.hexa — Automatic Module Absorber
+// 목적: module_discoverer가 만든 후보를 자동으로 .hexa로 쓰고 컴파일·실행·등록한다.
+// 입력: shared/module_candidates.jsonl
+// 출력: mk2_hexa/native/<name>.hexa, shared/module_absorbed_log.jsonl, shared/growth_bus.jsonl
+//
+// CLI:
+//   hexa module_absorber.hexa run [N]       상위 N개 후보 흡수 (기본 5)
+//   hexa module_absorber.hexa report        흡수 상태 리포트
+
+// ─── 경로 상수 ─────────────────────────────────────────────────
+let _home = exec("printenv HOME").trim()
+let _root = _home + "/Dev/nexus"
+let _native = _root + "/mk2_hexa/native"
+let _registry = _root + "/shared/theory_registry.jsonl"
+let _candidates = _root + "/shared/module_candidates.jsonl"
+let _absorbed = _root + "/shared/module_absorbed_log.jsonl"
+let _rejected = _root + "/shared/module_rejected_log.jsonl"
+let _bus = _root + "/shared/growth_bus.jsonl"
+let _hexa_bin = _home + "/Dev/hexa-lang/target/release/hexa"
+
+comptime const DEFAULT_N = 5
+comptime const COMPILE_TIMEOUT = 10
+
+// ─── 유틸리티 ──────────────────────────────────────────────────
+fn now_ts() -> string { exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim() }
+
+pure fn parse_int(s: string) -> int {
+    if s == "" { return 0 }
+    let mut n = ""
+    let mut i = 0
+    while i < s.len() {
+        let ch = s[i]
+        if ch == "0" || ch == "1" || ch == "2" || ch == "3" || ch == "4" || ch == "5" || ch == "6" || ch == "7" || ch == "8" || ch == "9" { n = n + ch }
+        i = i + 1
+    }
+    if n == "" { return 0 }
+    to_int(n)
+}
+
+pure fn parse_float(s: string) -> float {
+    if s == "" { return 0.0 }
+    let mut clean = ""
+    let mut i = 0
+    while i < s.len() {
+        let ch = s[i]
+        if ch == "0" || ch == "1" || ch == "2" || ch == "3" || ch == "4" || ch == "5" || ch == "6" || ch == "7" || ch == "8" || ch == "9" || ch == "." || ch == "-" { clean = clean + ch }
+        i = i + 1
+    }
+    if clean == "" { return 0.0 }
+    to_float(clean)
+}
+
+// JSON 필드 추출 (scalar/string)
+pure fn extract_field(line: string, field: string) -> string {
+    let needle = "\"" + field + "\":"
+    if !line.contains(needle) { return "" }
+    let rest = line.split(needle)[1]
+    // 문자열이면 첫 따옴표 뒤 ~ 다음 escape 되지 않은 따옴표까지
+    if rest.starts_with("\"") {
+        // template 에는 \" 가 들어있을 수 있으므로 수동 파싱
+        let mut out = ""
+        let mut i = 1
+        let mut done = false
+        while i < rest.len() && !done {
+            let ch = rest[i]
+            if ch == "\\" && i + 1 < rest.len() {
+                let nx = rest[i + 1]
+                if nx == "n" { out = out + "\n" }
+                else if nx == "t" { out = out + "\t" }
+                else if nx == "r" { out = out + "\r" }
+                else if nx == "\"" { out = out + "\"" }
+                else if nx == "\\" { out = out + "\\" }
+                else { out = out + nx }
+                i = i + 2
+            } else if ch == "\"" {
+                done = true
+            } else {
+                out = out + ch
+                i = i + 1
+            }
+        }
+        return out
+    }
+    // scalar
+    let mut out = ""
+    let mut i = 0
+    while i < rest.len() {
+        let ch = rest[i]
+        if ch == "," || ch == "}" || ch == " " || ch == "\n" { break }
+        out = out + ch
+        i = i + 1
+    }
+    out
+}
+
+// ─── 후보 구조체 ──────────────────────────────────────────────
+struct Candidate {
+    name: string,
+    kind: string,
+    domain: string,
+    parent: string,
+    reason: string,
+    score: float,
+    template: string
+}
+
+fn load_candidates() -> list {
+    let mut out = []
+    if !file_exists(_candidates) {
+        println("[WARN] candidates 파일 없음: " + _candidates)
+        return out
+    }
+    let lines = read_file(_candidates).split("\n")
+    let mut i = 0
+    while i < lines.len() {
+        let line = lines[i].trim()
+        if line != "" && line.starts_with("{") {
+            out = out + [Candidate {
+                name: extract_field(line, "name"),
+                kind: extract_field(line, "kind"),
+                domain: extract_field(line, "domain"),
+                parent: extract_field(line, "parent"),
+                reason: extract_field(line, "reason"),
+                score: parse_float(extract_field(line, "score")),
+                template: extract_field(line, "template")
+            }]
+        }
+        i = i + 1
+    }
+    out
+}
+
+// score 내림차순 정렬 (간단 삽입 정렬)
+fn sort_by_score(lst: list) -> list {
+    let mut sorted = []
+    let mut i = 0
+    while i < lst.len() {
+        let cur = lst[i]
+        let mut inserted = false
+        let mut nl = []
+        let mut j = 0
+        while j < sorted.len() {
+            if !inserted && cur.score > sorted[j].score {
+                nl = nl + [cur]
+                inserted = true
+            }
+            nl = nl + [sorted[j]]
+            j = j + 1
+        }
+        if !inserted { nl = nl + [cur] }
+        sorted = nl
+        i = i + 1
+    }
+    sorted
+}
+
+// 이미 흡수된 이름 리스트 로드
+fn load_absorbed_names() -> list {
+    let mut out = []
+    if !file_exists(_absorbed) { return out }
+    let lines = read_file(_absorbed).split("\n")
+    let mut i = 0
+    while i < lines.len() {
+        let line = lines[i].trim()
+        if line != "" && line.starts_with("{") {
+            let nm = extract_field(line, "module")
+            if nm != "" { out = out + [nm] }
+        }
+        i = i + 1
+    }
+    out
+}
+
+pure fn list_has_str(lst: list, v: string) -> bool {
+    let mut i = 0
+    while i < lst.len() {
+        if lst[i] == v { return true }
+        i = i + 1
+    }
+    false
+}
+
+// ─── 흡수 로직 ────────────────────────────────────────────────
+// 단일 후보 흡수 시도. 성공 시 true
+fn absorb_one(c: Candidate, ts: string) -> bool {
+    let filepath = _native + "/" + c.name + ".hexa"
+
+    // 파일이 이미 존재하면 skip
+    if file_exists(filepath) {
+        println("  [SKIP]   " + c.name + " (file already exists)")
+        return false
+    }
+
+    // 1. 파일 쓰기
+    try {
+        write_file(filepath, c.template)
+    } catch e {
+        println("  [ERR]    " + c.name + " write failed: " + to_string(e))
+        return false
+    }
+
+    // 2. 컴파일/실행 시도 (exit code를 마지막 라인에 기록)
+    let cmd = _hexa_bin + " " + filepath + " 2>&1; echo __EXIT__$?"
+    let mut trimmed = ""
+    try { trimmed = exec(cmd).trim() } catch e { trimmed = "exec_error: " + to_string(e) }
+
+    // 에러 패턴 감지: exit code != 0 또는 error/panic 키워드
+    let failed = trimmed.contains("error[") || trimmed.contains("panic") || trimmed.contains("exec_error") || !trimmed.contains("__EXIT__0")
+
+    if failed {
+        // rejected log
+        let esc_out = trimmed.replace("\"", "'").replace("\n", " | ")
+        let rej = "{\"ts\":\"" + ts + "\",\"module\":\"" + c.name + "\",\"kind\":\"" + c.kind + "\",\"error\":\"" + esc_out + "\"}\n"
+        if file_exists(_rejected) {
+            try { append_file(_rejected, rej) } catch e { write_file(_rejected, read_file(_rejected) + rej) }
+        } else {
+            write_file(_rejected, rej)
+        }
+        // 파일 삭제 (실패한 것은 남기지 않음)
+        exec("rm -f " + filepath)
+        println("  [REJECT] " + c.name + " compile failed")
+        return false
+    }
+
+    // 3. 성공 — growth_bus 이벤트
+    let bus_line = "{\"type\":\"module_absorbed\",\"module\":\"" + c.name + "\",\"kind\":\"" + c.kind + "\",\"domain\":\"" + c.domain + "\",\"parent\":\"" + c.parent + "\",\"absorbed_by\":\"module_absorber.hexa\",\"score\":" + to_string(c.score) + ",\"ts\":\"" + ts + "\"}\n"
+    try { append_file(_bus, bus_line) } catch e { println("  [WARN] bus append: " + to_string(e)) }
+
+    // 4. absorbed log
+    let abs_line = "{\"ts\":\"" + ts + "\",\"module\":\"" + c.name + "\",\"kind\":\"" + c.kind + "\",\"domain\":\"" + c.domain + "\",\"parent\":\"" + c.parent + "\",\"score\":" + to_string(c.score) + ",\"status\":\"absorbed\"}\n"
+    if file_exists(_absorbed) {
+        try { append_file(_absorbed, abs_line) } catch e { write_file(_absorbed, read_file(_absorbed) + abs_line) }
+    } else {
+        write_file(_absorbed, abs_line)
+    }
+
+    // 5. theory_registry에 직접 append (간이 엔트리)
+    let reg_line = "{\"name\":\"" + c.name + "\",\"cat\":\"" + c.kind + "\",\"domain\":\"" + c.domain + "\",\"fp\":\"\",\"loc\":0,\"desc\":\"auto-absorbed by module_absorber\"}\n"
+    try { append_file(_registry, reg_line) } catch e { println("  [WARN] registry append: " + to_string(e)) }
+
+    println("  [OK]     " + c.name + " absorbed (score=" + to_string(c.score) + ")")
+    true
+}
+
+// ─── run 명령 ─────────────────────────────────────────────────
+fn cmd_run(n: int) {
+    println("")
+    println("+=======================================================+")
+    println("|   Module Absorber - Autonomous Absorption Engine      |")
+    println("+=======================================================+")
+    println("  candidates: " + _candidates)
+    println("  target N  : " + to_string(n))
+    println("")
+
+    let all = load_candidates()
+    println("  [1/4] total candidates: " + to_string(all.len()))
+    if all.len() == 0 {
+        println("  [WARN] no candidates. run module_discoverer.hexa scan first.")
+        return
+    }
+
+    let sorted = sort_by_score(all)
+    println("  [2/4] sorted by score (desc)")
+
+    let absorbed_names = load_absorbed_names()
+    println("  [3/4] already absorbed: " + to_string(absorbed_names.len()))
+    println("")
+
+    let ts = now_ts()
+    let mut ok = 0
+    let mut fail = 0
+    let mut tried = 0
+    let mut i = 0
+    while i < sorted.len() && tried < n {
+        let c = sorted[i]
+        if !list_has_str(absorbed_names, c.name) {
+            tried = tried + 1
+            if absorb_one(c, ts) { ok = ok + 1 }
+            else { fail = fail + 1 }
+        }
+        i = i + 1
+    }
+
+    println("")
+    println("  [4/4] results: tried=" + to_string(tried) + " ok=" + to_string(ok) + " fail=" + to_string(fail))
+    println("")
+}
+
+// ─── report 명령 ──────────────────────────────────────────────
+fn cmd_report() {
+    println("=== module_absorber report ===")
+    let mut abs_n = 0
+    let mut rej_n = 0
+    if file_exists(_absorbed) {
+        let lines = read_file(_absorbed).split("\n")
+        let mut i = 0
+        while i < lines.len() {
+            let ln = lines[i].trim()
+            if ln != "" && ln.starts_with("{") { abs_n = abs_n + 1 }
+            i = i + 1
+        }
+    }
+    if file_exists(_rejected) {
+        let lines = read_file(_rejected).split("\n")
+        let mut i = 0
+        while i < lines.len() {
+            let ln = lines[i].trim()
+            if ln != "" && ln.starts_with("{") { rej_n = rej_n + 1 }
+            i = i + 1
+        }
+    }
+    println("  absorbed: " + to_string(abs_n))
+    println("  rejected: " + to_string(rej_n))
+    if file_exists(_absorbed) && abs_n > 0 {
+        println("")
+        println("  recent absorbed (last 10):")
+        let tail_out = exec("tail -n 10 " + _absorbed + " 2>/dev/null")
+        println(tail_out)
+    }
+}
+
+// ─── CLI entrypoint (top-level) ───────────────────────────────
+let argv = args()
+if argv.len() < 3 {
+    println("usage: module_absorber.hexa [run [N] | report]")
+} else {
+    let cmd = argv[2]
+    if cmd == "run" {
+        let n = if argv.len() >= 4 { parse_int(argv[3]) } else { DEFAULT_N }
+        let use_n = if n <= 0 { DEFAULT_N } else { n }
+        cmd_run(use_n)
+    }
+    else if cmd == "report" { cmd_report() }
+    else { println("[ERR] unknown: " + cmd) }
+}

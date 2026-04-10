@@ -1,0 +1,344 @@
+// Ported from tecs-l/n6-replication/src/n6_replication/runner.py (315L Python).
+// Original pytest + ProcessPoolExecutor replaced with:
+//   Tier 1 pytest   -> `python3 -m pytest` subprocess (FFI avoided)
+//   ProcessPool     -> `xargs -P N` shell parallelism
+//   JSON persist    -> json_stringify + write_file
+//
+// Non-ported bits live in runner.hexanoport (per-test hook via pytest plugin API).
+//
+// Deps: registry.hexa (load_all), parser.hexa (parse_output).
+// Because hexa lacks module imports, we inline the minimal surface we need.
+
+fn repo_root() {
+    let home = env_var("HOME")
+    return home + "/Dev/nexus/tecs-l"
+}
+
+fn n6rep_root() {
+    return repo_root() + "/n6-replication"
+}
+
+fn results_dir() {
+    return n6rep_root() + "/results"
+}
+
+fn tier1_dir() {
+    return n6rep_root() + "/tests/tier1"
+}
+
+fn registry_dir() {
+    return n6rep_root() + "/registry"
+}
+
+// ---------------------------------------------------------------------------
+// Helpers: result record + timestamp
+// ---------------------------------------------------------------------------
+
+fn mk_result(script_id, tier, entry, status, grades, p_vals, pass_n, fail_n, duration, snippet, err) {
+    let repo = if has_key(entry, "repo") { entry["repo"] } else { "TECS-L" }
+    return #{
+        "id": script_id,
+        "tier": tier,
+        "repo": repo,
+        "status": status,
+        "grade_counts": grades,
+        "p_values": p_vals,
+        "pass_count": pass_n,
+        "fail_count": fail_n,
+        "duration_seconds": duration,
+        "stdout_snippet": snippet,
+        "error": err,
+    }
+}
+
+fn timestamp() {
+    let mut out = ""
+    try { out = to_string(exec("date +%Y-%m-%d-%H%M%S")) } catch e {}
+    return out.trim()
+}
+
+// ---------------------------------------------------------------------------
+// Minimal parser — enough for status + counts (mirror parser.hexa)
+// ---------------------------------------------------------------------------
+
+fn parse_stdout(stdout) {
+    let mut pass_n = 0
+    let mut fail_n = 0
+    let lines = stdout.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let line = lines[i]
+        if line.contains("PASS") || line.contains("✅") { pass_n = pass_n + 1 }
+        if line.contains("FAIL") || line.contains("❌") { fail_n = fail_n + 1 }
+        i = i + 1
+    }
+    let green = len(stdout.split("🟩")) - 1
+    let orange = len(stdout.split("🟧")) - 1
+    let white = len(stdout.split("⚪")) - 1
+    let black = len(stdout.split("⬛")) - 1
+    let mut status = "parse_error"
+    if pass_n > 0 && fail_n == 0 { status = "pass" }
+    if fail_n > 0 { status = "fail" }
+    return #{
+        "status": status,
+        "pass_count": pass_n,
+        "fail_count": fail_n,
+        "grades": #{"green": green, "orange": orange, "white": white, "black": black},
+        "p_values": [],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tier 1: pytest via subprocess (no plugin hook — single summary record)
+// Original Python used pytest.main([...], plugins=[_Collector()]) for per-test
+// structured results. We instead invoke `python3 -m pytest --tb=short -q` and
+// parse the exit code + summary line. Per-test collector is DEFERRED.
+// ---------------------------------------------------------------------------
+
+fn run_tier1(verbose) {
+    let mut results = []
+    let tdir = tier1_dir()
+    if !file_exists(tdir) {
+        let r0 = mk_result("tier1_summary", 1, #{"repo": "n6-replication"}, "skip", #{}, [], 0, 0, 0.0, "tier1 dir missing: " + tdir, "no tier1 tests")
+        results = results.push(r0)
+        return results
+    }
+
+    let t0 = clock()
+    let v_flag = if verbose { " -v" } else { " -q --no-header" }
+    let cmd = "cd " + n6rep_root() + " && /usr/bin/python3 -m pytest " + tdir + v_flag + " --tb=short > /tmp/n6_tier1.out 2>&1 ; echo RC=$?"
+    let mut out = ""
+    try { out = to_string(exec(cmd)) } catch e {}
+    let elapsed = clock() - t0
+
+    let mut stdout = ""
+    try { stdout = to_string(exec("cat /tmp/n6_tier1.out")) } catch e {}
+
+    let ok = out.contains("RC=0")
+    let status = if ok { "pass" } else { "fail" }
+    let err = if ok { "" } else { ("pytest exit: " + out.trim()) }
+
+    let pass_n = if ok { 1 } else { 0 }
+    let fail_n = if ok { 0 } else { 1 }
+    let snippet = stdout.substring(0, 500)
+    let r1 = mk_result("tier1_summary", 1, #{"repo": "n6-replication"}, status, #{}, [], pass_n, fail_n, elapsed, snippet, err)
+    results = results.push(r1)
+    return results
+}
+
+// ---------------------------------------------------------------------------
+// Tier 2+3: registry scripts via subprocess
+// ---------------------------------------------------------------------------
+
+fn load_registry(tiers) {
+    let mut scripts = []
+    let mut i = 0
+    while i < len(tiers) {
+        let path = registry_dir() + "/tier" + to_string(tiers[i]) + ".json"
+        if file_exists(path) {
+            let mut parsed = []
+            try { parsed = json_parse(read_file(path)) } catch e {}
+            let mut j = 0
+            while j < len(parsed) {
+                scripts = scripts.push(parsed[j])
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    return scripts
+}
+
+fn run_script(entry, verbose) {
+    let script_path = if has_key(entry, "path") { entry["path"] } else { "" }
+    let tier = if has_key(entry, "tier") { entry["tier"] } else { 2 }
+    let timeout_s = if has_key(entry, "timeout") { entry["timeout"] } else { 120 }
+    let script_id = if has_key(entry, "id") { entry["id"] } else { script_path }
+    let cwd = if has_key(entry, "repo_path") { entry["repo_path"] } else { repo_root() }
+    let abs_script = cwd + "/" + script_path
+
+    if !file_exists(abs_script) {
+        return mk_result(script_id, tier, entry, "error", #{}, [], 0, 0, 0.0, "", "Script not found: " + abs_script)
+    }
+
+    let t0 = clock()
+    let cmd = "cd " + cwd + " && PYTHONPATH=" + cwd + " timeout " + to_string(timeout_s) + " /usr/bin/python3 " + abs_script + " > /tmp/n6_rs.out 2>&1 ; echo RC=$?"
+    let mut rc_out = ""
+    try { rc_out = to_string(exec(cmd)) } catch e {}
+    let elapsed = clock() - t0
+
+    let mut stdout = ""
+    try { stdout = to_string(exec("cat /tmp/n6_rs.out")) } catch e {}
+
+    if rc_out.contains("RC=124") {
+        let snip = stdout.substring(0, 500)
+        let tmsg = "Timed out after " + to_string(timeout_s) + "s"
+        return mk_result(script_id, tier, entry, "timeout", #{}, [], 0, 0, elapsed, snip, tmsg)
+    }
+
+    let parsed = parse_stdout(stdout)
+    let ok = rc_out.contains("RC=0")
+    let mut status = parsed["status"]
+    if !ok && status == "parse_error" { status = "error" }
+    if ok && status == "parse_error" { status = "pass" }
+
+    let err = if status == "pass" { "" } else { stdout.substring(0, 500) }
+
+    let snip2 = stdout.substring(0, 500)
+    return mk_result(script_id, tier, entry, status, parsed["grades"], parsed["p_values"], parsed["pass_count"], parsed["fail_count"], elapsed, snip2, err)
+}
+
+fn run_tier2_3(tiers, parallel, gpu, verbose) {
+    let scripts = load_registry(tiers)
+    let mut runnable = []
+    let mut skipped = []
+    let mut i = 0
+    while i < len(scripts) {
+        let s = scripts[i]
+        let needs_gpu = if has_key(s, "requires_gpu") { s["requires_gpu"] == true } else { false }
+        if needs_gpu && !gpu {
+            skipped = skipped.push(s)
+        } else {
+            runnable = runnable.push(s)
+        }
+        i = i + 1
+    }
+
+    let mut results = []
+    let mut k = 0
+    while k < len(skipped) {
+        let s = skipped[k]
+        let sid = if has_key(s, "id") { s["id"] } else { "unknown" }
+        let t = if has_key(s, "tier") { s["tier"] } else { 2 }
+        let rskip = mk_result(sid, t, s, "skip", #{}, [], 0, 0, 0.0, "", "requires_gpu=True but gpu=False")
+        results = results.push(rskip)
+        k = k + 1
+    }
+
+    // Parallel execution: hexa has no native thread pool, so we emulate via
+    // xargs -P when parallel > 1. Since each run_script call is a subprocess
+    // launch anyway, the overhead of serial-from-hexa is minor; for true
+    // wall-clock parallelism we build a shell command list and dispatch once.
+    //
+    // For safety + correctness we ALWAYS run serially from hexa but mark the
+    // parallel knob as advisory — true parallel dispatch with structured
+    // result capture requires a JSON shim on disk per worker.
+    let mut j = 0
+    while j < len(runnable) {
+        let r = run_script(runnable[j], verbose)
+        results = results.push(r)
+        if verbose {
+            println("  " + to_string(r["status"]) + "  " + to_string(r["id"]))
+        }
+        j = j + 1
+    }
+
+    return results
+}
+
+// ---------------------------------------------------------------------------
+// Persist + CLI
+// ---------------------------------------------------------------------------
+
+fn save_results(results) {
+    let rdir = results_dir()
+    try { exec("mkdir -p " + rdir) } catch e {}
+    let stamp = timestamp()
+    let path = rdir + "/" + stamp + ".json"
+    let body = json_stringify(results)
+    write_file(path, body)
+    return path
+}
+
+// CLI: runner.hexa [--tier1] [--tier 2 3] [--parallel N] [--gpu] [--verbose] [--save]
+let raw = args()
+let mut cli_args = []
+let mut ai = 2
+while ai < len(raw) {
+    cli_args = cli_args.push(raw[ai])
+    ai = ai + 1
+}
+
+let mut do_tier1 = false
+let mut tiers = [2, 3]
+let mut parallel = 1
+let mut gpu = false
+let mut verbose = false
+let mut save = false
+let mut i2 = 0
+while i2 < len(cli_args) {
+    let a = cli_args[i2]
+    if a == "--tier1" { do_tier1 = true }
+    if a == "--tier" {
+        tiers = []
+        let mut j2 = i2 + 1
+        while j2 < len(cli_args) {
+            let x = cli_args[j2]
+            if x.starts_with("--") { break }
+            tiers = tiers.push(to_int(x))
+            j2 = j2 + 1
+        }
+        i2 = j2 - 1
+    }
+    if a == "--parallel" && i2 + 1 < len(cli_args) {
+        parallel = to_int(cli_args[i2 + 1])
+        i2 = i2 + 1
+    }
+    if a == "--gpu" { gpu = true }
+    if a == "--verbose" { verbose = true }
+    if a == "--save" { save = true }
+    i2 = i2 + 1
+}
+
+println("n6-replication runner.hexa")
+println("  tiers:    " + to_string(tiers))
+println("  parallel: " + to_string(parallel) + " (advisory)")
+println("  gpu:      " + to_string(gpu))
+println("")
+
+let mut all_results = []
+
+if do_tier1 {
+    println("=== Tier 1 (pytest) ===")
+    let t1 = run_tier1(verbose)
+    let mut i3 = 0
+    while i3 < len(t1) {
+        all_results = all_results.push(t1[i3])
+        i3 = i3 + 1
+    }
+}
+
+println("=== Tier 2+3 (subprocess) ===")
+let t23 = run_tier2_3(tiers, parallel, gpu, verbose)
+let mut i4 = 0
+while i4 < len(t23) {
+    all_results = all_results.push(t23[i4])
+    i4 = i4 + 1
+}
+
+let mut pass_n = 0
+let mut fail_n = 0
+let mut skip_n = 0
+let mut to_n = 0
+let mut err_n = 0
+let mut ii = 0
+while ii < len(all_results) {
+    let s = all_results[ii]["status"]
+    if s == "pass" { pass_n = pass_n + 1 }
+    if s == "fail" { fail_n = fail_n + 1 }
+    if s == "skip" { skip_n = skip_n + 1 }
+    if s == "timeout" { to_n = to_n + 1 }
+    if s == "error" { err_n = err_n + 1 }
+    ii = ii + 1
+}
+
+println("")
+let summary = "SUMMARY: " + to_string(len(all_results)) + " total | " + to_string(pass_n) + " pass, " + to_string(fail_n) + " fail, " + to_string(to_n) + " timeout, " + to_string(err_n) + " error, " + to_string(skip_n) + " skip"
+println(summary)
+
+if save {
+    let path = save_results(all_results)
+    println("Saved: " + path)
+}
+
+exit(if fail_n + err_n + to_n == 0 { 0 } else { 1 })

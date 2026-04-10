@@ -1,0 +1,511 @@
+// mk2_hexa/native/module_discoverer.hexa — Autonomous Module Discoverer
+// 목적: shared/theory_registry, shared/dse/domains/*.toml, growth_bus tail을 스캔해서
+//       "있으면 좋은데 아직 없는" 메타-모듈 후보를 자동 생성한다.
+// 알고리즘: 갭 점수 = DSE 빈도(1.0) × growth_bus 최근 활동(log) × 부모 유사도
+// 출력: shared/module_candidates.jsonl
+//
+// CLI:
+//   hexa module_discoverer.hexa scan           전체 갭 분석 + 후보 생성
+//   hexa module_discoverer.hexa list           현재 후보 보기
+
+// ─── 경로 상수 ─────────────────────────────────────────────────
+let _home = exec("printenv HOME").trim()
+let _root = _home + "/Dev/nexus"
+let _native = _root + "/mk2_hexa/native"
+let _registry = _root + "/shared/theory_registry.jsonl"
+let _dse_dir = _root + "/shared/dse/domains"
+let _bus = _root + "/shared/growth_bus.jsonl"
+let _candidates = _root + "/shared/module_candidates.jsonl"
+
+comptime const BUS_TAIL = 5000
+comptime const MIN_GAP_SCORE = 0.1
+
+// ─── 유틸리티 ──────────────────────────────────────────────────
+fn now_ts() -> string { exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim() }
+
+pure fn extract_field(line: string, field: string) -> string {
+    let needle = "\"" + field + "\":"
+    if !line.contains(needle) { return "" }
+    let rest = line.split(needle)[1].trim()
+    if rest.starts_with("\"") {
+        let parts = rest.split("\"")
+        if parts.len() >= 2 { return parts[1] }
+    }
+    let mut result = ""
+    let mut i = 0
+    while i < rest.len() {
+        let ch = rest[i]
+        if ch == "," || ch == "}" || ch == " " || ch == "\n" { break }
+        result = result + ch
+        i = i + 1
+    }
+    result
+}
+
+pure fn list_has_str(lst: list, val: string) -> bool {
+    let mut i = 0
+    while i < lst.len() {
+        if lst[i] == val { return true }
+        i = i + 1
+    }
+    false
+}
+
+// 하이픈/언더스코어/점 정규화 → 식별자 친화
+fn sanitize(s: string) -> string {
+    let r1 = s.replace("-", "_")
+    let r2 = r1.replace(".", "_")
+    let r3 = r2.replace(" ", "_")
+    r3
+}
+
+// 두 문자열 접두 공유 길이 (부모 유사도 근사)
+pure fn common_prefix_len(a: string, b: string) -> int {
+    let mut i = 0
+    let lim = if a.len() < b.len() { a.len() } else { b.len() }
+    while i < lim {
+        if a[i] != b[i] { return i }
+        i = i + 1
+    }
+    i
+}
+
+// ─── 레지스트리 로드 ──────────────────────────────────────────
+struct RegEntry { name: string, cat: string, domain: string }
+
+fn load_registry() -> list {
+    let mut out = []
+    if !file_exists(_registry) {
+        println("[WARN] theory_registry 없음: " + _registry)
+        return out
+    }
+    let lines = read_file(_registry).split("\n")
+    let mut i = 0
+    while i < lines.len() {
+        let line = lines[i].trim()
+        if line != "" && line.starts_with("{") {
+            out = out + [RegEntry {
+                name: extract_field(line, "name"),
+                cat: extract_field(line, "cat"),
+                domain: extract_field(line, "domain")
+            }]
+        }
+        i = i + 1
+    }
+    out
+}
+
+// wave_a9 카테고리(wave_r1)에 이미 있는 도메인 집합
+fn existing_wave_domains(reg: list) -> list {
+    let mut out = []
+    let mut i = 0
+    while i < reg.len() {
+        let r = reg[i]
+        if r.cat == "wave_r1" || r.cat == "wave_core" {
+            if !list_has_str(out, r.domain) { out = out + [r.domain] }
+        }
+        i = i + 1
+    }
+    out
+}
+
+// 전체 레지스트리 이름 리스트
+fn all_names(reg: list) -> list {
+    let mut out = []
+    let mut i = 0
+    while i < reg.len() { out = out + [reg[i].name]; i = i + 1 }
+    out
+}
+
+// ─── DSE 도메인 로드 ──────────────────────────────────────────
+fn load_dse_domains() -> list {
+    let raw = exec("ls " + _dse_dir + "/*.toml 2>/dev/null").trim()
+    if raw == "" { return [] }
+    let files = raw.split("\n")
+    let mut out = []
+    let mut i = 0
+    while i < files.len() {
+        let fp = files[i].trim()
+        if fp != "" {
+            let parts = fp.split("/")
+            let fname = parts[parts.len() - 1]
+            let name = fname.split(".toml")[0]
+            out = out + [name]
+        }
+        i = i + 1
+    }
+    out
+}
+
+// ─── growth_bus tail: 최근 도메인 빈도 ─────────────────────────
+struct DomFreq { domain: string, count: int }
+
+fn load_recent_domain_freq() -> list {
+    // 병렬 리스트로 관리: dom_names[i] 의 카운트는 dom_counts[i]
+    let mut dom_names = []
+    let mut dom_counts = []
+    let raw = exec("tail -n " + to_string(BUS_TAIL) + " " + _bus + " 2>/dev/null")
+    if raw == "" {
+        return [dom_names, dom_counts]
+    }
+    let lines = raw.split("\n")
+    let mut i = 0
+    while i < lines.len() {
+        let line = lines[i].trim()
+        if line != "" && line.starts_with("{") {
+            let d = extract_field(line, "domain")
+            if d != "" {
+                let mut found = false
+                let mut j = 0
+                while j < dom_names.len() {
+                    if dom_names[j] == d {
+                        dom_counts[j] = dom_counts[j] + 1
+                        found = true
+                        break
+                    }
+                    j = j + 1
+                }
+                if !found {
+                    dom_names = dom_names + [d]
+                    dom_counts = dom_counts + [1]
+                }
+            }
+        }
+        i = i + 1
+    }
+    [dom_names, dom_counts]
+}
+
+// freqs = [dom_names, dom_counts] 병렬 리스트
+pure fn freq_lookup(freqs: list, dom: string) -> int {
+    if freqs.len() < 2 { return 0 }
+    let names = freqs[0]
+    let counts = freqs[1]
+    let mut i = 0
+    while i < names.len() {
+        if names[i] == dom { return counts[i] }
+        i = i + 1
+    }
+    0
+}
+
+pure fn freq_len(freqs: list) -> int {
+    if freqs.len() < 2 { return 0 }
+    freqs[0].len()
+}
+
+pure fn freq_name_at(freqs: list, i: int) -> string {
+    freqs[0][i]
+}
+
+pure fn freq_count_at(freqs: list, i: int) -> int {
+    freqs[1][i]
+}
+
+// ─── 갭 점수 계산 ──────────────────────────────────────────────
+// score = dse_in(1.0 if present) * (1 + recent_activity/100) * parent_similarity
+pure fn parent_similarity(dom: string, existing: list) -> float {
+    if existing.len() == 0 { return 0.3 }
+    let mut best = 0.0
+    let mut i = 0
+    while i < existing.len() {
+        let cp = common_prefix_len(dom, existing[i])
+        let mn = if dom.len() < existing[i].len() { dom.len() } else { existing[i].len() }
+        let denom = if mn == 0 { 1 } else { mn }
+        let sim = to_float(cp) / to_float(denom)
+        if sim > best { best = sim }
+        i = i + 1
+    }
+    // 최저 0.3, 최대 1.0 (완전 분리 도메인도 후보로 삼기 위함)
+    if best < 0.3 { 0.3 } else { best }
+}
+
+// ─── 템플릿 생성 ──────────────────────────────────────────────
+// wave_a9 간단 emergent 마킹 (기존 wave_a9_<domain>.hexa 패턴)
+fn template_wave_a9(dom: string) -> string {
+    let name = "wave_a9_" + sanitize(dom)
+    let l1 = "// " + name + ".hexa - auto-discovered A9 pulse module"
+    let l2 = "fn domain() -> string { return \"" + dom + "\" }"
+    let l3 = "fn pulse() -> string { return \"A9:\" + domain() + \":resonance\" }"
+    let l4 = "fn main() { println(\"{\\\"module\\\":\\\"" + name + "\\\",\\\"wave\\\":\\\"A9\\\",\\\"status\\\":\\\"emergent\\\",\\\"discovered\\\":true}\") }"
+    let l5 = "main()"
+    l1 + "\n" + l2 + "\n" + l3 + "\n" + l4 + "\n" + l5 + "\n"
+}
+
+// wave_core 약간 확장된 버전 (파동 방정식 스텁)
+fn template_wave_core(dom: string) -> string {
+    let name = "wave_" + sanitize(dom)
+    let l1 = "// " + name + ".hexa - auto-discovered wave core stub"
+    let l2 = "fn domain() -> string { return \"" + dom + "\" }"
+    let l3 = "fn amplitude() -> float { return 1.0 }"
+    let l4 = "fn frequency() -> float { return 6.0 }"
+    let l5 = "fn main() {"
+    let l6 = "    let amp = amplitude()"
+    let l7 = "    let freq = frequency()"
+    let l8 = "    println(\"{\\\"module\\\":\\\"" + name + "\\\",\\\"wave\\\":\\\"CORE\\\",\\\"domain\\\":\\\"" + dom + "\\\",\\\"amp\\\":\" + to_string(amp) + \",\\\"freq\\\":\" + to_string(freq) + \",\\\"discovered\\\":true}\")"
+    let l9 = "}"
+    let l10 = "main()"
+    l1 + "\n" + l2 + "\n" + l3 + "\n" + l4 + "\n" + l5 + "\n" + l6 + "\n" + l7 + "\n" + l8 + "\n" + l9 + "\n" + l10 + "\n"
+}
+
+// blowup_variant (도메인 상수 확장)
+fn template_blowup_variant(dom: string) -> string {
+    let name = "blowup_" + sanitize(dom)
+    let l1 = "// " + name + ".hexa - auto-discovered blowup variant"
+    let l2 = "fn domain() -> string { return \"" + dom + "\" }"
+    let l3 = "fn constant() -> int { return 6 }"
+    let l4 = "fn main() {"
+    let l5 = "    let n = constant()"
+    let l6 = "    println(\"{\\\"module\\\":\\\"" + name + "\\\",\\\"blowup\\\":\\\"variant\\\",\\\"domain\\\":\\\"" + dom + "\\\",\\\"n\\\":\" + to_string(n) + \",\\\"discovered\\\":true}\")"
+    let l7 = "}"
+    let l8 = "main()"
+    l1 + "\n" + l2 + "\n" + l3 + "\n" + l4 + "\n" + l5 + "\n" + l6 + "\n" + l7 + "\n" + l8 + "\n"
+}
+
+// interference_pair (두 도메인 쌍)
+fn template_interference_pair(a: string, b: string) -> string {
+    let name = "interference_" + sanitize(a) + "_x_" + sanitize(b)
+    let l1 = "// " + name + ".hexa - auto-discovered interference pair"
+    let l2 = "fn domain_a() -> string { return \"" + a + "\" }"
+    let l3 = "fn domain_b() -> string { return \"" + b + "\" }"
+    let l4 = "fn main() {"
+    let l5 = "    let a = domain_a()"
+    let l6 = "    let b = domain_b()"
+    let l7 = "    println(\"{\\\"module\\\":\\\"" + name + "\\\",\\\"type\\\":\\\"interference_pair\\\",\\\"a\\\":\\\"\" + a + \"\\\",\\\"b\\\":\\\"\" + b + \"\\\",\\\"discovered\\\":true}\")"
+    let l8 = "}"
+    let l9 = "main()"
+    l1 + "\n" + l2 + "\n" + l3 + "\n" + l4 + "\n" + l5 + "\n" + l6 + "\n" + l7 + "\n" + l8 + "\n" + l9 + "\n"
+}
+
+// 템플릿을 JSON string에 안전하게 임베드 (escape)
+pure fn json_escape(s: string) -> string {
+    let mut out = ""
+    let mut i = 0
+    while i < s.len() {
+        let ch = s[i]
+        if ch == "\\" { out = out + "\\\\" }
+        else if ch == "\"" { out = out + "\\\"" }
+        else if ch == "\n" { out = out + "\\n" }
+        else if ch == "\r" { out = out + "\\r" }
+        else if ch == "\t" { out = out + "\\t" }
+        else { out = out + ch }
+        i = i + 1
+    }
+    out
+}
+
+// ─── 후보 레코드 ──────────────────────────────────────────────
+struct Candidate {
+    name: string,
+    kind: string,
+    domain: string,
+    parent: string,
+    reason: string,
+    score: float,
+    template: string
+}
+
+fn candidate_json(c: Candidate, ts: string) -> string {
+    let p1 = "{\"ts\":\"" + ts + "\",\"name\":\"" + c.name + "\""
+    let p2 = ",\"kind\":\"" + c.kind + "\",\"domain\":\"" + c.domain + "\""
+    let p3 = ",\"parent\":\"" + c.parent + "\",\"reason\":\"" + c.reason + "\""
+    let p4 = ",\"score\":" + to_string(c.score)
+    let p5 = ",\"template\":\"" + json_escape(c.template) + "\"}"
+    p1 + p2 + p3 + p4 + p5
+}
+
+// ─── scan 명령 ────────────────────────────────────────────────
+fn cmd_scan() {
+    println("")
+    println("+=======================================================+")
+    println("|   Module Discoverer - Autonomous Gap Scanner          |")
+    println("+=======================================================+")
+    println("  registry: " + _registry)
+    println("  dse dir : " + _dse_dir)
+    println("  bus tail: " + to_string(BUS_TAIL))
+    println("")
+
+    let reg = load_registry()
+    println("  [1/5] registry modules: " + to_string(reg.len()))
+
+    let existing = existing_wave_domains(reg)
+    println("  [2/5] existing wave domains: " + to_string(existing.len()))
+
+    let all_nm = all_names(reg)
+
+    let dse = load_dse_domains()
+    println("  [3/5] DSE domains: " + to_string(dse.len()))
+
+    let freqs = load_recent_domain_freq()
+    println("  [4/5] recent bus domains: " + to_string(freq_len(freqs)))
+
+    // 갭 찾기: DSE에 있지만 sanitize 이름이 레지스트리에 없는 도메인
+    let ts = now_ts()
+    let mut candidates = []
+    let mut di = 0
+    while di < dse.len() {
+        let dom = dse[di]
+        let san = sanitize(dom)
+        let wave_name = "wave_a9_" + san
+        let wave_core_name = "wave_" + san
+        let blowup_name = "blowup_" + san
+
+        let has_wave_a9 = list_has_str(all_nm, wave_name)
+        let has_wave_core = list_has_str(all_nm, wave_core_name)
+        let has_blowup = list_has_str(all_nm, blowup_name)
+
+        if !has_wave_a9 {
+            let freq = freq_lookup(freqs, dom)
+            let act = 1.0 + to_float(freq) / 100.0
+            let psim = parent_similarity(san, existing)
+            let score = 1.0 * act * psim
+            if score >= MIN_GAP_SCORE {
+                candidates = candidates + [Candidate {
+                    name: wave_name,
+                    kind: "wave_a9",
+                    domain: dom,
+                    parent: "wave_a9_algebra",
+                    reason: "dse_domain_without_wave_a9_module",
+                    score: score,
+                    template: template_wave_a9(dom)
+                }]
+            }
+        }
+
+        // wave_core 후보: 활동 >= 1 이고 없을 때 (활성 도메인만)
+        if !has_wave_core && freq_lookup(freqs, dom) >= 1 {
+            let act = 1.0 + to_float(freq_lookup(freqs, dom)) / 50.0
+            let psim = parent_similarity(san, existing)
+            let score = 1.2 * act * psim
+            candidates = candidates + [Candidate {
+                name: wave_core_name,
+                kind: "wave_core",
+                domain: dom,
+                parent: "wave_core",
+                reason: "active_domain_without_wave_core",
+                score: score,
+                template: template_wave_core(dom)
+            }]
+        }
+
+        // blowup_variant: DSE가 존재하면 저점수로 추가 (탐험)
+        if !has_blowup && di % 7 == 0 {
+            let score = 0.4 * parent_similarity(san, existing)
+            if score >= MIN_GAP_SCORE {
+                candidates = candidates + [Candidate {
+                    name: blowup_name,
+                    kind: "blowup_variant",
+                    domain: dom,
+                    parent: "blowup",
+                    reason: "blowup_coverage_expansion",
+                    score: score,
+                    template: template_blowup_variant(dom)
+                }]
+            }
+        }
+
+        di = di + 1
+    }
+
+    // interference_pair: 활동이 있는 도메인끼리 한 쌍씩
+    let mut act_doms = []
+    let mut fi = 0
+    let fn_count = freq_len(freqs)
+    while fi < fn_count {
+        if freq_count_at(freqs, fi) >= 5 {
+            act_doms = act_doms + [freq_name_at(freqs, fi)]
+        }
+        fi = fi + 1
+    }
+    if act_doms.len() >= 2 {
+        let mut ai = 0
+        while ai < act_doms.len() {
+            let mut bj = ai + 1
+            while bj < act_doms.len() {
+                let a = act_doms[ai]
+                let b = act_doms[bj]
+                let name = "interference_" + sanitize(a) + "_x_" + sanitize(b)
+                if !list_has_str(all_nm, name) {
+                    candidates = candidates + [Candidate {
+                        name: name,
+                        kind: "interference_pair",
+                        domain: a + "+" + b,
+                        parent: "interference_map",
+                        reason: "active_domain_pair",
+                        score: 0.8,
+                        template: template_interference_pair(a, b)
+                    }]
+                }
+                bj = bj + 1
+            }
+            ai = ai + 1
+        }
+    }
+
+    println("  [5/5] candidates generated: " + to_string(candidates.len()))
+    println("")
+
+    // 파일 기록 (append 모드)
+    let mut buf = ""
+    let mut ci = 0
+    while ci < candidates.len() {
+        buf = buf + candidate_json(candidates[ci], ts) + "\n"
+        ci = ci + 1
+    }
+
+    if buf != "" {
+        if file_exists(_candidates) {
+            try { append_file(_candidates, buf) } catch e { write_file(_candidates, read_file(_candidates) + buf) }
+        } else {
+            write_file(_candidates, buf)
+        }
+        println("  [OK] wrote " + to_string(candidates.len()) + " candidates -> " + _candidates)
+    } else {
+        println("  [INFO] no candidates meeting score threshold.")
+    }
+
+    // 상위 10개 프리뷰
+    println("")
+    println("  Top candidates (first 10):")
+    let mut pi = 0
+    let lim = if candidates.len() < 10 { candidates.len() } else { 10 }
+    while pi < lim {
+        let c = candidates[pi]
+        println("    [" + to_string(pi + 1) + "] " + c.kind + "  " + c.name + "  score=" + to_string(c.score))
+        pi = pi + 1
+    }
+    println("")
+}
+
+fn cmd_list() {
+    if !file_exists(_candidates) {
+        println("[INFO] no candidates file yet. run scan first.")
+        return
+    }
+    let lines = read_file(_candidates).split("\n")
+    let mut i = 0
+    let mut n = 0
+    while i < lines.len() {
+        let line = lines[i].trim()
+        if line != "" && line.starts_with("{") {
+            n = n + 1
+            let nm = extract_field(line, "name")
+            let kd = extract_field(line, "kind")
+            let sc = extract_field(line, "score")
+            println("  [" + to_string(n) + "] " + kd + "  " + nm + "  score=" + sc)
+        }
+        i = i + 1
+    }
+    println("  total candidates: " + to_string(n))
+}
+
+// ─── CLI entrypoint (top-level) ───────────────────────────────
+let argv = args()
+if argv.len() < 3 {
+    println("usage: module_discoverer.hexa [scan|list]")
+} else {
+    let cmd = argv[2]
+    if cmd == "scan" { cmd_scan() }
+    else if cmd == "list" { cmd_list() }
+    else { println("[ERR] unknown: " + cmd) }
+}

@@ -1,0 +1,204 @@
+// Ported from tecs-l/n6-replication/src/n6_replication/fetcher.py
+// Shallow-clone / update external repos and generate tier3.json.
+// Python subprocess -> hexa exec().
+
+// Repo list loaded from env or a JSON sidecar to avoid hardcoding (SSOT rule).
+// Falls back to the original 6 repos if no override present.
+
+fn default_repos() {
+    return [
+        #{"name": "SEDI",              "url": "https://github.com/need-singularity/sedi.git"},
+        #{"name": "anima",             "url": "https://github.com/need-singularity/anima.git"},
+        #{"name": "ph-training",       "url": "https://github.com/need-singularity/ph-training.git"},
+        #{"name": "golden-moe",        "url": "https://github.com/need-singularity/golden-moe.git"},
+        #{"name": "conscious-lm",      "url": "https://github.com/need-singularity/conscious-lm.git"},
+        #{"name": "energy-efficiency", "url": "https://github.com/need-singularity/energy-efficiency.git"}
+    ]
+}
+
+fn load_repos() {
+    let home = env_var("HOME")
+    let override_path = home + "/Dev/nexus/shared/n6_replication_repos.json"
+    if file_exists(override_path) {
+        let content = read_file(override_path)
+        let mut parsed = []
+        try { parsed = json_parse(content) } catch e {}
+        if len(parsed) > 0 { return parsed }
+    }
+    return default_repos()
+}
+
+fn fetch_dir() {
+    let home = env_var("HOME")
+    return home + "/.n6-replication/repos"
+}
+
+fn state_file() {
+    let home = env_var("HOME")
+    return home + "/.n6-replication/fetch_state.json"
+}
+
+fn registry_dir() {
+    let home = env_var("HOME")
+    return home + "/Dev/nexus/tecs-l/n6-replication/registry"
+}
+
+fn load_state() {
+    let path = state_file()
+    if !file_exists(path) { return #{} }
+    let content = read_file(path)
+    let mut parsed = #{}
+    try { parsed = json_parse(content) } catch e {}
+    return parsed
+}
+
+fn save_state(state) {
+    let path = state_file()
+    // Ensure parent dir exists
+    try { exec("mkdir -p " + fetch_dir()) } catch e {}
+    write_file(path, json_stringify(state))
+}
+
+fn clone_repo(name, url, verbose) {
+    let dest = fetch_dir() + "/" + name
+    if file_exists(dest) {
+        if verbose { println("[fetch] " + name + ": already exists, skipping clone") }
+        return true
+    }
+    if verbose { println("[fetch] " + name + ": cloning " + url) }
+    let mut out = ""
+    try {
+        out = to_string(exec("git clone --depth 1 " + url + " " + dest + " 2>&1"))
+    } catch e {
+        return false
+    }
+    return file_exists(dest)
+}
+
+fn pull_repo(name, verbose) {
+    let dest = fetch_dir() + "/" + name
+    if !file_exists(dest) {
+        if verbose { println("[fetch] " + name + ": not cloned yet, skipping pull") }
+        return false
+    }
+    if verbose { println("[fetch] " + name + ": pulling latest") }
+    let mut out = ""
+    try {
+        out = to_string(exec("cd " + dest + " && git pull --ff-only 2>&1"))
+    } catch e {
+        return false
+    }
+    return true
+}
+
+fn scan_tier3() {
+    let repos = load_repos()
+    let mut entries = []
+    let mut i = 0
+    while i < len(repos) {
+        let name = repos[i]["name"]
+        let verify_dir = fetch_dir() + "/" + name + "/verify"
+        if file_exists(verify_dir) {
+            // list .py scripts via exec
+            let mut ls_out = ""
+            try { ls_out = to_string(exec("ls -1 " + verify_dir + "/*.py 2>/dev/null")) } catch e {}
+            let files = ls_out.trim().split("\n")
+            let mut k = 0
+            while k < len(files) {
+                let path = files[k].trim()
+                if path != "" {
+                    let parts = path.split("/")
+                    let fname = parts[len(parts) - 1]
+                    entries = entries.push(#{
+                        "id": name + "/" + fname,
+                        "repo": name,
+                        "path": "verify/" + fname,
+                        "abs_path": path,
+                        "depends_on": [],
+                        "requires_gpu": false,
+                        "timeout": 120,
+                        "tier": 3
+                    })
+                }
+                k = k + 1
+            }
+        }
+        i = i + 1
+    }
+    try { exec("mkdir -p " + registry_dir()) } catch e {}
+    write_file(registry_dir() + "/tier3.json", json_stringify(entries))
+    return entries
+}
+
+fn fetch_all(verbose) {
+    try { exec("mkdir -p " + fetch_dir()) } catch e {}
+    let mut state = load_state()
+    let now_s = now()
+    let repos = load_repos()
+    let mut i = 0
+    while i < len(repos) {
+        let name = repos[i]["name"]
+        let url = repos[i]["url"]
+        let ok = clone_repo(name, url, verbose)
+        state[name] = #{
+            "url": url,
+            "status": if ok { "cloned" } else { "failed" },
+            "last_fetch": now_s,
+            "path": fetch_dir() + "/" + name
+        }
+        i = i + 1
+    }
+    save_state(state)
+    let entries = scan_tier3()
+    if verbose {
+        println("[fetch] Scanned " + to_string(len(entries)) + " tier-3 scripts across " + to_string(len(repos)) + " repos")
+    }
+    return state
+}
+
+fn update_all(verbose) {
+    let mut state = load_state()
+    let now_s = now()
+    let repos = load_repos()
+    let mut i = 0
+    while i < len(repos) {
+        let name = repos[i]["name"]
+        let url = repos[i]["url"]
+        let dest = fetch_dir() + "/" + name
+        let mut ok = false
+        if file_exists(dest) {
+            ok = pull_repo(name, verbose)
+            state[name] = #{
+                "url": url,
+                "status": if ok { "updated" } else { "update_failed" },
+                "last_fetch": now_s,
+                "path": dest
+            }
+        } else {
+            if verbose { println("[fetch] " + name + ": not yet cloned, cloning now") }
+            ok = clone_repo(name, url, verbose)
+            state[name] = #{
+                "url": url,
+                "status": if ok { "cloned" } else { "failed" },
+                "last_fetch": now_s,
+                "path": dest
+            }
+        }
+        i = i + 1
+    }
+    save_state(state)
+    let entries = scan_tier3()
+    if verbose {
+        println("[fetch] Scanned " + to_string(len(entries)) + " tier-3 scripts across " + to_string(len(repos)) + " repos")
+    }
+    return state
+}
+
+// Smoke test: dry-run (list repos only)
+let repos = load_repos()
+println("fetcher: " + to_string(len(repos)) + " repos configured")
+let mut i = 0
+while i < len(repos) {
+    println("  " + repos[i]["name"] + " -> " + repos[i]["url"])
+    i = i + 1
+}
