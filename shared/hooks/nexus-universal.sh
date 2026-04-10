@@ -19,9 +19,10 @@ if [ -x "$HOOK_BIN" ]; then
   exit 0
 fi
 
-# fallback: Python
+# fallback: hexa
 source "$HOOK_DIR/ensure-symlinks.sh" 2>/dev/null || true
-RESULT=$(echo "$INPUT" | /usr/bin/python3 "$HOOK_DIR/nexus-engine.py" --mode agent 2>/dev/null) || true
+HEXA="${HOME}/Dev/hexa-lang/target/release/hexa"
+RESULT=$(echo "$INPUT" | "$HEXA" "$HOOK_DIR/nexus-engine.hexa" agent 2>/dev/null) || true
 if [ -n "$RESULT" ]; then
   echo "$RESULT"
 else

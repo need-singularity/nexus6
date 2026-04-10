@@ -26,9 +26,8 @@ HEXA_HOOK="${HOME}/Dev/nexus/mk2_hexa/native/hook.hexa"
 
 if [ -x "$HEXA" ] && [ -f "$HEXA_HOOK" ]; then
   RESULT=$(echo "$INPUT" | "$HEXA" "$HEXA_HOOK" pre-commit 2>/dev/null) || true
-else
-  # hexa 없으면 Python fallback 유지
-  RESULT=$(echo "$INPUT" | /usr/bin/python3 "$HOOK_DIR/nexus-engine.py" --mode pre-commit 2>/dev/null) || true
+elif [ -x "$HEXA" ]; then
+  RESULT=$(echo "$INPUT" | "$HEXA" "$HOOK_DIR/nexus-engine.hexa" pre-commit 2>/dev/null) || true
 fi
 if [ -n "$RESULT" ]; then
   echo "$RESULT"
