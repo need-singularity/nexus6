@@ -1,0 +1,130 @@
+// ═══════════════════════════════════════════════════════════
+// atlas_health.hexa — atlas.n6 무결성 헬스체크 (readonly)
+// R1 HEXA-FIRST 준수 (이전 atlas_health.sh 대체)
+// 용도: orphan refs / 중복 / 깨진 라인 / grade 분포 감지
+// 사용: hexa atlas_health.hexa [path] [--verbose]
+// ═══════════════════════════════════════════════════════════
+
+let a = args()
+let mut _ATLAS_PATH = "shared/n6/atlas.n6"
+let mut verbose = false
+let mut ai: i64 = 1
+while ai < len(a) {
+    let tok = a[ai]
+    if tok == "--verbose" || tok == "-v" { verbose = true }
+    else if !tok.starts_with("-") { _ATLAS_PATH = tok }
+    ai = ai + 1
+}
+
+if !file_exists(_ATLAS_PATH) {
+    println("error: atlas file not found: " + _ATLAS_PATH)
+    println("usage: hexa atlas_health.hexa [path] [--verbose]")
+    exit(1)
+}
+
+// ─── 통계 수집 (exec 경유 fast path) ───
+fn _stat_size(path: string) -> i64 {
+    let mut r = 0
+    try {
+        let raw = to_string(exec("stat -f '%z' " + path + " 2>/dev/null || stat -c '%s' " + path + " 2>/dev/null")).trim()
+        r = to_int(raw)
+    } catch e {}
+    return r
+}
+
+fn _grep_count(path: string, pattern: string) -> i64 {
+    let mut r = 0
+    try {
+        let raw = to_string(exec("grep -c '" + pattern + "' " + path + " 2>/dev/null || echo 0")).trim()
+        r = to_int(raw)
+    } catch e {}
+    return r
+}
+
+fn _line_count(path: string) -> i64 {
+    let mut r = 0
+    try {
+        let raw = to_string(exec("wc -l < " + path + " 2>/dev/null")).trim()
+        r = to_int(raw)
+    } catch e {}
+    return r
+}
+
+let size_bytes = _stat_size(_ATLAS_PATH)
+let lines = _line_count(_ATLAS_PATH)
+let nodes = _grep_count(_ATLAS_PATH, "\"type\":\"node\"")
+let edges = _grep_count(_ATLAS_PATH, "\"type\":\"edge\"")
+
+println("=== atlas.n6 health: " + _ATLAS_PATH + " ===")
+println("  size:          " + to_string(size_bytes) + " bytes")
+println("  lines:         " + to_string(lines))
+println("  nodes:         " + to_string(nodes))
+println("  edges:         " + to_string(edges))
+
+// ─── 유일 node ID 카운트 (awk 경유) ───
+let node_uniq_raw = to_string(exec("awk -F'\"id\":\"' '/\"type\":\"node\"/{split($2,a,\"\\\"\");print a[1]}' " + _ATLAS_PATH + " 2>/dev/null | sort -u | wc -l")).trim()
+let mut node_uniq: i64 = 0
+try { node_uniq = to_int(node_uniq_raw) } catch e {}
+println("  unique nodes:  " + to_string(node_uniq) + " (dup node IDs: " + to_string(nodes - node_uniq) + ")")
+
+// ─── edge 참조 (from/to) 유일 집합 ───
+let refs_uniq_raw = to_string(exec("awk '/\"type\":\"edge\"/ { match($0, /\"from\":\"[^\"]*\"/); if(RSTART>0) print substr($0, RSTART+8, RLENGTH-9); match($0, /\"to\":\"[^\"]*\"/); if(RSTART>0) print substr($0, RSTART+6, RLENGTH-7) }' " + _ATLAS_PATH + " 2>/dev/null | sort -u | wc -l")).trim()
+let mut refs_uniq: i64 = 0
+try { refs_uniq = to_int(refs_uniq_raw) } catch e {}
+println("  unique refs:   " + to_string(refs_uniq))
+
+// ─── orphan refs 분리 (virtual n6-/bt-/foundation- 제외) ───
+let orphans_tmp = "/tmp/.atlas_health_orphans." + to_string(exec("echo $$").trim())
+try { exec("bash", ["-c",
+    "comm -23 <(awk '/\"type\":\"edge\"/ { match($0, /\"from\":\"[^\"]*\"/); if(RSTART>0) print substr($0, RSTART+8, RLENGTH-9); match($0, /\"to\":\"[^\"]*\"/); if(RSTART>0) print substr($0, RSTART+6, RLENGTH-7) }' " + _ATLAS_PATH + " | sort -u) <(awk -F'\"id\":\"' '/\"type\":\"node\"/{split($2,a,\"\\\"\");print a[1]}' " + _ATLAS_PATH + " | sort -u) > " + orphans_tmp + " 2>/dev/null"
+]) } catch e {}
+let virtual_count_raw = to_string(exec("grep -cE '^(n6-|bt-|foundation-)' " + orphans_tmp + " 2>/dev/null || echo 0")).trim()
+let mut virtual_count: i64 = 0
+try { virtual_count = to_int(virtual_count_raw) } catch e {}
+let real_orphans_raw = to_string(exec("grep -cvE '^(n6-|bt-|foundation-)' " + orphans_tmp + " 2>/dev/null || echo 0")).trim()
+let mut real_orphans: i64 = 0
+try { real_orphans = to_int(real_orphans_raw) } catch e {}
+println("  virtual refs:  " + to_string(virtual_count) + " (n6-/bt-/foundation- 유도 체인)")
+let orphan_status = if real_orphans == 0 { "✓" } else { "⚠️" }
+println("  real orphans:  " + to_string(real_orphans) + "  " + orphan_status)
+
+if verbose && real_orphans > 0 {
+    println("  --- first 20 real orphans ---")
+    let sample = to_string(exec("grep -vE '^(n6-|bt-|foundation-)' " + orphans_tmp + " 2>/dev/null | head -20"))
+    let sample_lines = sample.split("\n")
+    for sl in sample_lines { if sl.trim() != "" { println("    " + sl) } }
+}
+try { exec("rm -f " + orphans_tmp) } catch e {}
+
+// ─── 중복 데이터 라인 ───
+let dup_raw = to_string(exec("grep -v '^#' " + _ATLAS_PATH + " 2>/dev/null | grep -v '^$' | sort | uniq -d | wc -l")).trim()
+let mut dup: i64 = 0
+try { dup = to_int(dup_raw) } catch e {}
+let dup_status = if dup == 0 { "✓" } else { "⚠️" }
+println("  dup data lines:" + to_string(dup) + "  " + dup_status)
+
+// ─── malformed ───
+let mal_raw = to_string(exec("awk '/^$|^#/{next} /^[[:space:]]/{next} /^[{]/{next} /^@/{next} {c++} END{print c+0}' " + _ATLAS_PATH + " 2>/dev/null")).trim()
+let mut mal: i64 = 0
+try { mal = to_int(mal_raw) } catch e {}
+let mal_status = if mal == 0 { "✓" } else { "⚠️" }
+println("  malformed:     " + to_string(mal) + "  " + mal_status)
+
+if verbose && mal > 0 {
+    println("  --- first 10 malformed ---")
+    let sample = to_string(exec("awk '/^$|^#/{next} /^[[:space:]]/{next} /^[{]/{next} /^@/{next} {print NR\": \"$0}' " + _ATLAS_PATH + " 2>/dev/null | head -10"))
+    let sample_lines = sample.split("\n")
+    for sl in sample_lines { if sl.trim() != "" { println("    " + sl) } }
+}
+
+// ─── Grade 분포 (hypothesis [N?] 포함) ───
+println("  grade dist:")
+let grade_raw = to_string(exec("grep -oE '\\[[0-9]+[?*]*\\]' " + _ATLAS_PATH + " 2>/dev/null | sort | uniq -c | sort -rn | head -12"))
+let grade_lines = grade_raw.split("\n")
+for gl in grade_lines { if gl.trim() != "" { println("    " + gl.trim()) } }
+
+// ─── exit code ───
+if real_orphans > 0 || dup > 0 || mal > 0 {
+    exit(1)
+}
+exit(0)
