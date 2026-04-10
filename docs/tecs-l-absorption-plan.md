@@ -308,3 +308,63 @@ mk2_hexa/native/
 - [ ] hexa-lang 팀과 Track B 블로커 해제 협의 (FFI vs native tensor)
 - [ ] Track C 면제 대상 Zenodo 백업 상태 확인
 - [ ] 최종 삭제 에이전트에게 체크리스트 전달 (Track A 100% 포팅 후)
+
+## Progress 2026-04-10 (iter 4) — 검토 + 안전 체크리스트 갱신
+
+### 스캐너 블로커 (iter3 미해제 항목) 재확인
+
+| 파일 | 상태 | 비고 |
+|------|------|------|
+| module_counter.hexa | ✅ 해제됨 | `find ... -name '*.hexa' -type f` 사용 (line 46) |
+| theory_registry.hexa | ✅ 해제됨 | `cmd_build` 재귀 스캔 (line 108) |
+| todo.hexa | ✅ 해제됨 | `find ... -name '*.hexa' -type f` (lines 91, 430) |
+| sync_docs.hexa | ✅ 해제됨 | `find ... -name '*.hexa'` (line 68) |
+| anima_loop.hexa | ✅ 무관 | `.hexa` 스캔 코드 부재 (지난 iter 잘못 식별) |
+| session_briefing.hexa | ⚠️ println-only | hardcode 3건 존재(L66-68) — exec 호출 아님, 동적 lookup 시도 후 사용자 revert. 출력 메시지로만 사용되므로 git mv 후 수동 갱신 권장 |
+
+→ **스캐너 블로커는 iter3 시점부터 이미 해제 상태**. 본 iter4 시점에서 신규 작업 불요.
+
+### 레지스트리 drift
+
+- `shared/discovery/theory_registry.jsonl`: 664행 (mtime 19:04)
+- 실제 `mk2_hexa/native/*.hexa`: 674개
+- **drift: 10개** — 다른 에이전트 진행 중 신규 모듈 미등록. 다음 quiet window 에 `theory_registry.hexa build` 재실행 권장 (다른 에이전트와 충돌 없는 시점).
+
+### Track C 면제 대상 Zenodo 백업 검증
+
+| 디렉토리 | 파일 | 백업 상태 | 비고 |
+|---------|------|-----------|------|
+| `tecs-l/zenodo/manifest.json` | — | ✅ 활성 | 5 카테고리 / **123 papers** (tecs-l 33 + anima 39 + sedi 20 + brainwire 2 + n6 29) |
+| `tecs-l/zenodo/upload-results-*.json` | 6 files | ✅ 56 prod DOI | sandbox 0건, 모두 production. 샘플: `10.5281/zenodo.19341174` |
+| `tecs-l/results/` | 30 files / 84MB | ⚠️ 일부만 | 매니페스트는 papers 추적 — raw results (.md/.txt) 별도 업로드 여부 미검증. 삭제 전 별도 백업 필요 |
+| `tecs-l/eeg/` | 2 files | 🟢 면제 가능 | 의존: brainflow + scipy + matplotlib. 데이터 파일 부재 (수집기/분석기 코드만). Zenodo 백업 불요 |
+| `tecs-l/serve/` | 4 files | 🟢 면제 가능 | 의존: fastapi + torch + conscious_lm/growing_conscious_lm. Track B 블로커와 연결 — torch 결정 후 재검토 |
+| `tecs-l/zenodo/` 자체 | 13 files | ✅ 자기참조 | 업로드 스크립트 자체 (papers 리포 통합 대기) |
+
+### Track A 진행 (다른 에이전트 자동 포팅, 본 세션 read-only)
+
+| 디렉토리 | iter3 → now | Δ |
+|---------|------------|---|
+| tecs-l/verify .py | 141 → 138 | −3 |
+| tecs-l/experiments .py | 158 → 140 | −18 |
+| tecs-l/math .py | 62 → 61 | −1 |
+| tecs-l 합계 .py | 462 → **425** | −37 |
+| mk2_hexa/native .hexa | 684 → **703** | +19 |
+| .hexanoport markers | 102 → **142** | +40 |
+
+흡수율 추정: ~29% → **~35%** (425 잔여 / 650 원본).
+
+### 본 세션 안전 작업 결과
+
+1. ✅ **R14 평면 → 카테고리 경로 P1 일괄 치환** — 299 files / 763 substitutions (commit f607a78). 심링크 204개는 안전망으로 유지. tecs-l 내부 12개 .md 도 갱신됨.
+2. ⚠️ **session_briefing.hexa S1 시도 → 사용자 revert** — println 정적 유지 결정. 향후 git mv 시점에 수동 갱신.
+3. ✅ **theory_registry 인프라 검증** — `cmd_build` 정상, 재귀 스캔 사용. drift 10건 보고.
+4. ✅ **Track C Zenodo 백업 검증** — 위 표 참조. results/ 만 추가 백업 필요.
+
+### 다음 액션 우선순위 (재정렬)
+
+1. 🔴 **`tecs-l/results/` 84MB 백업 결정** — 삭제 전 필수. 옵션: (a) Zenodo 추가 업로드, (b) papers 리포 이관, (c) 외부 stoarge.
+2. 🟡 **`theory_registry.hexa build` quiet-window 재실행** — drift 0 복원.
+3. 🟡 **verify/ + math/ Track A 추가 포팅** — 다른 에이전트와 lock 협의 필요.
+4. 🟢 **torch FFI / native tensor 결정 요청 — hexa-lang 팀** — 180건 차단 해제 단일 키.
+5. 🟢 **카테고리별 git mv 일괄** — theory_registry build 정상 작동 확인 후. desc 필드는 build 가 자동 갱신.
