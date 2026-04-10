@@ -8,7 +8,7 @@ INPUT=$(cat)
 bash "$HOOK_DIR/growth-tick.sh" post-bash </dev/null >/dev/null 2>&1 &
 
 HEXA="$HOME/Dev/nexus/shared/scripts/bin/hexa"
-HEXA_HOOK="$HOME/Dev/nexus/mk2_hexa/native/hook.hexa"
+HEXA_HOOK="$HOME/Dev/nexus/shared/hooks/hook.hexa"
 
 # mk2 hexa only
 RESULT=$(echo "$INPUT" | "$HEXA" "$HEXA_HOOK" post-bash 2>/dev/null) || true

@@ -11,7 +11,7 @@ export BRIDGE_MSG
 
 # hexa 배너 엔진 (Python 대체)
 HEXA="${HOME}/Dev/nexus/shared/scripts/bin/hexa"
-HEXA_BANNER="${HOME}/Dev/nexus/mk2_hexa/native/banner.hexa"
+HEXA_BANNER="${HOME}/Dev/nexus/shared/hooks/banner.hexa"
 
 if [ -x "$HEXA" ] && [ -f "$HEXA_BANNER" ]; then
   HEXA_DIR="$(dirname "$HEXA_BANNER")"

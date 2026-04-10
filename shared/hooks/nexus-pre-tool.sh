@@ -8,8 +8,8 @@ INPUT=$(cat)
 bash "$HOOK_DIR/growth-tick.sh" pre-tool </dev/null >/dev/null 2>&1 &
 
 HEXA="${HOME}/Dev/nexus/shared/scripts/bin/hexa"
-HEXA_JSON_FIELD="${HOME}/Dev/nexus/mk2_hexa/native/json_field.hexa"
-HEXA_HOOK="${HOME}/Dev/nexus/mk2_hexa/native/hook.hexa"
+HEXA_JSON_FIELD="${HOME}/Dev/nexus/shared/hooks/json_field.hexa"
+HEXA_HOOK="${HOME}/Dev/nexus/shared/hooks/hook.hexa"
 
 # tool_name 추출
 if [ -x "$HEXA" ] && [ -f "$HEXA_JSON_FIELD" ]; then
@@ -29,7 +29,7 @@ fi
 
 # ─── L0 가드: Write/Edit 시 파일 경로 확인 ───
 if [ "$TOOL_NAME" = "Write" ] || [ "$TOOL_NAME" = "Edit" ]; then
-  HEXA_GUARD="${HOME}/Dev/nexus/mk2_hexa/native/guard.hexa"
+  HEXA_GUARD="${HOME}/Dev/nexus/shared/hooks/guard.hexa"
   if [ -x "$HEXA" ] && [ -f "$HEXA_GUARD" ]; then
     FILE_PATH=$(echo "$INPUT" | "$HEXA" "$HEXA_JSON_FIELD" file_path 2>/dev/null)
     if [ -n "$FILE_PATH" ]; then

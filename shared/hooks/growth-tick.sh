@@ -30,7 +30,7 @@ GROWTH_JSON="${HOME}/Dev/anima/anima/config/growth_state.json"
 [ -f "$GROWTH_JSON" ] || exit 0
 
 HEXA="${HOME}/Dev/nexus/shared/scripts/bin/hexa"
-HEXA_GROWTH_TICK="${HOME}/Dev/nexus/mk2_hexa/native/growth_tick.hexa"
+HEXA_GROWTH_TICK="${HOME}/Dev/nexus/shared/hooks/growth_tick.hexa"
 
 if [ -x "$HEXA" ] && [ -f "$HEXA_GROWTH_TICK" ]; then
   "$HEXA" "$HEXA_GROWTH_TICK" "${1:-unknown}" "$GROWTH_JSON" 2>/dev/null

@@ -6,11 +6,11 @@ source "$HOOK_DIR/bootstrap.sh" || exit 0
 
 INPUT=$(cat)
 HEXA="${HOME}/Dev/nexus/shared/scripts/bin/hexa"
-HEXA_HOOK="${HOME}/Dev/nexus/mk2_hexa/native/hook.hexa"
+HEXA_HOOK="${HOME}/Dev/nexus/shared/hooks/hook.hexa"
 
 # 사용자 프롬프트 텍스트 추출
-if [ -x "$HEXA" ] && [ -f "${HOME}/Dev/nexus/mk2_hexa/native/json_field.hexa" ]; then
-  USER_TEXT=$(echo "$INPUT" | "$HEXA" "${HOME}/Dev/nexus/mk2_hexa/native/json_field.hexa" prompt 2>/dev/null)
+if [ -x "$HEXA" ] && [ -f "${HOME}/Dev/nexus/shared/hooks/json_field.hexa" ]; then
+  USER_TEXT=$(echo "$INPUT" | "$HEXA" "${HOME}/Dev/nexus/shared/hooks/json_field.hexa" prompt 2>/dev/null)
 else
   USER_TEXT=$(echo "$INPUT" | grep -o '"prompt"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"prompt"[[:space:]]*:[[:space:]]*"//;s/".*//')
 fi

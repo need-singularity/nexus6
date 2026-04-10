@@ -15,11 +15,11 @@ BASENAME=$(basename "$FILE")
 
 # ─── 데이터 유형별 nexus 유도 (모든 확장자 대상) ───
 
-# 렌즈 → nexus mk2_hexa/native/
+# 렌즈 → nexus shared/hexa/native/
 if [[ "$FILE" =~ lens.*\.(rs|py)$ ]] || [[ "$FILE" =~ telescope/lenses/ ]]; then
   LENS_NAME="${BASENAME%.rs}"
   LENS_NAME="${LENS_NAME%.py}"
-  echo "BLOCKED: $FILE — 렌즈는 nexus hexa로 작성. ${NEXUS}/mk2_hexa/native/${LENS_NAME}.hexa" >&2
+  echo "BLOCKED: $FILE — 렌즈는 nexus hexa로 작성. ${NEXUS}/shared/hexa/native/${LENS_NAME}.hexa" >&2
   exit 2
 fi
 
@@ -31,7 +31,7 @@ fi
 
 # 수식/공식 → nexus shared/
 if [[ "$FILE" =~ formula ]] && [[ "$FILE" =~ \.(json|jsonl|py|rs)$ ]] && [[ "$FILE" != *"$NEXUS/"* ]]; then
-  echo "BLOCKED: $FILE — 수식은 nexus에 중앙 관리. ${NEXUS}/shared/ 또는 mk2_hexa/native/" >&2
+  echo "BLOCKED: $FILE — 수식은 nexus에 중앙 관리. ${NEXUS}/shared/ 또는 shared/hexa/native/" >&2
   exit 2
 fi
 
