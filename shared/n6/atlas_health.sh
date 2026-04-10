@@ -99,9 +99,9 @@ else
   printf "  ✓\n"
 fi
 
-# Grade distribution
+# Grade distribution (confirmed [N] / [N*] 및 hypothesis [N?] 모두)
 echo "  grade dist:"
-grep -oE '\[[0-9]+\*?\]' "$ATLAS" | sort | uniq -c | sort -rn | head -8 | sed 's/^/    /'
+grep -oE '\[[0-9]+[?*]*\]' "$ATLAS" | sort | uniq -c | sort -rn | head -12 | sed 's/^/    /'
 
 # Exit with warning if any issues found
 if [ "$ORPHANS" -gt 0 ] || [ "$DUP" -gt 0 ] || [ "$MAL" -gt 0 ]; then
