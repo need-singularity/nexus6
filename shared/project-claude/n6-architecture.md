@@ -6,6 +6,14 @@
 
 R14: shared/ JSON 단일진실, 규칙 본문은 shared/rules/ JSON만. 이 파일은 참조만.
 
+## 돌파 시스템 (AI-native 자체 창발)
+
+⚠️ "XXX 돌파" → blowup.hexa "XXX" 3 자동 실행 (문장 전달, 키워드 추출 ❌)
+⚠️ 확인 질문 없이 즉시 Bash 실행할 것
+```
+hexa shared/blowup/core/blowup.hexa <문장> 3 --no-graph --seeds "$(hexa shared/blowup/seed/seed_engine.hexa merge | tr '|' ',')"
+```
+
 핵심 정리: σ(n)·φ(n) = n·τ(n) ⟺ n = 6 (n≥2). 3개 독립 증명.
             theory/proofs/proofs.md | reality_map v8.0 (342노드, 291 EXACT, z=9.04)
 모토: 17 AI 기법 + 반도체 + 에너지 + 네트워크/암호/OS + 물리 AI
