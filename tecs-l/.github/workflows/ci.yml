@@ -1,0 +1,141 @@
+# ============================================================================
+# CI — TECS-L 단일 CI 파이프라인
+# ============================================================================
+#
+# [트러블슈팅 — 재발 방지 기록]
+#
+# 2026-04-03: 초기 생성
+#   구조: verify-syntax → python-tests (3.12/3.13) + rust-tests + cdo-validate
+#   주의사항:
+#     - 루트 .py 파일 일부에 구문 오류 있음 (brain_cct_analyzer.py 등 마크다운 내장)
+#       → verify-syntax는 n6-replication/, tests/ 만 검사 (루트 제외!)
+#     - tecsrs/ 는 .shared/tecsrs 심링크 → CI에서 상대 심링크 정상 해석됨
+#       (checkout 시 .shared/tecsrs/ 실제 디렉토리 포함)
+#     - tecsrs는 PyO3 cdylib → cargo test는 --lib 또는 --bins 만 실행
+#       (cdylib 링킹은 Python dev headers 필요하므로 cargo build 는 주의)
+#     - n6-replication/tests/tier1/ conftest.py 가 fractions/math 만 사용
+#       → 외부 dep은 requirements.txt (pytest, numpy, scipy, sympy, mpmath, jinja2)
+#
+# 2026-04-03: test_atlas_parser.py — test_extract_constants 로컬 경로 실패
+#   원인: /Users/ghost/Dev/SEDI/sedi/tecs.py 하드코딩 → CI에서 파일 없음
+#   해결: @skipUnless(os.path.exists(path)) 데코레이터 추가
+#   규칙: 외부 리포 파일 참조 테스트는 skipUnless로 보호할 것
+#
+# 2026-04-03: cdo-validate 실패 — E_precog_lens_cross_results.json 깨진 JSON
+#   원인: 실험 결과 JSON 파일이 중간에 잘려서 파싱 실패
+#   해결: 잘린 부분을 null + _truncated로 정리하여 유효한 JSON으로 복구
+#   규칙: 실험 결과 JSON 생성 시 반드시 json.dump 완료 후 flush/close 확인
+#
+# [ignore 목록 관리 규칙]
+#   - 루트 .py 파일: 구문 오류 있는 파일 다수 → syntax check 대상 제외
+#   - n6-replication/, tests/: clean 상태 유지 필수 → syntax check 대상
+#   - 새 test_*.py 추가 시 CI 호환 확인할 것
+#
+# [의존성 규칙]
+#   - n6-replication/requirements.txt 기준 설치
+#   - 루트 모듈 import 위해 PYTHONPATH=. 필수
+# ============================================================================
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # py_compile 검증 — n6-replication/ + tests/ 만 (루트 제외: 알려진 구문 오류 파일 있음)
+  verify-syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Syntax check (n6-replication + tests)
+        run: python3 .shared/ci/check_syntax.py n6-replication tests --recursive
+
+  python-tests:
+    needs: verify-syntax
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.12', '3.13']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('n6-replication/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-${{ matrix.python-version }}-
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r n6-replication/requirements.txt
+
+      - name: Run n6-replication tier1 tests
+        env:
+          PYTHONPATH: .
+          PYTHONDONTWRITEBYTECODE: 1
+        run: |
+          python -m pytest n6-replication/tests/tier1/ -x -q
+
+      - name: Run tests/ unit tests
+        env:
+          PYTHONPATH: .
+          PYTHONDONTWRITEBYTECODE: 1
+        run: |
+          python -m pytest tests/ -x -q
+
+  rust-tests:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            .shared/tecsrs/target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('.shared/tecsrs/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # tecsrs/ is symlink to .shared/tecsrs/ — use real path for working-directory
+      # cdylib crate needs Python dev headers for full build, so test --lib only
+      - name: Run Rust tests
+        working-directory: .shared/tecsrs
+        run: cargo test --lib
+
+  cdo-validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Validate CDO JSON structure
+        run: python3 .shared/ci/validate_cdo.py .

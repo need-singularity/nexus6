@@ -1,0 +1,130 @@
+# Auto-Generated Discovery Paper — Cycle 8
+
+**Generated**: 2026-04-04T19:51:23.202208
+**Stage**: tree
+**Total discoveries**: 483
+**Exact (🟩)**: 483, **Structural (🟧)**: 0
+
+## Abstract
+
+Automated discovery loop identified 483 exact and 0 structural relationships among n=6 arithmetic constants across 4 search engines over 8 cycles.
+
+## Exact Discoveries (🟩)
+
+| # | Formula | Target | Error | Engine | Domains |
+|---|---------|--------|-------|--------|---------|
+| 1 | `(disc_29-1/2)` | 1/2 | 0.00e+00 | dfs | - |
+| 2 | `(1/2*disc_29)` | 1/2 | 0.00e+00 | dfs | - |
+| 3 | `(1/2/disc_29)` | 1/2 | 0.00e+00 | dfs | - |
+| 4 | `(1/2^disc_29)` | 1/2 | 0.00e+00 | dfs | - |
+| 5 | `(disc_29-1/2)` | 2/4 | 0.00e+00 | dfs | - |
+| 6 | `(1/2*disc_29)` | 2/4 | 0.00e+00 | dfs | - |
+| 7 | `(1/2/disc_29)` | 2/4 | 0.00e+00 | dfs | - |
+| 8 | `(1/2^disc_29)` | 2/4 | 0.00e+00 | dfs | - |
+| 9 | `(disc_29-1/2)` | 3/6 | 0.00e+00 | dfs | - |
+| 10 | `(1/2*disc_29)` | 3/6 | 0.00e+00 | dfs | - |
+| 11 | `(1/2/disc_29)` | 3/6 | 0.00e+00 | dfs | - |
+| 12 | `(1/2^disc_29)` | 3/6 | 0.00e+00 | dfs | - |
+| 13 | `(disc_29-1/2)` | 4/8 | 0.00e+00 | dfs | - |
+| 14 | `(1/2*disc_29)` | 4/8 | 0.00e+00 | dfs | - |
+| 15 | `(1/2/disc_29)` | 4/8 | 0.00e+00 | dfs | - |
+| 16 | `(1/2^disc_29)` | 4/8 | 0.00e+00 | dfs | - |
+| 17 | `(disc_29-1/2)` | 5/10 | 0.00e+00 | dfs | - |
+| 18 | `(1/2*disc_29)` | 5/10 | 0.00e+00 | dfs | - |
+| 19 | `(1/2/disc_29)` | 5/10 | 0.00e+00 | dfs | - |
+| 20 | `(1/2^disc_29)` | 5/10 | 0.00e+00 | dfs | - |
+| 21 | `(disc_29-1/2)` | 6/12 | 0.00e+00 | dfs | - |
+| 22 | `(1/2*disc_29)` | 6/12 | 0.00e+00 | dfs | - |
+| 23 | `(1/2/disc_29)` | 6/12 | 0.00e+00 | dfs | - |
+| 24 | `(1/2^disc_29)` | 6/12 | 0.00e+00 | dfs | - |
+| 25 | `(disc_2/1/2)` | 1/3 | 0.00e+00 | dfs | - |
+| 26 | `(1/2*disc_7)` | 1/3 | 0.00e+00 | dfs | - |
+| 27 | `(disc_47^1/2)` | 1/3 | 0.00e+00 | dfs | - |
+| 28 | `(disc_7-1/3)` | 1/3 | 0.00e+00 | dfs | - |
+| 29 | `(disc_2/1/2)` | 2/6 | 0.00e+00 | dfs | - |
+| 30 | `(1/2*disc_7)` | 2/6 | 0.00e+00 | dfs | - |
+| 31 | `(disc_47^1/2)` | 2/6 | 0.00e+00 | dfs | - |
+| 32 | `(disc_7-1/3)` | 2/6 | 0.00e+00 | dfs | - |
+| 33 | `(disc_2/1/2)` | 3/9 | 0.00e+00 | dfs | - |
+| 34 | `(1/2*disc_7)` | 3/9 | 0.00e+00 | dfs | - |
+| 35 | `(disc_47^1/2)` | 3/9 | 0.00e+00 | dfs | - |
+| 36 | `(disc_7-1/3)` | 3/9 | 0.00e+00 | dfs | - |
+| 37 | `(disc_2/1/2)` | 4/12 | 0.00e+00 | dfs | - |
+| 38 | `(1/2*disc_7)` | 4/12 | 0.00e+00 | dfs | - |
+| 39 | `(disc_47^1/2)` | 4/12 | 0.00e+00 | dfs | - |
+| 40 | `(disc_7-1/3)` | 4/12 | 0.00e+00 | dfs | - |
+| 41 | `(1/2*disc_1)` | 1/6 | 0.00e+00 | dfs | - |
+| 42 | `(disc_34/1/2)` | 1/6 | 0.00e+00 | dfs | - |
+| 43 | `(1/2/disc_35)` | 1/6 | 0.00e+00 | dfs | - |
+| 44 | `(1/3*disc_0)` | 1/6 | 0.00e+00 | dfs | - |
+| 45 | `(1/2*disc_1)` | 2/12 | 0.00e+00 | dfs | - |
+| 46 | `(disc_34/1/2)` | 2/12 | 0.00e+00 | dfs | - |
+| 47 | `(1/2/disc_35)` | 2/12 | 0.00e+00 | dfs | - |
+| 48 | `(1/3*disc_0)` | 2/12 | 0.00e+00 | dfs | - |
+| 49 | `(disc_37/1/2)` | 5/6 | 0.00e+00 | dfs | - |
+| 50 | `(1/2/disc_38)` | 5/6 | 0.00e+00 | dfs | - |
+
+## Structural Discoveries (🟧)
+
+| # | Formula | Target | Error | Engine |
+|---|---------|--------|-------|--------|
+
+## Cross-Engine Convergence
+
+| Value | Engines | Count |
+|-------|---------|-------|
+| 0.500000 | convergence, dfs | 2 |
+| 0.333333 | convergence, dfs | 2 |
+| 0.833333 | convergence, dfs | 2 |
+| 0.693147 | convergence, dfs | 2 |
+| 1.414214 | convergence, dfs | 2 |
+| 0.000000 | perfect, quantum | 2 |
+
+## Pending External Novelty Validation
+
+The following discoveries are flagged for WebSearch novelty verification.
+Claude should run `novelty_search_query(d)` with WebSearch for each.
+If the identity is already well-known, set `is_novel=False`.
+
+| # | Formula | Target | Grade | Suggested Query |
+|---|---------|--------|-------|-----------------|
+| 1 | `(disc_29-1/2)` | 1/2 | 🟩 | `"(disc_29-1/2)" 1/2 number theory identity OR theorem OR kno` |
+| 2 | `(1/2*disc_29)` | 1/2 | 🟩 | `"(1/2*disc_29)" 1/2 number theory identity OR theorem OR kno` |
+| 3 | `(1/2/disc_29)` | 1/2 | 🟩 | `"(1/2/disc_29)" 1/2 number theory identity OR theorem OR kno` |
+| 4 | `(1/2^disc_29)` | 1/2 | 🟩 | `"(1/2^disc_29)" 1/2 number theory identity OR theorem OR kno` |
+| 5 | `(disc_29-1/2)` | 2/4 | 🟩 | `"(disc_29-1/2)" 2/4 number theory identity OR theorem OR kno` |
+| 6 | `(1/2*disc_29)` | 2/4 | 🟩 | `"(1/2*disc_29)" 2/4 number theory identity OR theorem OR kno` |
+| 7 | `(1/2/disc_29)` | 2/4 | 🟩 | `"(1/2/disc_29)" 2/4 number theory identity OR theorem OR kno` |
+| 8 | `(1/2^disc_29)` | 2/4 | 🟩 | `"(1/2^disc_29)" 2/4 number theory identity OR theorem OR kno` |
+| 9 | `(disc_29-1/2)` | 3/6 | 🟩 | `"(disc_29-1/2)" 3/6 number theory identity OR theorem OR kno` |
+| 10 | `(1/2*disc_29)` | 3/6 | 🟩 | `"(1/2*disc_29)" 3/6 number theory identity OR theorem OR kno` |
+| 11 | `(1/2/disc_29)` | 3/6 | 🟩 | `"(1/2/disc_29)" 3/6 number theory identity OR theorem OR kno` |
+| 12 | `(1/2^disc_29)` | 3/6 | 🟩 | `"(1/2^disc_29)" 3/6 number theory identity OR theorem OR kno` |
+| 13 | `(disc_29-1/2)` | 4/8 | 🟩 | `"(disc_29-1/2)" 4/8 number theory identity OR theorem OR kno` |
+| 14 | `(1/2*disc_29)` | 4/8 | 🟩 | `"(1/2*disc_29)" 4/8 number theory identity OR theorem OR kno` |
+| 15 | `(1/2/disc_29)` | 4/8 | 🟩 | `"(1/2/disc_29)" 4/8 number theory identity OR theorem OR kno` |
+| 16 | `(1/2^disc_29)` | 4/8 | 🟩 | `"(1/2^disc_29)" 4/8 number theory identity OR theorem OR kno` |
+| 17 | `(disc_29-1/2)` | 5/10 | 🟩 | `"(disc_29-1/2)" 5/10 number theory identity OR theorem OR kn` |
+| 18 | `(1/2*disc_29)` | 5/10 | 🟩 | `"(1/2*disc_29)" 5/10 number theory identity OR theorem OR kn` |
+| 19 | `(1/2/disc_29)` | 5/10 | 🟩 | `"(1/2/disc_29)" 5/10 number theory identity OR theorem OR kn` |
+| 20 | `(1/2^disc_29)` | 5/10 | 🟩 | `"(1/2^disc_29)" 5/10 number theory identity OR theorem OR kn` |
+| 21 | `(disc_29-1/2)` | 6/12 | 🟩 | `"(disc_29-1/2)" 6/12 number theory identity OR theorem OR kn` |
+| 22 | `(1/2*disc_29)` | 6/12 | 🟩 | `"(1/2*disc_29)" 6/12 number theory identity OR theorem OR kn` |
+| 23 | `(1/2/disc_29)` | 6/12 | 🟩 | `"(1/2/disc_29)" 6/12 number theory identity OR theorem OR kn` |
+| 24 | `(1/2^disc_29)` | 6/12 | 🟩 | `"(1/2^disc_29)" 6/12 number theory identity OR theorem OR kn` |
+| 25 | `(disc_2/1/2)` | 1/3 | 🟩 | `"(disc_2/1/2)" 1/3 number theory identity OR theorem OR know` |
+| 26 | `(1/2*disc_7)` | 1/3 | 🟩 | `"(1/2*disc_7)" 1/3 number theory identity OR theorem OR know` |
+| 27 | `(disc_47^1/2)` | 1/3 | 🟩 | `"(disc_47^1/2)" 1/3 number theory identity OR theorem OR kno` |
+| 28 | `(disc_7-1/3)` | 1/3 | 🟩 | `"(disc_7-1/3)" 1/3 number theory identity OR theorem OR know` |
+| 29 | `(disc_2/1/2)` | 2/6 | 🟩 | `"(disc_2/1/2)" 2/6 number theory identity OR theorem OR know` |
+| 30 | `(1/2*disc_7)` | 2/6 | 🟩 | `"(1/2*disc_7)" 2/6 number theory identity OR theorem OR know` |
+
+## Growth Trajectory
+
+- Injected constants: 250
+- Current stage: tree
+- Search depth: 3
+- Error threshold: 0.0001
+
+---
+*Auto-generated by TECS-L Discovery Loop v1.0*

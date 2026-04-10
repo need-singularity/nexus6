@@ -28,6 +28,44 @@ engine/        프로젝트별 엔진 .hexa
 project-claude/ 프로젝트 CLAUDE.md 마스터
 ```
 
+## L0 보호
+
+L0 = 불변식. 유저가 L0 보호를 명시 요청한 경우에만 승인 절차 — 평시에는 자유 수정.
+승인 수정 시 커밋에 `L0-수정: [파일] — [이유]` 기록.
+
+| 경로 | 설명 |
+|------|------|
+| `shared/bin` | compat 심링크 — 전역 hook 의존 |
+| `shared/hooks/*.hexa` | 공용 훅 엔진 전체 (hook/guard/go-parallel/banner/scan/pre-tool/post-edit/post-bash/block-*/bootstrap/check-project/ensure-symlinks/bridge-ensure/block_local_data/nexus-engine/mk2-engine/sync-hooks) |
+| `shared/hooks/hook-entry.sh` | 공용 hook 래퍼 |
+| `shared/hooks/block-forbidden-ext.sh` | R2 금지 확장자 차단 |
+| `shared/blowup/core/blowup.hexa` | 블로업 엔진 — 9-phase 파이프라인 |
+| `shared/blowup/seed/seed_engine.hexa` | 시드 엔진 — 교차수분 + atlas |
+| `shared/blowup/commands.hexa` | 명령 라우터 — 14종 매핑 |
+| `shared/blowup/todo.hexa` | 할일 엔진 |
+| `shared/blowup/lens/lens_forge.hexa` | 렌즈 단조기 |
+| `shared/scripts/bin/hexa` | hexa resolver |
+| `shared/config/core.json` | 시스템맵 + 명령어 |
+| `shared/config/absolute_rules.json` | 절대 규칙 R1~R8 |
+| `shared/config/convergence_ops.json` | CDO 수렴 운영 원칙 |
+| `shared/config/loop/*.json` | 성장 루프 설정 (nexus/anima/n6) |
+| `shared/lockdown/lockdown.json` | 잠금 체계 자체 |
+| `shared/convergence/` | 골화/안정/실패 수렴 추적 |
+| `shared/discovery/discovery_graph.json` | 발견 그래프 SSOT |
+| `shared/n6/n6_constants.jsonl` | n=6 상수 레지스트리 |
+| `shared/n6/atlas.n6` | 현실 지도 SSOT |
+| `shared/discovery/reality_map_3d.html` | 3D 현실지도 원본 |
+| `shared/CLAUDE.md` | 전 프로젝트 공유 규칙 |
+| `shared/shared_work_rules.md` | sync 블록 원본 |
+| `shared/bt/bt_keywords.jsonl` | 돌파 키워드 레지스트리 |
+| `shared/bt/bt_domains.jsonl` | 돌파 도메인 레지스트리 |
+| `shared/project-claude/` | 전 프로젝트 CLAUDE.md 마스터 |
+| `shared/rules/` | AI-native 규칙 체계 SSOT |
+| `docs/index.html` | 3D 현실지도 프론트엔드 |
+| `CLAUDE.md` | nexus 프로젝트 규칙 (이 파일) |
+
+전역 불변식: 전 프로젝트 CLAUDE.md의 todo/할일 실행은 반드시 `shared/bin/hexa` resolver 경유. 직접 바이너리 하드코딩 금지.
+
 ## ref
 
 ```
