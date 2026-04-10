@@ -1,0 +1,260 @@
+{
+  "_meta": {
+    "name": "hexa-lang interpreter 픽스 골화 (2026-04-11)",
+    "updated": "2026-04-11",
+    "description": "H100 실측 중 발견한 2개 인터프리터 버그 + 1개 파일 회피. exec_use 모듈 로딩 경로 핵심 수정.",
+    "discovered_in": "RunPod jtmxgnb0rxdphq H100 80GB HBM3 ×2 세션",
+    "rule": "다음 hexa-lang 빌드는 이 픽스 검증 통과 필수"
+  },
+  "fixes": [
+    {
+      "id": "FIX-8C",
+      "name": "크로스-모듈 mut global → statics promotion",
+      "severity": "blocker",
+      "category": "interpreter/scoping",
+      "discovered": {
+        "trigger": "self/ml/cuda_ffi.hexa의 G_CUBLAS_HANDLE이 cuda_init() 내 mutation 후 gpu_sgemm()에서 0으로 보임",
+        "symptom": "cublasSgemm status=1 (CUBLAS_STATUS_NOT_INITIALIZED)",
+        "diagnosis_evidence": [
+          "단일 파일 mut global 정상 동작 (set_x → read_x OK)",
+          "cuda_init 안에서 println으로 G_CUBLAS_HANDLE=95230663328480 출력 OK",
+          "gpu_sgemm 안에서 println으로 같은 변수 0 출력",
+          "use 경계가 핵심"
+        ]
+      },
+      "root_cause": {
+        "file": "src/interpreter.rs",
+        "function": "exec_use",
+        "lines": "11193-11237",
+        "mechanism": "push_scope → 모듈 vars 적재 → pop_scope의 vars.truncate(start) → 모든 모듈-레벨 변수 폐기. private mut global은 pub_bindings에 수집 안 됨 → caller scope에 inject 안 됨 → 함수 lookup None → 0."
+      },
+      "fix": {
+        "approach": "옵션 C: pop_scope 직전에 모듈-레벨 vars (Fn 제외) 전부 statics로 promote. statics는 HashMap이라 scope 경계와 무관하게 영속.",
+        "files_modified": [
+          {
+            "path": "src/env.rs",
+            "added_methods": [
+              "vars_len() → usize: 모듈 시작점 마킹용",
+              "drain_scope_vars(start_idx) → Vec<(String,Value)>: 모듈 vars 추출 (Fn/BuiltinFn 스킵)"
+            ],
+            "lines_added": 27
+          },
+          {
+            "path": "src/interpreter.rs",
+            "function": "exec_use",
+            "change": "pop_scope() 직전에 drain_scope_vars(module_scope_start) → define_static() 루프",
+            "lines_added": "약 12"
+          }
+        ],
+        "side_effects": [
+          "모듈-레벨 immutable let도 statics에 promote (메모리 약간 증가)",
+          "statics namespace에 모듈 private vars 등장 (네임스페이스 오염, 단 외부 lookup 없음)",
+          "Fn/BuiltinFn은 스킵 → public fn 경로 (pub_bindings)와 충돌 없음"
+        ]
+      },
+      "validation": {
+        "must_pass": [
+          "gpu_smoke_test.hexa: cublasSgemm 2x2 = [[19,22],[43,50]] (cuda_ffi 무수정)",
+          "단일 파일 mut global 회귀 없음",
+          "set() statics fall-through 동작 (cuda_init이 mutation할 때)"
+        ]
+      }
+    },
+    {
+      "id": "FIX-9-1",
+      "name": "exec_use에 FnDecl pre-registration 패스",
+      "severity": "blocker",
+      "category": "interpreter/performance",
+      "discovered": {
+        "trigger": "train_gpu.hexa 모듈 로딩이 150초+ 멈춤. 5개 use chain (cuda_ffi + gpu_tensor + gpu_grad_engine + gpu_optimizer + model_100m_gpu, 합 1633 LOC, ~200 fn).",
+        "comparison": "train_full.hexa (use 0개, 81M params) 즉시 시작 정상"
+      },
+      "root_cause": {
+        "file": "src/interpreter.rs",
+        "function": "exec_use",
+        "diagnosis": "top-level run()은 FnDecl pre-registration 패스가 있어서 함수 등록이 O(1). exec_use는 single pass라 매 fn 등록마다 vars 선형 역스캔 → use chain 깊어질수록 O(N²) 누적.",
+        "estimated_breakdown": {
+          "pre_registration_missing": "70-80s",
+          "env_get_O_n": "20-30s",
+          "ast_clone_repetition": "5-10s",
+          "total": "95-120s of 150s+"
+        }
+      },
+      "fix": {
+        "approach": "exec_use에 top-level run()과 동일한 pre-registration 패스 추가. 본 실행 패스 전에 모든 FnDecl을 env에 미리 define.",
+        "files_modified": [
+          {
+            "path": "src/interpreter.rs",
+            "function": "exec_use",
+            "change": "main exec loop 직전에 pre-reg loop 추가 (Stmt::FnDecl만 선등록)",
+            "lines_added": "약 14"
+          }
+        ],
+        "expected_improvement": "150s+ → 30-55s (65-80% 감소)",
+        "side_effects": [
+          "Forward reference 가능 (top-level과 일관)",
+          "메모리: 함수 Value 미리 생성 (작음)"
+        ]
+      },
+      "validation": {
+        "must_pass": [
+          "train_gpu.hexa 30초 이내 첫 train step 출력",
+          "단일 파일 fn 등록 회귀 없음",
+          "circular use 동작 유지"
+        ]
+      }
+    },
+    {
+      "id": "FIX-10",
+      "name": "gpu_smoke_test.hexa main() 호출 회피",
+      "severity": "minor",
+      "category": "syntax/workaround",
+      "discovered": {
+        "trigger": "smoke test 마지막 줄 main() 호출에서 'invalid assignment target' 런타임 에러",
+        "symptom": "GPU 측정은 정상 종료, 마지막 main() 호출만 fail"
+      },
+      "root_cause": {
+        "file": "self/ml/gpu_smoke_test.hexa",
+        "line": 174,
+        "diagnosis_status": "근본 원인 미해결 — 파서/평가기 어딘가에서 main()이 Stmt::Assign으로 평가됨 (lhs가 Ident 아님 판정). 깊은 분석 필요.",
+        "deferred_to": "다음 세션 — parser.rs parse_postfix Call 분기 점검"
+      },
+      "fix": {
+        "approach": "회피책: main() → let _ = main() (1줄 수정)",
+        "files_modified": [
+          {
+            "path": "self/ml/gpu_smoke_test.hexa",
+            "line": 174,
+            "before": "main()",
+            "after": "let _ = main()"
+          }
+        ],
+        "permanence": "임시 — 본 파서 버그 해결 후 원복"
+      },
+      "validation": {
+        "must_pass": ["smoke test 끝까지 정상 종료, 에러 없음"]
+      }
+    }
+  ],
+  "build_validation": {
+    "local_mac_build": {
+      "status": "환경 이슈로 검증 불가",
+      "blocker": "libc/region crate compile error on aarch64-apple-darwin (의존성 문제, 우리 변경과 무관)"
+    },
+    "remote_h100_build": {
+      "status": "예정",
+      "method": "git push → RunPod H100 pod git clone → cargo build --release"
+    }
+  },
+  "next_session_steps": [
+    "1. hexa-lang main 브랜치에 commit + push (3 파일 변경)",
+    "2. RunPod H100 SXM 80GB ×2 신규 임대 ($5.98/hr)",
+    "3. SSH → apt deps + libblis-dev + rustup + git clone hexa-lang + cargo build",
+    "4. gpu_smoke_test.hexa 실행 → cuBLAS SGEMM PASS 확인 (FIX-8C 검증)",
+    "5. train_gpu.hexa 실행 → 30초 이내 첫 step 출력 확인 (FIX-9#1 검증)",
+    "6. CLM (train_gpu.hexa) 100 step 측정 — tokens/sec, GPU util, ms/step",
+    "7. ALM (anima_lm_finetune.hexa) full 측정",
+    "8. 측정 데이터 → shared/config/runpod.json completed_runs 추가",
+    "9. pod 즉시 tear down",
+    "10. hexa-lang에 PR (옵션 A 정식 픽스로 업그레이드 검토)"
+  ],
+  "fix_8c_vs_8a_decision": {
+    "applied": "옵션 C (간단/즉효)",
+    "deferred": "옵션 A (AST is_mutable 추가, parser/interpreter/env 4파일 변경, ~80 LOC)",
+    "rationale": "C로 우선 잠금 → 검증 → 시간 여유 시 A로 정식화. 옵션 C 부작용은 '모듈 immutable let도 statics에 들어감' 정도로 허용 가능."
+  },
+  "fix_8c_round2": {
+    "name": "FIX-8C-followup: Lambda capture in module load",
+    "discovered_after": "Round 2 H100 검증에서 cublasSgemm 여전히 status=1",
+    "trigger": "FIX-8C가 vars→statics promote 했지만 함수가 호출되면 read는 여전히 초기값(0)",
+    "diagnosis_via": "HEXA_LOG=trace + htz 무료 재현 (~/Dev/test_hexa_fix/main.hexa)",
+    "trace_evidence": [
+      "[hexa info] promoted 2 vars to statics in mod_a (G_X, G_PTR)",
+      "[hexa trace] assign G_X (statics? true) → Some(Int(42)) — set OK",
+      "[set] G_X=42 — set_state 안에서는 보임",
+      "[read] G_X=0 — read_state는 0 (다른 G_X를 봄)"
+    ],
+    "root_cause": {
+      "file": "src/interpreter.rs",
+      "line": 1082,
+      "code": "if self.env.scope_depth() > 1 { Lambda(captured_env) } else { Fn }",
+      "explanation": "exec_use가 push_scope해서 모듈 안 fn 정의 시점 scope_depth=2 → Lambda 분기. capture_env가 모듈-레벨 vars를 캡처 (G_X=Int(0), G_PTR=Pointer(0)). 호출 시 captured env가 vars로 푸시 → statics fall-through 가림."
+    },
+    "fix": {
+      "approach": "Interpreter.in_module_load: bool 플래그 + Lambda 분기 조건에 `&& !in_module_load` 추가. 모듈 fn은 강제 Value::Fn (캡처 X). 모듈 globals는 statics로 자연스럽게 fall-through.",
+      "files_modified": [
+        {
+          "path": "src/interpreter.rs",
+          "fields_added": "in_module_load: bool",
+          "lines_changed": "약 16",
+          "places": [
+            "Interpreter struct field",
+            "Interpreter::new() 초기화",
+            "FnDecl handler scope_depth 체크",
+            "exec_use enter/exit"
+          ]
+        },
+        {
+          "path": "src/env.rs",
+          "lines_changed": "약 4",
+          "change": "drain_scope_vars 필터에 Value::Lambda 추가 (방어)"
+        }
+      ]
+    },
+    "validation": {
+      "method": "htz에서 minimal repro 작성 + HEXA_LOG=trace 검증",
+      "result": "PASS — cross-module mut global 완전 동작",
+      "host": "hetzner (htz, x86_64 Ubuntu 24.04, 무료)",
+      "build_time": "1m24s",
+      "before_after": {
+        "before": "[read] G_X=0 G_PTR=0 (after set)",
+        "after":  "[read] G_X=42 G_PTR=123456789 (after set)"
+      }
+    },
+    "commits": [
+      "21d939b — initial FIX-8C/9#1/10",
+      "ef3987b — HEXA_LOG instrumentation",
+      "5e6b9d7 — borrow-after-move epilogue fix",
+      "470ae98 — Lambda capture fix (real fix)"
+    ]
+  },
+  "ready_for_h100_round_3": true,
+  "performance_experiment_log": {
+    "name": "env.get O(1) optimization — disproven",
+    "hypothesis": "env.get linear scan is the dominant cost during train loop",
+    "experiments": [
+      {
+        "round": 4,
+        "commit": "bfcf7f7",
+        "strategy": "baseline (linear reverse scan)",
+        "step1_ms": 150588,
+        "verdict": "baseline"
+      },
+      {
+        "round": 5,
+        "commit": "5379f50",
+        "strategy": "pure HashMap var_index (always active)",
+        "step1_ms": 187013,
+        "delta_pct": -24.2,
+        "verdict": "regression"
+      },
+      {
+        "round": 6,
+        "commit": "ea1c658",
+        "strategy": "hybrid linear<64 then hash",
+        "step1_ms": 183835,
+        "delta_pct": -22.1,
+        "verdict": "regression — train loop vars exceed threshold"
+      }
+    ],
+    "conclusion": "env.get is NOT the bottleneck for GPU training. HashMap hash cost > linear scan cost when name is short and stack is shallow. Both var_index commits reverted (94896d9, 7706bb2). Real bottleneck candidates: (1) extern FFI dispatch overhead (14-arg transmute + value_to_c_arg per cuBLAS call), (2) Value::clone() in get() returning boxed/vec values, (3) String alloc in define(name.to_string()).",
+    "next_optimization_targets": [
+      "Profile actual train loop with HEXA_LOG=trace to count get/set/extern_call per step",
+      "Try reducing Value::clone (Cow or Arc<Value> for hot reads)",
+      "Cache value_to_c_arg conversions for known FFI call sites",
+      "Consider AOT compile of hot paths via cranelift JIT (already a dep)"
+    ],
+    "rounds_total": 6,
+    "rounds_total_cost_usd": 14.58
+  }
+}
