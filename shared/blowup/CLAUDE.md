@@ -1,7 +1,7 @@
 # blowup/ — 단일 진입점 + 변종/렌즈/시드/우로보로스
 
 entry: core/blowup.hexa (357e50e router/batch/wave 흡수)
-cli:   hexa blowup.hexa <domain> <depth> [--no-graph] [--seeds <s>]
+cli:   hexa blowup.hexa <domain> <depth> [--seeds <s>]
 
 core/        blowup.hexa
 guard/       blowup_guard.hexa
