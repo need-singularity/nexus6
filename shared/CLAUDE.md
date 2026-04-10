@@ -3,6 +3,8 @@
 > 원본: `~/Dev/nexus/shared/` | 심링크: 각 리포 `.shared/ → ../nexus/shared/`
 > 모든 규칙/설정은 shared/ JSON이 단일 진실 (R14).
 
+> 🛑 **tecs-l 흡수 진행 중** (2026-04-10): tecs-l/ → nexus/mk2_hexa/native/{verify,math,engines,experiments}. Track A 진행 / Track B 블로커(torch/sklearn/scipy) 보류. 로드맵: `~/Dev/nexus/docs/tecs-l-absorption-plan.md`
+
 ## 참조
 
 | 항목 | 파일 | 내용 |
@@ -25,6 +27,18 @@
 | 계산기 | `calculators.json` + `calc/` | 194+ 레지스트리 |
 | 문법 | `hexa_grammar.jsonl` | hexa-lang 전체 문법 + pitfalls |
 | 비밀 | `SECRET.md` | API 토큰/계정 |
+| 인프라 CLI | `bin/infra` | 4호스트(mac/ubu/htz/vast) 자원 실시간 현황 — `infra` / `infra json` / `infra rec` |
+
+## 자원 현황 즉시 인지
+
+```bash
+infra        # mac/ubu/htz/vast 색상 출력 (기본)
+infra rec    # GPU/CPU/AVOID 추천만
+infra json   # SSOT raw dump
+```
+- **SSOT**: `shared/infra_state.json` (10분 cycle)
+- **바이너리**: `shared/bin/infra` (어떤 프로젝트에서도 PATH로 즉시 호출)
+- **L0 준수**: 전역 ~/.claude 미수정, PATH symlink만 사용
 
 ## NEXUS-6 API
 
