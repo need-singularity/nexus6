@@ -31,7 +31,7 @@ def count_md(root):
 
 # ═══ NEXUS stats ═══
 closed = cnt(f'{NX}/shared/discovery/verified_constants.jsonl')
-topo = cnt(f'{NX}/shared/cycle/topology.jsonl')
+topo = cnt(f'{NX}/shared/discovery/cycle/topology.jsonl')
 disc = cnt(f'{NX}/shared/discovery/discovery_log.jsonl')
 stubs = len(os.listdir(f'{NX}/shared/calc/auto_stubs')) if os.path.isdir(f'{NX}/shared/calc/auto_stubs') else 0
 status = Counter()
@@ -213,7 +213,7 @@ anima_elapsed_h = anima_elapsed_sec / 3600
 
 # Domains distribution
 domains = Counter()
-for i,l in enumerate(open(f'{NX}/shared/cycle/topology.jsonl')):
+for i,l in enumerate(open(f'{NX}/shared/discovery/cycle/topology.jsonl')):
     if i > 15000: break
     try: domains[json.loads(l).get('domain','?')] += 1
     except: pass

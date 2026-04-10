@@ -17,8 +17,8 @@ GROWTH_LOG="${GROWTH_DIR}/growth.log"
 GROWTH_BUS="$HOME/Dev/nexus/shared/discovery/growth_bus.jsonl"
 LOCKFILE="/tmp/n6-growth-${GROWTH_NAME}.lock"
 
-# ── 루프 순서 정의 (shared/loop/{project}.json) ──
-LOOP_DEF="$HOME/Dev/nexus/shared/loop/${GROWTH_NAME}.json"
+# ── 루프 순서 정의 (shared/config/loop/{project}.json) ──
+LOOP_DEF="$HOME/Dev/nexus/shared/config/loop/${GROWTH_NAME}.json"
 if [ -f "$LOOP_DEF" ]; then
     _loop_interval=$(/usr/bin/python3 -c "import json; print(json.load(open('$LOOP_DEF')).get('interval', 1800))" 2>/dev/null)
     _loop_max=$(/usr/bin/python3 -c "import json; print(json.load(open('$LOOP_DEF')).get('max_cycles', 999))" 2>/dev/null)

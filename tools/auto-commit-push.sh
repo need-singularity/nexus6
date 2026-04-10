@@ -22,10 +22,10 @@ fi
 
 # Stage only agent-generated paths
 git add shared/discovery/verified_constants.jsonl 2>/dev/null || true
-git add shared/cycle/ 2>/dev/null || true
+git add shared/discovery/cycle/ 2>/dev/null || true
 git add shared/discovery/self_improve_log.jsonl 2>/dev/null || true
 git add shared/calc/auto_stubs/ 2>/dev/null || true
-git add shared/alien/alien_index_distribution.json 2>/dev/null || true
+git add shared/discovery/alien/alien_index_distribution.json 2>/dev/null || true
 git add docs/hypotheses/ 2>/dev/null || true
 
 # Skip if nothing staged

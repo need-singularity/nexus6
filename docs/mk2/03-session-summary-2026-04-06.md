@@ -105,7 +105,7 @@ docs/hypotheses/
 ### Config
 
 ```
-shared/cycle/
+shared/discovery/cycle/
 └── sectors.yaml        — sector keyword dictionary
 ```
 

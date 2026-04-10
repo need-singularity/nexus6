@@ -5,7 +5,7 @@ HOOK_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$HOOK_DIR/bootstrap.sh" || exit 0
 
 INPUT=$(cat)
-HEXA="${HOME}/Dev/nexus/shared/bin/hexa"
+HEXA="${HOME}/Dev/nexus/shared/scripts/bin/hexa"
 HEXA_HOOK="${HOME}/Dev/nexus/mk2_hexa/native/hook.hexa"
 
 # 사용자 프롬프트 텍스트 추출

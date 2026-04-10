@@ -4,7 +4,7 @@ GROWTH_NAME="nexus"
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DOMAIN="discovery"
 
-# 공통 라이브러리 (shared/loop/nexus.json에서 interval/max_cycles 자동 로드)
+# 공통 라이브러리 (shared/config/loop/nexus.json에서 interval/max_cycles 자동 로드)
 COMMON="$PROJECT_ROOT/scripts/lib/growth_common.sh"
 source "$COMMON"
 MAX_CYCLES=${1:-${MAX_CYCLES:-999}}

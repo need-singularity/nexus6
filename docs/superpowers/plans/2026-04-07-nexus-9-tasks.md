@@ -53,7 +53,7 @@ git commit -m "chore: growth_bus + 상태 파일 동기화"
 - [ ] **Step 4: anima/airgenome 상태 파일 커밋**
 
 ```bash
-git add shared/consciousness/anima_state.json shared/consciousness/anima_autofix.json shared/growth/airgenome_gates.jsonl
+git add shared/consciousness/anima_state.json shared/consciousness/anima_autofix.json shared/discovery/growth/airgenome_gates.jsonl
 git commit -m "chore: anima + airgenome 상태 파일 추가"
 ```
 

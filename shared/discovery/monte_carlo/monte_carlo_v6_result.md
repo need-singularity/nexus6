@@ -45,4 +45,4 @@
 
 - `shared/monte_carlo_n6_pi_e_phi.py` — NATURAL_ONLY 환경변수 지원
 - `shared/n6_uniqueness_pi_e_phi.json` — natural-only MC 원시 결과
-- `shared/monte_carlo/monte_carlo_v6_result.md` — 본 보고서 (재작성)
+- `shared/discovery/monte_carlo/monte_carlo_v6_result.md` — 본 보고서 (재작성)

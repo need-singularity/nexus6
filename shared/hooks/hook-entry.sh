@@ -29,7 +29,7 @@ find_hexa() {
   for cand in \
     "$HOOK_DIR/../bin/hexa" \
     "$HOME/Dev/hexa-lang/hexa" \
-    "$HOME/Dev/nexus/shared/bin/hexa" \
+    "$HOME/Dev/nexus/shared/scripts/bin/hexa" \
     "$HOME/.hx/bin/hexa" \
     "$HOME/Dev/hexa-lang/target/release/hexa" \
     "$HOME/Dev/hexa-lang/target/release/hexa-bin-actual"

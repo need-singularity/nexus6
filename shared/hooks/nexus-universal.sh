@@ -21,7 +21,7 @@ fi
 
 # fallback: hexa
 source "$HOOK_DIR/ensure-symlinks.sh" 2>/dev/null || true
-HEXA="${HOME}/Dev/nexus/shared/bin/hexa"
+HEXA="${HOME}/Dev/nexus/shared/scripts/bin/hexa"
 RESULT=$(echo "$INPUT" | "$HEXA" "$HOOK_DIR/nexus-engine.hexa" agent 2>/dev/null) || true
 if [ -n "$RESULT" ]; then
   echo "$RESULT"

@@ -1226,7 +1226,7 @@ pub const EXIT_BUDGET: i32 = 2;
 pub const EXIT_HALTED: i32 = 3;
 pub const EXIT_LOCKED: i32 = 4;
 
-/// Paths derived from a base directory (default `shared/cycle/`).
+/// Paths derived from a base directory (default `shared/discovery/cycle/`).
 pub struct TickPaths {
     pub base: PathBuf,
     pub topology: PathBuf,
@@ -1668,12 +1668,12 @@ case "${1:-status}" in
   halt)
     touch "$HOME/.nexus/halt" 2>/dev/null || \
       (mkdir -p "$HOME/.nexus" && touch "$HOME/.nexus/halt")
-    # Also touch shared/cycle/halt since that's where the tick actually checks
-    mkdir -p "$(pwd)/shared/cycle" && touch "$(pwd)/shared/cycle/halt"
+    # Also touch shared/discovery/cycle/halt since that's where the tick actually checks
+    mkdir -p "$(pwd)/shared/cycle" && touch "$(pwd)/shared/discovery/cycle/halt"
     echo "halt flag set"
     ;;
   resume)
-    rm -f "$(pwd)/shared/cycle/halt" "$HOME/.nexus/halt"
+    rm -f "$(pwd)/shared/discovery/cycle/halt" "$HOME/.nexus/halt"
     echo "halt flag cleared"
     ;;
   status)

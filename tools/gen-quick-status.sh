@@ -20,7 +20,7 @@ def count(p):
     except: return 0
 
 closed = count(f'{NX}/shared/discovery/verified_constants.jsonl')
-topo = count(f'{NX}/shared/cycle/topology.jsonl')
+topo = count(f'{NX}/shared/discovery/cycle/topology.jsonl')
 disc = count(f'{NX}/shared/discovery/discovery_log.jsonl')
 stubs = len(os.listdir(f'{NX}/shared/calc/auto_stubs')) if os.path.isdir(f'{NX}/shared/calc/auto_stubs') else 0
 
@@ -39,7 +39,7 @@ near = status.get('NEAR', 0)
 
 # Project breakdown
 domains = Counter()
-for i,l in enumerate(open(f'{NX}/shared/cycle/topology.jsonl')):
+for i,l in enumerate(open(f'{NX}/shared/discovery/cycle/topology.jsonl')):
     if i > 15000: break
     try: domains[json.loads(l).get('domain','?')] += 1
     except: pass

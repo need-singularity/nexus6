@@ -29,7 +29,7 @@
 - `memory` — `~/.claude-claude9/projects/*/memory/*.md` 각 파일
 - `architecture_design` — daemon 전용, 실시간 Mac vitals
 
-### 상태 파일 (`shared/cycle/`)
+### 상태 파일 (`shared/discovery/cycle/`)
 - `topology.jsonl` — 점(singularities), append-only
 - `edges.jsonl` — 엣지(simhash distance ≤ eps=0.3)
 - `budget.json`, `wal.jsonl`, `state.lock`, `halt`
@@ -62,12 +62,12 @@
 ```bash
 # 상태
 bash tools/install-cycle-tick.sh status
-wc -l shared/cycle/topology.jsonl
-tail -1 shared/cycle/topology.jsonl
+wc -l shared/discovery/cycle/topology.jsonl
+tail -1 shared/discovery/cycle/topology.jsonl
 
 # 정지/재개
-touch shared/cycle/halt     # 정지 (tick skip)
-rm shared/cycle/halt        # 재개
+touch shared/discovery/cycle/halt     # 정지 (tick skip)
+rm shared/discovery/cycle/halt        # 재개
 
 # 일괄 흡수 / 실시간 흡수
 nexus singularity-backfill --base-dir /Users/ghost/Dev/nexus/shared/cycle

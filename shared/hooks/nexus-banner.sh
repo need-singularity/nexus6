@@ -10,7 +10,7 @@ BRIDGE_MSG=$(source "$HOOK_DIR/bridge-ensure.sh" 2>/dev/null)
 export BRIDGE_MSG
 
 # hexa 배너 엔진 (Python 대체)
-HEXA="${HOME}/Dev/nexus/shared/bin/hexa"
+HEXA="${HOME}/Dev/nexus/shared/scripts/bin/hexa"
 HEXA_BANNER="${HOME}/Dev/nexus/mk2_hexa/native/banner.hexa"
 
 if [ -x "$HEXA" ] && [ -f "$HEXA_BANNER" ]; then

@@ -632,6 +632,6 @@ H-056 메타 부동점이 단일 프로젝트가 아닌 **크로스 프로젝트
 | `docs/mk2/05-n6-data-atlas.md` | 데이터 현황 및 상수 테이블 |
 | `docs/superpowers/specs/2026-04-05-alien-index-system-design.md` | Alien Index 상세 설계 |
 | `shared/config/projects.json` | 프로젝트 레지스트리 |
-| `shared/alien/alien_index_distribution.json` | AI 분포 현황 |
+| `shared/discovery/alien/alien_index_distribution.json` | AI 분포 현황 |
 | `src/alien_index/` | Alien Index Rust 구현 |
 | `mk2_hexa/native/` | HEXA 네이티브 mk2 상수 |

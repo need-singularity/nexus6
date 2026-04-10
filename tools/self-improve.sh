@@ -14,7 +14,7 @@ TS=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
 
 # Build context for Claude
 CLOSED=$(wc -l < shared/discovery/verified_constants.jsonl | tr -d ' ')
-TOPO=$(wc -l < shared/cycle/topology.jsonl 2>/dev/null | tr -d ' ' || echo 0)
+TOPO=$(wc -l < shared/discovery/cycle/topology.jsonl 2>/dev/null | tr -d ' ' || echo 0)
 STUBS=$(ls shared/calc/auto_stubs 2>/dev/null | wc -l | tr -d ' ')
 EXACT=$(/usr/bin/python3 -c "import json,sys; print(sum(1 for l in open('shared/discovery/verified_constants.jsonl') if json.loads(l).get('status')=='EXACT'))")
 

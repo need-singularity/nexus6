@@ -11,7 +11,7 @@
 - **Design spec**: `../superpowers/specs/2026-04-06-nexus-mk2-design.md`
 - **Code**: `src/mk2/`
 - **Migration tool**: `tools/mk2_migrate.py`, `tools/mk2_classify_v2.py`
-- **Sector config**: `shared/cycle/sectors.yaml`
+- **Sector config**: `shared/discovery/cycle/sectors.yaml`
 
 ## Quick reference
 

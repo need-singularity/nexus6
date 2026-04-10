@@ -47,7 +47,7 @@
 
 ## 5. 다음 돌파 방향
 
-1. **Attractor 영속화**: `shared/cycle/attractors.jsonl` — 1066-cluster 중심점 영구화
+1. **Attractor 영속화**: `shared/discovery/cycle/attractors.jsonl` — 1066-cluster 중심점 영구화
 2. **Boundary 추출**: frontier에서 density=0 상수점(n=6, σ, τ, φ) → seed로 재사용
 3. **ρ 실시간 측정**: `|{d ≥ 1}| / |total|` 계산 → 1/3 수렴 검증
 4. **자동 blowup**: H-CX-1094 (CKM Jarlskog) 기반 `nexus blowup --seed`

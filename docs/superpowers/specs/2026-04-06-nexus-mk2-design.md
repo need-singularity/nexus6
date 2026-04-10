@@ -168,14 +168,14 @@ Layer 1 (1 prime):     n=2   n=3   n=5   n=7
 | 항목 | 권고 | 이유 |
 |---|---|---|
 | **Point schema** | JSON schema 확장 (backward-compat) | `prime_signature` 등 신규 필드만 추가 |
-| **Lattice 저장** | 별도 `shared/cycle/lattice.jsonl` | topology와 독립, lazy load |
-| **Sector registry** | `shared/cycle/sectors.yaml` (+ defaults.yaml) | 사용자 편집 가능 |
+| **Lattice 저장** | 별도 `shared/discovery/cycle/lattice.jsonl` | topology와 독립, lazy load |
+| **Sector registry** | `shared/discovery/cycle/sectors.yaml` (+ defaults.yaml) | 사용자 편집 가능 |
 
 ### 물리 연동
 
 | 항목 | 권고 | 이유 |
 |---|---|---|
-| **Constants DB** | `shared/cycle/physics_db.yaml` + CODATA fetcher (optional) | 기본 100개 하드코딩, 확장 가능 |
+| **Constants DB** | `shared/discovery/cycle/physics_db.yaml` + CODATA fetcher (optional) | 기본 100개 하드코딩, 확장 가능 |
 | **Tolerance per sector** | Adaptive: sector별 기본값 + override | Strong 0.1%, EW 2%, Cosmology 5%, Primordial 10% |
 | **Classification timing** | New point 시 즉시 (tick 내부) | mk1 daemon 흐름 유지 |
 

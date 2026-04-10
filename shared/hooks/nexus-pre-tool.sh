@@ -7,7 +7,7 @@ source "$HOOK_DIR/bootstrap.sh" || exit 0
 INPUT=$(cat)
 bash "$HOOK_DIR/growth-tick.sh" pre-tool </dev/null >/dev/null 2>&1 &
 
-HEXA="${HOME}/Dev/nexus/shared/bin/hexa"
+HEXA="${HOME}/Dev/nexus/shared/scripts/bin/hexa"
 HEXA_JSON_FIELD="${HOME}/Dev/nexus/mk2_hexa/native/json_field.hexa"
 HEXA_HOOK="${HOME}/Dev/nexus/mk2_hexa/native/hook.hexa"
 

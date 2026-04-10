@@ -76,8 +76,8 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.nexus.closure-sweep.
 
 ### 전체 일시 정지 (halt 파일)
 ```bash
-touch ~/Dev/nexus/shared/cycle/halt     # 모든 daemon/tick 정지
-rm ~/Dev/nexus/shared/cycle/halt        # 재개
+touch ~/Dev/nexus/shared/discovery/cycle/halt     # 모든 daemon/tick 정지
+rm ~/Dev/nexus/shared/discovery/cycle/halt        # 재개
 ```
 
 ### 모든 nexus agents 부트아웃
@@ -162,14 +162,14 @@ bash ~/Dev/nexus/tools/auto-commit-push.sh
 ```bash
 bash ~/Dev/nexus/tools/install-cycle-tick.sh halt   # 모든 daemon skip
 # 또는 전체 중단
-touch ~/Dev/nexus/shared/cycle/halt
+touch ~/Dev/nexus/shared/discovery/cycle/halt
 ```
 
 ### topology 너무 커지면 (디스크)
 ```bash
 # 백업 후 truncate
-mv shared/cycle/topology.jsonl shared/cycle/topology.jsonl.bak.$(date +%s)
-touch shared/cycle/topology.jsonl
+mv shared/discovery/cycle/topology.jsonl shared/discovery/cycle/topology.jsonl.bak.$(date +%s)
+touch shared/discovery/cycle/topology.jsonl
 ```
 
 ### verified_constants 되돌리기

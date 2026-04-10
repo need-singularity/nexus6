@@ -1,4 +1,4 @@
-# shared/loop/ — 프로젝트 루프 순서 정의
+# shared/config/loop/ — 프로젝트 루프 순서 정의
 
 > 각 프로젝트의 성장 루프 실행 순서를 정의한다.
 > 엔진: `scripts/lib/growth_common.sh` → `run_growth_loop()`
@@ -6,9 +6,9 @@
 ## 연결 구조
 
 ```
-shared/loop/nexus.json ──┐
-shared/loop/anima.json ──┤── growth_common.sh가 자동 로드
-shared/loop/n6-arch.json ┘   (interval, max_cycles, domain)
+shared/config/loop/nexus.json ──┐
+shared/config/loop/anima.json ──┤── growth_common.sh가 자동 로드
+shared/config/loop/n6-arch.json ┘   (interval, max_cycles, domain)
                               │
                               ▼
 ┌─────────────────────────────────────────┐
@@ -25,11 +25,11 @@ shared/loop/n6-arch.json ┘   (interval, max_cycles, domain)
 ┌──────────┬──────────────────────────────────┬──────────┬───────────────┐
 │ 프로젝트 │            loop JSON             │ interval │    domain     │
 ├──────────┼──────────────────────────────────┼──────────┼───────────────┤
-│ nexus    │ shared/loop/nexus.json           │ 1800s    │ discovery     │
+│ nexus    │ shared/config/loop/nexus.json           │ 1800s    │ discovery     │
 ├──────────┼──────────────────────────────────┼──────────┼───────────────┤
-│ anima    │ shared/loop/anima.json           │ 999s     │ consciousness │
+│ anima    │ shared/config/loop/anima.json           │ 999s     │ consciousness │
 ├──────────┼──────────────────────────────────┼──────────┼───────────────┤
-│ n6-arch  │ shared/loop/n6-architecture.json │ 1800s    │ architecture  │
+│ n6-arch  │ shared/config/loop/n6-architecture.json │ 1800s    │ architecture  │
 └──────────┴──────────────────────────────────┴──────────┴───────────────┘
 ```
 
@@ -152,5 +152,5 @@ shared/loop/n6-arch.json ┘   (interval, max_cycles, domain)
 |------|------|
 | `scripts/lib/growth_common.sh` | 공통 phase 함수 + 루프 오케스트레이터 |
 | `shared/discovery/growth_bus.jsonl` | 이벤트 스트림 (append-only) |
-| `shared/loop/{project}.json` | 루프 순서 정의 (이 디렉토리) |
+| `shared/config/loop/{project}.json` | 루프 순서 정의 (이 디렉토리) |
 | `.growth/growth_state.json` | 각 프로젝트 로컬 상태 (cycle, last_run) |

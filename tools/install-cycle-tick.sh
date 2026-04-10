@@ -22,11 +22,11 @@ case "${1:-status}" in
     echo "uninstalled: ${LABEL}"
     ;;
   halt)
-    mkdir -p "$(pwd)/shared/cycle" && touch "$(pwd)/shared/cycle/halt"
+    mkdir -p "$(pwd)/shared/cycle" && touch "$(pwd)/shared/discovery/cycle/halt"
     echo "halt flag set"
     ;;
   resume)
-    rm -f "$(pwd)/shared/cycle/halt"
+    rm -f "$(pwd)/shared/discovery/cycle/halt"
     echo "halt flag cleared"
     ;;
   status)

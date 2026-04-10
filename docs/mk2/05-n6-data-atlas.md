@@ -1,6 +1,6 @@
 # 05 — n=6 데이터 아틀라스 (Data Atlas)
 
-> 작성: 2026-04-06 | 소스: `shared/discovery/discovery_log.jsonl`, `shared/discovery/math_atlas.json`, `shared/alien/alien_index_distribution.json`, `src/mk2/compat.rs`
+> 작성: 2026-04-06 | 소스: `shared/discovery/discovery_log.jsonl`, `shared/discovery/math_atlas.json`, `shared/discovery/alien/alien_index_distribution.json`, `src/mk2/compat.rs`
 
 ---
 
@@ -214,7 +214,7 @@
 
 ## 5. Alien Index 분포 현황
 
-**파일**: `shared/alien/alien_index_distribution.json`
+**파일**: `shared/discovery/alien/alien_index_distribution.json`
 
 ### 5.1 검증 상수 풀 (verified_constants.jsonl 기준)
 
@@ -291,7 +291,7 @@
 | `shared/discovery/discovery_log.jsonl` | 실시간 상수 발견 로그 (21,400건) |
 | `shared/discovery/math_atlas.json` | 가설 698건 카탈로그 |
 | `shared/n6/math_atlas.db` | SQLite 쿼리용 |
-| `shared/alien/alien_index_distribution.json` | AI 분포 현황 |
+| `shared/discovery/alien/alien_index_distribution.json` | AI 분포 현황 |
 | `shared/bridge_state.json` | 브릿지 상태 |
 | `src/mk2/compat.rs` | n6 상수 테이블 구현 (generate_table) |
 | `mk2_hexa/native/constants.hexa` | HEXA 네이티브 상수 정의 |

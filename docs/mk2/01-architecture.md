@@ -141,17 +141,17 @@ user_value (f64)
 
 ## External config files
 
-### `shared/cycle/sectors.yaml`
+### `shared/discovery/cycle/sectors.yaml`
 
 Sector definitions (keywords + value_ranges + prime_set_preferred).
 User-editable; reloadable at runtime.
 
-### `shared/cycle/physics_db.yaml`
+### `shared/discovery/cycle/physics_db.yaml`
 
 Known constants with names + CODATA values + basis formulas.
 Seeds classification with prior art.
 
-### `shared/cycle/lattice.jsonl`
+### `shared/discovery/cycle/lattice.jsonl`
 
 Persisted LatticeNode entries (materialized subset).
 Grows as classifier encounters new n.

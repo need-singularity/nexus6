@@ -30,7 +30,7 @@
 **Status**: Working, 43,509 points migrated
 
 - `tools/mk2_migrate.py` — augments topology.jsonl with prime_set/layer/sector
-- Output: `shared/cycle/topology_mk2.jsonl` (30MB, gitignored)
+- Output: `shared/discovery/cycle/topology_mk2.jsonl` (30MB, gitignored)
 
 ### Phase 5 — Classifier v2 + Rust port 🚧
 
@@ -38,7 +38,7 @@
 
 **Tasks**:
 - [x] Python classifier_v2 with keyword+value+ps weighted scoring
-- [x] `shared/cycle/sectors.yaml` keyword dictionary
+- [x] `shared/discovery/cycle/sectors.yaml` keyword dictionary
 - [x] Validation on 43K points (legitimate physics hypothesis detection)
 - [ ] Rust port of classify_v2
 - [ ] Load sectors.yaml via serde

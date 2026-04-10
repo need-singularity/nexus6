@@ -71,7 +71,7 @@ src/singularity_recursion/
 Binary: `src/bin/cycle_tick.rs` (thin wrapper → `CycleTick::run()`).
 CLI integration: `nexus singularity-tick` subcommand in `src/cli/parser.rs`.
 
-### File layout (`shared/cycle/`)
+### File layout (`shared/discovery/cycle/`)
 
 | File | Format | Write pattern | Role |
 |---|---|---|---|

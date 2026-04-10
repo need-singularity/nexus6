@@ -15,7 +15,7 @@ ts = datetime.now().isoformat()
 
 # Get domains from topology
 domains_present = set()
-for i, l in enumerate(open(f'{NX}/shared/cycle/topology.jsonl')):
+for i, l in enumerate(open(f'{NX}/shared/discovery/cycle/topology.jsonl')):
     if i > 20000: break
     try:
         d = json.loads(l).get('domain','?')
@@ -32,7 +32,7 @@ def simhash_hex(text):
 # Read last 2000 points to find recent frontiers per domain
 recent_points = []
 try:
-    with open(f'{NX}/shared/cycle/topology.jsonl', 'rb') as f:
+    with open(f'{NX}/shared/discovery/cycle/topology.jsonl', 'rb') as f:
         f.seek(-300000, 2)
         lines = f.read().decode('utf-8','ignore').split('\n')
     for l in lines[-2000:]:
@@ -74,7 +74,7 @@ for dom in sorted(domains_present)[:10]:
     }
     probes.append(probe)
 
-with open(f'{NX}/shared/cycle/topology.jsonl', 'a') as f:
+with open(f'{NX}/shared/discovery/cycle/topology.jsonl', 'a') as f:
     for p in probes:
         f.write(json.dumps(p, ensure_ascii=False) + '\n')
 

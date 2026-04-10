@@ -21,7 +21,7 @@ fi
 
 # fallback: hexa hook 엔진 (Python 대체)
 source "$HOOK_DIR/ensure-symlinks.sh" 2>/dev/null || true
-HEXA="${HOME}/Dev/nexus/shared/bin/hexa"
+HEXA="${HOME}/Dev/nexus/shared/scripts/bin/hexa"
 HEXA_HOOK="${HOME}/Dev/nexus/mk2_hexa/native/hook.hexa"
 
 if [ -x "$HEXA" ] && [ -f "$HEXA_HOOK" ]; then
