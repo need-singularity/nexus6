@@ -1,4 +1,17 @@
-# 🔬 TECS-L
+# 🛑 [DELETE-PENDING] TECS-L — nexus 흡수 대상
+
+> **이 리포는 독립 리포가 아닙니다. nexus 의 흡수 대상(DELETE PENDING) 입니다.**
+>
+> - 상태: Track A 진행 / Track B 보류 (2026-04-10 기준)
+> - 포팅 완료: 약 75 .hexa 모듈 → `~/Dev/nexus/mk2_hexa/native/`
+> - Track B 블로커: torch(250), sklearn(79), scipy(104) — hexa-lang FFI/tensor 결정 대기
+> - 신규 작업 금지: 모든 신규 모듈은 `nexus/mk2_hexa/native/{verify,math,engines,experiments}/*.hexa`
+> - 코드 삭제는 별도 에이전트가 담당. 이동/문서화만 현재 수행 중.
+> - 전체 로드맵: `~/Dev/nexus/docs/tecs-l-absorption-plan.md`
+
+---
+
+# 🔬 TECS-L (원본 문서)
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19243580.svg)](https://doi.org/10.5281/zenodo.19243580)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)

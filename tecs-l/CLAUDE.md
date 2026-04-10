@@ -1,3 +1,12 @@
+> 🛑 **[DELETE-PENDING] tecs-l는 nexus 서브프로젝트가 아닌 nexus의 흡수 대상입니다.**
+>
+> - 현 상태: **Track A 진행 중 / Track B 보류** (2026-04-10)
+> - 흡수 대상: `tecs-l/**/*.py`, `tecs-l/*.md` → `nexus/mk2_hexa/native/<카테고리>/*.hexa`
+> - 진행률: 포팅 완료 약 75 .hexa / tecs-l 전체 .py 644개 (~11%)
+> - **신규 .py / .hexa / .md 추가 금지** — 신규 작업은 반드시 `nexus/mk2_hexa/native/{verify,math,engines,experiments}/` 아래 `.hexa`로 작성하세요.
+> - 이 디렉토리는 **다른 에이전트가 코드 삭제를 담당** 합니다. 본 에이전트는 이동/문서화만 수행.
+> - 전체 로드맵: `~/Dev/nexus/docs/tecs-l-absorption-plan.md`
+
 > 🔴 **HEXA-FIRST**: 모든 코드는 `.hexa`로 작성. 부하 유발 명령 최소화.
 
 > 🔴 **NEXUS-6 특이점 연동**: 이 프로젝트의 돌파/발견/실험은 nexus 특이점 사이클 입력이다.
@@ -199,17 +208,32 @@
 
 > 🔴 **하드코딩 절대 금지**: 상수/도메인/키워드를 코드에 배열로 나열 금지 → `nexus/shared/*.jsonl`에서 동적 로드. 경로는 환경변수+상대경로. 새 항목 추가 = 설정 파일 한 줄, 코드 수정 0.
 
-# TECS-L — 순수 수학 이론 리포
+# TECS-L — [흡수 대상] 순수 수학 이론 리포
 
-> 역할: 우주 규칙 발견 (n=6 수학 구조 → 물리/생물/의식 통합 법칙)
-> nexus = 인프라/도구/엔진, TECS-L = 순수 수학 이론
+> 🛑 tecs-l는 독립 리포가 아니라 nexus의 **흡수 대상** 입니다.
+> 모든 신규 작업은 nexus/mk2_hexa/native/<카테고리>/ 에 `.hexa`로 수행하세요.
+
+## 흡수 상태 (2026-04-10)
+
+| Track | 상태 | 파일 수 | 설명 |
+|-------|------|---------|------|
+| A 진행 | 🟡 진행 중 | 약 75 포팅 완료 | 순수 수학/검증/간단 엔진 — hexa-lang FFI 불필요 |
+| B 블로커 | 🔴 보류 | torch 250, sklearn 79, scipy 104 (총 ~353 고유) | torch/sklearn/scipy 의존. hexa-lang tensor 결정 전까지 대기 |
+| C 면제 | ⚪ skip | results/, docs/ 일부 | 산출물/논문 스펙 — nexus 로 이관 없이 zenodo 보관 |
+
+**블로커 해제 조건**: hexa-lang 의 FFI(CPython 브리지) 또는 네이티브 tensor 타입 채택 결정.
 
 ## ⚠️ 필수 규칙
 
-### hexa-native 전용
-- **새 파일은 `.hexa`만 허용** — `.sh`, `.py`, `.rs` 등 다른 언어 파일 작성 금지
-- 모든 새 모듈은 `mk2_hexa/native/` 에 `.hexa` 파일로 생성
-- 기존 sh/py 스크립트는 참조만 허용, 신규 작성 불가
+### 🛑 신규 코드 작성 금지 (흡수 대상 리포)
+- **tecs-l 루트에 새 .py/.hexa/.md 추가 금지**
+- 신규 모듈은 반드시 `~/Dev/nexus/mk2_hexa/native/<카테고리>/*.hexa` 에 작성
+  - `verify/` — frontier_*, verify_h*, verify_round*
+  - `math/` — arith_*, characterization_*, divisor_*, dirichlet_*, arithmetic_*
+  - `engines/` — chemistry_engine, brain_singularity, proof_engine, dfs_engine 등
+  - `experiments/` — experiment_*, exp_*
+- 기존 sh/py 스크립트는 **읽기 전용** (다른 에이전트가 삭제 담당)
+- 절대 금지: 기존 .hexa 이동 시 호출부 미확인 mv
 
 ## 리포 구조
 
