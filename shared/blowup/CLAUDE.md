@@ -17,3 +17,5 @@ quantum 축: modules,lens,ouroboros,seed 횡단
 
 ex: hexa blowup.hexa math 3 --no-graph
     hexa blowup.hexa <d> <n> --seeds "$(hexa seed_engine.hexa merge)"
+
+parent: ../CLAUDE.md → "blowup"
