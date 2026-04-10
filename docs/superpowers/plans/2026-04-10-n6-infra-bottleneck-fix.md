@@ -63,7 +63,7 @@ RSYNC_OPTS=(-azP --delete --exclude='.DS_Store' --exclude='SECRET.md' --exclude=
 
 SYNC_FILES=(
   "reality_map_live.json"
-  "growth_bus.jsonl"
+  "n6/atlas.n6"
   "infra_state.json"
   "dse_cross_results.json"
   "n6/docs/"
@@ -119,7 +119,7 @@ DEBOUNCE=5  # 초
 
 WATCH_PATHS=(
   "$SHARED/reality_map_live.json"
-  "$SHARED/growth_bus.jsonl"
+  "$SHARED/n6/atlas.n6"
   "$SHARED/dse_cross_results.json"
   "$SHARED/n6/docs"
 )
@@ -196,7 +196,7 @@ ssh hetzner 'head -c 2000 ~/Dev/nexus/shared/dse/dse_cross_results.json' 2>/dev/
 ```hexa
 // dse_joint_optimizer.hexa — Cross-DSE 상위 공명 쌍 → joint 최적화
 // 입력: shared/dse/dse_cross_results.json (cross_dse_fusion.hexa 출력)
-// 출력: shared/dse/dse_joint_results.json + growth_bus.jsonl
+// 출력: shared/dse/dse_joint_results.json + atlas.n6
 //
 // Usage:
 //   hexa dse_joint_optimizer.hexa              상위 15쌍 joint 최적화
@@ -209,7 +209,7 @@ fn main() {
     let cross_path = shared + "/dse_cross_results.json"
     let dse_dir = shared + "/dse/domains"
     let out_path = shared + "/dse_joint_results.json"
-    let bus_path = shared + "/growth_bus.jsonl"
+    let bus_path = shared + "/n6/atlas.n6"
 
     // ─── ARGS ───
     let a = args()
@@ -350,7 +350,7 @@ fn main() {
     try {
         let evt = "{\"ts\":\"" + ts + "\",\"type\":\"dse_joint_optimize\",\"pairs\":" + to_string(results.len()) + ",\"source\":\"dse_joint_optimizer.hexa\"}\n"
         append_file(bus_path, evt)
-        println("[bus] growth_bus.jsonl updated")
+        println("[bus] atlas.n6 updated")
     } catch e {
         println("[WARN] bus write failed: " + to_string(e))
     }
@@ -590,7 +590,7 @@ async function loadAll(){
 
 async function loadGrowthBus(){
   try{
-    const r=await fetch('growth_bus.jsonl',{cache:'no-store'});
+    const r=await fetch('atlas.n6',{cache:'no-store'});
     if(!r.ok) return;
     const text=await r.text();
     BUS_LINES=text.trim().split('\n').filter(l=>l).map(l=>{try{return JSON.parse(l)}catch{return null}}).filter(Boolean);
@@ -757,7 +757,7 @@ JS 섹션 (loadData 함수 뒤)에 추가:
 // ═══ GROWTH BUS 이벤트 스트리밍 ═══
 async function loadGrowthBus(){
   try{
-    const r=await fetch('growth_bus.jsonl',{cache:'no-store'});
+    const r=await fetch('atlas.n6',{cache:'no-store'});
     if(!r.ok) return;
     const text=await r.text();
     const lines=text.trim().split('\n').filter(l=>l).slice(-15).reverse();

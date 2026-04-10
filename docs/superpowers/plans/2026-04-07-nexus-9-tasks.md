@@ -15,7 +15,7 @@
 | 파일 | 역할 | 작업 |
 |------|------|------|
 | `.gitignore` | auto_stubs 제외 | Task 6: 수정 |
-| `shared/discovery/growth_bus.jsonl` | 이벤트 스트림 | Task 2: rotation |
+| `shared/n6/atlas.n6` (growth_bus 섹션) | 이벤트 스트림 | Task 2: rotation |
 | `shared/hexa_pitfalls_log.jsonl` | 실수 기록 | Task 7: 분석 |
 | `shared/config/hexa_grammar.jsonl` | 문법 스펙 | Task 7: P6 규칙 추가 (해당 시) |
 | `shared/dashboard.html` | 대시보드 | Task 8: reality_map 시각화 추가 |
@@ -59,11 +59,11 @@ git commit -m "chore: anima + airgenome 상태 파일 추가"
 
 ---
 
-### Task 2: growth_bus.jsonl rotation (147k줄 → 아카이브)
+### Task 2: atlas.n6 growth_bus rotation (147k줄 → 아카이브)
 
 **Files:**
 - Create: `shared/archive/growth_bus_20260407.jsonl`
-- Modify: `shared/discovery/growth_bus.jsonl`
+- Modify: `shared/n6/atlas.n6` (growth_bus 섹션)
 
 - [ ] **Step 1: 아카이브 디렉토리 확인**
 
@@ -71,29 +71,30 @@ git commit -m "chore: anima + airgenome 상태 파일 추가"
 ls shared/archive/ 2>/dev/null || mkdir -p shared/archive
 ```
 
-- [ ] **Step 2: 현재 growth_bus를 아카이브로 이동**
+- [ ] **Step 2: atlas.n6에서 growth_bus 섹션 아카이브 추출**
 
 ```bash
-mv shared/discovery/growth_bus.jsonl shared/archive/growth_bus_20260407.jsonl
+hexa shared/n6/atlas.n6 export --section growth_bus > shared/archive/growth_bus_20260407.jsonl
 ```
 
-- [ ] **Step 3: 최근 1000줄만 새 growth_bus.jsonl로 생성**
+- [ ] **Step 3: atlas.n6 growth_bus 섹션을 최근 1000건으로 rotation**
 
 ```bash
-tail -1000 shared/archive/growth_bus_20260407.jsonl > shared/discovery/growth_bus.jsonl
+hexa shared/n6/atlas.n6 rotate --section growth_bus --keep 1000
 ```
 
 - [ ] **Step 4: 결과 확인**
 
 ```bash
-wc -l shared/discovery/growth_bus.jsonl shared/archive/growth_bus_20260407.jsonl
+hexa shared/n6/atlas.n6 query --section growth_bus --count
+wc -l shared/archive/growth_bus_20260407.jsonl
 ```
 
 - [ ] **Step 5: 커밋**
 
 ```bash
-git add shared/discovery/growth_bus.jsonl shared/archive/growth_bus_20260407.jsonl
-git commit -m "chore: growth_bus rotation — 147k줄 아카이브 + 최근 1000줄 유지"
+git add shared/n6/atlas.n6 shared/archive/growth_bus_20260407.jsonl
+git commit -m "chore: atlas.n6 growth_bus rotation — 147k줄 아카이브 + 최근 1000줄 유지"
 ```
 
 ---
