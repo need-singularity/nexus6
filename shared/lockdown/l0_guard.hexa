@@ -1,0 +1,316 @@
+// shared/lockdown/l0_guard.hexa — L0 골화 자동 보호 (전 프로젝트 공용)
+//
+// SSOT: shared/lockdown/lockdown.json → projects.{name}.L0
+// REPO/OWNER: git remote 자동 감지 (cwd 의 git 리포 기준)
+// 위치: nexus shared/ — 7 프로젝트 공용 (anima/scripts/l0_guard.hexa 의 shared 포팅)
+//
+// Usage (해당 git 리포 안에서 실행):
+//   hexa ~/Dev/nexus/shared/lockdown/l0_guard.hexa verify       전체 검증 (파일 + CODEOWNERS + GitHub)
+//   hexa ~/Dev/nexus/shared/lockdown/l0_guard.hexa sync         CODEOWNERS 재생성 + GitHub 보호 적용
+//   hexa ~/Dev/nexus/shared/lockdown/l0_guard.hexa merge <PR#>  solo-repo PR 머지 (enforce_admins 안전 패턴)
+//   hexa ~/Dev/nexus/shared/lockdown/l0_guard.hexa status       현재 보호 상태 요약
+
+let HOME = env("HOME")
+let LOCKDOWN = HOME + "/Dev/nexus/shared/lockdown/lockdown.json"
+let SYNC_CODEOWNERS = HOME + "/Dev/nexus/shared/scripts/sync_codeowners.hexa"
+let HEXA = HOME + "/Dev/hexa-lang/hexa"
+let OWNER = "@need-singularity"
+let BRANCH = "main"
+let CODEOWNERS = ".github/CODEOWNERS"
+
+// ─── Auto-detect project + REPO from cwd ───
+
+fn detect_root() {
+    return exec("git rev-parse --show-toplevel 2>/dev/null").trim()
+}
+
+fn detect_project() {
+    let root = detect_root()
+    if root == "" { return "" }
+    return exec("basename " + root).trim()
+}
+
+fn detect_repo() {
+    let url = exec("git remote get-url origin 2>/dev/null").trim()
+    if url == "" { return "" }
+    return exec("echo '" + url + "' | sed -E 's|.*github\\.com[:/]||; s|\\.git$||'").trim()
+}
+
+// ─── L0 paths from lockdown.json ───
+
+fn get_l0_paths(project) {
+    let raw = exec("python3 -c \"import json; [print(e['path']) for e in json.load(open('" + LOCKDOWN + "'))['projects'].get('" + project + "',{}).get('L0',[])]\" 2>/dev/null")
+    return raw.trim()
+}
+
+// ─── GitHub protection via gh CLI ───
+
+fn gh_check(repo, field) {
+    let r = exec("gh api repos/" + repo + "/branches/" + BRANCH + "/protection 2>/dev/null | python3 -c \"import sys,json; d=json.load(sys.stdin); " + field + "\" 2>/dev/null").trim()
+    if r == "True" { return true }
+    if r == "true" { return true }
+    return false
+}
+
+fn gh_enforce_admins_status(repo) {
+    return gh_check(repo, "print(d.get('enforce_admins',{}).get('enabled',False))")
+}
+
+fn gh_enforce_admins_on(repo) {
+    exec("gh api repos/" + repo + "/branches/" + BRANCH + "/protection/enforce_admins -X POST 2>/dev/null")
+}
+
+fn gh_enforce_admins_off(repo) {
+    exec("gh api repos/" + repo + "/branches/" + BRANCH + "/protection/enforce_admins -X DELETE 2>/dev/null")
+}
+
+fn check_require_pr(repo) {
+    return gh_check(repo, "print(d.get('required_pull_request_reviews') is not None)")
+}
+
+fn check_code_owner_reviews(repo) {
+    return gh_check(repo, "print(d.get('required_pull_request_reviews',{}).get('require_code_owner_reviews',False))")
+}
+
+fn check_force_push_blocked(repo) {
+    return gh_check(repo, "print(not d.get('allow_force_pushes',{}).get('enabled',True))")
+}
+
+fn check_deletions_blocked(repo) {
+    return gh_check(repo, "print(not d.get('allow_deletions',{}).get('enabled',True))")
+}
+
+// ─── Commands ───
+
+fn cmd_status(project, repo) {
+    println("═══ L0 보호 상태 — " + project + " (" + repo + ") ═══")
+    println("")
+
+    let e = gh_enforce_admins_status(repo)
+    let pr = check_require_pr(repo)
+    let co = check_code_owner_reviews(repo)
+    let fp = check_force_push_blocked(repo)
+    let dl = check_deletions_blocked(repo)
+    let cf_check = exec("test -e " + CODEOWNERS + " && echo Y || echo N").trim()
+    let cf = cf_check == "Y"
+
+    if e { println("  PASS  enforce_admins") } else { println("  FAIL  enforce_admins") }
+    if pr { println("  PASS  require_pull_request") } else { println("  FAIL  require_pull_request") }
+    if co { println("  PASS  require_code_owner_reviews") } else { println("  FAIL  require_code_owner_reviews") }
+    if fp { println("  PASS  force_push_blocked") } else { println("  FAIL  force_push_blocked") }
+    if dl { println("  PASS  branch_delete_blocked") } else { println("  FAIL  branch_delete_blocked") }
+    if cf { println("  PASS  CODEOWNERS 존재") } else { println("  FAIL  CODEOWNERS 없음") }
+
+    println("")
+    if e && pr && co && fp && dl && cf {
+        println("  L0 보호 완전. 빈틈 없음.")
+    } else {
+        println("  보호 갭 있음 — sync 명령 실행")
+    }
+}
+
+fn cmd_verify(project, repo) {
+    println("═══ L0 Guard — " + project + " 전체 검증 ═══")
+    println("")
+    let mut pass = 0
+    let mut fail = 0
+    let root = detect_root()
+
+    // 1. L0 파일 존재
+    println("── 1. L0 파일 존재 (lockdown.json projects." + project + ".L0) ──")
+    let paths_str = get_l0_paths(project)
+    if paths_str == "" {
+        println("  FAIL  lockdown.json에 " + project + " 항목 없음")
+        fail = fail + 1
+    } else {
+        let lines = paths_str.split("\n")
+        let mut i = 0
+        while i < len(lines) {
+            let p = lines[i].trim()
+            if p != "" {
+                let abs = root + "/" + p
+                let exists = exec("test -e '" + abs + "' && echo Y || echo N").trim()
+                if exists == "Y" {
+                    println("  PASS  " + p)
+                    pass = pass + 1
+                } else {
+                    println("  FAIL  " + p + " — 없음")
+                    fail = fail + 1
+                }
+            }
+            i = i + 1
+        }
+    }
+
+    // 2. CODEOWNERS 동기화 검증
+    println("")
+    println("── 2. CODEOWNERS 동기화 ──")
+    let co_check = exec("test -e " + CODEOWNERS + " && echo Y || echo N").trim()
+    if co_check != "Y" {
+        println("  FAIL  " + CODEOWNERS + " 없음")
+        fail = fail + 1
+    } else {
+        let co_content = read_file(CODEOWNERS)
+        let lines = paths_str.split("\n")
+        let mut j = 0
+        let mut co_pass = 0
+        let mut co_fail = 0
+        while j < len(lines) {
+            let p = lines[j].trim()
+            if p != "" {
+                if co_content.contains(p) {
+                    co_pass = co_pass + 1
+                } else {
+                    println("  FAIL  CODEOWNERS 누락: " + p)
+                    co_fail = co_fail + 1
+                }
+            }
+            j = j + 1
+        }
+        if co_fail == 0 {
+            println("  PASS  CODEOWNERS 모든 L0 경로 포함 (" + to_string(co_pass) + "건)")
+            pass = pass + co_pass
+        } else {
+            pass = pass + co_pass
+            fail = fail + co_fail
+        }
+    }
+
+    // 3. GitHub branch protection
+    println("")
+    println("── 3. GitHub Branch Protection ──")
+    let e = gh_enforce_admins_status(repo)
+    let prr = check_require_pr(repo)
+    let cor = check_code_owner_reviews(repo)
+    let fp = check_force_push_blocked(repo)
+    let dl = check_deletions_blocked(repo)
+
+    if e { println("  PASS  enforce_admins"); pass = pass + 1 } else { println("  FAIL  enforce_admins"); fail = fail + 1 }
+    if prr { println("  PASS  require_pull_request"); pass = pass + 1 } else { println("  FAIL  require_pull_request"); fail = fail + 1 }
+    if cor { println("  PASS  require_code_owner_reviews"); pass = pass + 1 } else { println("  FAIL  require_code_owner_reviews"); fail = fail + 1 }
+    if fp { println("  PASS  force_push_blocked"); pass = pass + 1 } else { println("  FAIL  force_push_blocked"); fail = fail + 1 }
+    if dl { println("  PASS  branch_delete_blocked"); pass = pass + 1 } else { println("  FAIL  branch_delete_blocked"); fail = fail + 1 }
+
+    println("")
+    println("═══ 결과: " + to_string(pass) + " PASS / " + to_string(fail) + " FAIL ═══")
+    if fail == 0 {
+        println("L0 보호 완전.")
+    } else {
+        println("보호 갭 " + to_string(fail) + "건 — sync 명령으로 복구")
+    }
+}
+
+fn cmd_sync(project, repo) {
+    println("═══ L0 Guard — " + project + " 동기화 ═══")
+    println("")
+
+    // 1. CODEOWNERS — sync_codeowners.hexa 위임 (전 7 프로젝트 일괄)
+    println("── 1. CODEOWNERS (sync_codeowners.hexa 위임) ──")
+    let out = exec(HEXA + " " + SYNC_CODEOWNERS + " 2>&1")
+    println(out)
+
+    // 2. GitHub enforce_admins
+    println("── 2. GitHub Branch Protection ──")
+    if !gh_enforce_admins_status(repo) {
+        println("  FIX   enforce_admins 활성화...")
+        gh_enforce_admins_on(repo)
+        if gh_enforce_admins_status(repo) {
+            println("  DONE  enforce_admins = true")
+        } else {
+            println("  FAIL  enforce_admins 활성화 실패")
+        }
+    } else {
+        println("  OK    enforce_admins 이미 활성")
+    }
+
+    if check_require_pr(repo) {
+        println("  OK    PR 리뷰 활성")
+    } else {
+        println("  WARN  PR 리뷰 미설정 — GitHub UI에서 확인")
+    }
+
+    println("")
+    println("═══ 동기화 완료 — verify 로 확인 ═══")
+}
+
+fn cmd_merge(repo, pr_number) {
+    println("═══ L0 Guard — Solo-repo PR #" + pr_number + " 머지 (" + repo + ") ═══")
+    println("")
+
+    // 1. enforce_admins OFF
+    println("  [1/4] enforce_admins 해제...")
+    gh_enforce_admins_off(repo)
+
+    // 2. merge
+    println("  [2/4] PR #" + pr_number + " 머지...")
+    let merge_out = exec("gh pr merge " + pr_number + " --merge --admin 2>&1")
+    println("  " + merge_out)
+
+    // 3. enforce_admins ON (무조건 복구)
+    println("  [3/4] enforce_admins 재활성화...")
+    gh_enforce_admins_on(repo)
+
+    // 4. 결과 확인
+    let state = exec("gh pr view " + pr_number + " --json state -q '.state' 2>/dev/null").trim()
+    println("  [4/4] PR 상태: " + state)
+    if state == "MERGED" {
+        println("")
+        println("  DONE  PR #" + pr_number + " 머지 완료 + enforce_admins 복구")
+        let pull = exec("git checkout " + BRANCH + " && git pull origin " + BRANCH + " 2>&1").trim()
+        println("  " + pull)
+    } else {
+        println("")
+        println("  FAIL  PR #" + pr_number + " 머지 실패 — enforce_admins는 복구됨")
+    }
+}
+
+fn print_usage() {
+    println("Usage: hexa ~/Dev/nexus/shared/lockdown/l0_guard.hexa <command>")
+    println("")
+    println("  verify       전체 검증 (파일 + CODEOWNERS + GitHub)")
+    println("  sync         CODEOWNERS 재생성 + GitHub 보호 적용")
+    println("  merge <PR#>  solo-repo PR 머지 (enforce_admins 안전 패턴)")
+    println("  status       현재 보호 상태 요약")
+    println("")
+    println("프로젝트/REPO 자동 감지: cwd 가 7 프로젝트 (nexus/n6-architecture/anima/hexa-lang/void/papers/airgenome) git 리포 안이어야 함")
+}
+
+// ─── Entry ───
+
+fn main() {
+    let a = args()
+    if len(a) < 3 {
+        print_usage()
+        return
+    }
+
+    let project = detect_project()
+    let repo = detect_repo()
+
+    if project == "" {
+        println("FAIL: git 리포 안에서 실행하세요 (cwd 가 git 안이어야 함)")
+        return
+    }
+    if repo == "" {
+        println("FAIL: git remote 'origin' 없음 — github.com 리포여야 함")
+        return
+    }
+
+    let cmd = a[2]
+    if cmd == "verify" { cmd_verify(project, repo) }
+    else if cmd == "sync" { cmd_sync(project, repo) }
+    else if cmd == "merge" {
+        if len(a) < 4 {
+            println("Usage: hexa ~/Dev/nexus/shared/lockdown/l0_guard.hexa merge <PR#>")
+            return
+        }
+        cmd_merge(repo, a[3])
+    }
+    else if cmd == "status" { cmd_status(project, repo) }
+    else {
+        println("Unknown command: " + cmd)
+        print_usage()
+    }
+}
+
+main()
