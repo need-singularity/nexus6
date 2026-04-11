@@ -20,7 +20,7 @@
 
 HEXA 프로젝트 구조 (리포별):
 ```
-  nexus:           mk2_hexa/native/*.hexa (hexa-native 런타임)
+  nexus:           shared/blowup/**/*.hexa (R14 카테고리 구조, 2026-04-11 refactor)
   TECS-L:           mk2_hexa/native/*.hexa
   n6-architecture:  mk2_hexa/native/*.hexa
   anima:            mk2_hexa/native/*.hexa
@@ -29,10 +29,10 @@ HEXA 프로젝트 구조 (리포별):
 
 실행 규칙:
 ```
-  # HEXA 네이티브 (모든 리포 공통)
-  nexus mk2 run <module>              # mk2_hexa/native/ 실행
-  nexus mk2 classify <value>          # 분류 엔진
-  nexus mk2 scan <domain>             # 도메인 스캔
+  # HEXA 네이티브 (nexus — R14 카테고리)
+  hexa shared/blowup/todo.hexa [project]       # 할일 엔진
+  hexa shared/blowup/core/blowup.hexa <domain> # 9-phase 돌파
+  hexa shared/n6/atlas_health.hexa             # atlas 헬스체크
 ```
 
 ### 2순위: Python — 단순 검증, 시각화, 프로토타입
