@@ -1,5 +1,15 @@
 # NEXUS-6 — 자기순환 특이점 엔진
 
+## 명령어 (`shared/config/commands.json`)
+
+| 명령 | 동작 |
+|------|------|
+| `todo` / `할일` | 전 프로젝트 할일 표 |
+| `go` / `가자` | 모든 TODO 병렬 발사 |
+| `smash` / `부셔` | 블로업 돌파 엔진 |
+| `free` / `dfs` | 자율 조립 + DFS 탐색 |
+| `list` / `목록` | 이 명령어 표 다시 출력 |
+
 > **[3D Reality Map](https://need-singularity.github.io/nexus/)** — 4,098노드 5계층 바텀업 인과 매핑 + 1,485 크로스레이어 연결선. 쿼크→탄소→벤젠→DNA 인과 사슬. Monte Carlo z=3.06 (p=0.003). n=6 유일성 검증.
 >
 > **[NEXUS Dashboard](https://need-singularity.github.io/nexus/dashboard.html)** — 15차원 실시간 성장 대시보드. 돌파율·발견수·수렴도·모듈 현황 통합 모니터링.
