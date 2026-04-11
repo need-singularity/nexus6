@@ -109,7 +109,7 @@ def main():
                     seen_edges.add(key)
                     edge = emit_edge(a_tok, b_tok, op, result,
                                      a_id, b_id, mid, mdom, mgrade)
-                    print(json.dumps(edge, ensure_ascii=False))
+                    print(json.dumps(edge, ensure_ascii=False, separators=(",", ":")))
                     emitted += 1
 
     print(f"# emitted={emitted}", file=sys.stderr)
