@@ -1,49 +1,64 @@
-# void — HEXA 터미널 (FATHOM)
+# void — hexa-only AI-native 터미널
 
-## 명령어 (shared/config/commands.json)
+> SSoT: `state.json`. 참조 기준: **macOS Terminal.app**. iTerm2/kitty/Warp/Ghostty/Alacritty 참조 제외 (VD1).
 
-| 명령 | 동작 |
+## state (모든 진행/결정은 JSON/JSONL에만)
+
+| 파일 | 역할 |
 |------|------|
-| `todo` / `할일` | 전 프로젝트 할일 표 |
-| `go` / `가자` | 모든 TODO 병렬 발사 |
-| `smash` / `부셔` | 블로업 돌파 엔진 |
-| `explore` / `탐색` | 5모듈 자율 DFS |
-| `list` / `목록` | 이 명령어 표 다시 출력 |
+| `state.json`         | 레이어·바이너리·블로커·next steps SSoT |
+| `breakthroughs.jsonl` | 증명된 능력 append-only (현재 10건) |
+| `pitfalls.jsonl`     | 발견된 함정 append-only |
+| `convergence.json`   | 골화 (ossified) 결정 |
+| `rules.json`         | VD1~VD5 프로젝트 규칙 |
+| `hooks.json`         | hook DSL — smoke-pass/fail/codegen-slow/iterm2-ref/discovery-emit |
+| `manifest.json`      | 소스 파일 ↔ 레이어 ↔ 의존 |
+| `hexa.toml`          | 패키지 매니페스트 (hexa-lang 기준) |
 
-> shared/ JSON 단일진실 (R14). 규칙: `shared/rules/common.json` (R0~R27)
+## layers
 
-## ⛔ 규칙 준수 (필수)
+| L | 역할 | 소스 접두 |
+|---|------|-----------|
+| L1_sys  | OS 브릿지 (PTY/termios/poll/Cocoa) | `src/sys_*.c,.m` |
+| L2_term | VT 파서/스크린 버퍼/UTF-8 (순수 hexa) | `src/smoke_*.hexa` (모듈 임포트 미구현으로 임베딩) |
+| L3_app  | 엔트리 + 이벤트 루프 + 렌더 | 미착수 |
 
-작업 시작 전 `shared/rules/common.json` + `shared/rules/void.json` 을 읽고 전 규칙 준수. 위반 시 즉시 수정.
+## build / run
 
-## 트리맵
+| 방법 | 명령 |
+|------|------|
+| 설치 | `hx install void` (hexa-lang pkg 레지스트리 경유) |
+| 실행 | `./void` (현재 MVP: AppKit smoke — 800x600 NSWindow) |
+| 통합 | `./void --term-v1` (PTY → VT → 80x24 grid 증명) |
+| 전체 빌드 | `./void --build` (9 smoke 병렬 빌드) |
+| 상태 | `./void --status` (state.json 요약) |
+| 단건 | `scripts/build.sh src/smoke_<name>.hexa src/sys_<dep>.{c,m}` |
+
+## 현재 블로커
 
 ```
-core/           L1~L3 심장부 (L0) — sys/ render/ terminal/
-ui/             L4 탭/레이아웃/테마
-plugin/         L5 플러그인 시스템
-ai/             L6 NEXUS-6 연동
-platform/       OS 브릿지 — macOS Cocoa/Metal
-app/            엔트리포인트 — main, main_app, main_tabs
-tests/          smoke + 통합 테스트
-scripts/        빌드/릴리즈
-docs/           설계문서/플랜
+VB1 native build_c        high    interpreted ./hexa 7.7KB→170s
+VB2 hexa 모듈 임포트 부재    medium  VT parser/screen 공통화 불가
+VB3 extern param 추론 한계  low    s.chars() 우회
 ```
 
-## 의존 방향
+## 아카이브
 
-`core/sys → core/render → core/terminal → ui → plugin → ai` (단방향)
+이전 Metal/Vulkan 6-layer (core/ui/plugin/ai/platform) 설계 65 commits:
+`~/archive/void_20260411_pre_terminalapp/`
 
 ## ref
 
 ```
-rules     shared/rules/common.json             R0~R27 공통
-project   shared/rules/void.json               VD1~VD2
-lock      shared/rules/lockdown.json           L0/L1/L2
-cdo       shared/rules/convergence_ops.json    CDO 수렴
-registry  shared/config/projects.json
-cfg       shared/config/project_config.json
-core      shared/config/core.json
-conv      shared/convergence/void.json
-api       shared/CLAUDE.md
+rules        shared/rules/common.json       R0~R27
+project      rules.json                     VD1~VD5
+lockdown     shared/rules/lockdown.json     L0/L1/L2
+design       docs/design.md
+manifest     manifest.json
+package      hexa.toml
+compiler     ~/Dev/hexa-lang/hexa
+build_c      ~/Dev/hexa-lang/self/build_c.hexa
+registry     ~/Dev/hexa-lang/pkg/registry.tsv
+archived     ~/archive/void_20260411_pre_terminalapp/
+discovery    shared/discovery/growth_bus.jsonl
 ```
