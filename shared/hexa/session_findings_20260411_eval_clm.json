@@ -1,0 +1,136 @@
+{
+  "_meta": {
+    "name": "hexa-lang 인터프리터 의미론 검증 — eval_clm 세션",
+    "updated": "2026-04-11",
+    "description": "P5c-1 서빙 엔드포인트 (eval_clm.hexa) 구현 중 발견한 hexa 인터프리터 의미론 7건과 P5c-4 레이턴시 측정 데이터 포인트. 전부 /tmp에서 최소 재현 확인 완료.",
+    "session": "2026-04-11 train_and_save.hexa → train_byte_clm.hexa → eval_clm.hexa → measure_latency.hexa 파이프라인 완성",
+    "rule": "이 findings는 향후 hexa 학습/추론/서빙 .hexa 작성 시 필수 참고"
+  },
+  "findings": [
+    {
+      "id": "FIND-LIST-PBV",
+      "severity": "blocker",
+      "category": "semantics/list",
+      "title": "hexa lists are pass-by-value",
+      "symptom": "Helper function `fn train_one_pair(W, token, target)` mutating `W[row_start + j] = ...` had no effect on caller's W — loss stayed exactly at log(vocab) across 200 steps.",
+      "minimal_repro": {
+        "file": "/tmp/mut_test.hexa",
+        "code": "fn mutate(arr) { arr[0] = 99 }\nfn main() {\n    let mut a = [1, 2, 3]\n    mutate(a)\n    println(a)  // [1, 2, 3] — unchanged\n}\nlet _ = main()",
+        "observed": "[1, 2, 3]",
+        "expected_if_by_ref": "[99, 2, 3]"
+      },
+      "root_cause": "List values are copied when passed to a function. Index-mutation inside the callee writes to the local copy. The caller's binding is never touched.",
+      "workarounds": [
+        {
+          "approach": "inline into main's scope where `let mut` lives",
+          "when": "hot path / frequent mutation",
+          "evidence": "training/train_and_save.hexa line 200-250 inlines SGD update → loss drops 2.08 → 0.008 in 82 ms"
+        },
+        {
+          "approach": "return the updated list, caller reassigns",
+          "when": "one-shot update, clean call-site",
+          "evidence": "/tmp/ret_test.hexa: `fn mutate_ret(arr) { arr[0]=99; return arr }` + `a = mutate_ret(a)` → [99, 2, 3]"
+        },
+        {
+          "approach": "module-level `let mut` + helper assigns from inside",
+          "when": "multiple readers/writers of same state",
+          "evidence": "eval_clm.hexa install_tensor(name, data) writes module-level `embed`/`L0_Wq`/... /tmp/modmut_test.hexa confirms module-level vars can be reassigned AND index-mutated from inside functions"
+        },
+        {
+          "approach": "raw pointer + write_f32/read_f32",
+          "when": "GPU weights, native FFI buffers",
+          "evidence": "training/train_gpu_pure.hexa uses alloc_raw + write_f32 for all weights"
+        }
+      ],
+      "verification": "After inlining SGD into main() in train_and_save.hexa: loss 2.079 → 0.008 in 30 steps (82 ms), top1 11% → 100%, PASS"
+    },
+    {
+      "id": "FIND-ARGS-INDEX",
+      "severity": "minor",
+      "category": "semantics/cli",
+      "title": "args() indexing: [0]=binary, [1]=script, [2]=first user arg",
+      "symptom": "`hexa serving/eval_serve.hexa -- /tmp/foo.ckpt` loaded the DEFAULT model, not the checkpoint. Looked like a checkpoint loader bug.",
+      "minimal_repro": {
+        "file": "/tmp/args_test.hexa",
+        "results": {
+          "$HEXA /tmp/args_test.hexa": "len=2 [0]=/Users/ghost/Dev/hexa-lang/hexa [1]=/tmp/args_test.hexa",
+          "$HEXA /tmp/args_test.hexa foo": "len=3 [0]=hexa [1]=script [2]=foo",
+          "$HEXA /tmp/args_test.hexa -- foo": "len=4 [0]=hexa [1]=script [2]=-- [3]=foo"
+        }
+      },
+      "root_cause": "hexa args() returns the FULL argv including the hexa binary path at [0] and the script at [1]. No `--` separator convention. First user argument is always at index 2.",
+      "rule": "Read CLI args with `if len(_argv) >= 3 { path = _argv[2] }`. Never pass `--` as an argument separator.",
+      "affected_files": [
+        "serving/eval_serve.hexa",
+        "serving/eval_clm.hexa",
+        "serving/measure_latency.hexa"
+      ]
+    },
+    {
+      "id": "FIND-CWD-RELATIVE",
+      "severity": "minor",
+      "category": "tooling/cwd",
+      "title": "hexa interpreter uses process cwd for relative paths, not script dir",
+      "symptom": "Background training command `$HEXA training/train_byte_clm.hexa` exited with 'Error reading training/train_byte_clm.hexa: No such file or directory' even though the file existed at /Users/ghost/Dev/anima/training/train_byte_clm.hexa. Cause: outer shell cwd was /Users/ghost/Dev/hexa-lang.",
+      "root_cause": "hexa resolves relative script paths against the caller's getcwd(), not against anything script-relative. Same applies to read_file/write_file inside the script.",
+      "rule": "Always use absolute paths in Bash tool calls when invoking hexa from multiple directories. For cross-repo work (anima + hexa-lang) this is the default failure mode.",
+      "example_fix": "cd /Users/ghost/Dev/anima && $HEXA serving/eval_clm.hexa /tmp/train_byte_clm.ckpt"
+    },
+    {
+      "id": "FIND-STRCAT-FAST",
+      "severity": "info",
+      "category": "perf/string",
+      "title": "String concatenation is O(1) amortized — safe for 100 KB+ accumulation",
+      "symptom_before": "Worried that building 80 KB checkpoint via `s = s + token_str` in a loop would be O(n²) and make save_checkpoint the dominant cost.",
+      "benchmark": {
+        "file": "/tmp/strperf.hexa",
+        "workload": "5000 concats of 20-char strings → final length 105000",
+        "measured_ms": 86,
+        "complexity": "linear in total output size — rope or amortized doubling"
+      },
+      "implication": "train_byte_clm.hexa save_checkpoint writes 100 KB HEXACKPT-v1 in <100 ms. No need for write_file_bytes or chunked output."
+    },
+    {
+      "id": "FIND-MODMUT-OK",
+      "severity": "info",
+      "category": "semantics/scope",
+      "title": "Module-level `let mut` can be reassigned AND index-mutated from inside functions",
+      "repro": {
+        "file": "/tmp/modmut_test.hexa",
+        "code": "let mut G = [1, 2, 3]\nfn modify()     { G = [99, 100, 101] }\nfn modify_idx() { G[0] = 777 }\nfn main() {\n    println(G)           // [1, 2, 3]\n    modify()\n    println(G)           // [99, 100, 101]\n    modify_idx()\n    println(G)           // [777, 100, 101]\n}",
+        "all_work": true
+      },
+      "implication": "eval_clm.hexa's install_tensor(name, data) pattern (module-level `let mut embed = tensor_zeros(...)` + `if name == 'embed' { embed = data }`) is correct hexa semantics. Same pattern used by eval_serve.hexa's W_DATA binding."
+    },
+    {
+      "id": "FIND-SEMI-IF",
+      "severity": "info",
+      "category": "syntax",
+      "title": "Multi-statement if/while blocks with `;` separator work",
+      "repro": "if 1 > 0 { a = 5; b = 10 }  →  a=5, b=10",
+      "implication": "while loops can compress inner body: `while i < n { out[i] = f(i); i = i + 1 }`"
+    },
+    {
+      "id": "P5c-4-LATENCY-INTERP",
+      "severity": "info",
+      "category": "measurement/latency",
+      "title": "CPU interpreter per-token latency baseline",
+      "measurement": {
+        "tool": "anima/serving/measure_latency.hexa",
+        "model": "2-layer transformer d=16 ff=32 vocab=32 seq=8 rank=4 (19 tensors, 100 KB ckpt)",
+        "ckpt": "/tmp/train_byte_clm_200.ckpt",
+        "iters": 32,
+        "total_ms": 43836,
+        "ms_per_token": 1369.9,
+        "target_p5c4": 200,
+        "verdict": "FAIL — 6.85x slower than P5c-4 200 ms/token target",
+        "native_estimate": {
+          "speedup_assumption": 500,
+          "projected_ms_per_token": 2.74,
+          "rationale": "P5b hexa-lang interpreter→native speedup demonstrated 500x for comparable ops (alphabeta3 + BLIS, DD175)"
+        }
+      },
+      "implication": "P5c-4 target is unreachable on the mac interpreter. Native build (hexa-build + BLIS) would put us at ~2.74 ms/token — 73x UNDER the target. H100 GPU path would be even faster. Critical path: bench on native first, then on H100."
+    }
+  ]
+}
