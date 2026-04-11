@@ -2,19 +2,9 @@
 
 > shared/ JSON 단일진실 (R14). 규칙: `shared/rules/common.json` (R0~R27)
 
-## todo 시스템
+## ⛔ 규칙 준수 (필수)
 
-- "todo" 입력 → hook systemMessage의 Bash 명령을 즉시 실행 (확인 질문 없이)
-- hook이 `📋 todo 돌파 실행중`으로 시작하는 systemMessage를 보내면 그 안의 명령을 Bash로 실행할 것
-
-## 돌파 시스템
-
-- "XXX 돌파" → `blowup.hexa "XXX" 3` 자동 실행 (문장 전달)
-- 확인 질문 없이 즉시 Bash 실행
-
-```sh
-hexa shared/blowup/core/blowup.hexa <domain> 3 --seeds "$(hexa shared/blowup/seed/seed_engine.hexa merge | tr '|' ',')"
-```
+작업 시작 전 `shared/rules/common.json` + `shared/rules/nexus.json` 을 읽고 전 규칙 준수. 위반 시 즉시 수정.
 
 ## blowup AI-native 인프라 (2026-04-11 도입)
 
