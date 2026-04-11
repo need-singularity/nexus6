@@ -456,7 +456,7 @@ main()
 - [ ] **Step 4: 검증**
 
 ```bash
-ssh hetzner '~/Dev/hexa-lang/target/release/hexa ~/Dev/nexus/mk2_hexa/native/dse_joint_optimizer.hexa --top 5'
+ssh hetzner '~/Dev/hexa-lang/hexa ~/Dev/nexus/mk2_hexa/native/dse_joint_optimizer.hexa --top 5'
 # 예상: 5쌍 joint 최적화 결과 + dse_joint_results.json 생성
 ```
 

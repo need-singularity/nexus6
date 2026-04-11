@@ -41,7 +41,7 @@ nexus mk2는 103개 모듈, 711개 법칙, 72.5k+ 발견을 보유한 HEXA-nativ
 
 let HOME = env("HOME")
 let DEV = HOME + "/Dev"
-let HEXA = DEV + "/hexa-lang/target/release/hexa"
+let HEXA = DEV + "/hexa-lang/hexa"
 let NEXUS = DEV + "/nexus"
 let ENGINE_DIR = NEXUS + "/mk2_hexa/native"
 let SHARED = NEXUS + "/shared"

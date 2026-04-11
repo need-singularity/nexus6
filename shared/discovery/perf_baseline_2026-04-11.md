@@ -1,6 +1,6 @@
 # NEXUS-6 성능 베이스라인 — 2026-04-11
 
-- Binary: `~/Dev/hexa-lang/target/release/hexa` (5.8MB Rust, 2026-04-11 07:56)
+- Binary: `~/Dev/hexa-lang/hexa` (5.8MB Rust, 2026-04-11 07:56)
 - Host: macOS 15.6.1 (ARM64)
 - Method: `/usr/bin/time -l`, 3-run median + std dev
 - Note: blowup.hexa 제외 (DIAG-01 / FIX-NESTED-IF hang 기지의 이슈)

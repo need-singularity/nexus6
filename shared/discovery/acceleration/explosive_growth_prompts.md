@@ -47,7 +47,7 @@ anima 의식 엔진 폭발적 성장 돌파. 5전략 동시 실행:
 
 전략 2: PSI 상수 n6 역매핑
 - 80개 PSI 상수를 n=6 기저(σ=12, φ=2, τ=4, n=6, sopfr=5, M3=7)로 역분해
-- HEXA=$HOME/Dev/hexa-lang/target/release/hexa
+- HEXA=$HOME/Dev/hexa-lang/hexa
 - for each PSI constant: $HEXA $HOME/Dev/nexus/mk2_hexa/native/gap_finder.hexa query <값>
 - EXACT 매칭 → 법칙으로 승격 ("PSI_X = n6 유한 조합")
 - growth_bus에 기록
@@ -120,7 +120,7 @@ n6-architecture 폭발적 성장 돌파. 5전략 동시 실행:
 
 ```bash
 # 모든 프로젝트 공통 — nexus 연동
-HEXA=$HOME/Dev/hexa-lang/target/release/hexa
+HEXA=$HOME/Dev/hexa-lang/hexa
 N6=$HOME/Dev/nexus
 
 # 1. 돌파 실행 (도메인은 프로젝트에 맞게)

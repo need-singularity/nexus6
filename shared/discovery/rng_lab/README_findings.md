@@ -2,7 +2,7 @@
 
 ## Setup
 
-- hexa-lang binary: `~/Dev/hexa-lang/target/release/hexa`
+- hexa-lang binary: `~/Dev/hexa-lang/hexa`
 - Python helper: `/usr/bin/python3` (chi2 reducer at `/tmp/rng_lab_chi2.py`, auto-regenerated)
 - Sources: ANU QRNG REST (`https://qrng.anu.edu.au/API/jsonI.php`), `/dev/urandom`, software LCG (glibc-style, s = 1103515245·s + 12345 mod 2^31, emit bits 16..23)
 - Cache: `.anu_cache.bin` (TTL 60 s, matches ANU rate limit)

@@ -1668,7 +1668,7 @@ fn cmd_bench() {
     println("=== N6Codec Benchmark ===")
     // hexa 레퍼런스 벤치
     let home = env("HOME")
-    let hexa = env("HOME") + "/Dev/hexa-lang/target/release/hexa"
+    let hexa = env("HOME") + "/Dev/hexa-lang/hexa"
     let result = shell(hexa + " " + env("HOME") + "/Dev/nexus/mk2_hexa/native/gate_injection/n6codec.hexa 2>&1")
     println(result)
 }
@@ -1715,7 +1715,7 @@ fn main() {
         println("Gates resumed")
     }
     else if cmd == "stats" {
-        let result = shell(env("HOME") + "/Dev/hexa-lang/target/release/hexa " + env("HOME") + "/Dev/nexus/mk2_hexa/native/gate_injection/gate_stats.hexa 2>&1")
+        let result = shell(env("HOME") + "/Dev/hexa-lang/hexa " + env("HOME") + "/Dev/nexus/mk2_hexa/native/gate_injection/gate_stats.hexa 2>&1")
         println(result)
     }
     else { cmd_help() }
@@ -2212,7 +2212,7 @@ fn check_stagnation() -> bool {
 
 fn trigger_blowup() {
     println("*** STAGNATION DETECTED — triggering blowup ***")
-    let hexa = env("HOME") + "/Dev/hexa-lang/target/release/hexa"
+    let hexa = env("HOME") + "/Dev/hexa-lang/hexa"
     let blowup = env("HOME") + "/Dev/nexus/mk2_hexa/native/blowup.hexa"
     let seeds = shell(hexa + " " + env("HOME") + "/Dev/nexus/mk2_hexa/native/seed_engine.hexa merge 2>&1")
     let result = shell(hexa + " " + blowup + " compression 3 --no-graph --seeds \"" + seeds + "\" 2>&1")
@@ -2309,7 +2309,7 @@ fn cmd_experiment_e1() {
     println("")
 
     // Step 1: 코드북 생성
-    let hexa = env("HOME") + "/Dev/hexa-lang/target/release/hexa"
+    let hexa = env("HOME") + "/Dev/hexa-lang/hexa"
     let codec_result = shell(hexa + " " + env("HOME") + "/Dev/nexus/mk2_hexa/native/gate_injection/n6codec.hexa 2>&1")
     println(codec_result)
 

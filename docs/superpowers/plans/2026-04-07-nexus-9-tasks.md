@@ -141,7 +141,7 @@ grep -l "closed" mk2_hexa/native/*.hexa | head -5
 - [ ] **Step 1: 현재 돌파율 확인**
 
 ```bash
-HEXA=$HOME/Dev/hexa-lang/target/release/hexa
+HEXA=$HOME/Dev/hexa-lang/hexa
 $HEXA mk2_hexa/native/directions.hexa brief 2>/dev/null | head -5
 ```
 
@@ -174,7 +174,7 @@ tail -5 shared/logs/cmd_router.log
 - [ ] **Step 1: 현재 교차수분 상태 확인**
 
 ```bash
-HEXA=$HOME/Dev/hexa-lang/target/release/hexa
+HEXA=$HOME/Dev/hexa-lang/hexa
 $HEXA mk2_hexa/native/cross_project.hexa resonance 2>/dev/null | head -20
 ```
 
