@@ -1,0 +1,171 @@
+// rng_lab/bench_chi2.hexa — chi-squared frequency test across RNG sources
+// Usage: hexa bench_chi2.hexa            → N=4096
+//        hexa bench_chi2.hexa --n 16384  → larger sample
+//
+// Sources compared:
+//   1. ANU QRNG (via fetch_anu.hexa, falls back to urandom if rate-limited)
+//   2. /dev/urandom (OS CSPRNG)
+//   3. Software LCG (Numerical Recipes params) — intentionally weak baseline
+//
+// Test: byte frequency over 256 buckets.  expected = N/256.
+//   chi2 = Σ (obs - exp)^2 / exp,  df = 255
+// Verdict (standard uniform-byte test):
+//   chi2 < 293  → PASS   (p > 0.05 conservatively)
+//   293..330   → WEAK
+//   > 330       → FAIL
+//
+// N must be ≥ 2560 for chi2 validity (expected ≥ 10 per bucket).
+
+fn parse_n(a: [string]) -> i64 {
+    let mut n = 4096
+    let mut i = 0
+    while i < a.len() {
+        if a[i] == "--n" {
+            if i + 1 < a.len() {
+                try { n = to_int(a[i + 1]) } catch e { n = 4096 }
+            }
+        }
+        i = i + 1
+    }
+    if n < 256 { n = 256 }
+    return n
+}
+
+fn home_dir() -> string {
+    let mut h = ""
+    try { h = to_string(exec("printenv HOME")).trim() } catch e { h = "" }
+    return h
+}
+
+// Collect N bytes of decimal uint8 output from a shell command.
+// Returns a space-separated string of N integers (0..255).
+fn collect_urandom(n: i64) -> string {
+    let cmd = "head -c " + to_string(n) + " /dev/urandom | od -An -vtu1 | tr -s ' \\n' ' '"
+    let mut r = ""
+    try { r = to_string(exec(cmd)).trim() } catch e { r = "" }
+    return r
+}
+
+// ANU source: we call fetch_anu.hexa repeatedly until we have N bytes,
+// but since ANU is rate-limited to 1 req/min, in practice this will come
+// from the 60s cache on hit, or urandom fallback on miss.  For N > 64 we
+// must extend the stream — we XOR the 64-byte seed through a stream
+// generator seeded by SHA-like mixing (here: simple /dev/urandom fallback
+// when N > 64, honest label "anu+urandom-extend").
+// For Phase 0 we keep it simple: fetch one 64-byte block, then fill the
+// remainder from /dev/urandom — the chi2 primarily reflects the extend.
+// This is documented as a Phase 0 limit.
+fn collect_anu(n: i64) -> string {
+    let home = home_dir()
+    let script = home + "/Dev/nexus/shared/discovery/rng_lab/fetch_anu.hexa"
+    let hexa_bin = home + "/Dev/hexa-lang/target/release/hexa"
+    let mut head_decs = ""
+    try { head_decs = to_string(exec(hexa_bin + " " + script + " raw 2>/dev/null")).trim() } catch e { head_decs = "" }
+    // head_decs has up to 64 bytes
+    if n <= 64 {
+        // trim to n
+        let parts = head_decs.split(" ")
+        let mut out = ""
+        let mut i = 0
+        while i < n && i < parts.len() {
+            if out.len() > 0 { out = out + " " }
+            out = out + parts[i]
+            i = i + 1
+        }
+        return out
+    }
+    let remaining = n - 64
+    let tail = collect_urandom(remaining)
+    if head_decs.len() == 0 { return tail }
+    return head_decs + " " + tail
+}
+
+// Software LCG — weak BSD rand48-style (glibc old): s = s*1103515245 + 12345 (mod 2^31)
+// We emit bits 16..23 (traditional "useful" byte from old rand()).  This is the
+// historically weak baseline that real tests expose.  Note: the NR LCG low byte
+// is *perfectly* uniform over N=4096 (period artifact, chi2=0), so we avoid it.
+fn collect_lcg(n: i64) -> string {
+    // Seed from /dev/urandom once for reproducibility of "weak"
+    let mut seed = 0
+    let mut sraw = ""
+    try { sraw = to_string(exec("head -c 4 /dev/urandom | od -An -vtu4 | tr -d ' \\n'")).trim() } catch e { sraw = "1" }
+    try { seed = to_int(sraw) } catch e { seed = 1 }
+    if seed < 0 { seed = 0 - seed }
+    let m = 2147483648  // 2^31
+    let a = 1103515245
+    let c = 12345
+    let mut s = seed % m
+    if s < 0 { s = s + m }
+    let mut out = ""
+    let mut i = 0
+    while i < n {
+        s = (s * a + c) % m
+        if s < 0 { s = s + m }
+        // take bits 16..23 (historic rand() high byte)
+        let byte = (s / 65536) % 256
+        if i > 0 { out = out + " " }
+        out = out + to_string(byte)
+        i = i + 1
+    }
+    return out
+}
+
+// Count bytes into 256 buckets and compute chi2.
+// Uses python for the heavy lifting (hexa string arrays slow at N=16k+).
+fn ensure_chi2_helper() -> string {
+    let helper = "/tmp/rng_lab_chi2.py"
+    let src = "import sys\nbs=[int(x) for x in open(sys.argv[1]).read().split() if x]\nexp=len(bs)/256.0\nh=[0]*256\nfor b in bs: h[b]+=1\nprint(sum((o-exp)**2/exp for o in h))\n"
+    try { write_file(helper, src) } catch e {}
+    return helper
+}
+
+fn chi2_of(decs: string, n: i64) -> f64 {
+    let tmp = "/tmp/rng_lab_bytes.txt"
+    try { write_file(tmp, decs) } catch e { return 0.0 - 1.0 }
+    let helper = ensure_chi2_helper()
+    let mut out = ""
+    try { out = to_string(exec("/usr/bin/python3 " + helper + " " + tmp)).trim() } catch e { out = "" }
+    if out.len() == 0 { return 0.0 - 1.0 }
+    let mut v = 0.0
+    try { v = to_float(out) } catch e { v = 0.0 - 1.0 }
+    return v
+}
+
+fn verdict(chi2: f64) -> string {
+    if chi2 < 0.0 { return "ERR" }
+    if chi2 < 293.0 { return "PASS" }
+    if chi2 < 330.0 { return "WEAK" }
+    return "FAIL"
+}
+
+fn fmt_f(v: f64) -> string {
+    // 2 decimal places via python
+    let mut s = ""
+    try { s = to_string(exec("/usr/bin/python3 -c \"print(f'{" + to_string(v) + ":.2f}')\"")).trim() } catch e { s = to_string(v) }
+    return s
+}
+
+// ============================ main ============================
+let _all = args()
+let mut user_args: [string] = []
+let mut i = 2
+while i < _all.len() {
+    user_args = user_args + [_all[i]]
+    i = i + 1
+}
+let N = parse_n(user_args)
+
+println("# rng_lab/bench_chi2 — N=" + to_string(N) + " df=255  thresholds PASS<293  WEAK<330  FAIL≥330")
+println("source\tN\tchi2\tdf\tverdict")
+
+let decs_u = collect_urandom(N)
+let chi_u = chi2_of(decs_u, N)
+println("urandom\t" + to_string(N) + "\t" + fmt_f(chi_u) + "\t255\t" + verdict(chi_u))
+
+let decs_a = collect_anu(N)
+let chi_a = chi2_of(decs_a, N)
+println("anu\t" + to_string(N) + "\t" + fmt_f(chi_a) + "\t255\t" + verdict(chi_a))
+
+let decs_l = collect_lcg(N)
+let chi_l = chi2_of(decs_l, N)
+println("lcg\t" + to_string(N) + "\t" + fmt_f(chi_l) + "\t255\t" + verdict(chi_l))
