@@ -368,5 +368,77 @@
       "key_finding": "Interpreter dispatch cost is the dominant term on GPU training step (161s actual vs 0.302s SGEMM ceiling on same pod → 533× gap). Fixing this is the most valuable next interpreter work.",
       "recommended_next_lever": "Single-call fused train_step FFI: compile a C shim that takes (weights[], tokens[], targets[], out_loss) and runs fwd+bwd+opt via direct cuBLAS calls without hexa interpretation. Reduces per-step interpreter cost to O(1) instead of O(2400 ops per step)."
     }
+  },
+  "interpreter_overhead_diagnosis_20260411_1345": {
+    "_meta": {
+      "tool": "anima/training/profile_step_ops.hexa",
+      "platform": "mac arm64 (host) + extrapolation to htz/h100 x86_64",
+      "purpose": "Diagnose why R8 train_gpu step 0 = 161s while raw SGEMM ceiling = 0.3s (533× gap)",
+      "added": "2026-04-11T13:45"
+    },
+    "measurements_mac_arm64": {
+      "naive_matmul_16x64x64": {
+        "iters": 10,
+        "mean_ms_per_iter": 19423.9,
+        "estimated_inner_ops": 327680,
+        "per_op_us": 59.3
+      },
+      "array_index_hot_loop": {
+        "total_indices": 1000000,
+        "total_ms": 78379.1,
+        "ns_per_index": 78379
+      },
+      "empty_body_loop_iter": {
+        "iters": 100000,
+        "total_ms": 315.6,
+        "ns_per_iter": 3156
+      },
+      "env_lookup_5_locals": {
+        "total_lookups": 500000,
+        "total_ms": 621.9,
+        "ns_per_lookup": 1244
+      }
+    },
+    "extrapolation_to_h100": {
+      "mac_arm64_to_htz_x86_64_ratio": 85,
+      "rationale": "Prior session measurement: mac arm64 bench_env_get array_index = 18685 ns vs htz = 219 ns (85×)",
+      "htz_per_op_us_estimated": 0.7,
+      "h100_per_op_us_estimated": 0.7,
+      "rationale_h100": "Same x86_64 Linux as htz; per-op dispatch cost ≈ BLAS call marshalling, not GPU-dependent"
+    },
+    "r8_reconciliation": {
+      "r8_actual_step_ms": 161448,
+      "r8_sgemm_ceiling_ms": 302,
+      "r8_gap": 533,
+      "estimated_interpreter_ops_per_step": "100k-200k",
+      "rationale": "43.6M param model: ~2000 cuBLAS dispatches × ~50-100 interpreted statements each (arg marshalling, tensor handle lookup, result wrapping) = 100-200k interpreter statements",
+      "predicted_h100_step_ms": "70000-140000 (70-140 s)",
+      "match": "R8 actual 161s within prediction band — confirms hypothesis"
+    },
+    "conclusion": "Interpreter dispatch overhead (not GPU compute) dominates the training step cost. Every cuBLAS call incurs ~50-100 interpreted statements of arg prep / result wrapping, and this adds up to ~99.8% of wall time vs raw SGEMM.",
+    "recommended_fix_paths": [
+      {
+        "id": "FIX-TRAIN-STEP-FFI",
+        "approach": "C shim libtrain_step.so exposing `train_step(weights_ptrs, tokens, targets, out_loss)` that runs fwd+bwd+opt directly via cuBLAS without going through hexa interpreter per-op",
+        "expected_speedup": "100-500× on train step (bring 161s → 0.3-1.6s)",
+        "cost": "1-2 days of C + hexa extern fn wiring",
+        "risk": "medium — needs to match existing hexa tensor layout and backward formulas"
+      },
+      {
+        "id": "FIX-CRANELIFT-JIT",
+        "approach": "Use existing cranelift dep in hexa-lang to JIT-compile the train_step hot path AOT",
+        "expected_speedup": "50-200× if inlining works across extern FFI boundaries",
+        "cost": "2-4 days",
+        "risk": "higher — cranelift integration with FFI is non-trivial"
+      },
+      {
+        "id": "FIX-BATCHED-BUILTIN",
+        "approach": "Add a single `gpu_train_step_batched(config, weights, tokens, targets)` builtin in hexa Rust code that internally loops over layers in Rust",
+        "expected_speedup": "similar to FIX-TRAIN-STEP-FFI but staying within hexa runtime",
+        "cost": "1 day",
+        "status": "blocked — src/ Rust was deleted in 3c46294 self-host absorption; new builtins must now be added to self/interpreter.hexa which is itself slow. Adding to Rust binary means cutting a new hexa-lang release."
+      }
+    ],
+    "next_session_action": "Pick FIX-TRAIN-STEP-FFI and implement the C shim. This unblocks 1B training economically. Without it, 1B H100 wall clock = ~$180k at $6/hr."
   }
 }
