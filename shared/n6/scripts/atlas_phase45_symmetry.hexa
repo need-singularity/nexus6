@@ -1,0 +1,164 @@
+// ═══════════════════════════════════════════════════════════
+// atlas_phase45_symmetry.hexa — Phase 4.5 @S commute sweep
+// Agent 24 proposal impl (audit 2026-04-11)
+// READ-ONLY on atlas.n6 → emits @S commute / vieta edges as JSONL
+// 출력: stdout (JSONL). atlas.n6 자체 수정 없음.
+// 사용:
+//   hexa shared/n6/scripts/atlas_phase45_symmetry.hexa [atlas_path] \
+//        > shared/n6/atlas_phase45_symmetry.jsonl
+// ═══════════════════════════════════════════════════════════
+
+let a = args()
+let mut _ATLAS_PATH = "shared/n6/atlas.n6"
+let mut ai: i64 = 2
+while ai < len(a) {
+    let tok = a[ai]
+    if !tok.starts_with("-") { _ATLAS_PATH = tok }
+    ai = ai + 1
+}
+
+if !file_exists(_ATLAS_PATH) {
+    println("# error: atlas file not found: " + _ATLAS_PATH)
+    exit(1)
+}
+
+// ─── stderr 진행 로그 ───
+fn _log(msg: string) {
+    try { exec("bash", ["-c", "printf '%s\\n' \"" + msg + "\" 1>&2"]) } catch e {}
+}
+
+_log("[phase45] atlas=" + _ATLAS_PATH)
+
+// ─── 1. node + summary 추출 (awk) ───
+// 필드 형식: id\top\tlhs_a\tlhs_b\trhs
+// summary 정규식: "summary":"<lhs> <op> <rhs> = <val>"
+//  op ∈ { +, * }  (commutative 전용)
+let extracted = "/tmp/.phase45_pairs." + to_string(exec("echo $$").trim())
+let awk_src = "awk -F'\\t' '\n"
+    + "BEGIN{OFS=\"\\t\"}\n"
+    + "/\"type\":\"node\"/{\n"
+    + "  line=$0\n"
+    + "  idp=index(line,\"\\\"id\\\":\\\"\"); if(idp==0) next\n"
+    + "  rest=substr(line,idp+6); q=index(rest,\"\\\"\"); if(q==0) next\n"
+    + "  id=substr(rest,1,q-1)\n"
+    + "  sp=index(line,\"\\\"summary\\\":\\\"\"); if(sp==0) next\n"
+    + "  srest=substr(line,sp+11); sq=index(srest,\"\\\"\"); if(sq==0) next\n"
+    + "  summ=substr(srest,1,sq-1)\n"
+    + "  # summ 형식: \"A op B = V\"  (공백 필수)\n"
+    + "  n=split(summ,p,\" \")\n"
+    + "  if(n<5) next\n"
+    + "  if(p[4]!=\"=\") next\n"
+    + "  op=p[2]\n"
+    + "  if(op!=\"+\" && op!=\"*\") next\n"
+    + "  lhs_a=p[1]; lhs_b=p[3]; rhs=p[5]\n"
+    + "  # 정규화: sorted pair\n"
+    + "  if(lhs_a<=lhs_b){A=lhs_a;B=lhs_b}else{A=lhs_b;B=lhs_a}\n"
+    + "  print op, rhs, A, B, id\n"
+    + "}' '" + _ATLAS_PATH + "' > '" + extracted + "'"
+
+_log("[phase45] step1: extract binary-op nodes via awk")
+try { exec("bash", ["-c", awk_src]) } catch e {}
+let n_extracted_raw = to_string(exec("wc -l < '" + extracted + "' 2>/dev/null")).trim()
+_log("[phase45] extracted lines: " + n_extracted_raw)
+
+// ─── 2. commute 버킷: (op, rhs, A, B) 동일 2+ ───
+// sort → uniq 로 같은 키에 2+ id 가 모이면 commute 페어
+// 출력: op rhs A B id1 id2   (처음 2개만)
+let commute_tsv = "/tmp/.phase45_commute." + to_string(exec("echo $$").trim())
+let commute_awk = "sort -k1,1 -k2,2 -k3,3 -k4,4 '" + extracted + "' | awk -F'\\t' '\n"
+    + "{\n"
+    + "  key=$1 FS $2 FS $3 FS $4\n"
+    + "  if(key==prev){ if(cnt==1){ id2=$5; cnt=2; print op,rhs,A,B,id1,id2 } }\n"
+    + "  else { prev=key; op=$1; rhs=$2; A=$3; B=$4; id1=$5; cnt=1 }\n"
+    + "}' OFS='\\t' > '" + commute_tsv + "'"
+
+_log("[phase45] step2: bucket commute pairs")
+try { exec("bash", ["-c", commute_awk]) } catch e {}
+let n_commute_raw = to_string(exec("wc -l < '" + commute_tsv + "' 2>/dev/null")).trim()
+_log("[phase45] commute pairs: " + n_commute_raw)
+
+// ─── 3. vieta 버킷: (A,B) 가 '+' 와 '*' 양쪽 모두 존재 ───
+// extracted 를 (A,B) 키로 그룹화 → 해당 그룹에 op='+' 와 '*' 모두 있으면 vieta
+// 각 그룹에서 첫 '+' id 와 첫 '*' id 페어링
+let vieta_tsv = "/tmp/.phase45_vieta." + to_string(exec("echo $$").trim())
+let vieta_awk = "sort -k3,3 -k4,4 -k1,1 '" + extracted + "' | awk -F'\\t' '\n"
+    + "function flush(){\n"
+    + "  if(has_plus && has_star){\n"
+    + "    print A,B,plus_rhs,star_rhs,plus_id,star_id\n"
+    + "  }\n"
+    + "}\n"
+    + "{\n"
+    + "  key=$3 FS $4\n"
+    + "  if(key!=prev){ flush(); prev=key; A=$3; B=$4; has_plus=0; has_star=0; plus_id=\"\"; star_id=\"\"; plus_rhs=\"\"; star_rhs=\"\" }\n"
+    + "  if($1==\"+\" && !has_plus){ has_plus=1; plus_id=$5; plus_rhs=$2 }\n"
+    + "  if($1==\"*\" && !has_star){ has_star=1; star_id=$5; star_rhs=$2 }\n"
+    + "}\n"
+    + "END{ flush() }' OFS='\\t' > '" + vieta_tsv + "'"
+
+_log("[phase45] step3: detect vieta pairs")
+try { exec("bash", ["-c", vieta_awk]) } catch e {}
+let n_vieta_raw = to_string(exec("wc -l < '" + vieta_tsv + "' 2>/dev/null")).trim()
+_log("[phase45] vieta pairs: " + n_vieta_raw)
+
+// ─── 4. JSONL 방출 (stdout) ───
+// 헤더 주석 1줄
+println("# phase45 @S commute sweep — source=" + _ATLAS_PATH + " ts=2026-04-11")
+
+fn _jesc(s: string) -> string {
+    // 최소 이스케이프 — id/op/rhs 는 영숫자·기호 제한
+    return s.replace("\\", "\\\\").replace("\"", "\\\"")
+}
+
+// commute 에지
+let commute_body = to_string(exec("cat '" + commute_tsv + "' 2>/dev/null"))
+let clines = commute_body.split("\n")
+let mut emitted_c: i64 = 0
+for ln in clines {
+    if ln.trim() == "" { continue }
+    let f = ln.split("\t")
+    if len(f) < 6 { continue }
+    let op = f[0]
+    let rhs = f[1]
+    let id1 = f[4]
+    let id2 = f[5]
+    let label = "commute_" + op
+    let json = "{\"type\":\"edge\",\"kind\":\"@S\",\"from\":\""
+        + _jesc(id1) + "\",\"to\":\"" + _jesc(id2)
+        + "\",\"label\":\"" + label
+        + "\",\"value\":" + rhs
+        + ",\"confidence\":1.0,\"source\":\"phase45\",\"timestamp\":\"2026-04-11\"}"
+    println(json)
+    emitted_c = emitted_c + 1
+}
+
+// vieta 에지
+let vieta_body = to_string(exec("cat '" + vieta_tsv + "' 2>/dev/null"))
+let vlines = vieta_body.split("\n")
+let mut emitted_v: i64 = 0
+for ln in vlines {
+    if ln.trim() == "" { continue }
+    let f = ln.split("\t")
+    if len(f) < 6 { continue }
+    let aop = f[0]
+    let bop = f[1]
+    let plus_rhs = f[2]
+    let star_rhs = f[3]
+    let plus_id = f[4]
+    let star_id = f[5]
+    let label = "vieta_" + aop + "_" + bop
+    let json = "{\"type\":\"edge\",\"kind\":\"@S\",\"from\":\""
+        + _jesc(plus_id) + "\",\"to\":\"" + _jesc(star_id)
+        + "\",\"label\":\"" + label
+        + "\",\"sum\":" + plus_rhs
+        + ",\"product\":" + star_rhs
+        + ",\"confidence\":1.0,\"source\":\"phase45\",\"timestamp\":\"2026-04-11\"}"
+    println(json)
+    emitted_v = emitted_v + 1
+}
+
+_log("[phase45] emitted commute=" + to_string(emitted_c) + " vieta=" + to_string(emitted_v))
+
+// cleanup
+try { exec("rm -f '" + extracted + "' '" + commute_tsv + "' '" + vieta_tsv + "'") } catch e {}
+
+exit(0)
