@@ -501,16 +501,10 @@ fn graph_load() -> string {
 fn _valid_atlas_line(line: string) -> bool {
     let t = line.trim()
     if len(t) == 0 { return true }
-    let first = t[0..1]
-    if first == "#" { return true }
-    if first == "{" { return true }
-    if first == "@" { return true }
-    if first == "\"" { return true }
-    if first == "<" { return true }
-    if first == ">" { return true }
-    if first == "!" { return true }
-    if first == "-" { return true }
-    return false
+    // 허용 첫 글자 집합: # { @ " < > ! -
+    // 9개 if 체인 → 단일 contains 로 축약 (type-check O(N²) 함정 회피)
+    let allowed = "#{@\"<>!-"
+    return allowed.contains(t[0..1])
 }
 
 // 안전 append: 무효 라인 필터링 후 append_file. 거부 건수 stdout 보고.
@@ -639,6 +633,49 @@ fn graph_stats_read_cache(min_deg: i64) -> string {
 // 증분 스캔: cached head_hash 일치 + size 증가 → Δ 구간만 파싱
 // content: 현재 atlas.n6 전체 문자열 (graph_load 이미 로드됨)
 // 반환: "nodes|edges|hubs" (성공) or "" (miss — 전체 스캔으로 fallback)
+// deg 사이드카 TSV → map 로드 (헬퍼 분리: type-check 부담 완화)
+fn _load_deg_sidecar(dpath: string) -> map {
+    let mut deg_map = #{}
+    if !file_exists(dpath) { return deg_map }
+    let mut deg_raw = ""
+    try { deg_raw = read_file(dpath) } catch e { return deg_map }
+    let deg_lines = deg_raw.split("\n")
+    let n = len(deg_lines)
+    let mut di: i64 = 0
+    while di < n {
+        let dl = deg_lines[di]
+        di = di + 1
+        if len(dl) == 0 { continue }
+        let tp = dl.split("\t")
+        if len(tp) < 2 { continue }
+        try { deg_map[tp[0]] = to_int(tp[1]) } catch e {}
+    }
+    return deg_map
+}
+
+// deg_map 훑어 min_deg 이상인 허브 개수 반환
+fn _count_hubs(deg_map: map, min_deg: i64) -> i64 {
+    let vals = deg_map.values()
+    let n = len(vals)
+    let mut hub: i64 = 0
+    let mut hi: i64 = 0
+    while hi < n {
+        let d: i64 = vals[hi]
+        if d >= min_deg { hub = hub + 1 }
+        hi = hi + 1
+    }
+    return hub
+}
+
+// deg_map 의 단일 id 카운트 +1 (try/catch hoist)
+fn _deg_bump(deg_map: map, key: string) -> map {
+    if len(key) == 0 { return deg_map }
+    let mut d: i64 = 0
+    try { d = deg_map[key] } catch e {}
+    deg_map[key] = d + 1
+    return deg_map
+}
+
 fn graph_stats_incremental(content: string, min_deg: i64) -> string {
     if min_deg != 3 { return "" }
     if len(content) == 0 { return "" }
@@ -655,29 +692,15 @@ fn graph_stats_incremental(content: string, min_deg: i64) -> string {
     try { c_nodes = to_int(cp[3]) } catch e { return "" }
     try { c_edges = to_int(cp[4]) } catch e { return "" }
     let c_head = cp[6]
-    // append-only 조건: cur_size > cached_size (같으면 exact match가 먼저 잡았음)
     if len(content) <= c_size { return "" }
     if c_head == "" { return "" }
     let cur_head = _head_hash_256(_ATLAS_PATH)
     if cur_head == "" { return "" }
     if cur_head != c_head { return "" }
-    // deg 사이드카 로드
-    let dpath = graph_deg_cache_path()
-    if !file_exists(dpath) { return "" }
-    let mut deg_raw = ""
-    try { deg_raw = read_file(dpath) } catch e { return "" }
-    let mut deg_map = #{}
-    let deg_lines = deg_raw.split("\n")
-    let mut di: i64 = 0
-    while di < len(deg_lines) {
-        let dl = deg_lines[di]
-        di = di + 1
-        if len(dl) == 0 { continue }
-        let tp = dl.split("\t")
-        if len(tp) < 2 { continue }
-        try { deg_map[tp[0]] = to_int(tp[1]) } catch e {}
-    }
-    // Δ 구간: shell tail -c +N 으로 바이트 오프셋 이후만 추출 (hexa char-index 함정 회피)
+    let mut deg_map = _load_deg_sidecar(graph_deg_cache_path())
+    // (빈 map 이면 과거엔 조기 return 이었음 — file_exists 검사를 헬퍼가 흡수)
+    // 시맨틱 보존 위해 수동 체크
+    if !file_exists(graph_deg_cache_path()) { return "" }
     let cur_stat = _stat_mtime_size(_ATLAS_PATH)
     if cur_stat == "" { return "" }
     let cs = cur_stat.split(" ")
@@ -690,8 +713,6 @@ fn graph_stats_incremental(content: string, min_deg: i64) -> string {
     if len(tail) == 0 { return "" }
     let delta_lines = tail.split("\n")
     let delta_len = len(delta_lines)
-    // 경계 보정: 첫 줄이 atlas.n6 유효 라인 패턴이면 유지, 아니면 mid-line 조각으로 간주 skip
-    // 과거에는 "{"로만 판정했으나 @X / # / 들여쓰기 부속라인도 유효하므로 전체 validator 재사용
     let mut start: i64 = 0
     if delta_len > 0 {
         let first = delta_lines[0]
@@ -708,30 +729,11 @@ fn graph_stats_incremental(content: string, min_deg: i64) -> string {
         if t == "node" { nodes = nodes + 1 }
         if t == "edge" {
             edges = edges + 1
-            let f = graph_extract_field(line, "from")
-            let to = graph_extract_field(line, "to")
-            if len(f) > 0 {
-                let mut d: i64 = 0
-                try { d = deg_map[f] } catch e {}
-                deg_map[f] = d + 1
-            }
-            if len(to) > 0 {
-                let mut d: i64 = 0
-                try { d = deg_map[to] } catch e {}
-                deg_map[to] = d + 1
-            }
+            deg_map = _deg_bump(deg_map, graph_extract_field(line, "from"))
+            deg_map = _deg_bump(deg_map, graph_extract_field(line, "to"))
         }
     }
-    // hub 재계산 (전체 deg_map 훑기)
-    let vals = deg_map.values()
-    let mut hub_count: i64 = 0
-    let mut hi: i64 = 0
-    while hi < len(vals) {
-        let d: i64 = vals[hi]
-        if d >= min_deg { hub_count = hub_count + 1 }
-        hi = hi + 1
-    }
-    // 사이드카 재기록 — line_count는 (c_lines + delta_len - start) 근사
+    let hub_count = _count_hubs(deg_map, min_deg)
     let new_line_count = c_lines + (delta_len - start)
     graph_stats_write_cache_full(nodes, edges, hub_count, new_line_count, deg_map)
     return to_string(nodes) + "|" + to_string(edges) + "|" + to_string(hub_count)
