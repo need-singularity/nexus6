@@ -832,11 +832,50 @@ fn graph_stats_write_cache_full(nodes: i64, edges: i64, hubs: i64, line_count: i
 // 모든 사이드카 쓰기는 graph_stats_write_cache_full 경유 — deg_map 포함 필수
 // (과거의 no-deg wrapper는 line_count=0 불변식 위반 위험으로 제거됨)
 
+// ─── AI-native shell uplift (R0 회피: hexa string OOM 방지) ───
+// 발생 원인: content.split("\n") + graph_extract_field(line.split("")) 가
+//   12MB+ atlas.n6 처리 시 ~200M small allocs → 126GB OOM (dmesg 확정 2026-04-12)
+// 본 함수: awk 1초로 동등한 nodes/edges/hubs 산출 + deg sidecar 생성.
+// 결과 무효 시 빈 문자열 반환 → 호출자가 legacy hexa-loop fallback.
+fn graph_stats_awk(min_deg: i64) -> string {
+    let awk_script = _HOME + "/Dev/nexus/shared/blowup/lib/atlas_stats.awk"
+    if !file_exists(awk_script) { return "" }
+    if !file_exists(_ATLAS_PATH) { return "" }
+    let deg_path = graph_deg_cache_path()
+    let cmd = "awk -v min_deg=" + to_string(min_deg) + " -v deg_path='" + deg_path + "' -f '" + awk_script + "' '" + _ATLAS_PATH + "' 2>/dev/null"
+    let mut out = ""
+    try { out = exec(cmd) } catch e { return "" }
+    let trimmed = out.trim()
+    // 형식 검증: "nodes|edges|hubs"
+    let parts = trimmed.split("|")
+    if len(parts) != 3 { return "" }
+    return trimmed
+}
+
+// awk 우회 후 stats 사이드카 갱신 (deg sidecar 는 awk 가 직접 작성)
+fn graph_stats_write_cache_after_awk(nodes: i64, edges: i64, hubs: i64) {
+    if !file_exists(_ATLAS_PATH) { return }
+    let stat_raw = _stat_mtime_size(_ATLAS_PATH)
+    if stat_raw == "" { return }
+    let sp = stat_raw.split(" ")
+    if len(sp) < 2 { return }
+    let mtime = sp[0]
+    let size = sp[1]
+    let head_hash = _head_hash_256(_ATLAS_PATH)
+    let mut lc_raw = ""
+    try { lc_raw = exec("wc -l < '" + _ATLAS_PATH + "'") } catch e {}
+    let mut line_count: i64 = 0
+    try { line_count = to_int(lc_raw.trim()) } catch e {}
+    let body = "{\"schema\":2,\"mtime\":" + mtime + ",\"size\":" + size + ",\"line_count\":" + to_string(line_count) + ",\"head_hash\":\"" + head_hash + "\",\"nodes\":" + to_string(nodes) + ",\"edges\":" + to_string(edges) + ",\"hubs\":" + to_string(hubs) + "}\n"
+    try { write_file(graph_stats_cache_path(), body) } catch e {}
+}
+
 // AI-native: 단일 패스 그래프 통계 — graph_count_type×2 + graph_hub_count 3회 순회 → 1회
-// 3단 fast path:
+// 4단 fast path:
 //   1) exact cache hit (mtime+size) → O(1)
 //   2) incremental (append-only tail) → O(Δ lines)
-//   3) full scan → O(total lines), 사이드카 재작성
+//   3) shell uplift (awk) → ~1초/12MB, 메모리 100MB 이내
+//   4) hexa fallback full scan → O(total lines), OOM 위험 (legacy)
 // 반환: "nodes|edges|hubs" (pipe-separated)
 fn graph_stats_single_pass(content: string, min_deg: i64) -> string {
     if len(content) == 0 { return "0|0|0" }
@@ -846,7 +885,22 @@ fn graph_stats_single_pass(content: string, min_deg: i64) -> string {
     // 2) incremental (append-only)
     let incr = graph_stats_incremental(content, min_deg)
     if incr != "" { return incr }
-    // 3) full scan
+    // 3) shell uplift — 12MB+ 에서 hexa-loop OOM 회피
+    let shell = graph_stats_awk(min_deg)
+    if shell != "" {
+        if min_deg == 3 {
+            let sp = shell.split("|")
+            let mut sn: i64 = 0
+            let mut se: i64 = 0
+            let mut sh: i64 = 0
+            try { sn = to_int(sp[0]) } catch e {}
+            try { se = to_int(sp[1]) } catch e {}
+            try { sh = to_int(sp[2]) } catch e {}
+            graph_stats_write_cache_after_awk(sn, se, sh)
+        }
+        return shell
+    }
+    // 4) hexa fallback (legacy — 작은 atlas 만 안전)
     let lines = content.split("\n")
     let mut nodes: i64 = 0
     let mut edges: i64 = 0
