@@ -2639,12 +2639,9 @@ let mut absorb_graph_edges: i64 = 0
 let mut absorb_bus_events: i64 = 0
 let growth_bus_path = atlas_path
 
-// Duplicate check: 최근 150줄만 로드 (cooldown 완화: 미탐색 영역 연속 돌파 허용)
-let mut absorb_existing_log = ""
-try {
-    let _tail_result = exec("tail -150 '" + log_path + "' 2>/dev/null")
-    absorb_existing_log = to_string(_tail_result)
-} catch e {}
+// Cross-process dedup: grep 전체 log 검사 (tail -150 → grep per-ID, O(1) short-circuit)
+// 이전 tail -150 은 cross-process race 에서 중복 발생 (70758414 3건 관찰)
+let mut absorb_existing_log = ""  // intra-batch 추적용 (grep 불필요 영역)
 
 // Read current graph for cross-ref — AI-native: 캐시 재사용 (디스크 재읽기 제거)
 let mut absorb_graph_content = ""
@@ -2680,7 +2677,17 @@ while ci < len(recurse_all_corollaries) {
         // A. Discovery log: only EXACT grade, skip duplicates
         if cor_grade == "EXACT" {
             let dup_needle = "\"blowup-" + cor_id + "\""
-            if !absorb_existing_log.contains(dup_needle) {
+            // Cross-process dedup: grep 전체 log (tail -150 대체, per-ID O(1) short-circuit)
+            let mut _log_dup_found = false
+            if absorb_existing_log.contains(dup_needle) {
+                _log_dup_found = true
+            } else {
+                try {
+                    let _grep_hit = exec("grep -qF " + dup_needle + " '" + log_path + "' 2>/dev/null && echo Y")
+                    if to_string(_grep_hit).trim() == "Y" { _log_dup_found = true }
+                } catch e {}
+            }
+            if !_log_dup_found {
                 let mut ai_d: i64 = 0
                 let mut ai_r: i64 = 0
                 if cor_conf >= 0.8 { ai_d = 1 }
@@ -2698,10 +2705,19 @@ while ci < len(recurse_all_corollaries) {
         // B. Graph: add node + edge for conf >= 0.5
         if !skip_graph && cor_conf >= 0.5 {
             let g_node_id = "recurse-" + cor_id
-            // 두 단계 dedup: (1) 기존 atlas.n6 (2) 이번 배치
+            // 세 단계 dedup: (1) 이번 배치 (2) 캐시 (3) grep cross-process
             let mut _absorb_in_batch = false
             try { _absorb_in_batch = has_key(_absorb_new_ids, g_node_id) } catch e {}
-            if !_absorb_in_batch && !graph_node_exists(absorb_graph_content, g_node_id) {
+            let mut _graph_dup = _absorb_in_batch
+            if !_graph_dup { _graph_dup = graph_node_exists(absorb_graph_content, g_node_id) }
+            if !_graph_dup {
+                // Cross-process dedup: grep 전체 graph 파일 (stale cache 보완)
+                try {
+                    let _gg = exec("grep -qF '\"id\":\"" + g_node_id + "\"' '" + graph_path + "' 2>/dev/null && echo Y")
+                    if to_string(_gg).trim() == "Y" { _graph_dup = true }
+                } catch e {}
+            }
+            if !_graph_dup {
                 let g_conf = min_f(cor_conf, 1.0)
                 let node_json = graph_append_node_d(g_node_id, "RecursiveDiscovery", cor_domain, cor_type, g_conf, 1)
                 if len(absorb_graph_entries) > 0 { absorb_graph_entries = absorb_graph_entries + "\n" }
@@ -2806,7 +2822,17 @@ if file_exists(atlas_n6_path) {
 
             // EXACT + NEAR(conf>=0.9) 만 atlas에 흡수
             if ac_grade == "EXACT" || (ac_grade == "NEAR" && a_cor_conf >= 0.9) {
-                if !atlas_content.contains(a_cor_id) {
+                // Cross-process dedup: grep 전체 atlas.n6 (stale cache 대체, per-ID O(1))
+                let mut _atlas_dup = false
+                if atlas_content.contains(a_cor_id) {
+                    _atlas_dup = true
+                } else {
+                    try {
+                        let _ag = exec("grep -qF '" + a_cor_id + "' '" + atlas_n6_path + "' 2>/dev/null && echo Y")
+                        if to_string(_ag).trim() == "Y" { _atlas_dup = true }
+                    } catch e {}
+                }
+                if !_atlas_dup {
                     let g_mark = if ac_grade == "EXACT" { "*" } else { "?" }
                     let ar = to_int(a_cor_conf * 10.0)
                     let ac_n6_type = if ac_grade == "EXACT" { "F" } else { "R" }
@@ -3118,45 +3144,23 @@ try { exec(absorb_hexa_bin, [directions_path, "update"]) } catch e {}
 // ═══════════════════════════════════════════════════════════
 
 try { exec("printf '%s [phase-7.5-autolink] start\\n' \"$(date +%H:%M:%S)\" >> " + _TRACE_PATH) } catch e {}
-println("═══ Phase 7.5: Auto-Link (parallel) ═══")
+println("═══ Phase 7.5: Auto-Link ═══")
 
-let engine_dir = _NEXUS + "/shared/blowup/modules"
 let hexa_bin = _HEXA_BIN
 let autolink_log = "shared/.autolink_out.log"
 
-// 4개 프로세스를 백그라운드 병렬 실행 → wait로 일괄 대기
-// 순차 80초 → 병렬 ~20초 (가장 느린 1개 기준)
+// lens_forge — 유일한 현존 auto-link 도구
+// (auto_register, gap_finder, alien_index 는 2026-04 기준 삭제/이동됨)
 let forge_path = _NEXUS + "/shared/blowup/lens/lens_forge.hexa"
-let ar_path = engine_dir + "/auto_register.hexa"
-let gf_path = engine_dir + "/gap_finder.hexa"
-let ai_path = engine_dir + "/alien_index.hexa"
 
-let mut par_cmd = hexa_bin + " " + forge_path + " forge > " + autolink_log + ".a 2>&1 & "
-par_cmd = par_cmd + hexa_bin + " " + ar_path + " sync " + log_path + " > " + autolink_log + ".b 2>&1 & "
-par_cmd = par_cmd + hexa_bin + " " + gf_path + " target > " + autolink_log + ".c 2>&1 & "
-if logged > 0 {
-    par_cmd = par_cmd + hexa_bin + " " + ai_path + " alien_index.hexa assess 6.0 > " + autolink_log + ".d 2>&1 & "
-}
-par_cmd = par_cmd + "wait"
-
-println("  [parallel] lens_forge + auto_register + gap_finder + alien_index ...")
-try { exec("bash", ["-c", par_cmd]) } catch e {}
-
-// 결과 수집
 let mut al_a = ""
-let mut al_b = ""
-let mut al_c = ""
-let mut al_d = ""
-try { al_a = exec("head -1 " + autolink_log + ".a 2>/dev/null") } catch e {}
-try { al_b = exec("head -1 " + autolink_log + ".b 2>/dev/null") } catch e {}
-try { al_c = exec("head -1 " + autolink_log + ".c 2>/dev/null") } catch e {}
-if logged > 0 {
-    try { al_d = exec("head -1 " + autolink_log + ".d 2>/dev/null") } catch e {}
+try {
+    exec("bash", ["-c", hexa_bin + " " + forge_path + " forge > " + autolink_log + ".a 2>&1"])
+    al_a = to_string(exec("head -1 " + autolink_log + ".a 2>/dev/null")).trim()
+    println("  [7.5] lens_forge: ", al_a)
+} catch e {
+    println("  [7.5] WARN: lens_forge failed — ", to_string(e))
 }
-try { println("  [7.5a] ", al_a.trim()) } catch e { println("  [7.5a] done") }
-try { println("  [7.5b] ", al_b.trim()) } catch e { println("  [7.5b] done") }
-try { println("  [7.5c] ", al_c.trim()) } catch e { println("  [7.5c] done") }
-if logged > 0 { try { println("  [7.5d] ", al_d.trim()) } catch e { println("  [7.5d] done") } }
 
 println("═══ Phase 7.5 complete ═══")
 println("")
