@@ -267,7 +267,7 @@ def main():
             "source": "phase48",
             "timestamp": "2026-04-11",
         }
-        print(json.dumps(edge, ensure_ascii=False))
+        print(json.dumps(edge, ensure_ascii=False, separators=(",", ":")))
         emitted += 1
         per_token_counts[primary] += 1
         per_domain_counts[domain] += 1
