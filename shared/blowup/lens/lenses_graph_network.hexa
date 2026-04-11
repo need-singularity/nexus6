@@ -1,0 +1,745 @@
+// shared/blowup/lens/lenses_graph_network.hexa — 10 graph/network lenses (Rust 포팅)
+// 원본: nexus/src/telescope/lenses/
+// Uses LensResult, result_add, empty_result, abs_f, sqrt_f, ln_f,
+//       list_mean, list_variance, list_sort from telescope.hexa
+//
+// Lenses (10):
+//  1. community_detection   2. complexity_network    3. graph_neural
+//  4. knowledge_graph       5. link_prediction       6. network_flow
+//  7. spectral_graph        8. topological_data      9. topological_sort
+// 10. cross_domain_bridge
+
+// ─── 공유 상수 ───
+
+comptime const n6    = 6.0
+comptime const sigma6 = 12.0
+comptime const tau6  = 4.0
+comptime const phi6  = 2.0
+comptime const sopfr6 = 5.0
+comptime const gamma_sf = 3.0   // 스케일프리 지수 = tau-1
+
+// ─── 로컬 헬퍼 ───
+
+pure fn min_f(a: float, b: float) -> float { if a < b { a } else { b } }
+pure fn max_f(a: float, b: float) -> float { if a > b { a } else { b } }
+pure fn clamp_f(x: float, lo: float, hi: float) -> float { min_f(max_f(x, lo), hi) }
+
+pure fn list_sum(data) -> float {
+    let mut s = 0.0
+    for v in data { s = s + v }
+    s
+}
+
+pure fn list_std(data, mean: float) -> float {
+    sqrt_f(list_variance(data, mean))
+}
+
+// 컬럼 평균 계산: data[n×d] row-major에서 j번째 컬럼 평균
+pure fn col_mean(data, n: int, d: int, j: int) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + data[i * d + j]
+        i = i + 1
+    }
+    s / max_f(to_float(n), 1.0)
+}
+
+// 컬럼 분산
+pure fn col_var(data, n: int, d: int, j: int, mean: float) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        let diff = data[i * d + j] - mean
+        s = s + diff * diff
+        i = i + 1
+    }
+    s / max_f(to_float(n), 1.0)
+}
+
+// n=6 상수 목록 공명 점수: means 목록 중 n=6 상수 ±8% 이내 비율
+pure fn n6_target_score(means, d: int) -> float {
+    let targets = [n6, tau6, sigma6, phi6, sopfr6]
+    let mut hit = 0
+    let mut j = 0
+    while j < means.len() {
+        let m = means[j]
+        let mut k = 0
+        while k < targets.len() {
+            let t = targets[k]
+            if t > 0.000000000001 && abs_f((m - t) / t) < 0.08 {
+                hit = hit + 1
+                k = targets.len()    // 한 번 매칭되면 다음 컬럼으로
+            }
+            k = k + 1
+        }
+        j = j + 1
+    }
+    to_float(hit) / max_f(to_float(d), 1.0)
+}
+
+// n=6 공명 (±7% 더 좁은 대역)
+pure fn n6_resonance_score(means, d: int) -> float {
+    let targets = [n6, tau6, sigma6, phi6, sopfr6]
+    let mut hit = 0
+    let mut j = 0
+    while j < means.len() {
+        let m = means[j]
+        let mut k = 0
+        while k < targets.len() {
+            let t = targets[k]
+            if t > 0.000000000001 && abs_f((m - t) / t) < 0.07 {
+                hit = hit + 1
+                k = targets.len()
+            }
+            k = k + 1
+        }
+        j = j + 1
+    }
+    to_float(hit) / max_f(to_float(d), 1.0)
+}
+
+// 단조 변화율: 각 컬럼의 양방향 단조성 측정
+pure fn monotone_score(data, n: int, d: int) -> float {
+    let mut s = 0.0
+    let mut j = 0
+    while j < d {
+        let mut pos = 0
+        let mut total = 0
+        let mut i = 1
+        while i < n {
+            let diff = data[i * d + j] - data[(i - 1) * d + j]
+            if diff > 0.0 { pos = pos + 1 }
+            total = total + 1
+            i = i + 1
+        }
+        if total > 0 {
+            let ratio = to_float(pos) / to_float(total)
+            s = s + abs_f(ratio - 0.5) * 2.0
+        }
+        j = j + 1
+    }
+    s / max_f(to_float(d), 1.0)
+}
+
+// 신호 강도: mean / (mean + std)
+pure fn signal_ratio_score(means, stds, d: int) -> float {
+    let mean_val = list_sum(means) / max_f(to_float(d), 1.0)
+    let mean_std = list_sum(stds)  / max_f(to_float(d), 1.0)
+    clamp_f(abs_f(mean_val) / (abs_f(mean_val) + mean_std + 0.000000000001), 0.0, 1.0)
+}
+
+// 차원 n=6 공명: d가 6에 가까울수록 1
+pure fn dim_n6_score(d: int) -> float {
+    max_f(1.0 - abs_f(to_float(d) - n6) / n6 * 2.0, 0.0)
+}
+
+// 페어와이즈 거리 (row-major, 유클리드)
+pure fn row_dist(data, n: int, d: int, i: int, j: int) -> float {
+    let mut s = 0.0
+    let mut k = 0
+    while k < d {
+        let diff = data[i * d + k] - data[j * d + k]
+        s = s + diff * diff
+        k = k + 1
+    }
+    sqrt_f(s)
+}
+
+// ─── (1) community_detection ───
+// 커뮤니티 탐지 — 모듈성 n=6
+// n=6 연결: 커뮤니티=n=6, modularity Q=1-1/sigma, 해상도=phi=2
+
+fn scan_community_detection(data, n: int, d: int) -> LensResult {
+    let mut r = empty_result()
+    if n < 6 || d == 0 { return r }
+
+    // 컬럼 평균/표준편차 수집
+    let mut means = []
+    let mut stds  = []
+    let mut j = 0
+    while j < d {
+        let m = col_mean(data, n, d, j)
+        let v = col_var(data, n, d, j, m)
+        means = means + [m]
+        stds  = stds  + [sqrt_f(v)]
+        j = j + 1
+    }
+
+    let target_score = n6_target_score(means, d)
+    let sig_ratio    = signal_ratio_score(means, stds, d)
+    let monotone     = monotone_score(data, n, d)
+    let n6_dim       = dim_n6_score(d)
+    let n6_res       = n6_resonance_score(means, d)
+
+    let community_score = target_score * 0.25
+        + sig_ratio    * 0.25
+        + monotone     * 0.15
+        + n6_dim       * 0.20
+        + n6_res       * 0.15
+
+    r = result_add(r, "target_score",    [target_score])
+    r = result_add(r, "signal_ratio",    [sig_ratio])
+    r = result_add(r, "monotone",        [monotone])
+    r = result_add(r, "n6_dim",          [n6_dim])
+    r = result_add(r, "n6_resonance",    [n6_res])
+    r = result_add(r, "community_score", [community_score])
+    r
+}
+
+// ─── (2) complexity_network ───
+// 복잡 네트워크 — 스몰월드/스케일프리 n=6 수렴
+// n=6 연결:
+//   클러스터링 계수 최적 = n=6 neighbors
+//   scale-free 지수 gamma ≈ 3 = tau-1
+//   허브 연결도 임계 = sigma=12
+//   평균 경로 ~ log(n=6) = phi
+
+fn scan_complexity_network(data, n: int, d: int) -> LensResult {
+    let mut r = empty_result()
+    if n < 6 || d == 0 { return r }
+
+    let max_n = if n < 64 { n } else { 64 }
+
+    // 임계값: 전체 pairwise 거리 분위수 1/3 사용 (간이)
+    let mut all_dists = []
+    let mut i = 0
+    while i < max_n {
+        let mut j = i + 1
+        while j < max_n {
+            all_dists = all_dists + [row_dist(data, n, d, i, j)]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let sorted_dists = list_sort(all_dists)
+    let threshold_idx = sorted_dists.len() / 3
+    let threshold = if sorted_dists.len() > 0 { sorted_dists[threshold_idx] } else { 1.0 }
+
+    // degree 배열
+    let mut degree = []
+    i = 0
+    while i < max_n { degree = degree + [0] ; i = i + 1 }
+    i = 0
+    while i < max_n {
+        let mut j = i + 1
+        while j < max_n {
+            if row_dist(data, n, d, i, j) < threshold {
+                degree[i] = degree[i] + 1
+                degree[j] = degree[j] + 1
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    let deg_sum = list_sum(degree)
+    let mean_degree = deg_sum / max_f(to_float(max_n), 1.0)
+    let n6_degree   = max_f(1.0 - abs_f(mean_degree - n6) / n6, 0.0)
+
+    // 스케일프리 지수: max_degree / mean_degree ≈ gamma=3
+    let max_deg = list_max(degree)
+    let scale_free = max_f(1.0 - abs_f(max_deg / max_f(mean_degree, 1.0) - gamma_sf) / gamma_sf, 0.0)
+
+    // 허브 수 (degree > sigma=12)
+    let mut hub_count = 0
+    for deg in degree {
+        if deg > sigma6 { hub_count = hub_count + 1 }
+    }
+    let hub_score = min_f(to_float(hub_count) / max_f(to_float(max_n), 1.0), 1.0)
+
+    // 컬럼 평균 기반 공명
+    let mut means = []
+    let mut j = 0
+    while j < d {
+        means = means + [col_mean(data, n, d, j)]
+        j = j + 1
+    }
+    let targets_ext = [n6, tau6, sigma6, phi6, sopfr6, gamma_sf]
+    let mut hit = 0
+    for m in means {
+        let mut k = 0
+        while k < targets_ext.len() {
+            let t = targets_ext[k]
+            if t > 0.000000000001 && abs_f((m - t) / t) < 0.08 {
+                hit = hit + 1
+                k = targets_ext.len()
+            }
+            k = k + 1
+        }
+    }
+    let target_score = to_float(hit) / max_f(to_float(d), 1.0)
+    let n6_res = n6_resonance_score(means, d)
+
+    let complexity_score = n6_degree  * 0.30
+        + scale_free   * 0.25
+        + hub_score    * 0.15
+        + target_score * 0.15
+        + n6_res       * 0.15
+
+    r = result_add(r, "mean_degree",      [mean_degree])
+    r = result_add(r, "n6_degree",        [n6_degree])
+    r = result_add(r, "scale_free",       [scale_free])
+    r = result_add(r, "hub_score",        [hub_score])
+    r = result_add(r, "target_score",     [target_score])
+    r = result_add(r, "n6_resonance",     [n6_res])
+    r = result_add(r, "complexity_score", [complexity_score])
+    r
+}
+
+// ─── (3) graph_neural ───
+// 그래프 신경망 — 메시지 전달 n=6
+// n=6 연결: 집계 홉=n=6, 이웃=sigma=12, 레이어=tau=4
+
+fn scan_graph_neural(data, n: int, d: int) -> LensResult {
+    let mut r = empty_result()
+    if n < 6 || d == 0 { return r }
+
+    let mut means = []
+    let mut stds  = []
+    let mut j = 0
+    while j < d {
+        let m = col_mean(data, n, d, j)
+        let v = col_var(data, n, d, j, m)
+        means = means + [m]
+        stds  = stds  + [sqrt_f(v)]
+        j = j + 1
+    }
+
+    let target_score = n6_target_score(means, d)
+    let sig_ratio    = signal_ratio_score(means, stds, d)
+    let monotone     = monotone_score(data, n, d)
+    let n6_dim       = dim_n6_score(d)
+    let n6_res       = n6_resonance_score(means, d)
+
+    let gnn_score = target_score * 0.25
+        + sig_ratio  * 0.25
+        + monotone   * 0.15
+        + n6_dim     * 0.20
+        + n6_res     * 0.15
+
+    r = result_add(r, "target_score", [target_score])
+    r = result_add(r, "signal_ratio", [sig_ratio])
+    r = result_add(r, "monotone",     [monotone])
+    r = result_add(r, "n6_dim",       [n6_dim])
+    r = result_add(r, "n6_resonance", [n6_res])
+    r = result_add(r, "gnn_score",    [gnn_score])
+    r
+}
+
+// ─── (4) knowledge_graph ───
+// 지식 그래프 — 트리플 n=6 수렴
+// n=6 연결: 관계 유형=n=6, 엔티티 차원=sigma=12, 임베딩=tau*sigma=48
+
+fn scan_knowledge_graph(data, n: int, d: int) -> LensResult {
+    let mut r = empty_result()
+    if n < 6 || d == 0 { return r }
+
+    let mut means = []
+    let mut stds  = []
+    let mut j = 0
+    while j < d {
+        let m = col_mean(data, n, d, j)
+        let v = col_var(data, n, d, j, m)
+        means = means + [m]
+        stds  = stds  + [sqrt_f(v)]
+        j = j + 1
+    }
+
+    let target_score = n6_target_score(means, d)
+    let sig_ratio    = signal_ratio_score(means, stds, d)
+    let monotone     = monotone_score(data, n, d)
+    let n6_dim       = dim_n6_score(d)
+    let n6_res       = n6_resonance_score(means, d)
+
+    let kg_score = target_score * 0.25
+        + sig_ratio  * 0.25
+        + monotone   * 0.15
+        + n6_dim     * 0.20
+        + n6_res     * 0.15
+
+    r = result_add(r, "target_score", [target_score])
+    r = result_add(r, "signal_ratio", [sig_ratio])
+    r = result_add(r, "monotone",     [monotone])
+    r = result_add(r, "n6_dim",       [n6_dim])
+    r = result_add(r, "n6_resonance", [n6_res])
+    r = result_add(r, "kg_score",     [kg_score])
+    r
+}
+
+// ─── (5) link_prediction ───
+// 링크 예측 — 관계 강도 n=6
+// n=6 연결: 경로=n=6, Katz beta=1/sigma, 공통 이웃=tau=4
+
+fn scan_link_prediction(data, n: int, d: int) -> LensResult {
+    let mut r = empty_result()
+    if n < 6 || d == 0 { return r }
+
+    let mut means = []
+    let mut stds  = []
+    let mut j = 0
+    while j < d {
+        let m = col_mean(data, n, d, j)
+        let v = col_var(data, n, d, j, m)
+        means = means + [m]
+        stds  = stds  + [sqrt_f(v)]
+        j = j + 1
+    }
+
+    // Katz 베타 근사: 각 컬럼 공명 강도를 1/sigma 스케일로 측정
+    let katz_beta = 1.0 / sigma6   // 0.0833
+    let mut katz_sum = 0.0
+    for m in means {
+        // beta * |m| 이 1 근처일 때 최대 신호
+        let k_val = abs_f(katz_beta * m)
+        katz_sum = katz_sum + clamp_f(1.0 - abs_f(k_val - 1.0), 0.0, 1.0)
+    }
+    let katz_score = katz_sum / max_f(to_float(d), 1.0)
+
+    let target_score = n6_target_score(means, d)
+    let sig_ratio    = signal_ratio_score(means, stds, d)
+    let monotone     = monotone_score(data, n, d)
+    let n6_dim       = dim_n6_score(d)
+    let n6_res       = n6_resonance_score(means, d)
+
+    let link_score = katz_score    * 0.20
+        + target_score * 0.20
+        + sig_ratio    * 0.20
+        + monotone     * 0.15
+        + n6_dim       * 0.15
+        + n6_res       * 0.10
+
+    r = result_add(r, "katz_score",   [katz_score])
+    r = result_add(r, "target_score", [target_score])
+    r = result_add(r, "signal_ratio", [sig_ratio])
+    r = result_add(r, "monotone",     [monotone])
+    r = result_add(r, "n6_dim",       [n6_dim])
+    r = result_add(r, "n6_resonance", [n6_res])
+    r = result_add(r, "link_score",   [link_score])
+    r
+}
+
+// ─── (6) network_flow ───
+// 네트워크 흐름 — max-flow/min-cut n=6
+// n=6 연결: 컷 수=n=6, 흐름 채널=tau=4, 최대 용량=sigma=12
+
+fn scan_network_flow(data, n: int, d: int) -> LensResult {
+    let mut r = empty_result()
+    if n < 6 || d == 0 { return r }
+
+    let mut means = []
+    let mut stds  = []
+    let mut j = 0
+    while j < d {
+        let m = col_mean(data, n, d, j)
+        let v = col_var(data, n, d, j, m)
+        means = means + [m]
+        stds  = stds  + [sqrt_f(v)]
+        j = j + 1
+    }
+
+    // 흐름 균형: 각 컬럼 평균이 sigma=12 기준 용량 내에 있는지
+    let mut flow_balance = 0.0
+    for m in means {
+        let cap_ratio = clamp_f(abs_f(m) / max_f(sigma6, 1.0), 0.0, 1.0)
+        flow_balance = flow_balance + (1.0 - abs_f(cap_ratio - 0.5) * 2.0)
+    }
+    flow_balance = flow_balance / max_f(to_float(d), 1.0)
+
+    // 컷 수 = n=6 공명
+    let cut_n6 = dim_n6_score(d)
+
+    let target_score = n6_target_score(means, d)
+    let sig_ratio    = signal_ratio_score(means, stds, d)
+    let monotone     = monotone_score(data, n, d)
+    let n6_res       = n6_resonance_score(means, d)
+
+    let flow_score = flow_balance  * 0.25
+        + cut_n6       * 0.20
+        + target_score * 0.20
+        + sig_ratio    * 0.15
+        + monotone     * 0.10
+        + n6_res       * 0.10
+
+    r = result_add(r, "flow_balance", [flow_balance])
+    r = result_add(r, "cut_n6",       [cut_n6])
+    r = result_add(r, "target_score", [target_score])
+    r = result_add(r, "signal_ratio", [sig_ratio])
+    r = result_add(r, "monotone",     [monotone])
+    r = result_add(r, "n6_resonance", [n6_res])
+    r = result_add(r, "flow_score",   [flow_score])
+    r
+}
+
+// ─── (7) spectral_graph ───
+// 스펙트럴 그래프 — Laplacian 고유값 n=6
+// n=6 연결: k=n=6 고유벡터, Fiedler값=1/n, 스펙트럴 갭=phi=2
+
+fn scan_spectral_graph(data, n: int, d: int) -> LensResult {
+    let mut r = empty_result()
+    if n < 6 || d == 0 { return r }
+
+    let mut means = []
+    let mut stds  = []
+    let mut j = 0
+    while j < d {
+        let m = col_mean(data, n, d, j)
+        let v = col_var(data, n, d, j, m)
+        means = means + [m]
+        stds  = stds  + [sqrt_f(v)]
+        j = j + 1
+    }
+
+    // 스펙트럴 갭 근사: 분산 스펙트럼에서 최대-최솟값 비율
+    let sorted_vars = list_sort(stds)
+    let spec_min = if sorted_vars.len() > 0 { sorted_vars[0] } else { 0.0 }
+    let spec_max = if sorted_vars.len() > 0 { sorted_vars[sorted_vars.len() - 1] } else { 1.0 }
+    let spectral_gap = if spec_max > 0.000000000001 { spec_min / spec_max } else { 0.0 }
+
+    // Fiedler 값 공명: 1/n=6 = 0.1667 근처
+    let fiedler_target = 1.0 / n6
+    let fiedler_score = clamp_f(1.0 - abs_f(spectral_gap - fiedler_target) / max_f(fiedler_target, 0.01), 0.0, 1.0)
+
+    // 스펙트럴 갭 = phi=2 공명
+    let gap_phi = clamp_f(1.0 - abs_f(spec_max - spec_min - phi6) / phi6, 0.0, 1.0)
+
+    let target_score = n6_target_score(means, d)
+    let sig_ratio    = signal_ratio_score(means, stds, d)
+    let monotone     = monotone_score(data, n, d)
+    let n6_dim       = dim_n6_score(d)
+    let n6_res       = n6_resonance_score(means, d)
+
+    let spectral_graph_score = fiedler_score  * 0.20
+        + gap_phi        * 0.15
+        + target_score   * 0.20
+        + sig_ratio      * 0.20
+        + monotone       * 0.10
+        + n6_dim         * 0.10
+        + n6_res         * 0.05
+
+    r = result_add(r, "spectral_gap",         [spectral_gap])
+    r = result_add(r, "fiedler_score",        [fiedler_score])
+    r = result_add(r, "gap_phi",              [gap_phi])
+    r = result_add(r, "target_score",         [target_score])
+    r = result_add(r, "signal_ratio",         [sig_ratio])
+    r = result_add(r, "monotone",             [monotone])
+    r = result_add(r, "n6_dim",               [n6_dim])
+    r = result_add(r, "n6_resonance",         [n6_res])
+    r = result_add(r, "spectral_graph_score", [spectral_graph_score])
+    r
+}
+
+// ─── (8) topological_data ───
+// 위상 데이터 (TDA) — 파이프라인 n=6
+// n=6 연결: 필터링 파라미터=n=6, 바코드 길이=sigma=12, 호몰로지=tau=4
+
+fn scan_topological_data(data, n: int, d: int) -> LensResult {
+    let mut r = empty_result()
+    if n < 6 || d == 0 { return r }
+
+    let mut means = []
+    let mut stds  = []
+    let mut j = 0
+    while j < d {
+        let m = col_mean(data, n, d, j)
+        let v = col_var(data, n, d, j, m)
+        means = means + [m]
+        stds  = stds  + [sqrt_f(v)]
+        j = j + 1
+    }
+
+    // 바코드 길이 근사: 분산 정렬 후 인접 차이 = persistent homology 간격
+    let sorted_means = list_sort(means)
+    let mut barcode_len = 0.0
+    let mut bi = 1
+    while bi < sorted_means.len() {
+        barcode_len = barcode_len + abs_f(sorted_means[bi] - sorted_means[bi - 1])
+        bi = bi + 1
+    }
+    // sigma=12 기준 공명
+    let barcode_sigma = clamp_f(1.0 - abs_f(barcode_len - sigma6) / max_f(sigma6, 0.01), 0.0, 1.0)
+
+    // 호몰로지 차원 = tau=4 공명 (d == 4 근방)
+    let homology_tau = clamp_f(1.0 - abs_f(to_float(d) - tau6) / tau6, 0.0, 1.0)
+
+    let target_score = n6_target_score(means, d)
+    let sig_ratio    = signal_ratio_score(means, stds, d)
+    let monotone     = monotone_score(data, n, d)
+    let n6_dim       = dim_n6_score(d)
+    let n6_res       = n6_resonance_score(means, d)
+
+    let tda_score = barcode_sigma  * 0.20
+        + homology_tau  * 0.15
+        + target_score  * 0.20
+        + sig_ratio     * 0.20
+        + monotone      * 0.10
+        + n6_dim        * 0.10
+        + n6_res        * 0.05
+
+    r = result_add(r, "barcode_len",   [barcode_len])
+    r = result_add(r, "barcode_sigma", [barcode_sigma])
+    r = result_add(r, "homology_tau",  [homology_tau])
+    r = result_add(r, "target_score",  [target_score])
+    r = result_add(r, "signal_ratio",  [sig_ratio])
+    r = result_add(r, "monotone",      [monotone])
+    r = result_add(r, "n6_dim",        [n6_dim])
+    r = result_add(r, "n6_resonance",  [n6_res])
+    r = result_add(r, "tda_score",     [tda_score])
+    r
+}
+
+// ─── (9) topological_sort ───
+// 위상 정렬 — DAG 의존 체인 n=6
+// n=6 연결: 의존 깊이=n=6, 병렬 레벨=tau=4, 선행 노드=phi=2
+
+fn scan_topological_sort(data, n: int, d: int) -> LensResult {
+    let mut r = empty_result()
+    if n < 6 || d == 0 { return r }
+
+    let mut means = []
+    let mut stds  = []
+    let mut j = 0
+    while j < d {
+        let m = col_mean(data, n, d, j)
+        let v = col_var(data, n, d, j, m)
+        means = means + [m]
+        stds  = stds  + [sqrt_f(v)]
+        j = j + 1
+    }
+
+    // DAG 깊이 근사: 단조 증가하는 연속 체인 길이
+    let sorted_means = list_sort(means)
+    let mut depth = 1
+    let mut di = 1
+    while di < sorted_means.len() {
+        if sorted_means[di] > sorted_means[di - 1] { depth = depth + 1 }
+        di = di + 1
+    }
+    let depth_n6 = clamp_f(1.0 - abs_f(to_float(depth) - n6) / n6, 0.0, 1.0)
+
+    // 병렬 레벨 = tau=4 공명
+    // 중간값 클러스터 수 (값이 비슷한 그룹) ≈ tau
+    let mean_val = list_mean(means)
+    let std_val  = list_std(means, mean_val)
+    let mut cluster_count = 0
+    for m in means {
+        if abs_f(m - mean_val) < std_val * 0.5 { cluster_count = cluster_count + 1 }
+    }
+    let parallel_tau = clamp_f(1.0 - abs_f(to_float(cluster_count) - tau6) / tau6, 0.0, 1.0)
+
+    let target_score = n6_target_score(means, d)
+    let sig_ratio    = signal_ratio_score(means, stds, d)
+    let monotone     = monotone_score(data, n, d)
+    let n6_dim       = dim_n6_score(d)
+    let n6_res       = n6_resonance_score(means, d)
+
+    let topo_score = depth_n6     * 0.20
+        + parallel_tau  * 0.15
+        + target_score  * 0.20
+        + sig_ratio     * 0.20
+        + monotone      * 0.10
+        + n6_dim        * 0.10
+        + n6_res        * 0.05
+
+    r = result_add(r, "dag_depth",    [to_float(depth)])
+    r = result_add(r, "depth_n6",     [depth_n6])
+    r = result_add(r, "parallel_tau", [parallel_tau])
+    r = result_add(r, "target_score", [target_score])
+    r = result_add(r, "signal_ratio", [sig_ratio])
+    r = result_add(r, "monotone",     [monotone])
+    r = result_add(r, "n6_dim",       [n6_dim])
+    r = result_add(r, "n6_resonance", [n6_res])
+    r = result_add(r, "topo_score",   [topo_score])
+    r
+}
+
+// ─── (10) cross_domain_bridge ───
+// 도메인 간 브리지 — 이종 도메인 구조 공명 감지
+// n=6 연결:
+//   이종 도메인 연결 최적 수 = n=6
+//   브리지 강도 임계 = 1/n = 0.1667
+//   구조 동형 레이어 = tau=4
+//   cross-domain 공명 주파수 = sigma=12
+
+fn scan_cross_domain_bridge(data, n: int, d: int) -> LensResult {
+    let mut r = empty_result()
+    if n < 6 || d < 2 { return r }
+
+    let dims = if d < 12 { d } else { 12 }
+
+    let mut means = []
+    let mut j = 0
+    while j < dims {
+        means = means + [col_mean(data, n, d, j)]
+        j = j + 1
+    }
+
+    // 1. 크로스-차원 공분산 합산 (브리지 강도)
+    let mut cross_sum = 0.0
+    let mut cross_count = 0
+    let mut i = 0
+    while i < dims {
+        let mut jj = i + 1
+        while jj < dims {
+            // 두 컬럼의 평균 곱 (공분산 근사)
+            let mi = col_mean(data, n, d, i)
+            let mj = col_mean(data, n, d, jj)
+            let mut cov = 0.0
+            let mut k = 0
+            while k < n {
+                cov = cov + (data[k * d + i] - mi) * (data[k * d + jj] - mj)
+                k = k + 1
+            }
+            cov = cov / max_f(to_float(n), 1.0)
+            cross_sum = cross_sum + abs_f(cov)
+            cross_count = cross_count + 1
+            jj = jj + 1
+        }
+        i = i + 1
+    }
+    let bridge_strength = min_f(cross_sum / max_f(to_float(cross_count), 1.0), 1.0)
+
+    // 2. 구조 동형 점수: mean[j]/mean[i] 가 n=6 배율 근처
+    let iso_ratios = [1.0, phi6, n6 / phi6, tau6, sigma6 / phi6]
+    let mut iso_count = 0
+    i = 0
+    while i < dims {
+        let mut jj = i + 1
+        while jj < dims {
+            if abs_f(means[i]) > 0.000000000001 {
+                let ratio = means[jj] / means[i]
+                let mut rk = 0
+                while rk < iso_ratios.len() {
+                    if abs_f(ratio - iso_ratios[rk]) < 0.1 {
+                        iso_count = iso_count + 1
+                        rk = iso_ratios.len()
+                    }
+                    rk = rk + 1
+                }
+            }
+            jj = jj + 1
+        }
+        i = i + 1
+    }
+    let iso_score = to_float(iso_count) / max_f(to_float(cross_count), 1.0)
+
+    // 3. n=6 브리지 수 공명 (dims ≈ n=6)
+    let bridge_n6 = max_f(1.0 - abs_f(to_float(dims) - n6) / n6, 0.0)
+
+    let target_score = n6_target_score(means, dims)
+    let n6_res       = n6_resonance_score(means, dims)
+
+    let bridge_score = min_f(bridge_strength, 1.0) * 0.25
+        + iso_score    * 0.25
+        + bridge_n6    * 0.20
+        + target_score * 0.15
+        + n6_res       * 0.15
+
+    r = result_add(r, "bridge_strength", [bridge_strength])
+    r = result_add(r, "iso_score",       [iso_score])
+    r = result_add(r, "bridge_n6",       [bridge_n6])
+    r = result_add(r, "target_score",    [target_score])
+    r = result_add(r, "n6_resonance",    [n6_res])
+    r = result_add(r, "bridge_score",    [bridge_score])
+    r
+}

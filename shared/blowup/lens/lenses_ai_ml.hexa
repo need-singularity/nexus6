@@ -1,0 +1,731 @@
+// lenses_ai_ml.hexa — 16 AI/ML lenses ported from Rust
+// 출처: nexus/src/telescope/lenses/ (active_learning, adversarial_robustness,
+//       agent_coordination, attention_mechanism, cognitive_load,
+//       contrastive_learning, explainability, fairness_bias,
+//       federated_learning, meta_learning, multi_task, neural_architecture,
+//       reinforcement_reward, self_supervised, transfer_learning,
+//       continual_learning)
+//
+// 의존: telescope.hexa (LensResult, result_add, empty_result, abs_f,
+//       sqrt_f, ln_f, list_mean, list_variance, list_sort)
+//
+// 렌즈 목록 (16):
+//  1. active_learning       2. adversarial_robustness  3. agent_coordination
+//  4. attention_mechanism   5. cognitive_load           6. contrastive_learning
+//  7. explainability        8. fairness_bias            9. federated_learning
+// 10. meta_learning        11. multi_task              12. neural_architecture
+// 13. reinforcement_reward 14. self_supervised         15. transfer_learning
+// 16. continual_learning
+
+// ─── 공유 상수 (n=6: σ(6)=12, τ(6)=4, φ(6)=2, sopfr(6)=5) ───
+
+comptime const n6      = 6.0
+comptime const sigma6  = 12.0
+comptime const tau6    = 4.0
+comptime const phi6    = 2.0
+comptime const sopfr6  = 5.0
+
+// ─── 로컬 헬퍼 ───
+
+pure fn min_f(a: float, b: float) -> float { if a < b { a } else { b } }
+pure fn max_f(a: float, b: float) -> float { if a > b { a } else { b } }
+pure fn clamp_f(x: float, lo: float, hi: float) -> float { min_f(max_f(x, lo), hi) }
+pure fn to_float(x: int) -> float { float(x) }
+
+// data[n×d] 행렬에서 j번째 열 평균 계산
+pure fn col_mean(data, n: int, d: int, j: int) -> float {
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + data[i * d + j]
+        i = i + 1
+    }
+    s / to_float(n)
+}
+
+// data[n×d] 행렬에서 j번째 열 표준편차 계산
+pure fn col_std(data, n: int, d: int, j: int, mean: float) -> float {
+    let mut v = 0.0
+    let mut i = 0
+    while i < n {
+        let diff = data[i * d + j] - mean
+        v = v + diff * diff
+        i = i + 1
+    }
+    sqrt_f(v / to_float(n))
+}
+
+// n=6 핵심 상수 5개 중 하나와 8% 오차 내에서 공명하는지 확인
+pure fn resonates_tight(m: float) -> bool {
+    let targets = [n6, tau6, sigma6, phi6, sopfr6]
+    let mut found = false
+    for t in targets {
+        if t > 0.000000000001 {
+            let rel = abs_f(m - t) / t
+            if rel < 0.08 { found = true }
+        }
+    }
+    found
+}
+
+// n=6 핵심 상수 5개 중 하나와 7% 오차 내에서 공명하는지 확인
+pure fn resonates_loose(m: float) -> bool {
+    let targets = [n6, tau6, sigma6, phi6, sopfr6]
+    let mut found = false
+    for t in targets {
+        if t > 0.000000000001 {
+            let rel = abs_f(m - t) / t
+            if rel < 0.07 { found = true }
+        }
+    }
+    found
+}
+
+// ─── 공통 5-지표 계산 (모든 렌즈가 공유하는 n×d 행렬 분석) ───
+// 반환: [target_score, signal_ratio, monotone, n6_dim, n6_resonance]
+
+pure fn base_metrics(data, n: int, d: int) -> [float] {
+    // 1. 열별 평균/표준편차 수집
+    let mut means = []
+    let mut stds  = []
+    let mut j = 0
+    while j < d {
+        let m = col_mean(data, n, d, j)
+        let s = col_std(data, n, d, j, m)
+        means = means + [m]
+        stds  = stds  + [s]
+        j = j + 1
+    }
+
+    // 2. target_score: n=6 상수와 8% 이내 공명하는 열 비율
+    let mut ts_count = 0
+    for m in means {
+        if resonates_tight(m) { ts_count = ts_count + 1 }
+    }
+    let target_score = to_float(ts_count) / to_float(d)
+
+    // 3. signal_ratio: 평균 절댓값 / (평균 절댓값 + 평균 표준편차)
+    let mut std_sum = 0.0
+    let mut abs_sum = 0.0
+    for s in stds  { std_sum = std_sum + s }
+    for m in means { abs_sum = abs_sum + abs_f(m) }
+    let mean_std = std_sum / to_float(d)
+    let mean_val = abs_sum / to_float(d)
+    let signal_ratio = clamp_f(mean_val / (mean_val + mean_std + 0.000000000001), 0.0, 1.0)
+
+    // 4. monotone: 각 열에서 단조 증가 비율 편차의 평균
+    let mut mono_sum = 0.0
+    j = 0
+    while j < d {
+        let mut pos_count = 0
+        let mut diff_count = 0
+        let mut i = 1
+        while i < n {
+            let delta = data[i * d + j] - data[(i - 1) * d + j]
+            if delta > 0.0 { pos_count = pos_count + 1 }
+            diff_count = diff_count + 1
+            i = i + 1
+        }
+        let ratio = to_float(pos_count) / max_f(to_float(diff_count), 1.0)
+        mono_sum = mono_sum + abs_f(ratio - 0.5) * 2.0
+        j = j + 1
+    }
+    let monotone = mono_sum / to_float(d)
+
+    // 5. n6_dim: 차원 수 d가 n=6에 가까울수록 높은 공명 점수
+    let n6_dim = max_f(1.0 - abs_f(to_float(d) - n6) / n6 * 2.0, 0.0)
+
+    // 6. n6_resonance: n=6 상수와 7% 이내 공명하는 열 비율
+    let mut res_count = 0
+    for m in means {
+        if resonates_loose(m) { res_count = res_count + 1 }
+    }
+    let n6_resonance = to_float(res_count) / to_float(d)
+
+    [target_score, signal_ratio, monotone, n6_dim, n6_resonance]
+}
+
+// ─── (1) active_learning ───
+// 능동 학습: 쿼리 배치=n=6, uncertainty threshold=1/n, pool=σ²=144
+
+fn scan_active_learning(data, n: int, d: int) -> LensResult {
+    let mut r = empty_result()
+    if n < 6 || d == 0 { return r }
+
+    let m = base_metrics(data, n, d)
+    let target_score  = m[0]
+    let signal_ratio  = m[1]
+    let monotone      = m[2]
+    let n6_dim        = m[3]
+    let n6_resonance  = m[4]
+
+    // 능동 학습 특화: uncertainty 기반 쿼리 전략 — 불확실성이 클수록 정보 이득 높음
+    // query_entropy: 데이터 분산 기반 불확실성 (높을수록 능동 쿼리 효과 큼)
+    let query_entropy = clamp_f(signal_ratio * (1.0 - signal_ratio) * tau6, 0.0, 1.0)
+
+    let active_score = target_score   * 0.25
+                     + signal_ratio   * 0.25
+                     + monotone       * 0.15
+                     + n6_dim         * 0.20
+                     + n6_resonance   * 0.15
+
+    r = result_add(r, "target_score",  [target_score])
+    r = result_add(r, "signal_ratio",  [signal_ratio])
+    r = result_add(r, "monotone",      [monotone])
+    r = result_add(r, "n6_dim",        [n6_dim])
+    r = result_add(r, "n6_resonance",  [n6_resonance])
+    r = result_add(r, "query_entropy", [query_entropy])
+    r = result_add(r, "active_score",  [active_score])
+    r
+}
+
+// ─── (2) adversarial_robustness ───
+// 적대적 강건성: PGD 단계=n=6, epsilon=1/σ=1/12, L∞ radius=1/n
+
+fn scan_adversarial_robustness(data, n: int, d: int) -> LensResult {
+    let mut r = empty_result()
+    if n < 6 || d == 0 { return r }
+
+    let m = base_metrics(data, n, d)
+    let target_score  = m[0]
+    let signal_ratio  = m[1]
+    let monotone      = m[2]
+    let n6_dim        = m[3]
+    let n6_resonance  = m[4]
+
+    // 강건성 특화: perturbation 내성 — 신호 안정성이 높을수록 적대적 공격에 강함
+    // robustness_margin: 신호 비율과 단조성을 결합한 내성 지표
+    let robustness_margin = clamp_f(signal_ratio * (1.0 - monotone * 0.5), 0.0, 1.0)
+
+    let adv_score = target_score      * 0.25
+                  + signal_ratio      * 0.25
+                  + monotone          * 0.15
+                  + n6_dim            * 0.20
+                  + n6_resonance      * 0.15
+
+    r = result_add(r, "target_score",       [target_score])
+    r = result_add(r, "signal_ratio",       [signal_ratio])
+    r = result_add(r, "monotone",           [monotone])
+    r = result_add(r, "n6_dim",             [n6_dim])
+    r = result_add(r, "n6_resonance",       [n6_resonance])
+    r = result_add(r, "robustness_margin",  [robustness_margin])
+    r = result_add(r, "adv_score",          [adv_score])
+    r
+}
+
+// ─── (3) agent_coordination ───
+// 다중 에이전트 조율: 에이전트 수=n=6, 합의 임계=τ=4, 메시지 라운드=σ=12
+
+fn scan_agent_coordination(data, n: int, d: int) -> LensResult {
+    let mut r = empty_result()
+    if n < 6 || d == 0 { return r }
+
+    let m = base_metrics(data, n, d)
+    let target_score  = m[0]
+    let signal_ratio  = m[1]
+    let monotone      = m[2]
+    let n6_dim        = m[3]
+    let n6_resonance  = m[4]
+
+    // 조율 특화: 합의 수렴 지표 — n=6 에이전트의 분산 감소율
+    // consensus_rate: 열들의 동조 정도 (단조성 낮을수록 합의 수렴 느림)
+    let consensus_rate = clamp_f((1.0 - monotone) * n6_resonance + signal_ratio * 0.3, 0.0, 1.0)
+
+    let agent_score = target_score    * 0.25
+                    + signal_ratio    * 0.25
+                    + monotone        * 0.15
+                    + n6_dim          * 0.20
+                    + n6_resonance    * 0.15
+
+    r = result_add(r, "target_score",   [target_score])
+    r = result_add(r, "signal_ratio",   [signal_ratio])
+    r = result_add(r, "monotone",       [monotone])
+    r = result_add(r, "n6_dim",         [n6_dim])
+    r = result_add(r, "n6_resonance",   [n6_resonance])
+    r = result_add(r, "consensus_rate", [consensus_rate])
+    r = result_add(r, "agent_score",    [agent_score])
+    r
+}
+
+// ─── (4) attention_mechanism ───
+// 어텐션 메커니즘: 헤드=n=6, KV 차원=σ²=144, 온도=φ=2
+
+fn scan_attention_mechanism(data, n: int, d: int) -> LensResult {
+    let mut r = empty_result()
+    if n < 6 || d == 0 { return r }
+
+    let m = base_metrics(data, n, d)
+    let target_score  = m[0]
+    let signal_ratio  = m[1]
+    let monotone      = m[2]
+    let n6_dim        = m[3]
+    let n6_resonance  = m[4]
+
+    // 어텐션 특화: 쿼리-키 정렬도 — 신호 비율을 n=6 헤드 온도 φ=2로 정규화
+    // head_alignment: n=6 헤드에서 정보 집중도
+    let head_alignment = clamp_f(signal_ratio * n6_resonance * phi6 / n6, 0.0, 1.0)
+
+    let attention_score = target_score     * 0.25
+                        + signal_ratio     * 0.25
+                        + monotone         * 0.15
+                        + n6_dim           * 0.20
+                        + n6_resonance     * 0.15
+
+    r = result_add(r, "target_score",    [target_score])
+    r = result_add(r, "signal_ratio",    [signal_ratio])
+    r = result_add(r, "monotone",        [monotone])
+    r = result_add(r, "n6_dim",          [n6_dim])
+    r = result_add(r, "n6_resonance",    [n6_resonance])
+    r = result_add(r, "head_alignment",  [head_alignment])
+    r = result_add(r, "attention_score", [attention_score])
+    r
+}
+
+// ─── (5) cognitive_load ───
+// 인지 부하: 청크=n=6, 처리 단계=τ=4, 주의 자원=φ=2
+
+fn scan_cognitive_load(data, n: int, d: int) -> LensResult {
+    let mut r = empty_result()
+    if n < 6 || d == 0 { return r }
+
+    let m = base_metrics(data, n, d)
+    let target_score  = m[0]
+    let signal_ratio  = m[1]
+    let monotone      = m[2]
+    let n6_dim        = m[3]
+    let n6_resonance  = m[4]
+
+    // 인지 부하 특화: 작업기억 용량 초과 지표
+    // working_memory_pressure: 차원이 n=6을 넘을수록 부하 증가 (n6_dim 역수)
+    let working_memory_pressure = clamp_f(1.0 - n6_dim + monotone * 0.3, 0.0, 1.0)
+
+    let cogload_score = target_score              * 0.25
+                      + signal_ratio              * 0.25
+                      + monotone                  * 0.15
+                      + n6_dim                    * 0.20
+                      + n6_resonance              * 0.15
+
+    r = result_add(r, "target_score",            [target_score])
+    r = result_add(r, "signal_ratio",            [signal_ratio])
+    r = result_add(r, "monotone",                [monotone])
+    r = result_add(r, "n6_dim",                  [n6_dim])
+    r = result_add(r, "n6_resonance",            [n6_resonance])
+    r = result_add(r, "working_memory_pressure", [working_memory_pressure])
+    r = result_add(r, "cogload_score",           [cogload_score])
+    r
+}
+
+// ─── (6) contrastive_learning ───
+// 대조 학습: negative 샘플=n=6, 온도=τ/σ=1/3, SimCLR augment=φ=2
+
+fn scan_contrastive_learning(data, n: int, d: int) -> LensResult {
+    let mut r = empty_result()
+    if n < 6 || d == 0 { return r }
+
+    let m = base_metrics(data, n, d)
+    let target_score  = m[0]
+    let signal_ratio  = m[1]
+    let monotone      = m[2]
+    let n6_dim        = m[3]
+    let n6_resonance  = m[4]
+
+    // 대조 학습 특화: positive/negative pair 분리 가능성
+    // pair_separability: 평균 신호와 분산 패턴에서 클래스 경계 예측
+    // 온도 파라미터 = τ/σ = 4/12 = 1/3 → 분리 날카로움
+    let temp = tau6 / sigma6
+    let pair_separability = clamp_f(signal_ratio * (1.0 - temp) + n6_resonance * temp, 0.0, 1.0)
+
+    let contrastive_score = target_score      * 0.25
+                          + signal_ratio      * 0.25
+                          + monotone          * 0.15
+                          + n6_dim            * 0.20
+                          + n6_resonance      * 0.15
+
+    r = result_add(r, "target_score",       [target_score])
+    r = result_add(r, "signal_ratio",       [signal_ratio])
+    r = result_add(r, "monotone",           [monotone])
+    r = result_add(r, "n6_dim",             [n6_dim])
+    r = result_add(r, "n6_resonance",       [n6_resonance])
+    r = result_add(r, "pair_separability",  [pair_separability])
+    r = result_add(r, "contrastive_score",  [contrastive_score])
+    r
+}
+
+// ─── (7) explainability ───
+// 설명가능성: 설명 특성=n=6, SHAP 샘플=σ²=144, 근사 오차=1/n
+
+fn scan_explainability(data, n: int, d: int) -> LensResult {
+    let mut r = empty_result()
+    if n < 6 || d == 0 { return r }
+
+    let m = base_metrics(data, n, d)
+    let target_score  = m[0]
+    let signal_ratio  = m[1]
+    let monotone      = m[2]
+    let n6_dim        = m[3]
+    let n6_resonance  = m[4]
+
+    // 설명가능성 특화: 특성 중요도의 집중도 (소수 특성에 집중될수록 설명 쉬움)
+    // feature_concentration: n=6 차원 공명 × 단조성 (중요 특성이 명확히 분리됨)
+    let feature_concentration = clamp_f(n6_dim * (1.0 - monotone * 0.4) + target_score * 0.3, 0.0, 1.0)
+
+    let explain_score = target_score           * 0.25
+                      + signal_ratio           * 0.25
+                      + monotone               * 0.15
+                      + n6_dim                 * 0.20
+                      + n6_resonance           * 0.15
+
+    r = result_add(r, "target_score",          [target_score])
+    r = result_add(r, "signal_ratio",          [signal_ratio])
+    r = result_add(r, "monotone",              [monotone])
+    r = result_add(r, "n6_dim",               [n6_dim])
+    r = result_add(r, "n6_resonance",          [n6_resonance])
+    r = result_add(r, "feature_concentration", [feature_concentration])
+    r = result_add(r, "explain_score",         [explain_score])
+    r
+}
+
+// ─── (8) fairness_bias ───
+// 공정성 편향: 집단=n=6, disparity gap=1/n=1/6, equalized odds=φ=2
+
+fn scan_fairness_bias(data, n: int, d: int) -> LensResult {
+    let mut r = empty_result()
+    if n < 6 || d == 0 { return r }
+
+    let m = base_metrics(data, n, d)
+    let target_score  = m[0]
+    let signal_ratio  = m[1]
+    let monotone      = m[2]
+    let n6_dim        = m[3]
+    let n6_resonance  = m[4]
+
+    // 공정성 특화: 집단 간 disparate impact 측정
+    // disparity_index: 데이터 분포 불균형 → 0에 가까울수록 공정
+    // n=6 집단 분할 기준: φ=2 equalized odds 조건 적용
+    let disparity_index = clamp_f(abs_f(signal_ratio - n6_resonance) * phi6, 0.0, 1.0)
+    let fairness_gap    = clamp_f(1.0 - disparity_index, 0.0, 1.0)
+
+    let fairness_score = target_score     * 0.25
+                       + signal_ratio     * 0.25
+                       + monotone         * 0.15
+                       + n6_dim           * 0.20
+                       + n6_resonance     * 0.15
+
+    r = result_add(r, "target_score",    [target_score])
+    r = result_add(r, "signal_ratio",    [signal_ratio])
+    r = result_add(r, "monotone",        [monotone])
+    r = result_add(r, "n6_dim",          [n6_dim])
+    r = result_add(r, "n6_resonance",    [n6_resonance])
+    r = result_add(r, "disparity_index", [disparity_index])
+    r = result_add(r, "fairness_gap",    [fairness_gap])
+    r = result_add(r, "fairness_score",  [fairness_score])
+    r
+}
+
+// ─── (9) federated_learning ───
+// 연합 학습: 클라이언트=n=6, round=σ=12, local epoch=τ=4
+
+fn scan_federated_learning(data, n: int, d: int) -> LensResult {
+    let mut r = empty_result()
+    if n < 6 || d == 0 { return r }
+
+    let m = base_metrics(data, n, d)
+    let target_score  = m[0]
+    let signal_ratio  = m[1]
+    let monotone      = m[2]
+    let n6_dim        = m[3]
+    let n6_resonance  = m[4]
+
+    // 연합 학습 특화: 클라이언트 드리프트 — 분산이 클수록 gradient 이질성 높음
+    // client_drift: 신호 비율의 분산성 (1 - signal_ratio가 드리프트)
+    // σ=12 라운드 후 수렴 기대 → 1/σ=1/12 단위 수렴 속도
+    let client_drift = clamp_f((1.0 - signal_ratio) * (1.0 - n6_resonance), 0.0, 1.0)
+    let convergence_speed = clamp_f(1.0 / sigma6 * (signal_ratio + n6_dim), 0.0, 1.0)
+
+    let federated_score = target_score        * 0.25
+                        + signal_ratio        * 0.25
+                        + monotone            * 0.15
+                        + n6_dim              * 0.20
+                        + n6_resonance        * 0.15
+
+    r = result_add(r, "target_score",       [target_score])
+    r = result_add(r, "signal_ratio",       [signal_ratio])
+    r = result_add(r, "monotone",           [monotone])
+    r = result_add(r, "n6_dim",             [n6_dim])
+    r = result_add(r, "n6_resonance",       [n6_resonance])
+    r = result_add(r, "client_drift",       [client_drift])
+    r = result_add(r, "convergence_speed",  [convergence_speed])
+    r = result_add(r, "federated_score",    [federated_score])
+    r
+}
+
+// ─── (10) meta_learning ───
+// 메타 학습: shot=n=6, way=τ, inner loop=φ=2
+
+fn scan_meta_learning(data, n: int, d: int) -> LensResult {
+    let mut r = empty_result()
+    if n < 6 || d == 0 { return r }
+
+    let m = base_metrics(data, n, d)
+    let target_score  = m[0]
+    let signal_ratio  = m[1]
+    let monotone      = m[2]
+    let n6_dim        = m[3]
+    let n6_resonance  = m[4]
+
+    // 메타 학습 특화: few-shot 일반화 능력
+    // generalization_gap: 메타 학습기의 과제 간 전이 능력
+    // n=6-shot, τ=4-way 환경에서 inner loop φ=2회 최적화
+    let few_shot_capacity = clamp_f(n6_resonance * signal_ratio + n6_dim / phi6, 0.0, 1.0)
+    let generalization_gap = clamp_f(abs_f(few_shot_capacity - monotone), 0.0, 1.0)
+
+    let meta_score = target_score         * 0.25
+                   + signal_ratio         * 0.25
+                   + monotone             * 0.15
+                   + n6_dim               * 0.20
+                   + n6_resonance         * 0.15
+
+    r = result_add(r, "target_score",        [target_score])
+    r = result_add(r, "signal_ratio",        [signal_ratio])
+    r = result_add(r, "monotone",            [monotone])
+    r = result_add(r, "n6_dim",              [n6_dim])
+    r = result_add(r, "n6_resonance",        [n6_resonance])
+    r = result_add(r, "few_shot_capacity",   [few_shot_capacity])
+    r = result_add(r, "generalization_gap",  [generalization_gap])
+    r = result_add(r, "meta_score",          [meta_score])
+    r
+}
+
+// ─── (11) multi_task ───
+// 다중 과제: 과제 수=n=6, 공유 레이어=τ=4, MTL 손실=φ=2
+
+fn scan_multi_task(data, n: int, d: int) -> LensResult {
+    let mut r = empty_result()
+    if n < 6 || d == 0 { return r }
+
+    let m = base_metrics(data, n, d)
+    let target_score  = m[0]
+    let signal_ratio  = m[1]
+    let monotone      = m[2]
+    let n6_dim        = m[3]
+    let n6_resonance  = m[4]
+
+    // 다중 과제 특화: 과제 간 간섭 vs 공유 표현 이득
+    // task_interference: n=6 과제 중 충돌 비율 — 단조성이 낮을수록 간섭 큼
+    // shared_repr_gain: 공유 τ=4 레이어의 정보 재사용 이득
+    let task_interference   = clamp_f(monotone * (1.0 - n6_resonance), 0.0, 1.0)
+    let shared_repr_gain    = clamp_f(n6_resonance * tau6 / n6 + signal_ratio * 0.2, 0.0, 1.0)
+
+    let multitask_score = target_score        * 0.25
+                        + signal_ratio        * 0.25
+                        + monotone            * 0.15
+                        + n6_dim              * 0.20
+                        + n6_resonance        * 0.15
+
+    r = result_add(r, "target_score",      [target_score])
+    r = result_add(r, "signal_ratio",      [signal_ratio])
+    r = result_add(r, "monotone",          [monotone])
+    r = result_add(r, "n6_dim",            [n6_dim])
+    r = result_add(r, "n6_resonance",      [n6_resonance])
+    r = result_add(r, "task_interference", [task_interference])
+    r = result_add(r, "shared_repr_gain",  [shared_repr_gain])
+    r = result_add(r, "multitask_score",   [multitask_score])
+    r
+}
+
+// ─── (12) neural_architecture ───
+// 신경망 구조: depth=n=6, width=σ²=144, bottleneck=τ=4
+
+fn scan_neural_architecture(data, n: int, d: int) -> LensResult {
+    let mut r = empty_result()
+    if n < 6 || d == 0 { return r }
+
+    let m = base_metrics(data, n, d)
+    let target_score  = m[0]
+    let signal_ratio  = m[1]
+    let monotone      = m[2]
+    let n6_dim        = m[3]
+    let n6_resonance  = m[4]
+
+    // 신경망 구조 특화: 계층적 특성 학습 능력
+    // depth_resonance: n=6 레이어 깊이의 정보 계층화 효율
+    // bottleneck_ratio: τ=4 병목 압축 비율 → 차원 n6_dim 기반
+    let depth_resonance  = clamp_f(n6_dim * signal_ratio + n6_resonance * 0.4, 0.0, 1.0)
+    let bottleneck_ratio = clamp_f(tau6 / n6 * (1.0 - monotone * 0.5), 0.0, 1.0)
+
+    let arch_score = target_score        * 0.25
+                   + signal_ratio        * 0.25
+                   + monotone            * 0.15
+                   + n6_dim              * 0.20
+                   + n6_resonance        * 0.15
+
+    r = result_add(r, "target_score",     [target_score])
+    r = result_add(r, "signal_ratio",     [signal_ratio])
+    r = result_add(r, "monotone",         [monotone])
+    r = result_add(r, "n6_dim",           [n6_dim])
+    r = result_add(r, "n6_resonance",     [n6_resonance])
+    r = result_add(r, "depth_resonance",  [depth_resonance])
+    r = result_add(r, "bottleneck_ratio", [bottleneck_ratio])
+    r = result_add(r, "arch_score",       [arch_score])
+    r
+}
+
+// ─── (13) reinforcement_reward ───
+// 강화학습 보상: 행동 수=n=6, 할인율=1-1/σ=11/12, 에피소드=τ×σ=48
+
+fn scan_reinforcement_reward(data, n: int, d: int) -> LensResult {
+    let mut r = empty_result()
+    if n < 6 || d == 0 { return r }
+
+    let m = base_metrics(data, n, d)
+    let target_score  = m[0]
+    let signal_ratio  = m[1]
+    let monotone      = m[2]
+    let n6_dim        = m[3]
+    let n6_resonance  = m[4]
+
+    // 강화학습 특화: 정책 최적화 수렴 지표
+    // discount_factor: 1 - 1/σ = 11/12 ≈ 0.917
+    // return_stability: 단조 증가하는 보상 신호 안정성
+    let discount_factor   = 1.0 - 1.0 / sigma6
+    let return_stability  = clamp_f(monotone * signal_ratio + n6_resonance * discount_factor, 0.0, 1.0)
+    // policy_entropy: 행동 다양성 — n=6 행동 공간에서 탐색 균등성
+    let policy_entropy    = clamp_f(1.0 - abs_f(signal_ratio - 0.5) * phi6, 0.0, 1.0)
+
+    let rl_score = target_score      * 0.25
+                 + signal_ratio      * 0.25
+                 + monotone          * 0.15
+                 + n6_dim            * 0.20
+                 + n6_resonance      * 0.15
+
+    r = result_add(r, "target_score",     [target_score])
+    r = result_add(r, "signal_ratio",     [signal_ratio])
+    r = result_add(r, "monotone",         [monotone])
+    r = result_add(r, "n6_dim",           [n6_dim])
+    r = result_add(r, "n6_resonance",     [n6_resonance])
+    r = result_add(r, "return_stability", [return_stability])
+    r = result_add(r, "policy_entropy",   [policy_entropy])
+    r = result_add(r, "rl_score",         [rl_score])
+    r
+}
+
+// ─── (14) self_supervised ───
+// 자기지도: 마스크 비율=1/n=1/6, pretext 과제=τ=4, 배치=σ²=144
+
+fn scan_self_supervised(data, n: int, d: int) -> LensResult {
+    let mut r = empty_result()
+    if n < 6 || d == 0 { return r }
+
+    let m = base_metrics(data, n, d)
+    let target_score  = m[0]
+    let signal_ratio  = m[1]
+    let monotone      = m[2]
+    let n6_dim        = m[3]
+    let n6_resonance  = m[4]
+
+    // 자기지도 특화: 예측 과제 복잡도 및 마스킹 재구성 품질
+    // mask_ratio: 1/n=6 비율 마스킹 — 적절한 도전 난이도
+    let mask_ratio   = 1.0 / n6
+    // pretext_quality: τ=4 pretext 과제 신호 품질
+    let pretext_quality = clamp_f(signal_ratio * n6_resonance + mask_ratio * monotone, 0.0, 1.0)
+    // reconstruction_loss_proxy: 데이터 복잡도 기반 재구성 난이도
+    let reconstruction_loss = clamp_f(1.0 - pretext_quality * signal_ratio, 0.0, 1.0)
+
+    let ssl_score = target_score          * 0.25
+                  + signal_ratio          * 0.25
+                  + monotone              * 0.15
+                  + n6_dim                * 0.20
+                  + n6_resonance          * 0.15
+
+    r = result_add(r, "target_score",         [target_score])
+    r = result_add(r, "signal_ratio",         [signal_ratio])
+    r = result_add(r, "monotone",             [monotone])
+    r = result_add(r, "n6_dim",               [n6_dim])
+    r = result_add(r, "n6_resonance",         [n6_resonance])
+    r = result_add(r, "pretext_quality",      [pretext_quality])
+    r = result_add(r, "reconstruction_loss",  [reconstruction_loss])
+    r = result_add(r, "ssl_score",            [ssl_score])
+    r
+}
+
+// ─── (15) transfer_learning ───
+// 전이 학습: 레이어 전이=n=6, fine-tune epoch=τ=4, 적응 비율=1/φ=0.5
+
+fn scan_transfer_learning(data, n: int, d: int) -> LensResult {
+    let mut r = empty_result()
+    if n < 6 || d == 0 { return r }
+
+    let m = base_metrics(data, n, d)
+    let target_score  = m[0]
+    let signal_ratio  = m[1]
+    let monotone      = m[2]
+    let n6_dim        = m[3]
+    let n6_resonance  = m[4]
+
+    // 전이 학습 특화: 소스→타겟 도메인 적응 효율
+    // domain_shift: 소스와 타겟 분포 차이 — 신호 비율 편차로 근사
+    let domain_shift     = clamp_f(abs_f(signal_ratio - n6_resonance), 0.0, 1.0)
+    // transferability: n=6 레이어의 전이 가능성 — 공명 높을수록 좋음
+    let transferability  = clamp_f(n6_resonance * (1.0 - domain_shift) + n6_dim * 0.3, 0.0, 1.0)
+    // fine_tune_cost: τ=4 에포크에 소요되는 적응 비용 추정
+    let fine_tune_cost   = clamp_f(domain_shift * tau6 / n6, 0.0, 1.0)
+
+    let transfer_score = target_score     * 0.25
+                       + signal_ratio     * 0.25
+                       + monotone         * 0.15
+                       + n6_dim           * 0.20
+                       + n6_resonance     * 0.15
+
+    r = result_add(r, "target_score",   [target_score])
+    r = result_add(r, "signal_ratio",   [signal_ratio])
+    r = result_add(r, "monotone",       [monotone])
+    r = result_add(r, "n6_dim",         [n6_dim])
+    r = result_add(r, "n6_resonance",   [n6_resonance])
+    r = result_add(r, "domain_shift",   [domain_shift])
+    r = result_add(r, "transferability",[transferability])
+    r = result_add(r, "fine_tune_cost", [fine_tune_cost])
+    r = result_add(r, "transfer_score", [transfer_score])
+    r
+}
+
+// ─── (16) continual_learning ───
+// 연속 학습: 과제=n=6, EWC lambda=1/n, replay buffer=σ×τ=48
+
+fn scan_continual_learning(data, n: int, d: int) -> LensResult {
+    let mut r = empty_result()
+    if n < 6 || d == 0 { return r }
+
+    let m = base_metrics(data, n, d)
+    let target_score  = m[0]
+    let signal_ratio  = m[1]
+    let monotone      = m[2]
+    let n6_dim        = m[3]
+    let n6_resonance  = m[4]
+
+    // 연속 학습 특화: catastrophic forgetting 방어
+    // ewc_lambda: EWC 정규화 강도 = 1/n=6 — 중요 가중치 보호
+    let ewc_lambda       = 1.0 / n6
+    // forgetting_risk: 새 과제 학습 시 이전 기억 손실 위험도
+    let forgetting_risk  = clamp_f((1.0 - n6_resonance) * monotone + ewc_lambda, 0.0, 1.0)
+    // plasticity: 새 과제 적응 능력 — 안정성-가소성 트레이드오프
+    let plasticity       = clamp_f(signal_ratio * (1.0 - forgetting_risk * ewc_lambda), 0.0, 1.0)
+    // replay_efficiency: σ×τ=48 버퍼 재생 효율
+    let replay_efficiency = clamp_f(n6_resonance * sigma6 * tau6 / (sigma6 * tau6 + 1.0), 0.0, 1.0)
+
+    let continual_score = target_score        * 0.25
+                        + signal_ratio        * 0.25
+                        + monotone            * 0.15
+                        + n6_dim              * 0.20
+                        + n6_resonance        * 0.15
+
+    r = result_add(r, "target_score",       [target_score])
+    r = result_add(r, "signal_ratio",       [signal_ratio])
+    r = result_add(r, "monotone",           [monotone])
+    r = result_add(r, "n6_dim",             [n6_dim])
+    r = result_add(r, "n6_resonance",       [n6_resonance])
+    r = result_add(r, "forgetting_risk",    [forgetting_risk])
+    r = result_add(r, "plasticity",         [plasticity])
+    r = result_add(r, "replay_efficiency",  [replay_efficiency])
+    r = result_add(r, "continual_score",    [continual_score])
+    r
+}

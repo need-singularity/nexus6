@@ -1,0 +1,763 @@
+// lenses_signal_info.hexa — 8 signal/information lenses
+// Rust 원본: nexus/src/telescope/lenses/ 의 8개 파일에서 변환
+//
+// Lenses (8):
+//  1. fourier_analysis         — 주파수 영역 n=6 공명 감지
+//  2. wavelet_transform        — 다중 해상도 n=6 스케일 분해
+//  3. signal_reconstruction    — compressed sensing sparsity=n=6
+//  4. information_bottleneck   — IB beta=n=6, MI 보존/압축 균형
+//  5. dimensionality_bottleneck — latent 차원=n=6 병목
+//  6. renyi_entropy            — alpha 차수별 Renyi 엔트로피, H_0=log(n=6)
+//  7. time_series_decomp       — 추세/계절/잔차 분해, 주기=n=6
+//  8. kalman_filter            — 상태 추정 혁신 gain=1/n=6
+//
+// 의존: telescope.hexa (LensResult, ScanEntry, result_add, empty_result,
+//                       abs_f, sqrt_f, ln_f, sanitize, list_mean,
+//                       list_variance, list_sort)
+
+// ─── 공유 상수 ───
+
+comptime const n6         = 6.0
+comptime const sigma6     = 12.0
+comptime const tau6       = 4.0
+comptime const phi6       = 2.0
+comptime const sopfr6     = 5.0
+
+// ─── 공유 헬퍼 ───
+
+pure fn si_min_f(a: float, b: float) -> float { if a < b { a } else { b } }
+pure fn si_max_f(a: float, b: float) -> float { if a > b { a } else { b } }
+pure fn si_clamp(x: float, lo: float, hi: float) -> float {
+    si_min_f(si_max_f(x, lo), hi)
+}
+
+// 컬럼 평균 목록 계산 (n 행, d 열, row-major data)
+pure fn col_means(data, n: int, d: int) -> [] {
+    let mut means = []
+    let mut j = 0
+    while j < d {
+        let mut s = 0.0
+        let mut i = 0
+        while i < n {
+            s = s + data[i * d + j]
+            i = i + 1
+        }
+        means = means + [s / to_float(n)]
+        j = j + 1
+    }
+    means
+}
+
+// 컬럼 표준편차 목록
+pure fn col_stds(data, n: int, d: int, means) -> [] {
+    let mut stds = []
+    let mut j = 0
+    while j < d {
+        let m = means[j]
+        let mut v = 0.0
+        let mut i = 0
+        while i < n {
+            let diff = data[i * d + j] - m
+            v = v + diff * diff
+            i = i + 1
+        }
+        stds = stds + [sqrt_f(v / to_float(n))]
+        j = j + 1
+    }
+    stds
+}
+
+// n=6 상수 공명 비율
+// 각 컬럼 평균이 [n6, tau6, sigma6, phi6, sopfr6] 중 하나와 8% 이내인 비율
+pure fn target_resonance(means, d: int) -> float {
+    let targets = [n6, tau6, sigma6, phi6, sopfr6]
+    let mut hits = 0
+    let mut j = 0
+    while j < means.len() {
+        let m = means[j]
+        let mut matched = false
+        for t in targets {
+            if t > 0.000000000001 {
+                if abs_f(m - t) / t < 0.08 { matched = true }
+            }
+        }
+        if matched { hits = hits + 1 }
+        j = j + 1
+    }
+    to_float(hits) / to_float(si_max_f(to_float(d), 1.0))
+}
+
+// 차원 n=6 공명 (d가 6에 가까울수록 1)
+pure fn dim_n6_score(d: int) -> float {
+    si_max_f(1.0 - abs_f(to_float(d) - n6) / n6 * 2.0, 0.0)
+}
+
+// 단조 변화율 (각 컬럼에서 양의 차분 비율 편향 합산)
+pure fn monotone_score(data, n: int, d: int) -> float {
+    let mut s = 0.0
+    let mut j = 0
+    while j < d {
+        let mut pos = 0
+        let mut total = 0
+        let mut i = 1
+        while i < n {
+            let diff = data[i * d + j] - data[(i - 1) * d + j]
+            if diff > 0.0 { pos = pos + 1 }
+            total = total + 1
+            i = i + 1
+        }
+        let ratio = to_float(pos) / to_float(si_max_f(to_float(total), 1.0))
+        s = s + abs_f(ratio - 0.5) * 2.0
+        j = j + 1
+    }
+    if d > 0 { s / to_float(d) } else { 0.0 }
+}
+
+// 신호 강도 비율 (mean / (mean + std))
+pure fn signal_ratio_score(means, stds, d: int) -> float {
+    let mut mean_val = 0.0
+    let mut mean_std = 0.0
+    let mut j = 0
+    while j < means.len() {
+        mean_val = mean_val + abs_f(means[j])
+        mean_std = mean_std + stds[j]
+        j = j + 1
+    }
+    let df = to_float(si_max_f(to_float(d), 1.0))
+    mean_val = mean_val / df
+    mean_std = mean_std / df
+    si_clamp(mean_val / (mean_val + mean_std + 0.000000000001), 0.0, 1.0)
+}
+
+// n=6 공명 (7% 임계)
+pure fn n6_resonance_score(means, d: int) -> float {
+    let targets = [n6, tau6, sigma6, phi6, sopfr6]
+    let mut hits = 0
+    let mut j = 0
+    while j < means.len() {
+        let m = means[j]
+        let mut matched = false
+        for t in targets {
+            if t > 0.000000000001 {
+                if abs_f(m - t) / t < 0.07 { matched = true }
+            }
+        }
+        if matched { hits = hits + 1 }
+        j = j + 1
+    }
+    to_float(hits) / to_float(si_max_f(to_float(d), 1.0))
+}
+
+// ─── (1) fourier_analysis ───
+// 주파수 n=6 공명 — harmonics=n=6, 기본 주파수=1/n=6
+
+fn scan_fourier_analysis(data, n: int, d: int) -> LensResult {
+    let mut r = empty_result()
+    if n < 6 { return r }
+    if d == 0 { return r }
+
+    let means = col_means(data, n, d)
+    let stds  = col_stds(data, n, d, means)
+
+    let target_score  = target_resonance(means, d)
+    let sig_ratio     = signal_ratio_score(means, stds, d)
+    let mono          = monotone_score(data, n, d)
+    let n6_dim        = dim_n6_score(d)
+    let n6_res        = n6_resonance_score(means, d)
+
+    let fourier_score = target_score * 0.25
+                      + sig_ratio    * 0.25
+                      + mono         * 0.15
+                      + n6_dim       * 0.20
+                      + n6_res       * 0.15
+
+    r = result_add(r, "target_score",  [target_score])
+    r = result_add(r, "signal_ratio",  [sig_ratio])
+    r = result_add(r, "monotone",      [mono])
+    r = result_add(r, "n6_dim",        [n6_dim])
+    r = result_add(r, "n6_resonance",  [n6_res])
+    r = result_add(r, "fourier_score", [fourier_score])
+    r
+}
+
+// ─── (2) wavelet_transform ───
+// 다중 해상도 n=6 — 레벨=n=6, Daubechies 탭=tau*phi=8, 스케일=phi^n=64
+
+fn scan_wavelet_transform(data, n: int, d: int) -> LensResult {
+    let mut r = empty_result()
+    if n < 6 { return r }
+    if d == 0 { return r }
+
+    let means = col_means(data, n, d)
+    let stds  = col_stds(data, n, d, means)
+
+    let target_score   = target_resonance(means, d)
+    let sig_ratio      = signal_ratio_score(means, stds, d)
+    let mono           = monotone_score(data, n, d)
+    let n6_dim         = dim_n6_score(d)
+    let n6_res         = n6_resonance_score(means, d)
+
+    // 추가: 다중 해상도 에너지 비율 (연속 차분 평균)
+    let mut energy_ratio = 0.0
+    let mut j = 0
+    while j < d {
+        let mut detail_energy = 0.0
+        let mut approx_energy = 0.0
+        let mut i = 0
+        while i < n - 1 {
+            let detail = data[(i + 1) * d + j] - data[i * d + j]
+            let approx = (data[(i + 1) * d + j] + data[i * d + j]) / 2.0
+            detail_energy = detail_energy + detail * detail
+            approx_energy = approx_energy + approx * approx
+            i = i + 1
+        }
+        let total = detail_energy + approx_energy + 0.000000000001
+        energy_ratio = energy_ratio + detail_energy / total
+        j = j + 1
+    }
+    energy_ratio = if d > 0 { energy_ratio / to_float(d) } else { 0.0 }
+
+    let wavelet_score = target_score  * 0.20
+                      + sig_ratio     * 0.20
+                      + mono          * 0.15
+                      + n6_dim        * 0.20
+                      + n6_res        * 0.15
+                      + energy_ratio  * 0.10
+
+    r = result_add(r, "target_score",    [target_score])
+    r = result_add(r, "signal_ratio",    [sig_ratio])
+    r = result_add(r, "monotone",        [mono])
+    r = result_add(r, "n6_dim",          [n6_dim])
+    r = result_add(r, "n6_resonance",    [n6_res])
+    r = result_add(r, "energy_ratio",    [energy_ratio])
+    r = result_add(r, "wavelet_score",   [wavelet_score])
+    r
+}
+
+// ─── (3) signal_reconstruction ───
+// Compressed sensing — sparsity=n=6, measurement=sigma*tau=48, RIP delta=1/n=6
+
+fn scan_signal_reconstruction(data, n: int, d: int) -> LensResult {
+    let mut r = empty_result()
+    if n < 6 { return r }
+    if d == 0 { return r }
+
+    let means = col_means(data, n, d)
+    let stds  = col_stds(data, n, d, means)
+
+    let target_score = target_resonance(means, d)
+    let sig_ratio    = signal_ratio_score(means, stds, d)
+    let mono         = monotone_score(data, n, d)
+    let n6_dim       = dim_n6_score(d)
+    let n6_res       = n6_resonance_score(means, d)
+
+    // 희소성 추정: 평균 대비 0에 가까운 값의 비율 (sparsity proxy)
+    let mut sparsity = 0.0
+    let mut j = 0
+    while j < d {
+        let m = means[j]
+        let std_j = stds[j]
+        let threshold = std_j * 0.1 + 0.000000000001
+        let mut near_zero = 0
+        let mut i = 0
+        while i < n {
+            if abs_f(data[i * d + j] - m) < threshold { near_zero = near_zero + 1 }
+            i = i + 1
+        }
+        sparsity = sparsity + to_float(near_zero) / to_float(n)
+        j = j + 1
+    }
+    sparsity = if d > 0 { sparsity / to_float(d) } else { 0.0 }
+
+    // n=6 sparsity 공명: 희소성이 1/n=6 에 가까울수록 높은 점수
+    let sparsity_n6 = si_max_f(1.0 - abs_f(sparsity - 1.0 / n6) * n6, 0.0)
+
+    let recon_score = target_score   * 0.20
+                    + sig_ratio      * 0.20
+                    + mono           * 0.15
+                    + n6_dim         * 0.15
+                    + n6_res         * 0.15
+                    + sparsity_n6    * 0.15
+
+    r = result_add(r, "target_score",  [target_score])
+    r = result_add(r, "signal_ratio",  [sig_ratio])
+    r = result_add(r, "monotone",      [mono])
+    r = result_add(r, "n6_dim",        [n6_dim])
+    r = result_add(r, "n6_resonance",  [n6_res])
+    r = result_add(r, "sparsity",      [sparsity])
+    r = result_add(r, "sparsity_n6",   [sparsity_n6])
+    r = result_add(r, "recon_score",   [recon_score])
+    r
+}
+
+// ─── (4) information_bottleneck ───
+// IB beta=n=6, 클러스터=n=6, MI 보존 vs 압축 균형
+// 참고: SharedData.mi_matrix 없으므로 MI는 엔트로피 기반으로 근사
+
+fn scan_information_bottleneck(data, n: int, d: int) -> LensResult {
+    let mut r = empty_result()
+    if n < 6 { return r }
+    if d < 2 { return r }
+
+    let means = col_means(data, n, d)
+
+    // 1. 평균 MI 근사: 각 컬럼의 엔트로피를 MI 프록시로 사용
+    let mut avg_mi = 0.0
+    let mut j = 0
+    while j < d {
+        let mut col = []
+        let mut i = 0
+        while i < n {
+            col = col + [data[i * d + j]]
+            i = i + 1
+        }
+        let ent = shannon_entropy_si(col)
+        avg_mi = avg_mi + ent
+        j = j + 1
+    }
+    avg_mi = avg_mi / to_float(d)
+
+    // 2. 압축률 추정 (분산 기반)
+    let mut total_var = 0.0
+    let mut k = 0
+    while k < d {
+        let m = means[k]
+        let mut v = 0.0
+        let mut i = 0
+        while i < n {
+            let diff = data[i * d + k] - m
+            v = v + diff * diff
+            i = i + 1
+        }
+        total_var = total_var + v / to_float(n)
+        k = k + 1
+    }
+    let compression = si_clamp(1.0 - total_var / (total_var + 1.0), 0.0, 1.0)
+
+    // 3. IB beta n=6 상수 공명
+    let beta_score = target_resonance(means, d)
+
+    // 4. 차원 공명
+    let n6_dim = dim_n6_score(d)
+
+    // 5. MI 보존 비율
+    let mi_preservation = si_clamp(avg_mi / (avg_mi + 1.0), 0.0, 1.0)
+
+    let ib_score = mi_preservation * 0.30
+                 + compression     * 0.20
+                 + beta_score      * 0.20
+                 + n6_dim          * 0.15
+                 + si_min_f(avg_mi, 1.0) * 0.15
+
+    r = result_add(r, "avg_mi",          [avg_mi])
+    r = result_add(r, "compression",     [compression])
+    r = result_add(r, "beta_score",      [beta_score])
+    r = result_add(r, "n6_dim",          [n6_dim])
+    r = result_add(r, "mi_preservation", [mi_preservation])
+    r = result_add(r, "ib_score",        [ib_score])
+    r
+}
+
+// shannon_entropy_si: 로컬 섀넌 엔트로피 (lenses_math의 shannon_entropy와 독립)
+pure fn shannon_entropy_si(col) -> float {
+    if col.len() < 2 { return 0.0 }
+    let sorted = list_sort(col)
+    let mut counts = []
+    let mut current = sorted[0]
+    let mut count = 1
+    let mut i = 1
+    while i < sorted.len() {
+        if abs_f(sorted[i] - current) < 0.01 {
+            count = count + 1
+        } else {
+            counts = counts + [count]
+            current = sorted[i]
+            count = 1
+        }
+        i = i + 1
+    }
+    counts = counts + [count]
+    let total = to_float(col.len())
+    let mut ent = 0.0
+    for c in counts {
+        let p = to_float(c) / total
+        if p > 0.0 { ent = ent - p * ln_f(p) }
+    }
+    ent
+}
+
+// ─── (5) dimensionality_bottleneck ───
+// latent 차원=n=6 병목 — 인코더 레이어=tau=4, 재구성 손실=1/n=6
+
+fn scan_dimensionality_bottleneck(data, n: int, d: int) -> LensResult {
+    let mut r = empty_result()
+    if n < 6 { return r }
+    if d == 0 { return r }
+
+    let means = col_means(data, n, d)
+    let stds  = col_stds(data, n, d, means)
+
+    let target_score  = target_resonance(means, d)
+    let sig_ratio     = signal_ratio_score(means, stds, d)
+    let mono          = monotone_score(data, n, d)
+    let n6_dim        = dim_n6_score(d)
+    let n6_res        = n6_resonance_score(means, d)
+
+    // 잠재 차원 압축 비율: 분산 상위 n=6 차원으로 설명되는 비율
+    // (d > 6 이면 상위 6 컬럼 분산 / 전체 분산)
+    let mut var_list = []
+    let mut j = 0
+    while j < d {
+        let m = means[j]
+        let mut v = 0.0
+        let mut i = 0
+        while i < n {
+            let diff = data[i * d + j] - m
+            v = v + diff * diff
+            i = i + 1
+        }
+        var_list = var_list + [v / to_float(n)]
+        j = j + 1
+    }
+    let total_var = list_sum_si(var_list)
+    let sorted_var = list_sort(var_list)
+    // 상위 n=6 개 (정렬 오름차순이므로 끝에서 6개)
+    let take = si_min_f(to_float(d), n6)
+    let take_int = to_int_si(take)
+    let mut top_var = 0.0
+    let mut k = 0
+    let start_k = sorted_var.len() - take_int
+    while k < take_int {
+        let idx = start_k + k
+        if idx >= 0 && idx < sorted_var.len() {
+            top_var = top_var + sorted_var[idx]
+        }
+        k = k + 1
+    }
+    let latent_coverage = if total_var > 0.000000000001 {
+        si_clamp(top_var / total_var, 0.0, 1.0)
+    } else { 1.0 }
+
+    let dim_bottle_score = target_score    * 0.20
+                         + sig_ratio       * 0.20
+                         + mono            * 0.15
+                         + n6_dim          * 0.20
+                         + n6_res          * 0.10
+                         + latent_coverage * 0.15
+
+    r = result_add(r, "target_score",      [target_score])
+    r = result_add(r, "signal_ratio",      [sig_ratio])
+    r = result_add(r, "monotone",          [mono])
+    r = result_add(r, "n6_dim",            [n6_dim])
+    r = result_add(r, "n6_resonance",      [n6_res])
+    r = result_add(r, "latent_coverage",   [latent_coverage])
+    r = result_add(r, "dim_bottle_score",  [dim_bottle_score])
+    r
+}
+
+pure fn list_sum_si(data) -> float {
+    let mut s = 0.0
+    for v in data { s = s + v }
+    s
+}
+
+pure fn to_int_si(x: float) -> int {
+    if x >= 0.0 { int(x) } else { 0 - int(0.0 - x) }
+}
+
+// ─── (6) renyi_entropy ───
+// alpha 차수별 Renyi 엔트로피: H_0=log(n=6), H_2=collision, H_inf=min-entropy
+// n=6 bins 히스토그램
+
+pure fn renyi_entropy_si(col, alpha: float) -> float {
+    if col.len() < 2 { return 0.0 }
+    let lo = list_min_si(col)
+    let hi = list_max_si(col)
+    let range = si_max_f(hi - lo, 0.000000000001)
+    let n_bins = to_int_si(n6)  // 6 bins
+    let scale = to_float(n_bins - 1) / range
+    let mut counts = [0, 0, 0, 0, 0, 0]  // 6 bins
+    for v in col {
+        let bin_f = (v - lo) * scale
+        let bin = to_int_si(si_clamp(bin_f, 0.0, to_float(n_bins - 1)))
+        if bin == 0 { counts[0] = counts[0] + 1 }
+        else if bin == 1 { counts[1] = counts[1] + 1 }
+        else if bin == 2 { counts[2] = counts[2] + 1 }
+        else if bin == 3 { counts[3] = counts[3] + 1 }
+        else if bin == 4 { counts[4] = counts[4] + 1 }
+        else { counts[5] = counts[5] + 1 }
+    }
+    let nf = to_float(col.len())
+    let mut probs = []
+    for c in counts { probs = probs + [to_float(c) / nf] }
+
+    if abs_f(alpha - 1.0) < 0.0000001 {
+        // Shannon 극한
+        let mut ent = 0.0
+        for p in probs {
+            if p > 0.000000000001 { ent = ent - p * ln_f(p) }
+        }
+        ent
+    } else {
+        let mut sum_pa = 0.0
+        for p in probs { sum_pa = sum_pa + pow_approx(p, alpha) }
+        if sum_pa < 0.000000000001 { 0.0 }
+        else { ln_f(sum_pa) / (1.0 - alpha) }
+    }
+}
+
+pure fn pow_approx(base: float, exp_val: float) -> float {
+    // p^alpha = exp(alpha * ln(p))
+    if base < 0.000000000001 { return 0.0 }
+    let log_base = ln_f(base)
+    let x = exp_val * log_base
+    // exp(x) Taylor (x in [-20, 20])
+    let cx = si_clamp(x, -20.0, 20.0)
+    let mut s = 1.0
+    let mut term = cx
+    s = s + term
+    term = term * cx / 2.0
+    s = s + term
+    term = term * cx / 3.0
+    s = s + term
+    term = term * cx / 4.0
+    s = s + term
+    term = term * cx / 5.0
+    s = s + term
+    term = term * cx / 6.0
+    s = s + term
+    if s < 0.0 { 0.0 } else { s }
+}
+
+pure fn list_min_si(data) -> float {
+    if data.len() == 0 { return 0.0 }
+    let mut m = data[0]
+    let mut i = 1
+    while i < data.len() {
+        if data[i] < m { m = data[i] }
+        i = i + 1
+    }
+    m
+}
+
+pure fn list_max_si(data) -> float {
+    if data.len() == 0 { return 0.0 }
+    let mut m = data[0]
+    let mut i = 1
+    while i < data.len() {
+        if data[i] > m { m = data[i] }
+        i = i + 1
+    }
+    m
+}
+
+fn scan_renyi_entropy(data, n: int, d: int) -> LensResult {
+    let mut r = empty_result()
+    if n < 6 { return r }
+    if d == 0 { return r }
+
+    let mut h0_sum  = 0.0  // Hartley (alpha=0)
+    let mut h2_sum  = 0.0  // Collision (alpha=phi6=2)
+    let mut hinf_sum = 0.0 // Min-entropy (alpha=100, 근사)
+    let mut j = 0
+    while j < d {
+        let mut col = []
+        let mut i = 0
+        while i < n {
+            col = col + [data[i * d + j]]
+            i = i + 1
+        }
+        h0_sum   = h0_sum   + renyi_entropy_si(col, 0.0)
+        h2_sum   = h2_sum   + renyi_entropy_si(col, phi6)
+        hinf_sum = hinf_sum + renyi_entropy_si(col, 100.0)
+        j = j + 1
+    }
+    let df = to_float(d)
+    let h0_mean   = h0_sum   / df
+    let h2_mean   = h2_sum   / df
+    let hinf_mean = hinf_sum / df
+
+    // H_0 = log(n=6) 공명 점수
+    let log_n6 = ln_f(n6)
+    let h0_n6_score = si_max_f(1.0 - abs_f(h0_mean - log_n6) / (log_n6 + 0.000000000001), 0.0)
+
+    let means = col_means(data, n, d)
+    let target_score = target_resonance(means, d)
+    let n6_dim       = dim_n6_score(d)
+
+    let renyi_score = h0_n6_score          * 0.30
+                    + si_min_f(h2_mean, 1.0) * 0.20
+                    + si_min_f(hinf_mean, 1.0) * 0.10
+                    + target_score           * 0.20
+                    + n6_dim                 * 0.20
+
+    r = result_add(r, "h0_mean",      [h0_mean])
+    r = result_add(r, "h2_mean",      [h2_mean])
+    r = result_add(r, "hinf_mean",    [hinf_mean])
+    r = result_add(r, "h0_n6_score",  [h0_n6_score])
+    r = result_add(r, "target_score", [target_score])
+    r = result_add(r, "n6_dim",       [n6_dim])
+    r = result_add(r, "renyi_score",  [renyi_score])
+    r
+}
+
+// ─── (7) time_series_decomp ───
+// 추세/계절/잔차 분해 — 계절성 주기=n=6, 분해 레이어=tau=4
+
+fn scan_time_series_decomp(data, n: int, d: int) -> LensResult {
+    let mut r = empty_result()
+    if n < 8 { return r }
+    if d == 0 { return r }
+
+    let means = col_means(data, n, d)
+
+    // 1. 추세 강도 (선형 회귀 R²)
+    let mut trend_strength = 0.0
+    let t_mean = (to_float(n) - 1.0) / 2.0
+    let mut j = 0
+    while j < d {
+        let m = means[j]
+        let mut cov_ty = 0.0
+        let mut var_t  = 0.0
+        let mut var_y  = 0.0
+        let mut i = 0
+        while i < n {
+            let dt = to_float(i) - t_mean
+            let dy = data[i * d + j] - m
+            cov_ty = cov_ty + dt * dy
+            var_t  = var_t  + dt * dt
+            var_y  = var_y  + dy * dy
+            i = i + 1
+        }
+        let r2 = if var_t > 0.000000000001 && var_y > 0.000000000001 {
+            let corr = cov_ty / (si_max_f(sqrt_f(var_t * var_y), 0.000000000001))
+            corr * corr
+        } else { 0.0 }
+        trend_strength = trend_strength + r2
+        j = j + 1
+    }
+    trend_strength = trend_strength / to_float(d)
+
+    // 2. 계절성 감지 (n=6 주기 자기상관)
+    let lag = si_max_f(to_float(n / 6), 1.0)
+    let lag_int = to_int_si(lag)
+    let mut seasonality = 0.0
+    let mut jj = 0
+    while jj < d {
+        let m = means[jj]
+        let mut cov = 0.0
+        let mut var = 0.0
+        let mut i = lag_int
+        while i < n {
+            cov = cov + (data[(i - lag_int) * d + jj] - m) * (data[i * d + jj] - m)
+            var = var + (data[i * d + jj] - m) * (data[i * d + jj] - m)
+            i = i + 1
+        }
+        seasonality = seasonality + if var > 0.000000000001 { abs_f(cov / var) } else { 0.0 }
+        jj = jj + 1
+    }
+    seasonality = seasonality / to_float(d)
+
+    // 3. 잔차 불규칙성 (std / (|mean| + 1))
+    let mut residual_entropy = 0.0
+    let mut jk = 0
+    while jk < d {
+        let m = means[jk]
+        let mut v = 0.0
+        let mut i = 0
+        while i < n {
+            let diff = data[i * d + jk] - m
+            v = v + diff * diff
+            i = i + 1
+        }
+        let std_j = sqrt_f(v / to_float(n))
+        residual_entropy = residual_entropy + std_j / (abs_f(m) + 1.0)
+        jk = jk + 1
+    }
+    residual_entropy = si_min_f(residual_entropy / to_float(d), 1.0)
+
+    // 4. tau=4 레이어 공명
+    let layer_score = target_resonance(means, d)
+
+    // 5. n=6 차원 공명
+    let n6_dim = dim_n6_score(d)
+
+    // 6. 전체 n=6 공명
+    let n6_res = n6_resonance_score(means, d)
+
+    let decomp_score = trend_strength             * 0.25
+                     + seasonality                * 0.25
+                     + (1.0 - residual_entropy)   * 0.15
+                     + layer_score                * 0.15
+                     + n6_dim                     * 0.10
+                     + n6_res                     * 0.10
+
+    r = result_add(r, "trend_strength",   [trend_strength])
+    r = result_add(r, "seasonality",      [seasonality])
+    r = result_add(r, "residual_entropy", [residual_entropy])
+    r = result_add(r, "layer_score",      [layer_score])
+    r = result_add(r, "n6_dim",           [n6_dim])
+    r = result_add(r, "n6_resonance",     [n6_res])
+    r = result_add(r, "decomp_score",     [decomp_score])
+    r
+}
+
+// ─── (8) kalman_filter ───
+// 상태 추정 — 상태 차원=n=6, 관측=tau=4, innovation gain=1/n=6
+
+fn scan_kalman_filter(data, n: int, d: int) -> LensResult {
+    let mut r = empty_result()
+    if n < 6 { return r }
+    if d == 0 { return r }
+
+    let means = col_means(data, n, d)
+    let stds  = col_stds(data, n, d, means)
+
+    let target_score = target_resonance(means, d)
+    let sig_ratio    = signal_ratio_score(means, stds, d)
+    let mono         = monotone_score(data, n, d)
+    let n6_dim       = dim_n6_score(d)
+    let n6_res       = n6_resonance_score(means, d)
+
+    // 칼만 이노베이션 근사: 예측 오차 = 현재값 - 이전값의 이동평균
+    let mut innovation_score = 0.0
+    let mut j = 0
+    while j < d {
+        let mut pred = data[j]  // 첫 번째 행을 초기 상태로
+        let mut innov_sum = 0.0
+        let mut i = 1
+        while i < n {
+            let measurement = data[i * d + j]
+            // 칼만 게인 = 1/n=6 (고정)
+            let gain = 1.0 / n6
+            let innov = measurement - pred
+            let new_state = pred + gain * innov
+            innov_sum = innov_sum + abs_f(innov)
+            pred = new_state
+            i = i + 1
+        }
+        let mean_innov = innov_sum / to_float(n - 1)
+        let std_j = stds[j]
+        // 이노베이션 정규화 점수: 이노베이션이 std 대비 작을수록 좋은 추정
+        let normalized = si_clamp(1.0 - mean_innov / (std_j + mean_innov + 0.000000000001), 0.0, 1.0)
+        innovation_score = innovation_score + normalized
+        j = j + 1
+    }
+    innovation_score = if d > 0 { innovation_score / to_float(d) } else { 0.0 }
+
+    let kalman_score = target_score      * 0.20
+                     + sig_ratio         * 0.20
+                     + mono              * 0.15
+                     + n6_dim            * 0.15
+                     + n6_res            * 0.15
+                     + innovation_score  * 0.15
+
+    r = result_add(r, "target_score",     [target_score])
+    r = result_add(r, "signal_ratio",     [sig_ratio])
+    r = result_add(r, "monotone",         [mono])
+    r = result_add(r, "n6_dim",           [n6_dim])
+    r = result_add(r, "n6_resonance",     [n6_res])
+    r = result_add(r, "innovation_score", [innovation_score])
+    r = result_add(r, "kalman_score",     [kalman_score])
+    r
+}

@@ -1,0 +1,614 @@
+// lenses_systems.hexa — 8 systems/dynamics lenses ported from Rust
+// 변환 원본: nexus/src/telescope/lenses/
+//  1. distributed_consensus  (distributed_consensus_lens.rs)
+//  2. reservoir_computing     (reservoir_computing_lens.rs)
+//  3. spiking_neural          (spiking_neural_lens.rs)
+//  4. plasticity_consolidation (plasticity_consolidation_lens.rs)
+//  5. attractor_basin         (attractor_basin_lens.rs)
+//  6. manifold_learning       (manifold_learning_lens.rs)
+//  7. persistence_homology    (persistence_homology_lens.rs)
+//  8. causal_discovery        (causal_discovery_lens.rs)
+//
+// 의존: telescope.hexa (LensResult, ScanEntry, result_add, empty_result,
+//                       abs_f, sqrt_f, ln_f, sanitize, list_mean,
+//                       list_variance, list_sort)
+
+// ─── 공유 상수 ───
+
+comptime const n6        = 6.0
+comptime const sigma6    = 12.0
+comptime const tau6      = 4.0
+comptime const phi6      = 2.0
+comptime const sopfr6    = 5.0
+
+// ─── 공유 헬퍼 ───
+
+pure fn sys_min_f(a: float, b: float) -> float { if a < b { a } else { b } }
+pure fn sys_max_f(a: float, b: float) -> float { if a > b { a } else { b } }
+pure fn sys_clamp(x: float, lo: float, hi: float) -> float {
+    sys_min_f(sys_max_f(x, lo), hi)
+}
+
+// 열 평균 벡터 계산: data는 n*d 플랫 리스트
+pure fn col_means(data, n: int, d: int) -> [] {
+    let mut means = []
+    let mut j = 0
+    while j < d {
+        let mut s = 0.0
+        let mut i = 0
+        while i < n {
+            s = s + data[i * d + j]
+            i = i + 1
+        }
+        means = means + [s / to_float(n)]
+        j = j + 1
+    }
+    means
+}
+
+// 열 표준편차 벡터 계산
+pure fn col_stds(data, n: int, d: int, means) -> [] {
+    let mut stds = []
+    let mut j = 0
+    while j < d {
+        let m = means[j]
+        let mut var = 0.0
+        let mut i = 0
+        while i < n {
+            let diff = data[i * d + j] - m
+            var = var + diff * diff
+            i = i + 1
+        }
+        stds = stds + [sqrt_f(var / to_float(n))]
+        j = j + 1
+    }
+    stds
+}
+
+// n=6 상수 세트 공명 비율 (허용 오차 tol)
+pure fn resonance_ratio(means, tol: float) -> float {
+    let targets = [n6, tau6, sigma6, phi6, sopfr6]
+    let mut hits = 0
+    for m in means {
+        let mut matched = false
+        for t in targets {
+            if t > 0.000000000001 {
+                let rel = abs_f(m - t) / t
+                if rel < tol { matched = true }
+            }
+        }
+        if matched { hits = hits + 1 }
+    }
+    to_float(hits) / sys_max_f(to_float(means.len()), 1.0)
+}
+
+// 신호 강도 (mean_abs / (mean_abs + mean_std))
+pure fn signal_ratio(means, stds) -> float {
+    let mut sum_std = 0.0
+    let mut sum_abs = 0.0
+    for s in stds  { sum_std = sum_std + s }
+    for m in means { sum_abs = sum_abs + abs_f(m) }
+    let d = to_float(means.len())
+    let mv = sum_abs / sys_max_f(d, 1.0)
+    let sv = sum_std / sys_max_f(d, 1.0)
+    sys_clamp(mv / (mv + sv + 0.000000000001), 0.0, 1.0)
+}
+
+// 단조성 (각 열의 부호 일관성)
+pure fn monotone_ratio(data, n: int, d: int) -> float {
+    let mut s = 0.0
+    let mut j = 0
+    while j < d {
+        let mut pos = 0
+        let mut total = 0
+        let mut i = 1
+        while i < n {
+            let diff = data[i * d + j] - data[(i - 1) * d + j]
+            if diff > 0.0 { pos = pos + 1 }
+            total = total + 1
+            i = i + 1
+        }
+        if total > 0 {
+            let ratio = to_float(pos) / to_float(total)
+            s = s + abs_f(ratio - 0.5) * 2.0
+        }
+        j = j + 1
+    }
+    s / sys_max_f(to_float(d), 1.0)
+}
+
+// 차원 n=6 공명
+pure fn dim_n6_score(d: int) -> float {
+    sys_max_f(1.0 - abs_f(to_float(d) - n6) / n6 * 2.0, 0.0)
+}
+
+// ─── (1) distributed_consensus ───
+// n=6 연결: fault tolerance=n/phi=3, 노드=n=6, Paxos round=phi=2
+
+fn scan_distributed_consensus(data) -> LensResult {
+    let mut r = empty_result()
+    let n = data.len()
+    if n < 6 { return r }
+    // 1차원 플랫으로 처리 (d=1)
+    let means = [list_mean(data)]
+    let std_val = sqrt_f(list_variance(data, means[0]))
+    let stds = [std_val]
+
+    let ts = resonance_ratio(means, 0.08)
+    let sr = signal_ratio(means, stds)
+
+    // 단조성: 직접 계산
+    let mut pos = 0
+    let mut total = 0
+    let mut i = 1
+    while i < n {
+        if data[i] - data[i - 1] > 0.0 { pos = pos + 1 }
+        total = total + 1
+        i = i + 1
+    }
+    let mono = if total > 0 { abs_f(to_float(pos) / to_float(total) - 0.5) * 2.0 } else { 0.0 }
+
+    let n6d   = dim_n6_score(1)
+    let n6res = resonance_ratio(means, 0.07)
+
+    let score = ts * 0.25 + sr * 0.25 + mono * 0.15 + n6d * 0.20 + n6res * 0.15
+    r = result_add(r, "target_score",            [ts])
+    r = result_add(r, "signal_ratio",            [sr])
+    r = result_add(r, "monotone",                [mono])
+    r = result_add(r, "n6_dim",                  [n6d])
+    r = result_add(r, "n6_resonance",            [n6res])
+    r = result_add(r, "dist_consensus_score",    [score])
+    r
+}
+
+// ─── (2) reservoir_computing ───
+// n=6 연결: 저수지 노드=n*sigma=72, spectral radius=1-1/n, echo=tau=4
+
+fn scan_reservoir_computing(data) -> LensResult {
+    let mut r = empty_result()
+    let n = data.len()
+    if n < 6 { return r }
+    let mean = list_mean(data)
+    let std_val = sqrt_f(list_variance(data, mean))
+    let means = [mean]
+    let stds  = [std_val]
+
+    let ts = resonance_ratio(means, 0.08)
+    let sr = signal_ratio(means, stds)
+
+    let mut pos = 0
+    let mut total = 0
+    let mut i = 1
+    while i < n {
+        if data[i] - data[i - 1] > 0.0 { pos = pos + 1 }
+        total = total + 1
+        i = i + 1
+    }
+    let mono = if total > 0 { abs_f(to_float(pos) / to_float(total) - 0.5) * 2.0 } else { 0.0 }
+
+    // 에코 상태: lag-tau6 자기상관
+    let lag = 4
+    let mut cov = 0.0
+    let mut var = 0.0
+    let mut k = 0
+    while k < n - lag {
+        let d0 = data[k] - mean
+        let d1 = data[k + lag] - mean
+        cov = cov + d0 * d1
+        var = var + d0 * d0
+        k = k + 1
+    }
+    let echo_corr = if var > 0.000000000001 { sys_clamp(abs_f(cov / var), 0.0, 1.0) } else { 0.0 }
+
+    let n6d   = dim_n6_score(1)
+    let n6res = resonance_ratio(means, 0.07)
+
+    let score = ts * 0.20 + sr * 0.20 + mono * 0.15 + echo_corr * 0.25 + n6d * 0.10 + n6res * 0.10
+    r = result_add(r, "target_score",       [ts])
+    r = result_add(r, "signal_ratio",       [sr])
+    r = result_add(r, "monotone",           [mono])
+    r = result_add(r, "echo_corr",          [echo_corr])
+    r = result_add(r, "n6_dim",             [n6d])
+    r = result_add(r, "n6_resonance",       [n6res])
+    r = result_add(r, "reservoir_score",    [score])
+    r
+}
+
+// ─── (3) spiking_neural ───
+// n=6 연결: 임계전위=n*PHI/sigma=1, 불응기=tau=4ms, 시냅스=sigma=12
+
+fn scan_spiking_neural(data) -> LensResult {
+    let mut r = empty_result()
+    let n = data.len()
+    if n < 6 { return r }
+    let mean = list_mean(data)
+    let std_val = sqrt_f(list_variance(data, mean))
+    let means = [mean]
+    let stds  = [std_val]
+
+    let ts = resonance_ratio(means, 0.08)
+    let sr = signal_ratio(means, stds)
+
+    // 스파이크 감지: 임계값 = mean + phi6*std
+    let threshold = mean + phi6 * std_val
+    let mut spike_count = 0
+    for v in data {
+        if v > threshold { spike_count = spike_count + 1 }
+    }
+    let spike_rate = to_float(spike_count) / to_float(n)
+
+    // 불응기 패턴: spike 후 연속 억제
+    let mut refrac_ok = 0
+    let mut refrac_total = 0
+    let mut i = 1
+    while i < n {
+        if data[i - 1] > threshold {
+            refrac_total = refrac_total + 1
+            if data[i] < mean { refrac_ok = refrac_ok + 1 }
+        }
+        i = i + 1
+    }
+    let refrac_score = if refrac_total > 0 { to_float(refrac_ok) / to_float(refrac_total) } else { 0.0 }
+
+    let n6d   = dim_n6_score(1)
+    let n6res = resonance_ratio(means, 0.07)
+
+    let score = ts * 0.20 + sr * 0.15 + spike_rate * 0.25 + refrac_score * 0.25 + n6d * 0.10 + n6res * 0.05
+    r = result_add(r, "target_score",   [ts])
+    r = result_add(r, "signal_ratio",   [sr])
+    r = result_add(r, "spike_rate",     [spike_rate])
+    r = result_add(r, "refrac_score",   [refrac_score])
+    r = result_add(r, "n6_dim",         [n6d])
+    r = result_add(r, "n6_resonance",   [n6res])
+    r = result_add(r, "snn_score",      [score])
+    r
+}
+
+// ─── (4) plasticity_consolidation ───
+// n=6 연결: 강화 단계=n=6, SWS=tau=4, NREM=phi=2, 재활성화=sigma=12
+
+fn scan_plasticity_consolidation(data) -> LensResult {
+    let mut r = empty_result()
+    let n = data.len()
+    if n < 6 { return r }
+    let mean = list_mean(data)
+    let std_val = sqrt_f(list_variance(data, mean))
+    let means = [mean]
+    let stds  = [std_val]
+
+    let ts = resonance_ratio(means, 0.08)
+    let sr = signal_ratio(means, stds)
+
+    // 강화 단계 감지: n=6 구간으로 분할해 단계 간 차이 계산
+    let seg = sys_max_f(to_float(n) / n6, 1.0)
+    let seg_i = to_int(seg)
+    let mut seg_means = []
+    let mut k = 0
+    while k < 6 {
+        let start = k * seg_i
+        let end_i = sys_min_f(to_float((k + 1) * seg_i), to_float(n))
+        let end_int = to_int(end_i)
+        let mut s = 0.0
+        let mut cnt = 0
+        let mut idx = start
+        while idx < end_int {
+            s = s + data[idx]
+            cnt = cnt + 1
+            idx = idx + 1
+        }
+        if cnt > 0 { seg_means = seg_means + [s / to_float(cnt)] }
+        k = k + 1
+    }
+
+    // 단계 간 강화 (증가 추세)
+    let mut strengthen_score = 0.0
+    if seg_means.len() > 1 {
+        let mut inc = 0
+        let mut m = 1
+        while m < seg_means.len() {
+            if seg_means[m] > seg_means[m - 1] { inc = inc + 1 }
+            m = m + 1
+        }
+        strengthen_score = to_float(inc) / to_float(seg_means.len() - 1)
+    }
+
+    // SWS 공명: tau6 주기 자기상관
+    let lag = 4
+    let mut cov = 0.0
+    let mut var = 0.0
+    let mut i = 0
+    while i < n - lag {
+        let d0 = data[i] - mean
+        let d1 = data[i + lag] - mean
+        cov = cov + d0 * d1
+        var = var + d0 * d0
+        i = i + 1
+    }
+    let sws_corr = if var > 0.000000000001 { sys_clamp(abs_f(cov / var), 0.0, 1.0) } else { 0.0 }
+
+    let n6d   = dim_n6_score(1)
+    let n6res = resonance_ratio(means, 0.07)
+
+    let score = ts * 0.20 + sr * 0.15 + strengthen_score * 0.30 + sws_corr * 0.20 + n6d * 0.10 + n6res * 0.05
+    r = result_add(r, "target_score",       [ts])
+    r = result_add(r, "signal_ratio",       [sr])
+    r = result_add(r, "strengthen_score",   [strengthen_score])
+    r = result_add(r, "sws_corr",           [sws_corr])
+    r = result_add(r, "n6_dim",             [n6d])
+    r = result_add(r, "n6_resonance",       [n6res])
+    r = result_add(r, "plasticity_score",   [score])
+    r
+}
+
+// ─── (5) attractor_basin ───
+// n=6 연결: Lorenz 날개=phi=2, 고정점=tau-1=3, 분지=n/phi=3,
+//           카오스→질서=n=6, 주기배가 반복=tau=4
+
+fn scan_attractor_basin(data) -> LensResult {
+    let mut r = empty_result()
+    let n = data.len()
+    if n < 8 { return r }
+    let mean = list_mean(data)
+    let std_val = sqrt_f(list_variance(data, mean))
+
+    // 1. 고정점 근방 체류 (|x - mean| < 0.5 * std)
+    let half_std = std_val * 0.5
+    let mut near_count = 0
+    for v in data {
+        if abs_f(v - mean) < half_std { near_count = near_count + 1 }
+    }
+    let fixed_point_score = to_float(near_count) / to_float(n)
+
+    // 2. 주기 배가 감지 (period 2, 4, 8)
+    let periods = [2, 4, 8]
+    let mut pd_total = 0.0
+    for period in periods {
+        if period >= n { continue }
+        let mut corr = 0.0
+        let mut cnt = 0
+        let mut t = period
+        while t < n {
+            corr = corr + (data[t] - mean) * (data[t - period] - mean)
+            cnt = cnt + 1
+            t = t + 1
+        }
+        let var_v = std_val * std_val
+        if var_v > 0.000000000001 && cnt > 0 {
+            let c = abs_f(corr / to_float(cnt) / var_v)
+            if c > 0.5 { pd_total = pd_total + c }
+        }
+    }
+    let period_doubling = sys_min_f(pd_total / (to_float(periods.len()) * 1.0), 1.0)
+
+    // 3. n=6 공명
+    let means = [mean]
+    let ts = resonance_ratio(means, 0.08)
+
+    // 4. 차원 공명
+    let n6d = dim_n6_score(1)
+
+    // 5. 이중 봉우리 (bimodality: above/below mean 균형)
+    let mut above = 0
+    let mut below = 0
+    for v in data {
+        if v > mean { above = above + 1 }
+        else if v < mean { below = below + 1 }
+    }
+    let bimodal = if above > below {
+        to_float(below) / sys_max_f(to_float(above), 1.0)
+    } else {
+        to_float(above) / sys_max_f(to_float(below), 1.0)
+    }
+
+    let score = fixed_point_score * 0.30 + period_doubling * 0.25 + bimodal * 0.15 + ts * 0.15 + n6d * 0.15
+    r = result_add(r, "fixed_point_score",  [fixed_point_score])
+    r = result_add(r, "period_doubling",    [period_doubling])
+    r = result_add(r, "bimodal",            [bimodal])
+    r = result_add(r, "target_score",       [ts])
+    r = result_add(r, "n6_dim",             [n6d])
+    r = result_add(r, "attractor_score",    [score])
+    r
+}
+
+// ─── (6) manifold_learning ───
+// n=6 연결: 내재 차원=n=6, 이웃 수=sigma/phi=6, geodesic반경=n=6, 극소 수=tau=4
+
+fn scan_manifold_learning(data) -> LensResult {
+    let mut r = empty_result()
+    let n = data.len()
+    if n < 6 { return r }
+    let mean = list_mean(data)
+
+    // 1. 내재 차원 추정 (correlation dimension 근사, 1D 버전)
+    let sorted = list_sort(data)
+    let q1 = sorted[sorted.len() / 4]
+    let q3 = sorted[sorted.len() * 3 / 4]
+
+    // 거리 쌍 개수 at eps_small vs eps_large
+    let eps_small = abs_f(q1 - mean)
+    let eps_large = abs_f(q3 - mean)
+    let mut c_small = 0
+    let mut c_large = 0
+    for v in data {
+        if abs_f(v - mean) < eps_small { c_small = c_small + 1 }
+        if abs_f(v - mean) < eps_large { c_large = c_large + 1 }
+    }
+    let intrinsic_dim = if eps_large > eps_small * 1.01 && c_large > c_small && c_small > 0 {
+        let ratio = to_float(c_large) / to_float(c_small)
+        let eps_ratio = eps_large / eps_small
+        if eps_ratio > 1.0 && ratio > 1.0 {
+            ln_f(ratio) / ln_f(eps_ratio)
+        } else { 1.0 }
+    } else { 1.0 }
+
+    let dim_n6_v = sys_max_f(1.0 - abs_f(intrinsic_dim - n6) / n6, 0.0)
+
+    // 2. 곡률 근사 (삼각 불등식 위반: 1D에서는 중간값 조건)
+    let mut violations = 0
+    let mut triangles = 0
+    let sample = if n < 16 { n } else { 16 }
+    let mut i = 0
+    while i < sample {
+        let mut j = i + 1
+        while j < sample {
+            let mut k = j + 1
+            while k < sample {
+                let dij = abs_f(data[i] - data[j])
+                let djk = abs_f(data[j] - data[k])
+                let dik = abs_f(data[i] - data[k])
+                if dik > dij + djk + 0.0000000001 { violations = violations + 1 }
+                triangles = triangles + 1
+                k = k + 1
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let curvature = if triangles > 0 { to_float(violations) / to_float(triangles) } else { 0.0 }
+
+    let means = [mean]
+    let ts = resonance_ratio(means, 0.08)
+    let n6d = dim_n6_score(1)
+
+    let score = dim_n6_v * 0.35 + (1.0 - curvature) * 0.25 + ts * 0.20 + n6d * 0.20
+    r = result_add(r, "intrinsic_dim",      [intrinsic_dim])
+    r = result_add(r, "dim_n6",             [dim_n6_v])
+    r = result_add(r, "curvature",          [curvature])
+    r = result_add(r, "target_score",       [ts])
+    r = result_add(r, "n6_dim",             [n6d])
+    r = result_add(r, "manifold_score",     [score])
+    r
+}
+
+// ─── (7) persistence_homology ───
+// n=6 연결: Betti수=n=6, persistence bar=sigma=12,
+//           death/birth=phi=2, filtration=tau=4, 연결성분=n=6
+
+fn scan_persistence_homology(data) -> LensResult {
+    let mut r = empty_result()
+    let n = data.len()
+    if n < 6 { return r }
+    let sorted = list_sort(data)
+    let mean = list_mean(data)
+
+    // Vietoris-Rips 근사: n=6 filtration 단계로 연결 성분 추정
+    let n_steps = 6
+    let mut betti0_steps = []
+    let mut step = 0
+    while step < n_steps {
+        // epsilon 임계값: 데이터 범위를 n_steps로 분할
+        let mn = sorted[0]
+        let mx = sorted[sorted.len() - 1]
+        let range = mx - mn
+        let eps = mn + range * to_float(step + 1) / to_float(n_steps + 1)
+
+        // 연결 성분 수 (Union-Find 근사: 정렬된 데이터에서 eps 내 이웃 합치기)
+        let mut components = n
+        let mut i = 1
+        while i < n {
+            if abs_f(sorted[i] - sorted[i - 1]) < eps {
+                components = components - 1
+            }
+            i = i + 1
+        }
+        let comp_clamped = if components < 1 { 1 } else { components }
+        betti0_steps = betti0_steps + [to_float(comp_clamped)]
+        step = step + 1
+    }
+
+    // n=6 Betti-0 공명
+    let mut b0_hits = 0
+    for b in betti0_steps {
+        if abs_f(b - n6) < 2.0 { b0_hits = b0_hits + 1 }
+    }
+    let betti0_n6 = to_float(b0_hits) / to_float(n_steps)
+
+    // 평균 성분 수 대비 n=6 공명
+    let mean_comp = list_mean(betti0_steps)
+    let bar_n6 = sys_max_f(1.0 - abs_f(mean_comp - n6) / n6, 0.0)
+
+    // death/birth 비율 phi=2 공명
+    let early = betti0_steps[0]
+    let late  = betti0_steps[betti0_steps.len() - 1]
+    let db_ratio = if late > 0.0000000001 { early / late } else { 1.0 }
+    let db_phi = sys_max_f(1.0 - abs_f(db_ratio - phi6) / phi6, 0.0)
+
+    let means = [mean]
+    let ts = resonance_ratio(means, 0.08)
+    let n6d = dim_n6_score(1)
+
+    let score = betti0_n6 * 0.30 + bar_n6 * 0.20 + db_phi * 0.20 + ts * 0.15 + n6d * 0.15
+    r = result_add(r, "betti0_n6",          [betti0_n6])
+    r = result_add(r, "bar_n6",             [bar_n6])
+    r = result_add(r, "death_birth_ratio",  [db_ratio])
+    r = result_add(r, "db_phi",             [db_phi])
+    r = result_add(r, "target_score",       [ts])
+    r = result_add(r, "n6_dim",             [n6d])
+    r = result_add(r, "ph_score",           [score])
+    r
+}
+
+// ─── (8) causal_discovery ───
+// n=6 연결: 최대 조건 집합=n=6, skeleton edge=sigma=12, v-구조=tau=4
+
+fn scan_causal_discovery(data) -> LensResult {
+    let mut r = empty_result()
+    let n = data.len()
+    if n < 6 { return r }
+    let mean = list_mean(data)
+    let std_val = sqrt_f(list_variance(data, mean))
+    let means = [mean]
+    let stds  = [std_val]
+
+    let ts = resonance_ratio(means, 0.08)
+    let sr = signal_ratio(means, stds)
+
+    // lag-1 자기상관 (PC 알고리즘 독립성 검정 근사)
+    let mut cov1 = 0.0
+    let mut var1 = 0.0
+    let mut i = 1
+    while i < n {
+        let d0 = data[i - 1] - mean
+        let d1 = data[i] - mean
+        cov1 = cov1 + d0 * d1
+        var1 = var1 + d0 * d0
+        i = i + 1
+    }
+    let lag1_corr = if var1 > 0.000000000001 { sys_clamp(abs_f(cov1 / var1), 0.0, 1.0) } else { 0.0 }
+
+    // v-구조 감지: 연속 3점에서 양쪽이 평균 아래이고 중간이 위인 패턴
+    let mut v_count = 0
+    let mut k = 1
+    while k < n - 1 {
+        if data[k - 1] < mean && data[k] > mean && data[k + 1] < mean { v_count = v_count + 1 }
+        k = k + 1
+    }
+    let v_ratio = to_float(v_count) / sys_max_f(to_float(n - 2), 1.0)
+    // v-구조 수 tau6=4 공명
+    let v_tau = sys_max_f(1.0 - abs_f(to_float(v_count) - tau6) / tau6, 0.0)
+
+    let mut pos = 0
+    let mut total = 0
+    let mut j = 1
+    while j < n {
+        if data[j] - data[j - 1] > 0.0 { pos = pos + 1 }
+        total = total + 1
+        j = j + 1
+    }
+    let mono = if total > 0 { abs_f(to_float(pos) / to_float(total) - 0.5) * 2.0 } else { 0.0 }
+
+    let n6d   = dim_n6_score(1)
+    let n6res = resonance_ratio(means, 0.07)
+
+    let score = ts * 0.20 + sr * 0.15 + lag1_corr * 0.20 + v_tau * 0.20 + mono * 0.10 + n6d * 0.10 + n6res * 0.05
+    r = result_add(r, "target_score",       [ts])
+    r = result_add(r, "signal_ratio",       [sr])
+    r = result_add(r, "lag1_corr",          [lag1_corr])
+    r = result_add(r, "v_ratio",            [v_ratio])
+    r = result_add(r, "v_tau",              [v_tau])
+    r = result_add(r, "monotone",           [mono])
+    r = result_add(r, "n6_dim",             [n6d])
+    r = result_add(r, "n6_resonance",       [n6res])
+    r = result_add(r, "causal_disc_score",  [score])
+    r
+}
