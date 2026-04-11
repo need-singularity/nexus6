@@ -1,9 +1,9 @@
 # calc/ — Calculator tools (Python)
 
-HEXA 우선: iter>10K | t>10s | combo>10^6 | MC>100K | brute/grid/large-N → mk2_hexa/native/
+HEXA 우선: iter>10K | t>10s | combo>10^6 | MC>100K | brute/grid/large-N → shared/blowup/ (R14)
 Python 한정: 단발 검증 | 오차표 | fetch/API | 시각화 | 프로토타입
 
-HEXA   mk2_hexa/native/  | nexus mk2 run <m>           | constants,pure_math,classify,grading,cycle
+HEXA   shared/blowup/    | hexa shared/blowup/core/blowup.hexa <d> | todo,blowup,core,modules,lens,ouroboros,seed
 Python calc/              | python3 calc/<n>.py [args] | <domain>_<purpose>.py, argparse, ASCII out
 
 verifiers:
