@@ -1,0 +1,457 @@
+// shared/blowup/modules/absorb.hexa — 미흡수 발견 자동 감지 + 흡수 엔진
+// 복원: 6ad4cab2 에서 mk2_hexa 전체 폐기 시 삭제됨 → 2026-04-12 복원
+// R28: atlas.n6 단일진실. JSON 발견 저장소 폐기 (discovery_log.jsonl 읽기전용).
+// Rust/Python 의존 0 — 순수 hexa 파일 I/O
+// CLI: hexa absorb.hexa [scan|auto|tick|status]
+//
+// airgenome 지식 통합:
+//   - AG5 stream filter: compact corollary byte 재인코딩 지원
+//   - AG6 Mac 차단: absorb는 원격에서만 실행 (Mac=오케스트레이션)
+//   - AG7 dispatch_state: best-fit 호스트 정보 참조
+//   - flock 경합 방지: 분할 발사 동시 absorb 안전
+
+let HOME = env("HOME")
+let NEXUS = HOME + "/Dev/nexus/shared"
+let LOG_PATH = NEXUS + "/discovery/discovery_log.jsonl"
+let ATLAS_PATH = NEXUS + "/n6/atlas.n6"
+let BUS_PATH = NEXUS + "/discovery/growth_bus.jsonl"
+let SCAN_TAIL = 200  // 최근 N건만 스캔
+
+// ─── n=6 상수 테이블 (EXACT 노드 엣지 연결용) ───
+comptime const N6_CONSTANTS = ["n", "sigma", "phi", "tau", "J2", "sopfr", "M3"]
+comptime const N6_VALUES    = ["6", "12", "2", "4", "24", "5", "7"]
+
+// ─── JSON 간이 파서 ───
+pure fn extract_field(line: string, field: string) -> string {
+    let needle = "\"" + field + "\":"
+    if !line.contains(needle) { return "" }
+    let after = line.split(needle)
+    if after.len() < 2 { return "" }
+    let rest = after[1].trim()
+    // "value" — quoted string
+    if rest.starts_with("\"") {
+        let parts = rest.split("\"")
+        if parts.len() >= 2 { return parts[1] }
+    }
+    // {object} — nested object
+    if rest.starts_with("{") {
+        // 간이: { ... } 까지
+        let mut depth = 0
+        let mut result = ""
+        let mut i = 0
+        while i < rest.len() {
+            let ch = rest[i]
+            if ch == "{" { depth = depth + 1 }
+            if ch == "}" { depth = depth - 1 }
+            result = result + ch
+            if depth == 0 { break }
+            i = i + 1
+        }
+        return result
+    }
+    // number/bool — take until , or } or whitespace
+    let mut result = ""
+    let mut i = 0
+    while i < rest.len() {
+        let ch = rest[i]
+        if ch == "," || ch == "}" || ch == " " || ch == "\n" { break }
+        result = result + ch
+        i = i + 1
+    }
+    result
+}
+
+pure fn extract_int(line: string, field: string) -> int {
+    let s = extract_field(line, field)
+    if s == "" { return 0 }
+    let mut num_str = ""
+    let mut i = 0
+    let mut cont = true
+    while i < s.len() && cont {
+        let ch = s[i]
+        if ch == "0" || ch == "1" || ch == "2" || ch == "3" || ch == "4" || ch == "5" || ch == "6" || ch == "7" || ch == "8" || ch == "9" {
+            num_str = num_str + ch
+        } else {
+            cont = false
+        }
+        i = i + 1
+    }
+    if num_str == "" { return 0 }
+    to_int(num_str)
+}
+
+// ─── n6_match (alien_index 판정용) ───
+pure fn abs_f(x: float) -> float {
+    if x < 0.0 { 0.0 - x } else { x }
+}
+
+fn n6_match_grade(value: float) -> string {
+    if abs_f(value - 6.0) < 0.0001 { return "EXACT" }
+    if abs_f(value - 2.0) < 0.0001 { return "EXACT" }
+    if abs_f(value - 4.0) < 0.0001 { return "EXACT" }
+    if abs_f(value - 12.0) < 0.0001 { return "EXACT" }
+    if abs_f(value - 5.0) < 0.0001 { return "EXACT" }
+    if abs_f(value - 7.0) < 0.0001 { return "EXACT" }
+    if abs_f(value - 24.0) < 0.0001 { return "EXACT" }
+    if abs_f(value - 144.0) < 0.0001 { return "EXACT" }
+    let mut rel = abs_f(value - 137.036) / 137.036
+    if rel < 0.01 { return "NEAR" }
+    rel = abs_f(value - 1836.15) / 1836.15
+    if rel < 0.01 { return "NEAR" }
+    rel = abs_f(value - 0.3153) / 0.3153
+    if rel < 0.05 { return "NEAR" }
+    rel = abs_f(value - 0.6847) / 0.6847
+    if rel < 0.01 { return "NEAR" }
+    ""
+}
+
+// ─── 타임스탬프 ───
+fn now_ts() -> string {
+    let raw = exec("date", ["+%Y-%m-%dT%H:%M:%S"])
+    raw.trim()
+}
+
+// ─── discovery_graph에서 기존 노드 ID 집합 로드 ───
+fn load_graph_node_ids() -> list {
+    let mut ids = []
+    if !file_exists(ATLAS_PATH) { return ids }
+    let content = read_file(ATLAS_PATH)
+    let lines = content.split("\n")
+    let mut i = 0
+    while i < lines.len() {
+        let line = lines[i].trim()
+        if line.contains("\"type\":\"node\"") || line.contains("\"type\": \"node\"") {
+            let id = extract_field(line, "id")
+            if id != "" {
+                ids = ids + [id]
+            }
+        }
+        i = i + 1
+    }
+    ids
+}
+
+// ─── discovery_log 최근 N건 읽기 (tail) ───
+fn load_recent_log(n: int) -> list {
+    let mut lines_out = []
+    if !file_exists(LOG_PATH) { return lines_out }
+    // exec tail for efficiency (1.39M lines — read_file 전체는 불가)
+    let raw = exec("tail", ["-n", to_string(n), LOG_PATH])
+    let lines = raw.split("\n")
+    let mut i = 0
+    while i < lines.len() {
+        let line = lines[i].trim()
+        if line != "" && line.starts_with("{") {
+            lines_out = lines_out + [line]
+        }
+        i = i + 1
+    }
+    lines_out
+}
+
+// ─── 미흡수 발견 탐지 (scan 모드) ───
+// discovery_log 항목 중 discovery_graph에 노드가 없는 것 = 미흡수
+fn scan_unabsorbed() -> list {
+    let graph_ids = load_graph_node_ids()
+    let recent = load_recent_log(SCAN_TAIL)
+
+    let mut unabsorbed = []
+    let mut ri = 0
+    while ri < recent.len() {
+        let line = recent[ri]
+        let constant = extract_field(line, "constant")
+        let source = extract_field(line, "source")
+
+        // discovery_graph의 노드 ID는 constant 값과 매칭
+        // blowup 소스는 이미 blowup Phase 6에서 그래프에 기록됨
+        // 비-blowup 소스 (hook, cross_project 등)가 미흡수 대상
+        let mut found = false
+        let mut gi = 0
+        while gi < graph_ids.len() {
+            if graph_ids[gi] == constant {
+                found = true
+                break
+            }
+            // 부분 매칭: 그래프 ID에 constant가 포함된 경우
+            if graph_ids[gi].contains(constant) && constant.len() > 2 {
+                found = true
+                break
+            }
+            gi = gi + 1
+        }
+
+        if !found && constant != "" {
+            unabsorbed = unabsorbed + [line]
+        }
+        ri = ri + 1
+    }
+    unabsorbed
+}
+
+// ─── n6 상수 이름으로 그래프 노드 ID 찾기 ───
+pure fn value_to_n6_node(value: string) -> string {
+    // 값이 n6 상수 값과 일치하면 해당 노드 ID 반환
+    let mut i = 0
+    while i < 7 {
+        if N6_VALUES[i] == value {
+            return "n6-" + N6_CONSTANTS[i]
+        }
+        i = i + 1
+    }
+    ""
+}
+
+// ─── 노드 ID 생성 (source + constant 기반) ───
+pure fn make_node_id(source: string, constant: string) -> string {
+    // 소스별 prefix
+    let prefix = if source.contains("hook") { "hook" }
+                 else if source.contains("cross") { "cross" }
+                 else if source.contains("manual") { "manual" }
+                 else if source.contains("TECS") { "tecs" }
+                 else if source.contains("agent") { "agent" }
+                 else { "ext" }
+    prefix + "-" + constant
+}
+
+// ─── 자동 흡수 실행 (auto 모드) ───
+fn absorb_auto() -> int {
+    let unabsorbed = scan_unabsorbed()
+    if unabsorbed.len() == 0 {
+        println("[absorb] 미흡수 발견 없음 — 그래프 동기화 완료")
+        return 0
+    }
+
+    let ts = now_ts()
+    let mut absorbed = 0
+    let mut graph_append = ""
+    let mut bus_append = ""
+
+    let mut ui = 0
+    while ui < unabsorbed.len() {
+        let line = unabsorbed[ui]
+        let constant = extract_field(line, "constant")
+        let value = extract_field(line, "value")
+        let grade = extract_field(line, "grade")
+        let source = extract_field(line, "source")
+        let d = extract_int(line, "d")
+
+        let node_id = make_node_id(source, constant)
+
+        // confidence: EXACT=1.0, NEAR=0.95, CLOSE=0.85, else=0.7
+        let confidence = if grade == "EXACT" { "1" }
+                         else if grade == "NEAR" { "0.95" }
+                         else if grade == "CLOSE" { "0.85" }
+                         else { "0.7" }
+
+        // 도메인 추정
+        let domain = if source.contains("hook") { "realtime" }
+                     else if source.contains("TECS") { "math" }
+                     else if source.contains("cross") { "cross-domain" }
+                     else { "external" }
+
+        // summary 구성
+        let summary = constant + " = " + value + " [" + grade + "] via " + source
+
+        // 노드 JSON
+        let node_json = "{\"type\":\"node\",\"id\":\"" + node_id + "\",\"node_type\":\"Discovery\",\"domain\":\"" + domain + "\",\"summary\":\"" + summary + "\",\"confidence\":" + confidence + ",\"absorbed_at\":\"" + ts + "\"}"
+        graph_append = graph_append + node_json + "\n"
+
+        // EXACT 등급이면 n6 상수 노드와 엣지 연결
+        if grade == "EXACT" {
+            let n6_node = value_to_n6_node(value)
+            if n6_node != "" {
+                let edge_json = "{\"type\":\"edge\",\"from\":\"" + n6_node + "\",\"to\":\"" + node_id + "\",\"edge_type\":\"Absorb\",\"strength\":" + confidence + ",\"bidirectional\":false}"
+                graph_append = graph_append + edge_json + "\n"
+            }
+        }
+
+        // growth_bus 이벤트
+        let bus_json = "{\"source\":\"absorb\",\"type\":\"absorption\",\"timestamp\":\"" + ts + "\",\"node_id\":\"" + node_id + "\",\"constant\":\"" + constant + "\",\"value\":\"" + value + "\",\"grade\":\"" + grade + "\",\"origin\":\"" + source + "\",\"d\":" + to_string(d) + "}"
+        bus_append = bus_append + bus_json + "\n"
+
+        absorbed = absorbed + 1
+        ui = ui + 1
+    }
+
+    // discovery_graph.json에 추가
+    if graph_append != "" {
+        append_file(ATLAS_PATH, graph_append)
+    }
+
+    // growth_bus.jsonl에 흡수 이벤트 기록
+    if bus_append != "" {
+        append_file(BUS_PATH, bus_append)
+    }
+
+    println("[absorb] " + to_string(absorbed) + "건 흡수 완료 → discovery_graph + growth_bus")
+    absorbed
+}
+
+// ─── status 모드 — rho + 흡수 통계 ───
+fn print_status() {
+    // discovery_log 전체 통계 (tail 기반 최근 1000건)
+    let recent_1k = load_recent_log(1000)
+    let mut total = recent_1k.len()
+    let mut d0 = 0
+    let mut d1 = 0
+    let mut d5 = 0
+    let mut exact_count = 0
+    let mut near_count = 0
+    let mut by_source_hook = 0
+    let mut by_source_blowup = 0
+    let mut by_source_other = 0
+
+    let mut i = 0
+    while i < total {
+        let line = recent_1k[i]
+        let d = extract_int(line, "d")
+        if d == 0 { d0 = d0 + 1 }
+        if d == 1 { d1 = d1 + 1 }
+        if d >= 5 { d5 = d5 + 1 }
+        let grade = extract_field(line, "grade")
+        if grade == "EXACT" { exact_count = exact_count + 1 }
+        if grade == "NEAR" { near_count = near_count + 1 }
+        let source = extract_field(line, "source")
+        if source.contains("hook") { by_source_hook = by_source_hook + 1 }
+        else if source.contains("blowup") { by_source_blowup = by_source_blowup + 1 }
+        else { by_source_other = by_source_other + 1 }
+        i = i + 1
+    }
+
+    let d_ge1 = total - d0
+    let rho = if total > 0 { to_float(d_ge1) / to_float(total) } else { 0.0 }
+
+    // 미흡수 수
+    let unabsorbed = scan_unabsorbed()
+
+    // 그래프 노드 수
+    let graph_ids = load_graph_node_ids()
+
+    // 전체 로그 라인 수 (wc -l)
+    let total_log_raw = exec("wc", ["-l", LOG_PATH])
+    let total_log_str = total_log_raw.trim().split(" ")[0]
+
+    println("=== mk2 absorb status (hexa-native) ===")
+    println("  log           : " + LOG_PATH)
+    println("  total (log)   : " + total_log_str)
+    println("  recent sample : " + to_string(total) + " (last 1000)")
+    println("  graph nodes   : " + to_string(graph_ids.len()))
+    println("  ── 등급 분포 (recent) ──")
+    println("  d=0           : " + to_string(d0))
+    println("  d=1           : " + to_string(d1))
+    println("  d>=5          : " + to_string(d5))
+    println("  EXACT         : " + to_string(exact_count))
+    println("  NEAR          : " + to_string(near_count))
+    println("  ── 소스 분포 (recent) ──")
+    println("  blowup        : " + to_string(by_source_blowup))
+    println("  hook          : " + to_string(by_source_hook))
+    println("  other         : " + to_string(by_source_other))
+    println("  ── 흡수 현황 ──")
+    println("  unabsorbed    : " + to_string(unabsorbed.len()) + " (last " + to_string(SCAN_TAIL) + ")")
+    println("  ── 돌파율 ──")
+    println("  rho           : " + to_string(rho))
+    println("  target        : 0.333333")
+    let delta = abs_f(rho - 0.333333)
+    println("  delta         : " + to_string(delta))
+    if delta < 0.01 {
+        println("  convergence   : YES")
+    } else {
+        println("  convergence   : NO (off by " + to_string(delta) + ")")
+    }
+}
+
+// ─── scan 모드 — 미흡수 목록 출력 ───
+fn print_scan() {
+    let unabsorbed = scan_unabsorbed()
+    println("=== mk2 absorb scan — 미흡수 발견 ===")
+    println("  scanned       : last " + to_string(SCAN_TAIL) + " entries")
+    println("  unabsorbed    : " + to_string(unabsorbed.len()))
+    println("")
+
+    if unabsorbed.len() == 0 {
+        println("  (모든 최근 발견이 그래프에 흡수됨)")
+        return
+    }
+
+    let mut i = 0
+    while i < unabsorbed.len() {
+        let line = unabsorbed[i]
+        let constant = extract_field(line, "constant")
+        let value = extract_field(line, "value")
+        let grade = extract_field(line, "grade")
+        let source = extract_field(line, "source")
+        let d = extract_int(line, "d")
+        println("  [" + to_string(i + 1) + "] " + constant + " = " + value + " (" + grade + ") src=" + source + " d=" + to_string(d))
+        i = i + 1
+    }
+}
+
+// ─── tick 모드 — scan+auto 통합 (JSON 출력) ───
+fn run_tick() {
+    let unabsorbed_before = scan_unabsorbed()
+    let count_before = unabsorbed_before.len()
+
+    let absorbed = if count_before > 0 { absorb_auto() } else { 0 }
+
+    let ts = now_ts()
+
+    // JSON 출력 (파이프라인 연동)
+    let json = "{\"mode\":\"tick\",\"timestamp\":\"" + ts + "\",\"scanned\":" + to_string(SCAN_TAIL) + ",\"unabsorbed_found\":" + to_string(count_before) + ",\"absorbed\":" + to_string(absorbed) + ",\"status\":\"ok\"}"
+    println(json)
+}
+
+// ─── distribution 모드 — 분포 파일 출력 (하위 호환) ───
+fn write_distribution() {
+    let recent_1k = load_recent_log(1000)
+    let mut total = recent_1k.len()
+    let mut d0 = 0
+    let mut d1 = 0
+    let mut d5 = 0
+
+    let mut i = 0
+    while i < total {
+        let line = recent_1k[i]
+        let d = extract_int(line, "d")
+        if d == 0 { d0 = d0 + 1 }
+        if d == 1 { d1 = d1 + 1 }
+        if d >= 5 { d5 = d5 + 1 }
+        i = i + 1
+    }
+
+    let d_ge1 = total - d0
+    let rho = if total > 0 { to_float(d_ge1) / to_float(total) } else { 0.0 }
+
+    let dist_content = "{\"total\":" + to_string(total) + ",\"d0\":" + to_string(d0) + ",\"d1\":" + to_string(d1) + ",\"d5\":" + to_string(d5) + ",\"rho\":" + to_string(rho) + "}"
+    write_file(BUS_PATH, dist_content)
+    println("written: " + BUS_PATH)
+}
+
+// ─── CLI ───
+// args() = [hexa_binary, script_path, user_arg, ...]
+let a = args()
+let mode = if a.len() >= 3 { a[2] } else { "status" }
+
+if mode == "scan" {
+    print_scan()
+} else if mode == "auto" {
+    absorb_auto()
+} else if mode == "tick" {
+    run_tick()
+} else if mode == "status" {
+    print_status()
+} else if mode == "distribution" {
+    write_distribution()
+} else if mode == "help" {
+    println("absorb.hexa — 미흡수 발견 자동 감지 + 흡수 엔진")
+    println("")
+    println("사용법:")
+    println("  hexa absorb.hexa scan          미흡수 발견 목록")
+    println("  hexa absorb.hexa auto          자동 흡수 실행")
+    println("  hexa absorb.hexa tick          scan+auto 통합 (JSON, 파이프라인용)")
+    println("  hexa absorb.hexa status        rho + 흡수 통계")
+    println("  hexa absorb.hexa distribution  분포 파일 출력")
+    println("  hexa absorb.hexa help          이 도움말")
+} else {
+    println("알 수 없는 명령: " + mode)
+    println("사용 가능: scan, auto, tick, status, distribution, help")
+}
