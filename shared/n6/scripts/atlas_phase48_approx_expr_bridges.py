@@ -71,17 +71,17 @@ PRIMARY_PRIORITY = ["n", "phi", "tau", "sigma", "sopfr", "j2", "J2",
 # Map an observed token → the canonical n6-* node id slug (Phase 46 ids
 # are all lowercase, so J2→j2, M3→m3).
 TOKEN_TO_CONST = {
-    "n": "n6-n",
-    "phi": "n6-phi",
-    "tau": "n6-tau",
-    "sigma": "n6-sigma",
-    "sopfr": "n6-sopfr",
-    "mu": "n6-mu",
-    "j2": "n6-j2",
-    "J2": "n6-j2",
-    "m3": "n6-m3",
-    "M3": "n6-m3",
-    "P2": "n6-P2",  # P2 has no Phase 46 pivot yet — kept for bookkeeping only
+    "n": "n",
+    "phi": "phi",
+    "tau": "tau",
+    "sigma": "sigma",
+    "sopfr": "sopfr",
+    "mu": "mu",
+    "j2": "J2",
+    "J2": "J2",
+    "m3": "M3",
+    "M3": "M3",
+    "P2": "n6-P2",  # P2 stays prefixed — no @P P2 text-form primitive yet
 }
 
 # Tokens that count as "canonical presence" for the row (P2/M3 flagged, s<num>
