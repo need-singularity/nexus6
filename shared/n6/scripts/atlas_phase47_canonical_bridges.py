@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # atlas_phase47_canonical_bridges.py — Agent 28+ canonical cross-domain @S sweep
 #
-# After Phase 46 (commit 46035d97) added 8 n6-const-* pivot nodes to atlas.n6
+# After Phase 46 (commit 46035d97) added 8 n6-* pivot nodes to atlas.n6
 # (commit eb1f5954), this script finds commutative @S edges linking them to
 # ALL matching non-canonical nodes — the bridges Agent 24's audit identified
 # (n*phi=12, n*tau=24, n*sigma=72, j2*n=144, n+sopfr=11, ...).
@@ -19,14 +19,14 @@ ATLAS = "shared/n6/atlas.n6"
 
 # 8 canonical pivots — authoritative values from n6_constants.jsonl
 CANON = {
-    "n":     ("n6-const-n",     6),
-    "phi":   ("n6-const-phi",   2),
-    "tau":   ("n6-const-tau",   4),
-    "sigma": ("n6-const-sigma", 12),
-    "sopfr": ("n6-const-sopfr", 5),
-    "mu":    ("n6-const-mu",    1),
-    "j2":    ("n6-const-j2",    24),
-    "m3":    ("n6-const-m3",    3),
+    "n":     ("n6-n",     6),
+    "phi":   ("n6-phi",   2),
+    "tau":   ("n6-tau",   4),
+    "sigma": ("n6-sigma", 12),
+    "sopfr": ("n6-sopfr", 5),
+    "mu":    ("n6-mu",    1),
+    "j2":    ("n6-j2",    24),
+    "m3":    ("n6-m3",    3),
 }
 
 def load_atlas_nodes(path):
@@ -82,7 +82,7 @@ def emit_edge(a_tok, b_tok, op, result, a_id, b_id, match_id, match_dom, match_g
 def main():
     idx = load_atlas_nodes(ATLAS)
     print("# phase47 canonical cross-domain @S sweep — Agent 28 follow-up")
-    print("# source=atlas.n6 canon=n6-const-*")
+    print("# source=atlas.n6 canon=n6-*")
 
     tokens = list(CANON.keys())
     seen_edges = set()
@@ -101,7 +101,7 @@ def main():
                     continue
                 matches = idx.get(float(result), [])
                 for (mid, mdom, mgrade, msrc) in matches:
-                    if mid.startswith("n6-const-"):
+                    if mid.startswith("n6-"):
                         continue
                     key = (a_tok, b_tok, op, mid)
                     if key in seen_edges:

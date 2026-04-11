@@ -14,7 +14,7 @@
 #
 # This script parses those lines (both `= value = expr` and `= value ≈ expr` forms),
 # evaluates the first canonical-bearing expression using a safe eval, and emits an
-# @S edge from `n6-const-<primary_token>` → node_id when the expression reproduces
+# @S edge from `n6-<primary_token>` → node_id when the expression reproduces
 # the declared value under at least one evaluation context.
 #
 # === AUTHORITY: two conflicting canonical contexts ========================
@@ -63,25 +63,25 @@ CTX_VERIFY = {
     "M3": 7, "m3": 7, "J2": 24, "j2": 24, "P2": 28, "mu": 1,
 }
 
-# Primary token selection priority — which n6-const-* becomes the edge source.
+# Primary token selection priority — which n6-* becomes the edge source.
 # `n` is the deepest pivot; fall back alphabetically otherwise.
 PRIMARY_PRIORITY = ["n", "phi", "tau", "sigma", "sopfr", "j2", "J2",
                     "m3", "M3", "mu", "P2"]
 
-# Map an observed token → the canonical n6-const-* node id slug (Phase 46 ids
+# Map an observed token → the canonical n6-* node id slug (Phase 46 ids
 # are all lowercase, so J2→j2, M3→m3).
 TOKEN_TO_CONST = {
-    "n": "n6-const-n",
-    "phi": "n6-const-phi",
-    "tau": "n6-const-tau",
-    "sigma": "n6-const-sigma",
-    "sopfr": "n6-const-sopfr",
-    "mu": "n6-const-mu",
-    "j2": "n6-const-j2",
-    "J2": "n6-const-j2",
-    "m3": "n6-const-m3",
-    "M3": "n6-const-m3",
-    "P2": "n6-const-P2",  # P2 has no Phase 46 pivot yet — kept for bookkeeping only
+    "n": "n6-n",
+    "phi": "n6-phi",
+    "tau": "n6-tau",
+    "sigma": "n6-sigma",
+    "sopfr": "n6-sopfr",
+    "mu": "n6-mu",
+    "j2": "n6-j2",
+    "J2": "n6-j2",
+    "m3": "n6-m3",
+    "M3": "n6-m3",
+    "P2": "n6-P2",  # P2 has no Phase 46 pivot yet — kept for bookkeeping only
 }
 
 # Tokens that count as "canonical presence" for the row (P2/M3 flagged, s<num>
@@ -158,7 +158,7 @@ def pick_primary_token(tokens):
     for tok in PRIMARY_PRIORITY:
         if tok in tokens:
             return tok
-    # Fall back: alphabetically first CANON token that mapped to a n6-const-*
+    # Fall back: alphabetically first CANON token that mapped to a n6-*
     canon_hits = sorted(t for t in tokens if t in CANON_TOKENS)
     return canon_hits[0] if canon_hits else None
 
@@ -233,9 +233,9 @@ def main():
         from_id = TOKEN_TO_CONST.get(primary)
         if not from_id:
             continue
-        # n6-const-P2 does not yet exist as a pivot node (Phase 46 emitted 8,
+        # n6-P2 does not yet exist as a pivot node (Phase 46 emitted 8,
         # not including P2). Skip P2-primary edges to avoid dangling references.
-        if from_id == "n6-const-P2":
+        if from_id == "n6-P2":
             # Re-pick the next-best canonical token if P2 was primary.
             alt = [t for t in PRIMARY_PRIORITY if t in tokens and t != "P2"]
             if not alt:
