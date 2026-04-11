@@ -17,16 +17,17 @@ from collections import defaultdict
 
 ATLAS = "shared/n6/atlas.n6"
 
-# 8 canonical pivots — authoritative values from n6_constants.jsonl
+# 8 canonical pivots — bare-name ids matching @P text-format primitives in atlas.n6
+# (J2/M3 capitalized to match @P J2 = jordan_totient(6,2) / @P M3 = mertens(6))
 CANON = {
-    "n":     ("n6-n",     6),
-    "phi":   ("n6-phi",   2),
-    "tau":   ("n6-tau",   4),
-    "sigma": ("n6-sigma", 12),
-    "sopfr": ("n6-sopfr", 5),
-    "mu":    ("n6-mu",    1),
-    "j2":    ("n6-j2",    24),
-    "m3":    ("n6-m3",    3),
+    "n":     ("n",     6),
+    "phi":   ("phi",   2),
+    "tau":   ("tau",   4),
+    "sigma": ("sigma", 12),
+    "sopfr": ("sopfr", 5),
+    "mu":    ("mu",    1),
+    "j2":    ("J2",    24),
+    "m3":    ("M3",    3),
 }
 
 def load_atlas_nodes(path):
