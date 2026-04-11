@@ -53,10 +53,12 @@ from collections import defaultdict
 ATLAS = "shared/n6/atlas.n6"
 EDGE_CAP = 500
 
-# Two canonical contexts (see header)
+# Single canonical context (post M3=7 unification, 2026-04-11):
+# n6_constants.jsonl + atlas.n6 @P primitives + verify_formulas.hexa now AGREE.
+# Both CTX_AGENT28 and CTX_VERIFY retained for backward compat (identical now).
 CTX_AGENT28 = {
     "n": 6, "phi": 2, "tau": 4, "sigma": 12, "sopfr": 5,
-    "mu": 1, "j2": 24, "J2": 24, "m3": 3, "M3": 3, "P2": 28,
+    "mu": 1, "j2": 24, "J2": 24, "m3": 7, "M3": 7, "P2": 28,
 }
 CTX_VERIFY = {
     "n": 6, "sigma": 12, "tau": 4, "phi": 2, "sopfr": 5,
@@ -186,7 +188,7 @@ def parse_atlas(path):
 def main():
     print("# phase48 approx-expression cross-domain @S sweep — Agent 32")
     print("# source=atlas.n6 tokens=n,phi,tau,sigma,sopfr,mu,j2,M3,P2")
-    print("# contexts=agent28(M3=3)|verify_formulas(M3=7)")
+    print("# contexts=unified (M3=7 from atlas @P authority, post 2026-04-11 fix)")
 
     per_token_counts = defaultdict(int)
     per_domain_counts = defaultdict(int)

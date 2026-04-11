@@ -75,9 +75,10 @@ DOMAIN = "n6-canonical"
 #   sopfr= sum_prime_factors(6)=5   (= 2+3)
 #   mu   = mobius(6)          = 1   (n6_constants.jsonl overrides -1)
 #   j2   = jordan_totient(6,2)= 24
-#   M3   = mertens(6)         = 3   (n6_constants.jsonl; atlas.n6
-#                                     DSL line @P M3 says 7 — conflict
-#                                     noted, n6_constants.jsonl wins)
+#   M3   = mertens(6)         = 7   (matches @P atlas authority +
+#                                     n_M3=42 / M3_div_phi=3.5 / M3_sq=49
+#                                     invariants. n6_constants.jsonl
+#                                     line was a typo, fixed 2026-04-11)
 #   n    = 6
 REQUESTED_TOKENS = ["n", "phi", "tau", "sigma", "sopfr", "mu", "j2", "m3"]
 
@@ -164,7 +165,10 @@ def main() -> int:
             skipped += 1
             continue
         value = constants[key]
-        node_id = f"n6-const-{tok}"
+        # Match @P text-format primitive convention: bare name with proper case.
+        # 'm3' / 'j2' lowercase tokens map to capital ids ('M3' / 'J2') used by
+        # the @P foundation lines and by post-2026-04-11 unified phase47/48.
+        node_id = "M3" if tok == "m3" else ("J2" if tok == "j2" else tok)
 
         if atlas_exists and atlas_has_node(ATLAS_PATH, node_id):
             print(

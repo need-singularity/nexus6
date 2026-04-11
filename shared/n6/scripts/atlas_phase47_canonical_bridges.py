@@ -18,7 +18,8 @@ from collections import defaultdict
 ATLAS = "shared/n6/atlas.n6"
 
 # 8 canonical pivots — bare-name ids matching @P text-format primitives in atlas.n6
-# (J2/M3 capitalized to match @P J2 = jordan_totient(6,2) / @P M3 = mertens(6))
+# (J2/M3 capitalized to match @P J2 = jordan_totient(6,2)=24 / @P M3 = mertens(6)=7)
+# M3 = 7 (from atlas authority, matches n_M3=42 / M3_div_phi=3.5 / M3_sq=49 invariants)
 CANON = {
     "n":     ("n",     6),
     "phi":   ("phi",   2),
@@ -27,7 +28,7 @@ CANON = {
     "sopfr": ("sopfr", 5),
     "mu":    ("mu",    1),
     "j2":    ("J2",    24),
-    "m3":    ("M3",    3),
+    "m3":    ("M3",    7),
 }
 
 def load_atlas_nodes(path):
