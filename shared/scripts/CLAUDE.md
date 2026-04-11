@@ -8,7 +8,10 @@ sync (R1 migrated .sh → .hexa):
 
 run: nexus_ensure_running.hexa
 
-bin/: 실행 심볼릭 링크 디렉토리
-  hexa: hexa 바이너리 resolver (R1 예외 — bootstrap bash, hexa 를 찾기 전에 실행)
+bin/: 실행 바이너리 디렉토리 (shared/bin → scripts/bin 심링크)
+  hexa  : hexa 바이너리 resolver (R1 예외 — bootstrap bash, hexa 를 찾기 전에 실행)
+  infra : 4호스트 자원 현황 CLI (R1 예외 — Python3 interpreter 사용, json-only output)
+          → SSOT: shared/infra_state.json, config: shared/config/infrastructure.json
+          → 사용법: infra | infra json | infra rec
 
 parent: ../CLAUDE.md → "scripts"
