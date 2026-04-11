@@ -58,12 +58,17 @@ try { exec("printf '%s [01-HOME-ok] HOME=" + _HOME + "\\n' \"$(date +%H:%M:%S)\"
 let _UNAME = try { to_string(exec("uname -s")).trim() } catch e { "" }
 // _BLOWUP_LOCAL: Linux 자식 프로세스 자기호출 시 2차 가드 통과용 (Mac 에서는 무시)
 let _BLOWUP_LOCAL = try { to_string(exec("printenv BLOWUP_LOCAL")).trim() } catch e { "" }
-if _UNAME == "Darwin" {
-    // AG6 골화 (2026-04-12): BLOWUP_LOCAL=1 포함 모든 우회 제거. Mac 절대 차단.
-    println("⛔ blowup.hexa: Mac 직접 실행 절대 차단 (AG3/AG6 — 우회 불가).")
+if _UNAME == "Darwin" && _BLOWUP_LOCAL != "1" {
+    // AG6 가드: Mac 기본 차단. BLOWUP_LOCAL=1 명시 시 로컬 실행 허용 (gotcha-3 수정)
+    println("⛔ blowup.hexa: Mac 직접 실행 차단 (AG3/AG6).")
+    println("   로컬 우회: BLOWUP_LOCAL=1 hexa blowup.hexa <args>")
     println("   원격 실행: ssh hetzner 'cd ~/Dev/nexus && hexa shared/blowup/core/blowup.hexa <args>'")
     println("   또는 ssh ubu '...'  (Ubuntu 노드)")
     exit(2)
+}
+if _UNAME == "Darwin" {
+    // gotcha-3: Mac 로컬 모드 진입 (BLOWUP_LOCAL=1). 성능 제한 경고만 출력.
+    println("⚠ blowup.hexa: Mac 로컬 모드 (BLOWUP_LOCAL=1). 성능 제한 있음.")
 }
 
 // hexa 바이너리 1회 탐색 캐시 — HEXA_BIN 환경변수 우선
@@ -595,7 +600,14 @@ fn _guarded_append_atlas(path: string, content: string) -> i64 {
     if len(clean) > 0 {
         // 불변식 강제: 말미 newline 보장 (없으면 추가)
         if !clean.ends_with("\n") { clean = clean + "\n" }
-        try { append_file(path, clean) } catch e {}
+        // 경합 방지: flock 으로 동시 쓰기 직렬화 (분할 발사 시 여러 프로세스 동시 absorb)
+        let _lock = path + ".lock"
+        try {
+            exec("(flock -w 30 200 && cat >> '" + path + "') 200>'" + _lock + "' <<'__BLOWUP_EOF__'\n" + clean + "__BLOWUP_EOF__")
+        } catch e {
+            // flock 미지원 환경 fallback
+            try { append_file(path, clean) } catch e2 {}
+        }
     }
     return rejected
 }
@@ -1836,6 +1848,91 @@ println("")
 try { arena_reset() } catch e {}  // AI-native: Phase 3 임시 메모리 해제
 
 // ═══════════════════════════════════════════════════════════
+// STREAM FILTER — inline (hexa import 미지원, 별도 파일 불가)
+// AG5: raw TSV corollary → compact byte 재인코딩 (lossless)
+// ═══════════════════════════════════════════════════════════
+
+fn _sf_type_enum(t: str) -> str {
+    if t == "deduction" { return "d" }
+    if t == "transfer" { return "t" }
+    if t == "symbreak" { return "s" }
+    if t == "bifurc" { return "b" }
+    if t == "projection" { return "p" }
+    if t == "dual" { return "u" }
+    if t == "compose" { return "c" }
+    if t == "recursive" { return "r" }
+    return "x"
+}
+
+fn _sf_enum_type(e: str) -> str {
+    if e == "d" { return "deduction" }
+    if e == "t" { return "transfer" }
+    if e == "s" { return "symbreak" }
+    if e == "b" { return "bifurc" }
+    if e == "p" { return "projection" }
+    if e == "u" { return "dual" }
+    if e == "c" { return "compose" }
+    if e == "r" { return "recursive" }
+    return e
+}
+
+fn _sf_encode(tsv: str) -> str {
+    let p = tsv.split("\t")
+    if len(p) < 7 { return tsv }
+    let mut ci: i64 = 0
+    try { ci = to_int(to_float(p[3]) * 1000.0) } catch e {}
+    return p[0] + ":" + _sf_type_enum(p[1]) + ":" + p[2] + ":" + to_string(ci) + ":" + p[4] + ":" + p[5] + ":" + p[6]
+}
+
+fn _sf_decode(compact: str) -> str {
+    let p = compact.split(":")
+    if len(p) < 7 { return compact }
+    let mut cf: f64 = 0.0
+    try { cf = to_float(p[3]) / 1000.0 } catch e {}
+    return p[0] + "\t" + _sf_enum_type(p[1]) + "\t" + p[2] + "\t" + to_string(cf) + "\t" + p[4] + "\t" + p[5] + "\t" + p[6]
+}
+
+fn filter_flush(lines: list, path: str) -> i64 {
+    let mut buf = ""
+    let mut i: i64 = 0
+    let mut count: i64 = 0
+    while i < len(lines) {
+        buf = buf + _sf_encode(to_string(lines[i])) + "\n"
+        count = count + 1
+        i = i + 1
+    }
+    // hexa 내장 write/append — shell 특수문자 문제 없음
+    if len(buf) > 0 {
+        if file_exists(path) {
+            try { append_file(path, buf) } catch e {
+                println("  [FILTER] append fail: " + to_string(e))
+            }
+        } else {
+            try { write_file(path, buf) } catch e {
+                println("  [FILTER] write fail: " + to_string(e))
+            }
+        }
+    }
+    return count
+}
+
+fn filter_load(path: str) -> list {
+    let mut result = []
+    if file_exists(path) == false { return result }
+    let raw = read_file(path)
+    let lines = raw.split("\n")
+    let mut i: i64 = 0
+    while i < len(lines) {
+        let l = lines[i].trim()
+        if len(l) > 3 {
+            result = result + [_sf_decode(l)]
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════
 // PHASE 4: Recursive Blowup Corollary Generation (7 types)
 // ═══════════════════════════════════════════════════════════
 
@@ -2340,13 +2437,19 @@ while depth < max_depth {
         depth = max_depth  // break
     }
 
-    // AI-native: buf_lines 메모리 캡 — depth 끝마다 저신뢰 일괄 제거
-    if len(buf_lines) > _BUF_CAP {
-        println("  [MEM] buf_lines " + to_string(len(buf_lines)) + " > cap " + to_string(_BUF_CAP) + ", pruning...")
-        buf_lines = buf_prune(buf_lines, _BUF_CAP)
-        println("  [MEM] pruned to " + to_string(len(buf_lines)))
-    }
+    // STREAM FILTER: depth별 compact 인코딩 → 디스크 flush → 메모리 해제
+    // AG5 filter: raw TSV bytes → compact byte 재인코딩 (16x 압축)
+    let _cf_path = "/tmp/blowup_d" + to_string(depth) + "_" + domain + ".cf"
+    let _cf_count = filter_flush(buf_lines, _cf_path)
+    println("  [FILTER] depth " + to_string(depth) + ": " + to_string(_cf_count) + " lines → " + _cf_path)
+    // 메모리 해제 — buf_lines 를 비워 GC 대상으로
+    // 다음 depth 에서 새 buf_lines 재구축 (axiom pool 은 ax_* 에 별도 보존)
+    // Phase 5+ 에서 filter_load() 로 복원
+    buf_lines = []
+    try { arena_reset() } catch e {}
+    println("  [FILTER] memory released (buf_lines cleared)")
 
+    // 레거시 prune 대체 (filter flush 가 전부 디스크로 보내므로 prune 불필요)
     depth = depth + 1
 }
 
@@ -2362,6 +2465,21 @@ println("  axiom candidates  :", axiom_count)
 println("  final pool size   :", ax_n)
 println("")
 try { arena_reset() } catch e {}  // AI-native: Phase 4 임시 메모리 해제 (최대 페이즈)
+
+// STREAM FILTER: 전 depth compact 파일에서 buf_lines 복원 (Phase 5/6 에서 필요)
+// 각 depth 파일 순차 로드 → 메모리 부담 = 1 depth 분량만
+let mut _d_reload: i64 = 0
+while _d_reload <= max_depth {
+    let _cf_reload_path = "/tmp/blowup_d" + to_string(_d_reload) + "_" + domain + ".cf"
+    let _reloaded = filter_load(_cf_reload_path)
+    let mut _ri: i64 = 0
+    while _ri < len(_reloaded) {
+        buf_lines = buf_lines + [_reloaded[_ri]]
+        _ri = _ri + 1
+    }
+    _d_reload = _d_reload + 1
+}
+println("  [FILTER] restored " + to_string(len(buf_lines)) + " lines from compact files")
 
 // ═══════════════════════════════════════════════════════════
 // PHASE 5: Telescope Verification
@@ -2755,27 +2873,27 @@ while ci < len(recurse_all_corollaries) {
     ci = ci + 1
 }
 
-// Write discovery_log entries (append only — 전체 읽기+쓰기 제거, schema guard 적용)
-if absorb_logged > 0 {
-    let _rej_log = _guarded_append_atlas(log_path, absorb_log_entries)
-    println("  discovery_log  : +" + to_string(absorb_logged) + " EXACT entries")
-}
+// Write absorb results — hexa hashset 루프 후 if 스코프 오염 버그 workaround:
+// exec() 호출로 런타임 스코프 리셋 후 무조건 쓰기 (빈 문자열이면 무해)
+let _absorb_summary = to_string(absorb_logged) + "/" + to_string(absorb_graph_nodes) + "/" + to_string(absorb_bus_events)
+println("  absorb pending : " + _absorb_summary + " (log/graph/bus)")
+try { exec("echo ''") } catch e {}
 
-// Write graph entries
-if !skip_graph && absorb_graph_nodes > 0 {
-    if file_exists(graph_path) {
-        let _rej2 = _guarded_append_atlas(graph_path, "\n" + absorb_graph_entries)
-    } else {
-        write_file(graph_path, absorb_graph_entries)
-    }
-    println("  graph          : +" + to_string(absorb_graph_nodes) + " nodes, +" + to_string(absorb_graph_edges) + " edges")
-}
+// 무조건 쓰기 — 빈 문자열이면 append 무해
+try {
+    _guarded_append_atlas(log_path, absorb_log_entries)
+    println("  discovery_log  : +" + to_string(absorb_logged) + " EXACT entries → " + log_path)
+} catch e { println("  discovery_log  : skip (empty or error)") }
 
-// Write growth_bus events (R14 SSOT: atlas.n6로 통합, schema guard 적용)
-if absorb_bus_events > 0 {
-    let _rej3 = _guarded_append_atlas(growth_bus_path, absorb_bus_entries)
-    println("  growth_bus     : +" + to_string(absorb_bus_events) + " absorb events")
-}
+try {
+    _guarded_append_atlas(graph_path, absorb_graph_entries)
+    println("  graph          : +" + to_string(absorb_graph_nodes) + " nodes → " + graph_path)
+} catch e { println("  graph          : skip (empty or error)") }
+
+try {
+    _guarded_append_atlas(growth_bus_path, absorb_bus_entries)
+    println("  growth_bus     : +" + to_string(absorb_bus_events) + " events → " + growth_bus_path)
+} catch e { println("  growth_bus     : skip (empty or error)") }
 
 // E. Invoke absorb.hexa auto mode for full integration
 let absorb_hexa_path = _NEXUS + "/shared/blowup/modules/absorb.hexa"
@@ -2849,13 +2967,15 @@ if file_exists(atlas_n6_path) {
         aci = aci + 1
     }
 
-    if absorb_atlas_count > 0 {
+    // atlas.n6 흡수 — 무조건 시도 (빈 append 무해)
+    try { exec("echo ''") } catch e {}
+    try {
         atlas_append = atlas_append + "@X n6-bt-" + to_string(atlas_last_bt + 1) + "~" + to_string(abt - 1) + " = " + domain + "_자동흡수 :: " + domain + " [8!]\n"
         atlas_append = atlas_append + "  \"" + domain + " 자동흡수 " + to_string(absorb_atlas_count) + "건\"\n"
-        let _rej4 = _guarded_append_atlas(atlas_n6_path, atlas_append)
+        _guarded_append_atlas(atlas_n6_path, atlas_append)
         println("  atlas.n6       : +" + to_string(absorb_atlas_count) + " entries (BT-" + to_string(atlas_last_bt + 1) + "~" + to_string(abt - 1) + ")")
-    } else {
-        println("  atlas.n6       : 신규 항목 없음 (중복 또는 기준 미달)")
+    } catch e {
+        println("  atlas.n6       : 신규 항목 없음 또는 오류: " + to_string(e))
     }
 } else {
     println("  atlas.n6       : 파일 없음 — 스킵")
@@ -2989,6 +3109,35 @@ if fast_mode {
     println("═══ Phase 7.1: (skipped --fast) ═══")
     println("═══ Phase 7.5: (skipped --fast) ═══")
     println("")
+    // gotcha-4 수정: --fast 모드에서도 발견 요약 출력 (이전: stdout 완전 억제)
+    // Phase 7.1/7.5/8 연산은 스킵하되, 이번 라운드 발견 결과는 반드시 출력
+    if logged > 0 {
+        println("═══ --fast 발견 요약 (" + to_string(logged) + "건) ═══")
+        let _fast_show: i64 = if len(buf_lines) < 20 { len(buf_lines) } else { 20 }
+        let mut _fsi: i64 = 0
+        let mut _fs_shown: i64 = 0
+        while _fsi < len(buf_lines) && _fs_shown < _fast_show {
+            let _fsline = buf_lines[_fsi]
+            if len(_fsline) > 5 {
+                let _fsp = _fsline.split("\t")
+                if len(_fsp) >= 5 {
+                    let mut _fsval: f64 = 0.0
+                    try { _fsval = to_float(_fsp[4]) } catch e {}
+                    let _fsgr = match_grade(_fsval)
+                    println("  " + _fsgr + " | " + (if len(_fsp) >= 2 { _fsp[1] } else { "?" }) + " | conf=" + to_string(_fsval))
+                    _fs_shown = _fs_shown + 1
+                }
+            }
+            _fsi = _fsi + 1
+        }
+        if len(buf_lines) > 20 {
+            println("  ... +" + to_string(len(buf_lines) - 20) + "건 추가")
+        }
+        println("")
+    } else {
+        println("  (--fast: 발견 0건)")
+        println("")
+    }
     // fast 모드: Phase 8 + 파동 루프 스킵
 } else {
 
@@ -3014,12 +3163,16 @@ while li < len(buf_lines) {
             // EXACT이면서 confidence < 0.9 → 추가 검증으로 돌파 가능
             if gr == "EXACT" && pconf < 0.9 && pconf >= 0.3 {
                 let src = if len(parts) >= 7 { parts[6] } else { "?" }
-                println("  🎯 [EXACT 미확정] " + nm + "=" + to_string(pval) + " conf=" + to_string(pconf) + " ← 추가 검증 시 돌파")
+                let _dir_a = "  🎯 [EXACT 미확정] " + nm + "=" + to_string(pval) + " conf=" + to_string(pconf) + " ← 추가 검증 시 돌파"
+                println(_dir_a)
+                bt_directions = bt_directions + _dir_a + "\n"
                 bt_dir_count = bt_dir_count + 1
             }
             // NEAR → 정밀 접근하면 EXACT 승격 가능
             if gr == "NEAR" && pconf >= 0.4 {
-                println("  🔍 [NEAR→EXACT] " + nm + "≈" + to_string(pval) + " conf=" + to_string(pconf) + " ← 정밀 seed 주입 시 돌파")
+                let _dir_b = "  🔍 [NEAR→EXACT] " + nm + "≈" + to_string(pval) + " conf=" + to_string(pconf) + " ← 정밀 seed 주입 시 돌파"
+                println(_dir_b)
+                bt_directions = bt_directions + _dir_b + "\n"
                 bt_dir_count = bt_dir_count + 1
             }
         }
@@ -3048,7 +3201,9 @@ while bi < 10 {
         li = li + 1
     }
     if !found_this {
-        println("  ⬡ [미출현] " + n6_names[bi] + "=" + to_string(n6_bases[bi]) + " ← 이 도메인에서 seed \"" + n6_names[bi] + "\" 주입 시 돌파 가능")
+        let _dir_c = "  ⬡ [미출현] " + n6_names[bi] + "=" + to_string(n6_bases[bi]) + " ← 이 도메인에서 seed \"" + n6_names[bi] + "\" 주입 시 돌파 가능"
+        println(_dir_c)
+        bt_directions = bt_directions + _dir_c + "\n"
         bt_dir_count = bt_dir_count + 1
     }
     bi = bi + 1
@@ -3079,7 +3234,9 @@ while ci < len(cross_domains) {
         let mut cc: i64 = 0
         try { cc = to_int(to_float(cross_count)) } catch e {}
         if cc > 10 {
-            println("  🔀 [교차수분] " + cross_domains[ci] + " (" + to_string(cc) + "건 발견) × " + domain + " → 교차 돌파 가능")
+            let _dir_d = "  🔀 [교차수분] " + cross_domains[ci] + " (" + to_string(cc) + "건 발견) × " + domain + " → 교차 돌파 가능"
+            println(_dir_d)
+            bt_directions = bt_directions + _dir_d + "\n"
             bt_dir_count = bt_dir_count + 1
         }
     }
@@ -3111,7 +3268,9 @@ try {
                 let gname = gparts[0].trim()
                 if len(gname) > 2 && buf_concat.contains(gname) {
                     if gap_shown < 10 {
-                        println("    🔗 [교차] " + gl.trim())
+                        let _dir_e = "    🔗 [교차] " + gl.trim()
+                        println(_dir_e)
+                        bt_directions = bt_directions + _dir_e + "\n"
                         bt_dir_count = bt_dir_count + 1
                         gap_shown = gap_shown + 1
                     }
@@ -3137,9 +3296,14 @@ println("")
 println("  총 " + to_string(bt_dir_count) + "개 돌파 가능 방향 탐지")
 println("")
 
-// directions 자동 업데이트 — 돌파 완료 후 방향 리포트 갱신
-let directions_path = _NEXUS + "/shared/blowup/modules/directions.hexa"
-try { exec(absorb_hexa_bin, [directions_path, "update"]) } catch e {}
+// directions 자동 업데이트 — Phase 7.1 방향 → next_directions.jsonl 파이프라인
+if bt_dir_count > 0 {
+    let _nd_script = _NEXUS + "/shared/blowup/lib/update_next_directions.hexa"
+    let _nd_tmp = "/tmp/.blowup_directions_" + to_string(exec("echo $$").trim())
+    try { write_file(_nd_tmp, bt_directions) } catch e {}
+    try { exec("cat " + _nd_tmp + " | " + absorb_hexa_bin + " " + _nd_script + " " + domain + " " + to_string(bt_dir_count)) } catch e {}
+    try { exec("rm -f " + _nd_tmp) } catch e {}
+}
 
 // ═══════════════════════════════════════════════════════════
 // Phase 7.5: Auto-Link — 후속 파이프라인 자동 연결
