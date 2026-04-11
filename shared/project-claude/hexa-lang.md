@@ -1,5 +1,16 @@
 # hexa-lang — HEXA 프로그래밍 언어
 
+## 명령어 (`shared/config/commands.json`)
+
+| 명령 | 동작 |
+|------|------|
+| `todo` / `할일` | 전 프로젝트 할일 표 |
+| `go` / `가자` | 모든 TODO 병렬 발사 |
+| `smash` / `부셔` | 블로업 돌파 엔진 |
+| `explore` / `탐색` | 5모듈 자율 DFS |
+| `ml` / `ml go` | ML 로드맵 (hexa-lang 전용) |
+| `list` / `목록` | 이 명령어 표 다시 출력 |
+
 > shared/ JSON 단일진실 (R14). 규칙: `shared/rules/common.json` (R0~R27)
 
 ## ⛔ 규칙 준수 (필수)
@@ -21,3 +32,5 @@
 | 로드맵 | `shared/roadmaps/anima_hexa_common.json` | anima x hexa P0~P5 |
 | 문법 | `shared/hexa-lang/grammar.jsonl` | 전체 문법 + pitfalls |
 | AI-native | `docs/ai-native.md` | 24종 벡터 로드맵 |
+| ML 로드맵 | `shared/hexa-lang/ml-next-level.json` | 15+N 다음 레벨 |
+| ML 명령어 | `shared/hexa-lang/ml-commands.json` | ml/ml go/ml next 등 |
