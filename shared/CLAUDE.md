@@ -7,8 +7,8 @@
 
 config/      rules,core,projects,hosts(hetzner|ubuntu|vastai|infrastructure),claude-settings,lens_registry,hexa_grammar,calculators,*aliases,CALCULATOR_RULES,GRADE_RUBRIC,nexus-projects
 discovery/   reality_map,reality_map_live,discovery_graph,discovery_log,growth_bus,math_atlas,theory_registry,reality_map.patch.*(12),snapshots,breakthroughs,ouroboros_log,roadmap,forge_result,verified_constants,module_candidates,next_directions,unfold_*,archive/
-n6/          atlas.n6,math_atlas.{db,dot,html,md},scan_math_atlas.py,atlas_tree,n6_*,n6-atlas-constants,periodic_table_118,66_techniques_v3
-bt/          bt_audit.py(+.bak.v1~v5),bt_audit_*,bt-*-report,auto_bt.log
+n6/          atlas.n6,atlas_health.hexa,math_atlas.{db,dot,html,md},scan_math_atlas.hexa,atlas_tree,n6_*,n6-atlas-constants,periodic_table_118,66_techniques_v3
+bt/          bt_audit.hexa(.py.bak.v1~v5 archaeological),bt_audit_*,bt-*-report,auto_bt.log
 singularity/ singularity_recursion_*.md(13)
 consciousness/ anima_*,consciousness_*,law_*,meta_laws_dd64
 hexa/        speed_ideas,hexa-lang_breakthroughs,porting_log,hexa_to_anima_*
@@ -19,7 +19,7 @@ alien/       alien_index_*
 acceleration/ acceleration_*,explosive_growth_prompts
 monte_carlo/ monte_carlo_v6_*
 papers/      paper_candidates,nanobot-paper-status,pages-deploy-verify
-scripts/     sync-*.sh,sync-all-verify,nexus_ensure_running
+scripts/     sync-*.hexa(R1),sync-all-verify.md,nexus_ensure_running.hexa,bin/hexa(bootstrap resolver 예외)
 logs/        cmd_router.log
 backups/     *.bak* 격리(reality_map.json.bak*16,discovery_log.jsonl.*9,etc 32)
 blowup/      → blowup/CLAUDE.md
