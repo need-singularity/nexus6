@@ -1,0 +1,1098 @@
+// ═══════════════════════════════════════════════════════════
+// shared/blowup/modules/field_gradient_bench.hexa
+// Multi-Domain Field Gradient Benchmark — infra-only analysis tool
+//
+// Measures gradient convergence rates and compares domain-by-domain
+// field strengths. Reads atlas.n6 time-series data to compute:
+//   1. Per-domain field strength Phi(t) over recent windows
+//   2. Gradient dPhi/dt convergence rate per domain
+//   3. Cross-domain gradient correlation matrix
+//   4. Convergence ranking: which domains converge fastest
+//
+// 7-phase pipeline:
+//   FB1: Atlas Window     read atlas.n6 tail, partition into time windows
+//   FB2: Field Strength   compute Phi(domain, window) for each window
+//   FB3: Gradient Calc    finite-difference dPhi/dt per domain
+//   FB4: Convergence Rate fit exponential decay rate per domain
+//   FB5: Correlation      cross-domain gradient correlation matrix
+//   FB6: Ranking          sort domains by convergence speed
+//   FB7: Report           structured benchmark output
+//
+// Usage:
+//   hexa field_gradient_bench.hexa                    full benchmark
+//   hexa field_gradient_bench.hexa --windows 5        number of time windows (default 4)
+//   hexa field_gradient_bench.hexa --tail 1000        atlas.n6 tail lines (default 600)
+//   hexa field_gradient_bench.hexa math physics       restrict to domains
+//   hexa field_gradient_bench.hexa help               usage
+// ═══════════════════════════════════════════════════════════
+
+let _HOME = exec("printenv HOME").trim()
+
+// ═══════════════════════════════════════════════════════════
+// ─── n=6 CONSTANTS LOADER (shared/n6/n6_constants.jsonl) ───
+// ═══════════════════════════════════════════════════════════
+
+fn load_n6_consts() -> list {
+    let home = _HOME
+    let path = home + "/Dev/nexus/shared/n6/n6_constants.jsonl"
+    let mut raw = ""
+    try { raw = read_file(path) } catch e { return [[], []] }
+    let lines = raw.split("\n")
+    let mut names = []
+    let mut values = []
+    for line in lines {
+        let t = line.trim()
+        if t == "" { continue }
+        let mut name = ""
+        let mut value = 0.0
+        if t.contains("\"name\":\"") {
+            let p = t.split("\"name\":\"")
+            if p.len() >= 2 { name = p[1].split("\"")[0] }
+        }
+        if t.contains("\"value\":") {
+            let p = t.split("\"value\":")
+            if p.len() >= 2 { value = to_float(p[1].split(",")[0].split("}")[0].trim()) }
+        }
+        if name != "" { names = names + [name] ; values = values + [value] }
+    }
+    [names, values]
+}
+
+let _n6 = load_n6_consts()
+let _n6_names: list = _n6[0]
+let _n6_vals: list = _n6[1]
+let _n6_count: i64 = len(_n6_vals)
+
+// ═══════════════════════════════════════════════════════════
+// ─── UTILITIES ───
+// ═══════════════════════════════════════════════════════════
+
+fn safe_float(s: string) -> f64 {
+    let mut v = 0.0
+    try { v = to_float(s) } catch e {}
+    return v
+}
+
+fn abs_f(x: f64) -> f64 { if x < 0.0 { return 0.0 - x } ; return x }
+fn max_f(a: f64, b: f64) -> f64 { if a > b { return a } ; return b }
+fn min_f(a: f64, b: f64) -> f64 { if a < b { return a } ; return b }
+fn clamp01(x: f64) -> f64 { if x < 0.0 { return 0.0 } ; if x > 1.0 { return 1.0 } ; return x }
+
+fn sqrt_f(x: f64) -> f64 {
+    if x <= 0.0 { return 0.0 }
+    let mut g = if x > 2.0 { x / 2.0 } else { 1.0 }
+    let mut i: i64 = 0
+    while i < 15 { g = (g + x / g) / 2.0 ; i = i + 1 }
+    return g
+}
+
+fn ln_f(x: f64) -> f64 {
+    if x <= 0.0 { return 0.0 }
+    let mut s = 0.0
+    let mut t = (x - 1.0) / (x + 1.0)
+    let t2 = t * t
+    let mut k: i64 = 1
+    while k <= 15 { s = s + t / to_float(k) ; t = t * t2 ; k = k + 2 }
+    return 2.0 * s
+}
+
+fn exp_f(x: f64) -> f64 {
+    if x > 20.0 { return 999999999.0 }
+    if x < 0.0 - 20.0 { return 0.0 }
+    let mut s = 1.0
+    let mut t = 1.0
+    let mut k: i64 = 1
+    while k <= 30 { t = t * x / to_float(k) ; s = s + t ; k = k + 1 }
+    return s
+}
+
+fn truncate4(x: f64) -> string {
+    let s = to_string(x)
+    let parts = s.split(".")
+    if parts.len() < 2 { return s + ".0000" }
+    let dec = parts[1]
+    let dc = dec.split("")
+    if dec.len() >= 4 { return parts[0] + "." + dc[0] + dc[1] + dc[2] + dc[3] }
+    return s
+}
+
+fn truncate2(x: f64) -> string {
+    let s = to_string(x)
+    let parts = s.split(".")
+    if parts.len() < 2 { return s + ".00" }
+    let dec = parts[1]
+    let dc = dec.split("")
+    if dec.len() >= 2 { return parts[0] + "." + dc[0] + dc[1] }
+    return s
+}
+
+fn pad_right(s: string, width: i64) -> string {
+    let mut out = s
+    while out.len() < width { out = out + " " }
+    return out
+}
+
+fn pad_left(s: string, width: i64) -> string {
+    let mut out = s
+    while out.len() < width { out = " " + out }
+    return out
+}
+
+fn timestamp_now() -> string {
+    let mut ts = ""
+    try { ts = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim() } catch e { ts = "unknown" }
+    return ts
+}
+
+// ═══════════════════════════════════════════════════════════
+// AI-native atlas guard helpers (from lib/atlas_guard.hexa.inc)
+// Append-path filter + dedup only. Phase logic invariant.
+// ═══════════════════════════════════════════════════════════
+
+fn _valid_atlas_line(line: string) -> bool {
+    let t = line.trim()
+    if len(t) == 0 { return true }
+    let first = t[0..1]
+    if first == "#" { return true }
+    if first == "{" { return true }
+    if first == "@" { return true }
+    if first == "\"" { return true }
+    if first == "<" { return true }
+    if first == ">" { return true }
+    if first == "!" { return true }
+    if first == "-" { return true }
+    return false
+}
+
+fn _guarded_append_atlas(path: string, content: string) -> i64 {
+    if len(content) == 0 { return 0 }
+    let is_atlas = path.contains("atlas.n6")
+    let lines = content.split("\n")
+    let mut clean = ""
+    let mut rejected: i64 = 0
+    let mut deduped: i64 = 0
+    let mut first = true
+    let mut i: i64 = 0
+    while i < len(lines) {
+        let line = lines[i]
+        if !_valid_atlas_line(line) {
+            rejected = rejected + 1
+            i = i + 1
+            continue
+        }
+        let t = line.trim()
+        if is_atlas && len(t) > 0 && !t.starts_with("#") {
+            let mut already = false
+            try {
+                let gr = exec("grep -Fxq -- '" + t.replace("'", "'\\''") + "' '" + path + "' 2>/dev/null && echo Y || echo N")
+                already = gr.trim() == "Y"
+            } catch e {}
+            if already {
+                deduped = deduped + 1
+                i = i + 1
+                continue
+            }
+        }
+        if !first { clean = clean + "\n" }
+        clean = clean + line
+        first = false
+        i = i + 1
+    }
+    if rejected > 0 {
+        println("  [schema guard] rejected " + to_string(rejected) + " invalid lines -> " + path)
+    }
+    if deduped > 0 {
+        println("  [dedup guard] skipped " + to_string(deduped) + " duplicate lines -> " + path)
+    }
+    if len(clean) > 0 {
+        if !clean.ends_with("\n") { clean = clean + "\n" }
+        try { append_file(path, clean) } catch e {}
+    }
+    return rejected
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── n6 PROXIMITY ───
+// ═══════════════════════════════════════════════════════════
+
+fn n6_dist_one(value: f64, constant: f64) -> f64 {
+    return abs_f(value - constant) / max_f(abs_f(constant), 1.0)
+}
+
+fn n6_distance(value: f64) -> f64 {
+    if value != value || abs_f(value) > 999999999.0 { return 1.0 }
+    let mut d = 1.0
+    let mut i: i64 = 0
+    while i < _n6_count { d = min_f(d, n6_dist_one(value, to_float(_n6_vals[i]))) ; i = i + 1 }
+    return min_f(d, 1.0)
+}
+
+fn match_grade(value: f64) -> string {
+    let d = n6_distance(value)
+    if d < 0.0001 { return "EXACT" }
+    if d < 0.01 { return "NEAR" }
+    if d < 0.05 { return "CLOSE" }
+    return "MISS"
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── DOMAIN LOADER ───
+// ═══════════════════════════════════════════════════════════
+
+fn load_all_domains() -> list {
+    let home = _HOME
+    let mut doms = ["math", "physics", "topology", "consciousness", "chemistry",
+                    "cosmology", "biology", "information", "geometry", "number_theory"]
+    try {
+        let lines = read_file(home + "/Dev/nexus/shared/bt/bt_domains.jsonl").split("\n")
+        let mut ld = []
+        for l in lines {
+            if l.trim() != "" && l.contains("\"domain\":\"") {
+                ld = ld + [l.split("\"domain\":\"")[1].split("\"")[0]]
+            }
+        }
+        if ld.len() > 0 { doms = ld }
+    } catch e {}
+    doms
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── FB1: ATLAS WINDOW ───
+// Read atlas.n6 tail, partition lines into N equal-sized windows.
+// Each window represents a sequential time slice.
+// Returns list of windows, each window is a list of line strings.
+// Encoded as list of "WINDOW_N|line" strings for flat representation.
+// ═══════════════════════════════════════════════════════════
+
+fn atlas_window(tail_n: i64, n_windows: i64) -> list {
+    let home = _HOME
+    let atlas_path = home + "/Dev/nexus/shared/n6/atlas.n6"
+    let mut raw = ""
+    try { raw = exec("tail -" + to_string(tail_n) + " '" + atlas_path + "' 2>/dev/null") } catch e {}
+    if raw.trim() == "" {
+        println("  [FB1] atlas.n6 empty or unreadable")
+        return []
+    }
+
+    // Filter to data lines only (skip comments, blank lines)
+    let all_lines = raw.split("\n")
+    let mut data_lines = []
+    let mut li: i64 = 0
+    while li < len(all_lines) {
+        let line = to_string(all_lines[li]).trim()
+        if line != "" && line[0..1] != "#" {
+            data_lines = data_lines + [line]
+        }
+        li = li + 1
+    }
+
+    let total = len(data_lines)
+    if total == 0 { return [] }
+
+    // Partition into n_windows equal chunks
+    let window_size = if total / n_windows > 0 { total / n_windows } else { 1 }
+    let mut tagged = []
+    let mut di: i64 = 0
+    while di < total {
+        let win_idx = di / window_size
+        let win_n = if win_idx >= n_windows { n_windows - 1 } else { win_idx }
+        tagged = tagged + [to_string(win_n) + "|" + to_string(data_lines[di])]
+        di = di + 1
+    }
+    return tagged
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── FB2: FIELD STRENGTH ───
+// Compute Phi(domain, window) = minimum n6_distance found in that
+// window for each domain. Phi=0 means EXACT hit, Phi=1 means no data.
+//
+// Returns list of "domain|window|phi|exact_count|near_count|entry_count"
+// ═══════════════════════════════════════════════════════════
+
+fn field_strength(tagged_lines: list, domains: list, n_windows: i64) -> list {
+    let mut results = []
+
+    let mut di: i64 = 0
+    while di < len(domains) {
+        let dom = to_string(domains[di])
+
+        let mut wi: i64 = 0
+        while wi < n_windows {
+            let win_prefix = to_string(wi) + "|"
+            let mut min_dist: f64 = 1.0
+            let mut exact_count: i64 = 0
+            let mut near_count: i64 = 0
+            let mut entry_count: i64 = 0
+
+            let mut li: i64 = 0
+            while li < len(tagged_lines) {
+                let tagged = to_string(tagged_lines[li])
+                if !tagged.starts_with(win_prefix) { li = li + 1 ; continue }
+
+                // Strip window prefix to get the line
+                let line = tagged.split("|")[1]
+                // This line might have more pipes from JSON content -- rejoin
+                let parts_all = tagged.split("|")
+                let mut line_full = ""
+                let mut pi: i64 = 1
+                while pi < len(parts_all) {
+                    if pi > 1 { line_full = line_full + "|" }
+                    line_full = line_full + parts_all[pi]
+                    pi = pi + 1
+                }
+
+                // Check domain match
+                let mut line_dom = ""
+                if line_full.contains("\"domain\":\"") {
+                    line_dom = line_full.split("\"domain\":\"")[1].split("\"")[0]
+                } else { if line_full.contains("\"dom\":\"") {
+                    line_dom = line_full.split("\"dom\":\"")[1].split("\"")[0]
+                } }
+
+                if line_dom != dom { li = li + 1 ; continue }
+
+                entry_count = entry_count + 1
+
+                // Check grade
+                if line_full.contains("\"grade\":\"EXACT\"") {
+                    min_dist = 0.0
+                    exact_count = exact_count + 1
+                } else { if line_full.contains("\"grade\":\"NEAR\"") {
+                    near_count = near_count + 1
+                    if 0.005 < min_dist { min_dist = 0.005 }
+                } }
+
+                // Extract n6_dist if present
+                if line_full.contains("\"n6_dist\":") {
+                    let dist_s = line_full.split("\"n6_dist\":")[1].split(",")[0].split("}")[0].trim()
+                    let dist = safe_float(dist_s)
+                    if dist >= 0.0 && dist < min_dist { min_dist = dist }
+                }
+
+                // Extract conf if present
+                if line_full.contains("\"conf\":") {
+                    let conf_s = line_full.split("\"conf\":")[1].split(",")[0].split("}")[0].trim()
+                    let conf = safe_float(conf_s)
+                    let dist_from_conf = 1.0 - clamp01(conf)
+                    if dist_from_conf < min_dist { min_dist = dist_from_conf }
+                }
+
+                // Extract value and compute distance
+                if line_full.contains("\"value\":") {
+                    let val_s = line_full.split("\"value\":")[1].split(",")[0].split("}")[0].trim()
+                    let val = safe_float(val_s)
+                    if abs_f(val) > 0.0000000001 {
+                        let vdist = n6_distance(val)
+                        if vdist < min_dist { min_dist = vdist }
+                    }
+                }
+
+                li = li + 1
+            }
+
+            results = results + [dom + "|" + to_string(wi) + "|" + truncate4(min_dist) + "|" + to_string(exact_count) + "|" + to_string(near_count) + "|" + to_string(entry_count)]
+            wi = wi + 1
+        }
+        di = di + 1
+    }
+    return results
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── FB3: GRADIENT CALC ───
+// Finite-difference gradient: dPhi/dt = (Phi[w+1] - Phi[w]) / 1
+// Negative gradient means field is converging toward EXACT.
+//
+// Returns list of "domain|gradient_avg|gradient_min|gradient_max|trend"
+// trend: CONVERGING (avg < -0.01), STABLE (|avg| < 0.01), DIVERGING (avg > 0.01)
+// ═══════════════════════════════════════════════════════════
+
+fn gradient_calc(field_data: list, domains: list, n_windows: i64) -> list {
+    let mut results = []
+
+    let mut di: i64 = 0
+    while di < len(domains) {
+        let dom = to_string(domains[di])
+
+        // Extract Phi sequence for this domain across windows
+        let mut phi_seq = []
+        let mut wi: i64 = 0
+        while wi < n_windows {
+            let key = dom + "|" + to_string(wi) + "|"
+            let mut found_phi = 1.0
+            let mut fi: i64 = 0
+            while fi < len(field_data) {
+                let fd = to_string(field_data[fi])
+                if fd.starts_with(key) {
+                    let fdp = fd.split("|")
+                    if fdp.len() >= 3 { found_phi = safe_float(fdp[2]) }
+                }
+                fi = fi + 1
+            }
+            phi_seq = phi_seq + [found_phi]
+            wi = wi + 1
+        }
+
+        // Compute gradients between consecutive windows
+        let mut grads = []
+        let mut grad_sum: f64 = 0.0
+        let mut grad_min: f64 = 999.0
+        let mut grad_max: f64 = 0.0 - 999.0
+        let mut gi: i64 = 0
+        while gi < len(phi_seq) - 1 {
+            let phi_curr = to_float(phi_seq[gi])
+            let phi_next = to_float(phi_seq[gi + 1])
+            let grad = phi_next - phi_curr
+            grads = grads + [grad]
+            grad_sum = grad_sum + grad
+            if grad < grad_min { grad_min = grad }
+            if grad > grad_max { grad_max = grad }
+            gi = gi + 1
+        }
+
+        let n_grads = len(grads)
+        let grad_avg = if n_grads > 0 { grad_sum / to_float(n_grads) } else { 0.0 }
+        if n_grads == 0 { grad_min = 0.0 ; grad_max = 0.0 }
+
+        // Determine trend
+        let trend = if grad_avg < 0.0 - 0.01 { "CONVERGING" } else { if grad_avg > 0.01 { "DIVERGING" } else { "STABLE" } }
+
+        results = results + [dom + "|" + truncate4(grad_avg) + "|" + truncate4(grad_min) + "|" + truncate4(grad_max) + "|" + trend]
+        di = di + 1
+    }
+    return results
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── FB4: CONVERGENCE RATE ───
+// Fit exponential decay: Phi(t) ~ Phi_0 * exp(-lambda * t)
+// lambda = convergence rate. Higher lambda = faster convergence.
+// Uses simple log-linear regression on the Phi sequence.
+//
+// Returns list of "domain|lambda|phi_initial|phi_final|half_life"
+// ═══════════════════════════════════════════════════════════
+
+fn convergence_rate(field_data: list, domains: list, n_windows: i64) -> list {
+    let mut results = []
+
+    let mut di: i64 = 0
+    while di < len(domains) {
+        let dom = to_string(domains[di])
+
+        // Extract Phi sequence
+        let mut phi_seq = []
+        let mut wi: i64 = 0
+        while wi < n_windows {
+            let key = dom + "|" + to_string(wi) + "|"
+            let mut found_phi = 1.0
+            let mut fi: i64 = 0
+            while fi < len(field_data) {
+                let fd = to_string(field_data[fi])
+                if fd.starts_with(key) {
+                    let fdp = fd.split("|")
+                    if fdp.len() >= 3 { found_phi = safe_float(fdp[2]) }
+                }
+                fi = fi + 1
+            }
+            phi_seq = phi_seq + [found_phi]
+            wi = wi + 1
+        }
+
+        let phi_initial = to_float(phi_seq[0])
+        let phi_final = to_float(phi_seq[len(phi_seq) - 1])
+
+        // Log-linear regression: ln(Phi) = ln(Phi_0) - lambda * t
+        // Collect (t, ln(Phi)) pairs where Phi > 0
+        let mut sum_t: f64 = 0.0
+        let mut sum_lnp: f64 = 0.0
+        let mut sum_t2: f64 = 0.0
+        let mut sum_t_lnp: f64 = 0.0
+        let mut n_pts: i64 = 0
+
+        let mut ti: i64 = 0
+        while ti < len(phi_seq) {
+            let phi = to_float(phi_seq[ti])
+            if phi > 0.0001 {  // avoid ln(0)
+                let t_f = to_float(ti)
+                let lnp = ln_f(phi)
+                sum_t = sum_t + t_f
+                sum_lnp = sum_lnp + lnp
+                sum_t2 = sum_t2 + t_f * t_f
+                sum_t_lnp = sum_t_lnp + t_f * lnp
+                n_pts = n_pts + 1
+            }
+            ti = ti + 1
+        }
+
+        let mut lambda = 0.0
+        if n_pts >= 2 {
+            let n_f = to_float(n_pts)
+            let denom = n_f * sum_t2 - sum_t * sum_t
+            if abs_f(denom) > 0.0000000001 {
+                // slope of ln(Phi) vs t = -lambda
+                let slope = (n_f * sum_t_lnp - sum_t * sum_lnp) / denom
+                lambda = 0.0 - slope  // negate: positive lambda = converging
+            }
+        }
+
+        // Half-life: t_half = ln(2) / lambda
+        let ln2 = 0.6931
+        let half_life = if lambda > 0.0001 { ln2 / lambda } else { if lambda < 0.0 - 0.0001 { 0.0 - 1.0 } else { 999.0 } }
+
+        results = results + [dom + "|" + truncate4(lambda) + "|" + truncate4(phi_initial) + "|" + truncate4(phi_final) + "|" + truncate2(half_life)]
+        di = di + 1
+    }
+    return results
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── FB5: CORRELATION MATRIX ───
+// Compute Pearson correlation between gradient sequences of each
+// domain pair. High positive correlation = domains move together.
+//
+// Returns list of "domA|domB|correlation" (upper triangle only)
+// ═══════════════════════════════════════════════════════════
+
+fn gradient_correlation(field_data: list, domains: list, n_windows: i64) -> list {
+    // First build gradient vectors per domain
+    let mut grad_vectors = []  // list of pipe-separated gradient strings
+    let n_grads = n_windows - 1
+    if n_grads < 2 { return [] }
+
+    let mut di: i64 = 0
+    while di < len(domains) {
+        let dom = to_string(domains[di])
+
+        // Extract Phi sequence
+        let mut phi_seq = []
+        let mut wi: i64 = 0
+        while wi < n_windows {
+            let key = dom + "|" + to_string(wi) + "|"
+            let mut found_phi = 1.0
+            let mut fi: i64 = 0
+            while fi < len(field_data) {
+                let fd = to_string(field_data[fi])
+                if fd.starts_with(key) {
+                    let fdp = fd.split("|")
+                    if fdp.len() >= 3 { found_phi = safe_float(fdp[2]) }
+                }
+                fi = fi + 1
+            }
+            phi_seq = phi_seq + [found_phi]
+            wi = wi + 1
+        }
+
+        // Compute gradients
+        let mut grad_str = ""
+        let mut gi: i64 = 0
+        while gi < len(phi_seq) - 1 {
+            let g = to_float(phi_seq[gi + 1]) - to_float(phi_seq[gi])
+            if grad_str == "" { grad_str = to_string(g) } else { grad_str = grad_str + "," + to_string(g) }
+            gi = gi + 1
+        }
+        grad_vectors = grad_vectors + [grad_str]
+        di = di + 1
+    }
+
+    // Compute pairwise Pearson correlation
+    let mut corr_results = []
+    let mut ai: i64 = 0
+    while ai < len(domains) {
+        let mut bi: i64 = ai + 1
+        while bi < len(domains) {
+            let ga = to_string(grad_vectors[ai]).split(",")
+            let gb = to_string(grad_vectors[bi]).split(",")
+            let n = min_f(to_float(len(ga)), to_float(len(gb)))
+            let ni = to_int(n)
+
+            if ni < 2 { bi = bi + 1 ; continue }
+
+            // Compute means
+            let mut sum_a: f64 = 0.0
+            let mut sum_b: f64 = 0.0
+            let mut ki: i64 = 0
+            while ki < ni {
+                sum_a = sum_a + safe_float(ga[ki])
+                sum_b = sum_b + safe_float(gb[ki])
+                ki = ki + 1
+            }
+            let mean_a = sum_a / n
+            let mean_b = sum_b / n
+
+            // Compute correlation components
+            let mut cov: f64 = 0.0
+            let mut var_a: f64 = 0.0
+            let mut var_b: f64 = 0.0
+            let mut ci: i64 = 0
+            while ci < ni {
+                let da = safe_float(ga[ci]) - mean_a
+                let db = safe_float(gb[ci]) - mean_b
+                cov = cov + da * db
+                var_a = var_a + da * da
+                var_b = var_b + db * db
+                ci = ci + 1
+            }
+
+            let denom = sqrt_f(var_a * var_b)
+            let corr = if denom > 0.0000000001 { cov / denom } else { 0.0 }
+            corr_results = corr_results + [to_string(domains[ai]) + "|" + to_string(domains[bi]) + "|" + truncate4(corr)]
+            bi = bi + 1
+        }
+        ai = ai + 1
+    }
+    return corr_results
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── FB6: RANKING ───
+// Sort domains by convergence speed (lambda descending).
+// Returns list of "rank|domain|lambda|trend|phi_final|grade"
+// ═══════════════════════════════════════════════════════════
+
+fn convergence_ranking(conv_data: list, grad_data: list) -> list {
+    // Build sortable list: "lambda|domain|trend|phi_final"
+    let mut sortable = []
+    let mut ci: i64 = 0
+    while ci < len(conv_data) {
+        let cd = to_string(conv_data[ci])
+        let cdp = cd.split("|")
+        // cdp: domain|lambda|phi_initial|phi_final|half_life
+        if cdp.len() >= 5 {
+            let dom = cdp[0]
+            let lambda = cdp[1]
+            let phi_final = safe_float(cdp[3])
+
+            // Get trend from gradient data
+            let mut trend = "STABLE"
+            let mut gi: i64 = 0
+            while gi < len(grad_data) {
+                let gd = to_string(grad_data[gi])
+                if gd.starts_with(dom + "|") {
+                    let gdp = gd.split("|")
+                    if gdp.len() >= 5 { trend = gdp[4] }
+                }
+                gi = gi + 1
+            }
+
+            // Grade based on phi_final
+            let grade = if phi_final < 0.0001 { "EXACT" } else { if phi_final < 0.01 { "NEAR" } else { if phi_final < 0.05 { "CLOSE" } else { if phi_final >= 1.0 { "UNEXPLORED" } else { "ACTIVE" } } } }
+
+            sortable = sortable + [lambda + "|" + dom + "|" + trend + "|" + truncate4(phi_final) + "|" + grade]
+        }
+        ci = ci + 1
+    }
+
+    // Bubble sort by lambda descending (highest convergence first)
+    let mut swapped = true
+    while swapped {
+        swapped = false
+        let mut i: i64 = 0
+        while i < len(sortable) - 1 {
+            let a_lambda = safe_float(to_string(sortable[i]).split("|")[0])
+            let b_lambda = safe_float(to_string(sortable[i + 1]).split("|")[0])
+            if a_lambda < b_lambda {
+                let tmp = sortable[i]
+                sortable[i] = sortable[i + 1]
+                sortable[i + 1] = tmp
+                swapped = true
+            }
+            i = i + 1
+        }
+    }
+
+    // Build ranked output
+    let mut ranked = []
+    let mut ri: i64 = 0
+    while ri < len(sortable) {
+        let s = to_string(sortable[ri])
+        let sp = s.split("|")
+        if sp.len() >= 5 {
+            ranked = ranked + [to_string(ri + 1) + "|" + sp[1] + "|" + sp[0] + "|" + sp[2] + "|" + sp[3] + "|" + sp[4]]
+        }
+        ri = ri + 1
+    }
+    return ranked
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── FB7: REPORT ───
+// ═══════════════════════════════════════════════════════════
+
+fn print_report(domains: list, n_windows: i64, field_data: list, grad_data: list, conv_data: list, corr_data: list, ranked: list) {
+    println("")
+    println("================================================================")
+    println("  Multi-Domain Field Gradient Benchmark")
+    println("================================================================")
+    println("")
+
+    // Field strength table (domain x window)
+    println("--- FB2: Field Strength Phi(domain, window) ---")
+    // Header
+    let mut header = "  " + pad_right("DOMAIN", 18)
+    let mut wi: i64 = 0
+    while wi < n_windows {
+        header = header + pad_right("W" + to_string(wi), 10)
+        wi = wi + 1
+    }
+    header = header + pad_right("ENTRIES", 10) + "EXACT"
+    println(header)
+
+    let mut di: i64 = 0
+    while di < len(domains) {
+        let dom = to_string(domains[di])
+        let mut row = "  " + pad_right(dom, 18)
+        let mut total_entries: i64 = 0
+        let mut total_exact: i64 = 0
+
+        let mut wi2: i64 = 0
+        while wi2 < n_windows {
+            let key = dom + "|" + to_string(wi2) + "|"
+            let mut phi_s = "1.0000"
+            let mut fi: i64 = 0
+            while fi < len(field_data) {
+                let fd = to_string(field_data[fi])
+                if fd.starts_with(key) {
+                    let fdp = fd.split("|")
+                    if fdp.len() >= 6 {
+                        phi_s = fdp[2]
+                        total_entries = total_entries + to_int(safe_float(fdp[5]))
+                        total_exact = total_exact + to_int(safe_float(fdp[3]))
+                    }
+                }
+                fi = fi + 1
+            }
+            row = row + pad_right(phi_s, 10)
+            wi2 = wi2 + 1
+        }
+        row = row + pad_right(to_string(total_entries), 10) + to_string(total_exact)
+        println(row)
+        di = di + 1
+    }
+
+    // Gradient table
+    println("")
+    println("--- FB3: Gradient dPhi/dt ---")
+    println("  " + pad_right("DOMAIN", 18) + pad_right("AVG", 12) + pad_right("MIN", 12) + pad_right("MAX", 12) + "TREND")
+    let mut gi: i64 = 0
+    while gi < len(grad_data) {
+        let gd = to_string(grad_data[gi])
+        let gdp = gd.split("|")
+        if gdp.len() >= 5 {
+            println("  " + pad_right(gdp[0], 18) + pad_right(gdp[1], 12) + pad_right(gdp[2], 12) + pad_right(gdp[3], 12) + gdp[4])
+        }
+        gi = gi + 1
+    }
+
+    // Convergence rate table
+    println("")
+    println("--- FB4: Convergence Rate (exponential fit) ---")
+    println("  " + pad_right("DOMAIN", 18) + pad_right("LAMBDA", 12) + pad_right("PHI_0", 12) + pad_right("PHI_F", 12) + "HALF_LIFE")
+    let mut ci: i64 = 0
+    while ci < len(conv_data) {
+        let cd = to_string(conv_data[ci])
+        let cdp = cd.split("|")
+        if cdp.len() >= 5 {
+            let hl_display = if cdp[4] == "-1.00" { "DIVERGING" } else { if safe_float(cdp[4]) > 100.0 { ">100" } else { cdp[4] } }
+            println("  " + pad_right(cdp[0], 18) + pad_right(cdp[1], 12) + pad_right(cdp[2], 12) + pad_right(cdp[3], 12) + hl_display)
+        }
+        ci = ci + 1
+    }
+
+    // Correlation matrix (top pairs)
+    println("")
+    println("--- FB5: Cross-Domain Gradient Correlation ---")
+    if len(corr_data) == 0 {
+        println("  (insufficient data for correlation, need >= 3 windows)")
+    } else {
+        // Sort by absolute correlation descending
+        let mut sorted_corr = []
+        let mut sci: i64 = 0
+        while sci < len(corr_data) { sorted_corr = sorted_corr + [to_string(corr_data[sci])] ; sci = sci + 1 }
+
+        let mut swapped = true
+        while swapped {
+            swapped = false
+            let mut si: i64 = 0
+            while si < len(sorted_corr) - 1 {
+                let a_corr = abs_f(safe_float(to_string(sorted_corr[si]).split("|")[2]))
+                let b_corr = abs_f(safe_float(to_string(sorted_corr[si + 1]).split("|")[2]))
+                if a_corr < b_corr {
+                    let tmp = sorted_corr[si]
+                    sorted_corr[si] = sorted_corr[si + 1]
+                    sorted_corr[si + 1] = tmp
+                    swapped = true
+                }
+                si = si + 1
+            }
+        }
+
+        println("  " + pad_right("DOMAIN_A", 18) + pad_right("DOMAIN_B", 18) + pad_right("CORR", 12) + "STRENGTH")
+        let show_limit = if len(sorted_corr) < 15 { len(sorted_corr) } else { 15 }
+        let mut cri: i64 = 0
+        while cri < show_limit {
+            let cr = to_string(sorted_corr[cri])
+            let crp = cr.split("|")
+            if crp.len() >= 3 {
+                let corr_val = abs_f(safe_float(crp[2]))
+                let strength = if corr_val > 0.8 { "STRONG" } else { if corr_val > 0.5 { "MODERATE" } else { if corr_val > 0.2 { "WEAK" } else { "NONE" } } }
+                println("  " + pad_right(crp[0], 18) + pad_right(crp[1], 18) + pad_right(crp[2], 12) + strength)
+            }
+            cri = cri + 1
+        }
+        if len(sorted_corr) > 15 { println("  ... (" + to_string(len(sorted_corr) - 15) + " more pairs)") }
+    }
+
+    // Convergence ranking
+    println("")
+    println("--- FB6: Convergence Ranking ---")
+    println("  " + pad_right("RANK", 6) + pad_right("DOMAIN", 18) + pad_right("LAMBDA", 12) + pad_right("TREND", 14) + pad_right("PHI_F", 10) + "GRADE")
+    let mut ri: i64 = 0
+    while ri < len(ranked) {
+        let r = to_string(ranked[ri])
+        let rp = r.split("|")
+        if rp.len() >= 6 {
+            println("  " + pad_right("#" + rp[0], 6) + pad_right(rp[1], 18) + pad_right(rp[2], 12) + pad_right(rp[3], 14) + pad_right(rp[4], 10) + rp[5])
+        }
+        ri = ri + 1
+    }
+
+    // Summary
+    let mut n_converging: i64 = 0
+    let mut n_diverging: i64 = 0
+    let mut n_stable: i64 = 0
+    let mut gsi: i64 = 0
+    while gsi < len(grad_data) {
+        let gd = to_string(grad_data[gsi])
+        if gd.contains("|CONVERGING") { n_converging = n_converging + 1 }
+        if gd.contains("|DIVERGING") { n_diverging = n_diverging + 1 }
+        if gd.contains("|STABLE") { n_stable = n_stable + 1 }
+        gsi = gsi + 1
+    }
+
+    println("")
+    println("================================================================")
+    println("  SUMMARY")
+    println("  Domains benchmarked: " + to_string(len(domains)))
+    println("  Time windows:        " + to_string(n_windows))
+    println("  Converging:          " + to_string(n_converging))
+    println("  Stable:              " + to_string(n_stable))
+    println("  Diverging:           " + to_string(n_diverging))
+    println("  Correlations:        " + to_string(len(corr_data)) + " pairs")
+    println("================================================================")
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── STRUCTURED OUTPUT (JSONL to atlas.n6) ───
+// ═══════════════════════════════════════════════════════════
+
+fn write_bench_log(domains: list, n_windows: i64, grad_data: list, conv_data: list, ranked: list) {
+    let home = _HOME
+    let atlas_path = home + "/Dev/nexus/shared/n6/atlas.n6"
+    let ts = timestamp_now()
+
+    // Count trends
+    let mut n_conv: i64 = 0
+    let mut n_div: i64 = 0
+    let mut gsi: i64 = 0
+    while gsi < len(grad_data) {
+        let gd = to_string(grad_data[gsi])
+        if gd.contains("|CONVERGING") { n_conv = n_conv + 1 }
+        if gd.contains("|DIVERGING") { n_div = n_div + 1 }
+        gsi = gsi + 1
+    }
+
+    // Top domain from ranking
+    let mut top_dom = "none"
+    if len(ranked) > 0 {
+        let r = to_string(ranked[0]).split("|")
+        if r.len() >= 2 { top_dom = r[1] }
+    }
+
+    let summary = "{\"ts\":\"" + ts + "\",\"engine\":\"field_gradient_bench\",\"domains\":" + to_string(len(domains)) + ",\"windows\":" + to_string(n_windows) + ",\"converging\":" + to_string(n_conv) + ",\"diverging\":" + to_string(n_div) + ",\"top_domain\":\"" + top_dom + "\"}"
+    let _rej = _guarded_append_atlas(atlas_path, summary + "\n")
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── HELP ───
+// ═══════════════════════════════════════════════════════════
+
+fn print_help() {
+    println("field_gradient_bench.hexa -- Multi-Domain Field Gradient Benchmark")
+    println("")
+    println("Measures gradient convergence rates and compares domain-by-domain")
+    println("field strengths from atlas.n6 time-series data.")
+    println("")
+    println("Usage:")
+    println("  hexa field_gradient_bench.hexa                    full benchmark")
+    println("  hexa field_gradient_bench.hexa --windows 5        number of time windows (default 4)")
+    println("  hexa field_gradient_bench.hexa --tail 1000        atlas.n6 tail lines (default 600)")
+    println("  hexa field_gradient_bench.hexa math physics       restrict to domains")
+    println("  hexa field_gradient_bench.hexa help               this message")
+    println("")
+    println("7-Phase Pipeline:")
+    println("  FB1  Atlas Window       partition atlas.n6 tail into time windows")
+    println("  FB2  Field Strength     compute Phi(domain, window)")
+    println("  FB3  Gradient Calc      finite-difference dPhi/dt per domain")
+    println("  FB4  Convergence Rate   log-linear exponential decay fit")
+    println("  FB5  Correlation        cross-domain gradient Pearson correlation")
+    println("  FB6  Ranking            sort domains by convergence speed")
+    println("  FB7  Report             structured benchmark output")
+    println("")
+    println("Metrics:")
+    println("  Phi       field distance to nearest n6 constant (0=EXACT, 1=unknown)")
+    println("  Lambda    exponential convergence rate (higher = faster)")
+    println("  Half-life windows until Phi halves (ln(2)/lambda)")
+    println("  Gradient  dPhi/dt between consecutive windows")
+    println("  Corr      Pearson correlation between domain gradient vectors")
+    println("")
+    println("Trends: CONVERGING (avg gradient < -0.01)")
+    println("        STABLE     (|avg gradient| < 0.01)")
+    println("        DIVERGING  (avg gradient > 0.01)")
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── THEOREM + PROOF ───
+// ═══════════════════════════════════════════════════════════
+
+theorem gradient_convergence {
+    // For n6 field theory: if a domain has gradient < 0 in 3+
+    // consecutive windows, the exponential fit lambda > 0 and
+    // the domain is genuinely converging toward an n6 constant.
+    assert 6 * 2 == 12           // n * phi = sigma
+    assert 12 / 4 == 3           // sigma / tau = n/phi
+}
+
+proof benchmark_bounded {
+    // Benchmark computation is bounded:
+    //   FB2: O(domains * windows * lines)
+    //   FB3: O(domains * windows)
+    //   FB4: O(domains * windows) -- log-linear regression
+    //   FB5: O(domains^2 * windows) -- pairwise correlation
+    //   FB6: O(domains^2) -- bubble sort
+    //   Total: O(domains^2 * windows * lines) -- tractable for <50 domains, <5000 lines
+    invariant 50 * 50 * 5 * 5000 == 62500000  // ~62M ops upper bound
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── MAIN ───
+// ═══════════════════════════════════════════════════════════
+
+fn main() {
+    let cli_args = args()
+
+    // Parse CLI arguments
+    let mut domain_filter = []
+    let mut n_windows: i64 = 4
+    let mut tail_n: i64 = 600
+    let mut show_help = false
+
+    let mut ai: i64 = 2  // args()[0]=hexa, [1]=script
+    while ai < len(cli_args) {
+        let arg = to_string(cli_args[ai])
+        if arg == "help" || arg == "--help" || arg == "-h" {
+            show_help = true
+        } else { if arg == "--windows" {
+            if ai + 1 < len(cli_args) {
+                ai = ai + 1
+                let wval = safe_float(to_string(cli_args[ai]))
+                if wval >= 2.0 && wval <= 20.0 { n_windows = to_int(wval) }
+            }
+        } else { if arg == "--tail" {
+            if ai + 1 < len(cli_args) {
+                ai = ai + 1
+                let tval = safe_float(to_string(cli_args[ai]))
+                if tval >= 10.0 && tval <= 5000.0 { tail_n = to_int(tval) }
+            }
+        } else {
+            domain_filter = domain_filter + [arg]
+        } } }
+        ai = ai + 1
+    }
+
+    if show_help {
+        print_help()
+        return
+    }
+
+    // Load domains
+    let all_domains = if len(domain_filter) > 0 { domain_filter } else { load_all_domains() }
+
+    println("")
+    println("=== Multi-Domain Field Gradient Benchmark ===")
+    println("  n6 constants loaded: " + to_string(_n6_count))
+    println("  domains:             " + to_string(len(all_domains)))
+    println("  time windows:        " + to_string(n_windows))
+    println("  atlas.n6 tail lines: " + to_string(tail_n))
+    println("")
+
+    // ─── FB1: Atlas Window ───
+    println("[FB1] Atlas Window -- partitioning " + to_string(tail_n) + " lines into " + to_string(n_windows) + " windows")
+    let tagged_lines = atlas_window(tail_n, n_windows)
+    println("  data lines: " + to_string(len(tagged_lines)))
+
+    if len(tagged_lines) == 0 {
+        println("")
+        println("  No data lines found in atlas.n6. Run blowup engines first.")
+        return
+    }
+
+    // ─── FB2: Field Strength ───
+    println("")
+    println("[FB2] Field Strength -- computing Phi(domain, window)")
+    let field_data = field_strength(tagged_lines, all_domains, n_windows)
+    println("  computed " + to_string(len(field_data)) + " field measurements")
+
+    // ─── FB3: Gradient Calc ───
+    println("")
+    println("[FB3] Gradient Calc -- finite-difference dPhi/dt")
+    let grad_data = gradient_calc(field_data, all_domains, n_windows)
+    let mut n_conv: i64 = 0
+    let mut gci: i64 = 0
+    while gci < len(grad_data) {
+        if to_string(grad_data[gci]).contains("|CONVERGING") { n_conv = n_conv + 1 }
+        gci = gci + 1
+    }
+    println("  " + to_string(n_conv) + "/" + to_string(len(all_domains)) + " domains converging")
+
+    // ─── FB4: Convergence Rate ───
+    println("")
+    println("[FB4] Convergence Rate -- exponential decay fit")
+    let conv_data = convergence_rate(field_data, all_domains, n_windows)
+    println("  fitted " + to_string(len(conv_data)) + " domain decay curves")
+
+    // ─── FB5: Correlation ───
+    println("")
+    println("[FB5] Correlation -- cross-domain gradient Pearson")
+    let corr_data = gradient_correlation(field_data, all_domains, n_windows)
+    let mut strong_corr: i64 = 0
+    let mut cci: i64 = 0
+    while cci < len(corr_data) {
+        let cv = abs_f(safe_float(to_string(corr_data[cci]).split("|")[2]))
+        if cv > 0.8 { strong_corr = strong_corr + 1 }
+        cci = cci + 1
+    }
+    println("  " + to_string(len(corr_data)) + " pairs, " + to_string(strong_corr) + " strongly correlated")
+
+    // ─── FB6: Ranking ───
+    println("")
+    println("[FB6] Convergence Ranking")
+    let ranked = convergence_ranking(conv_data, grad_data)
+    if len(ranked) > 0 {
+        let top = to_string(ranked[0]).split("|")
+        if top.len() >= 2 {
+            println("  fastest converging: " + top[1])
+        }
+    }
+
+    // Log to atlas.n6
+    println("")
+    println("[LOG] Writing benchmark summary to atlas.n6")
+    write_bench_log(all_domains, n_windows, grad_data, conv_data, ranked)
+    println("  done.")
+
+    // ─── FB7: Report ───
+    print_report(all_domains, n_windows, field_data, grad_data, conv_data, corr_data, ranked)
+}
+
+main()

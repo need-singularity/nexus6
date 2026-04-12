@@ -5,7 +5,7 @@ core:
   reality_map_live.json        실시간
   reality_map_v8.3 / zscore_v9.3{,_revised}
   reality_map_3d.html          시각화
-  reality_map.patch.L*.jsonl   레벨별 패치 (12)
+  reality_map.patch.L*.jsonl   레벨별 패치 (10)
   reality_map_{extension_t8,t12_expansion}.jsonl
   _v94_new_nodes.json
 

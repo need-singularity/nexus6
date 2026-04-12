@@ -5,7 +5,8 @@ cli:   hexa blowup.hexa <domain> <depth> [--seeds <s>]
 
 core/        blowup.hexa
 guard/       blowup_guard.hexa
-modules/     blowup_{field,holographic,quantum,string,toe}.hexa            (변종5)
+modules/     blowup_{field,holographic,quantum,string,toe,qft}.hexa        (변종6)
+             + 벤치마크/유틸 포함 총 44개 .hexa
 lens/        telescope{,_holographic,_quantum}.hexa
              lenses_{core,applied,constants,math,physics,quantum}.hexa
              lens_forge.hexa

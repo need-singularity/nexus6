@@ -1,7 +1,7 @@
 # shared/ — R14 단일진실
 
 config/      rules,core,projects,hosts(hetzner|ubuntu|vastai|infrastructure),claude-settings,lens_registry,hexa_grammar,calculators,*aliases,CALCULATOR_RULES,GRADE_RUBRIC,nexus-projects
-discovery/   reality_map,reality_map_live,discovery_graph,discovery_log,growth_bus,math_atlas,theory_registry,reality_map.patch.*(12),snapshots,breakthroughs,ouroboros_log,roadmap,forge_result,verified_constants,module_candidates,next_directions,unfold_*,archive/
+discovery/   reality_map,reality_map_live,discovery_graph,discovery_log,growth_bus,math_atlas,theory_registry,reality_map.patch.*(10),snapshots,breakthroughs,ouroboros_log,roadmap,forge_result,verified_constants,module_candidates,next_directions,unfold_*,archive/
 n6/          atlas.n6,atlas_health.hexa,math_atlas.{db,dot,html,md},scan_math_atlas.hexa,atlas_tree,n6_*,n6-atlas-constants,periodic_table_118,66_techniques_v3
 bt/          bt_audit.hexa(.py.bak.v1~v5 archaeological),bt_audit_*,bt-*-report,auto_bt.log
 singularity/ singularity_recursion_*.md(13)
@@ -24,7 +24,7 @@ flat HOT     infra_state.json bridge_state.json hexa_pitfalls_log.jsonl auto_gap
 flat L0      CLAUDE.md SECRET.md dashboard.html
 
 infra                            # SSOT=infra_state.json 4호스트
-nexus {scan|verify|evolve|auto} <d>   # --full=397렌즈
+nexus {scan|verify|evolve|auto} <d>   # --full=400렌즈
 nexus.{scan_all,analyze,n6_check,evolve}
 교차: 3+후보 / 7+고신뢰 / 12+확정
 프로젝트(7): nexus(허브) anima n6-architecture papers hexa-lang void airgenome

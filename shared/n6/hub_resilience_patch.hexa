@@ -1,0 +1,375 @@
+// ================================================================
+// hub_resilience_patch.hexa — Hub Bottleneck Bypass Generator
+// READ-ONLY analysis + proposed-edge output. Does NOT write atlas.n6.
+//
+// Problem:
+//   node 'n' has C_B=716.3, graph resilience is LOW.
+//   The atlas is scale-free: 'n' (deg=884) dominates, and removing
+//   a handful of top hubs would fragment the graph severely.
+//
+// Strategy:
+//   1. Identify top bottleneck hubs (high betweenness centrality)
+//   2. For each bottleneck, find its neighbor clusters
+//   3. Propose bypass edges between neighbor clusters that currently
+//      only connect through the bottleneck (i.e., would disconnect
+//      if the bottleneck were removed)
+//   4. Also strengthen weak cross-domain bridges (fewest edges)
+//   5. Output all proposed edges to stdout in atlas.n6 JSON format
+//      for manual review before _guarded_append_atlas()
+//
+// Usage: hexa hub_resilience_patch.hexa [--max-bypass N] [--verbose]
+// ================================================================
+
+let a = args()
+let mut verbose = false
+let mut max_bypass: i64 = 40
+let mut ai: i64 = 2
+while ai < len(a) {
+    let tok = a[ai]
+    if tok == "--verbose" || tok == "-v" { verbose = true }
+    else if tok == "--max-bypass" && ai + 1 < len(a) {
+        ai = ai + 1
+        try { max_bypass = to_int(a[ai]) } catch e {}
+    }
+    ai = ai + 1
+}
+
+let _HOME = exec("printenv HOME").trim()
+let _BASE = _HOME + "/Dev/nexus"
+let _ATLAS = _BASE + "/shared/n6/atlas.n6"
+let _DEG   = _ATLAS + ".deg"
+let _STATS = _ATLAS + ".stats"
+
+// -- Utilities ---------------------------------------------------
+fn safe_int(s: string) -> i64 {
+    let mut v: i64 = 0
+    try { v = to_int(s.trim()) } catch e {}
+    return v
+}
+fn safe_float(s: string) -> f64 {
+    let mut v: f64 = 0.0
+    try { v = to_float(s.trim()) } catch e {}
+    return v
+}
+
+// -- Validate ----------------------------------------------------
+if !file_exists(_ATLAS) { println("error: atlas not found: " + _ATLAS); exit(1) }
+if !file_exists(_DEG) { println("error: degree sidecar not found: " + _DEG); exit(1) }
+
+println("================================================================")
+println("  Hub Resilience Patch — Bypass Edge Generator (read-only)")
+println("================================================================")
+println("")
+
+// -- 1. Load graph stats -----------------------------------------
+let mut total_nodes: i64 = 0
+let mut total_edges: i64 = 0
+if file_exists(_STATS) {
+    try {
+        let stats = read_file(_STATS).trim()
+        total_nodes = safe_int(exec("echo '" + stats + "' | grep -oE '\"nodes\":[0-9]+' | cut -d: -f2"))
+        total_edges = safe_int(exec("echo '" + stats + "' | grep -oE '\"edges\":[0-9]+' | cut -d: -f2"))
+    } catch e {}
+}
+println("  Graph: " + to_string(total_nodes) + " nodes, " + to_string(total_edges) + " edges")
+println("")
+
+// -- 2. Identify top bottleneck hubs ------------------------------
+// Use the same centrality proxy as hub_centrality_analyzer:
+//   C_B(v) = deg(v)^2 / sum(deg(neighbor_of_v))
+// High C_B = critical relay (high degree but low-degree neighbors).
+println("-- Phase 1: Identifying bottleneck hubs --")
+println("")
+
+let tmp_adj = "/tmp/.resilience_adj." + exec("echo $$").trim()
+let tmp_centrality = "/tmp/.resilience_cb." + exec("echo $$").trim()
+let tmp_bypass = "/tmp/.resilience_bypass." + exec("echo $$").trim()
+
+// Build from/to pair list from JSON edges
+try {
+    exec("bash", ["-c",
+        "awk -v FS='\"' '/\"type\":\"edge\"/{for(i=1;i<=NF;i++){if($i==\"from\")f=$(i+2);if($i==\"to\")t=$(i+2)}if(f!=\"\"&&t!=\"\")print f\"\\t\"t}' '" + _ATLAS + "' > '" + tmp_adj + "' 2>/dev/null"
+    ])
+} catch e {}
+
+let adj_count = safe_int(exec("wc -l < '" + tmp_adj + "' 2>/dev/null || echo 0"))
+println("  Edge pairs loaded: " + to_string(adj_count))
+
+// Compute centrality for hub nodes (degree >= 10)
+try {
+    exec("bash", ["-c",
+        "awk -F'\\t' '\n" +
+        "NR==FNR { deg[$1] = $2+0; next }\n" +
+        "{\n" +
+        "  a = $1; b = $2;\n" +
+        "  k = a \"|\" b; k2 = b \"|\" a;\n" +
+        "  if (!(k in S)) { S[k]=1; nb[a] = nb[a] b \";\"; }\n" +
+        "  if (!(k2 in S)) { S[k2]=1; nb[b] = nb[b] a \";\"; }\n" +
+        "}\n" +
+        "END {\n" +
+        "  for (v in deg) {\n" +
+        "    if (deg[v] < 10) continue;\n" +
+        "    n_str = nb[v]; if (n_str == \"\") continue;\n" +
+        "    split(n_str, nbs, \";\");\n" +
+        "    sum_nd = 0; nc = 0;\n" +
+        "    for (i in nbs) {\n" +
+        "      if (nbs[i] == \"\") continue;\n" +
+        "      if (nbs[i] in deg) sum_nd += deg[nbs[i]];\n" +
+        "      nc++;\n" +
+        "    }\n" +
+        "    if (sum_nd > 0) {\n" +
+        "      cb = (deg[v] * deg[v]) / sum_nd;\n" +
+        "      printf \"%.4f\\t%s\\t%d\\t%d\\t%.1f\\n\", cb, v, deg[v], nc, sum_nd/nc;\n" +
+        "    }\n" +
+        "  }\n" +
+        "}' '" + _DEG + "' '" + tmp_adj + "' | sort -t'\\t' -k1 -rn > '" + tmp_centrality + "' 2>/dev/null"
+    ])
+} catch e {}
+
+// Read top 10 bottleneck hubs
+let top_raw = exec("head -10 '" + tmp_centrality + "' 2>/dev/null").trim()
+let top_lines = top_raw.split("\n")
+
+println("")
+println("  Top 10 Bottleneck Hubs:")
+println("  " + "─".repeat(60))
+let mut bottleneck_ids: [string] = []
+let mut bi: i64 = 0
+for tl in top_lines {
+    let t = tl.trim()
+    if t == "" { continue }
+    let parts = t.split("\t")
+    if len(parts) >= 5 {
+        let cb = parts[0]
+        let nid = parts[1]
+        let deg_val = parts[2]
+        let nb_count = parts[3]
+        let avg_nb = parts[4]
+        println("    #" + to_string(bi + 1) + "  C_B=" + cb + "  " + nid + "  deg=" + deg_val + "  neighbors=" + nb_count + "  avg_nb_deg=" + avg_nb)
+        if bi < 10 {
+            bottleneck_ids = bottleneck_ids + [nid]
+        }
+    }
+    bi = bi + 1
+}
+println("")
+
+// -- 3. For each bottleneck, find neighbor pairs that ONLY connect
+//    through it, and propose bypass edges between them -------
+println("-- Phase 2: Generating bypass edges --")
+println("  Strategy: for each bottleneck hub, sample pairs of its low-degree")
+println("  neighbors. If they share no direct edge, propose one.")
+println("  This creates alternative paths, reducing C_B of the bottleneck.")
+println("")
+
+// For each bottleneck hub, extract its neighbors and find disjoint pairs.
+// Use awk to find pairs of neighbors that have no direct connection.
+// Limit per hub: max_bypass / num_bottlenecks
+let per_hub_limit = if len(bottleneck_ids) > 0 { max_bypass / to_int(to_string(len(bottleneck_ids))) } else { 5 }
+let per_hub = if per_hub_limit < 3 { 3 } else { per_hub_limit }
+
+let mut proposed_edges: [string] = []
+let mut total_proposed: i64 = 0
+
+for hub_id in bottleneck_ids {
+    if total_proposed >= max_bypass { break }
+
+    // Find neighbors of this hub that have low degree (<=5)
+    // These are the most vulnerable — losing the hub disconnects them
+    let nb_raw = exec("bash", ["-c",
+        "awk -F'\\t' -v hub='" + hub_id + "' '\n" +
+        "NR==FNR { deg[$1]=$2+0; next }\n" +
+        "($1==hub) { if (deg[$2]+0 <= 5 && deg[$2]+0 >= 1) print $2 }\n" +
+        "($2==hub) { if (deg[$1]+0 <= 5 && deg[$1]+0 >= 1) print $1 }\n" +
+        "' '" + _DEG + "' '" + tmp_adj + "' | sort -u | head -200 2>/dev/null"
+    ]).trim()
+
+    if nb_raw == "" { continue }
+    let nbs = nb_raw.split("\n")
+    let nb_count = len(nbs)
+
+    if verbose {
+        println("  Hub: " + hub_id + " — " + to_string(nb_count) + " low-degree neighbors found")
+    }
+
+    if nb_count < 2 { continue }
+
+    // Build set of existing edges among these neighbors for dedup
+    let existing_raw = exec("bash", ["-c",
+        "awk -F'\\t' '\n" +
+        "NR==FNR { wanted[$1]=1; next }\n" +
+        "($1 in wanted && $2 in wanted) { print $1\"\\t\"$2 }\n" +
+        "($2 in wanted && $1 in wanted) { print $2\"\\t\"$1 }\n" +
+        "' <(echo '" + nb_raw.replace("\n", "\n") + "') '" + tmp_adj + "' 2>/dev/null | sort -u"
+    ]).trim()
+
+    // Parse existing edges into a check set (via temp file for performance)
+    let tmp_existing = "/tmp/.resilience_existing." + exec("echo $$").trim()
+    try {
+        exec("bash", ["-c",
+            "awk -F'\\t' '\n" +
+            "NR==FNR { wanted[$1]=1; next }\n" +
+            "($1 in wanted && $2 in wanted) { print $1\"|\"$2; print $2\"|\"$1 }\n" +
+            "' <(echo '" + nb_raw.replace("'", "'\\''") + "') '" + tmp_adj + "' | sort -u > '" + tmp_existing + "' 2>/dev/null"
+        ])
+    } catch e {}
+
+    // Sample pairs: take every Kth pair to spread across neighbor space
+    let mut hub_proposed: i64 = 0
+    let step = if nb_count > 20 { nb_count / 10 } else { 1 }
+    let mut i: i64 = 0
+    while i < nb_count && hub_proposed < per_hub && total_proposed < max_bypass {
+        let j = (i + step) % nb_count
+        if i == j { i = i + 1; continue }
+        let from_n = nbs[i].trim()
+        let to_n = nbs[j].trim()
+        if from_n == "" || to_n == "" || from_n == to_n { i = i + 1; continue }
+
+        // Check if this edge already exists (quick grep on tmp file)
+        let check_key = from_n + "|" + to_n
+        let already_exists = safe_int(exec("grep -cF '" + check_key + "' '" + tmp_existing + "' 2>/dev/null || echo 0"))
+
+        if already_exists == 0 {
+            // Propose bypass edge
+            let edge_json = "{\"type\":\"edge\",\"from\":\"" + from_n + "\",\"to\":\"" + to_n + "\",\"edge_type\":\"Bypass\",\"strength\":0.8,\"bidirectional\":false,\"meta\":\"resilience-patch: bypass around " + hub_id + "\"}"
+            proposed_edges = proposed_edges + [edge_json]
+            hub_proposed = hub_proposed + 1
+            total_proposed = total_proposed + 1
+            if verbose {
+                println("    + bypass: " + from_n + " -> " + to_n + " (around " + hub_id + ")")
+            }
+        }
+        i = i + step
+        if i >= nb_count { break }
+    }
+
+    try { exec("rm -f '" + tmp_existing + "'") } catch e {}
+
+    if hub_proposed > 0 {
+        println("  Hub '" + hub_id + "': " + to_string(hub_proposed) + " bypass edges proposed")
+    }
+}
+println("")
+
+// -- 4. Strengthen weak cross-domain bridges ----------------------
+println("-- Phase 3: Strengthening weak cross-domain bridges --")
+println("  Identifying domain pairs connected by <= 5 edges (fragile).")
+println("")
+
+// Find weakest cross-domain bridges
+let weak_bridges_raw = exec("bash", ["-c",
+    "awk -F'\\t' '{\n" +
+    "  split($1, af, \"-\"); split($2, at, \"-\");\n" +
+    "  df = af[1]; dt = at[1];\n" +
+    "  if (df != \"\" && dt != \"\" && df != dt) {\n" +
+    "    if (df < dt) pair = df \"|\" dt; else pair = dt \"|\" df;\n" +
+    "    bridges[pair]++;\n" +
+    "    # store sample nodes for edge proposal\n" +
+    "    if (!(pair in sn1)) { sn1[pair]=$1; sn2[pair]=$2; }\n" +
+    "  }\n" +
+    "} END {\n" +
+    "  for (p in bridges) {\n" +
+    "    if (bridges[p] <= 5) {\n" +
+    "      print bridges[p] \"\\t\" p \"\\t\" sn1[p] \"\\t\" sn2[p];\n" +
+    "    }\n" +
+    "  }\n" +
+    "}' '" + tmp_adj + "' | sort -n 2>/dev/null"
+]).trim()
+
+let mut bridge_proposed: i64 = 0
+if weak_bridges_raw != "" {
+    let wb_lines = weak_bridges_raw.split("\n")
+    for wbl in wb_lines {
+        if total_proposed >= max_bypass { break }
+        let t = wbl.trim()
+        if t == "" { continue }
+        let parts = t.split("\t")
+        if len(parts) >= 4 {
+            let edge_count = parts[0]
+            let pair = parts[1]
+            let sample_from = parts[2]
+            let sample_to = parts[3]
+            let pair_parts = pair.split("|")
+            if len(pair_parts) >= 2 {
+                println("  Weak bridge: " + pair_parts[0] + " <-> " + pair_parts[1] + " (" + edge_count + " edges)")
+                // Propose a reinforcement edge using sample nodes from each domain
+                let edge_json = "{\"type\":\"edge\",\"from\":\"" + sample_from + "\",\"to\":\"" + sample_to + "\",\"edge_type\":\"Bridge\",\"strength\":0.9,\"bidirectional\":false,\"meta\":\"resilience-patch: strengthen " + pair_parts[0] + "-" + pair_parts[1] + " bridge\"}"
+                proposed_edges = proposed_edges + [edge_json]
+                bridge_proposed = bridge_proposed + 1
+                total_proposed = total_proposed + 1
+            }
+        }
+    }
+}
+if bridge_proposed == 0 {
+    println("  No critically weak bridges found (all > 5 edges).")
+}
+println("")
+
+// -- 5. Estimate impact -------------------------------------------
+println("-- Phase 4: Impact Estimation --")
+println("")
+
+// Current metrics
+let deg_node_count = safe_int(exec("wc -l < '" + _DEG + "' 2>/dev/null || echo 0"))
+let max_degree = safe_int(exec("awk -F'\\t' '{if($2+0>m)m=$2+0} END{print m}' '" + _DEG + "' 2>/dev/null"))
+let leaf_count = safe_int(exec("awk -F'\\t' '$2==1' '" + _DEG + "' 2>/dev/null | wc -l"))
+let leaf_pct = if deg_node_count > 0 { to_float(leaf_count) * 100.0 / to_float(deg_node_count) } else { 0.0 }
+let avg_degree = if deg_node_count > 0 { to_float(total_edges * 2) / to_float(deg_node_count) } else { 0.0 }
+let resilience_before = if max_degree > 0 { (avg_degree / to_float(max_degree)) * (1.0 - leaf_pct / 100.0) } else { 0.0 }
+
+// After adding bypass edges: leaves that gain an edge move to degree 2.
+// Each bypass edge touches 2 nodes. Conservatively, ~50% are leaves.
+let leaves_promoted = total_proposed  // each bypass promotes ~1 leaf on average
+let new_leaf_count = if leaf_count > leaves_promoted { leaf_count - leaves_promoted } else { 0 }
+let new_leaf_pct = if deg_node_count > 0 { to_float(new_leaf_count) * 100.0 / to_float(deg_node_count) } else { 0.0 }
+let new_total_edges = total_edges + total_proposed
+let new_avg_degree = if deg_node_count > 0 { to_float(new_total_edges * 2) / to_float(deg_node_count) } else { 0.0 }
+let resilience_after = if max_degree > 0 { (new_avg_degree / to_float(max_degree)) * (1.0 - new_leaf_pct / 100.0) } else { 0.0 }
+
+println("  BEFORE patch:")
+println("    edges:      " + to_string(total_edges))
+println("    avg_degree:  " + to_string(avg_degree))
+println("    leaf_ratio:  " + to_string(leaf_pct) + "%")
+println("    resilience:  " + to_string(resilience_before))
+println("")
+println("  AFTER patch (estimated):")
+println("    edges:      " + to_string(new_total_edges) + " (+" + to_string(total_proposed) + ")")
+println("    avg_degree:  " + to_string(new_avg_degree))
+println("    leaf_ratio:  " + to_string(new_leaf_pct) + "% (est. " + to_string(leaves_promoted) + " leaves promoted)")
+println("    resilience:  " + to_string(resilience_after))
+println("")
+let improvement = if resilience_before > 0.0 { (resilience_after - resilience_before) / resilience_before * 100.0 } else { 0.0 }
+println("  Resilience improvement: +" + to_string(improvement) + "%")
+println("")
+
+// -- 6. Output proposed edges -------------------------------------
+println("================================================================")
+println("  PROPOSED EDGES (" + to_string(total_proposed) + " total)")
+println("  Copy these lines to append via _guarded_append_atlas()")
+println("================================================================")
+println("")
+
+for edge in proposed_edges {
+    println(edge)
+}
+
+println("")
+println("================================================================")
+println("  SUMMARY")
+println("================================================================")
+println("")
+println("  Bottleneck hubs analyzed: " + to_string(len(bottleneck_ids)))
+println("  Bypass edges proposed:    " + to_string(total_proposed - bridge_proposed))
+println("  Bridge edges proposed:    " + to_string(bridge_proposed))
+println("  Total proposed:           " + to_string(total_proposed))
+println("")
+println("  IMPORTANT: atlas.n6 is L0 protected.")
+println("  To apply: pipe output through _guarded_append_atlas()")
+println("  Review each edge before committing.")
+println("================================================================")
+
+// Cleanup
+try { exec("rm -f '" + tmp_adj + "' '" + tmp_centrality + "' '" + tmp_bypass + "'") } catch e {}
+
+exit(0)

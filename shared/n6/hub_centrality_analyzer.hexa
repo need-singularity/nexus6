@@ -97,22 +97,15 @@ println("── 2. Betweenness Centrality (degree-proxy approximation) ──")
 println("")
 
 // Extract edges as from-to pairs, then compute neighbor-degree stats
-// Build adjacency list in awk, then for each hub compute the proxy
 let tmp_adj = "/tmp/.hub_centrality_adj." + exec("echo $$").trim()
 let tmp_centrality = "/tmp/.hub_centrality_rank." + exec("echo $$").trim()
+let tmp_nb_script = "/tmp/.hub_centrality_compute.awk"
 
 // Step 1: Build from/to pair list from JSON edges
 try {
-    exec("bash -c '" +
-        "awk -v FS=\"\\\"\" " +
-        "  '\\''/" + "\"type\":\"edge\"/{" +
-        "  for(i=1;i<=NF;i++){" +
-        "    if($i==\"from\") f=$(i+2);" +
-        "    if($i==\"to\") t=$(i+2)" +
-        "  }" +
-        "  if(f!=\"\" && t!=\"\") print f\"\\t\"t" +
-        "}'\\'' \"" + _ATLAS + "\" > \"" + tmp_adj + "\" 2>/dev/null" +
-        "'")
+    exec("bash", ["-c",
+        "awk -v FS='\"' '/\"type\":\"edge\"/{for(i=1;i<=NF;i++){if($i==\"from\")f=$(i+2);if($i==\"to\")t=$(i+2)}if(f!=\"\"&&t!=\"\")print f\"\\t\"t}' '" + _ATLAS + "' > '" + tmp_adj + "' 2>/dev/null"
+    ])
 } catch e {}
 
 let adj_count = safe_int(exec("wc -l < '" + tmp_adj + "' 2>/dev/null || echo 0"))
@@ -121,29 +114,41 @@ println("  Edge pairs extracted: " + to_string(adj_count))
 // Step 2: For each hub node, compute centrality proxy using degree sidecar
 // centrality = deg(v)^2 / sum(deg(neighbor)) for all neighbors of v
 // Higher score = more critical bottleneck
+//
+// Strategy: build neighbor lists as flat key "v|nb" in awk (avoids multi-dim arrays)
+// Then for each hub, sum neighbor degrees and compute proxy.
 try {
-    exec("bash -c '" +
-        // Build degree map and adjacency from edges, then compute centrality
-        "awk -F\"\\t\" '\\''NR==FNR{deg[$1]=$2; next}" +
-        "{" +
-        "  adj[$1][$2]=1; adj[$2][$1]=1" +
-        "}" +
-        "END{" +
-        "  for(v in deg){" +
-        "    if(deg[v]+0 < 3) continue;" +  // hubs only
-        "    sum_nd=0; nc=0;" +
-        "    for(nb in adj[v]){" +
-        "      if(nb in deg) sum_nd += deg[nb]+0;" +
-        "      nc++" +
-        "    }" +
-        "    if(sum_nd > 0){" +
-        "      cb = (deg[v]+0)*(deg[v]+0)/sum_nd;" +
-        "      avg_nd = sum_nd / (nc > 0 ? nc : 1);" +
-        "      printf \"%.4f\\t%s\\tdeg=%d\\tneighbors=%d\\tavg_neighbor_deg=%.1f\\n\", cb, v, deg[v]+0, nc, avg_nd" +
-        "    }" +
-        "  }" +
-        "}'\\'' \"" + _DEG + "\" \"" + tmp_adj + "\" | sort -t$'\\''\\t'\\'' -k1 -rn > \"" + tmp_centrality + "\" 2>/dev/null" +
-        "'")
+    exec("bash", ["-c",
+        "awk -F'\\t' '\n" +
+        "NR==FNR { deg[$1] = $2+0; next }\n" +
+        "{\n" +
+        "  a = $1; b = $2;\n" +
+        "  nb_key_ab = a \"|\" b;\n" +
+        "  nb_key_ba = b \"|\" a;\n" +
+        "  if (!(nb_key_ab in seen)) { seen[nb_key_ab]=1; neighbors[a] = neighbors[a] b \";\"; }\n" +
+        "  if (!(nb_key_ba in seen)) { seen[nb_key_ba]=1; neighbors[b] = neighbors[b] a \";\"; }\n" +
+        "}\n" +
+        "END {\n" +
+        "  for (v in deg) {\n" +
+        "    if (deg[v] < 3) continue;\n" +
+        "    n_str = neighbors[v];\n" +
+        "    if (n_str == \"\") continue;\n" +
+        "    split(n_str, nbs, \";\");\n" +
+        "    sum_nd = 0; nc = 0;\n" +
+        "    for (i in nbs) {\n" +
+        "      nb = nbs[i];\n" +
+        "      if (nb == \"\") continue;\n" +
+        "      if (nb in deg) sum_nd += deg[nb];\n" +
+        "      nc++;\n" +
+        "    }\n" +
+        "    if (sum_nd > 0) {\n" +
+        "      cb = (deg[v] * deg[v]) / sum_nd;\n" +
+        "      avg_nd = sum_nd / (nc > 0 ? nc : 1);\n" +
+        "      printf \"%.4f\\t%s\\tdeg=%d\\tneighbors=%d\\tavg_neighbor_deg=%.1f\\n\", cb, v, deg[v], nc, avg_nd;\n" +
+        "    }\n" +
+        "  }\n" +
+        "}' '" + _DEG + "' '" + tmp_adj + "' | sort -t'\\t' -k1 -rn > '" + tmp_centrality + "' 2>/dev/null"
+    ])
 } catch e {}
 
 // Display top centrality nodes
@@ -223,24 +228,17 @@ println("")
 
 // 4c. Domain-island detection: domains connected only through 1-2 bridges
 println("  Domain isolation analysis (which domains are weakly bridged):")
-// Count cross-domain edges per domain pair
-let domain_bridge_raw = exec("bash -c '" +
-    "awk -v FS=\"\\\"\" '\\''/" + "\"type\":\"edge\"/{" +
-    "  for(i=1;i<=NF;i++){" +
-    "    if($i==\"from\") f=$(i+2);" +
-    "    if($i==\"to\") t=$(i+2)" +
-    "  }" +
-    "  # extract domain prefix" +
-    "  split(f,af,\"-\"); split(t,at,\"-\");" +
-    "  df=af[1]; dt=at[1];" +
-    "  if(df!=\"\" && dt!=\"\" && df!=dt){" +
-    "    if(df<dt) pair=df\"|\"dt; else pair=dt\"|\"df;" +
-    "    bridges[pair]++" +
-    "  }" +
-    "}" +
-    "END{for(p in bridges) print bridges[p]\"\\t\"p}" +
-    "'\\'' \"" + _ATLAS + "\" | sort -n | head -20" +
-    "' 2>/dev/null").trim()
+// Count cross-domain edges per domain pair using the edge pair file
+let domain_bridge_raw = exec("bash", ["-c",
+    "awk -F'\\t' '{\n" +
+    "  split($1, af, \"-\"); split($2, at, \"-\");\n" +
+    "  df = af[1]; dt = at[1];\n" +
+    "  if (df != \"\" && dt != \"\" && df != dt) {\n" +
+    "    if (df < dt) pair = df \"|\" dt; else pair = dt \"|\" df;\n" +
+    "    bridges[pair]++\n" +
+    "  }\n" +
+    "} END { for (p in bridges) print bridges[p] \"\\t\" p }' '" + tmp_adj + "' | sort -n | head -20 2>/dev/null"
+]).trim()
 
 if domain_bridge_raw != "" {
     println("  Weakest domain bridges (fewest cross-domain edges):")
@@ -272,30 +270,27 @@ println("── 5. Bridge Node Detection ──")
 println("  (nodes whose removal would disconnect graph regions)")
 println("")
 
-// Find hub nodes that are the sole connector between domain prefixes
-// For each hub (deg>=3), check if it's the only link between any pair of its neighbor-domains
-let bridge_raw = exec("bash -c '" +
-    // Get edges and for each hub, check unique domain connections
-    "awk -v FS=\"\\\"\" '\\''/" + "\"type\":\"edge\"/{" +
-    "  for(i=1;i<=NF;i++){" +
-    "    if($i==\"from\") f=$(i+2);" +
-    "    if($i==\"to\") t=$(i+2)" +
-    "  }" +
-    "  if(f!=\"\" && t!=\"\"){" +
-    "    adj[f][t]=1; adj[t][f]=1" +
-    "  }" +
-    "}'\\'' \"" + _ATLAS + "\" && " +
-    "awk -F\"\\t\" '\\''$2>=10{print $1\"\\t\"$2}'\\'' \"" + _DEG + "\" | " +
-    "while IFS=$'\\''\\t'\\'' read -r nid deg; do " +
-    "  # Count how many unique domain prefixes this hub connects" +
-    "  domains=$(grep -E \"\\\"(from|to)\\\":\\\"${nid}\\\"\" \"" + _ATLAS + "\" 2>/dev/null | " +
-    "    grep -oE '\"(from|to)\":\"[^\"]+\"' | grep -v \"$nid\" | " +
-    "    sed 's/.*\"\\([^\"]*\\)\"/\\1/' | sed 's/-.*//' | sort -u | wc -l); " +
-    "  if [ \"$domains\" -ge 3 ] 2>/dev/null; then " +
-    "    echo \"${nid}|deg=${deg}|bridges=${domains}_domains\"; " +
-    "  fi; " +
-    "done | sort -t= -k2 -rn | head -" + to_string(top_n) +
-    "' 2>/dev/null").trim()
+// Find hub nodes that connect to neighbors from many different domain prefixes.
+// A hub bridging 3+ domain prefixes is a critical multi-domain connector.
+// Use the adjacency file + degree sidecar for efficient computation.
+let bridge_raw = exec("bash", ["-c",
+    "awk -F'\\t' '\n" +
+    "NR==FNR && $2+0 >= 10 { hubs[$1] = $2+0; next }\n" +
+    "{\n" +
+    "  if ($1 in hubs) {\n" +
+    "    split($2, p, \"-\"); if (p[1] != \"\") nb_dom[$1][p[1]] = 1;\n" +
+    "  }\n" +
+    "  if ($2 in hubs) {\n" +
+    "    split($1, p, \"-\"); if (p[1] != \"\") nb_dom[$2][p[1]] = 1;\n" +
+    "  }\n" +
+    "}\n" +
+    "END {\n" +
+    "  for (v in hubs) {\n" +
+    "    dc = 0; for (d in nb_dom[v]) dc++;\n" +
+    "    if (dc >= 3) printf \"%s|deg=%d|bridges=%d_domains\\n\", v, hubs[v], dc;\n" +
+    "  }\n" +
+    "}' '" + _DEG + "' '" + tmp_adj + "' | sort -t'|' -k2 -rn | head -" + to_string(top_n) + " 2>/dev/null"
+]).trim()
 
 if bridge_raw != "" {
     println("  Multi-domain bridge hubs (connecting 3+ domain prefixes):")
@@ -321,7 +316,7 @@ println("── 6. Potential Articulation Points ──")
 println("  (hubs with high degree / low avg neighbor degree ratio)")
 println("")
 
-let artic_raw = exec("awk -F'\\t' '$1 ~ /^[0-9]/ && $1+0 > 5.0' '" + tmp_centrality + "' 2>/dev/null | head -" + to_string(top_n)).trim()
+let artic_raw = exec("awk -F'\\t' '$1+0 > 5.0' '" + tmp_centrality + "' 2>/dev/null | head -" + to_string(top_n)).trim()
 if artic_raw != "" {
     let ar_lines = artic_raw.split("\n")
     let mut ar_count: i64 = 0
@@ -348,7 +343,7 @@ println("── 7. Graph Resilience Score ──")
 println("")
 
 let avg_degree = if deg_node_count > 0 { to_float(total_edges * 2) / to_float(deg_node_count) } else { 0.0 }
-let max_degree = safe_int(exec("sort -t'\\t' -k2 -rn '" + _DEG + "' 2>/dev/null | head -1 | cut -f2"))
+let max_degree = safe_int(exec("awk -F'\\t' '{if($2+0>m)m=$2+0} END{print m}' '" + _DEG + "' 2>/dev/null"))
 let resilience = if max_degree > 0 { (avg_degree / to_float(max_degree)) * (1.0 - leaf_pct / 100.0) } else { 0.0 }
 
 println("  avg degree:    " + to_string(avg_degree))

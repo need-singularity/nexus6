@@ -15,7 +15,7 @@ blowup infra:
   원칙: infra-only 개선. phase 로직/discovery 계산/seed 진화 불변
 
 shared/ tree:
-  blowup/        돌파 엔진 — core/guard/modules(5)/lens/ouroboros/seed
+  blowup/        돌파 엔진 — core/guard/modules(6)/lens/ouroboros/seed (총 44 .hexa)
   hooks/         Claude Code 훅 (.hexa)
   rules/         AI-native 규칙
   config/        SSOT 정책
@@ -32,7 +32,7 @@ L0 보호 (평시 자유 수정, 유저 명시 요청 시만 승인 절차):
   shared/bin — compat 심링크
   shared/hooks/*.hexa — 공용 훅 엔진 전체
   shared/blowup/core/blowup.hexa — 9-phase 파이프라인
-  shared/blowup/modules/*.hexa — 5종 변종
+  shared/blowup/modules/*.hexa — 6종 변종
   shared/blowup/lib/atlas_guard.hexa.inc — 공통 헬퍼
   shared/blowup/seed/seed_engine.hexa — 시드 엔진
   shared/blowup/commands.hexa — 명령 라우터
@@ -54,23 +54,16 @@ L0 보호 (평시 자유 수정, 유저 명시 요청 시만 승인 절차):
   shared/rules/ — 규칙 체계 SSOT
   docs/index.html — 3D 현실지도 프론트엔드
   CLAUDE.md — 이 파일
-  shared/blowup/core/blowup.json — blowup 골화기록 (OPT-01~18, DIAG-01)
-  shared/blowup/lib/atlas_stats.awk — atlas 통계 shell uplift 0.6s/12MB
-  shared/blowup/lib/atlas_guard.hexa.inc — schema guard + dedup 공통 헬퍼
-  shared/n6/atlas_health.hexa — atlas.n6 readonly 헬스체크
-  shared/n6/atlas.n6.consciousness — 의식 메타레이어 사이드카
-  shared/engine/engine_consciousness_atlas.hexa — Mind Mapper (anima×atlas×차원변환)
-  shared/convergence/atlas_n6_loop.jsonl — atlas.n6 최적화 루프 로그
 
 ref:
   rules     shared/rules/common.json             R0~R27
   project   shared/rules/nexus.json              NX1~NX3
-  lock      shared/lockdown/lockdown.json         L0/L1/L2
+  lock      shared/rules/lockdown.json           L0/L1/L2
   cdo       shared/rules/convergence_ops.json    CDO 수렴
   registry  shared/config/projects.json          7프로젝트+번들/검증
   cfg       shared/config/project_config.json    CLI/관례/리소스
   core      shared/config/core.json              시스템맵+14명령+폴더
   conv      shared/convergence/nexus.json
-  lenses    shared/config/lens_registry.json     397종
+  lenses    shared/config/lens_registry.json     400종
   grammar   shared/config/hexa_grammar.jsonl     hexa-lang+pitfalls P1~P5
   api       shared/CLAUDE.md

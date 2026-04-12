@@ -19,7 +19,7 @@ ref:
   registry  shared/config/projects.json          7프로젝트
   cfg       shared/config/project_config.json    CLI/빌드/DSE
   core      shared/config/core.json              시스템맵+14명령
-  conv      shared/hexa-lang/state.json          CDO+breakthroughs
+  conv      shared/hexa/state.json               CDO+breakthroughs
   roadmap   shared/roadmaps/anima_hexa_common.json  P0~P5
   grammar   shared/hexa-lang/grammar.jsonl       전체 문법+pitfalls
   ai-native docs/ai-native.md                    24종 벡터

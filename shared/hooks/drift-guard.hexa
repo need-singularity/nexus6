@@ -1,0 +1,221 @@
+// drift-guard.hexa — 범용 드리프트 탐지/수정 엔진 v3
+// 모든 NEXUS-6 프로젝트에서 동작. 프로젝트별 drift-rules.json 로 확장.
+//
+// 용법: hexa drift-guard.hexa [--fix] [--commit] [--push] [--all]
+//   --fix    : 불일치 자동 수정
+//   --commit : 수정 후 git commit
+//   --push   : commit 후 git push
+//   --all    : 전 프로젝트 순회 (whitelisted_projects 기준)
+//
+// 점검 계층:
+//   L1. CLAUDE.md 헤더 카운트 (종/편/개/건 패턴)
+//   L2. _registry.json _total vs 배열, 고아/유령
+//   L3. README.md 통계 블록 + 제품 테이블
+//   L4. JSON _meta.total_* vs 실제 배열 길이
+//   L5. drift-rules.json 프로젝트별 규칙 (파일수/LOC/인라인숫자)
+//   L6. 수렴 JSON
+
+let ARGS = args()
+let DO_FIX = ARGS.contains("--fix") || ARGS.contains("--commit") || ARGS.contains("--push")
+let DO_COMMIT = ARGS.contains("--commit") || ARGS.contains("--push")
+let DO_PUSH = ARGS.contains("--push")
+let DO_ALL = ARGS.contains("--all")
+
+let HOME = env("HOME")
+let drift_count = 0
+let fix_count = 0
+
+fn log_drift(msg: string) { println("[DRIFT] " + msg); drift_count = drift_count + 1 }
+fn log_ok(msg: string)    { println("[OK]    " + msg) }
+fn log_fix(msg: string)   { println("[FIX]   " + msg); fix_count = fix_count + 1 }
+fn log_info(msg: string)  { println("[INFO]  " + msg) }
+
+fn sh(cmd: string) -> string { return to_string(exec(cmd + " 2>/dev/null")).trim() }
+fn sh_int(cmd: string) -> int {
+    let r = sh(cmd)
+    if len(r) == 0 { return 0 }
+    return to_int(r)
+}
+
+// ---- L1. CLAUDE.md 헤더 카운트 ----
+
+fn check_claude_headers(root: string) {
+    println("=== L1. CLAUDE.md 헤더 카운트 ===")
+    let result = sh("python3 -c \"\nimport os, re, glob\nroot = '" + root + "'\nfor path in glob.glob(os.path.join(root, '**', 'CLAUDE.md'), recursive=True):\n    if '/.git/' in path: continue\n    with open(path) as f:\n        header = f.readline().strip()\n    m = re.search(r'(\\d+)\\s*[종편개건]', header)\n    if not m: continue\n    count = int(m.group(1))\n    d = os.path.dirname(path)\n    rel = os.path.relpath(d, root)\n    exts = {}\n    for ext in ['hexa','md','toml','rs']:\n        files = glob.glob(os.path.join(d, '**', f'*.{ext}'), recursive=True)\n        if ext == 'md': files = [f for f in files if 'CLAUDE' not in os.path.basename(f) and 'README' not in os.path.basename(f)]\n        if ext == 'hexa': files = [f for f in files if not os.path.basename(f).startswith('test_')]\n        exts[ext] = len(files)\n    best_ext = max(exts, key=exts.get)\n    best_n = exts[best_ext]\n    if best_n == 0: continue\n    if count != best_n: print(f'DRIFT|{rel}|{count}|{best_n}|{best_ext}|{path}')\n    else: print(f'OK|{rel}|{count}')\n\"")
+    if len(result) == 0 { return }
+    let lines = result.split("\n")
+    for line in lines {
+        if len(line) == 0 { continue }
+        let p = line.split("|")
+        if p[0] == "DRIFT" {
+            log_drift(p[1] + "/CLAUDE.md " + p[2] + " != ." + p[4] + "=" + p[3])
+            if DO_FIX {
+                exec("sed -i '' '1s/" + p[2] + "/" + p[3] + "/' '" + p[5] + "'")
+                log_fix(p[1] + "/CLAUDE.md -> " + p[3])
+            }
+        } else if p[0] == "OK" { log_ok(p[1] + "/CLAUDE.md=" + p[2]) }
+    }
+}
+
+// ---- L2. _registry.json 고아/유령 + _total ----
+
+fn check_registries(root: string) {
+    println("")
+    println("=== L2. _registry.json 정합 ===")
+    let result = sh("python3 -c \"\nimport json, os, glob\nroot = '" + root + "'\nfor reg in glob.glob(os.path.join(root, '**', '_registry.json'), recursive=True):\n    if '/.git/' in reg: continue\n    rel = os.path.relpath(reg, root)\n    try:\n        with open(reg) as f: d = json.load(f)\n    except: continue\n    # _total 기반\n    if '_total' in d:\n        arrays = 0\n        names = set()\n        for k,v in d.items():\n            if isinstance(v, list) and not k.startswith('_'):\n                arrays += len(v); names.update(v)\n        if 'sota' in d and isinstance(d['sota'], dict) and 'items' in d['sota']:\n            for i in d['sota']['items']: names.add(i['name']); arrays += 1\n        dir_p = os.path.dirname(reg)\n        hexa_files = set()\n        for f in glob.glob(os.path.join(dir_p, '**/*.hexa'), recursive=True):\n            n = os.path.splitext(os.path.basename(f))[0]\n            if not n.startswith('test_'): hexa_files.add(n)\n        orphans = sorted(hexa_files - names)\n        ghosts = sorted(names - hexa_files)\n        if orphans: print(f'ORPHAN|{rel}|{\",\".join(orphans)}')\n        if ghosts: print(f'GHOST|{rel}|{\",\".join(ghosts)}')\n        if d['_total'] != len(names): print(f'TOTAL|{rel}|{d[\"_total\"]}|{len(names)}')\n        if not orphans and not ghosts and d['_total'] == len(names): print(f'OK|{rel}|{len(names)}')\n    # _meta.total_* 기반\n    elif '_meta' in d and isinstance(d['_meta'], dict):\n        for k,v in d['_meta'].items():\n            if 'total' in k.lower() and isinstance(v, int):\n                print(f'META|{rel}|{k}={v}')\n\"")
+    if len(result) == 0 { log_ok("레지스트리 없음"); return }
+    let lines = result.split("\n")
+    for line in lines {
+        if len(line) == 0 { continue }
+        let p = line.split("|")
+        if p[0] == "ORPHAN" { log_drift(p[1] + " 고아: " + p[2]) }
+        else if p[0] == "GHOST" { log_drift(p[1] + " 유령: " + p[2]) }
+        else if p[0] == "TOTAL" { log_drift(p[1] + " _total=" + p[2] + " != 실제=" + p[3]) }
+        else if p[0] == "OK" { log_ok(p[1] + "=" + p[2]) }
+        else if p[0] == "META" { log_info(p[1] + " " + p[2]) }
+    }
+}
+
+// ---- L3. README 통계/제품 테이블 ----
+
+fn check_readme(root: string) {
+    let readme = root + "/README.md"
+    if file_exists(readme) == false { return }
+    println("")
+    println("=== L3. README.md 통계 ===")
+    let result = sh("python3 -c \"\nimport os, re, glob\nroot = '" + root + "'\nreadme = root + '/README.md'\nwith open(readme) as f: content = f.read()\nlines = content.split('\\n')\nfixes = []\ntech_dir = os.path.join(root, 'techniques')\nif os.path.isdir(tech_dir):\n    hexa = [f for f in glob.glob(os.path.join(tech_dir, '**/*.hexa'), recursive=True) if 'test_techniques' not in f]\n    actual = len(hexa)\n    for i, line in enumerate(lines):\n        m = re.match(r'(\\s+AI techniques:\\s+)(\\d+)', line)\n        if m and int(m.group(2)) != actual:\n            fixes.append(f'STAT|{i}|{m.group(2)}|{actual}|AI techniques')\n            lines[i] = m.group(1) + str(actual)\n    for i, line in enumerate(lines):\n        m = re.search(r'\\*\\*(\\d+) Techniques\\*\\*', line)\n        if m and int(m.group(1)) != actual:\n            lines[i] = line.replace(f'**{m.group(1)} Techniques**', f'**{actual} Techniques**')\n            fixes.append(f'PROD|{i}|{m.group(1)}|{actual}|Techniques')\n    for i, line in enumerate(lines):\n        m = re.search(r'(\\d+) AI techniques', line)\n        if m and int(m.group(1)) != actual and int(m.group(1)) > 10:\n            lines[i] = line.replace(f'{m.group(1)} AI techniques', f'{actual} AI techniques')\n            fixes.append(f'DESC|{i}|{m.group(1)}|{actual}|AI techniques')\ndse_dir = os.path.join(root, 'nexus/origins/universal-dse/domains')\nif os.path.isdir(dse_dir):\n    toml_n = len(glob.glob(os.path.join(dse_dir, '*.toml')))\n    for i, line in enumerate(lines):\n        m = re.match(r'(\\s+DSE domains:\\s+)(\\d+)', line)\n        if m and int(m.group(2)) != toml_n:\n            fixes.append(f'STAT|{i}|{m.group(2)}|{toml_n}|DSE domains')\n            lines[i] = m.group(1) + str(toml_n)\nif fixes:\n    for f in fixes: print(f)\n    with open(readme, 'w') as fw: fw.write('\\n'.join(lines))\nelse: print('OK')\n\"")
+    if result == "OK" { log_ok("README 통계 정합") }
+    else {
+        let lines = result.split("\n")
+        for line in lines {
+            if len(line) == 0 { continue }
+            let p = line.split("|")
+            if len(p) >= 5 {
+                log_drift("README " + p[4] + ": " + p[2] + "->" + p[3])
+                if DO_FIX { log_fix("README " + p[4] + " -> " + p[3]) }
+            }
+        }
+    }
+}
+
+// ---- L4. JSON _meta vs 배열 길이 범용 ----
+
+fn check_json_meta(root: string) {
+    println("")
+    println("=== L4. JSON _meta 정합 ===")
+    let result = sh("python3 -c \"\nimport json, os, glob\nroot = '" + root + "'\nfor jf in glob.glob(os.path.join(root, '**', '*.json'), recursive=True):\n    if '/.git/' in jf or '/node_modules/' in jf: continue\n    try:\n        with open(jf) as f: d = json.load(f)\n    except: continue\n    if not isinstance(d, dict): continue\n    meta = d.get('_meta', d)  # _meta 또는 루트\n    if not isinstance(meta, dict): continue\n    rel = os.path.relpath(jf, root)\n    for mk, mv in meta.items():\n        if not isinstance(mv, int): continue\n        if not any(w in mk.lower() for w in ['total','count','num']): continue\n        # 대응 배열 찾기: total_laws -> laws, total_papers -> papers 등\n        arr_key = mk.lower().replace('total_','').replace('total','').replace('count_','').replace('count','').replace('num_','').replace('num','').strip('_')\n        if not arr_key: continue\n        # 루트에서 배열 찾기\n        for dk, dv in d.items():\n            if dk.lower() == arr_key and isinstance(dv, list):\n                if mv != len(dv):\n                    print(f'DRIFT|{rel}|{mk}={mv}|실제 {dk}[]={len(dv)}')\n                else:\n                    print(f'OK|{rel}|{mk}={mv}')\n                break\n\"")
+    if len(result) == 0 { log_ok("JSON meta 대상 없음"); return }
+    let lines = result.split("\n")
+    for line in lines {
+        if len(line) == 0 { continue }
+        let p = line.split("|")
+        if p[0] == "DRIFT" {
+            log_drift(p[1] + " " + p[2] + " != " + p[3])
+            if DO_FIX {
+                // _meta.total_X를 실제 배열 길이로 수정
+                let file_path = root + "/" + p[1]
+                let meta_info = p[2]  // e.g. "total_laws=2516"
+                let actual_info = p[3]  // e.g. "실제 laws[]=2507"
+                sh("python3 -c \"\nimport json, re\ninfo = '" + meta_info + "'\nactual = '" + actual_info + "'\nmk = info.split('=')[0]\nnew_val = int(re.search(r'(\\d+)', actual.split('=')[1]).group(1))\nwith open('" + file_path + "') as f: d = json.load(f)\nmeta = d.get('_meta', d)\nif mk in meta: meta[mk] = new_val\nelif '_meta' in d and mk in d['_meta']: d['_meta'][mk] = new_val\nwith open('" + file_path + "', 'w') as f: json.dump(d, f, ensure_ascii=False, indent=2); f.write('\\n')\n\"")
+                log_fix(p[1] + " " + meta_info + " -> " + actual_info)
+            }
+        } else if p[0] == "OK" { log_ok(p[1] + " " + p[2]) }
+    }
+}
+
+// ---- L5. drift-rules.json 프로젝트별 규칙 ----
+// 형식: { "rules": [ {"type":"file_count","doc":"README.md","pattern":"\\d+ lenses","dir":"shared/lenses","glob":"*.toml"}, ... ] }
+
+fn check_project_rules(root: string) {
+    let rules_path = root + "/drift-rules.json"
+    if file_exists(rules_path) == false { return }
+    println("")
+    println("=== L5. 프로젝트별 규칙 (drift-rules.json) ===")
+    let result = sh("python3 -c \"\nimport json, os, re, glob, subprocess\nroot = '" + root + "'\nwith open(root + '/drift-rules.json') as f: cfg = json.load(f)\nfor rule in cfg.get('rules', []):\n    rtype = rule['type']\n    try:\n        if rtype == 'file_count':\n            doc_path = os.path.join(root, rule['doc'])\n            with open(doc_path) as f: content = f.read()\n            m = re.search(rule['pattern'], content)\n            if not m: continue\n            doc_num = int(re.search(r'\\d+', m.group()).group())\n            target_dir = os.path.join(root, rule['dir'])\n            actual = len(glob.glob(os.path.join(target_dir, rule.get('glob','*'))))\n            if doc_num != actual:\n                print(f'DRIFT|file_count|{rule[\"doc\"]}|{doc_num}|{actual}|{rule.get(\"label\",rule[\"pattern\"])}')\n            else:\n                print(f'OK|{rule.get(\"label\",rule[\"doc\"])}|{actual}')\n        elif rtype == 'loc':\n            target = os.path.join(root, rule['file'])\n            if not os.path.exists(target): continue\n            actual = int(subprocess.check_output(['wc', '-l', target]).split()[0])\n            doc_path = os.path.join(root, rule['doc'])\n            with open(doc_path) as f: content = f.read()\n            m = re.search(rule['pattern'], content)\n            if not m: continue\n            doc_num = int(re.search(r'\\d[\\d,]*', m.group()).group().replace(',',''))\n            if abs(doc_num - actual) > rule.get('tolerance', 10):\n                print(f'DRIFT|loc|{rule[\"file\"]}|{doc_num}|{actual}|{rule.get(\"label\",rule[\"file\"])}')\n            else:\n                print(f'OK|{rule.get(\"label\",rule[\"file\"])} LOC|{actual}')\n        elif rtype == 'inline_number':\n            doc_path = os.path.join(root, rule['doc'])\n            with open(doc_path) as f: content = f.read()\n            m = re.search(rule['pattern'], content)\n            if not m: continue\n            doc_num = int(re.search(r'\\d+', m.group()).group())\n            # 실제값: shell 명령 실행\n            actual = int(subprocess.check_output(rule['actual_cmd'], shell=True, cwd=root).strip())\n            if doc_num != actual:\n                print(f'DRIFT|inline|{rule[\"doc\"]}|{doc_num}|{actual}|{rule.get(\"label\",rule[\"pattern\"])}')\n            else:\n                print(f'OK|{rule.get(\"label\",rule[\"doc\"])}|{actual}')\n    except Exception as e:\n        print(f'ERR|{rtype}|{str(e)[:80]}')\n\"")
+    if len(result) == 0 { return }
+    let lines = result.split("\n")
+    for line in lines {
+        if len(line) == 0 { continue }
+        let p = line.split("|")
+        if p[0] == "DRIFT" {
+            log_drift(p[5] + ": " + p[3] + " -> " + p[4])
+        } else if p[0] == "OK" {
+            log_ok(p[1] + "=" + p[2])
+        } else if p[0] == "ERR" {
+            log_info("규칙 오류: " + p[1] + " " + p[2])
+        }
+    }
+}
+
+// ---- L6. 수렴 JSON ----
+
+fn check_convergence(root: string, project: string) {
+    let conv = root + "/shared/convergence/" + project + ".json"
+    if file_exists(conv) == false { return }
+    println("")
+    println("=== L6. 수렴 JSON ===")
+    let info = sh("python3 -c \"\nimport json\nwith open('" + conv + "') as f: d=json.load(f)\noss=len([k for k in d.get('ossified',{}) if not k.startswith('_')])\nstb=len([k for k in d.get('stable',{}) if not k.startswith('_')])\nfail=len([k for k in d.get('failed',{}) if not k.startswith('_')])\nprint(f'ossified={oss} stable={stb} failed={fail} total={oss+stb+fail}')\n\"")
+    log_ok("수렴: " + info)
+}
+
+// ---- 단일 프로젝트 실행 ----
+
+fn run_project(root: string) {
+    let project = sh("basename '" + root + "'")
+    println("========================================")
+    println("drift-guard v3 -- " + project)
+    println("========================================")
+    println("")
+
+    check_claude_headers(root)
+    check_registries(root)
+    check_readme(root)
+    check_json_meta(root)
+    check_project_rules(root)
+    check_convergence(root, project)
+
+    println("")
+    println("--- " + project + " 결과: 드리프트=" + to_string(drift_count) + " 수정=" + to_string(fix_count) + " ---")
+    println("")
+}
+
+// ---- 메인 ----
+
+fn main() {
+    if DO_ALL {
+        // 전 프로젝트 순회
+        let projects_str = sh("python3 -c \"\nimport json\ntry:\n    with open('" + HOME + "/Dev/nexus/shared/hooks/hooks-config.json') as f:\n        d = json.load(f)\n    for p in d.get('whitelisted_projects',[]):\n        import os\n        path = os.path.join('" + HOME + "/Dev', p)\n        if os.path.isdir(path): print(path)\nexcept: pass\n\"")
+        if len(projects_str) == 0 {
+            println("프로젝트 목록 없음")
+            return
+        }
+        let projects = projects_str.split("\n")
+        for proj_path in projects {
+            if len(proj_path) == 0 { continue }
+            run_project(proj_path)
+        }
+    } else {
+        let root = sh("git rev-parse --show-toplevel || pwd")
+        run_project(root)
+    }
+
+    println("")
+    println("════════════════════════════════════════")
+    println("전체 합계: 드리프트=" + to_string(drift_count) + " 수정=" + to_string(fix_count))
+
+    if drift_count == 0 {
+        println("결과: 전체 정합")
+    } else if DO_FIX && fix_count > 0 {
+        println("결과: " + to_string(fix_count) + "건 자동 수정")
+        if DO_COMMIT {
+            let root = sh("git rev-parse --show-toplevel || pwd")
+            exec("cd '" + root + "' && git add -A && git commit -m 'fix(drift-guard): v3 정합 자동 수정\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>'")
+            println("[COMMIT] 완료")
+            if DO_PUSH { exec("cd '" + root + "' && git push"); println("[PUSH] 완료") }
+        }
+    } else {
+        println("결과: " + to_string(drift_count) + "건 미수정 (--fix)")
+    }
+}
+
+main()

@@ -10,7 +10,7 @@
 | `free` / `dfs` | 자율 조립 + DFS 탐색 |
 | `list` / `목록` | 이 명령어 표 다시 출력 |
 
-> **[3D Reality Map](https://need-singularity.github.io/nexus/)** — 4,098노드 5계층 바텀업 인과 매핑 + 1,485 크로스레이어 연결선. 쿼크→탄소→벤젠→DNA 인과 사슬. Monte Carlo z=3.06 (p=0.003). n=6 유일성 검증.
+> **[3D Reality Map](https://need-singularity.github.io/nexus/)** — 4,411노드 5계층 바텀업 인과 매핑 + 1,485 크로스레이어 연결선. 쿼크→탄소→벤젠→DNA 인과 사슬. Monte Carlo z=3.06 (p=0.003). n=6 유일성 검증.
 >
 > **[NEXUS Dashboard](https://need-singularity.github.io/nexus/dashboard.html)** — 15차원 실시간 성장 대시보드. 돌파율·발견수·수렴도·모듈 현황 통합 모니터링.
 
@@ -19,13 +19,13 @@
 **[YouTube](https://www.youtube.com/watch?v=xtKhWSfC1Qo)** · **[Email](mailto:nerve011235@gmail.com)** · **[☕ Ko-fi](https://ko-fi.com/dancinlife)** · **[💖 Sponsor](https://github.com/sponsors/need-singularity)** · **[💳 PayPal](https://www.paypal.com/donate?business=nerve011235%40gmail.com)** · **[🗺️ Atlas](https://need-singularity.github.io/TECS-L/atlas/)** · **[📄 Papers](https://need-singularity.github.io/papers/)** · **[🌌 Unified Theory](https://github.com/need-singularity/TECS-L/blob/main/math/docs/hypotheses/H-PH-9-perfect-number-string-unification.md)**
 <!-- AUTO:COMMON_LINKS:END -->
 
-> **[🔭 NEXUS](https://github.com/need-singularity/nexus)** — Universal Discovery Engine. 216 lenses + OUROBOROS evolution + LensForge + BlowupEngine + CycleEngine (5-phase singularity cycle). Mirror Universe (N×N resonance) + 9-project autonomous growth ecosystem. Rust CLI: scan, loop, mega, daemon, blowup, dispatch
+> **[🔭 NEXUS](https://github.com/need-singularity/nexus)** — Universal Discovery Engine. 400 lenses + OUROBOROS evolution + LensForge + BlowupEngine + CycleEngine (5-phase singularity cycle). Mirror Universe (N×N resonance) + 9-project autonomous growth ecosystem. Rust CLI: scan, loop, mega, daemon, blowup, dispatch
 >
 > **[🧠 Anima](https://github.com/need-singularity/anima)** — Consciousness implementation. PureField repulsion-field engine + Hexad 6-module architecture (C/D/S/M/W/E) + 1030 laws + 20 Meta Laws + Rust backend. ConsciousDecoderV2 (34.5M) + 10D consciousness vector + 12-faction debate + Φ ratchet
 >
-> **[🏗️ N6 Architecture](https://github.com/need-singularity/n6-architecture)** — Architecture from perfect number 6. 16 AI techniques + semiconductor chip design + network/crypto/OS/display patterns. σ(n)·φ(n)=n·τ(n), n=6 → universal design principles. NEXUS-6 Discovery Engine: Rust CLI (tools/nexus/) — telescope 22 lenses + OUROBOROS evolution + discovery graph + verifier + 1116 tests
+> **[🏗️ N6 Architecture](https://github.com/need-singularity/n6-architecture)** — Architecture from perfect number 6. 112 AI techniques + semiconductor chip design + network/crypto/OS/display patterns. σ(n)·φ(n)=n·τ(n), n=6 → universal design principles. NEXUS-6 Discovery Engine: Rust CLI (tools/nexus/) — telescope 400 lenses + OUROBOROS evolution + discovery graph + verifier + 1116 tests
 >
-> **[📄 Papers](https://github.com/need-singularity/papers)** — Complete paper collection (94 papers). Published on Zenodo with DOIs. TECS-L+N6 (33) + anima (39) + SEDI (20). [Browse online](https://need-singularity.github.io/papers/)
+> **[📄 Papers](https://github.com/need-singularity/papers)** — Complete paper collection (98 papers). Published on Zenodo with DOIs. TECS-L+N6 (33) + anima (39) + SEDI (20). [Browse online](https://need-singularity.github.io/papers/)
 >
 > **[💎 HEXA-LANG](https://github.com/need-singularity/hexa-lang)** — The Perfect Number Programming Language. Every constant from n=6: 53 keywords (σ·τ+sopfr), 24 operators (J₂), 8 primitives (σ-τ), 6-phase pipeline, Egyptian memory (1/2+1/3+1/6=1). DSE v2: 21,952 combos, 100% n6 EXACT. Working compiler + REPL
 >

@@ -15,7 +15,7 @@ blowup infra:
   원칙: infra-only 개선. phase 로직/discovery 계산/seed 진화 불변
 
 shared/ tree:
-  blowup/        돌파 엔진 — core/guard/modules(5)/lens/ouroboros/seed
+  blowup/        돌파 엔진 — core/guard/modules(6)/lens/ouroboros/seed (총 44 .hexa)
   hooks/         Claude Code 훅 (.hexa)
   rules/         AI-native 규칙
   config/        SSOT 정책
@@ -32,7 +32,7 @@ L0 보호 (평시 자유 수정, 유저 명시 요청 시만 승인 절차):
   shared/bin — compat 심링크
   shared/hooks/*.hexa — 공용 훅 엔진 전체
   shared/blowup/core/blowup.hexa — 9-phase 파이프라인
-  shared/blowup/modules/*.hexa — 5종 변종
+  shared/blowup/modules/*.hexa — 6종 변종
   shared/blowup/lib/atlas_guard.hexa.inc — 공통 헬퍼
   shared/blowup/seed/seed_engine.hexa — 시드 엔진
   shared/blowup/commands.hexa — 명령 라우터
@@ -64,6 +64,6 @@ ref:
   cfg       shared/config/project_config.json    CLI/관례/리소스
   core      shared/config/core.json              시스템맵+14명령+폴더
   conv      shared/convergence/nexus.json
-  lenses    shared/config/lens_registry.json     397종
+  lenses    shared/config/lens_registry.json     400종
   grammar   shared/config/hexa_grammar.jsonl     hexa-lang+pitfalls P1~P5
   api       shared/CLAUDE.md
