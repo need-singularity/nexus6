@@ -1,8 +1,8 @@
 # config/ — SSOT 정책/규칙/락다운/렌즈/문법
 
 L0:
-  core-lockdown.json    37 파일 L0 불변
-  absolute_rules.json   R1~R21 + NX/AN/N6/PP/HX/VD/CT/AG
+  core-lockdown.json    DEPRECATED (shared/lockdown/lockdown.json 으로 이관)
+  absolute_rules.json   R0~R27 (33개) + NX/AN/N6/PP/HX/VD/CT/AG
   core.json             시스템맵 + 14명령 + 폴더
 
 registry:
@@ -17,7 +17,7 @@ hosts:
   hetzner_prompt.md  원격 실행 프롬프트
 
 lens/grammar:
-  lens_registry.json   397 렌즈
+  lens_registry.json   400 렌즈
   custom_lenses.jsonl  사용자 렌즈
   hexa_grammar.jsonl   hexa-lang + P1~P5
   calculators.json     계산기 카탈로그
@@ -25,7 +25,7 @@ lens/grammar:
 
 sub:
   loop/      자율 데몬 — 하위 CLAUDE.md
-  roadmaps/  16 시스템 로드맵 JSON
+  roadmaps/  18 시스템 로드맵 JSON
 
 ops:
   convergence_ops.json  수렴 파이프 (R4,R9~R11)

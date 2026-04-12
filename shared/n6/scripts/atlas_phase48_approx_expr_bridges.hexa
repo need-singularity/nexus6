@@ -1,0 +1,163 @@
+// ═══════════════════════════════════════════════════════════
+// atlas_phase48_approx_expr_bridges.hexa — approx-expression cross-domain @S sweep
+// Agent 32 follow-up to Phase 47
+// ───────────────────────────────────────────────────────────
+// Parses atlas.n6 lines with `= value = expr` or `= value ~ expr` forms,
+// evaluates canonical-token expressions via safe python eval,
+// emits @S edges from n6-<primary_token> to matching node.
+//
+// Infra-only: reads atlas.n6, writes JSONL to stdout. Does NOT modify atlas.n6.
+// Edge cap: 500 per run.
+//
+// Converted from atlas_phase48_approx_expr_bridges.py
+// ═══════════════════════════════════════════════════════════
+
+fn json_escape(s: string) -> string {
+    let mut out = ""
+    let mut i: i64 = 0
+    while i < len(s) {
+        let c = s[i]
+        if c == "\"" { out = out + "\\\"" }
+        else if c == "\\" { out = out + "\\\\" }
+        else { out = out + c }
+        i = i + 1
+    }
+    return out
+}
+
+fn _log(msg: string) {
+    try { exec("bash", ["-c", "printf '%s\\n' \"" + msg + "\" 1>&2"]) } catch e {}
+}
+
+fn main() {
+    let ATLAS = "shared/n6/atlas.n6"
+    let EDGE_CAP: i64 = 500
+
+    if !file_exists(ATLAS) {
+        println("# error: atlas not found: " + ATLAS)
+        exit(1)
+    }
+
+    // Canonical tokens and priority for primary selection
+    let primary_priority: list = ["n", "phi", "tau", "sigma", "sopfr", "j2", "J2", "m3", "M3", "mu", "P2"]
+    let canon_tokens: list = ["n", "phi", "tau", "sigma", "sopfr", "mu", "j2", "J2", "m3", "M3", "P2"]
+
+    // Token to canonical node id mapping
+    let mut token_to_const: map = #{}
+    token_to_const["n"] = "n"
+    token_to_const["phi"] = "phi"
+    token_to_const["tau"] = "tau"
+    token_to_const["sigma"] = "sigma"
+    token_to_const["sopfr"] = "sopfr"
+    token_to_const["mu"] = "mu"
+    token_to_const["j2"] = "J2"
+    token_to_const["J2"] = "J2"
+    token_to_const["m3"] = "M3"
+    token_to_const["M3"] = "M3"
+    token_to_const["P2"] = "n6-P2"
+
+    // Use a big python script to do the full parsing + eval in one shot.
+    // This avoids per-line exec overhead on 44k+ lines.
+    let py_script = "import json,re,sys\n"
+        + "from collections import defaultdict\n"
+        + "ATLAS=sys.argv[1]\n"
+        + "EDGE_CAP=500\n"
+        + "CTX={'n':6,'phi':2,'tau':4,'sigma':12,'sopfr':5,'mu':1,'j2':24,'J2':24,'m3':7,'M3':7,'P2':28}\n"
+        + "LINE_RE=re.compile(r'^@(?P<tag>\\w+)\\s+(?P<id>\\S+)\\s*=\\s*(?P<val>[-+]?\\d+(?:\\.\\d+)?)\\s*(?P<sep>[=\\u2248])\\s*(?P<expr>[^:]+?)\\s*::\\s*(?P<domain>[A-Za-z_]+)\\s*\\[(?P<grade>[^\\]]*)\\]\\s*$')\n"
+        + "TOKEN_RE=re.compile(r'\\b([A-Za-z_][A-Za-z0-9_]*)\\b')\n"
+        + "CANON={'n','phi','tau','sigma','sopfr','mu','j2','J2','m3','M3','P2'}\n"
+        + "PRI=['n','phi','tau','sigma','sopfr','j2','J2','m3','M3','mu','P2']\n"
+        + "T2C={'n':'n','phi':'phi','tau':'tau','sigma':'sigma','sopfr':'sopfr','mu':'mu','j2':'J2','J2':'J2','m3':'M3','M3':'M3','P2':'n6-P2'}\n"
+        + "def clean(raw):\n"
+        + "    if not raw: return None\n"
+        + "    s=raw.split(';')[0].strip()\n"
+        + "    s=re.sub(r'\\s*\\([^)]*\\)\\s*$','',s).strip()\n"
+        + "    if not s: return None\n"
+        + "    low=s.lower()\n"
+        + "    for w in ['\\uadfc\\uc0ac','\\ubd88\\uac00','misc','none','convention','exact','\\uc5c6\\uc74c','\\uacbd\\ud5d8','\\ucd94\\uc815']:\n"
+        + "        if w in low: return None\n"
+        + "    s=s.replace('^','**').replace('\\u00b2','**2').replace('\\u00b3','**3').replace('...', '')\n"
+        + "    if re.search(r'[^\\x00-\\x7f]',s): return None\n"
+        + "    if '=' in s: s=s.split('=')[0].strip()\n"
+        + "    return s or None\n"
+        + "def seval(expr,ctx):\n"
+        + "    try:\n"
+        + "        v=eval(expr,{'__builtins__':{}},ctx)\n"
+        + "        if isinstance(v,bool): return None\n"
+        + "        if isinstance(v,(int,float)): return float(v)\n"
+        + "    except: pass\n"
+        + "    return None\n"
+        + "def pick(tokens):\n"
+        + "    for t in PRI:\n"
+        + "        if t in tokens: return t\n"
+        + "    c=sorted(t for t in tokens if t in CANON)\n"
+        + "    return c[0] if c else None\n"
+        + "seen=set(); emitted=0\n"
+        + "ptc=defaultdict(int); pdc=defaultdict(int); pcc=defaultdict(int)\n"
+        + "total=0; n_canon=0; n_mismatch=0; n_noclean=0\n"
+        + "with open(ATLAS,'r') as f:\n"
+        + "    for line in f:\n"
+        + "        s=line.rstrip('\\n')\n"
+        + "        if not s or not s.startswith('@'): continue\n"
+        + "        if '::' not in s: continue\n"
+        + "        m=LINE_RE.match(s)\n"
+        + "        if not m: continue\n"
+        + "        try: val=float(m.group('val'))\n"
+        + "        except: continue\n"
+        + "        total+=1\n"
+        + "        nid=m.group('id'); expr_raw=m.group('expr'); dom=m.group('domain'); grade=m.group('grade')\n"
+        + "        expr=clean(expr_raw)\n"
+        + "        if expr is None: n_noclean+=1; continue\n"
+        + "        tokens={g.group(1) for g in TOKEN_RE.finditer(expr)}\n"
+        + "        cp=tokens&CANON\n"
+        + "        if not cp: continue\n"
+        + "        n_canon+=1\n"
+        + "        v_a=seval(expr,CTX)\n"
+        + "        tol=max(0.05*abs(val),0.5)\n"
+        + "        if v_a is None or abs(v_a-val)>tol: n_mismatch+=1; continue\n"
+        + "        ctx_label='agent28'\n"
+        + "        primary=pick(tokens)\n"
+        + "        if not primary: continue\n"
+        + "        from_id=T2C.get(primary)\n"
+        + "        if not from_id: continue\n"
+        + "        if from_id=='n6-P2':\n"
+        + "            alt=[t for t in PRI if t in tokens and t!='P2']\n"
+        + "            if not alt: continue\n"
+        + "            primary=alt[0]; from_id=T2C[primary]\n"
+        + "        key=(from_id,nid,ctx_label)\n"
+        + "        if key in seen: continue\n"
+        + "        seen.add(key)\n"
+        + "        if emitted>=EDGE_CAP: break\n"
+        + "        edge={'type':'edge','kind':'@S','from':from_id,'to':nid,'label':'approx_expr','expr':expr_raw.strip().split(';')[0].strip(),'value':val,'to_domain':dom,'to_grade':grade,'context':ctx_label,'confidence':1.0,'source':'phase48','timestamp':'2026-04-11'}\n"
+        + "        print(json.dumps(edge,ensure_ascii=False,separators=(',',':')))\n"
+        + "        emitted+=1; ptc[primary]+=1; pdc[dom]+=1; pcc[ctx_label]+=1\n"
+        + "print(f'# phase48 summary',file=sys.stderr)\n"
+        + "print(f'# total_rows_scanned={total}',file=sys.stderr)\n"
+        + "print(f'# rows_not_cleanable={n_noclean}',file=sys.stderr)\n"
+        + "print(f'# rows_with_canon_tokens={n_canon}',file=sys.stderr)\n"
+        + "print(f'# rows_eval_mismatch_both={n_mismatch}',file=sys.stderr)\n"
+        + "print(f'# edges_emitted={emitted}',file=sys.stderr)\n"
+        + "for t,c in sorted(ptc.items(),key=lambda x:-x[1]): print(f'# TOKEN-BRIDGE-COUNT {t} {c}',file=sys.stderr)\n"
+        + "for d,c in sorted(pdc.items(),key=lambda x:-x[1]): print(f'# DOMAIN-BRIDGE-COUNT {d} {c}',file=sys.stderr)\n"
+        + "for x,c in sorted(pcc.items(),key=lambda x:-x[1]): print(f'# CONTEXT-BRIDGE-COUNT {x} {c}',file=sys.stderr)\n"
+
+    println("# phase48 approx-expression cross-domain @S sweep — Agent 32")
+    println("# source=atlas.n6 tokens=n,phi,tau,sigma,sopfr,mu,j2,M3,P2")
+    println("# contexts=unified (M3=7 from atlas @P authority, post 2026-04-11 fix)")
+
+    let cmd = "python3 -c " + "\"" + py_script.replace("\"", "\\\"") + "\" " + "'" + ATLAS + "'"
+    try {
+        let out = exec(cmd)
+        let outlines = to_string(out).split("\n")
+        for line in outlines {
+            if line.trim() != "" {
+                println(line)
+            }
+        }
+    } catch e {
+        println("# error: " + to_string(e))
+        exit(1)
+    }
+}
+
+main()

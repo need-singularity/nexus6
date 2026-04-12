@@ -64,6 +64,6 @@ ref:
   cfg       shared/config/project_config.json    CLI/관례/리소스
   core      shared/config/core.json              시스템맵+14명령+폴더
   conv      shared/convergence/nexus.json
-  lenses    shared/config/lens_registry.json     397종
+  lenses    shared/config/lens_registry.json     400종
   grammar   shared/config/hexa_grammar.jsonl     hexa-lang+pitfalls P1~P5
   api       shared/CLAUDE.md

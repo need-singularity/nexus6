@@ -4,7 +4,8 @@ This `docs/` directory is published via GitHub Pages.
 
 ## Contents
 
-- `index.html` — Reality Map 3D (n=6, 127 nodes, embedded data)
+<!-- 노드 수는 index.html 내장 데이터 기준, atlas.n6 SSOT는 4,411 노드 -->
+- `index.html` — Reality Map 3D (n=6, 4,411 nodes, embedded data)
 - `reality_map_3d.html` — same as index (mirror)
 - `dashboard.html` — system dashboard
 - `reality_map.json` — full reality map dataset (relative fetch ok)
