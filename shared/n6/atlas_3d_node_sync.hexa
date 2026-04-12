@@ -1,0 +1,300 @@
+// ═══════════════════════════════════════════════════════════
+// atlas_3d_node_sync.hexa — 3D reality map node sync tool
+// docs/index.html 용 _mirror_atlas.n6 생성/갱신
+//
+// 기능:
+//   1. atlas.n6 텍스트(@-노드) 파싱 -> docs/_mirror_atlas.n6 동기화
+//   2. real edge vs bridge edge 분리 통계 생성 (bridge inflation 해결)
+//   3. JSON sidecar (docs/_mirror_atlas.meta.json) 출력:
+//      노드수, real edges, bridge-edge 추정치, domain 분포, grade 분포
+//
+// 사용: hexa shared/n6/atlas_3d_node_sync.hexa [--atlas PATH] [--out DIR] [--dry-run] [--verbose]
+// 원칙: atlas.n6 읽기 전용. docs/index.html 수정 금지 (L0).
+// ═══════════════════════════════════════════════════════════
+
+let a = args()
+let mut ATLAS_PATH = "shared/n6/atlas.n6"
+let mut OUT_DIR    = "docs"
+let mut dry_run    = false
+let mut verbose    = false
+
+// ─── CLI 파싱 ───
+let mut ai: i64 = 2
+while ai < len(a) {
+    let tok = a[ai]
+    if tok == "--atlas" && ai + 1 < len(a) { ai = ai + 1; ATLAS_PATH = a[ai] }
+    else if tok == "--out" && ai + 1 < len(a) { ai = ai + 1; OUT_DIR = a[ai] }
+    else if tok == "--dry-run" { dry_run = true }
+    else if tok == "--verbose" || tok == "-v" { verbose = true }
+    else if tok == "--help" || tok == "-h" {
+        println("usage: hexa atlas_3d_node_sync.hexa [--atlas PATH] [--out DIR] [--dry-run] [--verbose]")
+        println("  --atlas PATH   atlas.n6 source (default: shared/n6/atlas.n6)")
+        println("  --out DIR      output directory (default: docs)")
+        println("  --dry-run      parse + stats only, no file write")
+        println("  --verbose      detailed output")
+        exit(0)
+    }
+    ai = ai + 1
+}
+
+// ─── 파일 존재 검증 ───
+if !file_exists(ATLAS_PATH) {
+    println("error: atlas not found: " + ATLAS_PATH)
+    exit(1)
+}
+
+let mirror_path = OUT_DIR + "/_mirror_atlas.n6"
+let meta_path   = OUT_DIR + "/_mirror_atlas.meta.json"
+
+// ─── shell helper ───
+fn _exec_str(cmd: string) -> string {
+    let mut r = ""
+    try { r = to_string(exec(cmd)).trim() } catch e {}
+    return r
+}
+
+fn _exec_int(cmd: string) -> i64 {
+    let mut r: i64 = 0
+    try { r = to_int(to_string(exec(cmd)).trim()) } catch e {}
+    return r
+}
+
+println("=== atlas_3d_node_sync ===")
+println("  source: " + ATLAS_PATH)
+println("  target: " + mirror_path)
+
+// ═══════════════════════════════════════════════════════════
+// PHASE 1: atlas.n6 text-format (@-lines) 추출
+// docs/index.html parseAtlasN6() 는 텍스트 포맷만 파싱:
+//   @T id = expr :: domain [grade]
+//   <- / -> / => / == / ~> / |> / !! (continuation lines)
+//   # 주석 (section headers)
+// JSON 라인 ({"type":"node"...}, {"type":"edge"...}) 은 제외
+// ═══════════════════════════════════════════════════════════
+
+// fast path: awk 로 텍스트 포맷 라인만 추출 (JSON 라인 skip)
+// 규칙: 줄이 '{' 로 시작하면 JSON -> skip
+//        나머지: @-lines, continuation, comments, blank -> keep
+let awk_cmd = "awk '!/^\\{/' '" + ATLAS_PATH + "'"
+
+let text_content = _exec_str(awk_cmd)
+let text_lines   = text_content.split("\n")
+
+// ─── @-노드 카운트 (text format) ───
+let mut text_node_count: i64 = 0
+let mut text_edge_count: i64 = 0
+
+// domain 분포: domain -> count
+let mut domain_counts = ""    // "domain:count\n" accumulator
+let mut grade_counts  = ""    // "grade:count\n" accumulator
+
+// edge type tracking for real vs bridge separation
+let mut depends_count: i64  = 0   // <- lines
+let mut derives_count: i64  = 0   // -> lines
+let mut equiv_count: i64    = 0   // == lines
+let mut app_count: i64      = 0   // => lines
+let mut converge_count: i64 = 0   // ~> lines
+let mut verified_count: i64 = 0   // |> lines
+let mut bt_count: i64       = 0   // !! lines
+
+// count @-nodes and edge annotations using awk (fast)
+text_node_count = _exec_int("echo '" + to_string(len(text_lines)) + "' | cat -; grep -c '^@' '" + ATLAS_PATH + "' 2>/dev/null || echo 0")
+// more reliable: use grep directly
+text_node_count = _exec_int("grep -c '^@' '" + ATLAS_PATH + "' 2>/dev/null || echo 0")
+
+// count text-format edge annotations
+depends_count  = _exec_int("grep -cE '^\\s+<-' '" + ATLAS_PATH + "' 2>/dev/null || echo 0")
+derives_count  = _exec_int("grep -cE '^\\s+->' '" + ATLAS_PATH + "' 2>/dev/null || echo 0")
+equiv_count    = _exec_int("grep -cE '^\\s+==' '" + ATLAS_PATH + "' 2>/dev/null || echo 0")
+converge_count = _exec_int("grep -cE '^\\s+~>' '" + ATLAS_PATH + "' 2>/dev/null || echo 0")
+verified_count = _exec_int("grep -cE '^\\s+\\|>' '" + ATLAS_PATH + "' 2>/dev/null || echo 0")
+bt_count       = _exec_int("grep -cE '^\\s+!!' '" + ATLAS_PATH + "' 2>/dev/null || echo 0")
+app_count      = _exec_int("grep -cE '^\\s+=>' '" + ATLAS_PATH + "' 2>/dev/null || echo 0")
+
+// real edges = depends + derives + equiv (these create actual graph connections in parseAtlasN6)
+let real_edge_lines = depends_count + derives_count + equiv_count
+// NOTE: => (application), ~> (converge), |> (verified), !! (breakthrough)
+// are annotation-only in parseAtlasN6 -- they do NOT produce edges
+
+println("  text @-nodes:  " + to_string(text_node_count))
+println("  edge lines:    <- " + to_string(depends_count) + "  -> " + to_string(derives_count) + "  == " + to_string(equiv_count))
+println("  annotations:   => " + to_string(app_count) + "  ~> " + to_string(converge_count) + "  |> " + to_string(verified_count) + "  !! " + to_string(bt_count))
+
+// ═══════════════════════════════════════════════════════════
+// PHASE 2: JSON-format edge/node 카운트 (atlas.n6 후반부)
+// ═══════════════════════════════════════════════════════════
+
+let json_node_count = _exec_int("grep -c '\"type\":\"node\"' '" + ATLAS_PATH + "' 2>/dev/null || echo 0")
+let json_edge_count = _exec_int("grep -c '\"type\":\"edge\"' '" + ATLAS_PATH + "' 2>/dev/null || echo 0")
+
+println("  JSON nodes:    " + to_string(json_node_count))
+println("  JSON edges:    " + to_string(json_edge_count))
+
+// ═══════════════════════════════════════════════════════════
+// PHASE 3: domain 분포 + grade 분포 (awk fast path)
+// ═══════════════════════════════════════════════════════════
+
+let domain_dist = _exec_str("awk '/^@[A-Z?] /{match($0,/:: *([^ \\[]+)/,m); if(m[1]) print m[1]}' '" + ATLAS_PATH + "' 2>/dev/null | sort | uniq -c | sort -rn | head -20")
+let grade_dist  = _exec_str("awk '/^@[A-Z?] /{match($0,/\\[([^\\]]+)\\]/,m); if(m[1]) print m[1]}' '" + ATLAS_PATH + "' 2>/dev/null | sort | uniq -c | sort -rn | head -20")
+
+if verbose {
+    println("\n  --- domain distribution (top 20) ---")
+    let dd_lines = domain_dist.split("\n")
+    for dd in dd_lines { if dd.trim() != "" { println("    " + dd.trim()) } }
+
+    println("\n  --- grade distribution (top 20) ---")
+    let gd_lines = grade_dist.split("\n")
+    for gd in gd_lines { if gd.trim() != "" { println("    " + gd.trim()) } }
+}
+
+// ═══════════════════════════════════════════════════════════
+// PHASE 4: real edge 통계 (parseAtlasN6 호환)
+// index.html parseAtlasN6 파싱 결과 edge 수:
+//   - <- depends_on: edges.push({from:src, to:cur.id, type:'depends'})
+//     각 <- 라인에 comma-separated IDs -> 복수 edge 가능
+//   - -> derives: edges.push({from:cur.id, to:tgt, type:'derives'})
+//     각 -> 라인에 comma-separated IDs -> 복수 edge 가능
+//   - == equivalent: ID 추출 후 edge (regex 기반, 변수명만)
+// autoBridge() 가 추가하는 bridge edge 는 type='bridge'
+// ═══════════════════════════════════════════════════════════
+
+// <- 의 comma-separated IDs: 각 ID마다 1 edge
+let real_dep_edges = _exec_int("awk '/^[[:space:]]+<-/{gsub(/^[[:space:]]+<- */,\"\"); n=split($0,a,\",\"); t+=n}END{print t+0}' '" + ATLAS_PATH + "' 2>/dev/null")
+// -> 의 comma-separated IDs: 각 ID마다 1 edge
+let real_der_edges = _exec_int("awk '/^[[:space:]]+->/{gsub(/^[[:space:]]+-> */,\"\"); n=split($0,a,\",\"); t+=n}END{print t+0}' '" + ATLAS_PATH + "' 2>/dev/null")
+// == 는 ID 추출이 regex 기반이라 정확한 카운트 어렵지만 근사치
+let real_eq_edges = _exec_int("awk '/^[[:space:]]+==/{gsub(/^[[:space:]]+== */,\"\"); gsub(/[+\\-*/=(),]/, \" \"); for(i=1;i<=NF;i++) if($i ~ /^[a-z_][a-z0-9_]+$/) t++}END{print t+0}' '" + ATLAS_PATH + "' 2>/dev/null")
+
+let total_real_edges = real_dep_edges + real_der_edges + real_eq_edges
+
+println("\n  --- real edge count (parseAtlasN6 호환) ---")
+println("  depends (<-):  " + to_string(real_dep_edges))
+println("  derives (->):  " + to_string(real_der_edges))
+println("  equiv (==):    " + to_string(real_eq_edges))
+println("  total real:    " + to_string(total_real_edges))
+
+// ═══════════════════════════════════════════════════════════
+// PHASE 5: bridge edge 추정 (autoBridge 알고리즘 근사)
+// autoBridge() 전략:
+//   S1: prefix match (adjacent display layers)
+//   S2: level-adjacency bridging (keyword overlap, min 30 per pair)
+//   S3: domain-keyword thread matching (up to 5 per keyword per pair)
+//   S4: minimum 100 per adjacent pair guarantee
+// 정확한 수는 runtime 에서만 알 수 있지만 하한 추정 가능:
+//   4 adjacent pairs x 100 minimum = 400 bridge minimum
+// ═══════════════════════════════════════════════════════════
+
+let bridge_min_estimate: i64 = 400  // S4 guarantee: 4 pairs x 100
+// compute node distribution across display layers for better estimate
+let l0_nodes = _exec_int("awk '/^@[A-Z?] /{ match($0,/:: *([^ \\[]+)/,m); d=m[1]; if(d==\"foundation\"||d==\"sub_quark\"||d==\"quark\"||d==\"particle\"||d==\"nuclear\"||d==\"number_theory\"||d==\"algebra\"||d==\"topology\"||d==\"geometry\"||d==\"meta\"||d==\"mathematics\") c++ }END{print c+0}' '" + ATLAS_PATH + "' 2>/dev/null")
+let l1_nodes = _exec_int("awk '/^@[A-Z?] /{ match($0,/:: *([^ \\[]+)/,m); d=m[1]; if(d==\"atom\"||d==\"bond\"||d==\"physics\"||d==\"architecture\"||d==\"chemistry\") c++ }END{print c+0}' '" + ATLAS_PATH + "' 2>/dev/null")
+let l2_nodes = _exec_int("awk '/^@[A-Z?] /{ match($0,/:: *([^ \\[]+)/,m); d=m[1]; if(d==\"molecule\"||d==\"genetic\"||d==\"bio\"||d==\"material\"||d==\"consciousness\"||d==\"biology\") c++ }END{print c+0}' '" + ATLAS_PATH + "' 2>/dev/null")
+let l3_nodes = _exec_int("awk '/^@[A-Z?] /{ match($0,/:: *([^ \\[]+)/,m); d=m[1]; if(d==\"geology\"||d==\"meteorology\"||d==\"economics\"||d==\"linguistics\"||d==\"music\"||d==\"oceanography\"||d==\"electrical\"||d==\"crossing\"||d==\"dse\"||d==\"n6atlas\"||d==\"discovery\"||d==\"bt\") c++ }END{print c+0}' '" + ATLAS_PATH + "' 2>/dev/null")
+let l4_nodes = _exec_int("awk '/^@[A-Z?] /{ match($0,/:: *([^ \\[]+)/,m); d=m[1]; if(d==\"celestial\"||d==\"galactic\"||d==\"cosmological\"||d==\"multiversal\"||d==\"convergence\"||d==\"cosmology\") c++ }END{print c+0}' '" + ATLAS_PATH + "' 2>/dev/null")
+
+println("\n  --- layer distribution ---")
+println("  L0 (particles):  " + to_string(l0_nodes))
+println("  L1 (atoms):      " + to_string(l1_nodes))
+println("  L2 (molecules):  " + to_string(l2_nodes))
+println("  L3 (domains):    " + to_string(l3_nodes))
+println("  L4 (cosmic):     " + to_string(l4_nodes))
+
+// better bridge estimate: S1 contributes ~min(nodesA,nodesB) per pair,
+// S2/S3 add more based on keyword overlap, S4 guarantees floor
+// conservative: bridge_est ~ max(400, sum_of_pair_min)
+let pair01 = if l0_nodes < l1_nodes { l0_nodes } else { l1_nodes }
+let pair12 = if l1_nodes < l2_nodes { l1_nodes } else { l2_nodes }
+let pair23 = if l2_nodes < l3_nodes { l2_nodes } else { l3_nodes }
+let pair34 = if l3_nodes < l4_nodes { l3_nodes } else { l4_nodes }
+let mut bridge_estimate = pair01 + pair12 + pair23 + pair34
+if bridge_estimate < bridge_min_estimate { bridge_estimate = bridge_min_estimate }
+
+println("  bridge estimate: ~" + to_string(bridge_estimate) + " (autoBridge S1-S4)")
+println("  info panel fix:  Connections (N real + ~M bridge)")
+
+// ═══════════════════════════════════════════════════════════
+// PHASE 6: mirror 파일 생성 (text format only)
+// ═══════════════════════════════════════════════════════════
+
+if dry_run {
+    println("\n  [dry-run] skipping file write")
+} else {
+    // mtime 비교: 소스가 미러보다 새로우면 갱신
+    let src_mtime = _exec_int("stat -f '%m' '" + ATLAS_PATH + "' 2>/dev/null || stat -c '%Y' '" + ATLAS_PATH + "' 2>/dev/null || echo 0")
+    let mut dst_mtime: i64 = 0
+    if file_exists(mirror_path) {
+        dst_mtime = _exec_int("stat -f '%m' '" + mirror_path + "' 2>/dev/null || stat -c '%Y' '" + mirror_path + "' 2>/dev/null || echo 0")
+    }
+
+    if src_mtime > dst_mtime || !file_exists(mirror_path) {
+        // text-format only: filter out JSON lines (start with '{')
+        try {
+            exec("awk '!/^\\{/' '" + ATLAS_PATH + "' > '" + mirror_path + "'")
+            let new_lines = _exec_int("wc -l < '" + mirror_path + "' 2>/dev/null")
+            println("\n  mirror synced: " + to_string(new_lines) + " lines -> " + mirror_path)
+        } catch e {
+            println("error: failed to write mirror: " + to_string(e))
+            exit(1)
+        }
+    } else {
+        println("\n  mirror up-to-date (src mtime=" + to_string(src_mtime) + " <= dst mtime=" + to_string(dst_mtime) + ")")
+    }
+
+    // ─── meta sidecar: JSON with stats for info panel enhancement ───
+    let ts = _exec_str("date -u +%Y-%m-%dT%H:%M:%SZ")
+    let meta_json = "{\n" +
+        "  \"synced_at\": \"" + ts + "\",\n" +
+        "  \"source\": \"" + ATLAS_PATH + "\",\n" +
+        "  \"text_nodes\": " + to_string(text_node_count) + ",\n" +
+        "  \"json_nodes\": " + to_string(json_node_count) + ",\n" +
+        "  \"json_edges\": " + to_string(json_edge_count) + ",\n" +
+        "  \"real_edges\": {\n" +
+        "    \"depends\": " + to_string(real_dep_edges) + ",\n" +
+        "    \"derives\": " + to_string(real_der_edges) + ",\n" +
+        "    \"equiv\": " + to_string(real_eq_edges) + ",\n" +
+        "    \"total\": " + to_string(total_real_edges) + "\n" +
+        "  },\n" +
+        "  \"bridge_estimate\": " + to_string(bridge_estimate) + ",\n" +
+        "  \"layer_distribution\": {\n" +
+        "    \"L0_particles\": " + to_string(l0_nodes) + ",\n" +
+        "    \"L1_atoms\": " + to_string(l1_nodes) + ",\n" +
+        "    \"L2_molecules\": " + to_string(l2_nodes) + ",\n" +
+        "    \"L3_domains\": " + to_string(l3_nodes) + ",\n" +
+        "    \"L4_cosmic\": " + to_string(l4_nodes) + "\n" +
+        "  },\n" +
+        "  \"annotations\": {\n" +
+        "    \"applications\": " + to_string(app_count) + ",\n" +
+        "    \"convergences\": " + to_string(converge_count) + ",\n" +
+        "    \"verifications\": " + to_string(verified_count) + ",\n" +
+        "    \"breakthroughs\": " + to_string(bt_count) + "\n" +
+        "  },\n" +
+        "  \"info_panel_hint\": \"Connections (N real + ~M bridge) — bridge edges are synthetic from autoBridge()\"\n" +
+        "}"
+
+    try {
+        write_file(meta_path, meta_json)
+        println("  meta written:  " + meta_path)
+    } catch e {
+        println("warn: failed to write meta: " + to_string(e))
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// PHASE 7: 요약
+// ═══════════════════════════════════════════════════════════
+
+let total_nodes = text_node_count
+let total_display_edges = total_real_edges + bridge_estimate
+
+println("\n=== summary ===")
+println("  3D map nodes:     " + to_string(total_nodes))
+println("  real edges:       " + to_string(total_real_edges))
+println("  bridge estimate:  ~" + to_string(bridge_estimate))
+println("  total display:    ~" + to_string(total_display_edges))
+println("  bridge inflation: " + to_string(bridge_estimate * 100 / (total_display_edges + 1)) + "% of visible connections are synthetic")
+println("")
+println("  tip: info panel should show:")
+println("    Connections (X real + ~Y bridge)")
+println("    instead of just Connections (" + to_string(total_display_edges) + ")")
+println("")
+println("done.")

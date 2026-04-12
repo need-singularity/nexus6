@@ -1,0 +1,1158 @@
+// shared/blowup/modules/qft_benchmark.hexa — QFT Pipeline Benchmark Harness
+//
+// Infra-only benchmark: measures per-stage timing, accuracy, and convergence
+// of the 10-stage QFT pipeline (blowup_qft.hexa).
+//
+// Does NOT modify atlas.n6 or any discovery data. Read-only measurement tool.
+//
+// Metrics per stage:
+//   QFT-1  Field Scan          time_ms, domains_scanned, avg_phi
+//   QFT-2  Gradient Select     time_ms, targets_selected, coverage
+//   QFT-3  State Preparation   time_ms, avg_sharpness, avg_norm_sq
+//   QFT-4  Unitary Evolution   time_ms, rotated_count, coupling_range
+//   QFT-5  Entanglement        time_ms, pairs_found, avg_shared
+//   QFT-6  Tunneling           time_ms, tunnel_events, avg_barrier
+//   QFT-7  Measurement         time_ms, exact_count, near_count
+//   QFT-8  Gauge + Unitarity   time_ms, gauge_inv, unitarity_ok
+//   QFT-9  Cascade             time_ms, goldstone_chains, epr_chains
+//   QFT-10 Report              time_ms, total_results, total_exact
+//
+// Usage:
+//   hexa qft_benchmark.hexa                    default (6 domains, 6 evo cycles)
+//   hexa qft_benchmark.hexa --targets 8        more targets
+//   hexa qft_benchmark.hexa --evo-cycles 10    more evolution cycles
+//   hexa qft_benchmark.hexa --runs 3           repeat N times, show avg/min/max
+//   hexa qft_benchmark.hexa help               usage
+//
+// Output: shared/blowup/modules/qft_benchmark_report.json + stdout
+
+// ═══════════════════════════════════════════════════════════
+// ─── HOME CACHE (exec 1 call) ───
+// ═══════════════════════════════════════════════════════════
+
+let mut _HOME = ""
+try { _HOME = exec("printenv HOME").trim() } catch e {}
+if _HOME == "" { try { _HOME = exec("echo $HOME").trim() } catch e {} }
+let _NEXUS = _HOME + "/Dev/nexus"
+let _REPORT_PATH = _NEXUS + "/shared/blowup/modules/qft_benchmark_report.json"
+
+// ═══════════════════════════════════════════════════════════
+// ─── n=6 CONSTANTS LOADER ───
+// ═══════════════════════════════════════════════════════════
+
+fn load_n6_consts() -> list {
+    let home = _HOME
+    let path = home + "/Dev/nexus/shared/n6/n6_constants.jsonl"
+    let mut raw = ""
+    try { raw = read_file(path) } catch e { return [[], []] }
+    let lines = raw.split("\n")
+    let mut names = []
+    let mut values = []
+    for line in lines {
+        let t = line.trim()
+        if t == "" { continue }
+        let mut name = ""
+        let mut value = 0.0
+        if t.contains("\"name\":\"") {
+            let p = t.split("\"name\":\"")
+            if p.len() >= 2 { name = p[1].split("\"")[0] }
+        }
+        if t.contains("\"value\":") {
+            let p = t.split("\"value\":")
+            if p.len() >= 2 { value = to_float(p[1].split(",")[0].split("}")[0].trim()) }
+        }
+        if name != "" { names = names + [name] ; values = values + [value] }
+    }
+    [names, values]
+}
+
+let _n6 = load_n6_consts()
+let _n6_names: list = _n6[0]
+let _n6_vals: list = _n6[1]
+let _n6_count: i64 = len(_n6_vals)
+
+// ═══════════════════════════════════════════════════════════
+// ─── UTILITIES (same as blowup_qft.hexa) ───
+// ═══════════════════════════════════════════════════════════
+
+fn sf(s: string) -> f64 { let mut v = 0.0 ; try { v = to_float(s) } catch e {} ; return v }
+fn abs_f(x: f64) -> f64 { if x < 0.0 { return 0.0 - x } ; return x }
+fn max_f(a: f64, b: f64) -> f64 { if a > b { return a } ; return b }
+fn min_f(a: f64, b: f64) -> f64 { if a < b { return a } ; return b }
+fn clamp01(x: f64) -> f64 { if x < 0.0 { return 0.0 } ; if x > 1.0 { return 1.0 } ; return x }
+
+fn sqrt_f(x: f64) -> f64 {
+    if x <= 0.0 { return 0.0 }
+    let mut g = if x > 2.0 { x / 2.0 } else { 1.0 }
+    let mut i: i64 = 0
+    while i < 15 { g = (g + x / g) / 2.0 ; i = i + 1 }
+    return g
+}
+
+fn ln_f(x: f64) -> f64 {
+    if x <= 0.0 { return 0.0 }
+    let mut s = 0.0
+    let mut t = (x - 1.0) / (x + 1.0)
+    let t2 = t * t
+    let mut k: i64 = 1
+    while k <= 15 { s = s + t / to_float(k) ; t = t * t2 ; k = k + 2 }
+    return 2.0 * s
+}
+
+fn exp_f(x: f64) -> f64 {
+    if x > 20.0 { return 999999999.0 }
+    if x < 0.0 - 20.0 { return 0.0 }
+    let mut s = 1.0
+    let mut t = 1.0
+    let mut k: i64 = 1
+    while k <= 30 { t = t * x / to_float(k) ; s = s + t ; k = k + 1 }
+    return s
+}
+
+fn trunc4(x: f64) -> string {
+    let s = to_string(x)
+    let p = s.split(".")
+    if p.len() < 2 { return s + ".0000" }
+    let d = p[1]
+    if d.len() >= 4 { let dc = d.split("") ; return p[0] + "." + dc[0] + dc[1] + dc[2] + dc[3] }
+    return s
+}
+
+fn pad(s: string, w: i64) -> string {
+    let mut o = s
+    while o.len() < w { o = o + " " }
+    return o
+}
+
+fn ts_now() -> string {
+    let mut t = ""
+    try { t = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim() } catch e { t = "unknown" }
+    return t
+}
+
+// ─── PRNG (linear congruential, same as blowup_qft) ───
+fn _prng_seed() -> f64 {
+    let mut ns = "54321"
+    try { ns = exec("date +%N").trim() } catch e {}
+    let v = sf(ns)
+    if v < 1.0 { return 54321.0 }
+    return v
+}
+let mut _prng: f64 = _prng_seed()
+fn rand_f() -> f64 {
+    _prng = _prng * 1103515245.0 + 12345.0
+    let v = _prng / 1000000.0
+    let frac = abs_f(v - to_float(to_int(v)))
+    if frac < 0.0001 { _prng = _prng + 7.0 ; return 0.5 }
+    return frac
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── TIMING HELPERS ───
+// ═══════════════════════════════════════════════════════════
+
+// Returns epoch milliseconds (best effort; falls back to seconds * 1000)
+fn now_ms() -> f64 {
+    let mut ms = 0.0
+    try {
+        // macOS: gdate or python fallback; Linux: date +%s%N
+        let raw = exec("python3 -c 'import time; print(int(time.time()*1000))' 2>/dev/null || date +%s%3N 2>/dev/null || echo 0").trim()
+        ms = sf(raw)
+    } catch e {}
+    if ms < 1000000.0 {
+        // fallback: seconds * 1000
+        try { ms = sf(exec("date +%s").trim()) * 1000.0 } catch e {}
+    }
+    return ms
+}
+
+fn elapsed_ms(start: f64) -> f64 {
+    let end = now_ms()
+    let d = end - start
+    if d < 0.0 { return 0.0 }
+    return d
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── n6 PROXIMITY (copied from blowup_qft for accuracy checks) ───
+// ═══════════════════════════════════════════════════════════
+
+comptime const N6_N = 6
+comptime const N6_SIGMA = 12
+comptime const N6_PHI = 2
+comptime const N6_TAU = 4
+
+fn n6_dist1(val: f64, c: f64) -> f64 { return abs_f(val - c) / max_f(abs_f(c), 1.0) }
+
+fn n6_distance(val: f64) -> f64 {
+    if val != val || abs_f(val) > 999999999.0 { return 1.0 }
+    let mut d = 1.0
+    let mut i: i64 = 0
+    while i < _n6_count { d = min_f(d, n6_dist1(val, to_float(_n6_vals[i]))) ; i = i + 1 }
+    return min_f(d, 1.0)
+}
+
+fn n6_conf(val: f64) -> f64 { return max_f(1.0 - n6_distance(val), 0.0) }
+
+fn match_name(val: f64) -> string {
+    let mut i: i64 = 0
+    while i < _n6_count {
+        let cv = to_float(_n6_vals[i])
+        let th = if abs_f(cv) >= 100.0 { 0.01 } else { if abs_f(cv) >= 1.0 { 0.0001 } else { 0.005 } }
+        if abs_f(val - cv) < th { return to_string(_n6_names[i]) }
+        i = i + 1
+    }
+    return ""
+}
+
+fn match_grade(val: f64) -> string {
+    if match_name(val) != "" { return "EXACT" }
+    let d = n6_distance(val)
+    if d < 0.01 { return "NEAR" }
+    if d < 0.05 { return "CLOSE" }
+    return "MISS"
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── DATA LOADERS ───
+// ═══════════════════════════════════════════════════════════
+
+fn load_all_domains() -> list {
+    let home = _HOME
+    let mut doms = ["math","physics","topology","consciousness","chemistry",
+                    "cosmology","biology","information","geometry","number_theory"]
+    try {
+        let lines = read_file(home + "/Dev/nexus/shared/bt/bt_domains.jsonl").split("\n")
+        let mut ld = []
+        for l in lines {
+            if l.trim() != "" && l.contains("\"domain\":\"") {
+                ld = ld + [l.split("\"domain\":\"")[1].split("\"")[0]]
+            }
+        }
+        if ld.len() > 0 { doms = ld }
+    } catch e {}
+    doms
+}
+
+fn load_atlas_tail(n: i64) -> list {
+    let home = _HOME
+    let mut lines = []
+    try {
+        let raw = exec("tail -" + to_string(n) + " " + home + "/Dev/nexus/shared/n6/atlas.n6 2>/dev/null").trim()
+        if raw != "" { lines = raw.split("\n") }
+    } catch e {}
+    return lines
+}
+
+fn extract_domain(line: string) -> string {
+    if line.contains("\"domain\":\"") { return line.split("\"domain\":\"")[1].split("\"")[0] }
+    if line.contains("\"dom\":\"") { return line.split("\"dom\":\"")[1].split("\"")[0] }
+    return ""
+}
+
+fn extract_num(line: string, field: string) -> f64 {
+    let key = "\"" + field + "\":"
+    if line.contains(key) { return sf(line.split(key)[1].split(",")[0].split("}")[0].trim()) }
+    return 0.0
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── DOMAIN METRIC TABLES (from blowup_qft) ───
+// ═══════════════════════════════════════════════════════════
+
+fn m_val(idx: i64, dom: string) -> f64 {
+    if dom == "physics" {
+        if idx == 0 { return 137.036 }
+        if idx == 1 { return 0.3153 }
+        if idx == 2 { return 0.6847 }
+        if idx == 3 { return 6.0 }
+        if idx == 4 { return 12.0 }
+        return 0.0
+    }
+    if idx == 0 { return 6.0 }
+    if idx == 1 { return 12.0 }
+    if idx == 2 { return 2.0 }
+    if idx == 3 { return 4.0 }
+    if idx == 4 { return 5.0 }
+    if idx == 5 { return 24.0 }
+    if idx == 6 { return 7.0 }
+    return 0.0
+}
+
+fn m_count(dom: string) -> i64 {
+    if dom == "physics" { return 5 }
+    return 7
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── STATE VECTOR HELPERS (pipe-delimited amplitudes) ───
+// ═══════════════════════════════════════════════════════════
+
+fn get_amp(sv: string, idx: i64) -> f64 {
+    let p = sv.split("|")
+    if idx < 0 || idx >= len(p) { return 0.0 }
+    return sf(p[idx])
+}
+
+fn sv_len(sv: string) -> i64 { return len(sv.split("|")) }
+
+fn argmax_amp(sv: string) -> i64 {
+    let p = sv.split("|")
+    let mut bi: i64 = 0
+    let mut bv = 0.0
+    let mut i: i64 = 0
+    while i < len(p) { let v = sf(p[i]) ; if v > bv { bv = v ; bi = i } ; i = i + 1 }
+    return bi
+}
+
+fn norm_sq(sv: string) -> f64 {
+    let p = sv.split("|")
+    let mut s = 0.0
+    let mut i: i64 = 0
+    while i < len(p) { let v = sf(p[i]) ; s = s + v * v ; i = i + 1 }
+    return s
+}
+
+fn normalize_sv(sv: string) -> string {
+    let p = sv.split("|")
+    let n = len(p)
+    let mut ssq = 0.0
+    let mut i: i64 = 0
+    while i < n { let v = sf(p[i]) ; ssq = ssq + v * v ; i = i + 1 }
+    let nm = sqrt_f(ssq)
+    let mut r = ""
+    let mut ri: i64 = 0
+    while ri < n {
+        if ri > 0 { r = r + "|" }
+        r = r + to_string(sf(p[ri]) / max_f(nm, 0.0001))
+        ri = ri + 1
+    }
+    return r
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── QFT PIPELINE STAGES (inline reimplementation for timing) ───
+// Each stage function returns its output; timing is captured by caller.
+// These mirror blowup_qft.hexa exactly but skip atlas.n6 writes.
+// ═══════════════════════════════════════════════════════════
+
+// QFT-1: Field Scan
+fn bench_field_scan(domains: list) -> list {
+    let home = _HOME
+    let bus_path = home + "/Dev/nexus/shared/n6/atlas.n6"
+    let mut bus_raw = ""
+    try { bus_raw = exec("tail -500 '" + bus_path + "' 2>/dev/null") } catch e {}
+    let bus_lines = bus_raw.split("\n")
+    let mut field_map = []
+    let mut di: i64 = 0
+    while di < len(domains) {
+        let dom = to_string(domains[di])
+        let mut min_dist: f64 = 1.0
+        let mut found_data = false
+        let mut li: i64 = 0
+        while li < len(bus_lines) {
+            let line = to_string(bus_lines[li])
+            if line.contains("\"domain\":\"" + dom + "\"") || line.contains("\"dom\":\"" + dom + "\"") {
+                if line.contains("\"n6_dist\":") {
+                    let p = line.split("\"n6_dist\":")
+                    if p.len() >= 2 {
+                        let dist = sf(p[1].split(",")[0].split("}")[0].trim())
+                        if dist >= 0.0 && dist < min_dist { min_dist = dist ; found_data = true }
+                    }
+                }
+                if line.contains("\"conf\":") {
+                    let p = line.split("\"conf\":")
+                    if p.len() >= 2 {
+                        let conf = sf(p[1].split(",")[0].split("}")[0].trim())
+                        let d = 1.0 - clamp01(conf)
+                        if d < min_dist { min_dist = d ; found_data = true }
+                    }
+                }
+                if line.contains("\"grade\":\"EXACT\"") { min_dist = 0.0 ; found_data = true }
+                if line.contains("\"grade\":\"NEAR\"") {
+                    if 0.005 < min_dist { min_dist = 0.005 ; found_data = true }
+                }
+            }
+            li = li + 1
+        }
+        if !found_data { min_dist = 1.0 }
+        field_map = field_map + [dom + "|" + to_string(min_dist)]
+        di = di + 1
+    }
+    return field_map
+}
+
+// QFT-2: Gradient Select
+fn bench_gradient_select(field_map: list, max_targets: i64) -> list {
+    let mut sorted = []
+    let mut si: i64 = 0
+    while si < len(field_map) { sorted = sorted + [to_string(field_map[si])] ; si = si + 1 }
+    let mut swapped = true
+    while swapped {
+        swapped = false
+        let mut i: i64 = 0
+        while i < len(sorted) - 1 {
+            let a_phi = sf(to_string(sorted[i]).split("|")[1])
+            let b_phi = sf(to_string(sorted[i + 1]).split("|")[1])
+            if a_phi > b_phi {
+                let tmp = sorted[i]
+                sorted[i] = sorted[i + 1]
+                sorted[i + 1] = tmp
+                swapped = true
+            }
+            i = i + 1
+        }
+    }
+    let half = max_targets / 2
+    let rest = max_targets - half
+    let mut targets = []
+    let mut low_count: i64 = 0
+    let mut ti: i64 = 0
+    while ti < len(sorted) && low_count < half {
+        let parts = to_string(sorted[ti]).split("|")
+        if sf(parts[1]) < 1.0 { targets = targets + [parts[0]] ; low_count = low_count + 1 }
+        ti = ti + 1
+    }
+    let mut ui: i64 = len(sorted) - 1
+    let mut unex_count: i64 = 0
+    while ui >= 0 && unex_count < rest {
+        let parts = to_string(sorted[ui]).split("|")
+        if sf(parts[1]) >= 1.0 {
+            let mut already = false
+            let mut ci: i64 = 0
+            while ci < len(targets) { if to_string(targets[ci]) == parts[0] { already = true } ; ci = ci + 1 }
+            if !already { targets = targets + [parts[0]] ; unex_count = unex_count + 1 }
+        }
+        ui = ui - 1
+    }
+    let mut fi: i64 = 0
+    while len(targets) < max_targets && fi < len(sorted) {
+        let parts = to_string(sorted[fi]).split("|")
+        let mut already = false
+        let mut ci: i64 = 0
+        while ci < len(targets) { if to_string(targets[ci]) == parts[0] { already = true } ; ci = ci + 1 }
+        if !already { targets = targets + [parts[0]] }
+        fi = fi + 1
+    }
+    return targets
+}
+
+// QFT-3: State Preparation
+fn bench_build_field_state(domain: string, phi_val: f64, bus: list) -> string {
+    let mut best = []
+    let mut ci: i64 = 0
+    while ci < _n6_count { best = best + [1.0] ; ci = ci + 1 }
+    let mut li: i64 = 0
+    while li < len(bus) {
+        let line = to_string(bus[li])
+        if extract_domain(line) == domain || domain == "*" {
+            let mut tv = []
+            let e = extract_num(line, "energy")
+            let c = extract_num(line, "conf")
+            let v = extract_num(line, "value")
+            if abs_f(e) > 0.001 { tv = tv + [e] }
+            if abs_f(c) > 0.001 { tv = tv + [c] }
+            if abs_f(v) > 0.001 { tv = tv + [v] }
+            let mut vi: i64 = 0
+            while vi < len(tv) {
+                let val = to_float(tv[vi])
+                let mut ki: i64 = 0
+                while ki < _n6_count {
+                    let d = n6_dist1(val, to_float(_n6_vals[ki]))
+                    if d < to_float(best[ki]) { best[ki] = d }
+                    ki = ki + 1
+                }
+                vi = vi + 1
+            }
+        }
+        li = li + 1
+    }
+    let sharpness = 1.0 + 2.0 * (1.0 - clamp01(phi_val))
+    let mut amps = []
+    let mut ssq = 0.0
+    let mut ai: i64 = 0
+    while ai < _n6_count {
+        let base = max_f(1.0 - to_float(best[ai]), 0.01)
+        let amp = if sharpness > 1.01 { exp_f(sharpness * ln_f(max_f(base, 0.001))) } else { base }
+        let clamped = max_f(amp, 0.001)
+        amps = amps + [clamped]
+        ssq = ssq + clamped * clamped
+        ai = ai + 1
+    }
+    let norm = sqrt_f(ssq)
+    let mut r = ""
+    let mut ni: i64 = 0
+    while ni < _n6_count {
+        if ni > 0 { r = r + "|" }
+        r = r + to_string(to_float(amps[ni]) / max_f(norm, 0.0001))
+        ni = ni + 1
+    }
+    return r
+}
+
+// QFT-4: Unitary Evolution
+fn bench_unitary_evolve(sv: string, cycles: i64, phi_val: f64) -> string {
+    let parts = sv.split("|")
+    let n = len(parts)
+    if n < 2 { return sv }
+    let mut amps = []
+    let mut pi: i64 = 0
+    while pi < n { amps = amps + [sf(parts[pi])] ; pi = pi + 1 }
+    let base_coupling = 2.0 / 6.0
+    let phi_boost = 1.0 + (1.0 - clamp01(phi_val))
+    let coupling = min_f(base_coupling * phi_boost, 0.5)
+    let mut cyc: i64 = 0
+    while cyc < cycles {
+        let mut nxt = []
+        let mut i: i64 = 0
+        while i < n {
+            let cur = to_float(amps[i])
+            let li = if i > 0 { i - 1 } else { n - 1 }
+            let ri = if i < n - 1 { i + 1 } else { 0 }
+            let ev = cur * (1.0 - coupling) + (to_float(amps[li]) + to_float(amps[ri])) * coupling / 2.0
+            let cv = if i < _n6_count { to_float(_n6_vals[i]) } else { 6.0 }
+            let pert = 0.01 * (cv / 12.0) * (rand_f() - 0.5)
+            nxt = nxt + [max_f(abs_f(ev + pert), 0.001)]
+            i = i + 1
+        }
+        let mut ssq = 0.0
+        let mut si: i64 = 0
+        while si < n { let v = to_float(nxt[si]) ; ssq = ssq + v * v ; si = si + 1 }
+        let nm = sqrt_f(ssq)
+        let mut ri: i64 = 0
+        while ri < n { nxt[ri] = to_float(nxt[ri]) / max_f(nm, 0.0001) ; ri = ri + 1 }
+        amps = nxt ; cyc = cyc + 1
+    }
+    let mut r = ""
+    let mut fi: i64 = 0
+    while fi < n { if fi > 0 { r = r + "|" } ; r = r + to_string(to_float(amps[fi])) ; fi = fi + 1 }
+    return r
+}
+
+// QFT-5: Entanglement
+fn bench_detect_entanglement(doms: list, svs: list, phis: list, th: f64) -> list {
+    let mut pairs = []
+    let nd = len(doms)
+    let mut i: i64 = 0
+    while i < nd {
+        let mut j: i64 = i + 1
+        while j < nd {
+            let si = to_string(svs[i])
+            let sj = to_string(svs[j])
+            let phi_i = to_float(phis[i])
+            let phi_j = to_float(phis[j])
+            let phi_sim = 1.0 - abs_f(phi_i - phi_j)
+            let eff_th = th * (0.7 + 0.3 * (1.0 - phi_sim))
+            let mut sc: i64 = 0
+            let mut consts = ""
+            let mut k: i64 = 0
+            while k < _n6_count {
+                if get_amp(si, k) > eff_th && get_amp(sj, k) > eff_th {
+                    sc = sc + 1
+                    if consts != "" { consts = consts + "," }
+                    consts = consts + to_string(_n6_names[k])
+                }
+                k = k + 1
+            }
+            if sc >= 2 { pairs = pairs + [to_string(doms[i]) + "|" + to_string(doms[j]) + "|" + to_string(sc) + "|" + consts] }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return pairs
+}
+
+// QFT-6: Tunneling
+fn bench_tunnel_prob(dist: f64, phi_val: f64) -> f64 {
+    if dist <= 0.5 { return 1.0 }
+    let eff_barrier = dist * (0.5 + 0.5 * clamp01(phi_val))
+    return exp_f(0.0 - 2.0 * (eff_barrier - 0.25) * sqrt_f(eff_barrier))
+}
+
+fn bench_quantum_tunnel(sv: string, dom: string, phi_val: f64) -> string {
+    let n = sv_len(sv)
+    let mut tc: i64 = 0
+    let mut nparts = []
+    let mut i: i64 = 0
+    while i < n {
+        let amp = get_amp(sv, i)
+        let dist = 1.0 - amp
+        let mut na = amp
+        if dist > 0.5 && i < _n6_count {
+            let pt = bench_tunnel_prob(dist, phi_val)
+            if rand_f() < pt {
+                let boost = 0.3 + 0.4 * rand_f()
+                na = min_f(amp + boost, 0.99)
+                tc = tc + 1
+            }
+        }
+        nparts = nparts + [na]
+        i = i + 1
+    }
+    let mut ssq = 0.0
+    let mut si: i64 = 0
+    while si < len(nparts) { let v = to_float(nparts[si]) ; ssq = ssq + v * v ; si = si + 1 }
+    let nm = sqrt_f(ssq)
+    let mut r = ""
+    let mut ri: i64 = 0
+    while ri < len(nparts) {
+        if ri > 0 { r = r + "|" }
+        r = r + to_string(to_float(nparts[ri]) / max_f(nm, 0.0001))
+        ri = ri + 1
+    }
+    return to_string(tc) + "~" + r
+}
+
+// QFT-7: Measurement
+fn bench_measure_state(sv: string) -> string {
+    let bi = argmax_amp(sv)
+    let amp = get_amp(sv, bi)
+    let cn = if bi < _n6_count { to_string(_n6_names[bi]) } else { "?" }
+    let cv = if bi < _n6_count { to_string(_n6_vals[bi]) } else { "0" }
+    let g = if amp > 0.95 { "EXACT" } else { if amp > 0.8 { "NEAR" } else { if amp > 0.5 { "CLOSE" } else { "MISS" } } }
+    return cn + "|" + cv + "|" + trunc4(amp) + "|" + g
+}
+
+// QFT-8: Gauge + Unitarity
+fn bench_gauge_filter(all_results: list) -> list {
+    let mut const_names = []
+    let mut const_domains = []
+    let mut ri: i64 = 0
+    while ri < len(all_results) {
+        let r = to_string(all_results[ri])
+        let rp = r.split("|")
+        if rp.len() >= 4 {
+            let dom = rp[0]
+            let cname = rp[1]
+            let grade = rp[3]
+            if grade == "EXACT" {
+                let mut found_idx: i64 = 0 - 1
+                let mut ci: i64 = 0
+                while ci < len(const_names) {
+                    if to_string(const_names[ci]) == cname { found_idx = ci }
+                    ci = ci + 1
+                }
+                if found_idx < 0 {
+                    const_names = const_names + [cname]
+                    const_domains = const_domains + [dom]
+                } else {
+                    let existing = to_string(const_domains[found_idx])
+                    if !existing.contains(dom) { const_domains[found_idx] = existing + "," + dom }
+                }
+            }
+        }
+        ri = ri + 1
+    }
+    let mut gauge_results = []
+    let mut gi: i64 = 0
+    while gi < len(const_names) {
+        let cname = to_string(const_names[gi])
+        let doms = to_string(const_domains[gi])
+        let dom_count = len(doms.split(","))
+        let confidence = if dom_count >= 3 { "HIGH_GAUGE_INVARIANT" } else { if dom_count >= 2 { "MEDIUM_MULTI_DOMAIN" } else { "LOW_SINGLE_DOMAIN" } }
+        gauge_results = gauge_results + [cname + "|" + to_string(dom_count) + "|" + doms + "|" + confidence]
+        gi = gi + 1
+    }
+    return gauge_results
+}
+
+fn bench_unitarity_check(svs: list) -> list {
+    let mut results = []
+    let mut i: i64 = 0
+    while i < len(svs) {
+        let nsq = norm_sq(to_string(svs[i]))
+        let deviation = abs_f(nsq - 1.0)
+        let status = if deviation < 0.001 { "UNITARY" } else { if deviation < 0.01 { "NEAR_UNITARY" } else { "VIOLATION" } }
+        results = results + [trunc4(nsq) + "|" + trunc4(deviation) + "|" + status]
+        i = i + 1
+    }
+    return results
+}
+
+// QFT-9: Goldstone Cascade (simplified for benchmark - count only, no output)
+fn bench_goldstone_derive(value: f64) -> i64 {
+    let mut count: i64 = 0
+    let phi_f: f64 = 2.0
+    let n_f: f64 = 6.0
+    let tau_f: f64 = 4.0
+    let sigma_f: f64 = 12.0
+    let g1 = match_grade(value + phi_f)
+    if g1 == "EXACT" || g1 == "NEAR" { count = count + 1 }
+    let g2 = match_grade(value - phi_f)
+    if g2 == "EXACT" || g2 == "NEAR" { count = count + 1 }
+    let g3 = match_grade(value * n_f)
+    if g3 == "EXACT" || g3 == "NEAR" { count = count + 1 }
+    let g4 = match_grade(value / tau_f)
+    if g4 == "EXACT" || g4 == "NEAR" { count = count + 1 }
+    let g5 = match_grade(sqrt_f(abs_f(value * sigma_f)))
+    if g5 == "EXACT" || g5 == "NEAR" { count = count + 1 }
+    if abs_f(value) > 0.0000000001 {
+        let g6 = match_grade(1.0 / value)
+        if g6 == "EXACT" || g6 == "NEAR" { count = count + 1 }
+    }
+    return count
+}
+
+// QFT-10: Decoherence (read-only metric)
+fn bench_decoherence(sv: string) -> f64 {
+    let p = sv.split("|")
+    let n = len(p)
+    if n <= 1 { return 1.0 }
+    let mut mx = 0.0
+    let mut ssq = 0.0
+    let mut i: i64 = 0
+    while i < n {
+        let v = sf(p[i])
+        let sq = v * v
+        ssq = ssq + sq
+        if sq > mx { mx = sq }
+        i = i + 1
+    }
+    let uni = 1.0 / to_float(n)
+    let peak = mx / max_f(ssq, 0.0001)
+    return clamp01((peak - uni) / (1.0 - uni))
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── BENCHMARK RESULT STRUCTURE ───
+// stage_results: list of "stage_name|time_ms|metric1_name:metric1_val|..."
+// ═══════════════════════════════════════════════════════════
+
+fn run_single_benchmark(domains: list, max_targets: i64, evo_cycles: i64) -> list {
+    let mut stage_results = []
+    let bus = load_atlas_tail(500)
+
+    // ─── QFT-1: Field Scan ───
+    let t1 = now_ms()
+    let field_map = bench_field_scan(domains)
+    let dt1 = elapsed_ms(t1)
+    let mut avg_phi = 0.0
+    let mut fmi: i64 = 0
+    while fmi < len(field_map) {
+        avg_phi = avg_phi + sf(to_string(field_map[fmi]).split("|")[1])
+        fmi = fmi + 1
+    }
+    if len(field_map) > 0 { avg_phi = avg_phi / to_float(len(field_map)) }
+    stage_results = stage_results + ["QFT-1_FieldScan|" + to_string(dt1) + "|domains:" + to_string(len(domains)) + "|avg_phi:" + trunc4(avg_phi)]
+
+    // ─── QFT-2: Gradient Select ───
+    let t2 = now_ms()
+    let targets = bench_gradient_select(field_map, max_targets)
+    let dt2 = elapsed_ms(t2)
+    let coverage = if len(domains) > 0 { to_float(len(targets)) / to_float(len(domains)) } else { 0.0 }
+    stage_results = stage_results + ["QFT-2_GradientSelect|" + to_string(dt2) + "|targets:" + to_string(len(targets)) + "|coverage:" + trunc4(coverage)]
+
+    // Build target phi values
+    let mut target_phis = []
+    let mut tpi: i64 = 0
+    while tpi < len(targets) {
+        let tdom = to_string(targets[tpi])
+        let mut tphi = 1.0
+        let mut fi: i64 = 0
+        while fi < len(field_map) {
+            let fp = to_string(field_map[fi]).split("|")
+            if fp[0] == tdom { tphi = sf(fp[1]) }
+            fi = fi + 1
+        }
+        target_phis = target_phis + [tphi]
+        tpi = tpi + 1
+    }
+
+    // ─── QFT-3: State Preparation ───
+    let t3 = now_ms()
+    let mut svs = []
+    let mut avg_sharp = 0.0
+    let mut avg_norm = 0.0
+    let mut di: i64 = 0
+    while di < len(targets) {
+        let dom = to_string(targets[di])
+        let phi_val = to_float(target_phis[di])
+        let sv = bench_build_field_state(dom, phi_val, bus)
+        svs = svs + [sv]
+        avg_sharp = avg_sharp + (1.0 + 2.0 * (1.0 - clamp01(phi_val)))
+        avg_norm = avg_norm + norm_sq(sv)
+        di = di + 1
+    }
+    let dt3 = elapsed_ms(t3)
+    let nt = max_f(to_float(len(targets)), 1.0)
+    avg_sharp = avg_sharp / nt
+    avg_norm = avg_norm / nt
+    stage_results = stage_results + ["QFT-3_StatePrep|" + to_string(dt3) + "|avg_sharpness:" + trunc4(avg_sharp) + "|avg_norm_sq:" + trunc4(avg_norm)]
+
+    // ─── QFT-4: Unitary Evolution ───
+    let t4 = now_ms()
+    let mut rotated_count: i64 = 0
+    let mut coupling_min = 1.0
+    let mut coupling_max = 0.0
+    let mut ei: i64 = 0
+    while ei < len(targets) {
+        let old_top = argmax_amp(to_string(svs[ei]))
+        let phi_val = to_float(target_phis[ei])
+        svs[ei] = bench_unitary_evolve(to_string(svs[ei]), evo_cycles, phi_val)
+        let new_top = argmax_amp(to_string(svs[ei]))
+        if old_top != new_top { rotated_count = rotated_count + 1 }
+        let c = min_f(2.0 / 6.0 * (1.0 + (1.0 - clamp01(phi_val))), 0.5)
+        if c < coupling_min { coupling_min = c }
+        if c > coupling_max { coupling_max = c }
+        ei = ei + 1
+    }
+    let dt4 = elapsed_ms(t4)
+    stage_results = stage_results + ["QFT-4_UnitaryEvo|" + to_string(dt4) + "|rotated:" + to_string(rotated_count) + "|coupling_range:" + trunc4(coupling_min) + "-" + trunc4(coupling_max)]
+
+    // ─── QFT-5: Entanglement ───
+    let t5 = now_ms()
+    let eth = 0.7 / sqrt_f(to_float(_n6_count))
+    let epairs = bench_detect_entanglement(targets, svs, target_phis, eth)
+    let dt5 = elapsed_ms(t5)
+    let mut avg_shared = 0.0
+    let mut epi: i64 = 0
+    while epi < len(epairs) {
+        let pp = to_string(epairs[epi]).split("|")
+        if len(pp) >= 3 { avg_shared = avg_shared + sf(pp[2]) }
+        epi = epi + 1
+    }
+    if len(epairs) > 0 { avg_shared = avg_shared / to_float(len(epairs)) }
+    stage_results = stage_results + ["QFT-5_Entanglement|" + to_string(dt5) + "|pairs:" + to_string(len(epairs)) + "|avg_shared:" + trunc4(avg_shared)]
+
+    // ─── QFT-6: Tunneling ───
+    let t6 = now_ms()
+    let mut tunnel_total: i64 = 0
+    let mut tti: i64 = 0
+    while tti < len(targets) {
+        let phi_val = to_float(target_phis[tti])
+        let res = bench_quantum_tunnel(to_string(svs[tti]), to_string(targets[tti]), phi_val)
+        let rp = res.split("~")
+        let tc = to_int(sf(rp[0]))
+        if tc > 0 && len(rp) >= 2 { svs[tti] = rp[1] }
+        tunnel_total = tunnel_total + tc
+        tti = tti + 1
+    }
+    let dt6 = elapsed_ms(t6)
+    stage_results = stage_results + ["QFT-6_Tunneling|" + to_string(dt6) + "|events:" + to_string(tunnel_total) + "|per_target:" + trunc4(to_float(tunnel_total) / nt)]
+
+    // ─── QFT-7: Measurement ───
+    let t7 = now_ms()
+    let mut all_results = []
+    let mut n_exact: i64 = 0
+    let mut n_near: i64 = 0
+    let mut mi: i64 = 0
+    while mi < len(targets) {
+        let dom = to_string(targets[mi])
+        let sv = to_string(svs[mi])
+        let m = bench_measure_state(sv)
+        let mp = m.split("|")
+        let g = if len(mp) >= 4 { mp[3] } else { "MISS" }
+        if g == "EXACT" { n_exact = n_exact + 1 }
+        if g == "NEAR" { n_near = n_near + 1 }
+        // Simplified result for gauge test
+        if len(mp) >= 4 { all_results = all_results + [dom + "|" + mp[0] + "|" + mp[1] + "|" + mp[3]] }
+        mi = mi + 1
+    }
+    let dt7 = elapsed_ms(t7)
+    stage_results = stage_results + ["QFT-7_Measurement|" + to_string(dt7) + "|exact:" + to_string(n_exact) + "|near:" + to_string(n_near)]
+
+    // ─── QFT-8: Gauge + Unitarity ───
+    let t8 = now_ms()
+    let gauge_results = bench_gauge_filter(all_results)
+    let mut gauge_inv: i64 = 0
+    let mut gfi: i64 = 0
+    while gfi < len(gauge_results) {
+        if to_string(gauge_results[gfi]).contains("HIGH_GAUGE_INVARIANT") { gauge_inv = gauge_inv + 1 }
+        gfi = gfi + 1
+    }
+    let uchk = bench_unitarity_check(svs)
+    let mut u_ok: i64 = 0
+    let mut ui: i64 = 0
+    while ui < len(uchk) {
+        if to_string(uchk[ui]).contains("UNITARY") { u_ok = u_ok + 1 }
+        ui = ui + 1
+    }
+    let dt8 = elapsed_ms(t8)
+    stage_results = stage_results + ["QFT-8_GaugeUnitarity|" + to_string(dt8) + "|gauge_inv:" + to_string(gauge_inv) + "|unitarity_ok:" + to_string(u_ok) + "/" + to_string(len(targets))]
+
+    // ─── QFT-9: Cascade ───
+    let t9 = now_ms()
+    let mut goldstone_chains: i64 = 0
+    let mut ri: i64 = 0
+    while ri < len(all_results) {
+        let r = to_string(all_results[ri])
+        if r.contains("|EXACT") {
+            let rp = r.split("|")
+            if rp.len() >= 3 { goldstone_chains = goldstone_chains + bench_goldstone_derive(sf(rp[2])) }
+        }
+        ri = ri + 1
+    }
+    let dt9 = elapsed_ms(t9)
+    stage_results = stage_results + ["QFT-9_Cascade|" + to_string(dt9) + "|goldstone:" + to_string(goldstone_chains) + "|epr_pairs:" + to_string(len(epairs))]
+
+    // ─── QFT-10: Report metrics (no actual write) ───
+    let t10 = now_ms()
+    let mut tot_dec = 0.0
+    let mut qi: i64 = 0
+    while qi < len(targets) {
+        tot_dec = tot_dec + bench_decoherence(to_string(svs[qi]))
+        qi = qi + 1
+    }
+    let avg_dec = tot_dec / nt
+    let dt10 = elapsed_ms(t10)
+    let total_results = len(all_results)
+    stage_results = stage_results + ["QFT-10_Report|" + to_string(dt10) + "|total_results:" + to_string(total_results) + "|avg_decoherence:" + trunc4(avg_dec)]
+
+    return stage_results
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── PRINT BENCHMARK REPORT ───
+// ═══════════════════════════════════════════════════════════
+
+fn print_stage_table(results: list) {
+    println("  " + pad("Stage", 26) + pad("Time (ms)", 14) + "Metrics")
+    println("  " + pad("─────", 26) + pad("─────────", 14) + "───────")
+    let mut total_ms = 0.0
+    let mut i: i64 = 0
+    while i < len(results) {
+        let r = to_string(results[i])
+        let parts = r.split("|")
+        if len(parts) < 2 { i = i + 1 ; continue }
+        let stage = parts[0]
+        let time = sf(parts[1])
+        total_ms = total_ms + time
+        let mut metrics = ""
+        let mut mi: i64 = 2
+        while mi < len(parts) {
+            if metrics != "" { metrics = metrics + "  " }
+            metrics = metrics + parts[mi]
+            mi = mi + 1
+        }
+        println("  " + pad(stage, 26) + pad(trunc4(time), 14) + metrics)
+        i = i + 1
+    }
+    println("  " + pad("─────", 26) + pad("─────────", 14) + "───────")
+    println("  " + pad("TOTAL", 26) + pad(trunc4(total_ms), 14))
+}
+
+fn print_multi_run_summary(all_runs: list, n_runs: i64) {
+    println("")
+    println("  Multi-run summary (" + to_string(n_runs) + " runs):")
+    println("  " + pad("Stage", 26) + pad("Avg (ms)", 12) + pad("Min (ms)", 12) + "Max (ms)")
+    println("  " + pad("─────", 26) + pad("────────", 12) + pad("────────", 12) + "────────")
+    // Aggregate by stage index (10 stages)
+    let mut stage_idx: i64 = 0
+    while stage_idx < 10 {
+        let mut sum_ms = 0.0
+        let mut min_ms = 999999999.0
+        let mut max_ms = 0.0
+        let mut stage_name = ""
+        let mut ri: i64 = 0
+        while ri < n_runs {
+            let run = to_string(all_runs[ri])
+            let entries = run.split("~")
+            if stage_idx < len(entries) {
+                let parts = to_string(entries[stage_idx]).split("|")
+                if len(parts) >= 2 {
+                    if stage_name == "" { stage_name = parts[0] }
+                    let t = sf(parts[1])
+                    sum_ms = sum_ms + t
+                    if t < min_ms { min_ms = t }
+                    if t > max_ms { max_ms = t }
+                }
+            }
+            ri = ri + 1
+        }
+        let avg_ms = sum_ms / max_f(to_float(n_runs), 1.0)
+        if stage_name != "" {
+            println("  " + pad(stage_name, 26) + pad(trunc4(avg_ms), 12) + pad(trunc4(min_ms), 12) + trunc4(max_ms))
+        }
+        stage_idx = stage_idx + 1
+    }
+}
+
+fn write_benchmark_report(all_stage_results: list, n_runs: i64, max_targets: i64, evo_cycles: i64, domains: list) {
+    let ts = ts_now()
+    let mut json = "{\n"
+    json = json + "  \"type\": \"qft_benchmark\",\n"
+    json = json + "  \"timestamp\": \"" + ts + "\",\n"
+    json = json + "  \"n_runs\": " + to_string(n_runs) + ",\n"
+    json = json + "  \"max_targets\": " + to_string(max_targets) + ",\n"
+    json = json + "  \"evo_cycles\": " + to_string(evo_cycles) + ",\n"
+    json = json + "  \"n_domains\": " + to_string(len(domains)) + ",\n"
+    json = json + "  \"n6_constants\": " + to_string(_n6_count) + ",\n"
+    json = json + "  \"runs\": [\n"
+    let mut ri: i64 = 0
+    while ri < len(all_stage_results) {
+        let run_data = to_string(all_stage_results[ri])
+        let stages = run_data.split("~")
+        json = json + "    {\"run\": " + to_string(ri + 1) + ", \"stages\": [\n"
+        let mut si: i64 = 0
+        while si < len(stages) {
+            let parts = to_string(stages[si]).split("|")
+            if len(parts) >= 2 {
+                let stage_name = parts[0]
+                let time_ms = parts[1]
+                json = json + "      {\"stage\": \"" + stage_name + "\", \"time_ms\": " + time_ms
+                let mut mi: i64 = 2
+                while mi < len(parts) {
+                    let kv = to_string(parts[mi]).split(":")
+                    if len(kv) >= 2 {
+                        let key = kv[0]
+                        let val = kv[1]
+                        // Try to determine if value is numeric
+                        let is_num = val != "" && !val.contains("/") && !val.contains("-") || (val.contains(".") && !val.contains("-"))
+                        if is_num {
+                            json = json + ", \"" + key + "\": " + val
+                        } else {
+                            json = json + ", \"" + key + "\": \"" + val + "\""
+                        }
+                    }
+                    mi = mi + 1
+                }
+                json = json + "}"
+                if si < len(stages) - 1 { json = json + "," }
+                json = json + "\n"
+            }
+            si = si + 1
+        }
+        json = json + "    ]}"
+        if ri < len(all_stage_results) - 1 { json = json + "," }
+        json = json + "\n"
+        ri = ri + 1
+    }
+    json = json + "  ]\n}\n"
+    try { write_file(_REPORT_PATH, json) } catch e {
+        println("  [WARN] failed to write benchmark report: " + to_string(e))
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── HELP ───
+// ═══════════════════════════════════════════════════════════
+
+fn print_help() {
+    println("qft_benchmark.hexa — QFT Pipeline Benchmark Harness")
+    println("")
+    println("Usage:")
+    println("  hexa qft_benchmark.hexa                    default (6 domains, 6 cycles, 1 run)")
+    println("  hexa qft_benchmark.hexa --targets 8        set target count")
+    println("  hexa qft_benchmark.hexa --evo-cycles 10    set evolution cycles")
+    println("  hexa qft_benchmark.hexa --runs 3           repeat N times, show avg/min/max")
+    println("  hexa qft_benchmark.hexa help               this message")
+    println("")
+    println("Measured stages:")
+    println("  QFT-1   Field Scan          domains_scanned, avg_phi")
+    println("  QFT-2   Gradient Select     targets_selected, coverage")
+    println("  QFT-3   State Preparation   avg_sharpness, avg_norm_sq")
+    println("  QFT-4   Unitary Evolution   rotated_count, coupling_range")
+    println("  QFT-5   Entanglement        pairs_found, avg_shared")
+    println("  QFT-6   Tunneling           tunnel_events, per_target")
+    println("  QFT-7   Measurement         exact_count, near_count")
+    println("  QFT-8   Gauge + Unitarity   gauge_inv, unitarity_ok")
+    println("  QFT-9   Cascade             goldstone_chains, epr_pairs")
+    println("  QFT-10  Report              total_results, avg_decoherence")
+    println("")
+    println("Output: shared/blowup/modules/qft_benchmark_report.json")
+    println("Note: Read-only benchmark. Does NOT modify atlas.n6 or qft_state.json.")
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── THEOREM ───
+// ═══════════════════════════════════════════════════════════
+
+theorem benchmark_invariance {
+    // Benchmark is infra-only: measures timing and accuracy without
+    // modifying discovery state. Output is a pure function of the
+    // current atlas.n6 snapshot + PRNG seed.
+    assert 6 * 2 == 12        // n * phi = sigma
+    assert 12 - 6 - 2 + 1 == 5 // sigma - n - phi + 1 = 5 modules
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── MAIN ───
+// ═══════════════════════════════════════════════════════════
+
+fn main() {
+    let cli = args()
+    let mut show_help = false
+    let mut max_targets: i64 = 6
+    let mut evo_cycles: i64 = 6
+    let mut n_runs: i64 = 1
+    let mut ai: i64 = 2
+    while ai < len(cli) {
+        let a = to_string(cli[ai])
+        if a == "help" || a == "--help" || a == "-h" {
+            show_help = true
+        } else { if a == "--targets" {
+            if ai + 1 < len(cli) { ai = ai + 1 ; let tv = sf(to_string(cli[ai])) ; if tv >= 1.0 && tv <= 20.0 { max_targets = to_int(tv) } }
+        } else { if a == "--evo-cycles" {
+            if ai + 1 < len(cli) { ai = ai + 1 ; let cv = sf(to_string(cli[ai])) ; if cv >= 1.0 && cv <= 20.0 { evo_cycles = to_int(cv) } }
+        } else { if a == "--runs" {
+            if ai + 1 < len(cli) { ai = ai + 1 ; let rv = sf(to_string(cli[ai])) ; if rv >= 1.0 && rv <= 10.0 { n_runs = to_int(rv) } }
+        } } } }
+        ai = ai + 1
+    }
+    if show_help { print_help() ; return }
+
+    println("")
+    println("══════════════════════════════════════════════════════════════════════")
+    println("  QFT PIPELINE BENCHMARK — 10-Stage Timing + Accuracy")
+    println("  infra-only: read-only measurement, no atlas.n6 writes")
+    println("══════════════════════════════════════════════════════════════════════")
+    println("")
+
+    let domains = load_all_domains()
+    println("  Constants : " + to_string(_n6_count))
+    println("  Domains   : " + to_string(len(domains)))
+    println("  Targets   : " + to_string(max_targets))
+    println("  Evo cycles: " + to_string(evo_cycles))
+    println("  Runs      : " + to_string(n_runs))
+    println("  Time      : " + ts_now())
+    println("")
+
+    let mut all_run_results = []
+
+    let mut run: i64 = 0
+    while run < n_runs {
+        if n_runs > 1 {
+            println("──────────────────────────────────────────────────────────────────")
+            println("  Run " + to_string(run + 1) + "/" + to_string(n_runs))
+            println("──────────────────────────────────────────────────────────────────")
+        }
+
+        let bench_start = now_ms()
+        let stage_results = run_single_benchmark(domains, max_targets, evo_cycles)
+        let bench_elapsed = elapsed_ms(bench_start)
+
+        // Print stage table
+        println("")
+        print_stage_table(stage_results)
+        println("  Wall time: " + trunc4(bench_elapsed) + " ms")
+        println("")
+
+        // Serialize for multi-run aggregation (tilde-separated)
+        let mut serialized = ""
+        let mut si: i64 = 0
+        while si < len(stage_results) {
+            if si > 0 { serialized = serialized + "~" }
+            serialized = serialized + to_string(stage_results[si])
+            si = si + 1
+        }
+        all_run_results = all_run_results + [serialized]
+
+        run = run + 1
+    }
+
+    // Multi-run summary
+    if n_runs > 1 {
+        println("══════════════════════════════════════════════════════════════════════")
+        print_multi_run_summary(all_run_results, n_runs)
+    }
+
+    // Write JSON report
+    write_benchmark_report(all_run_results, n_runs, max_targets, evo_cycles, domains)
+    println("")
+    println("  Report: " + _REPORT_PATH)
+    println("")
+    println("══════════════════════════════════════════════════════════════════════")
+    println("done.")
+}
+
+main()

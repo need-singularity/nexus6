@@ -1,1 +1,0 @@
-discovery/alien/alien_index_frontier.md

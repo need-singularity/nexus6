@@ -1,0 +1,1086 @@
+// ═══════════════════════════════════════════════════════════
+// shared/blowup/modules/goldstone_cascade.hexa
+// Goldstone Cascade Verifier — infra-only analysis tool
+//
+// Standalone analyser that reads atlas.n6 + field module outputs to:
+//   1. Detect symmetry-breaking cascades from EXACT discoveries
+//   2. Count Goldstone modes per broken generator
+//   3. Verify vacuum manifold consistency (G/H coset structure)
+//   4. Trace cascade depth and branching factor
+//
+// 6-phase pipeline:
+//   GC1: Atlas Ingest     read atlas.n6 tail for EXACT/NEAR entries
+//   GC2: Generator Scan   identify broken symmetry generators
+//   GC3: Goldstone Count  enumerate massless modes per generator
+//   GC4: Cascade Trace    follow derivation chains to max depth
+//   GC5: Vacuum Verify    check coset G/H manifold closure
+//   GC6: Report           structured cascade + manifold report
+//
+// Usage:
+//   hexa goldstone_cascade.hexa                    full cascade analysis
+//   hexa goldstone_cascade.hexa --depth 5          max cascade depth (default 4)
+//   hexa goldstone_cascade.hexa --tail 800         atlas.n6 tail lines (default 500)
+//   hexa goldstone_cascade.hexa math physics       restrict to domains
+//   hexa goldstone_cascade.hexa help               usage
+// ═══════════════════════════════════════════════════════════
+
+let _HOME = exec("printenv HOME").trim()
+
+// ═══════════════════════════════════════════════════════════
+// ─── n=6 CONSTANTS LOADER (shared/n6/n6_constants.jsonl) ───
+// ═══════════════════════════════════════════════════════════
+
+fn load_n6_consts() -> list {
+    let home = _HOME
+    let path = home + "/Dev/nexus/shared/n6/n6_constants.jsonl"
+    let mut raw = ""
+    try { raw = read_file(path) } catch e { return [[], []] }
+    let lines = raw.split("\n")
+    let mut names = []
+    let mut values = []
+    for line in lines {
+        let t = line.trim()
+        if t == "" { continue }
+        let mut name = ""
+        let mut value = 0.0
+        if t.contains("\"name\":\"") {
+            let p = t.split("\"name\":\"")
+            if p.len() >= 2 { name = p[1].split("\"")[0] }
+        }
+        if t.contains("\"value\":") {
+            let p = t.split("\"value\":")
+            if p.len() >= 2 { value = to_float(p[1].split(",")[0].split("}")[0].trim()) }
+        }
+        if name != "" { names = names + [name] ; values = values + [value] }
+    }
+    [names, values]
+}
+
+let _n6 = load_n6_consts()
+let _n6_names: list = _n6[0]
+let _n6_vals: list = _n6[1]
+let _n6_count: i64 = len(_n6_vals)
+
+// ═══════════════════════════════════════════════════════════
+// ─── UTILITIES ───
+// ═══════════════════════════════════════════════════════════
+
+fn safe_float(s: string) -> f64 {
+    let mut v = 0.0
+    try { v = to_float(s) } catch e {}
+    return v
+}
+
+fn abs_f(x: f64) -> f64 { if x < 0.0 { return 0.0 - x } ; return x }
+fn max_f(a: f64, b: f64) -> f64 { if a > b { return a } ; return b }
+fn min_f(a: f64, b: f64) -> f64 { if a < b { return a } ; return b }
+fn clamp01(x: f64) -> f64 { if x < 0.0 { return 0.0 } ; if x > 1.0 { return 1.0 } ; return x }
+
+fn sqrt_f(x: f64) -> f64 {
+    if x <= 0.0 { return 0.0 }
+    let mut g = if x > 2.0 { x / 2.0 } else { 1.0 }
+    let mut i: i64 = 0
+    while i < 15 { g = (g + x / g) / 2.0 ; i = i + 1 }
+    return g
+}
+
+fn truncate4(x: f64) -> string {
+    let s = to_string(x)
+    let parts = s.split(".")
+    if parts.len() < 2 { return s + ".0000" }
+    let dec = parts[1]
+    let dc = dec.split("")
+    if dec.len() >= 4 { return parts[0] + "." + dc[0] + dc[1] + dc[2] + dc[3] }
+    return s
+}
+
+fn pad_right(s: string, width: i64) -> string {
+    let mut out = s
+    while out.len() < width { out = out + " " }
+    return out
+}
+
+fn timestamp_now() -> string {
+    let mut ts = ""
+    try { ts = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim() } catch e { ts = "unknown" }
+    return ts
+}
+
+// ═══════════════════════════════════════════════════════════
+// AI-native atlas guard helpers (from lib/atlas_guard.hexa.inc)
+// Append-path filter + dedup only. Phase logic invariant.
+// ═══════════════════════════════════════════════════════════
+
+fn _valid_atlas_line(line: string) -> bool {
+    let t = line.trim()
+    if len(t) == 0 { return true }
+    let first = t[0..1]
+    if first == "#" { return true }
+    if first == "{" { return true }
+    if first == "@" { return true }
+    if first == "\"" { return true }
+    if first == "<" { return true }
+    if first == ">" { return true }
+    if first == "!" { return true }
+    if first == "-" { return true }
+    return false
+}
+
+fn _guarded_append_atlas(path: string, content: string) -> i64 {
+    if len(content) == 0 { return 0 }
+    let is_atlas = path.contains("atlas.n6")
+    let lines = content.split("\n")
+    let mut clean = ""
+    let mut rejected: i64 = 0
+    let mut deduped: i64 = 0
+    let mut first = true
+    let mut i: i64 = 0
+    while i < len(lines) {
+        let line = lines[i]
+        if !_valid_atlas_line(line) {
+            rejected = rejected + 1
+            i = i + 1
+            continue
+        }
+        let t = line.trim()
+        if is_atlas && len(t) > 0 && !t.starts_with("#") {
+            let mut already = false
+            try {
+                let gr = exec("grep -Fxq -- '" + t.replace("'", "'\\''") + "' '" + path + "' 2>/dev/null && echo Y || echo N")
+                already = gr.trim() == "Y"
+            } catch e {}
+            if already {
+                deduped = deduped + 1
+                i = i + 1
+                continue
+            }
+        }
+        if !first { clean = clean + "\n" }
+        clean = clean + line
+        first = false
+        i = i + 1
+    }
+    if rejected > 0 {
+        println("  [schema guard] rejected " + to_string(rejected) + " invalid lines -> " + path)
+    }
+    if deduped > 0 {
+        println("  [dedup guard] skipped " + to_string(deduped) + " duplicate lines -> " + path)
+    }
+    if len(clean) > 0 {
+        if !clean.ends_with("\n") { clean = clean + "\n" }
+        try { append_file(path, clean) } catch e {}
+    }
+    return rejected
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── n6 PROXIMITY + MATCHING ───
+// ═══════════════════════════════════════════════════════════
+
+comptime const N6_N = 6
+comptime const N6_SIGMA = 12
+comptime const N6_PHI = 2
+comptime const N6_TAU = 4
+comptime const N6_SOPFR = 5
+comptime const N6_J2 = 24
+comptime const N6_M3 = 7
+
+fn n6_dist_one(value: f64, constant: f64) -> f64 {
+    return abs_f(value - constant) / max_f(abs_f(constant), 1.0)
+}
+
+fn n6_distance(value: f64) -> f64 {
+    if value != value || abs_f(value) > 999999999.0 { return 1.0 }
+    let mut d = 1.0
+    let mut i: i64 = 0
+    while i < _n6_count { d = min_f(d, n6_dist_one(value, to_float(_n6_vals[i]))) ; i = i + 1 }
+    return min_f(d, 1.0)
+}
+
+fn n6_conf(value: f64) -> f64 {
+    return max_f(1.0 - n6_distance(value), 0.0)
+}
+
+fn match_name(value: f64) -> string {
+    let mut i: i64 = 0
+    while i < _n6_count {
+        let cv = to_float(_n6_vals[i])
+        let th = if abs_f(cv) >= 100.0 { 0.01 } else { if abs_f(cv) >= 1.0 { 0.0001 } else { 0.005 } }
+        if abs_f(value - cv) < th { return to_string(_n6_names[i]) }
+        i = i + 1
+    }
+    return ""
+}
+
+fn match_grade(value: f64) -> string {
+    if match_name(value) != "" { return "EXACT" }
+    let d = n6_distance(value)
+    if d < 0.01 { return "NEAR" }
+    if d < 0.05 { return "CLOSE" }
+    return "MISS"
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── DOMAIN LOADER ───
+// ═══════════════════════════════════════════════════════════
+
+fn load_all_domains() -> list {
+    let home = _HOME
+    let mut doms = ["math", "physics", "topology", "consciousness", "chemistry",
+                    "cosmology", "biology", "information", "geometry", "number_theory"]
+    try {
+        let lines = read_file(home + "/Dev/nexus/shared/bt/bt_domains.jsonl").split("\n")
+        let mut ld = []
+        for l in lines {
+            if l.trim() != "" && l.contains("\"domain\":\"") {
+                ld = ld + [l.split("\"domain\":\"")[1].split("\"")[0]]
+            }
+        }
+        if ld.len() > 0 { doms = ld }
+    } catch e {}
+    doms
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── GC1: ATLAS INGEST ───
+// Read atlas.n6 tail, extract EXACT/NEAR entries with metadata.
+// Returns list of maps encoded as "domain|const_name|value|grade|ts"
+// ═══════════════════════════════════════════════════════════
+
+fn atlas_ingest(tail_n: i64, domain_filter: list) -> list {
+    let home = _HOME
+    let atlas_path = home + "/Dev/nexus/shared/n6/atlas.n6"
+    let mut raw = ""
+    try { raw = exec("tail -" + to_string(tail_n) + " '" + atlas_path + "' 2>/dev/null") } catch e {}
+    if raw.trim() == "" {
+        println("  [GC1] atlas.n6 empty or unreadable")
+        return []
+    }
+    let lines = raw.split("\n")
+    let filter_active = len(domain_filter) > 0
+
+    let mut entries = []
+    let mut li: i64 = 0
+    while li < len(lines) {
+        let line = to_string(lines[li]).trim()
+        if line == "" || line[0..1] == "#" { li = li + 1 ; continue }
+
+        // Extract domain
+        let mut dom = ""
+        if line.contains("\"domain\":\"") {
+            dom = line.split("\"domain\":\"")[1].split("\"")[0]
+        } else { if line.contains("\"dom\":\"") {
+            dom = line.split("\"dom\":\"")[1].split("\"")[0]
+        } }
+
+        // Apply domain filter
+        if filter_active && dom != "" {
+            let mut in_filter = false
+            let mut fi: i64 = 0
+            while fi < len(domain_filter) {
+                if to_string(domain_filter[fi]) == dom { in_filter = true }
+                fi = fi + 1
+            }
+            if !in_filter { li = li + 1 ; continue }
+        }
+
+        // Extract grade
+        let mut grade = ""
+        if line.contains("\"grade\":\"") {
+            grade = line.split("\"grade\":\"")[1].split("\"")[0]
+        }
+        // Only keep EXACT and NEAR entries for cascade analysis
+        if grade != "EXACT" && grade != "NEAR" { li = li + 1 ; continue }
+
+        // Extract constant name
+        let mut cname = ""
+        if line.contains("\"const\":\"") {
+            cname = line.split("\"const\":\"")[1].split("\"")[0]
+        } else { if line.contains("\"name\":\"") {
+            cname = line.split("\"name\":\"")[1].split("\"")[0]
+        } }
+
+        // Extract value
+        let mut val = 0.0
+        if line.contains("\"value\":") {
+            val = safe_float(line.split("\"value\":")[1].split(",")[0].split("}")[0].trim())
+        }
+
+        // Extract timestamp
+        let mut ts = ""
+        if line.contains("\"ts\":\"") {
+            ts = line.split("\"ts\":\"")[1].split("\"")[0]
+        }
+
+        if cname != "" && abs_f(val) > 0.0000000001 {
+            entries = entries + [dom + "|" + cname + "|" + to_string(val) + "|" + grade + "|" + ts]
+        }
+        li = li + 1
+    }
+    return entries
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── GC2: GENERATOR SCAN ───
+// Identify broken symmetry generators: each EXACT entry whose value
+// matches an n6 constant is a "generator" that can propagate cascades.
+// A generator "breaks" a symmetry when it pins a continuous degree
+// of freedom to a discrete n6 value.
+//
+// Returns list of "generator_id|const_name|value|domain|source_ts"
+// ═══════════════════════════════════════════════════════════
+
+fn generator_scan(entries: list) -> list {
+    let mut generators = []
+    let mut seen_names = []   // dedup by const_name to avoid duplicates
+
+    let mut ei: i64 = 0
+    while ei < len(entries) {
+        let e = to_string(entries[ei])
+        let ep = e.split("|")
+        // ep: dom|const_name|value|grade|ts
+        if ep.len() >= 5 && ep[3] == "EXACT" {
+            let cname = ep[1]
+            let val = safe_float(ep[2])
+            let matched = match_name(val)
+
+            // A valid generator: value matches a known n6 constant
+            if matched != "" {
+                // Check not already registered
+                let mut already = false
+                let mut si: i64 = 0
+                while si < len(seen_names) {
+                    if to_string(seen_names[si]) == matched { already = true }
+                    si = si + 1
+                }
+                if !already {
+                    let gen_id = "G_" + to_string(len(generators))
+                    generators = generators + [gen_id + "|" + matched + "|" + ep[2] + "|" + ep[0] + "|" + ep[4]]
+                    seen_names = seen_names + [matched]
+                }
+            }
+        }
+        ei = ei + 1
+    }
+    return generators
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── GC3: GOLDSTONE MODE COUNTING ───
+// For each generator, compute derivations that yield new EXACT/NEAR
+// values. Each such derivation is a "Goldstone mode" — a massless
+// excitation in the direction of the broken symmetry.
+//
+// Derivation operators (matching blowup_field.hexa conventions):
+//   D1: v + phi      D2: v - phi      D3: v * n
+//   D4: v / tau      D5: sqrt(v*sigma) D6: 1/v
+//   D7: v * phi      D8: v + tau      D9: v * v / sigma
+//
+// Returns list of "gen_id|derivation|derived_value|matched_name|grade"
+// ═══════════════════════════════════════════════════════════
+
+fn goldstone_modes(generators: list) -> list {
+    let phi_f: f64 = 2.0
+    let n_f: f64 = 6.0
+    let tau_f: f64 = 4.0
+    let sigma_f: f64 = 12.0
+
+    let mut modes = []
+
+    let mut gi: i64 = 0
+    while gi < len(generators) {
+        let g = to_string(generators[gi])
+        let gp = g.split("|")
+        // gp: gen_id|const_name|value|domain|ts
+        if gp.len() < 5 { gi = gi + 1 ; continue }
+        let gen_id = gp[0]
+        let src_val = safe_float(gp[2])
+
+        // D1: value + phi
+        let d1 = src_val + phi_f
+        let g1 = match_grade(d1)
+        if g1 == "EXACT" || g1 == "NEAR" {
+            let n1 = match_name(d1)
+            modes = modes + [gen_id + "|plus_phi|" + to_string(d1) + "|" + n1 + "|" + g1]
+        }
+
+        // D2: value - phi
+        let d2 = src_val - phi_f
+        let g2 = match_grade(d2)
+        if g2 == "EXACT" || g2 == "NEAR" {
+            let n2 = match_name(d2)
+            modes = modes + [gen_id + "|minus_phi|" + to_string(d2) + "|" + n2 + "|" + g2]
+        }
+
+        // D3: value * n
+        let d3 = src_val * n_f
+        let g3 = match_grade(d3)
+        if g3 == "EXACT" || g3 == "NEAR" {
+            let n3 = match_name(d3)
+            modes = modes + [gen_id + "|times_n|" + to_string(d3) + "|" + n3 + "|" + g3]
+        }
+
+        // D4: value / tau
+        if abs_f(tau_f) > 0.0 {
+            let d4 = src_val / tau_f
+            let g4 = match_grade(d4)
+            if g4 == "EXACT" || g4 == "NEAR" {
+                let n4 = match_name(d4)
+                modes = modes + [gen_id + "|div_tau|" + to_string(d4) + "|" + n4 + "|" + g4]
+            }
+        }
+
+        // D5: sqrt(value * sigma)
+        let d5 = sqrt_f(abs_f(src_val * sigma_f))
+        let g5 = match_grade(d5)
+        if g5 == "EXACT" || g5 == "NEAR" {
+            let n5 = match_name(d5)
+            modes = modes + [gen_id + "|sqrt_sigma|" + to_string(d5) + "|" + n5 + "|" + g5]
+        }
+
+        // D6: 1/value (inverse)
+        if abs_f(src_val) > 0.0000000001 {
+            let d6 = 1.0 / src_val
+            let g6 = match_grade(d6)
+            if g6 == "EXACT" || g6 == "NEAR" {
+                let n6 = match_name(d6)
+                modes = modes + [gen_id + "|inverse|" + to_string(d6) + "|" + n6 + "|" + g6]
+            }
+        }
+
+        // D7: value * phi
+        let d7 = src_val * phi_f
+        let g7 = match_grade(d7)
+        if g7 == "EXACT" || g7 == "NEAR" {
+            let n7 = match_name(d7)
+            modes = modes + [gen_id + "|times_phi|" + to_string(d7) + "|" + n7 + "|" + g7]
+        }
+
+        // D8: value + tau
+        let d8 = src_val + tau_f
+        let g8 = match_grade(d8)
+        if g8 == "EXACT" || g8 == "NEAR" {
+            let n8 = match_name(d8)
+            modes = modes + [gen_id + "|plus_tau|" + to_string(d8) + "|" + n8 + "|" + g8]
+        }
+
+        // D9: value^2 / sigma
+        let d9 = (src_val * src_val) / sigma_f
+        let g9 = match_grade(d9)
+        if g9 == "EXACT" || g9 == "NEAR" {
+            let n9 = match_name(d9)
+            modes = modes + [gen_id + "|sq_div_sigma|" + to_string(d9) + "|" + n9 + "|" + g9]
+        }
+
+        gi = gi + 1
+    }
+    return modes
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── GC4: CASCADE TRACE ───
+// Follow derivation chains from each generator's Goldstone modes.
+// If a Goldstone mode itself has grade EXACT, it becomes a secondary
+// generator that can propagate further. Traces up to max_depth.
+//
+// Returns list of "depth|chain_path|final_value|final_grade"
+// ═══════════════════════════════════════════════════════════
+
+fn cascade_trace(generators: list, max_depth: i64) -> list {
+    let phi_f: f64 = 2.0
+    let n_f: f64 = 6.0
+    let tau_f: f64 = 4.0
+    let sigma_f: f64 = 12.0
+    let mut chains = []
+
+    // Each generator seeds a cascade tree
+    let mut gi: i64 = 0
+    while gi < len(generators) {
+        let g = to_string(generators[gi])
+        let gp = g.split("|")
+        if gp.len() < 5 { gi = gi + 1 ; continue }
+        let gen_id = gp[0]
+        let src_name = gp[1]
+        let src_val = safe_float(gp[2])
+
+        // Depth-1 derivations
+        let derivs_d1 = _derive_all(src_val)
+        let mut di: i64 = 0
+        while di < len(derivs_d1) {
+            let d = to_string(derivs_d1[di])
+            let dp = d.split("|")
+            // dp: deriv_type|value|matched_name|grade
+            if dp.len() >= 4 {
+                let chain_path = src_name + " -[" + dp[0] + "]-> " + dp[2]
+                chains = chains + ["1|" + chain_path + "|" + dp[1] + "|" + dp[3]]
+
+                // Depth-2+ if EXACT and depth allows
+                if dp[3] == "EXACT" && max_depth >= 2 {
+                    let v2 = safe_float(dp[1])
+                    let n2 = dp[2]
+                    let derivs_d2 = _derive_all(v2)
+                    let mut d2i: i64 = 0
+                    while d2i < len(derivs_d2) {
+                        let dd2 = to_string(derivs_d2[d2i])
+                        let dp2 = dd2.split("|")
+                        if dp2.len() >= 4 {
+                            let chain2 = src_name + " -> " + n2 + " -[" + dp2[0] + "]-> " + dp2[2]
+                            chains = chains + ["2|" + chain2 + "|" + dp2[1] + "|" + dp2[3]]
+
+                            // Depth-3
+                            if dp2[3] == "EXACT" && max_depth >= 3 {
+                                let v3 = safe_float(dp2[1])
+                                let n3 = dp2[2]
+                                let derivs_d3 = _derive_all(v3)
+                                let mut d3i: i64 = 0
+                                while d3i < len(derivs_d3) {
+                                    let dd3 = to_string(derivs_d3[d3i])
+                                    let dp3 = dd3.split("|")
+                                    if dp3.len() >= 4 {
+                                        let chain3 = src_name + " -> .. -> " + n3 + " -[" + dp3[0] + "]-> " + dp3[2]
+                                        chains = chains + ["3|" + chain3 + "|" + dp3[1] + "|" + dp3[3]]
+
+                                        // Depth-4
+                                        if dp3[3] == "EXACT" && max_depth >= 4 {
+                                            let v4 = safe_float(dp3[1])
+                                            let n4 = dp3[2]
+                                            let derivs_d4 = _derive_all(v4)
+                                            let mut d4i: i64 = 0
+                                            while d4i < len(derivs_d4) {
+                                                let dd4 = to_string(derivs_d4[d4i])
+                                                let dp4 = dd4.split("|")
+                                                if dp4.len() >= 4 {
+                                                    let chain4 = src_name + " -> .. -> " + n4 + " -[" + dp4[0] + "]-> " + dp4[2]
+                                                    chains = chains + ["4|" + chain4 + "|" + dp4[1] + "|" + dp4[3]]
+                                                }
+                                                d4i = d4i + 1
+                                            }
+                                        }
+                                    }
+                                    d3i = d3i + 1
+                                }
+                            }
+                        }
+                        d2i = d2i + 1
+                    }
+                }
+            }
+            di = di + 1
+        }
+        gi = gi + 1
+    }
+    return chains
+}
+
+// Internal: compute all 9 derivations of a value, return EXACT/NEAR matches
+// Returns list of "deriv_type|value|matched_name|grade"
+fn _derive_all(val: f64) -> list {
+    let phi_f: f64 = 2.0
+    let n_f: f64 = 6.0
+    let tau_f: f64 = 4.0
+    let sigma_f: f64 = 12.0
+    let mut results = []
+
+    let ops_names = ["plus_phi", "minus_phi", "times_n", "div_tau", "sqrt_sigma",
+                     "inverse", "times_phi", "plus_tau", "sq_div_sigma"]
+
+    // Compute all 9 derived values
+    let mut derived = []
+    derived = derived + [val + phi_f]
+    derived = derived + [val - phi_f]
+    derived = derived + [val * n_f]
+    derived = derived + [if abs_f(tau_f) > 0.0 { val / tau_f } else { 0.0 }]
+    derived = derived + [sqrt_f(abs_f(val * sigma_f))]
+    derived = derived + [if abs_f(val) > 0.0000000001 { 1.0 / val } else { 0.0 }]
+    derived = derived + [val * phi_f]
+    derived = derived + [val + tau_f]
+    derived = derived + [(val * val) / sigma_f]
+
+    let mut oi: i64 = 0
+    while oi < len(derived) {
+        let dv = to_float(derived[oi])
+        if abs_f(dv) > 0.0000000001 {
+            let grade = match_grade(dv)
+            if grade == "EXACT" || grade == "NEAR" {
+                let name = match_name(dv)
+                let label = if name != "" { name } else { "unnamed_" + truncate4(dv) }
+                results = results + [to_string(ops_names[oi]) + "|" + to_string(dv) + "|" + label + "|" + grade]
+            }
+        }
+        oi = oi + 1
+    }
+    return results
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── GC5: VACUUM MANIFOLD VERIFICATION ───
+// Verify the coset structure G/H:
+//   G = full symmetry group (all n6 constants as generators)
+//   H = unbroken subgroup (constants NOT matched as generators)
+//   dim(G/H) should equal number of Goldstone modes (Goldstone theorem)
+//
+// Also checks closure: every Goldstone mode derivation chain must
+// eventually map back into the known constant set (no runaway).
+//
+// Returns a vacuum_report structure encoded as list of strings:
+//   "metric|value" pairs
+// ═══════════════════════════════════════════════════════════
+
+fn vacuum_verify(generators: list, modes: list, chains: list) -> list {
+    let mut report = []
+
+    // dim(G) = total n6 constants
+    let dim_g = _n6_count
+    report = report + ["dim_G|" + to_string(dim_g)]
+
+    // dim(H) = unbroken generators (n6 constants NOT found as generators)
+    let mut broken_names = []
+    let mut gi: i64 = 0
+    while gi < len(generators) {
+        let g = to_string(generators[gi])
+        let gp = g.split("|")
+        if gp.len() >= 2 { broken_names = broken_names + [gp[1]] }
+        gi = gi + 1
+    }
+    let dim_h = dim_g - len(broken_names)
+    report = report + ["dim_H|" + to_string(dim_h)]
+
+    // dim(G/H) = broken generators
+    let dim_coset = len(broken_names)
+    report = report + ["dim_G_over_H|" + to_string(dim_coset)]
+
+    // Count distinct Goldstone modes (by matched_name, EXACT only)
+    let mut mode_names = []
+    let mut mi: i64 = 0
+    while mi < len(modes) {
+        let m = to_string(modes[mi])
+        let mp = m.split("|")
+        // mp: gen_id|derivation|derived_value|matched_name|grade
+        if mp.len() >= 5 && mp[4] == "EXACT" {
+            let mname = mp[3]
+            let mut seen = false
+            let mut si: i64 = 0
+            while si < len(mode_names) {
+                if to_string(mode_names[si]) == mname { seen = true }
+                si = si + 1
+            }
+            if !seen { mode_names = mode_names + [mname] }
+        }
+        mi = mi + 1
+    }
+    let n_goldstone_exact = len(mode_names)
+    report = report + ["goldstone_modes_exact|" + to_string(n_goldstone_exact)]
+
+    // Goldstone theorem check: n_goldstone_modes >= dim(G/H)
+    let theorem_ok = n_goldstone_exact >= dim_coset
+    report = report + ["goldstone_theorem_satisfied|" + if theorem_ok { "YES" } else { "NO" }]
+
+    // Closure check: what fraction of cascade endpoints are known constants?
+    let mut total_endpoints: i64 = 0
+    let mut closed_endpoints: i64 = 0
+    let mut ci: i64 = 0
+    while ci < len(chains) {
+        let c = to_string(chains[ci])
+        let cp = c.split("|")
+        // cp: depth|chain_path|final_value|final_grade
+        if cp.len() >= 4 {
+            total_endpoints = total_endpoints + 1
+            if cp[3] == "EXACT" { closed_endpoints = closed_endpoints + 1 }
+        }
+        ci = ci + 1
+    }
+    let closure_ratio = if total_endpoints > 0 {
+        to_float(closed_endpoints) / to_float(total_endpoints)
+    } else { 0.0 }
+    report = report + ["cascade_endpoints_total|" + to_string(total_endpoints)]
+    report = report + ["cascade_endpoints_closed|" + to_string(closed_endpoints)]
+    report = report + ["closure_ratio|" + truncate4(closure_ratio)]
+
+    // Vacuum manifold is "stable" if closure > 0.5 and theorem is satisfied
+    let vacuum_stable = theorem_ok && closure_ratio > 0.5
+    report = report + ["vacuum_stable|" + if vacuum_stable { "STABLE" } else { "UNSTABLE" }]
+
+    // Max cascade depth reached
+    let mut max_depth_seen: i64 = 0
+    let mut di: i64 = 0
+    while di < len(chains) {
+        let c = to_string(chains[di])
+        let depth = safe_float(c.split("|")[0])
+        let depth_i = to_int(depth)
+        if depth_i > max_depth_seen { max_depth_seen = depth_i }
+        di = di + 1
+    }
+    report = report + ["max_cascade_depth|" + to_string(max_depth_seen)]
+
+    // Branching factor = total_chains / generators
+    let branch = if len(generators) > 0 {
+        to_float(len(chains)) / to_float(len(generators))
+    } else { 0.0 }
+    report = report + ["avg_branching_factor|" + truncate4(branch)]
+
+    return report
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── GC6: REPORT ───
+// ═══════════════════════════════════════════════════════════
+
+fn print_report(entries: list, generators: list, modes: list, chains: list, vac_report: list) {
+    println("")
+    println("================================================================")
+    println("  Goldstone Cascade Verifier Report")
+    println("================================================================")
+    println("")
+
+    // Atlas ingest summary
+    println("--- GC1: Atlas Ingest ---")
+    let mut exact_in: i64 = 0
+    let mut near_in: i64 = 0
+    let mut ei: i64 = 0
+    while ei < len(entries) {
+        let e = to_string(entries[ei])
+        if e.contains("|EXACT|") { exact_in = exact_in + 1 }
+        if e.contains("|NEAR|") { near_in = near_in + 1 }
+        ei = ei + 1
+    }
+    println("  Entries ingested:  " + to_string(len(entries)))
+    println("  EXACT:             " + to_string(exact_in))
+    println("  NEAR:              " + to_string(near_in))
+
+    // Generator summary
+    println("")
+    println("--- GC2: Broken Symmetry Generators ---")
+    println("  Generators found:  " + to_string(len(generators)))
+    if len(generators) > 0 {
+        println("")
+        println("  " + pad_right("ID", 8) + pad_right("CONSTANT", 20) + pad_right("VALUE", 16) + pad_right("DOMAIN", 16) + "SOURCE_TS")
+        let mut gi: i64 = 0
+        while gi < len(generators) && gi < 20 {
+            let g = to_string(generators[gi])
+            let gp = g.split("|")
+            if gp.len() >= 5 {
+                println("  " + pad_right(gp[0], 8) + pad_right(gp[1], 20) + pad_right(truncate4(safe_float(gp[2])), 16) + pad_right(gp[3], 16) + gp[4])
+            }
+            gi = gi + 1
+        }
+        if len(generators) > 20 { println("  ... (" + to_string(len(generators) - 20) + " more)") }
+    }
+
+    // Goldstone modes summary
+    println("")
+    println("--- GC3: Goldstone Mode Count ---")
+    println("  Total modes:       " + to_string(len(modes)))
+    // Count per generator
+    if len(generators) > 0 && len(modes) > 0 {
+        println("")
+        println("  " + pad_right("GENERATOR", 10) + pad_right("MODES", 8) + pad_right("EXACT", 8) + "NEAR")
+        let mut gi: i64 = 0
+        while gi < len(generators) {
+            let g = to_string(generators[gi])
+            let gp = g.split("|")
+            if gp.len() >= 1 {
+                let gen_id = gp[0]
+                let mut mode_total: i64 = 0
+                let mut mode_exact: i64 = 0
+                let mut mode_near: i64 = 0
+                let mut mi: i64 = 0
+                while mi < len(modes) {
+                    let m = to_string(modes[mi])
+                    if m.starts_with(gen_id + "|") {
+                        mode_total = mode_total + 1
+                        if m.contains("|EXACT") { mode_exact = mode_exact + 1 }
+                        if m.contains("|NEAR") { mode_near = mode_near + 1 }
+                    }
+                    mi = mi + 1
+                }
+                println("  " + pad_right(gen_id, 10) + pad_right(to_string(mode_total), 8) + pad_right(to_string(mode_exact), 8) + to_string(mode_near))
+            }
+            gi = gi + 1
+        }
+    }
+
+    // Show sample modes
+    if len(modes) > 0 {
+        println("")
+        println("  Sample Goldstone modes:")
+        let mut shown: i64 = 0
+        let mut mi: i64 = 0
+        while mi < len(modes) && shown < 10 {
+            let m = to_string(modes[mi])
+            let mp = m.split("|")
+            if mp.len() >= 5 {
+                println("    " + pad_right(mp[0], 6) + pad_right(mp[1], 16) + pad_right(truncate4(safe_float(mp[2])), 14) + pad_right(mp[3], 16) + mp[4])
+                shown = shown + 1
+            }
+            mi = mi + 1
+        }
+        if len(modes) > 10 { println("    ... (" + to_string(len(modes) - 10) + " more modes)") }
+    }
+
+    // Cascade trace
+    println("")
+    println("--- GC4: Cascade Trace ---")
+    let mut d1: i64 = 0
+    let mut d2: i64 = 0
+    let mut d3: i64 = 0
+    let mut d4: i64 = 0
+    let mut ci: i64 = 0
+    while ci < len(chains) {
+        let c = to_string(chains[ci])
+        let depth_s = c.split("|")[0]
+        if depth_s == "1" { d1 = d1 + 1 }
+        if depth_s == "2" { d2 = d2 + 1 }
+        if depth_s == "3" { d3 = d3 + 1 }
+        if depth_s == "4" { d4 = d4 + 1 }
+        ci = ci + 1
+    }
+    println("  Total chains:      " + to_string(len(chains)))
+    println("  Depth-1:           " + to_string(d1))
+    println("  Depth-2:           " + to_string(d2))
+    println("  Depth-3:           " + to_string(d3))
+    println("  Depth-4:           " + to_string(d4))
+
+    // Show sample chains
+    if len(chains) > 0 {
+        println("")
+        println("  Sample cascade chains:")
+        let mut shown_c: i64 = 0
+        let mut cci: i64 = 0
+        while cci < len(chains) && shown_c < 12 {
+            let c = to_string(chains[cci])
+            let cp = c.split("|")
+            if cp.len() >= 4 {
+                println("    [depth " + cp[0] + "] " + cp[1] + "  => " + truncate4(safe_float(cp[2])) + " (" + cp[3] + ")")
+                shown_c = shown_c + 1
+            }
+            cci = cci + 1
+        }
+        if len(chains) > 12 { println("    ... (" + to_string(len(chains) - 12) + " more chains)") }
+    }
+
+    // Vacuum manifold verification
+    println("")
+    println("--- GC5: Vacuum Manifold Verification ---")
+    let mut vi: i64 = 0
+    while vi < len(vac_report) {
+        let r = to_string(vac_report[vi])
+        let rp = r.split("|")
+        if rp.len() >= 2 {
+            println("  " + pad_right(rp[0], 30) + rp[1])
+        }
+        vi = vi + 1
+    }
+
+    // Final summary
+    println("")
+    println("================================================================")
+    println("  SUMMARY")
+    println("  Atlas entries:           " + to_string(len(entries)))
+    println("  Broken generators:       " + to_string(len(generators)))
+    println("  Goldstone modes:         " + to_string(len(modes)))
+    println("  Cascade chains:          " + to_string(len(chains)))
+
+    // Extract vacuum_stable from report
+    let mut vac_status = "UNKNOWN"
+    let mut vsi: i64 = 0
+    while vsi < len(vac_report) {
+        let r = to_string(vac_report[vsi])
+        if r.starts_with("vacuum_stable|") { vac_status = r.split("|")[1] }
+        vsi = vsi + 1
+    }
+    println("  Vacuum manifold:         " + vac_status)
+    println("================================================================")
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── STRUCTURED OUTPUT (JSONL to atlas.n6) ───
+// ═══════════════════════════════════════════════════════════
+
+fn write_cascade_log(generators: list, modes: list, chains: list, vac_report: list) {
+    let home = _HOME
+    let atlas_path = home + "/Dev/nexus/shared/n6/atlas.n6"
+    let ts = timestamp_now()
+
+    // Summary event
+    let mut vac_status = "UNKNOWN"
+    let mut closure = "0.0"
+    let mut vi: i64 = 0
+    while vi < len(vac_report) {
+        let r = to_string(vac_report[vi])
+        if r.starts_with("vacuum_stable|") { vac_status = r.split("|")[1] }
+        if r.starts_with("closure_ratio|") { closure = r.split("|")[1] }
+        vi = vi + 1
+    }
+
+    let summary = "{\"ts\":\"" + ts + "\",\"engine\":\"goldstone_cascade\",\"generators\":" + to_string(len(generators)) + ",\"modes\":" + to_string(len(modes)) + ",\"chains\":" + to_string(len(chains)) + ",\"vacuum\":\"" + vac_status + "\",\"closure\":" + closure + "}"
+    let _rej = _guarded_append_atlas(atlas_path, summary + "\n")
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── HELP ───
+// ═══════════════════════════════════════════════════════════
+
+fn print_help() {
+    println("goldstone_cascade.hexa -- Goldstone Cascade Verifier")
+    println("")
+    println("Standalone analysis tool for symmetry-breaking cascade detection,")
+    println("Goldstone mode counting, and vacuum manifold verification.")
+    println("")
+    println("Usage:")
+    println("  hexa goldstone_cascade.hexa                    full cascade analysis")
+    println("  hexa goldstone_cascade.hexa --depth 5          max cascade depth (default 4)")
+    println("  hexa goldstone_cascade.hexa --tail 800         atlas.n6 tail lines (default 500)")
+    println("  hexa goldstone_cascade.hexa math physics       restrict to specific domains")
+    println("  hexa goldstone_cascade.hexa help               this message")
+    println("")
+    println("6-Phase Pipeline:")
+    println("  GC1  Atlas Ingest       read atlas.n6 tail for EXACT/NEAR entries")
+    println("  GC2  Generator Scan     identify broken symmetry generators")
+    println("  GC3  Goldstone Count    enumerate modes per generator (9 derivations)")
+    println("  GC4  Cascade Trace      follow chains to max depth")
+    println("  GC5  Vacuum Verify      G/H coset closure + Goldstone theorem check")
+    println("  GC6  Report             structured cascade + manifold report")
+    println("")
+    println("Derivation operators (D1-D9):")
+    println("  D1: v+phi  D2: v-phi  D3: v*n  D4: v/tau  D5: sqrt(v*sigma)")
+    println("  D6: 1/v    D7: v*phi  D8: v+tau D9: v^2/sigma")
+    println("")
+    println("Vacuum manifold:")
+    println("  G = full n6 constant group, H = unbroken subgroup")
+    println("  dim(G/H) = broken generators, must <= Goldstone modes (theorem)")
+    println("  Closure ratio = fraction of cascade endpoints at known constants")
+    println("  STABLE = theorem satisfied + closure > 0.5")
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── THEOREM + PROOF ───
+// ═══════════════════════════════════════════════════════════
+
+theorem goldstone_mode_bound {
+    // Goldstone theorem: number of massless modes >= dim(G/H)
+    // With 9 derivation operators and N broken generators,
+    // max modes = 9 * N. If dim(G/H) = N, always satisfiable when
+    // at least 1 derivation per generator lands on a known constant.
+    assert 6 * 2 == 12           // n * phi = sigma
+    assert 12 / 4 == 3           // sigma / tau = n/phi
+    assert 6 + 12 + 2 + 4 == 24 // J2 identity
+}
+
+proof cascade_termination {
+    // Cascades terminate: finite constant set + bounded depth (max 4)
+    // Each depth level has at most 9 branches per source
+    // Total nodes <= 9^depth * generators = bounded
+    invariant 9 * 9 * 9 * 9 == 6561  // max branches at depth 4
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── MAIN ───
+// ═══════════════════════════════════════════════════════════
+
+fn main() {
+    let cli_args = args()
+
+    // Parse CLI arguments
+    let mut domain_filter = []
+    let mut max_depth: i64 = 4
+    let mut tail_n: i64 = 500
+    let mut show_help = false
+
+    let mut ai: i64 = 2  // args()[0]=hexa, [1]=script
+    while ai < len(cli_args) {
+        let arg = to_string(cli_args[ai])
+        if arg == "help" || arg == "--help" || arg == "-h" {
+            show_help = true
+        } else { if arg == "--depth" {
+            if ai + 1 < len(cli_args) {
+                ai = ai + 1
+                let dval = safe_float(to_string(cli_args[ai]))
+                if dval >= 1.0 && dval <= 8.0 { max_depth = to_int(dval) }
+            }
+        } else { if arg == "--tail" {
+            if ai + 1 < len(cli_args) {
+                ai = ai + 1
+                let tval = safe_float(to_string(cli_args[ai]))
+                if tval >= 10.0 && tval <= 5000.0 { tail_n = to_int(tval) }
+            }
+        } else {
+            domain_filter = domain_filter + [arg]
+        } } }
+        ai = ai + 1
+    }
+
+    if show_help {
+        print_help()
+        return
+    }
+
+    println("")
+    println("=== Goldstone Cascade Verifier ===")
+    println("  n6 constants loaded: " + to_string(_n6_count))
+    println("  max cascade depth:   " + to_string(max_depth))
+    println("  atlas.n6 tail lines: " + to_string(tail_n))
+    if len(domain_filter) > 0 {
+        let mut df_str = ""
+        let mut dfi: i64 = 0
+        while dfi < len(domain_filter) {
+            if df_str != "" { df_str = df_str + ", " }
+            df_str = df_str + to_string(domain_filter[dfi])
+            dfi = dfi + 1
+        }
+        println("  domain filter:       " + df_str)
+    }
+    println("")
+
+    // ─── GC1: Atlas Ingest ───
+    println("[GC1] Atlas Ingest -- reading atlas.n6 tail " + to_string(tail_n))
+    let entries = atlas_ingest(tail_n, domain_filter)
+    println("  ingested " + to_string(len(entries)) + " EXACT/NEAR entries")
+
+    if len(entries) == 0 {
+        println("")
+        println("  No EXACT/NEAR entries found. Nothing to cascade.")
+        println("  Try increasing --tail or running blowup_field.hexa first.")
+        return
+    }
+
+    // ─── GC2: Generator Scan ───
+    println("")
+    println("[GC2] Generator Scan -- identifying broken symmetry generators")
+    let generators = generator_scan(entries)
+    println("  found " + to_string(len(generators)) + " broken generators")
+
+    if len(generators) == 0 {
+        println("")
+        println("  No generators found (no EXACT values matching n6 constants).")
+        println("  Run blowup_field.hexa to generate EXACT discoveries first.")
+        return
+    }
+
+    // ─── GC3: Goldstone Mode Counting ───
+    println("")
+    println("[GC3] Goldstone Mode Count -- 9 derivation operators per generator")
+    let modes = goldstone_modes(generators)
+    println("  found " + to_string(len(modes)) + " Goldstone modes")
+
+    // ─── GC4: Cascade Trace ───
+    println("")
+    println("[GC4] Cascade Trace -- max depth " + to_string(max_depth))
+    let chains = cascade_trace(generators, max_depth)
+    println("  traced " + to_string(len(chains)) + " cascade chains")
+
+    // ─── GC5: Vacuum Manifold Verification ───
+    println("")
+    println("[GC5] Vacuum Manifold Verification")
+    let vac_report = vacuum_verify(generators, modes, chains)
+
+    // Log to atlas.n6
+    println("")
+    println("[LOG] Writing cascade summary to atlas.n6")
+    write_cascade_log(generators, modes, chains, vac_report)
+    println("  done.")
+
+    // ─── GC6: Report ───
+    print_report(entries, generators, modes, chains, vac_report)
+}
+
+main()

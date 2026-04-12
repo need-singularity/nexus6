@@ -65,7 +65,7 @@ L0 보호 (평시 자유 수정, 유저 명시 요청 시만 승인 절차):
 ref:
   rules     shared/rules/common.json             R0~R27
   project   shared/rules/nexus.json              NX1~NX3
-  lock      shared/rules/lockdown.json           L0/L1/L2
+  lock      shared/lockdown/lockdown.json         L0/L1/L2
   cdo       shared/rules/convergence_ops.json    CDO 수렴
   registry  shared/config/projects.json          7프로젝트+번들/검증
   cfg       shared/config/project_config.json    CLI/관례/리소스

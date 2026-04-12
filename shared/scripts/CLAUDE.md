@@ -5,6 +5,7 @@ sync (R1 migrated .sh → .hexa):
   sync-calculators.hexa sync-claude-rules.hexa sync-dse.hexa
   sync-math-atlas.hexa  sync-nexus-lenses.hexa sync-readmes.hexa
   sync-all-verify.md    (doc)
+  shared_work_rules.md  (sync 블록 원본, sync-claude-rules.hexa 참조)
 
 run: nexus_ensure_running.hexa
 

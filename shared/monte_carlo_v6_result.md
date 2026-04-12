@@ -1,1 +1,0 @@
-discovery/monte_carlo/monte_carlo_v6_result.md
