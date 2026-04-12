@@ -1,7 +1,7 @@
 // ⛔ CORE — L0 불변식 (블로업 엔진 9-phase 특이점 파이프라인. 수정 전 유저 승인 필수)
 // ⚠️ 로드맵: shared/config/roadmaps/blowup.json (Mk.I~VII 진화 계보)
 // 📊 골화기록: shared/blowup/core/blowup.json (AI-native 성능 최적화 — 창발 보존)
-// mk2_hexa/native/blowup.hexa — Mk.II 파동 연속돌파 엔진 (hexa-native)
+// shared/blowup/core/blowup.hexa — Mk.II 파동 연속돌파 엔진 (hexa-native)
 //
 // Mk.II 기본 동작: 파동 연속돌파 (6라운드, 자동 도메인 회전)
 //   hexa blowup.hexa              → auto 도메인, depth 3, 6라운드 연속돌파
@@ -51,25 +51,12 @@ try { exec("printf '%s [01-HOME-ok] HOME=" + _HOME + "\\n' \"$(date +%H:%M:%S)\"
 // R14 SSOT: blowup의 모든 출력(log/graph/growth_bus)은 atlas.n6 단일 파일로 통합.
 // growth_bus.jsonl은 airgenome 소유 별개 파일 — blowup은 읽지/쓰지 않음.
 
-// ⛔ AG3/AG6 (Ubuntu-First + Mac Compute ZERO) 가드 — 2026-04-12
-// Mac 에서 blowup 직접 호출 절대 차단. 우회 옵션 없음.
-// BLOWUP_LOCAL=1 우회 제거됨 (AG6 골화 2026-04-12).
-// 자동 SSH 재실행은 안 함 (working dir/env/stdio nuance 위험) — 거부 + 안내만.
-let _UNAME = try { to_string(exec("uname -s")).trim() } catch e { "" }
-// _BLOWUP_LOCAL: Linux 자식 프로세스 자기호출 시 2차 가드 통과용 (Mac 에서는 무시)
-let _BLOWUP_LOCAL = try { to_string(exec("printenv BLOWUP_LOCAL")).trim() } catch e { "" }
-if _UNAME == "Darwin" && _BLOWUP_LOCAL != "1" {
-    // AG6 가드: Mac 기본 차단. BLOWUP_LOCAL=1 명시 시 로컬 실행 허용 (gotcha-3 수정)
-    println("⛔ blowup.hexa: Mac 직접 실행 차단 (AG3/AG6).")
-    println("   로컬 우회: BLOWUP_LOCAL=1 hexa blowup.hexa <args>")
-    println("   원격 실행: ssh hetzner 'cd ~/Dev/nexus && hexa shared/blowup/core/blowup.hexa <args>'")
-    println("   또는 ssh ubu '...'  (Ubuntu 노드)")
-    exit(2)
-}
-if _UNAME == "Darwin" {
-    // gotcha-3: Mac 로컬 모드 진입 (BLOWUP_LOCAL=1). 성능 제한 경고만 출력.
-    println("⚠ blowup.hexa: Mac 로컬 모드 (BLOWUP_LOCAL=1). 성능 제한 있음.")
-}
+// AG3/AG6 Mac 가드 제거 (2026-04-12). BLOWUP_LOCAL=1 모드 삭제 — 전 플랫폼 직접 실행.
+
+// AI-native: O(1) node exist 캐시 — graph_node_exists O(n) contains → O(1) hashmap (OPT-08)
+// _atlas_cache 불변 보장 (런 내 1회 로드) → 런 내내 유효. 신규 노드는 _batch_new_ids가 별도 관리.
+let mut _node_id_set = #{}
+let mut _node_id_set_built = false
 
 // hexa 바이너리 1회 탐색 캐시 — HEXA_BIN 환경변수 우선
 let mut _HEXA_BIN = ""
@@ -535,32 +522,17 @@ fn _valid_atlas_line(line: string) -> bool {
     return allowed.contains(t[0..1])
 }
 
-// 안전 append: (1) schema 검증 (2) 기존 라인 dedup (3) append_file.
+// 안전 append: (1) schema 검증 (2) shell dedup (3) flock append.
 // 불변식: 결과는 항상 "\n"로 끝남 (다음 append 간 line boundary 보존).
-// dedup: atlas.n6 전용 — 기존 파일 읽어서 라인셋 빌드 후 중복 제거.
-// inter-process 중복 원천 차단 (concurrent blowup 30+ 실행 시 발생).
+// dedup: atlas.n6 전용 — grep -Fxq shell dedup (hexa read_file OOM 회피).
+// 이전: read_file(13MB) + split("\n") → 69k line hashmap → 매 호출 ~200MB alloc.
+// 현재: 라인별 grep -Fxq → O(batch × grep) shell 위임, hexa 메모리 0.
 fn _guarded_append_atlas(path: string, content: string) -> i64 {
     if len(content) == 0 { return 0 }
 
-    // (1) 기존 파일 라인셋 로드 (dedup용)
-    let mut existing = #{}
     let is_atlas = path.contains("atlas.n6")
-    if is_atlas {
-        try {
-            let cur = read_file(path)
-            let cur_lines = cur.split("\n")
-            let mut ei: i64 = 0
-            while ei < len(cur_lines) {
-                let el = cur_lines[ei].trim()
-                if len(el) > 0 {
-                    existing[el] = true
-                }
-                ei = ei + 1
-            }
-        } catch e {}
-    }
 
-    // (2) schema 검증 + dedup 필터링
+    // (1) schema 검증 + shell dedup 필터링
     let lines = content.split("\n")
     let mut clean = ""
     let mut rejected: i64 = 0
@@ -577,14 +549,17 @@ fn _guarded_append_atlas(path: string, content: string) -> i64 {
         // dedup: atlas.n6 대상만 — 빈 줄/주석은 dedup 제외
         let t = line.trim()
         if is_atlas && len(t) > 0 && !t.starts_with("#") {
+            // shell dedup: grep -Fxq (hexa 메모리에 파일 로드 안 함)
             let mut already = false
-            try { already = has_key(existing, t) } catch e {}
+            try {
+                let gr = exec("grep -Fxq -- '" + t.replace("'", "'\\''") + "' '" + path + "' 2>/dev/null && echo Y || echo N")
+                already = gr.trim() == "Y"
+            } catch e {}
             if already {
                 deduped = deduped + 1
                 i = i + 1
                 continue
             }
-            existing[t] = true
         }
         if !first { clean = clean + "\n" }
         clean = clean + line
@@ -913,46 +888,11 @@ fn graph_stats_single_pass(content: string, min_deg: i64) -> string {
         }
         return shell
     }
-    // 4) hexa fallback (legacy — 작은 atlas 만 안전)
-    let lines = content.split("\n")
-    let mut nodes: i64 = 0
-    let mut edges: i64 = 0
-    let mut deg_map = #{}
-    let mut li: i64 = 0
-    while li < len(lines) {
-        let line = lines[li]
-        if len(line) > 5 {
-            let t = graph_extract_field(line, "type")
-            if t == "node" { nodes = nodes + 1 }
-            if t == "edge" {
-                edges = edges + 1
-                let f = graph_extract_field(line, "from")
-                let to = graph_extract_field(line, "to")
-                if len(f) > 0 {
-                    let mut d: i64 = 0
-                    try { d = deg_map[f] } catch e {}
-                    deg_map[f] = d + 1
-                }
-                if len(to) > 0 {
-                    let mut d: i64 = 0
-                    try { d = deg_map[to] } catch e {}
-                    deg_map[to] = d + 1
-                }
-            }
-        }
-        li = li + 1
-    }
-    let vals = deg_map.values()
-    let mut hub_count: i64 = 0
-    let mut hi: i64 = 0
-    while hi < len(vals) {
-        let d: i64 = vals[hi]
-        if d >= min_deg { hub_count = hub_count + 1 }
-        hi = hi + 1
-    }
-    // 사이드카 전체 재기록 (deg_map 포함 — 후속 incremental path 활성화)
-    if min_deg == 3 { graph_stats_write_cache_full(nodes, edges, hub_count, len(lines), deg_map) }
-    return to_string(nodes) + "|" + to_string(edges) + "|" + to_string(hub_count)
+    // 4) hexa fallback 제거 (126GB OOM 경로 — 2026-04-12 dmesg 확정).
+    // tiers 1~3 실패 시: awk 스크립트 부재가 원인. 0|0|0 반환 + 경고.
+    println("  [WARN] graph_stats: cache miss + awk unavailable — returning 0|0|0")
+    println("  [WARN] atlas_stats.awk 존재 확인: " + _HOME + "/Dev/nexus/shared/blowup/lib/atlas_stats.awk")
+    return "0|0|0"
 }
 
 // Find hub node IDs (degree >= min_deg) — O(edges) using native Map (hashmap)
@@ -995,10 +935,31 @@ fn graph_hub_count(content: string, min_deg: i64) -> i64 {
 }
 
 // Check if a node ID already exists
+// AI-native: node ID 해시셋 1회 빌드 → graph_node_exists O(1) (OPT-08, 2026-04-12)
+// 13MB content.contains() O(n) per call → hashmap O(1). 2곳 호출 × ~17k nodes = 34k × O(n) 제거.
+fn _build_node_id_set(content: string) {
+    if _node_id_set_built { return }
+    let lines = content.split("\n")
+    let mut i: i64 = 0
+    while i < len(lines) {
+        let line = lines[i]
+        if len(line) > 10 {
+            let id = graph_extract_field(line, "id")
+            if len(id) > 0 {
+                _node_id_set[id] = true
+            }
+        }
+        i = i + 1
+    }
+    _node_id_set_built = true
+}
+
 fn graph_node_exists(content: string, id: string) -> bool {
     if len(content) == 0 { return false }
-    let needle = "\"id\":\"" + id + "\""
-    return content.contains(needle)
+    _build_node_id_set(content)
+    let mut found = false
+    try { found = has_key(_node_id_set, id) } catch e {}
+    return found
 }
 
 fn graph_append_node(id: string, node_type: string, dom: string, summary: string, conf: f64) -> string {
@@ -1575,6 +1536,7 @@ let max_depth: i64 = _raw_depth
 // --max-rounds M: 최대 라운드 (기본 6)
 // --dfs N: DFS 자율 탐색 — Phase 8 이후 최고 에너지 target 1개를 재귀 호출 (Phase 9)
 // --dfs-current D: 현재 DFS 깊이 (내부 재귀용, 기본 0)
+// --dfs-session S: DFS 세션 ID (루트가 PID로 생성, 자식에 전달 — visited 파일 격리)
 let mut skip_graph = false
 let mut ext_seeds = ""
 let mut ext_pool_cap: i64 = 0
@@ -1583,6 +1545,7 @@ let mut wave_round: i64 = 1
 let mut wave_max_rounds: i64 = 6
 let mut dfs_max_depth: i64 = 0
 let mut dfs_current: i64 = 0
+let mut dfs_session: string = ""
 let mut ai: i64 = 2
 while ai < len(a) {
     if a[ai] == "--no-graph" { skip_graph = true }
@@ -1611,101 +1574,22 @@ while ai < len(a) {
         dfs_current = to_int(a[ai + 1])
         ai = ai + 1
     }
+    if a[ai] == "--dfs-session" && ai + 1 < len(a) {
+        dfs_session = a[ai + 1]
+        ai = ai + 1
+    }
     ai = ai + 1
+}
+// DFS 세션 ID: 루트(dfs_current==0)가 PID 기반으로 생성, 동시 실행 visited 파일 격리
+if dfs_max_depth > 0 && dfs_session == "" {
+    try { dfs_session = exec("echo $$").trim() } catch e { dfs_session = "0" }
 }
 let _h_main = _HOME
 let atlas_path = _ATLAS_PATH
 let log_path = atlas_path
 let graph_path = atlas_path
 
-// ═══════════════════════════════════════════════════════════
-// AG2/AG3 Ubuntu 오프로드 — Mac 로컬 실행 금지 (gate_config.jsonl 준수)
-// round 1 진입 시만 체크. 이후 라운드는 Ubuntu에서 자기호출되므로 스킵.
-// ═══════════════════════════════════════════════════════════
-if wave_round == 1 && _BLOWUP_LOCAL != "1" && _UNAME == "Darwin" {
-    // AG3 오프로드는 Mac 전용. Linux(ubu/htz)에서는 이미 원격이므로 스킵.
-    // 수정 2026-04-12: ubu에서 자기 자신에게 SSH 시도 → exit(1) 루프 근본 원인
-    let mut _gc_path = _h_main + "/Dev/nexus/shared/gate_config.jsonl"
-    if !file_exists(_gc_path) { _gc_path = _h_main + "/Dev/airgenome/nexus/shared/gate_config.jsonl" }
-    if !file_exists(_gc_path) { _gc_path = _h_main + "/airgenome/nexus/shared/gate_config.jsonl" }
-    let mut _mac_allowed = !file_exists(_gc_path)  // gate_config 없으면 차단 안 함 (Ubuntu 등)
-    let mut _ubu_alias = "ubu"
-    let mut _ubu_hexa = _h_main + "/Dev/hexa-lang/hexa"
-    let mut _ubu_blowup = ""
-    let mut _ubu_dir = _h_main + "/airgenome"
-    try {
-        let _gc_raw = read_file(_gc_path)
-        let _gc_lines = _gc_raw.split("\n")
-        for _gc_line in _gc_lines {
-            let _gc_t = _gc_line.trim()
-            if _gc_t == "" { continue }
-            let _gc_p = json_parse(_gc_t)
-            if _gc_p["key"] == "mac_compute_allowed" { _mac_allowed = _gc_p["value"] == "true" }
-            if _gc_p["key"] == "ssh_alias" { _ubu_alias = _gc_p["value"] }
-            if _gc_p["key"] == "ubu_hexa_bin" { _ubu_hexa = _gc_p["value"] }
-            if _gc_p["key"] == "ubu_blowup_hexa" { _ubu_blowup = _gc_p["value"] }
-            if _gc_p["key"] == "remote_dir" { _ubu_dir = _gc_p["value"] }
-        }
-    } catch _gc_e {}
-
-    if !_mac_allowed {
-        // Ubuntu 도달 가능 여부 체크
-        let mut _ubu_ok = ""
-        try { _ubu_ok = to_string(exec("ssh -o ConnectTimeout=3 -o BatchMode=yes " + _ubu_alias + " echo ok 2>/dev/null")).trim() } catch e {}
-        if _ubu_ok == "ok" {
-            // 원본 인자 재조립 → Ubuntu SSH 실행
-            let mut _ubu_cmd = _ubu_hexa + " "
-            if _ubu_blowup != "" { _ubu_cmd = _ubu_cmd + _ubu_blowup } else { _ubu_cmd = _ubu_cmd + _ubu_dir + "/nexus/shared/blowup/core/blowup.hexa" }
-            _ubu_cmd = _ubu_cmd + " " + domain + " " + to_string(max_depth)
-            _ubu_cmd = _ubu_cmd + " --max-rounds " + to_string(wave_max_rounds)
-            if ext_seeds != "" { _ubu_cmd = _ubu_cmd + " --seeds \"" + ext_seeds + "\"" }
-            if skip_graph { _ubu_cmd = _ubu_cmd + " --no-graph" }
-            if fast_mode { _ubu_cmd = _ubu_cmd + " --fast" }
-            if ext_pool_cap > 0 { _ubu_cmd = _ubu_cmd + " --pool-cap " + to_string(ext_pool_cap) }
-
-            println("")
-            println("══════════════════════════════════════════════════════")
-            println("   AG3 Ubuntu-First: 블로업 원격 실행")
-            println("══════════════════════════════════════════════════════")
-            println("  target  : " + _ubu_alias)
-            println("  command : " + _ubu_cmd)
-            println("")
-
-            // nexus/shared 동기화 (atlas.n6 등 최신 반영)
-            try { exec("rsync -aq " + _h_main + "/Dev/nexus/shared/ " + _ubu_alias + ":" + _ubu_dir + "/nexus/shared/ 2>/dev/null") } catch e {}
-
-            try {
-                let _ubu_result = exec("ssh " + _ubu_alias + " '" + _ubu_cmd + "' 2>&1")
-                println(_ubu_result)
-            } catch _ubu_e {
-                println("  [AG3] Ubuntu 실행 실패: " + to_string(_ubu_e))
-            }
-
-            // 결과 동기화 (atlas.n6 등 Ubuntu → Mac)
-            try { exec("rsync -aq " + _ubu_alias + ":" + _ubu_dir + "/nexus/shared/n6/ " + _h_main + "/Dev/nexus/shared/n6/ 2>/dev/null") } catch e {}
-
-            println("")
-            println("done. (Ubuntu 실행 완료)")
-            exit(0)
-        } else {
-            // AG3 strict 모드: Ubuntu 불가 시 차단
-            let mut _ag3_mode_raw = ""
-            try { _ag3_mode_raw = to_string(exec("grep ag3_mode '" + _gc_path + "' 2>/dev/null")).trim() } catch e {}
-            let mut _ag3_strict = true
-            if _ag3_mode_raw.contains("degrade") || _ag3_mode_raw.contains("off") { _ag3_strict = false }
-            if _ag3_strict {
-                println("")
-                println("══════════════════════════════════════════════════════")
-                println("  ⛔ AG3 BLOCK: Ubuntu 미도달 + mac_compute_allowed=false")
-                println("  블로업 Mac 로컬 실행 차단 (배터리/CPU 보호)")
-                println("  → Ubuntu 연결 확인 후 재시도하세요")
-                println("══════════════════════════════════════════════════════")
-                exit(1)
-            }
-            println("  [AG3 degrade] Ubuntu 미도달 → 로컬 fallback (warning)")
-        }
-    }
-}
+// AG2/AG3 Ubuntu 오프로드 제거 (2026-04-12). 전 플랫폼 로컬 직접 실행.
 
 let mc: i64 = m_count(domain)
 
@@ -3399,7 +3283,7 @@ if logged > 0 {
         wave_cmd = wave_cmd + "wait"
 
         println("  [wave] " + to_string(len(wave_targets)) + "개 도메인 병렬 파동 발사...")
-        try { exec("bash", ["-c", "export BLOWUP_LOCAL=1 HEXA_BIN='" + _HEXA_BIN + "'; " + wave_cmd]) } catch e {}
+        try { exec("bash", ["-c", "export HEXA_BIN='" + _HEXA_BIN + "'; " + wave_cmd]) } catch e {}
 
         // 파동 결과 수집 + DFS용 best target 추적
         wi = 0
@@ -3458,8 +3342,8 @@ if logged > 0 {
         if dfs_max_depth > 0 && dfs_current < dfs_max_depth && dfs_best_energy > 0 && dfs_best_target != "" {
             println("")
             println("═══ Phase 9: DFS Deep Dive [depth " + to_string(dfs_current + 1) + "/" + to_string(dfs_max_depth) + "] ═══")
-            // Visited 체크 (PID 독립 파일로 재귀 간 공유)
-            let _dfs_visited = "/tmp/.blowup_dfs_visited." + to_string(dfs_max_depth)
+            // Visited 체크 (세션 ID로 격리 — 동시 DFS 실행 간 충돌 방지)
+            let _dfs_visited = "/tmp/.blowup_dfs_visited." + dfs_session
             let mut _already_seen = false
             try {
                 // 공백/특수문자 포함 도메인 보호: single-quote로 감싸기
@@ -3475,13 +3359,13 @@ if logged > 0 {
                 println("  target : " + dfs_best_target + " (에너지 " + to_string(dfs_best_energy) + ")")
                 println("  parent : " + domain)
                 println("  seeds  : " + wave_seed_csv)
-                // 재귀 호출: --dfs-current 증가, --dfs 유지, --no-graph 생략 (deep-dive은 기록 O)
+                // 재귀 호출: --dfs-current 증가, --dfs 유지, --dfs-session 전달, --no-graph 생략 (deep-dive은 기록 O)
                 // 주의: --fast 미전달 — Phase 8이 실행되어야 자식 level의 wave_targets이 생성되고 DFS 이어짐
                 // 도메인 인자도 quote 로 보호 (공백/특수문자 대응)
-                let dfs_cmd = hexa_bin + " " + _NEXUS + "/shared/blowup/core/blowup.hexa '" + dfs_best_target + "' " + to_string(max_depth) + " --dfs " + to_string(dfs_max_depth) + " --dfs-current " + to_string(dfs_current + 1) + " --max-rounds 1" + (if wave_seed_csv != "" { " --seeds \"" + wave_seed_csv + "\"" } else { "" })
+                let dfs_cmd = hexa_bin + " " + _NEXUS + "/shared/blowup/core/blowup.hexa '" + dfs_best_target + "' " + to_string(max_depth) + " --dfs " + to_string(dfs_max_depth) + " --dfs-current " + to_string(dfs_current + 1) + " --dfs-session " + dfs_session + " --max-rounds 1" + (if wave_seed_csv != "" { " --seeds \"" + wave_seed_csv + "\"" } else { "" })
                 println("  [dfs] " + dfs_cmd)
                 try {
-                    let _dfs_out = exec("bash", ["-c", "export BLOWUP_LOCAL=1 HEXA_BIN='" + _HEXA_BIN + "'; " + dfs_cmd + " 2>&1 | tail -30"])
+                    let _dfs_out = exec("bash", ["-c", "export HEXA_BIN='" + _HEXA_BIN + "'; " + dfs_cmd + " 2>&1 | tail -30"])
                     println(to_string(_dfs_out))
                 } catch _dfs_e {
                     println("  [dfs] 실행 실패: " + to_string(_dfs_e))
@@ -3714,7 +3598,7 @@ if wave_round < wave_max_rounds {
             println("  [MEM] memory pressure too high, stopping wave")
         } else {
             try {
-                let w5_out = exec("bash", ["-c", "export BLOWUP_LOCAL=1 HEXA_BIN='" + _HEXA_BIN + "'; ulimit -v 3145728 2>/dev/null; " + w5_cmd + " 2>&1"])
+                let w5_out = exec("bash", ["-c", "export HEXA_BIN='" + _HEXA_BIN + "'; ulimit -v 3145728 2>/dev/null; " + w5_cmd + " 2>&1"])
                 println(w5_out)
             } catch e {
                 println("  [오류] 라운드 " + to_string(wave_round + 1) + " 실행 실패: " + to_string(e))
@@ -3784,7 +3668,7 @@ if wave_round < wave_max_rounds {
             let _ou_efile: string = _ou_engines[_ou_ei]
             println("[ouroboros] → " + _ou_ename + " 돌파")
             try {
-                let _ou_cmd = "BLOWUP_LOCAL=1 HEXA_BIN='" + _ou_hexa + "' " + _ou_hexa + " " + _ou_engine_dir + "/" + _ou_efile + " " + domain + " " + to_string(max_depth) + _ou_flags
+                let _ou_cmd = "HEXA_BIN='" + _ou_hexa + "' " + _ou_hexa + " " + _ou_engine_dir + "/" + _ou_efile + " " + domain + " " + to_string(max_depth) + _ou_flags
                 if ext_seeds != "" { _ou_cmd = _ou_cmd + " --seeds \"" + ext_seeds + "\"" }
                 let _ou_result = exec("bash", ["-c", _ou_cmd + " 2>&1"])
                 println(_ou_result)

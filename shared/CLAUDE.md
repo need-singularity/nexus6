@@ -30,3 +30,4 @@ nexus.{scan_all,analyze,n6_check,evolve}
 프로젝트(7): nexus(허브) anima n6-architecture papers hexa-lang void airgenome
 
 규칙 본문은 config/absolute_rules.json (R14)
+commands: config/commands.json — autonomous 블록으로 Claude Code가 작업 중 smash/free/todo/go/keep 자율 판단·실행

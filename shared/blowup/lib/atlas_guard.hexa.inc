@@ -22,31 +22,12 @@ fn _valid_atlas_line(line: string) -> bool {
     return false
 }
 
-// append_file 전 (1) schema 검증 (2) 기존 라인 dedup (3) append.
-// atlas.n6 대상: 기존 파일 읽어서 라인셋 빌드 → 중복 원천 차단.
-// inter-process dedup — concurrent blowup 30+ 실행 시 중복 방지.
+// shell dedup 버전 — read_file OOM 회피 (2026-04-12 골화)
+// 이전: read_file(13MB) + split("\n") → 69k line hashmap → 매 호출 ~200MB alloc.
+// 현재: grep -Fxq shell 위임, hexa 메모리 0.
 fn _guarded_append_atlas(path: string, content: string) -> i64 {
     if len(content) == 0 { return 0 }
-
-    // (1) 기존 파일 라인셋 로드 (dedup용)
-    let mut existing = #{}
     let is_atlas = path.contains("atlas.n6")
-    if is_atlas {
-        try {
-            let cur = read_file(path)
-            let cur_lines = cur.split("\n")
-            let mut ei: i64 = 0
-            while ei < len(cur_lines) {
-                let el = cur_lines[ei].trim()
-                if len(el) > 0 {
-                    existing[el] = true
-                }
-                ei = ei + 1
-            }
-        } catch e {}
-    }
-
-    // (2) schema 검증 + dedup 필터링
     let lines = content.split("\n")
     let mut clean = ""
     let mut rejected: i64 = 0
@@ -63,13 +44,15 @@ fn _guarded_append_atlas(path: string, content: string) -> i64 {
         let t = line.trim()
         if is_atlas && len(t) > 0 && !t.starts_with("#") {
             let mut already = false
-            try { already = has_key(existing, t) } catch e {}
+            try {
+                let gr = exec("grep -Fxq -- '" + t.replace("'", "'\\''") + "' '" + path + "' 2>/dev/null && echo Y || echo N")
+                already = gr.trim() == "Y"
+            } catch e {}
             if already {
                 deduped = deduped + 1
                 i = i + 1
                 continue
             }
-            existing[t] = true
         }
         if !first { clean = clean + "\n" }
         clean = clean + line
