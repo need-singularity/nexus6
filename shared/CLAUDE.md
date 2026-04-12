@@ -1,4 +1,4 @@
-# shared/ R14 단일진실
+# shared/ — R14 단일진실
 
 config/      rules,core,projects,hosts(hetzner|ubuntu|vastai|infrastructure),claude-settings,lens_registry,hexa_grammar,calculators,*aliases,CALCULATOR_RULES,GRADE_RUBRIC,nexus-projects
 discovery/   reality_map,reality_map_live,discovery_graph,discovery_log,growth_bus,math_atlas,theory_registry,reality_map.patch.*(12),snapshots,breakthroughs,ouroboros_log,roadmap,forge_result,verified_constants,module_candidates,next_directions,unfold_*,archive/
@@ -13,15 +13,15 @@ growth/      airgenome_gates,growth_bus_archive,growth_strategies,growth-registr
 alien/       alien_index_*
 acceleration/ acceleration_*,explosive_growth_prompts
 monte_carlo/ monte_carlo_v6_*
-papers/      paper_candidates,nanobot-paper-status,pages-deploy-verify
-scripts/     sync-*.hexa(R1),sync-all-verify.md,nexus_ensure_running.hexa,bin/hexa(bootstrap resolver 예외)
+papers/      paper_candidates
+scripts/     sync-*.hexa(R1),sync-all-verify.md,shared_work_rules.md,nexus_ensure_running.hexa,bin/hexa(bootstrap resolver 예외)
 logs/        cmd_router.log
 backups/     *.bak* 격리(reality_map.json.bak*16,discovery_log.jsonl.*9,etc 32)
 blowup/      → blowup/CLAUDE.md
 기존         convergence/ calc/ hook/ hooks/ loop/ loop_logs/ n6_mirror/ roadmaps/ bin/ blowup/ cycle/ causal_chain/ tecsrs/
 
 flat HOT     infra_state.json bridge_state.json hexa_pitfalls_log.jsonl auto_gap.log growth_tick_preflight.log .bt_cooldown .gap_cooldown
-flat L0      CLAUDE.md SECRET.md shared_work_rules.md dashboard.html QUICK_STATUS.md
+flat L0      CLAUDE.md SECRET.md dashboard.html
 
 infra                            # SSOT=infra_state.json 4호스트
 nexus {scan|verify|evolve|auto} <d>   # --full=397렌즈

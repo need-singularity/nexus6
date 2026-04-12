@@ -1,1 +1,0 @@
-config/GRADE_RUBRIC_1_TO_10PLUS.md

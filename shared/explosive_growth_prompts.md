@@ -1,1 +1,0 @@
-discovery/acceleration/explosive_growth_prompts.md

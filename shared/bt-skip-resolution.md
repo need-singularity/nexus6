@@ -1,1 +1,0 @@
-bt/bt-skip-resolution.md

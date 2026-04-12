@@ -1,1 +1,0 @@
-n6/n6_uniqueness_pi_e_phi.md

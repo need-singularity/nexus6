@@ -1,1 +1,0 @@
-scripts/sync-all-verify.md

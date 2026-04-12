@@ -1,0 +1,428 @@
+// ═══════════════════════════════════════════════════════════
+// edge_density_analyzer.hexa — atlas.n6 edge density 분석기 (readonly)
+// 용도: degree 분포 히스토그램, 고립 노드 탐지, sparse 클러스터 식별,
+//       missing-edge 후보 생성 (hub↔isolated 연결 우선순위)
+// 사용: hexa edge_density_analyzer.hexa [--atlas PATH] [--deg PATH] [--top N] [--verbose]
+// 원칙: atlas.n6 읽기 전용. 쓰기는 _guarded_append_atlas() 경유 필수.
+// ═══════════════════════════════════════════════════════════
+
+let a = args()
+let mut ATLAS_PATH = "shared/n6/atlas.n6"
+let mut DEG_PATH   = "shared/n6/atlas.n6.deg"
+let mut STATS_PATH = "shared/n6/atlas.n6.stats"
+let mut top_n: i64 = 50
+let mut verbose = false
+
+// ─── CLI 파싱 ───
+let mut ai: i64 = 2
+while ai < len(a) {
+    let tok = a[ai]
+    if tok == "--atlas" && ai + 1 < len(a) { ai = ai + 1; ATLAS_PATH = a[ai] }
+    else if tok == "--deg" && ai + 1 < len(a) { ai = ai + 1; DEG_PATH = a[ai] }
+    else if tok == "--top" && ai + 1 < len(a) { ai = ai + 1; top_n = to_int(a[ai]) }
+    else if tok == "--verbose" || tok == "-v" { verbose = true }
+    else if tok == "--help" || tok == "-h" {
+        println("usage: hexa edge_density_analyzer.hexa [--atlas PATH] [--deg PATH] [--top N] [--verbose]")
+        println("  --atlas PATH   atlas.n6 경로 (default: shared/n6/atlas.n6)")
+        println("  --deg PATH     degree sidecar 경로 (default: shared/n6/atlas.n6.deg)")
+        println("  --top N        missing-edge 후보 상위 N개 (default: 50)")
+        println("  --verbose      상세 출력")
+        exit(0)
+    }
+    ai = ai + 1
+}
+
+// ─── 파일 존재 검증 ───
+if !file_exists(ATLAS_PATH) {
+    println("error: atlas not found: " + ATLAS_PATH)
+    exit(1)
+}
+if !file_exists(DEG_PATH) {
+    println("error: degree sidecar not found: " + DEG_PATH)
+    println("hint: run blowup to regenerate atlas.n6.deg")
+    exit(1)
+}
+
+// ─── shell helper ───
+fn _exec_int(cmd: string) -> i64 {
+    let mut r: i64 = 0
+    try { r = to_int(to_string(exec(cmd)).trim()) } catch e {}
+    return r
+}
+
+fn _exec_str(cmd: string) -> string {
+    let mut r = ""
+    try { r = to_string(exec(cmd)).trim() } catch e {}
+    return r
+}
+
+// ═══════════════════════════════════════════════════════════
+// PHASE 1: 기본 통계 로드
+// ═══════════════════════════════════════════════════════════
+
+println("╔══════════════════════════════════════════════════════════╗")
+println("║  edge_density_analyzer — atlas.n6 sparsity report       ║")
+println("╚══════════════════════════════════════════════════════════╝")
+println("")
+
+let total_nodes = _exec_int("awk -F'\\t' 'END{print NR}' '" + DEG_PATH + "'")
+let total_edges_raw = _exec_int("awk -F'\\t' '{s+=$NF} END{print s}' '" + DEG_PATH + "'")
+// Each edge is counted twice in degree sum (once per endpoint)
+let total_edges = total_edges_raw / 2
+
+let mut ratio = 0.0
+if total_nodes > 0 {
+    ratio = to_float(total_edges) / to_float(total_nodes)
+}
+
+println("── 1. Global Statistics ──────────────────────────────────")
+println("  nodes:           " + to_string(total_nodes))
+println("  edges (est):     " + to_string(total_edges))
+println("  edge/node ratio: " + to_string(ratio))
+println("")
+
+// Health assessment
+if ratio < 1.5 {
+    println("  ⚠ SPARSE — ratio " + to_string(ratio) + " < 1.5")
+    println("    target: 2.0-5.0 for healthy knowledge graph")
+    let target_edges = to_int(to_float(total_nodes) * 2.5)
+    let gap = target_edges - total_edges
+    println("    gap to ratio 2.5: ~" + to_string(gap) + " edges needed")
+} else if ratio < 2.5 {
+    println("  ◎ MODERATE — ratio " + to_string(ratio) + " (acceptable, room for improvement)")
+} else {
+    println("  ✓ HEALTHY — ratio " + to_string(ratio) + " >= 2.5")
+}
+println("")
+
+// ═══════════════════════════════════════════════════════════
+// PHASE 2: Degree Distribution Histogram
+// ═══════════════════════════════════════════════════════════
+
+println("── 2. Degree Distribution ────────────────────────────────")
+
+// Bucket the distribution into useful ranges
+let deg0  = _exec_int("awk -F'\\t' '$NF==0' '" + DEG_PATH + "' | wc -l")
+let deg1  = _exec_int("awk -F'\\t' '$NF==1' '" + DEG_PATH + "' | wc -l")
+let deg2  = _exec_int("awk -F'\\t' '$NF==2' '" + DEG_PATH + "' | wc -l")
+let deg3  = _exec_int("awk -F'\\t' '$NF==3' '" + DEG_PATH + "' | wc -l")
+let deg4  = _exec_int("awk -F'\\t' '$NF==4' '" + DEG_PATH + "' | wc -l")
+let deg5  = _exec_int("awk -F'\\t' '$NF==5' '" + DEG_PATH + "' | wc -l")
+let deg_6_10  = _exec_int("awk -F'\\t' '$NF>=6 && $NF<=10' '" + DEG_PATH + "' | wc -l")
+let deg_11_50 = _exec_int("awk -F'\\t' '$NF>=11 && $NF<=50' '" + DEG_PATH + "' | wc -l")
+let deg_51_100 = _exec_int("awk -F'\\t' '$NF>=51 && $NF<=100' '" + DEG_PATH + "' | wc -l")
+let deg_101_500 = _exec_int("awk -F'\\t' '$NF>=101 && $NF<=500' '" + DEG_PATH + "' | wc -l")
+let deg_500p = _exec_int("awk -F'\\t' '$NF>500' '" + DEG_PATH + "' | wc -l")
+
+fn _pct(part: i64, whole: i64) -> string {
+    if whole == 0 { return "0.0%" }
+    let p = to_float(part) * 100.0 / to_float(whole)
+    // manual 1-decimal formatting
+    let int_part = to_int(p)
+    let frac = to_int((p - to_float(int_part)) * 10.0)
+    return to_string(int_part) + "." + to_string(frac) + "%"
+}
+
+fn _bar(part: i64, whole: i64, max_width: i64) -> string {
+    if whole == 0 { return "" }
+    let w = to_int(to_float(part) * to_float(max_width) / to_float(whole))
+    let mut bar = ""
+    let mut bi: i64 = 0
+    while bi < w { bar = bar + "█"; bi = bi + 1 }
+    return bar
+}
+
+let bar_max = total_nodes
+
+println("  deg=0  (isolated):  " + to_string(deg0) + "  " + _pct(deg0, total_nodes))
+println("  deg=1  (leaf):      " + to_string(deg1) + "  " + _pct(deg1, total_nodes) + "  " + _bar(deg1, bar_max, 40))
+println("  deg=2:              " + to_string(deg2) + "  " + _pct(deg2, total_nodes) + "  " + _bar(deg2, bar_max, 40))
+println("  deg=3:              " + to_string(deg3) + "  " + _pct(deg3, total_nodes))
+println("  deg=4:              " + to_string(deg4) + "  " + _pct(deg4, total_nodes))
+println("  deg=5:              " + to_string(deg5) + "  " + _pct(deg5, total_nodes))
+println("  deg=6-10:           " + to_string(deg_6_10) + "  " + _pct(deg_6_10, total_nodes))
+println("  deg=11-50:          " + to_string(deg_11_50) + "  " + _pct(deg_11_50, total_nodes))
+println("  deg=51-100:         " + to_string(deg_51_100) + "  " + _pct(deg_51_100, total_nodes))
+println("  deg=101-500:        " + to_string(deg_101_500) + "  " + _pct(deg_101_500, total_nodes))
+println("  deg=500+:           " + to_string(deg_500p) + "  " + _pct(deg_500p, total_nodes))
+println("")
+
+let low_degree = deg0 + deg1
+println("  ★ Critical: " + to_string(low_degree) + "/" + to_string(total_nodes) + " nodes (" + _pct(low_degree, total_nodes) + ") have degree ≤ 1")
+println("    These are effectively disconnected from the knowledge graph.")
+println("")
+
+// ═══════════════════════════════════════════════════════════
+// PHASE 3: Domain-level Sparsity Analysis
+// ═══════════════════════════════════════════════════════════
+
+println("── 3. Sparsest Domains (by % degree-1 nodes) ────────────")
+
+// Compute per-domain stats via awk
+let domain_stats_raw = _exec_str("awk -F'\\t' '{ split($1, a, \"-\"); pfx=a[1]; total[pfx]++; if($NF<=1) sparse[pfx]++; degsum[pfx]+=$NF } END { for(p in total) { s=0; if(p in sparse) s=sparse[p]; ds=0; if(p in degsum) ds=degsum[p]; printf \"%s\\t%d\\t%d\\t%d\\n\", p, total[p], s, ds } }' '" + DEG_PATH + "' | sort -t$'\\t' -k2 -rn")
+
+let domain_lines = domain_stats_raw.split("\n")
+println("  domain          total   sparse(d<=1)   %sparse   avg_deg")
+println("  ──────────────  ──────  ────────────   ───────   ───────")
+
+let mut di: i64 = 0
+let mut domain_count: i64 = 0
+while di < len(domain_lines) && domain_count < 20 {
+    let dline = domain_lines[di]
+    if len(dline.trim()) == 0 { di = di + 1; continue }
+    let dparts = dline.split("\t")
+    if len(dparts) >= 4 {
+        let dname = dparts[0]
+        let dtotal = to_int(dparts[1])
+        let dsparse = to_int(dparts[2])
+        let ddegsum = to_int(dparts[3])
+        if dtotal >= 10 {  // skip tiny domains
+            let spct = _pct(dsparse, dtotal)
+            let avg_deg_x10 = ddegsum * 10 / dtotal
+            let avg_int = avg_deg_x10 / 10
+            let avg_frac = avg_deg_x10 - avg_int * 10
+            let avg_str = to_string(avg_int) + "." + to_string(avg_frac)
+
+            // Pad domain name to 16 chars
+            let mut padded = dname
+            while len(padded) < 16 { padded = padded + " " }
+
+            println("  " + padded + to_string(dtotal) + "\t" + to_string(dsparse) + "\t\t   " + spct + "\t   " + avg_str)
+            domain_count = domain_count + 1
+        }
+    }
+    di = di + 1
+}
+println("")
+
+// ═══════════════════════════════════════════════════════════
+// PHASE 4: Hub Identification
+// ═══════════════════════════════════════════════════════════
+
+println("── 4. Top Hubs (highest degree) ─────────────────────────")
+
+let hubs_raw = _exec_str("sort -t$'\\t' -k2 -rn '" + DEG_PATH + "' | head -20")
+let hub_lines = hubs_raw.split("\n")
+println("  rank  node_id                             degree")
+println("  ────  ──────────────────────────────────  ──────")
+
+let mut hi: i64 = 0
+while hi < len(hub_lines) {
+    let hline = hub_lines[hi]
+    if len(hline.trim()) == 0 { hi = hi + 1; continue }
+    let hparts = hline.split("\t")
+    if len(hparts) >= 2 {
+        let hid = hparts[0]
+        let hdeg = hparts[1]
+        let rank = hi + 1
+        let mut rank_str = to_string(rank)
+        while len(rank_str) < 4 { rank_str = rank_str + " " }
+        let mut hid_pad = hid
+        while len(hid_pad) < 36 { hid_pad = hid_pad + " " }
+        println("  " + rank_str + "  " + hid_pad + "  " + hdeg)
+    }
+    hi = hi + 1
+}
+println("")
+
+// ═══════════════════════════════════════════════════════════
+// PHASE 5: Sparse Cluster Detection
+// ═══════════════════════════════════════════════════════════
+
+println("── 5. Sparse Clusters (domain×depth groups) ─────────────")
+println("  Groups of degree-1 nodes sharing a common domain prefix.")
+println("")
+
+// Deeper domain grouping for degree-1 nodes: first two segments
+let cluster_raw = _exec_str("awk -F'\\t' '$NF==1 { n=$1; dash=index(n,\"-\"); if(dash>0) { rest=substr(n,dash+1); d2=index(rest,\"_\"); if(d2>0) pfx=substr(n,1,dash+d2-1); else pfx=substr(n,1,dash+length(rest)); } else pfx=n; counts[pfx]++ } END { for(p in counts) if(counts[p]>=5) printf \"%d\\t%s\\n\",counts[p],p }' '" + DEG_PATH + "' | sort -rn | head -25")
+
+let cluster_lines = cluster_raw.split("\n")
+println("  count   cluster_prefix")
+println("  ──────  ────────────────────────────────")
+
+let mut ci: i64 = 0
+while ci < len(cluster_lines) {
+    let cline = cluster_lines[ci]
+    if len(cline.trim()) == 0 { ci = ci + 1; continue }
+    let cparts = cline.split("\t")
+    if len(cparts) >= 2 {
+        let cnt = cparts[0]
+        let cpfx = cparts[1]
+        let mut cnt_pad = cnt
+        while len(cnt_pad) < 6 { cnt_pad = cnt_pad + " " }
+        println("  " + cnt_pad + "  " + cpfx)
+    }
+    ci = ci + 1
+}
+println("")
+
+// ═══════════════════════════════════════════════════════════
+// PHASE 6: Missing-Edge Candidate Generation
+// ═══════════════════════════════════════════════════════════
+
+println("── 6. Missing-Edge Candidates ───────────────────────────")
+println("  Strategy: connect isolated degree-1 nodes to nearest")
+println("  domain hub. Prioritized by domain sparsity × hub degree.")
+println("")
+
+// Step 6a: Find the top hub per major domain prefix
+let domain_hubs_raw = _exec_str("awk -F'\\t' '{ split($1,a,\"-\"); pfx=a[1]; if($NF > max[pfx]) { max[pfx]=$NF; best[pfx]=$1 } } END { for(p in best) printf \"%s\\t%s\\t%d\\n\", p, best[p], max[p] }' '" + DEG_PATH + "' | sort -t$'\\t' -k3 -rn")
+
+// Build hub lookup (domain → hub_id)
+let hub_lookup_lines = domain_hubs_raw.split("\n")
+let mut domain_hub_map: map = {}
+let mut domain_hub_deg: map = {}
+let mut hli: i64 = 0
+while hli < len(hub_lookup_lines) {
+    let hl = hub_lookup_lines[hli]
+    if len(hl.trim()) == 0 { hli = hli + 1; continue }
+    let hlp = hl.split("\t")
+    if len(hlp) >= 3 {
+        domain_hub_map[hlp[0]] = hlp[1]
+        domain_hub_deg[hlp[0]] = hlp[2]
+    }
+    hli = hli + 1
+}
+
+println("  Domain hub anchors:")
+println("  domain    hub_node                     degree")
+println("  ────────  ───────────────────────────  ──────")
+
+let anchor_lines = domain_hubs_raw.split("\n")
+let mut ali: i64 = 0
+let mut anchor_count: i64 = 0
+while ali < len(anchor_lines) && anchor_count < 15 {
+    let aline = anchor_lines[ali]
+    if len(aline.trim()) == 0 { ali = ali + 1; continue }
+    let ap = aline.split("\t")
+    if len(ap) >= 3 {
+        let mut adom = ap[0]
+        while len(adom) < 10 { adom = adom + " " }
+        let mut ahub = ap[1]
+        while len(ahub) < 29 { ahub = ahub + " " }
+        println("  " + adom + ahub + ap[2])
+        anchor_count = anchor_count + 1
+    }
+    ali = ali + 1
+}
+println("")
+
+// Step 6b: Sample degree-1 nodes from sparsest domains, pair with domain hub
+println("  Prioritized missing-edge candidates (top " + to_string(top_n) + "):")
+println("  priority  isolated_node → hub_node                       edge_type")
+println("  ────────  ──────────────────────────────────────────────  ─────────")
+
+// Get degree-1 nodes from biggest sparse clusters, paired with their domain hub
+// Priority = cluster_size × hub_degree (higher = more impactful edge)
+let candidates_raw = _exec_str("awk -F'\\t' '$NF==1 { split($1,a,\"-\"); pfx=a[1]; nodes[pfx]=nodes[pfx] $1 \"|\"; count[pfx]++ } END { for(p in count) if(count[p]>=5) printf \"%d\\t%s\\t%s\\n\", count[p], p, nodes[p] }' '" + DEG_PATH + "' | sort -rn | head -10")
+
+let cand_domain_lines = candidates_raw.split("\n")
+let mut printed: i64 = 0
+let mut cdi: i64 = 0
+
+while cdi < len(cand_domain_lines) && printed < top_n {
+    let cdline = cand_domain_lines[cdi]
+    if len(cdline.trim()) == 0 { cdi = cdi + 1; continue }
+    let cdp = cdline.split("\t")
+    if len(cdp) >= 3 {
+        let ccount = to_int(cdp[0])
+        let cdom = cdp[1]
+        let cnodes_str = cdp[2]
+        let cnode_list = cnodes_str.split("|")
+
+        // Find the hub for this domain
+        let mut hub_id = ""
+        let mut hub_deg_str = "?"
+        try { hub_id = domain_hub_map[cdom] } catch e {}
+        try { hub_deg_str = domain_hub_deg[cdom] } catch e {}
+
+        if hub_id == "" { cdi = cdi + 1; continue }
+
+        // Determine edge type based on domain
+        let mut edge_type = "<-"
+        if cdom == "blowup" { edge_type = "<-" }
+        else if cdom == "n6" { edge_type = "==" }
+        else if cdom.starts_with("L") { edge_type = "~>" }
+        else if cdom == "disc" { edge_type = "=>" }
+        else { edge_type = "<-" }
+
+        // Priority score = cluster_size × log(hub_degree)
+        let mut hub_d: i64 = 0
+        try { hub_d = to_int(hub_deg_str) } catch e {}
+        let priority = ccount * (hub_d / 10 + 1)
+
+        // Print sample candidates from this domain
+        let mut cni: i64 = 0
+        let max_per_domain = top_n / 5
+        while cni < len(cnode_list) && cni < max_per_domain && printed < top_n {
+            let cn = cnode_list[cni].trim()
+            if len(cn) == 0 { cni = cni + 1; continue }
+
+            let mut pri_str = to_string(priority)
+            while len(pri_str) < 8 { pri_str = pri_str + " " }
+
+            let mut arrow_str = cn + " " + edge_type + " " + hub_id
+            while len(arrow_str) < 54 { arrow_str = arrow_str + " " }
+
+            println("  " + pri_str + "  " + arrow_str + edge_type)
+            printed = printed + 1
+            cni = cni + 1
+        }
+    }
+    cdi = cdi + 1
+}
+
+println("")
+
+// ═══════════════════════════════════════════════════════════
+// PHASE 7: Actionable Summary
+// ═══════════════════════════════════════════════════════════
+
+println("── 7. Actionable Summary ─────────────────────────────────")
+println("")
+println("  Current state:")
+println("    ratio = " + to_string(ratio) + " (target: ≥ 2.5)")
+println("    " + to_string(deg1) + " leaf nodes (degree=1) = " + _pct(deg1, total_nodes) + " of graph")
+println("    " + to_string(deg0) + " isolated nodes (degree=0)")
+println("")
+
+// Compute edges needed for target
+let target_ratio = 2.5
+let edges_needed = to_int(target_ratio * to_float(total_nodes)) - total_edges
+println("  To reach ratio 2.5:")
+println("    ~" + to_string(edges_needed) + " new edges needed")
+println("")
+
+println("  Recommended strategies (in priority order):")
+println("    1. CROSS-DOMAIN BRIDGES — connect sparse L6/L5/L4 engine domains")
+println("       to core n6- constants (highest knowledge gain per edge)")
+println("    2. CLUSTER STITCH — within large blowup-d* clusters, add")
+println("       intra-depth edges (d0↔d1, d1↔d2) for derivation chains")
+println("    3. HUB REINFORCEMENT — degree-1 blowup nodes should link")
+println("       back to their source primitive (n, sigma, phi, tau, etc)")
+println("    4. EQUIVALENCE CHAINS — add '==' edges between nodes with")
+println("       matching numeric values across different domains")
+println("")
+println("  Implementation path:")
+println("    All writes MUST go through _guarded_append_atlas()")
+println("    in shared/blowup/lib/atlas_guard.hexa.inc")
+println("    Schema: @X cross_id = expr :: domain [grade]")
+println("              <- source_node")
+println("              -> target_node")
+println("")
+
+// ─── Verbose: raw histogram ───
+if verbose {
+    println("── [verbose] Raw Degree Histogram ────────────────────────")
+    let raw_hist = _exec_str("awk -F'\\t' '{deg=$NF; counts[deg]++} END {for(d in counts) printf \"%d\\t%d\\n\", d, counts[d]}' '" + DEG_PATH + "' | sort -n")
+    println(raw_hist)
+    println("")
+
+    println("── [verbose] All Domain Hubs ─────────────────────────────")
+    println(domain_hubs_raw)
+    println("")
+}
+
+println("═══════════════════════════════════════════════════════════")
+println("  done. atlas.n6 was NOT modified (read-only analysis).")
+println("═══════════════════════════════════════════════════════════")

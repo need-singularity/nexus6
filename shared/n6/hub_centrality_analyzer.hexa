@@ -1,0 +1,398 @@
+// ═══════════════════════════════════════════════════════════
+// hub_centrality_analyzer.hexa — 허브 중심성 + 약연결 탐지
+// READ-ONLY analysis tool. Does NOT modify atlas.n6 (L0 protected).
+//
+// 기능:
+//   1. Betweenness centrality 근사 (degree-based proxy)
+//   2. Weakly-connected component 탐지
+//   3. Bridge node 식별 (제거 시 그래프 분리)
+//   4. Centrality 순위 + weak-link 리포트
+//
+// Uses atlas.n6.deg sidecar for O(1) degree lookup.
+// Shell awk pipelines for graph traversal on 13MB atlas.
+//
+// Usage: hexa hub_centrality_analyzer.hexa [--verbose] [--top N]
+// ═══════════════════════════════════════════════════════════
+
+let a = args()
+let mut verbose = false
+let mut top_n: i64 = 30
+let mut ai: i64 = 2
+while ai < len(a) {
+    let tok = a[ai]
+    if tok == "--verbose" || tok == "-v" { verbose = true }
+    else if tok == "--top" && ai + 1 < len(a) {
+        ai = ai + 1
+        try { top_n = to_int(a[ai]) } catch e {}
+    }
+    ai = ai + 1
+}
+
+let _HOME = exec("printenv HOME").trim()
+let _BASE = _HOME + "/Dev/nexus"
+let _ATLAS = _BASE + "/shared/n6/atlas.n6"
+let _DEG   = _ATLAS + ".deg"
+let _STATS = _ATLAS + ".stats"
+
+// ─── Utilities ────────────────────────────────────────────
+fn safe_int(s: string) -> i64 {
+    let mut v: i64 = 0
+    try { v = to_int(s.trim()) } catch e {}
+    return v
+}
+
+fn safe_float(s: string) -> f64 {
+    let mut v: f64 = 0.0
+    try { v = to_float(s.trim()) } catch e {}
+    return v
+}
+
+// ─── Validate inputs ─────────────────────────────────────
+if !file_exists(_ATLAS) {
+    println("error: atlas not found: " + _ATLAS)
+    exit(1)
+}
+if !file_exists(_DEG) {
+    println("error: degree sidecar not found: " + _DEG)
+    println("hint:  run blowup to regenerate atlas.n6.deg")
+    exit(1)
+}
+
+println("═══════════════════════════════════════════════════════")
+println("  Hub Centrality Analyzer — atlas.n6 (read-only)")
+println("═══════════════════════════════════════════════════════")
+println("")
+
+// ─── 1. Load stats ───────────────────────────────────────
+let mut total_nodes: i64 = 0
+let mut total_edges: i64 = 0
+let mut total_hubs: i64 = 0
+if file_exists(_STATS) {
+    try {
+        let stats = read_file(_STATS).trim()
+        total_nodes = safe_int(exec("echo '" + stats + "' | grep -oE '\"nodes\":[0-9]+' | cut -d: -f2"))
+        total_edges = safe_int(exec("echo '" + stats + "' | grep -oE '\"edges\":[0-9]+' | cut -d: -f2"))
+        total_hubs = safe_int(exec("echo '" + stats + "' | grep -oE '\"hubs\":[0-9]+' | cut -d: -f2"))
+    } catch e {}
+}
+
+println("  Graph state:")
+println("    nodes: " + to_string(total_nodes))
+println("    edges: " + to_string(total_edges))
+println("    hubs:  " + to_string(total_hubs) + " (degree >= 3)")
+println("")
+
+// ─── 2. Betweenness Centrality Approximation ─────────────
+// True betweenness centrality is O(VE) — too expensive for 18k+19k.
+// Proxy: C_B(v) ~ degree(v) * (1 / avg_neighbor_degree(v))
+// Intuition: a node with high degree but low-degree neighbors is
+// a critical relay (betweenness bottleneck). If neighbors also have
+// high degree, the node is redundant (alternative paths exist).
+//
+// For each hub (degree >= 3), compute:
+//   centrality_proxy = degree * (degree / sum_neighbor_degree)
+// This approximates betweenness: hubs bridging sparse regions score higher.
+
+println("── 2. Betweenness Centrality (degree-proxy approximation) ──")
+println("")
+
+// Extract edges as from-to pairs, then compute neighbor-degree stats
+// Build adjacency list in awk, then for each hub compute the proxy
+let tmp_adj = "/tmp/.hub_centrality_adj." + exec("echo $$").trim()
+let tmp_centrality = "/tmp/.hub_centrality_rank." + exec("echo $$").trim()
+
+// Step 1: Build from/to pair list from JSON edges
+try {
+    exec("bash -c '" +
+        "awk -v FS=\"\\\"\" " +
+        "  '\\''/" + "\"type\":\"edge\"/{" +
+        "  for(i=1;i<=NF;i++){" +
+        "    if($i==\"from\") f=$(i+2);" +
+        "    if($i==\"to\") t=$(i+2)" +
+        "  }" +
+        "  if(f!=\"\" && t!=\"\") print f\"\\t\"t" +
+        "}'\\'' \"" + _ATLAS + "\" > \"" + tmp_adj + "\" 2>/dev/null" +
+        "'")
+} catch e {}
+
+let adj_count = safe_int(exec("wc -l < '" + tmp_adj + "' 2>/dev/null || echo 0"))
+println("  Edge pairs extracted: " + to_string(adj_count))
+
+// Step 2: For each hub node, compute centrality proxy using degree sidecar
+// centrality = deg(v)^2 / sum(deg(neighbor)) for all neighbors of v
+// Higher score = more critical bottleneck
+try {
+    exec("bash -c '" +
+        // Build degree map and adjacency from edges, then compute centrality
+        "awk -F\"\\t\" '\\''NR==FNR{deg[$1]=$2; next}" +
+        "{" +
+        "  adj[$1][$2]=1; adj[$2][$1]=1" +
+        "}" +
+        "END{" +
+        "  for(v in deg){" +
+        "    if(deg[v]+0 < 3) continue;" +  // hubs only
+        "    sum_nd=0; nc=0;" +
+        "    for(nb in adj[v]){" +
+        "      if(nb in deg) sum_nd += deg[nb]+0;" +
+        "      nc++" +
+        "    }" +
+        "    if(sum_nd > 0){" +
+        "      cb = (deg[v]+0)*(deg[v]+0)/sum_nd;" +
+        "      avg_nd = sum_nd / (nc > 0 ? nc : 1);" +
+        "      printf \"%.4f\\t%s\\tdeg=%d\\tneighbors=%d\\tavg_neighbor_deg=%.1f\\n\", cb, v, deg[v]+0, nc, avg_nd" +
+        "    }" +
+        "  }" +
+        "}'\\'' \"" + _DEG + "\" \"" + tmp_adj + "\" | sort -t$'\\''\\t'\\'' -k1 -rn > \"" + tmp_centrality + "\" 2>/dev/null" +
+        "'")
+} catch e {}
+
+// Display top centrality nodes
+let centrality_count = safe_int(exec("wc -l < '" + tmp_centrality + "' 2>/dev/null || echo 0"))
+println("  Hubs analyzed: " + to_string(centrality_count))
+println("")
+println("  TOP CENTRALITY (bottleneck hubs — removal would most disrupt flow):")
+println("  ───────────────────────────────────────────────────")
+
+let top_centrality_raw = exec("head -" + to_string(top_n) + " '" + tmp_centrality + "' 2>/dev/null").trim()
+if top_centrality_raw != "" {
+    let tc_lines = top_centrality_raw.split("\n")
+    let mut rank: i64 = 1
+    for tcl in tc_lines {
+        let t = tcl.trim()
+        if t == "" { continue }
+        let parts = t.split("\t")
+        if len(parts) >= 5 {
+            let cb_score = parts[0]
+            let node_id = parts[1]
+            let deg_info = parts[2]
+            let nb_info = parts[3]
+            let avg_info = parts[4]
+            println("    #" + to_string(rank) + "  C_B=" + cb_score + "  " + node_id + "  " + deg_info + "  " + nb_info + "  " + avg_info)
+        }
+        rank = rank + 1
+    }
+} else {
+    println("    (computing... large atlas may take time)")
+}
+println("")
+
+// ─── 3. LOWEST centrality hubs (redundant — high degree but well-connected neighbors) ───
+println("  LOWEST CENTRALITY (redundant hubs — many alternative paths):")
+println("  ───────────────────────────────────────────────────")
+let low_centrality_raw = exec("tail -" + to_string(top_n) + " '" + tmp_centrality + "' 2>/dev/null | sort -t$'\\t' -k1 -n | head -" + to_string(top_n)).trim()
+if low_centrality_raw != "" {
+    let lc_lines = low_centrality_raw.split("\n")
+    let mut rank: i64 = 1
+    for lcl in lc_lines {
+        let t = lcl.trim()
+        if t == "" { continue }
+        let parts = t.split("\t")
+        if len(parts) >= 3 {
+            println("    #" + to_string(rank) + "  C_B=" + parts[0] + "  " + parts[1] + "  " + parts[2])
+        }
+        rank = rank + 1
+        if rank > 15 { break }
+    }
+} else {
+    println("    (none)")
+}
+println("")
+
+// ─── 4. Weakly-Connected Components Detection ────────────
+// Use Union-Find approximation via shell:
+// For the full 18k-node graph, true WCC requires BFS/DFS.
+// Proxy: identify nodes with degree=0 (isolated) and
+// check if removing top hubs splits the graph.
+println("── 4. Weakly-Connected Component Analysis ──")
+println("")
+
+// 4a. Isolated nodes (degree 0 = not in .deg at all)
+// All nodes in atlas minus nodes that appear in any edge
+let deg_node_count = safe_int(exec("wc -l < '" + _DEG + "' 2>/dev/null || echo 0"))
+let isolated_estimate = total_nodes - deg_node_count
+println("  Nodes in degree sidecar: " + to_string(deg_node_count))
+println("  Estimated isolated (no edges): " + to_string(isolated_estimate))
+println("")
+
+// 4b. Degree-1 nodes (leaf nodes — weakly connected)
+let leaf_count = safe_int(exec("awk -F'\\t' '$2==1' '" + _DEG + "' 2>/dev/null | wc -l"))
+let leaf_pct = if deg_node_count > 0 { to_float(leaf_count) * 100.0 / to_float(deg_node_count) } else { 0.0 }
+println("  Leaf nodes (degree=1): " + to_string(leaf_count) + " (" + to_string(leaf_pct) + "%)")
+println("    These nodes would disconnect if their single neighbor is removed.")
+println("")
+
+// 4c. Domain-island detection: domains connected only through 1-2 bridges
+println("  Domain isolation analysis (which domains are weakly bridged):")
+// Count cross-domain edges per domain pair
+let domain_bridge_raw = exec("bash -c '" +
+    "awk -v FS=\"\\\"\" '\\''/" + "\"type\":\"edge\"/{" +
+    "  for(i=1;i<=NF;i++){" +
+    "    if($i==\"from\") f=$(i+2);" +
+    "    if($i==\"to\") t=$(i+2)" +
+    "  }" +
+    "  # extract domain prefix" +
+    "  split(f,af,\"-\"); split(t,at,\"-\");" +
+    "  df=af[1]; dt=at[1];" +
+    "  if(df!=\"\" && dt!=\"\" && df!=dt){" +
+    "    if(df<dt) pair=df\"|\"dt; else pair=dt\"|\"df;" +
+    "    bridges[pair]++" +
+    "  }" +
+    "}" +
+    "END{for(p in bridges) print bridges[p]\"\\t\"p}" +
+    "'\\'' \"" + _ATLAS + "\" | sort -n | head -20" +
+    "' 2>/dev/null").trim()
+
+if domain_bridge_raw != "" {
+    println("  Weakest domain bridges (fewest cross-domain edges):")
+    let db_lines = domain_bridge_raw.split("\n")
+    let mut db_count: i64 = 0
+    for dbl in db_lines {
+        let t = dbl.trim()
+        if t == "" { continue }
+        let parts = t.split("\t")
+        if len(parts) >= 2 {
+            let edge_count = parts[0]
+            let pair = parts[1]
+            let weakness = if safe_int(edge_count) <= 2 { " [CRITICAL - single point of failure]" } else if safe_int(edge_count) <= 5 { " [WEAK]" } else { "" }
+            println("    " + pair + ": " + edge_count + " edges" + weakness)
+        }
+        db_count = db_count + 1
+        if db_count >= 15 { break }
+    }
+} else {
+    println("    (unable to extract cross-domain edges)")
+}
+println("")
+
+// ─── 5. Bridge Node Detection ────────────────────────────
+// A bridge node is one whose removal would disconnect parts of the graph.
+// Approximation: nodes that are the ONLY connection between two domain clusters.
+// If a hub connects domains A and B, and no other edge connects A-B, it's a bridge.
+println("── 5. Bridge Node Detection ──")
+println("  (nodes whose removal would disconnect graph regions)")
+println("")
+
+// Find hub nodes that are the sole connector between domain prefixes
+// For each hub (deg>=3), check if it's the only link between any pair of its neighbor-domains
+let bridge_raw = exec("bash -c '" +
+    // Get edges and for each hub, check unique domain connections
+    "awk -v FS=\"\\\"\" '\\''/" + "\"type\":\"edge\"/{" +
+    "  for(i=1;i<=NF;i++){" +
+    "    if($i==\"from\") f=$(i+2);" +
+    "    if($i==\"to\") t=$(i+2)" +
+    "  }" +
+    "  if(f!=\"\" && t!=\"\"){" +
+    "    adj[f][t]=1; adj[t][f]=1" +
+    "  }" +
+    "}'\\'' \"" + _ATLAS + "\" && " +
+    "awk -F\"\\t\" '\\''$2>=10{print $1\"\\t\"$2}'\\'' \"" + _DEG + "\" | " +
+    "while IFS=$'\\''\\t'\\'' read -r nid deg; do " +
+    "  # Count how many unique domain prefixes this hub connects" +
+    "  domains=$(grep -E \"\\\"(from|to)\\\":\\\"${nid}\\\"\" \"" + _ATLAS + "\" 2>/dev/null | " +
+    "    grep -oE '\"(from|to)\":\"[^\"]+\"' | grep -v \"$nid\" | " +
+    "    sed 's/.*\"\\([^\"]*\\)\"/\\1/' | sed 's/-.*//' | sort -u | wc -l); " +
+    "  if [ \"$domains\" -ge 3 ] 2>/dev/null; then " +
+    "    echo \"${nid}|deg=${deg}|bridges=${domains}_domains\"; " +
+    "  fi; " +
+    "done | sort -t= -k2 -rn | head -" + to_string(top_n) +
+    "' 2>/dev/null").trim()
+
+if bridge_raw != "" {
+    println("  Multi-domain bridge hubs (connecting 3+ domain prefixes):")
+    let br_lines = bridge_raw.split("\n")
+    let mut br_count: i64 = 0
+    for brl in br_lines {
+        let t = brl.trim()
+        if t != "" {
+            println("    " + t)
+            br_count = br_count + 1
+        }
+    }
+    println("    --- " + to_string(br_count) + " bridge hubs ---")
+} else {
+    println("    (scanning...)")
+}
+println("")
+
+// ─── 6. Articulation Point Approximation ─────────────────
+// Nodes whose degree is much higher than their neighbors' average degree
+// are likely articulation points (their removal fragments the graph).
+println("── 6. Potential Articulation Points ──")
+println("  (hubs with high degree / low avg neighbor degree ratio)")
+println("")
+
+let artic_raw = exec("awk -F'\\t' '$1 ~ /^[0-9]/ && $1+0 > 5.0' '" + tmp_centrality + "' 2>/dev/null | head -" + to_string(top_n)).trim()
+if artic_raw != "" {
+    let ar_lines = artic_raw.split("\n")
+    let mut ar_count: i64 = 0
+    for arl in ar_lines {
+        let t = arl.trim()
+        if t == "" { continue }
+        let parts = t.split("\t")
+        if len(parts) >= 5 {
+            println("    C_B=" + parts[0] + "  " + parts[1] + "  " + parts[2] + "  " + parts[4])
+            ar_count = ar_count + 1
+        }
+    }
+    if ar_count == 0 { println("    (none with C_B > 5.0)") }
+    else { println("    --- " + to_string(ar_count) + " potential articulation points ---") }
+} else {
+    println("    (none detected)")
+}
+println("")
+
+// ─── 7. Resilience Score ─────────────────────────────────
+// How resilient is the graph to hub removal?
+// resilience ~ avg_degree / max_degree * (1 - leaf_ratio)
+println("── 7. Graph Resilience Score ──")
+println("")
+
+let avg_degree = if deg_node_count > 0 { to_float(total_edges * 2) / to_float(deg_node_count) } else { 0.0 }
+let max_degree = safe_int(exec("sort -t'\\t' -k2 -rn '" + _DEG + "' 2>/dev/null | head -1 | cut -f2"))
+let resilience = if max_degree > 0 { (avg_degree / to_float(max_degree)) * (1.0 - leaf_pct / 100.0) } else { 0.0 }
+
+println("  avg degree:    " + to_string(avg_degree))
+println("  max degree:    " + to_string(max_degree))
+println("  leaf ratio:    " + to_string(leaf_pct) + "%")
+println("  resilience:    " + to_string(resilience))
+
+let resilience_verdict = if resilience < 0.01 {
+    "LOW - scale-free hub dependency (brain-like but fragile to targeted attack)"
+} else if resilience < 0.05 {
+    "MODERATE - some redundancy"
+} else {
+    "HIGH - well-connected mesh"
+}
+println("  verdict:       " + resilience_verdict)
+println("")
+
+// ─── 8. Recommendations ─────────────────────────────────
+println("═══════════════════════════════════════════════════════")
+println("  RECOMMENDATIONS")
+println("═══════════════════════════════════════════════════════")
+println("")
+println("  1. STRENGTHEN weak domain bridges:")
+println("     Add edges between weakly-connected domain pairs")
+println("     to prevent single-point-of-failure fragmentation.")
+println("")
+println("  2. REDUCE articulation point dependency:")
+println("     Create alternative paths around top centrality hubs")
+println("     so that hub removal doesn't isolate graph regions.")
+println("")
+println("  3. CONNECT leaf nodes:")
+println("     " + to_string(leaf_count) + " leaf nodes are single-hop fragile.")
+println("     Promoting to degree >= 2 doubles resilience per node.")
+println("")
+println("  4. MONITOR bridge hubs:")
+println("     Top centrality hubs are information bottlenecks.")
+println("     Their health is critical to atlas connectivity.")
+println("")
+println("  IMPORTANT: atlas.n6 is L0 protected.")
+println("  All writes MUST go through _guarded_append_atlas().")
+println("  This tool is read-only analysis.")
+println("═══════════════════════════════════════════════════════")
+
+// Cleanup temp files
+try { exec("rm -f '" + tmp_adj + "' '" + tmp_centrality + "'") } catch e {}
+
+exit(0)

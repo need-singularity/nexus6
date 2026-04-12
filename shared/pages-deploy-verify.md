@@ -1,1 +1,0 @@
-discovery/papers/pages-deploy-verify.md

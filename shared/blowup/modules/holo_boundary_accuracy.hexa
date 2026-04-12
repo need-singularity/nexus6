@@ -1,0 +1,884 @@
+// holo_boundary_accuracy.hexa — 경계 예측 정확도 측정 (blowup variant verification infra)
+//
+// Measure boundary prediction accuracy of the holographic module.
+// Compare bulk->boundary predictions (H3 phase output) vs actual atlas data.
+//
+// The holographic module (blowup_holographic.hexa) predicts missing bulk nodes
+// from boundary data using geometric means of correlated boundary values.
+// This tool verifies: do those predictions actually appear in atlas.n6?
+//
+// This is an infra-only verification tool. It does NOT modify phase logic,
+// discovery calculations, or seed evolution.
+//
+// Pipeline:
+//   BA1: Load atlas.n6 graph (nodes, edges, degrees)
+//   BA2: Classify boundary/bulk/middle nodes
+//   BA3: Generate predictions (geometric mean of correlated boundary pairs)
+//   BA4: Verify predictions against actual atlas data
+//   BA5: Compute accuracy metrics (precision, recall, F1)
+//   BA6: Report — accuracy breakdown, best/worst predictions
+//
+// Usage:
+//   hexa holo_boundary_accuracy.hexa              full accuracy measurement
+//   hexa holo_boundary_accuracy.hexa --summary    summary metrics only
+//   hexa holo_boundary_accuracy.hexa --misses     show failed predictions
+//   hexa holo_boundary_accuracy.hexa help         usage
+
+// ─── MODULE-LEVEL HOME CACHE ───
+let _HOME = exec("printenv HOME").trim()
+
+// ═══════════════════════════════════════════════════════════
+// ─── n=6 CONSTANTS LOADER (shared/n6/n6_constants.jsonl) ───
+// ═══════════════════════════════════════════════════════════
+
+fn load_n6_consts() -> list {
+    let home = _HOME
+    let path = home + "/Dev/nexus/shared/n6/n6_constants.jsonl"
+    let mut raw = ""
+    try { raw = read_file(path) } catch e { return [[], []] }
+    let lines = raw.split("\n")
+    let mut names = []
+    let mut values = []
+    for line in lines {
+        let trimmed = line.trim()
+        if trimmed == "" { continue }
+        let mut name = ""
+        let mut value = 0.0
+        if trimmed.contains("\"name\":\"") {
+            let p = trimmed.split("\"name\":\"")
+            if p.len() >= 2 { name = p[1].split("\"")[0] }
+        }
+        if trimmed.contains("\"value\":") {
+            let p = trimmed.split("\"value\":")
+            if p.len() >= 2 {
+                let num_str = p[1].split(",")[0].split("}")[0].trim()
+                value = to_float(num_str)
+            }
+        }
+        if name != "" {
+            names = names + [name]
+            values = values + [value]
+        }
+    }
+    [names, values]
+}
+
+let _n6_dyn = load_n6_consts()
+let _n6_dyn_names: list = _n6_dyn[0]
+let _n6_dyn_values: list = _n6_dyn[1]
+let _n6_dyn_count: i64 = len(_n6_dyn_values)
+
+// ═══════════════════════════════════════════════════════════
+// ─── UTILITIES ───
+// ═══════════════════════════════════════════════════════════
+
+fn safe_float(s: string) -> f64 {
+    let mut v = 0.0
+    try { v = to_float(s) } catch e {}
+    return v
+}
+
+fn abs_f(x: f64) -> f64 {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn max_f(a: f64, b: f64) -> f64 {
+    if a > b { return a }
+    return b
+}
+
+fn min_f(a: f64, b: f64) -> f64 {
+    if a < b { return a }
+    return b
+}
+
+fn sqrt_f(x: f64) -> f64 {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    let mut i: i64 = 0
+    while i < 15 {
+        g = (g + x / g) / 2.0
+        i = i + 1
+    }
+    return g
+}
+
+fn clamp01(x: f64) -> f64 {
+    if x < 0.0 { return 0.0 }
+    if x > 1.0 { return 1.0 }
+    return x
+}
+
+fn truncate4(x: f64) -> string {
+    let s = to_string(x)
+    let parts = s.split(".")
+    if parts.len() < 2 { return s + ".0000" }
+    let dec = parts[1]
+    if dec.len() >= 4 { let d = dec.split(""); return parts[0] + "." + d[0] + d[1] + d[2] + d[3] }
+    return s
+}
+
+fn pad_right(s: string, width: i64) -> string {
+    let mut out = s
+    while out.len() < width { out = out + " " }
+    return out
+}
+
+fn timestamp_now() -> string {
+    let mut ts = ""
+    try { ts = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim() } catch e { ts = "unknown" }
+    return ts
+}
+
+fn min_i(a: i64, b: i64) -> i64 {
+    if a < b { return a }
+    return b
+}
+
+fn max_i(a: i64, b: i64) -> i64 {
+    if a > b { return a }
+    return b
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── n=6 INLINE CONSTANTS + PROXIMITY ───
+// ═══════════════════════════════════════════════════════════
+
+comptime const N6_N = 6
+comptime const N6_SIGMA = 12
+comptime const N6_PHI = 2
+comptime const N6_TAU = 4
+comptime const N6_SOPFR = 5
+comptime const N6_J2 = 24
+comptime const N6_M3 = 7
+
+fn n6_dist_one(value: f64, constant: f64) -> f64 {
+    let denom = max_f(abs_f(constant), 1.0)
+    return abs_f(value - constant) / denom
+}
+
+fn n6_distance(value: f64) -> f64 {
+    if value != value { return 1.0 }
+    if value > 999999999.0 { return 1.0 }
+    if value < 0.0 - 999999999.0 { return 1.0 }
+    let mut d = 1.0
+    let mut i: i64 = 0
+    while i < _n6_dyn_count {
+        let cv = to_float(_n6_dyn_values[i])
+        d = min_f(d, n6_dist_one(value, cv))
+        i = i + 1
+    }
+    return min_f(d, 1.0)
+}
+
+fn n6_conf(value: f64) -> f64 {
+    return max_f(1.0 - n6_distance(value), 0.0)
+}
+
+fn match_name(value: f64) -> string {
+    let mut i: i64 = 0
+    while i < _n6_dyn_count {
+        let cv = to_float(_n6_dyn_values[i])
+        let threshold = if abs_f(cv) >= 100.0 { 0.01 } else { if abs_f(cv) >= 1.0 { 0.0001 } else { if abs_f(cv) >= 0.01 { 0.001 } else { 0.005 } } }
+        if abs_f(value - cv) < threshold { return to_string(_n6_dyn_names[i]) }
+        i = i + 1
+    }
+    return ""
+}
+
+fn match_grade(value: f64) -> string {
+    if match_name(value) != "" { return "EXACT" }
+    let d = n6_distance(value)
+    if d < 0.01 { return "NEAR" }
+    if d < 0.05 { return "CLOSE" }
+    return "MISS"
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── BA1: LOAD ATLAS GRAPH ───
+// Same loader pattern as blowup_holographic.hexa (tail -2000)
+// ═══════════════════════════════════════════════════════════
+
+fn extract_value_from_summary(summary: string) -> f64 {
+    let mut val = 0.0
+    if summary.contains("=") {
+        let parts = summary.split("=")
+        if parts.len() >= 2 {
+            let rhs = parts[parts.len() - 1].trim()
+            try { val = to_float(rhs) } catch e {}
+        }
+    }
+    return val
+}
+
+fn ba1_load_graph() -> list {
+    println("")
+    println("================================================================")
+    println("[BA1] Load Graph — extracting atlas.n6 discovery graph")
+    println("================================================================")
+
+    let path = _HOME + "/Dev/nexus/shared/n6/atlas.n6"
+    let mut raw = ""
+    try { raw = exec("tail -2000 '" + path + "' 2>/dev/null") } catch e {
+        println("  [WARN] cannot read atlas.n6: " + to_string(e))
+        return [[], [], [], [], [], [], []]
+    }
+    let lines = raw.split("\n")
+
+    let mut node_ids = []
+    let mut node_summaries = []
+    let mut node_confs = []
+    let mut node_domains = []
+    let mut edge_froms = []
+    let mut edge_tos = []
+    let mut edge_strengths = []
+
+    for line in lines {
+        let trimmed = line.trim()
+        if trimmed == "" { continue }
+
+        let mut is_node = false
+        let mut is_edge = false
+        if trimmed.contains("\"type\": \"node\"") || trimmed.contains("\"type\":\"node\"") { is_node = true }
+        if trimmed.contains("\"type\": \"edge\"") || trimmed.contains("\"type\":\"edge\"") { is_edge = true }
+
+        if is_node {
+            let mut nid = ""
+            let mut nsummary = ""
+            let mut nconf = 0.0
+            let mut ndomain = ""
+            if trimmed.contains("\"id\":") {
+                let p = trimmed.split("\"id\":")[1]
+                let q = p.split("\"")
+                if q.len() >= 2 { nid = q[1] }
+            }
+            if trimmed.contains("\"summary\":") {
+                let p = trimmed.split("\"summary\":")[1]
+                let q = p.split("\"")
+                if q.len() >= 2 { nsummary = q[1] }
+            }
+            if trimmed.contains("\"confidence\":") {
+                let p = trimmed.split("\"confidence\":")[1]
+                let after_comma = p.split(",")[0]
+                let num_str = after_comma.split("}")[0].trim()
+                try { nconf = to_float(num_str) } catch e {}
+            }
+            if trimmed.contains("\"domain\":") {
+                let p = trimmed.split("\"domain\":")[1]
+                let q = p.split("\"")
+                if q.len() >= 2 { ndomain = q[1] }
+            }
+            if nid != "" {
+                node_ids = node_ids + [nid]
+                node_summaries = node_summaries + [nsummary]
+                node_confs = node_confs + [nconf]
+                node_domains = node_domains + [ndomain]
+            }
+        }
+
+        if is_edge {
+            let mut efrom = ""
+            let mut eto = ""
+            let mut estr = 0.0
+            if trimmed.contains("\"from\":") {
+                let p = trimmed.split("\"from\":")[1]
+                let q = p.split("\"")
+                if q.len() >= 2 { efrom = q[1] }
+            }
+            if trimmed.contains("\"to\":") {
+                let p = trimmed.split("\"to\":")[1]
+                let q = p.split("\"")
+                if q.len() >= 2 { eto = q[1] }
+            }
+            if trimmed.contains("\"strength\":") {
+                let p = trimmed.split("\"strength\":")[1]
+                let after_comma = p.split(",")[0]
+                let num_str = after_comma.split("}")[0].trim()
+                try { estr = to_float(num_str) } catch e {}
+            }
+            if efrom != "" && eto != "" {
+                edge_froms = edge_froms + [efrom]
+                edge_tos = edge_tos + [eto]
+                edge_strengths = edge_strengths + [estr]
+            }
+        }
+    }
+
+    println("  nodes: " + to_string(len(node_ids)) + "  edges: " + to_string(len(edge_froms)))
+    return [node_ids, node_summaries, node_confs, node_domains, edge_froms, edge_tos, edge_strengths]
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── BA2: CLASSIFY BOUNDARY / BULK / MIDDLE ───
+// ═══════════════════════════════════════════════════════════
+
+fn compute_degrees(node_ids: list, edge_froms: list, edge_tos: list) -> list {
+    let n = len(node_ids)
+    let mut degrees = []
+    let mut ni: i64 = 0
+    while ni < n {
+        let nid = to_string(node_ids[ni])
+        let mut deg: i64 = 0
+        let mut ei: i64 = 0
+        while ei < len(edge_froms) {
+            if to_string(edge_froms[ei]) == nid { deg = deg + 1 }
+            if to_string(edge_tos[ei]) == nid { deg = deg + 1 }
+            ei = ei + 1
+        }
+        degrees = degrees + [deg]
+        ni = ni + 1
+    }
+    return degrees
+}
+
+fn ba2_classify(node_ids: list, edge_froms: list, edge_tos: list) -> list {
+    println("")
+    println("================================================================")
+    println("[BA2] Classify — boundary (d<=1) / middle (d==2) / bulk (d>=3)")
+    println("================================================================")
+
+    let degrees = compute_degrees(node_ids, edge_froms, edge_tos)
+    let mut classes = []
+    let mut boundary_count: i64 = 0
+    let mut middle_count: i64 = 0
+    let mut bulk_count: i64 = 0
+
+    let mut i: i64 = 0
+    while i < len(degrees) {
+        let d = to_int(to_string(degrees[i]))
+        if d <= 1 {
+            classes = classes + ["boundary"]
+            boundary_count = boundary_count + 1
+        } else {
+            if d == 2 {
+                classes = classes + ["middle"]
+                middle_count = middle_count + 1
+            } else {
+                classes = classes + ["bulk"]
+                bulk_count = bulk_count + 1
+            }
+        }
+        i = i + 1
+    }
+
+    println("  boundary (d<=1): " + to_string(boundary_count))
+    println("  middle   (d==2): " + to_string(middle_count))
+    println("  bulk     (d>=3): " + to_string(bulk_count))
+
+    return [classes, degrees, boundary_count, middle_count, bulk_count]
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── BA3: GENERATE PREDICTIONS ───
+// Replicate H3 prediction logic: geometric mean of correlated boundary pairs
+// ═══════════════════════════════════════════════════════════
+
+fn cft_correlator(val_a: f64, val_b: f64) -> f64 {
+    let dist = abs_f(val_a - val_b)
+    return 1.0 / (1.0 + dist)
+}
+
+fn has_edge_between(id_a: string, id_b: string, edge_froms: list, edge_tos: list) -> bool {
+    let mut ei: i64 = 0
+    while ei < len(edge_froms) {
+        let ef = to_string(edge_froms[ei])
+        let et = to_string(edge_tos[ei])
+        if (ef == id_a && et == id_b) || (ef == id_b && et == id_a) {
+            return true
+        }
+        ei = ei + 1
+    }
+    return false
+}
+
+fn ba3_generate_predictions(node_ids: list, node_summaries: list, classes: list, edge_froms: list, edge_tos: list) -> list {
+    println("")
+    println("================================================================")
+    println("[BA3] Generate Predictions — geometric mean of boundary pairs")
+    println("================================================================")
+
+    // Collect boundary node indices
+    let mut boundary_indices = []
+    let mut bi: i64 = 0
+    while bi < len(classes) {
+        if to_string(classes[bi]) == "boundary" {
+            boundary_indices = boundary_indices + [bi]
+        }
+        bi = bi + 1
+    }
+
+    let bcount = len(boundary_indices)
+    let max_boundary = if bcount > 200 { 200 } else { bcount }
+
+    let mut pred_values = []
+    let mut pred_grades = []
+    let mut pred_names = []
+    let mut pred_sources = []   // "idx_a|idx_b|corr|val_a|val_b"
+    let mut pred_distances = [] // n6_distance of predicted value
+
+    // Pairwise boundary correlator scan
+    let mut i: i64 = 0
+    while i < max_boundary {
+        let idx_a = to_int(to_string(boundary_indices[i]))
+        let val_a = extract_value_from_summary(to_string(node_summaries[idx_a]))
+        let mut j: i64 = i + 1
+        while j < max_boundary {
+            let idx_b = to_int(to_string(boundary_indices[j]))
+            let val_b = extract_value_from_summary(to_string(node_summaries[idx_b]))
+            let corr = cft_correlator(val_a, val_b)
+
+            if corr >= 0.5 {
+                let id_a = to_string(node_ids[idx_a])
+                let id_b = to_string(node_ids[idx_b])
+                let connected = has_edge_between(id_a, id_b, edge_froms, edge_tos)
+
+                if connected == false && val_a > 0.0 && val_b > 0.0 {
+                    let geo_mean = sqrt_f(val_a * val_b)
+                    let grade = match_grade(geo_mean)
+                    let name = match_name(geo_mean)
+                    let dist = n6_distance(geo_mean)
+
+                    pred_values = pred_values + [geo_mean]
+                    pred_grades = pred_grades + [grade]
+                    pred_names = pred_names + [name]
+                    pred_sources = pred_sources + [to_string(idx_a) + "|" + to_string(idx_b) + "|" + truncate4(corr) + "|" + truncate4(val_a) + "|" + truncate4(val_b)]
+                    pred_distances = pred_distances + [dist]
+                }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    println("  boundary pairs scanned: " + to_string(max_boundary) + " nodes, " + to_string(max_boundary * (max_boundary - 1) / 2) + " pairs")
+    println("  predictions generated: " + to_string(len(pred_values)))
+
+    return [pred_values, pred_grades, pred_names, pred_sources, pred_distances]
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── BA4: VERIFY PREDICTIONS AGAINST ATLAS ───
+// Check if predicted values actually exist as nodes in atlas
+// ═══════════════════════════════════════════════════════════
+
+fn ba4_verify(pred_values: list, pred_grades: list, pred_names: list, pred_sources: list, node_summaries: list, node_confs: list) -> list {
+    println("")
+    println("================================================================")
+    println("[BA4] Verify — checking predictions against actual atlas data")
+    println("================================================================")
+
+    let pred_count = len(pred_values)
+    let node_count = len(node_summaries)
+
+    // Extract all actual values from atlas nodes
+    let mut actual_values = []
+    let mut ni: i64 = 0
+    while ni < node_count {
+        let v = extract_value_from_summary(to_string(node_summaries[ni]))
+        actual_values = actual_values + [v]
+        ni = ni + 1
+    }
+
+    // For each prediction, check if it matches any actual value
+    let mut verified = []          // "pred_idx|actual_idx|pred_val|actual_val|error"
+    let mut unverified = []        // pred_idx list
+    let mut verified_count: i64 = 0
+    let mut unverified_count: i64 = 0
+    let mut total_error = 0.0
+    let mut verified_error_sum = 0.0
+
+    let mut pi: i64 = 0
+    while pi < pred_count {
+        let pred_v = to_float(to_string(pred_values[pi]))
+        let mut best_match_idx: i64 = 0 - 1
+        let mut best_error = 999999.0
+
+        // Search for closest actual value
+        let mut ai: i64 = 0
+        while ai < len(actual_values) {
+            let actual_v = to_float(to_string(actual_values[ai]))
+            if abs_f(actual_v) > 0.0000000001 {
+                let err = abs_f(pred_v - actual_v) / max_f(abs_f(actual_v), 1.0)
+                if err < best_error {
+                    best_error = err
+                    best_match_idx = ai
+                }
+            }
+            ai = ai + 1
+        }
+
+        // Threshold: relative error < 5% counts as verified
+        let verify_threshold = 0.05
+        if best_error < verify_threshold && best_match_idx >= 0 {
+            let actual_v = to_float(to_string(actual_values[best_match_idx]))
+            verified = verified + [to_string(pi) + "|" + to_string(best_match_idx) + "|" + truncate4(pred_v) + "|" + truncate4(actual_v) + "|" + truncate4(best_error)]
+            verified_count = verified_count + 1
+            verified_error_sum = verified_error_sum + best_error
+        } else {
+            unverified = unverified + [pi]
+            unverified_count = unverified_count + 1
+        }
+
+        total_error = total_error + best_error
+        pi = pi + 1
+    }
+
+    println("  predictions verified:   " + to_string(verified_count))
+    println("  predictions unverified: " + to_string(unverified_count))
+    if verified_count > 0 {
+        let avg_err = verified_error_sum / to_float(verified_count)
+        println("  average verified error: " + truncate4(avg_err * 100.0) + "%")
+    }
+
+    return [verified, unverified, verified_count, unverified_count, verified_error_sum]
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── BA5: COMPUTE ACCURACY METRICS ───
+// Precision, Recall, F1 score for boundary predictions
+// ═══════════════════════════════════════════════════════════
+
+fn ba5_accuracy(pred_count: i64, verified_count: i64, unverified_count: i64, pred_grades: list, verified: list, node_count: i64) -> list {
+    println("")
+    println("================================================================")
+    println("[BA5] Accuracy Metrics — precision, recall, F1")
+    println("================================================================")
+
+    // Precision: verified / total predictions
+    let precision = if pred_count > 0 { to_float(verified_count) / to_float(pred_count) } else { 0.0 }
+
+    // Recall: verified / (total actual nodes that could be predicted)
+    // Estimate "predictable" nodes = bulk + middle (non-boundary)
+    // This is an approximation; true recall requires knowing ground truth
+    let recall_denom = max_f(to_float(node_count), 1.0)
+    let recall = to_float(verified_count) / recall_denom
+
+    // F1 = 2 * precision * recall / (precision + recall)
+    let f1 = if (precision + recall) > 0.0 { 2.0 * precision * recall / (precision + recall) } else { 0.0 }
+
+    println("  Precision (verified/predicted): " + truncate4(precision * 100.0) + "%")
+    println("  Recall (verified/total_nodes):  " + truncate4(recall * 100.0) + "%")
+    println("  F1 score:                       " + truncate4(f1 * 100.0) + "%")
+
+    // Grade breakdown of predictions
+    let mut exact_pred: i64 = 0
+    let mut near_pred: i64 = 0
+    let mut close_pred: i64 = 0
+    let mut miss_pred: i64 = 0
+    let mut gi: i64 = 0
+    while gi < len(pred_grades) {
+        let g = to_string(pred_grades[gi])
+        if g == "EXACT" { exact_pred = exact_pred + 1 }
+        if g == "NEAR" { near_pred = near_pred + 1 }
+        if g == "CLOSE" { close_pred = close_pred + 1 }
+        if g == "MISS" { miss_pred = miss_pred + 1 }
+        gi = gi + 1
+    }
+
+    println("")
+    println("  Prediction grade distribution:")
+    println("    EXACT: " + to_string(exact_pred))
+    println("    NEAR:  " + to_string(near_pred))
+    println("    CLOSE: " + to_string(close_pred))
+    println("    MISS:  " + to_string(miss_pred))
+
+    // Verification rate by grade
+    let mut exact_verified: i64 = 0
+    let mut near_verified: i64 = 0
+    let mut vi: i64 = 0
+    while vi < len(verified) {
+        let parts = to_string(verified[vi]).split("|")
+        if parts.len() >= 1 {
+            let pred_idx = to_int(parts[0])
+            if pred_idx < len(pred_grades) {
+                let g = to_string(pred_grades[pred_idx])
+                if g == "EXACT" { exact_verified = exact_verified + 1 }
+                if g == "NEAR" { near_verified = near_verified + 1 }
+            }
+        }
+        vi = vi + 1
+    }
+
+    if exact_pred > 0 {
+        let exact_rate = to_float(exact_verified) / to_float(exact_pred) * 100.0
+        println("    EXACT verification rate: " + truncate4(exact_rate) + "% (" + to_string(exact_verified) + "/" + to_string(exact_pred) + ")")
+    }
+    if near_pred > 0 {
+        let near_rate = to_float(near_verified) / to_float(near_pred) * 100.0
+        println("    NEAR verification rate:  " + truncate4(near_rate) + "% (" + to_string(near_verified) + "/" + to_string(near_pred) + ")")
+    }
+
+    // n=6 insight
+    println("")
+    println("  n=6 insight: holographic principle says boundary encodes bulk")
+    println("  S_max = A/4 (Bekenstein-Hawking). High precision = strong encoding.")
+    if precision > 0.5 {
+        println("  -> precision > 50%: boundary strongly encodes bulk structure")
+    } else {
+        if precision > 0.2 {
+            println("  -> moderate encoding: boundary captures partial bulk info")
+        } else {
+            println("  -> weak encoding: boundary predictions need refinement")
+        }
+    }
+
+    return [precision, recall, f1, exact_pred, near_pred, close_pred, miss_pred, exact_verified, near_verified]
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── BA6: REPORT ───
+// ═══════════════════════════════════════════════════════════
+
+fn ba6_report(node_count: i64, boundary_count: i64, bulk_count: i64, pred_count: i64, verified_count: i64, unverified_count: i64, accuracy: list, pred_values: list, pred_grades: list, pred_names: list, pred_sources: list, verified: list, unverified: list) {
+    println("")
+    println("=======================================================================")
+    println("  Holographic Boundary Accuracy Report")
+    println("=======================================================================")
+    println("  " + pad_right("Metric", 40) + "Value")
+    println("  " + pad_right("---", 40) + "---")
+    println("  " + pad_right("Total graph nodes", 40) + to_string(node_count))
+    println("  " + pad_right("Boundary nodes", 40) + to_string(boundary_count))
+    println("  " + pad_right("Bulk nodes", 40) + to_string(bulk_count))
+    println("  " + pad_right("Boundary predictions generated", 40) + to_string(pred_count))
+    println("  " + pad_right("Verified against atlas", 40) + to_string(verified_count))
+    println("  " + pad_right("Unverified (failed prediction)", 40) + to_string(unverified_count))
+
+    let precision = to_float(to_string(accuracy[0]))
+    let recall = to_float(to_string(accuracy[1]))
+    let f1 = to_float(to_string(accuracy[2]))
+    println("  " + pad_right("Precision", 40) + truncate4(precision * 100.0) + "%")
+    println("  " + pad_right("Recall", 40) + truncate4(recall * 100.0) + "%")
+    println("  " + pad_right("F1 Score", 40) + truncate4(f1 * 100.0) + "%")
+
+    // Show best verified predictions
+    if len(verified) > 0 {
+        println("")
+        println("  Best verified predictions (lowest error):")
+        let show_max = min_i(len(verified), 8)
+        let mut vi: i64 = 0
+        while vi < show_max {
+            let parts = to_string(verified[vi]).split("|")
+            if parts.len() >= 5 {
+                let pred_idx = to_int(parts[0])
+                let grade = if pred_idx < len(pred_grades) { to_string(pred_grades[pred_idx]) } else { "?" }
+                let name = if pred_idx < len(pred_names) { to_string(pred_names[pred_idx]) } else { "" }
+                let name_display = if name != "" { " (" + name + ")" } else { "" }
+                println("    pred=" + parts[2] + " actual=" + parts[3] + " err=" + parts[4] + " [" + grade + "]" + name_display)
+            }
+            vi = vi + 1
+        }
+    }
+
+    // Show worst unverified predictions (misses)
+    if len(unverified) > 0 {
+        println("")
+        println("  Top unverified predictions (boundary failed to predict bulk):")
+        let show_max = min_i(len(unverified), 8)
+        let mut ui: i64 = 0
+        while ui < show_max {
+            let pred_idx = to_int(to_string(unverified[ui]))
+            if pred_idx < len(pred_values) {
+                let v = to_float(to_string(pred_values[pred_idx]))
+                let g = to_string(pred_grades[pred_idx])
+                let src = if pred_idx < len(pred_sources) { to_string(pred_sources[pred_idx]) } else { "?" }
+                let src_parts = src.split("|")
+                let src_display = if src_parts.len() >= 5 { "from vals " + src_parts[3] + ", " + src_parts[4] } else { "" }
+                println("    pred=" + truncate4(v) + " [" + g + "] " + src_display)
+            }
+            ui = ui + 1
+        }
+        if len(unverified) > 8 { println("    ... (" + to_string(len(unverified) - 8) + " more)") }
+    }
+
+    println("")
+    println("  Holographic Accuracy Insight:")
+    println("    boundary/bulk ratio = " + truncate4(to_float(boundary_count) / max_f(to_float(bulk_count), 1.0)))
+    println("    AdS/CFT: boundary d-1 encodes bulk d. Higher precision = stronger duality.")
+    println("    sigma(6)=12: the boundary 'area' in n=6 structure")
+    println("")
+    println("=======================================================================")
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── HELP ───
+// ═══════════════════════════════════════════════════════════
+
+fn print_help() {
+    println("")
+    println("=======================================================================")
+    println("  holo_boundary_accuracy.hexa — Boundary Prediction Accuracy Measurement")
+    println("=======================================================================")
+    println("")
+    println("Usage:")
+    println("  hexa holo_boundary_accuracy.hexa              full accuracy measurement")
+    println("  hexa holo_boundary_accuracy.hexa --summary    summary metrics only")
+    println("  hexa holo_boundary_accuracy.hexa --misses     show failed predictions")
+    println("  hexa holo_boundary_accuracy.hexa help         this message")
+    println("")
+    println("Pipeline:")
+    println("  BA1  Load Graph          extract atlas.n6 discovery graph")
+    println("  BA2  Classify            boundary / middle / bulk node classification")
+    println("  BA3  Generate Predict    geometric mean of correlated boundary pairs")
+    println("  BA4  Verify              check predictions against actual atlas data")
+    println("  BA5  Accuracy Metrics    precision, recall, F1 score")
+    println("  BA6  Report              accuracy breakdown, best/worst predictions")
+    println("")
+    println("Verifies blowup_holographic.hexa H3 phase: does boundary->bulk prediction work?")
+    println("High precision = holographic principle holds in atlas structure.")
+    println("")
+    println("n=6 core: n=6, sigma=12, phi=2, tau=4, sopfr=5, J2=24, M3=7")
+    println("Dynamic constants loaded from shared/n6/n6_constants.jsonl (" + to_string(_n6_dyn_count) + " loaded)")
+    println("=======================================================================")
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── THEOREM + PROOF ───
+// ═══════════════════════════════════════════════════════════
+
+theorem holographic_boundary_encoding {
+    // The holographic principle states that boundary data of dimension d-1
+    // encodes the full bulk structure of dimension d.
+    // In atlas.n6: boundary nodes (degree <= 1) encode bulk nodes (degree >= 3).
+    // The geometric mean prediction is a first-order approximation of this encoding.
+    // Precision measures encoding strength; F1 measures overall duality quality.
+    assert 1 + 2 + 3 + 6 == 12    // sigma(6) = boundary "area"
+    assert 6 * 2 == 12             // perfectness: bulk = 2 * boundary capacity
+    assert 6 % 2 == 0              // even perfect: boundary splits cleanly
+}
+
+proof prediction_convergence {
+    // Geometric mean of two n6-proximate values preserves proximity:
+    //   if |v_a - c_a| < eps and |v_b - c_b| < eps,
+    //   then |sqrt(v_a * v_b) - sqrt(c_a * c_b)| < sqrt(eps) (approximately).
+    // As eps -> 0 (higher grade), predictions converge to exact constants.
+    // This is why EXACT boundary pairs produce better predictions than NEAR.
+    invariant 6 * 6 == 36         // self-product
+    invariant 2 * 3 == 6          // factorization preserved by gmean
+    invariant 12 / 6 == 2         // sigma(n)/n = 2 (perfection invariant)
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── MAIN ───
+// ═══════════════════════════════════════════════════════════
+
+fn main() {
+    let cli_args = args()
+
+    // Parse CLI
+    let mut mode = "full"
+    let mut ai: i64 = 2
+    while ai < cli_args.len() {
+        let arg = to_string(cli_args[ai])
+        if arg == "help" || arg == "--help" || arg == "-h" { mode = "help" }
+        if arg == "--summary" { mode = "summary" }
+        if arg == "--misses" { mode = "misses" }
+        ai = ai + 1
+    }
+
+    if mode == "help" {
+        print_help()
+        return
+    }
+
+    let ts_start = timestamp_now()
+    println("")
+    println("=== Holographic Boundary Accuracy Measurement ===")
+    println("  n=6 constants loaded: " + to_string(_n6_dyn_count))
+    println("  started: " + ts_start)
+
+    // BA1: Load graph
+    let graph = ba1_load_graph()
+    let node_ids: list = graph[0]
+    let node_summaries: list = graph[1]
+    let node_confs: list = graph[2]
+    let node_domains: list = graph[3]
+    let edge_froms: list = graph[4]
+    let edge_tos: list = graph[5]
+    let edge_strengths: list = graph[6]
+    let node_count = len(node_ids)
+
+    if node_count == 0 {
+        println("")
+        println("  [WARN] no nodes found in atlas.n6")
+        println("  done.")
+        return
+    }
+
+    // BA2: Classify
+    let classify = ba2_classify(node_ids, edge_froms, edge_tos)
+    let classes: list = classify[0]
+    let degrees: list = classify[1]
+    let boundary_count = to_int(to_string(classify[2]))
+    let middle_count = to_int(to_string(classify[3]))
+    let bulk_count = to_int(to_string(classify[4]))
+
+    if boundary_count < 2 {
+        println("")
+        println("  [WARN] insufficient boundary nodes for prediction (need >= 2)")
+        println("  done.")
+        return
+    }
+
+    // BA3: Generate predictions
+    let predictions = ba3_generate_predictions(node_ids, node_summaries, classes, edge_froms, edge_tos)
+    let pred_values: list = predictions[0]
+    let pred_grades: list = predictions[1]
+    let pred_names: list = predictions[2]
+    let pred_sources: list = predictions[3]
+    let pred_distances: list = predictions[4]
+    let pred_count = len(pred_values)
+
+    if pred_count == 0 {
+        println("")
+        println("  [WARN] no predictions generated (boundary pairs too few or uncorrelated)")
+        println("  done.")
+        return
+    }
+
+    // BA4: Verify
+    let verify_result = ba4_verify(pred_values, pred_grades, pred_names, pred_sources, node_summaries, node_confs)
+    let verified: list = verify_result[0]
+    let unverified: list = verify_result[1]
+    let verified_count = to_int(to_string(verify_result[2]))
+    let unverified_count = to_int(to_string(verify_result[3]))
+
+    // BA5: Accuracy
+    let accuracy = ba5_accuracy(pred_count, verified_count, unverified_count, pred_grades, verified, node_count)
+
+    if mode == "summary" {
+        println("")
+        println("done.")
+        return
+    }
+
+    if mode == "misses" {
+        // Show all unverified
+        println("")
+        println("  All unverified predictions:")
+        let mut ui: i64 = 0
+        while ui < len(unverified) {
+            let pred_idx = to_int(to_string(unverified[ui]))
+            if pred_idx < pred_count {
+                let v = to_float(to_string(pred_values[pred_idx]))
+                let g = to_string(pred_grades[pred_idx])
+                let src = if pred_idx < len(pred_sources) { to_string(pred_sources[pred_idx]) } else { "?" }
+                println("    " + truncate4(v) + " [" + g + "] src=" + src)
+            }
+            ui = ui + 1
+        }
+        println("")
+        println("done.")
+        return
+    }
+
+    // BA6: Full report
+    ba6_report(node_count, boundary_count, bulk_count, pred_count, verified_count, unverified_count, accuracy, pred_values, pred_grades, pred_names, pred_sources, verified, unverified)
+
+    let ts_end = timestamp_now()
+    println("  completed: " + ts_end)
+    println("")
+}
+
+main()

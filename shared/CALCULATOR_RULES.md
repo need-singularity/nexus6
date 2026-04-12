@@ -1,1 +1,0 @@
-config/CALCULATOR_RULES.md
