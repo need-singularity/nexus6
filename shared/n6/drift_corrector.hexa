@@ -150,44 +150,280 @@ let rec_n_mu = parse_json_int(raw_c, "n_mu")
 let rec_tau_mu = parse_json_int(raw_c, "tau_mu")
 
 // -- 2. Measure current live state --------------------------------
+//    ROI#26: 24+ exec(grep/wc/awk) → 단일 awk 멀티패턴 1회 + 결과 캐시
+//    atlas.n6(12MB) 1-pass scan: cortical 6패턴 + coupling 8패턴 + node 11 ID = 25 카운트
+//    deg sidecar: 1-pass awk로 leaf/max/hub별 degree 전부 수집
+
+// --- Cache infrastructure ---
+let _DRIFT_CACHE = _BASE + "/shared/n6/.drift_cache"
+
+fn _drift_cache_valid() -> bool {
+    if !file_exists(_DRIFT_CACHE) { return false }
+    if !file_exists(_ATLAS) { return false }
+    let mut atlas_mtime = ""
+    try { atlas_mtime = exec("stat -f '%m' '" + _ATLAS + "' 2>/dev/null || stat -c '%Y' '" + _ATLAS + "' 2>/dev/null").trim() } catch e { return false }
+    let mut cache_raw = ""
+    try { cache_raw = read_file(_DRIFT_CACHE) } catch e { return false }
+    let marker = "\"atlas_mtime\":"
+    let chunks = cache_raw.split(marker)
+    if len(chunks) < 2 { return false }
+    let cached_mtime = chunks[1].split(",")[0].split("}")[0].trim().replace("\"", "")
+    return cached_mtime == atlas_mtime
+}
+
+fn _drift_cache_get(key: string) -> i64 {
+    let mut raw = ""
+    try { raw = read_file(_DRIFT_CACHE) } catch e { return 0 }
+    let marker = "\"" + key + "\":"
+    let chunks = raw.split(marker)
+    if len(chunks) < 2 { return 0 }
+    let val = chunks[1].split(",")[0].split("}")[0].split("\n")[0].trim()
+    return safe_int(val)
+}
+
+fn _drift_cache_put(data: string) {
+    try { write_file(_DRIFT_CACHE, data) } catch e {}
+}
+
+// --- Stats sidecar (small file, parse in hexa) ---
 let mut cur_nodes: i64 = 0
 let mut cur_edges: i64 = 0
 let mut cur_hubs: i64 = 0
 if file_exists(_STATS) {
     try {
-        let stats = read_file(_STATS).trim()
-        cur_nodes = safe_int(exec("echo '" + stats + "' | grep -oE '\"nodes\":[0-9]+' | cut -d: -f2"))
-        cur_edges = safe_int(exec("echo '" + stats + "' | grep -oE '\"edges\":[0-9]+' | cut -d: -f2"))
-        cur_hubs = safe_int(exec("echo '" + stats + "' | grep -oE '\"hubs\":[0-9]+' | cut -d: -f2"))
+        let stats_raw = read_file(_STATS).trim()
+        cur_nodes = parse_json_int(stats_raw, "nodes")
+        cur_edges = parse_json_int(stats_raw, "edges")
+        cur_hubs = parse_json_int(stats_raw, "hubs")
     } catch e {}
 }
 
-let deg_total = safe_int(exec("wc -l < '" + _DEG + "' 2>/dev/null || echo 0"))
-let cur_leaf_count = safe_int(exec("awk -F'\\t' '$2==1' '" + _DEG + "' 2>/dev/null | wc -l"))
+// --- DEG sidecar: single awk pass for leaf_count + max_degree + 6 hub degrees ---
+let _deg_awk = "BEGIN{FS=\"\\t\"; leaves=0; maxd=0} " +
+    "{d=$2+0; if(d==1)leaves++; if(d>maxd)maxd=d} " +
+    "$1==\"n\"{hn=d} $1==\"J2\"{hJ2=d} $1==\"phi\"{hphi=d} " +
+    "$1==\"sigma\"{hsigma=d} $1==\"tau\"{htau=d} $1==\"sopfr\"{hsopfr=d} " +
+    "END{print NR\"|\"leaves\"|\"maxd\"|\"hn\"|\"hJ2\"|\"hphi\"|\"hsigma\"|\"htau\"|\"hsopfr}"
+
+let mut deg_total: i64 = 0
+let mut cur_leaf_count: i64 = 0
+let mut cur_max_degree: i64 = 0
+let mut cur_hub_n: i64 = 0
+let mut cur_hub_J2: i64 = 0
+let mut cur_hub_phi: i64 = 0
+let mut cur_hub_sigma: i64 = 0
+let mut cur_hub_tau: i64 = 0
+let mut cur_hub_sopfr: i64 = 0
+
+if file_exists(_DEG) {
+    let mut deg_out = ""
+    try { deg_out = exec("awk '" + _deg_awk + "' '" + _DEG + "' 2>/dev/null").trim() } catch e {}
+    let dp = deg_out.split("|")
+    if len(dp) == 9 {
+        deg_total = safe_int(dp[0])
+        cur_leaf_count = safe_int(dp[1])
+        cur_max_degree = safe_int(dp[2])
+        cur_hub_n = safe_int(dp[3])
+        cur_hub_J2 = safe_int(dp[4])
+        cur_hub_phi = safe_int(dp[5])
+        cur_hub_sigma = safe_int(dp[6])
+        cur_hub_tau = safe_int(dp[7])
+        cur_hub_sopfr = safe_int(dp[8])
+    }
+}
+
 let cur_leaf_ratio = if deg_total > 0 { to_float(cur_leaf_count) / to_float(deg_total) } else { 0.0 }
 let cur_hub_ratio = if deg_total > 0 { to_float(cur_hubs) / to_float(deg_total) } else { 0.0 }
 let cur_density = if cur_nodes > 1 { to_float(cur_edges * 2) / (to_float(cur_nodes) * to_float(cur_nodes - 1)) } else { 0.0 }
-let cur_max_degree = safe_int(exec("awk -F'\\t' '{if($2+0>m)m=$2+0} END{print m}' '" + _DEG + "' 2>/dev/null"))
 
-fn cur_hub_deg(hub_id: string) -> i64 {
-    return safe_int(exec("awk -F'\\t' -v id='" + hub_id + "' '$1==id{print $2}' '" + _DEG + "' 2>/dev/null || echo 0"))
+// --- Atlas single-pass: 25 pattern counts in 1 awk scan (ROI#26 핵심) ---
+// Cortical 6: n(\bn\b|n=6|n =), phi, sigma, tau, sopfr, mu
+// Coupling 8: n_sigma, n_phi, phi_sigma, sigma_tau, phi_tau, n_tau, n_mu, tau_mu
+// Node IDs 11: 5 mm_nodes + 6 dim_nodes (grep -cF equivalent)
+let mm_nodes = ["mm-consciousness-topology", "mm-thalamic-hub-n", "mm-dimension-imbalance", "mm-soc-criticality", "mm-dim-fold-515"]
+let dim_nodes = ["dim-intrinsic-4d", "dim-phi-critical-14", "dim-phi-fractal-30", "dim-faction-topology", "dim-maxpool-phi-amplify", "dim-shannon-ladder"]
+
+// Cache hit → skip atlas scan entirely
+let mut cur_count_n: i64 = 0
+let mut cur_count_phi: i64 = 0
+let mut cur_count_sigma: i64 = 0
+let mut cur_count_tau: i64 = 0
+let mut cur_count_sopfr: i64 = 0
+let mut cur_count_mu: i64 = 0
+let mut cur_n_sigma: i64 = 0
+let mut cur_n_phi: i64 = 0
+let mut cur_phi_sigma: i64 = 0
+let mut cur_sigma_tau: i64 = 0
+let mut cur_phi_tau: i64 = 0
+let mut cur_n_tau: i64 = 0
+let mut cur_n_mu: i64 = 0
+let mut cur_tau_mu: i64 = 0
+let mut missing_nodes: [string] = []
+
+let mut _cache_hit = false
+if _drift_cache_valid() {
+    _cache_hit = true
+    cur_count_n = _drift_cache_get("cnt_n")
+    cur_count_phi = _drift_cache_get("cnt_phi")
+    cur_count_sigma = _drift_cache_get("cnt_sigma")
+    cur_count_tau = _drift_cache_get("cnt_tau")
+    cur_count_sopfr = _drift_cache_get("cnt_sopfr")
+    cur_count_mu = _drift_cache_get("cnt_mu")
+    cur_n_sigma = _drift_cache_get("cp_n_sigma")
+    cur_n_phi = _drift_cache_get("cp_n_phi")
+    cur_phi_sigma = _drift_cache_get("cp_phi_sigma")
+    cur_sigma_tau = _drift_cache_get("cp_sigma_tau")
+    cur_phi_tau = _drift_cache_get("cp_phi_tau")
+    cur_n_tau = _drift_cache_get("cp_n_tau")
+    cur_n_mu = _drift_cache_get("cp_n_mu")
+    cur_tau_mu = _drift_cache_get("cp_tau_mu")
+    // Reconstruct missing_nodes from cache
+    let mut mni: i64 = 0
+    while mni < len(mm_nodes) {
+        if _drift_cache_get("node_" + mm_nodes[mni]) == 0 { missing_nodes = missing_nodes + [mm_nodes[mni]] }
+        mni = mni + 1
+    }
+    mni = 0
+    while mni < len(dim_nodes) {
+        if _drift_cache_get("node_" + dim_nodes[mni]) == 0 { missing_nodes = missing_nodes + [dim_nodes[mni]] }
+        mni = mni + 1
+    }
+    if verbose { println("  [cache] drift_cache hit — atlas scan skipped") }
 }
 
-let cur_hub_n = cur_hub_deg("n")
-let cur_hub_J2 = cur_hub_deg("J2")
-let cur_hub_phi = cur_hub_deg("phi")
-let cur_hub_sigma = cur_hub_deg("sigma")
-let cur_hub_tau = cur_hub_deg("tau")
-let cur_hub_sopfr = cur_hub_deg("sopfr")
+if !_cache_hit {
+    // Build single-pass awk: all 25 counters in one atlas.n6 traversal
+    // Node ID list for fixed-string matching
+    let mut node_id_awk_init = ""
+    let mut node_id_awk_body = ""
+    let mut ni: i64 = 0
+    while ni < len(mm_nodes) {
+        let nid = mm_nodes[ni]
+        let vname = "nd" + to_string(ni)
+        node_id_awk_init = node_id_awk_init + vname + "=0; "
+        node_id_awk_body = node_id_awk_body + "if(index($0,\"\\\"" + nid + "\\\"\"))  " + vname + "++; "
+        ni = ni + 1
+    }
+    let mm_len = len(mm_nodes)
+    ni = 0
+    while ni < len(dim_nodes) {
+        let nid = dim_nodes[ni]
+        let vname = "nd" + to_string(mm_len + ni)
+        node_id_awk_init = node_id_awk_init + vname + "=0; "
+        node_id_awk_body = node_id_awk_body + "if(index($0,\"\\\"" + nid + "\\\"\"))  " + vname + "++; "
+        ni = ni + 1
+    }
+    let total_nd = mm_len + len(dim_nodes)
 
-// Current cortical layer weights
-let cur_count_n = safe_int(exec("grep -c '\\bn\\b\\|n=6\\|n =' '" + _ATLAS + "' 2>/dev/null || echo 0"))
-let cur_count_phi = safe_int(exec("grep -c 'phi\\|euler_totient' '" + _ATLAS + "' 2>/dev/null || echo 0"))
-let cur_count_sigma = safe_int(exec("grep -c 'sigma\\|divisor_sum' '" + _ATLAS + "' 2>/dev/null || echo 0"))
-let cur_count_tau = safe_int(exec("grep -c 'tau\\|divisor_count' '" + _ATLAS + "' 2>/dev/null || echo 0"))
-let cur_count_sopfr = safe_int(exec("grep -c 'sopfr\\|sum_prime' '" + _ATLAS + "' 2>/dev/null || echo 0"))
-let cur_count_mu = safe_int(exec("grep -c '\"mu\"\\|mobius' '" + _ATLAS + "' 2>/dev/null || echo 0"))
+    // Build END print: nd0|nd1|...|nd10
+    let mut nd_print = ""
+    let mut ndi: i64 = 0
+    while ndi < total_nd {
+        if ndi > 0 { nd_print = nd_print + "\"|\"|" }
+        nd_print = nd_print + "nd" + to_string(ndi)
+        ndi = ndi + 1
+    }
 
+    let atlas_awk = "BEGIN{cn=0;cphi=0;csig=0;ctau=0;csopfr=0;cmu=0;" +
+        "ns=0;np=0;ps=0;st=0;pt=0;nt=0;nm=0;tm=0;" +
+        node_id_awk_init + "} " +
+        // Cortical counts
+        "{" +
+        "if(/\\<n\\>/ || /n=6/ || /n =/) cn++; " +
+        "if(/phi/ || /euler_totient/) cphi++; " +
+        "if(/sigma/ || /divisor_sum/) csig++; " +
+        "if(/tau/ || /divisor_count/) ctau++; " +
+        "if(/sopfr/ || /sum_prime/) csopfr++; " +
+        "if(/\"mu\"/ || /mobius/) cmu++; " +
+        // Coupling counts
+        "if(/sigma.*n/ || /n.*sigma/) ns++; " +
+        "if(/phi.*n/ || /n.*phi/) np++; " +
+        "if(/phi.*sigma/ || /sigma.*phi/) ps++; " +
+        "if(/sigma.*tau/ || /tau.*sigma/) st++; " +
+        "if(/phi.*tau/ || /tau.*phi/) pt++; " +
+        "if(/tau.*n/ || /n.*tau/) nt++; " +
+        "if(/mu.*n/ || /n.*mu/) nm++; " +
+        "if(/tau.*mu/ || /mu.*tau/) tm++; " +
+        // Node ID checks
+        node_id_awk_body +
+        "} " +
+        "END{print cn\"|\"cphi\"|\"csig\"|\"ctau\"|\"csopfr\"|\"cmu" +
+        "\"|\"ns\"|\"np\"|\"ps\"|\"st\"|\"pt\"|\"nt\"|\"nm\"|\"tm" +
+        "\"|\"" + nd_print + "}"
+
+    let mut awk_out = ""
+    try { awk_out = exec("awk '" + atlas_awk + "' '" + _ATLAS + "' 2>/dev/null").trim() } catch e {}
+    let ap = awk_out.split("|")
+
+    // 14 counters + 11 node IDs = 25 fields expected
+    if len(ap) >= 14 + total_nd {
+        cur_count_n = safe_int(ap[0])
+        cur_count_phi = safe_int(ap[1])
+        cur_count_sigma = safe_int(ap[2])
+        cur_count_tau = safe_int(ap[3])
+        cur_count_sopfr = safe_int(ap[4])
+        cur_count_mu = safe_int(ap[5])
+        cur_n_sigma = safe_int(ap[6])
+        cur_n_phi = safe_int(ap[7])
+        cur_phi_sigma = safe_int(ap[8])
+        cur_sigma_tau = safe_int(ap[9])
+        cur_phi_tau = safe_int(ap[10])
+        cur_n_tau = safe_int(ap[11])
+        cur_n_mu = safe_int(ap[12])
+        cur_tau_mu = safe_int(ap[13])
+
+        // Node existence → missing_nodes
+        let mut nci: i64 = 0
+        while nci < len(mm_nodes) {
+            if safe_int(ap[14 + nci]) == 0 { missing_nodes = missing_nodes + [mm_nodes[nci]] }
+            nci = nci + 1
+        }
+        nci = 0
+        while nci < len(dim_nodes) {
+            if safe_int(ap[14 + mm_len + nci]) == 0 { missing_nodes = missing_nodes + [dim_nodes[nci]] }
+            nci = nci + 1
+        }
+    }
+
+    // Write cache (keyed by atlas mtime)
+    let mut atlas_mtime = ""
+    try { atlas_mtime = exec("stat -f '%m' '" + _ATLAS + "' 2>/dev/null || stat -c '%Y' '" + _ATLAS + "' 2>/dev/null").trim() } catch e {}
+    if atlas_mtime != "" {
+        let mut cache_json = "{\"atlas_mtime\":" + atlas_mtime
+        cache_json = cache_json + ",\"cnt_n\":" + to_string(cur_count_n)
+        cache_json = cache_json + ",\"cnt_phi\":" + to_string(cur_count_phi)
+        cache_json = cache_json + ",\"cnt_sigma\":" + to_string(cur_count_sigma)
+        cache_json = cache_json + ",\"cnt_tau\":" + to_string(cur_count_tau)
+        cache_json = cache_json + ",\"cnt_sopfr\":" + to_string(cur_count_sopfr)
+        cache_json = cache_json + ",\"cnt_mu\":" + to_string(cur_count_mu)
+        cache_json = cache_json + ",\"cp_n_sigma\":" + to_string(cur_n_sigma)
+        cache_json = cache_json + ",\"cp_n_phi\":" + to_string(cur_n_phi)
+        cache_json = cache_json + ",\"cp_phi_sigma\":" + to_string(cur_phi_sigma)
+        cache_json = cache_json + ",\"cp_sigma_tau\":" + to_string(cur_sigma_tau)
+        cache_json = cache_json + ",\"cp_phi_tau\":" + to_string(cur_phi_tau)
+        cache_json = cache_json + ",\"cp_n_tau\":" + to_string(cur_n_tau)
+        cache_json = cache_json + ",\"cp_n_mu\":" + to_string(cur_n_mu)
+        cache_json = cache_json + ",\"cp_tau_mu\":" + to_string(cur_tau_mu)
+        // Node existence flags (1=found, 0=missing)
+        let mut nwi: i64 = 0
+        while nwi < len(mm_nodes) {
+            let nfound = if safe_int(ap[14 + nwi]) > 0 { 1 } else { 0 }
+            cache_json = cache_json + ",\"node_" + mm_nodes[nwi] + "\":" + to_string(nfound)
+            nwi = nwi + 1
+        }
+        nwi = 0
+        while nwi < len(dim_nodes) {
+            let nfound = if safe_int(ap[14 + mm_len + nwi]) > 0 { 1 } else { 0 }
+            cache_json = cache_json + ",\"node_" + dim_nodes[nwi] + "\":" + to_string(nfound)
+            nwi = nwi + 1
+        }
+        cache_json = cache_json + "}\n"
+        _drift_cache_put(cache_json)
+    }
+    if verbose { println("  [scan] single-pass awk complete — " + to_string(14 + total_nd) + " counters collected") }
+}
+
+// Cortical weights from counts
 let total_mentions = to_float(cur_count_n + cur_count_phi + cur_count_sigma + cur_count_tau + cur_count_sopfr + cur_count_mu)
 let cur_w_sigma = if total_mentions > 0.0 { to_float(cur_count_sigma) / total_mentions * 100.0 } else { 0.0 }
 let cur_w_phi = if total_mentions > 0.0 { to_float(cur_count_phi) / total_mentions * 100.0 } else { 0.0 }
@@ -195,19 +431,6 @@ let cur_w_sopfr = if total_mentions > 0.0 { to_float(cur_count_sopfr) / total_me
 let cur_w_tau = if total_mentions > 0.0 { to_float(cur_count_tau) / total_mentions * 100.0 } else { 0.0 }
 let cur_w_n = if total_mentions > 0.0 { to_float(cur_count_n) / total_mentions * 100.0 } else { 0.0 }
 let cur_w_mu = if total_mentions > 0.0 { to_float(cur_count_mu) / total_mentions * 100.0 } else { 0.0 }
-
-// Current dimensional coupling
-fn cur_coupling(pattern: string) -> i64 {
-    return safe_int(exec("grep -c '" + pattern + "' '" + _ATLAS + "' 2>/dev/null || echo 0"))
-}
-let cur_n_sigma = cur_coupling("sigma.*n\\|n.*sigma")
-let cur_n_phi = cur_coupling("phi.*n\\|n.*phi")
-let cur_phi_sigma = cur_coupling("phi.*sigma\\|sigma.*phi")
-let cur_sigma_tau = cur_coupling("sigma.*tau\\|tau.*sigma")
-let cur_phi_tau = cur_coupling("phi.*tau\\|tau.*phi")
-let cur_n_tau = cur_coupling("tau.*n\\|n.*tau")
-let cur_n_mu = cur_coupling("mu.*n\\|n.*mu")
-let cur_tau_mu = cur_coupling("tau.*mu\\|mu.*tau")
 
 // -- 3. Detect and categorize all 6 drift dimensions ---------------
 
@@ -285,25 +508,7 @@ if cur_hub_sigma < cur_hub_tau { hub_order_ok = false }
 if cur_hub_tau < cur_hub_sopfr { hub_order_ok = false }
 if !hub_order_ok { critical_drift = true; drift_count = drift_count + 1 }
 
-// Mind Mapper node integrity
-let mm_nodes = ["mm-consciousness-topology", "mm-thalamic-hub-n", "mm-dimension-imbalance", "mm-soc-criticality", "mm-dim-fold-515"]
-let dim_nodes = ["dim-intrinsic-4d", "dim-phi-critical-14", "dim-phi-fractal-30", "dim-faction-topology", "dim-maxpool-phi-amplify", "dim-shannon-ladder"]
-
-let mut missing_nodes: [string] = []
-let mut mi: i64 = 0
-while mi < len(mm_nodes) {
-    let nid = mm_nodes[mi]
-    let found = safe_int(exec("grep -cF '\"" + nid + "\"' '" + _ATLAS + "' 2>/dev/null || echo 0"))
-    if found == 0 { missing_nodes = missing_nodes + [nid] }
-    mi = mi + 1
-}
-mi = 0
-while mi < len(dim_nodes) {
-    let nid = dim_nodes[mi]
-    let found = safe_int(exec("grep -cF '\"" + nid + "\"' '" + _ATLAS + "' 2>/dev/null || echo 0"))
-    if found == 0 { missing_nodes = missing_nodes + [nid] }
-    mi = mi + 1
-}
+// Mind Mapper node integrity (mm_nodes/dim_nodes/missing_nodes computed in single-pass above)
 if len(missing_nodes) > 0 { drift_count = drift_count + 1 }
 
 // -- 4. Report drift points (human-readable) ----------------------

@@ -4,7 +4,7 @@
 //
 // READ-ONLY analysis script. Does NOT modify atlas.n6.
 // Uses degree sidecar (atlas.n6.deg) for fast O(1) lookup.
-// Falls back to shell-based atlas scan when sidecar stale.
+// All parsing is hexa-native: read_file + split (no awk/grep exec).
 //
 // Usage: hexa hub_growth_strategy.hexa [--verbose] [--top N]
 //
@@ -33,6 +33,53 @@ let _ATLAS = _BASE + "/shared/n6/atlas.n6"
 let _DEG   = _ATLAS + ".deg"
 let _STATS = _ATLAS + ".stats"
 
+// ─── JSON 경량 파서 헬퍼 (exec(grep) 제거용, todo.hexa 패턴) ───
+fn _json_val(line: string, key: string) -> string {
+    let needle = "\"" + key + "\":"
+    if !line.contains(needle) { return "" }
+    let after = line.split(needle)[1].trim()
+    if after.starts_with("\"") {
+        return after.split("\"")[1]
+    }
+    let mut buf = ""
+    let chars = after.split("")
+    for c in chars {
+        if c == "," || c == "}" || c == " " || c == "\n" { break }
+        buf = buf + c
+    }
+    return buf
+}
+
+fn _json_int(line: string, key: string) -> i64 {
+    let s = _json_val(line, key)
+    let mut v: i64 = 0
+    try { v = to_int(to_float(s.trim())) } catch e {}
+    return v
+}
+
+// ─── 도메인 분류 헬퍼 (near-hub/hub 통계용) ───
+fn _classify_domain_nearhub(id: string) -> string {
+    let parts = id.split("-")
+    if len(parts) >= 2 && parts[0] == "n6" && parts[1] == "cross" { return "n6-cross" }
+    if len(parts) >= 2 && parts[0] == "n6" && parts[1] == "dse" { return "n6-dse" }
+    if len(parts) >= 2 && parts[0] == "n6" && parts[1] == "atlas" { return "n6-atlas" }
+    if len(parts) >= 2 && parts[0] == "n6" && parts[1] == "bt" { return "n6-bt" }
+    if parts[0] == "n6" { return "n6-derived" }
+    if parts[0] == "blowup" { return "blowup" }
+    if parts[0] == "disc" { return "disc" }
+    if parts[0] == "recurse" { return "recurse" }
+    return parts[0]
+}
+
+fn _classify_domain_hub(id: string) -> string {
+    let parts = id.split("-")
+    if len(parts) >= 2 && parts[0] == "n6" && parts[1] == "bt" { return "n6-bt" }
+    if len(parts) >= 2 && parts[0] == "n6" && parts[1] == "cross" { return "n6-cross" }
+    if parts[0] == "n6" { return "n6-derived" }
+    if parts[0] == "disc" { return "disc" }
+    return parts[0]
+}
+
 // ─── 1. Validate inputs ───────────────────────────────────
 if !file_exists(_ATLAS) {
     println("error: atlas not found: " + _ATLAS)
@@ -55,19 +102,10 @@ let mut total_edges: i64 = 0
 let mut total_hubs: i64 = 0
 if file_exists(_STATS) {
     let stats_raw = read_file(_STATS).trim()
-    // parse JSON fields manually (hexa has no json lib)
-    try {
-        let nodes_match = exec("echo '" + stats_raw + "' | grep -oE '\"nodes\":[0-9]+' | cut -d: -f2").trim()
-        total_nodes = to_int(nodes_match)
-    } catch e {}
-    try {
-        let edges_match = exec("echo '" + stats_raw + "' | grep -oE '\"edges\":[0-9]+' | cut -d: -f2").trim()
-        total_edges = to_int(edges_match)
-    } catch e {}
-    try {
-        let hubs_match = exec("echo '" + stats_raw + "' | grep -oE '\"hubs\":[0-9]+' | cut -d: -f2").trim()
-        total_hubs = to_int(hubs_match)
-    } catch e {}
+    // hexa-native JSON parsing — 1x read_file, no exec (ROI#27)
+    total_nodes = _json_int(stats_raw, "nodes")
+    total_edges = _json_int(stats_raw, "edges")
+    total_hubs  = _json_int(stats_raw, "hubs")
 }
 
 let hub_target: i64 = 400
@@ -81,29 +119,51 @@ println("    target:      " + to_string(hub_target))
 println("    needed:      " + to_string(hubs_needed))
 println("")
 
-// ─── 3. Degree distribution summary ──────────────────────
+// ─── 3. Load deg TSV once into memory (ROI#25) ──────────
+// Single read_file + split → all downstream analysis is in-memory
+let _deg_raw = read_file(_DEG).trim()
+let _deg_all_lines = _deg_raw.split("\n")
+
+// Build in-memory maps: node_id -> degree, degree -> count
+// Also collect per-category lists for strategies below
+let mut deg_dist = #{"_": 0}    // degree(string) -> count
+let mut deg2_nodes: [string] = []
+let mut deg3plus_nodes: [string] = []
+let mut node_deg = #{"_": 0}    // node_id -> degree (for partner lookups)
+
+for _dl in _deg_all_lines {
+    let _t = _dl.trim()
+    if _t == "" { continue }
+    let _cols = _t.split("\t")
+    if len(_cols) < 2 { continue }
+    let _nid = _cols[0]
+    let mut _d: i64 = 0
+    try { _d = to_int(_cols[1]) } catch e { continue }
+    let _dk = to_string(_d)
+    if has_key(deg_dist, _dk) { deg_dist[_dk] = deg_dist[_dk] + 1 }
+    else { deg_dist[_dk] = 1 }
+    node_deg[_nid] = _d
+    if _d == 2 { deg2_nodes = deg2_nodes.push(_nid) }
+    if _d >= 3 { deg3plus_nodes = deg3plus_nodes.push(_nid) }
+}
+
 println("  Degree distribution:")
-let deg_dist_raw = exec("awk -F'\\t' '{d[$2]++} END {for (k in d) print k, d[k]}' '" + _DEG + "' | sort -rn").trim()
-let deg_lines = deg_dist_raw.split("\n")
 
 let mut deg1_count: i64 = 0
 let mut deg2_count: i64 = 0
 let mut deg3plus_count: i64 = 0
 let mut max_degree: i64 = 0
 
-for dl in deg_lines {
-    let t = dl.trim()
-    if t == "" { continue }
-    let parts = t.split(" ")
-    if len(parts) < 2 { continue }
-    let mut deg: i64 = 0
-    let mut cnt: i64 = 0
-    try { deg = to_int(parts[0]) } catch e { continue }
-    try { cnt = to_int(parts[1]) } catch e { continue }
-    if deg > max_degree { max_degree = deg }
-    if deg == 1 { deg1_count = cnt }
-    if deg == 2 { deg2_count = cnt }
-    if deg >= 3 { deg3plus_count = deg3plus_count + cnt }
+let _dk_list = keys(deg_dist)
+for _dk in _dk_list {
+    if _dk == "_" { continue }
+    let mut _dv: i64 = 0
+    try { _dv = to_int(_dk) } catch e { continue }
+    let _cnt = deg_dist[_dk]
+    if _dv > max_degree { max_degree = _dv }
+    if _dv == 1 { deg1_count = _cnt }
+    if _dv == 2 { deg2_count = _cnt }
+    if _dv >= 3 { deg3plus_count = deg3plus_count + _cnt }
 }
 
 let leaf_pct = if total_nodes > 0 { to_string(deg1_count * 100 / total_nodes) } else { "?" }
@@ -118,21 +178,54 @@ println("")
 
 // ─── 4. Near-hub analysis: degree-2 nodes by domain ──────
 println("  Near-hub pool by domain (degree=2, need +1 edge):")
-let domain_dist_raw = exec("awk -F'\\t' '$2==2{print $1}' '" + _DEG + "' | awk -F'-' '{ if ($1==\"n6\" && $2==\"cross\") d=\"n6-cross\"; else if ($1==\"n6\" && $2==\"dse\") d=\"n6-dse\"; else if ($1==\"n6\" && $2==\"atlas\") d=\"n6-atlas\"; else if ($1==\"n6\" && $2==\"bt\") d=\"n6-bt\"; else if ($1==\"n6\") d=\"n6-derived\"; else if ($1==\"blowup\") d=\"blowup\"; else if ($1==\"disc\") d=\"disc\"; else if ($1==\"recurse\") d=\"recurse\"; else d=$1; print d}' | sort | uniq -c | sort -rn").trim()
-let domain_lines = domain_dist_raw.split("\n")
-for ddl in domain_lines {
-    let t = ddl.trim()
-    if t != "" { println("    " + t) }
+// In-memory domain classification (ROI#25)
+let mut _nh_domain_count = #{"_": 0}
+for _nid in deg2_nodes {
+    let _dom = _classify_domain_nearhub(_nid)
+    if has_key(_nh_domain_count, _dom) { _nh_domain_count[_dom] = _nh_domain_count[_dom] + 1 }
+    else { _nh_domain_count[_dom] = 1 }
+}
+// Sort by count descending — collect into array of "count domain" strings
+let mut _nh_pairs: [string] = []
+let _nh_keys = keys(_nh_domain_count)
+for _nk in _nh_keys {
+    if _nk == "_" { continue }
+    let _nc = _nh_domain_count[_nk]
+    // zero-pad count for sort (6 digits)
+    let _pad = to_string(1000000 + _nc)
+    _nh_pairs = _nh_pairs.push(_pad + " " + _nk)
+}
+_nh_pairs = _nh_pairs.sort().reverse()
+for _np in _nh_pairs {
+    // strip padding: "1000042 blowup" → "42 blowup"
+    let _real_count = to_string(to_int(_np.split(" ")[0]) - 1000000)
+    let _real_dom = _np.split(" ")[1]
+    println("    " + _real_count + " " + _real_dom)
 }
 println("")
 
 // ─── 5. Hub existing distribution by domain ──────────────
 println("  Current hubs by domain (degree>=3):")
-let hub_domain_raw = exec("awk -F'\\t' '$2>=3{print $1}' '" + _DEG + "' | awk -F'-' '{ if ($1==\"n6\" && $2==\"bt\") d=\"n6-bt\"; else if ($1==\"n6\" && $2==\"cross\") d=\"n6-cross\"; else if ($1==\"n6\") d=\"n6-derived\"; else if ($1==\"disc\") d=\"disc\"; else d=$1; print d}' | sort | uniq -c | sort -rn").trim()
-let hub_domain_lines = hub_domain_raw.split("\n")
-for hdl in hub_domain_lines {
-    let t = hdl.trim()
-    if t != "" { println("    " + t) }
+// In-memory hub domain classification (ROI#25)
+let mut _hub_domain_count = #{"_": 0}
+for _nid in deg3plus_nodes {
+    let _dom = _classify_domain_hub(_nid)
+    if has_key(_hub_domain_count, _dom) { _hub_domain_count[_dom] = _hub_domain_count[_dom] + 1 }
+    else { _hub_domain_count[_dom] = 1 }
+}
+let mut _hd_pairs: [string] = []
+let _hd_keys = keys(_hub_domain_count)
+for _hk in _hd_keys {
+    if _hk == "_" { continue }
+    let _hc = _hub_domain_count[_hk]
+    let _hpad = to_string(1000000 + _hc)
+    _hd_pairs = _hd_pairs.push(_hpad + " " + _hk)
+}
+_hd_pairs = _hd_pairs.sort().reverse()
+for _hp in _hd_pairs {
+    let _hreal_count = to_string(to_int(_hp.split(" ")[0]) - 1000000)
+    let _hreal_dom = _hp.split(" ")[1]
+    println("    " + _hreal_count + " " + _hreal_dom)
 }
 println("")
 
@@ -147,24 +240,63 @@ println("")
 // 6a. Near-hub nodes connected to top hubs (highest leverage)
 println("  [Strategy A] Connected to top-10 hubs (leverage promotion):")
 println("  ─────────────────────────────────────────────")
-// Get top 10 hub IDs
-let top_hubs_raw = exec("awk -F'\\t' '$2>=50{print $1}' '" + _DEG + "' | head -20").trim()
-let top_hub_ids = top_hubs_raw.split("\n")
+// Collect top hub IDs (degree >= 50) from in-memory map (ROI#25)
+let mut _top_hub_set = #{"_": true}
+for _nid in deg3plus_nodes {
+    if has_key(node_deg, _nid) && node_deg[_nid] >= 50 {
+        _top_hub_set[_nid] = true
+    }
+}
 
-// For each degree-2 node, check if any of its edges connect to a top hub
-// This uses a shell pipeline for performance on the 13MB atlas
-let strat_a_raw = exec("bash -c '" +
-    "awk -F\"\\t\" \"\\$2==2{print \\$1}\" \"" + _DEG + "\" | " +
-    "while IFS= read -r nid; do " +
-    "  hub_partner=$(grep -m3 \"\\\"$nid\\\"\" \"" + _ATLAS + "\" | grep -oE \"\\\"(from|to)\\\":\\\"[^\\\"]+\\\"\" | grep -v \"$nid\" | head -1 | grep -oE \"\\\"[^\\\"]+\\\"$\" | tr -d \"\\\"\"); " +
-    "  if [ -n \"$hub_partner\" ]; then " +
-    "    pdeg=$(awk -F\"\\t\" -v id=\"$hub_partner\" \"\\$1==id{print \\$2}\" \"" + _DEG + "\"); " +
-    "    if [ -n \"$pdeg\" ] && [ \"$pdeg\" -ge 50 ] 2>/dev/null; then " +
-    "      echo \"$nid|deg=2|partner=$hub_partner(deg=$pdeg)\"; " +
-    "    fi; " +
-    "  fi; " +
-    "done | head -" + to_string(top_n) + "'" +
-    " 2>/dev/null").trim()
+// Load atlas once for edge partner lookups (Strategy A only)
+let _atlas_raw = read_file(_ATLAS)
+let _atlas_lines = _atlas_raw.split("\n")
+
+// Build adjacency: for each deg-2 node, find edge partners via atlas scan
+// Scan atlas lines for edges mentioning deg-2 nodes connected to top hubs
+let mut _strat_a_results: [string] = []
+let mut _deg2_set = #{"_": true}
+for _nid in deg2_nodes { _deg2_set[_nid] = true }
+
+for _al in _atlas_lines {
+    let _at = _al.trim()
+    if _at == "" { continue }
+    if !_at.contains("\"edge\"") { continue }
+    // Extract from/to
+    let mut _from_id = ""
+    let mut _to_id = ""
+    if _at.contains("\"from\":\"") {
+        let _fparts = _at.split("\"from\":\"")
+        if len(_fparts) >= 2 { _from_id = _fparts[1].split("\"")[0] }
+    }
+    if _at.contains("\"to\":\"") {
+        let _tparts = _at.split("\"to\":\"")
+        if len(_tparts) >= 2 { _to_id = _tparts[1].split("\"")[0] }
+    }
+    if _from_id == "" || _to_id == "" { continue }
+    // Check if one end is deg-2 and other end is top hub
+    if has_key(_deg2_set, _from_id) && has_key(_top_hub_set, _to_id) {
+        let _pd = node_deg[_to_id]
+        _strat_a_results = _strat_a_results.push(_from_id + "|deg=2|partner=" + _to_id + "(deg=" + to_string(_pd) + ")")
+    }
+    if has_key(_deg2_set, _to_id) && has_key(_top_hub_set, _from_id) {
+        let _pd2 = node_deg[_from_id]
+        _strat_a_results = _strat_a_results.push(_to_id + "|deg=2|partner=" + _from_id + "(deg=" + to_string(_pd2) + ")")
+    }
+}
+
+// Deduplicate and limit
+let mut _sa_seen = #{"_": true}
+let mut _strat_a_deduped: [string] = []
+for _sr in _strat_a_results {
+    let _sr_key = _sr.split("|")[0]
+    if !has_key(_sa_seen, _sr_key) {
+        _sa_seen[_sr_key] = true
+        _strat_a_deduped = _strat_a_deduped.push(_sr)
+        if len(_strat_a_deduped) >= top_n { break }
+    }
+}
+let strat_a_raw = _strat_a_deduped.join("\n")
 
 if strat_a_raw != "" {
     let strat_a_lines = strat_a_raw.split("\n")
@@ -185,7 +317,16 @@ println("")
 // 6b. Cross-domain near-hubs (n6-cross-* at degree 2)
 println("  [Strategy B] Cross-domain bridges (n6-cross-* at degree 2):")
 println("  ─────────────────────────────────────────────")
-let cross_raw = exec("awk -F'\\t' '$2==2 && $1 ~ /^n6-cross/' '" + _DEG + "' | sort -t$'\\t' -k1,1 | head -" + to_string(top_n)).trim()
+// In-memory filter (ROI#25)
+let mut _cross_list: [string] = []
+for _nid in deg2_nodes {
+    if _nid.starts_with("n6-cross") {
+        _cross_list = _cross_list.push(_nid + "\t2")
+        if len(_cross_list) >= top_n { break }
+    }
+}
+_cross_list = _cross_list.sort()
+let cross_raw = _cross_list.join("\n")
 if cross_raw != "" {
     let cross_lines = cross_raw.split("\n")
     let mut xc: i64 = 0
@@ -202,7 +343,15 @@ println("")
 // 6c. Discovery nodes at degree 2
 println("  [Strategy C] Discovery nodes at threshold (disc-* at degree 2):")
 println("  ─────────────────────────────────────────────")
-let disc_raw = exec("awk -F'\\t' '$2==2 && $1 ~ /^disc-/' '" + _DEG + "' | head -30").trim()
+// In-memory filter (ROI#25)
+let mut _disc_list: [string] = []
+for _nid in deg2_nodes {
+    if _nid.starts_with("disc-") {
+        _disc_list = _disc_list.push(_nid + "\t2")
+        if len(_disc_list) >= 30 { break }
+    }
+}
+let disc_raw = _disc_list.join("\n")
 if disc_raw != "" {
     let disc_lines = disc_raw.split("\n")
     let mut dc: i64 = 0
@@ -219,7 +368,20 @@ println("")
 // 6d. Knowledge layer nodes (L*-*) at degree 2
 println("  [Strategy D] Knowledge layer nodes (L*-* at degree 2):")
 println("  ─────────────────────────────────────────────")
-let layer_raw = exec("awk -F'\\t' '$2==2 && $1 ~ /^L[0-9]/' '" + _DEG + "' | head -30").trim()
+// In-memory filter (ROI#25)
+let mut _layer_list: [string] = []
+for _nid in deg2_nodes {
+    let _fc = _nid.chars()[0]
+    if _fc == "L" && len(_nid) > 1 {
+        let _sc = _nid.chars()[1]
+        if _sc == "0" || _sc == "1" || _sc == "2" || _sc == "3" || _sc == "4"
+            || _sc == "5" || _sc == "6" || _sc == "7" || _sc == "8" || _sc == "9" {
+            _layer_list = _layer_list.push(_nid + "\t2")
+            if len(_layer_list) >= 30 { break }
+        }
+    }
+}
+let layer_raw = _layer_list.join("\n")
 if layer_raw != "" {
     let layer_lines = layer_raw.split("\n")
     let mut lc: i64 = 0
@@ -236,7 +398,21 @@ println("")
 // 6e. Real-world domain nodes (ECON/GEO/BIO/CHIP/AI) at degree 2
 println("  [Strategy E] Real-world domain nodes at threshold:")
 println("  ─────────────────────────────────────────────")
-let real_raw = exec("awk -F'\\t' '$2==2 && ($1 ~ /^ECON/ || $1 ~ /^GEO/ || $1 ~ /^BIO/ || $1 ~ /^BIG/ || $1 ~ /^CHIP/ || $1 ~ /^AI/ || $1 ~ /^CHEM/ || $1 ~ /^ENERGY/ || $1 ~ /^CRYPTO/)' '" + _DEG + "' | sort -t$'\\t' -k1,1 | head -40").trim()
+// In-memory filter (ROI#25)
+let _rw_prefixes = ["ECON", "GEO", "BIO", "BIG", "CHIP", "AI", "CHEM", "ENERGY", "CRYPTO"]
+let mut _real_list: [string] = []
+for _nid in deg2_nodes {
+    let mut _rw_match = false
+    for _rp in _rw_prefixes {
+        if _nid.starts_with(_rp) { _rw_match = true; break }
+    }
+    if _rw_match {
+        _real_list = _real_list.push(_nid + "\t2")
+        if len(_real_list) >= 40 { break }
+    }
+}
+_real_list = _real_list.sort()
+let real_raw = _real_list.join("\n")
 if real_raw != "" {
     let real_lines = real_raw.split("\n")
     let mut rc: i64 = 0
@@ -287,22 +463,47 @@ println("")
 println("  ═══ TOP PROMOTION CANDIDATES (immediate action) ═══")
 println("")
 
-// Get degree-2 nodes that have semantic richness (longer IDs = more compositional)
-// and belong to high-value domains
-let top_candidates_raw = exec("awk -F'\\t' '$2==2' '" + _DEG + "' | awk -F'\\t' '{ " +
-    "score=0; " +
-    "if ($1 ~ /^n6-cross/) score=100; " +
-    "else if ($1 ~ /^disc-/) score=90; " +
-    "else if ($1 ~ /^n6-dse/) score=85; " +
-    "else if ($1 ~ /^n6-atlas/) score=80; " +
-    "else if ($1 ~ /^ECON|^GEO|^BIO|^BIG|^CHIP|^AI|^CHEM/) score=75; " +
-    "else if ($1 ~ /^L[0-9]/) score=70; " +
-    "else if ($1 ~ /^recurse/) score=60; " +
-    "else if ($1 ~ /^blowup-d2/) score=50; " +
-    "else if ($1 ~ /^blowup-d1/) score=40; " +
-    "else score=10; " +
-    "printf \"%d\\t%s\\n\", score, $1 " +
-    "}' | sort -t$'\\t' -k1 -rn | head -" + to_string(top_n)).trim()
+// Score degree-2 nodes by domain priority — in-memory (ROI#25)
+fn _score_node(id: string) -> i64 {
+    if id.starts_with("n6-cross") { return 100 }
+    if id.starts_with("disc-") { return 90 }
+    if id.starts_with("n6-dse") { return 85 }
+    if id.starts_with("n6-atlas") { return 80 }
+    let _score_prefixes = ["ECON", "GEO", "BIO", "BIG", "CHIP", "AI", "CHEM"]
+    for _sp in _score_prefixes {
+        if id.starts_with(_sp) { return 75 }
+    }
+    if len(id) > 1 {
+        let _f = id.chars()[0]
+        let _s = id.chars()[1]
+        if _f == "L" && (_s == "0" || _s == "1" || _s == "2" || _s == "3" || _s == "4"
+            || _s == "5" || _s == "6" || _s == "7" || _s == "8" || _s == "9") { return 70 }
+    }
+    if id.starts_with("recurse") { return 60 }
+    if id.starts_with("blowup-d2") { return 50 }
+    if id.starts_with("blowup-d1") { return 40 }
+    return 10
+}
+let mut _scored_list: [string] = []
+for _nid in deg2_nodes {
+    let _sc = _score_node(_nid)
+    // Zero-pad score (7 digits) + tab + node_id for sort
+    let _spad = to_string(10000000 + _sc)
+    _scored_list = _scored_list.push(_spad + "\t" + _nid)
+}
+_scored_list = _scored_list.sort().reverse()
+// Take top_n
+let mut _top_cand_lines: [string] = []
+let mut _tci: i64 = 0
+for _sl in _scored_list {
+    if _tci >= top_n { break }
+    // Convert padded score back: "10000100\tn6-cross-X" → "100\tn6-cross-X"
+    let _sp = _sl.split("\t")
+    let _real_score = to_string(to_int(_sp[0]) - 10000000)
+    _top_cand_lines = _top_cand_lines.push(_real_score + "\t" + _sp[1])
+    _tci = _tci + 1
+}
+let top_candidates_raw = _top_cand_lines.join("\n")
 
 if top_candidates_raw != "" {
     let tc_lines = top_candidates_raw.split("\n")

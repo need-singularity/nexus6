@@ -1,5 +1,6 @@
 // setup.hexa — NEXUS-6 훅 자동 셋업 (setup.sh 대체)
 // 사용법: hexa ~/Dev/nexus/shared/hooks/setup.hexa
+// ROI#33: 14회 exec 배치화 → 3회 exec (symlink batch + prep batch + verify batch)
 
 let HOME = env("HOME")
 let HEXA = HOME + "/Dev/nexus/shared/scripts/bin/hexa"
@@ -8,7 +9,7 @@ let CONFIG = HOOK_DIR + "/hooks-config.json"
 let DEV_DIR = HOME + "/Dev"
 let SETTINGS = HOME + "/.claude/settings.json"
 
-println("=== NEXUS-6 Hook Setup v4.0-HEXA ===")
+println("=== NEXUS-6 Hook Setup v4.1-HEXA (batched) ===")
 println("")
 
 // ── 1. hooks-config.json에서 화이트리스트 읽기 ──
@@ -35,73 +36,74 @@ for p in projects {
 }
 println("[1] 화이트리스트: " + proj_list)
 
-// ── 2. 심링크 설정 ──
+// ── 2. 심링크 설정 (배치: 단일 exec) ──
 println("")
 println("[2] 심링크 설정")
 
+// 프로젝트별 link_to 매핑을 bash 인라인 배열로 구성
+let mut entries_arg = ""
 for proj in projects {
-    let dir = DEV_DIR + "/" + proj
-    if to_string(exec("test -d '" + dir + "' && echo y || echo n")).trim() != "y" {
-        println("  SKIP " + proj + " (디렉토리 없음)")
-        continue
-    }
-    if proj == "nexus" {
-        println("  SKIP nexus (원본)")
-        continue
-    }
+    if proj == "nexus" { continue }
+    let mut lt = "../TECS-L/.shared"
+    if proj == "TECS-L" || proj == "fathom" { lt = "../nexus/shared" }
+    if len(entries_arg) > 0 { entries_arg = entries_arg + " " }
+    entries_arg = entries_arg + proj + "|" + lt
+}
 
-    let target = dir + "/.shared"
-    let mut link_to = "../TECS-L/.shared"
-    if proj == "TECS-L" || proj == "fathom" { link_to = "../nexus/shared" }
-
-    if to_string(exec("test -L '" + target + "' && echo y || echo n")).trim() == "y" {
-        let current = to_string(exec("readlink '" + target + "'")).trim()
-        if current == link_to {
-            println("  OK " + proj + " → " + link_to)
-        } else {
-            exec("rm '" + target + "' && ln -s '" + link_to + "' '" + target + "'")
-            println("  FIX " + proj + " → " + link_to + " (was: " + current + ")")
-        }
-    } else if to_string(exec("test -d '" + target + "' && echo y || echo n")).trim() == "y" {
-        println("  WARN " + proj + ": .shared는 실제 디렉토리 — 수동 확인 필요")
-    } else {
-        exec("ln -s '" + link_to + "' '" + target + "'")
-        println("  NEW " + proj + " → " + link_to)
+// 단일 bash -c: 모든 test -d / test -L / readlink / ln -s 일괄 처리
+let symlink_result = to_string(exec("bash -c 'DEV=\"" + DEV_DIR + "\"; for entry in " + entries_arg + "; do proj=\"${entry%%|*}\"; link_to=\"${entry#*|}\"; dir=\"$DEV/$proj\"; target=\"$dir/.shared\"; if [ ! -d \"$dir\" ]; then echo \"SKIP $proj (디렉토리 없음)\"; continue; fi; if [ -L \"$target\" ]; then cur=$(readlink \"$target\"); if [ \"$cur\" = \"$link_to\" ]; then echo \"OK $proj → $link_to\"; else rm \"$target\" && ln -s \"$link_to\" \"$target\"; echo \"FIX $proj → $link_to (was: $cur)\"; fi; elif [ -d \"$target\" ]; then echo \"WARN $proj: .shared는 실제 디렉토리 — 수동 확인 필요\"; else ln -s \"$link_to\" \"$target\"; echo \"NEW $proj → $link_to\"; fi; done'")).trim()
+if len(symlink_result) > 0 {
+    let lines = symlink_result.split("\n")
+    for line in lines {
+        println("  " + line)
     }
 }
 
-// ── 3. 실행권한 확인 ──
+// ── 3+4 준비: chmod + hexa 파일 존재 6건 + anima hook + settings 백업 (단일 exec 배치) ──
 println("")
 println("[3] 실행권한 확인")
-exec("chmod +x " + HOOK_DIR + "/*.sh " + HOOK_DIR + "/*.hexa 2>/dev/null")
+
+let _anima_hook = HOME + "/Dev/anima/.growth/loop-hook.hexa"
+let prep_result = to_string(exec("bash -c 'chmod +x " + HOOK_DIR + "/*.sh " + HOOK_DIR + "/*.hexa 2>/dev/null; echo CHMOD_OK; for s in nexus-banner nexus-pre-tool nexus-post-edit nexus-post-bash nexus-prompt-scan go-parallel; do if [ -f \"" + HOOK_DIR + "/${s}.hexa\" ]; then echo \"HEXA:${s}\"; else echo \"BASH:${s}\"; fi; done; if [ -f \"" + _anima_hook + "\" ]; then echo ANIMA:hexa; else echo ANIMA:bash; fi; if [ -f \"" + SETTINGS + "\" ]; then ts=$(date +%Y%m%d-%H%M%S); cp \"" + SETTINGS + "\" \"" + SETTINGS + ".bak-${ts}\"; echo \"BACKUP:" + SETTINGS + ".bak-${ts}\"; else echo BACKUP:NONE; fi'")).trim()
+
 println("  OK — *.sh + *.hexa chmod +x")
+
+// 배치 결과 파싱 → hexa_cmd 매핑
+let prep_lines = prep_result.split("\n")
+let mut cmd_map = #{"nexus-banner": "", "nexus-pre-tool": "", "nexus-post-edit": "", "nexus-post-bash": "", "nexus-prompt-scan": "", "go-parallel": ""}
+let mut anima_cmd = ""
+let mut backup_path = ""
+
+for bline in prep_lines {
+    if bline.starts_with("HEXA:") {
+        let sname = bline.replace("HEXA:", "")
+        cmd_map[sname] = HEXA + " " + HOOK_DIR + "/" + sname + ".hexa"
+    } else if bline.starts_with("BASH:") {
+        let sname = bline.replace("BASH:", "")
+        cmd_map[sname] = "bash " + HOOK_DIR + "/" + sname + ".sh"
+    } else if bline == "ANIMA:hexa" {
+        anima_cmd = HEXA + " " + _anima_hook
+    } else if bline == "ANIMA:bash" {
+        anima_cmd = "bash " + HOME + "/Dev/anima/.growth/loop-hook.sh"
+    } else if bline.starts_with("BACKUP:") {
+        let bp = bline.replace("BACKUP:", "")
+        if bp != "NONE" { backup_path = bp }
+    }
+}
+
+let banner = cmd_map["nexus-banner"]
+let pre_tool = cmd_map["nexus-pre-tool"]
+let post_edit = cmd_map["nexus-post-edit"]
+let post_bash = cmd_map["nexus-post-bash"]
+let prompt_scan = cmd_map["nexus-prompt-scan"]
+let go_par = cmd_map["go-parallel"]
+let anima = anima_cmd
 
 // ── 4. hooks-config.json → settings.json 동기화 ──
 println("")
 println("[4] settings.json 훅 동기화 (HEXA 우선)")
-
-fn hexa_cmd(script: str) -> str {
-    let hexa_name = script.replace(".sh", ".hexa")
-    let hexa_path = HOOK_DIR + "/" + hexa_name
-    if to_string(exec("test -f '" + hexa_path + "' && echo y || echo n")).trim() == "y" { return HEXA + " " + hexa_path }
-    return "bash " + HOOK_DIR + "/" + script
-}
-
-let banner = hexa_cmd("nexus-banner.sh")
-let pre_tool = hexa_cmd("nexus-pre-tool.sh")
-let post_edit = hexa_cmd("nexus-post-edit.sh")
-let post_bash = hexa_cmd("nexus-post-bash.sh")
-let prompt_scan = hexa_cmd("nexus-prompt-scan.sh")
-let go_par = hexa_cmd("go-parallel.sh")
-// anima loop-hook: R1 migrated .sh → .hexa, HEXA resolver 경유
-let _anima_hook = HOME + "/Dev/anima/.growth/loop-hook.hexa"
-let anima = if to_string(exec("test -f '" + _anima_hook + "' && echo y || echo n")).trim() == "y" { HEXA + " " + _anima_hook } else { "bash " + HOME + "/Dev/anima/.growth/loop-hook.sh" }
-
-// 백업
-if to_string(exec("test -f '" + SETTINGS + "' && echo y || echo n")).trim() == "y" {
-    let bak = SETTINGS + ".bak-" + to_string(exec("date +%Y%m%d-%H%M%S")).trim()
-    exec("cp '" + SETTINGS + "' '" + bak + "'")
-    println("  백업: " + bak)
+if len(backup_path) > 0 {
+    println("  백업: " + backup_path)
 }
 
 // settings.json의 hooks 부분 교체 — 순수 hexa (/usr/bin/python3 제거)
@@ -139,16 +141,19 @@ if len(after_hooks_arr) > 1 {
     println("  훅 동기화 완료 (순수 hexa)")
 }
 
-// ── 5. 검증 ──
+// ── 5. 검증 (단일 exec 배치) ──
 println("")
 println("[5] 검증")
 
-let banner_out = to_string(exec(HEXA + " " + HOOK_DIR + "/nexus-banner.hexa 2>/dev/null")).trim()
-if len(banner_out) > 0 && banner_out.contains("systemMessage") { println("  OK — 배너 정상") } else { println("  WARN — 배너 확인 필요") }
-
-let hook_count = to_string(exec("grep -c 'command' '" + SETTINGS + "' 2>/dev/null || echo 0")).trim()
-println("  OK — settings.json에 " + hook_count + " hook entries")
+let verify_result = to_string(exec("bash -c '" + HEXA + " " + HOOK_DIR + "/nexus-banner.hexa 2>/dev/null; echo \"---SEP---\"; grep -c command \"" + SETTINGS + "\" 2>/dev/null || echo 0'")).trim()
+let verify_parts = verify_result.split("---SEP---")
+if len(verify_parts) >= 2 {
+    let banner_out = verify_parts[0].trim()
+    let hook_count = verify_parts[1].trim()
+    if len(banner_out) > 0 && banner_out.contains("systemMessage") { println("  OK — 배너 정상") } else { println("  WARN — 배너 확인 필요") }
+    println("  OK — settings.json에 " + hook_count + " hook entries")
+}
 
 println("")
-println("=== 셋업 완료 (HEXA-FIRST) ===")
+println("=== 셋업 완료 (HEXA-FIRST, batched) ===")
 println("프로젝트 추가: hooks-config.json의 whitelisted_projects에 추가 후 재실행")
