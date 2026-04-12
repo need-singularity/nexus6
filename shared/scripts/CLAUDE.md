@@ -8,6 +8,7 @@ sync (R1 migrated .sh → .hexa):
   shared_work_rules.md  (sync 블록 원본, sync-claude-rules.hexa 참조)
 
 rotate: rotate_discovery_log.hexa (ROI #3 — discovery_log.jsonl 주간 로테이션+gzip)
+        rotate_auto_gap.hexa (ROI #19 — auto_gap.log >5MB 로테이션+gzip, keep 2)
 stream: stream_discovery_graph.hexa (ROI #8 — NDJSON 스트리밍 유틸. stats/nodes/edges/ids/query/domain/window)
 
 run: nexus_ensure_running.hexa

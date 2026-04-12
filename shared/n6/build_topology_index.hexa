@@ -1,0 +1,225 @@
+// ═══════════════════════════════════════════════════════════
+// build_topology_index.hexa — topology_mk2.jsonl 인덱스 빌더
+// R1 HEXA-FIRST 준수 (staleness 판정 hexa, 대용량 빌드 python3 위임)
+// 용도: 47K-line topology_mk2.jsonl → O(1) node lookup JSON
+// 사용: hexa build_topology_index.hexa [--src PATH] [--force] [--verbose]
+// 출력: topology_mk2.idx.json (동일 디렉토리)
+// 원칙: topology_mk2.jsonl 읽기 전용. 인덱스만 생성/갱신.
+// ═══════════════════════════════════════════════════════════
+
+let a = args()
+let mut SRC_PATH = "shared/discovery/cycle/topology_mk2.jsonl"
+let mut force = false
+let mut verbose = false
+
+// ─── CLI 파싱 ───
+let mut ai: i64 = 2
+while ai < len(a) {
+    let tok = a[ai]
+    if tok == "--src" && ai + 1 < len(a) { ai = ai + 1; SRC_PATH = a[ai] }
+    else if tok == "--force" || tok == "-f" { force = true }
+    else if tok == "--verbose" || tok == "-v" { verbose = true }
+    else if tok == "--help" || tok == "-h" {
+        println("usage: hexa build_topology_index.hexa [--src PATH] [--force] [--verbose]")
+        println("  --src PATH     topology_mk2.jsonl 경로 (default: shared/discovery/cycle/topology_mk2.jsonl)")
+        println("  --force        mtime 무시, 강제 재빌드")
+        println("  --verbose      상세 출력")
+        println("")
+        println("output: topology_mk2.idx.json (same directory as source)")
+        println("format: {\"_meta\":{...},\"nodes\":{\"p_000000\":{\"ln\":1,\"domain\":...,\"layer\":...},...}}")
+        println("secondary: \"by_domain\":{\"architecture_design\":[\"p_000000\",...]}}")
+        println("           \"by_sector\":{\"primordial\":[\"p_000003\",...]}}")
+        exit(0)
+    }
+    ai = ai + 1
+}
+
+// ─── 파일 존재 검증 ───
+if !file_exists(SRC_PATH) {
+    println("error: source file not found: " + SRC_PATH)
+    println("usage: hexa build_topology_index.hexa [--src PATH] [--force] [--verbose]")
+    exit(1)
+}
+
+// ─── shell helper ───
+fn _exec_str(cmd: string) -> string {
+    let mut r = ""
+    try { r = to_string(exec(cmd)).trim() } catch e {}
+    return r
+}
+
+fn _exec_int(cmd: string) -> i64 {
+    let mut r: i64 = 0
+    try { r = to_int(to_string(exec(cmd)).trim()) } catch e {}
+    return r
+}
+
+// ─── 경로 계산 ───
+let OUT_PATH = SRC_PATH.replace(".jsonl", ".idx.json")
+
+println("╔══════════════════════════════════════════════════════════╗")
+println("║  build_topology_index — topology node index builder      ║")
+println("╚══════════════════════════════════════════════════════════╝")
+println("")
+
+// ─── source mtime ───
+let source_mtime = _exec_str("stat -f '%m' '" + SRC_PATH + "' 2>/dev/null || stat -c '%Y' '" + SRC_PATH + "' 2>/dev/null")
+if verbose {
+    println("  source: " + SRC_PATH)
+    println("  output: " + OUT_PATH)
+    println("  source mtime: " + source_mtime)
+}
+
+// ─── staleness check ───
+if !force && file_exists(OUT_PATH) {
+    let cached_mtime = _exec_str("python3 -c \"import json; print(json.load(open('" + OUT_PATH + "'))['_meta']['mtime'])\" 2>/dev/null")
+    if cached_mtime == source_mtime {
+        println("  status: FRESH (mtime=" + source_mtime + ")")
+        println("  topology_mk2.idx.json is up to date. Use --force to rebuild.")
+        let cached_nodes = _exec_str("python3 -c \"import json; m=json.load(open('" + OUT_PATH + "'))['_meta']; print(m['node_count'])\" 2>/dev/null")
+        let cached_domains = _exec_str("python3 -c \"import json; m=json.load(open('" + OUT_PATH + "'))['_meta']; print(m['domain_count'])\" 2>/dev/null")
+        let cached_size = _exec_str("stat -f '%z' '" + OUT_PATH + "' 2>/dev/null || stat -c '%s' '" + OUT_PATH + "' 2>/dev/null")
+        println("  cached: " + cached_nodes + " nodes, " + cached_domains + " domains, " + cached_size + " bytes")
+        exit(0)
+    }
+    if verbose {
+        println("  cached mtime: " + cached_mtime + " (stale, source=" + source_mtime + ")")
+    }
+}
+
+// ─── 빌드 시작 ───
+let line_count_est = _exec_int("wc -l < '" + SRC_PATH + "'")
+println("  building topology index ...")
+println("  source: " + SRC_PATH + " (~" + to_string(line_count_est) + " lines)")
+println("")
+
+// ─── Python3 위임: 47K lines 대용량 처리 ───
+// hexa 단독으로는 JSON 파싱 속도 제약 → python3 fast path
+// 인덱스 구조:
+//   nodes[id]  = {ln, domain, seed_from, layer, sector, tick}   — O(1) 조회
+//   by_domain  = {domain: [id, ...]}                            — 도메인별 조회
+//   by_sector  = {sector: [id, ...]}                            — 섹터별 조회
+//   by_layer   = {layer: [id, ...]}                             — 레이어별 조회
+let py_script = "
+import json, sys, os
+from collections import defaultdict
+
+src_path = '" + SRC_PATH + "'
+out_path = '" + OUT_PATH + "'
+source_mtime = '" + source_mtime + "'
+verbose = " + if verbose { "True" } else { "False" } + "
+
+nodes = {}
+by_domain = defaultdict(list)
+by_sector = defaultdict(list)
+by_layer = defaultdict(list)
+count = 0
+errors = 0
+dup_ids = 0
+
+with open(src_path) as f:
+    for ln, line in enumerate(f, 1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+            nid = obj['id']
+            domain = obj.get('domain', '')
+            seed_from = obj.get('seed_from', None)
+            mk2 = obj.get('mk2', {})
+            layer = mk2.get('layer', 0)
+            sector = mk2.get('sector', 'unknown')
+            tick = obj.get('discovered_at_tick', 0)
+
+            if nid in nodes:
+                dup_ids += 1
+                if verbose and dup_ids <= 5:
+                    print(f'  warn: duplicate id {nid} at line {ln} (first at {nodes[nid][\"ln\"]})', flush=True)
+                continue
+
+            nodes[nid] = {
+                'ln': ln,
+                'domain': domain,
+                'seed_from': seed_from,
+                'layer': layer,
+                'sector': sector,
+                'tick': tick
+            }
+            by_domain[domain].append(nid)
+            by_sector[sector].append(nid)
+            by_layer[str(layer)].append(nid)
+            count += 1
+            if verbose and count % 10000 == 0:
+                print(f'  ... {count:,} nodes indexed', flush=True)
+        except Exception as ex:
+            errors += 1
+            if errors <= 5 and verbose:
+                print(f'  warn: parse error line {ln}: {ex}', flush=True)
+            continue
+
+print(f'  parsed: {count:,} nodes, {len(by_domain):,} domains, {len(by_sector):,} sectors, {len(by_layer):,} layers')
+if dup_ids:
+    print(f'  duplicates skipped: {dup_ids}')
+if errors:
+    print(f'  parse errors: {errors}')
+
+result = {
+    '_meta': {
+        'source': os.path.basename(src_path),
+        'mtime': source_mtime,
+        'node_count': count,
+        'domain_count': len(by_domain),
+        'sector_count': len(by_sector),
+        'layer_count': len(by_layer),
+        'duplicate_ids': dup_ids,
+        'errors': errors,
+        'format': 'nodes[id]={ln,domain,seed_from,layer,sector,tick}; by_domain/by_sector/by_layer for secondary lookup'
+    },
+    'nodes': nodes,
+    'by_domain': dict(by_domain),
+    'by_sector': dict(by_sector),
+    'by_layer': dict(by_layer)
+}
+
+print(f'  writing {out_path} ...')
+with open(out_path, 'w') as f:
+    json.dump(result, f, separators=(',', ':'))
+
+size_bytes = os.path.getsize(out_path)
+size_mb = size_bytes / (1024 * 1024)
+print(f'  done: {size_bytes:,} bytes ({size_mb:.1f} MB)')
+"
+
+let build_result = _exec_str("python3 -c \"" + py_script + "\" 2>&1")
+println(build_result)
+
+// ─── 결과 검증 ───
+if !file_exists(OUT_PATH) {
+    println("")
+    println("  ERROR: index file was not created!")
+    println("  check python3 availability and disk space.")
+    exit(1)
+}
+
+// 최종 통계
+let final_size = _exec_str("stat -f '%z' '" + OUT_PATH + "' 2>/dev/null || stat -c '%s' '" + OUT_PATH + "' 2>/dev/null")
+let final_nodes = _exec_str("python3 -c \"import json; m=json.load(open('" + OUT_PATH + "'))['_meta']; print(m['node_count'])\" 2>/dev/null")
+let final_domains = _exec_str("python3 -c \"import json; m=json.load(open('" + OUT_PATH + "'))['_meta']; print(m['domain_count'])\" 2>/dev/null")
+let final_sectors = _exec_str("python3 -c \"import json; m=json.load(open('" + OUT_PATH + "'))['_meta']; print(m['sector_count'])\" 2>/dev/null")
+let final_layers = _exec_str("python3 -c \"import json; m=json.load(open('" + OUT_PATH + "'))['_meta']; print(m['layer_count'])\" 2>/dev/null")
+
+println("")
+println("═══════════════════════════════════════════════════════════")
+println("  RESULT")
+println("  nodes:    " + final_nodes)
+println("  domains:  " + final_domains)
+println("  sectors:  " + final_sectors)
+println("  layers:   " + final_layers)
+println("  size:     " + final_size + " bytes")
+println("  output:   " + OUT_PATH)
+println("  mtime:    " + source_mtime)
+println("═══════════════════════════════════════════════════════════")
+println("  topology index built. O(n) scan -> O(1) lookup ready.")
+println("═══════════════════════════════════════════════════════════")
+exit(0)

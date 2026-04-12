@@ -16,24 +16,88 @@ let _mod_step: i64 = 50
 let _goal_min: i64 = 100
 let _alien_target: i64 = 10
 
+fn safe_int(s: string) -> i64 {
+    let mut v: i64 = 0
+    try { v = to_int(to_float(s.trim())) } catch e {}
+    return v
+}
+
+// ─── JSON 경량 파서 헬퍼 (python3 서브프로세스 제거용) ───
+// _json_val: {"key":"value",...} 에서 key의 string value 추출
+fn _json_val(line: string, key: string) -> string {
+    let needle = "\"" + key + "\":"
+    if !line.contains(needle) { return "" }
+    let after = line.split(needle)[1].trim()
+    if after.starts_with("\"") {
+        return after.split("\"")[1]
+    }
+    // 숫자 값
+    let mut buf = ""
+    let mut i: i64 = 0
+    let chars = after.split("")
+    for c in chars {
+        if c == "," || c == "}" || c == "]" || c == " " || c == "\n" { break }
+        buf = buf + c
+    }
+    return buf
+}
+
+// _json_int: {"key": 123} 에서 key의 int value 추출
+fn _json_int(line: string, key: string) -> i64 {
+    return safe_int(_json_val(line, key))
+}
+
+// _json_sections: paths.json의 "engines":{...}, "dirs":{...}, "files":{...} 에서 k:v 쌍 추출
+fn _parse_paths_section(raw: string, section: string) -> string {
+    let needle = "\"" + section + "\""
+    if !raw.contains(needle) { return "" }
+    let after = raw.split(needle)[1]
+    // "{" 이후 ~ "}" 까지
+    if !after.contains("{") { return "" }
+    let inner = after.split("{")[1].split("}")[0]
+    let mut out = ""
+    // "key": "value" 쌍 추출
+    let parts = inner.split("\"")
+    // parts: ["", key, ": ", value, ", ", key2, ": ", value2, ...]
+    // 인덱스 1,3,5,7,... (홀수) 가 key/value 교대
+    let mut idx: i64 = 0
+    let mut pkey = ""
+    for p in parts {
+        if idx % 2 == 1 {
+            if pkey == "" {
+                pkey = p
+            } else {
+                out = out + pkey + "\t" + p + "\n"
+                pkey = ""
+            }
+        }
+        idx = idx + 1
+    }
+    return out
+}
+
 // ─── L2 SSOT: paths.json 로더 (stale path class 영구 소거) ───
 // shared/config/paths.json의 engines/dirs/files 섹션을 평탄 map으로 로드
 fn _load_path_map() -> map {
     let mut M = #{}
-    let raw = exec("/usr/bin/python3 -c 'import json; d=json.load(open(\"" + _shared + "/config/paths.json\")); [print(f\"{k}\\t{v}\") for sec in [\"engines\",\"dirs\",\"files\"] for k,v in d.get(sec,{}).items()]' 2>/dev/null")
-    let lines = raw.split("\n")
-    for line in lines {
-        if line.trim() == "" { continue }
-        let parts = line.split("\t")
-        if parts.len() < 2 { continue }
-        let key = parts[0].trim()
-        let val = parts[1].trim()
-        if val.starts_with("MISSING") {
-            M[key] = val
-        } else if val.starts_with("/") {
-            M[key] = val
-        } else {
-            M[key] = _dev + "/nexus/" + val
+    let raw_json = read_file(_shared + "/config/paths.json")
+    let sections = ["engines", "dirs", "files"]
+    for sec in sections {
+        let pairs = _parse_paths_section(raw_json, sec)
+        let lines = pairs.split("\n")
+        for line in lines {
+            if line.trim() == "" { continue }
+            let parts = line.split("\t")
+            if parts.len() < 2 { continue }
+            let key = parts[0].trim()
+            let val = parts[1].trim()
+            if val.starts_with("MISSING") {
+                M[key] = val
+            } else if val.starts_with("/") {
+                M[key] = val
+            } else {
+                M[key] = _dev + "/nexus/" + val
+            }
         }
     }
     return M
@@ -46,10 +110,92 @@ fn _is_missing(p: string) -> bool { return p.starts_with("MISSING") }
 let _engine_dir = _dev + "/nexus/shared/blowup"
 let _module_dir = _engine_dir + "/modules"
 
-fn safe_int(s: string) -> i64 {
-    let mut v: i64 = 0
-    try { v = to_int(to_float(s.trim())) } catch e {}
-    return v
+// ─── 렌즈 레지스트리 카운터 (python3 제거 — hexa native) ───
+fn _count_lens_status(status: string) -> i64 {
+    let mut cnt: i64 = 0
+    try {
+        let raw = read_file(_shared + "/lens_registry.json")
+        let entries = raw.split("\"status\"")
+        for e in entries {
+            if !e.contains(":") { continue }
+            let sv = e.split(":")[1].trim().split("\"")[1]
+            if sv == status { cnt = cnt + 1 }
+        }
+    } catch e {}
+    return cnt
+}
+
+// ─── products.json alien_index 리스트 (hexa native) ───
+fn _alien_items_below(target: i64) -> string {
+    let mut out = ""
+    try {
+        let raw = read_file(_dev + "/n6-architecture/config/products.json")
+        let sec_parts = raw.split("\"title\":")
+        let mut si: i64 = 0
+        for sp in sec_parts {
+            if si == 0 { si = si + 1; continue }
+            let title = sp.trim().split("\"")[1]
+            let mut alien: i64 = 0
+            if sp.contains("\"alien_index\"") {
+                alien = _json_int(sp, "alien_index")
+            }
+            if alien < target {
+                out = out + title + "\t" + to_string(alien) + "\n"
+            }
+            si = si + 1
+        }
+    } catch e {}
+    return out
+}
+
+// ─── DSE 미탐색 도메인 (hexa native — shell diff) ───
+fn _dse_missing_domains(limit: i64) -> string {
+    return exec("comm -23 <(ls -1 " + _dev + "/n6-architecture/docs 2>/dev/null | while read d; do test -d " + _dev + "/n6-architecture/docs/\"$d\" && echo \"$d\"; done | sort) <(ls -1 " + _shared + "/dse/domains/*.toml 2>/dev/null | xargs -I{} basename {} .toml | sort) | head -" + to_string(limit))
+}
+
+// ─── goal.md 미작성/부실 카운트 (hexa native — shell) ───
+fn _goal_missing_count() -> i64 {
+    return safe_int(exec("ls -1 " + _dev + "/n6-architecture/docs 2>/dev/null | while read d; do test -d " + _dev + "/n6-architecture/docs/\"$d\" && ! test -f " + _dev + "/n6-architecture/docs/\"$d\"/goal.md && echo \"$d\"; done | wc -l").trim())
+}
+fn _goal_weak_count(thr: i64) -> i64 {
+    return safe_int(exec("for d in $(ls -1 " + _dev + "/n6-architecture/docs 2>/dev/null); do f=" + _dev + "/n6-architecture/docs/$d/goal.md; test -f \"$f\" && n=$(wc -l < \"$f\") && [ \"$n\" -lt " + to_string(thr) + " ] && echo \"$d\"; done | wc -l").trim())
+}
+
+// ─── papers manifest 파서 (hexa native) ───
+fn _papers_count_status(status: string) -> i64 {
+    let mut cnt: i64 = 0
+    try {
+        let raw = read_file(_dev + "/papers/manifest.json")
+        let parts = raw.split("\"status\"")
+        for p in parts {
+            if !p.contains(":") { continue }
+            let sv = p.split(":")[1].trim().split("\"")[1]
+            if sv == status { cnt = cnt + 1 }
+        }
+    } catch e {}
+    return cnt
+}
+fn _papers_total() -> i64 {
+    let mut cnt: i64 = 0
+    try {
+        let raw = read_file(_dev + "/papers/manifest.json")
+        let parts = raw.split("\"title\":")
+        cnt = parts.len() - 1
+    } catch e {}
+    return cnt
+}
+fn _papers_doi_count() -> i64 {
+    let mut cnt: i64 = 0
+    try {
+        let raw = read_file(_dev + "/papers/manifest.json")
+        let parts = raw.split("\"doi\"")
+        for p in parts {
+            if !p.contains(":") { continue }
+            let dv = p.split(":")[1].trim().split("\"")[1]
+            if dv != "" { cnt = cnt + 1 }
+        }
+    } catch e {}
+    return cnt
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -140,15 +286,36 @@ fn load_project_breakthroughs(name: string) -> string {
     let mut out = ""
 
     if name == "n6-architecture" {
-        // products.json에서 alien < 10 스캔
+        // products.json에서 alien < 10 스캔 (hexa native)
         try {
-            let prod_cmd = "/usr/bin/python3 -c 'import json; d=json.load(open(\"" + _dev + "/n6-architecture/config/products.json\")); [print(chr(9).join([str(i+300),\"CRITICAL\",\"승격\",s[\"title\"]+\" 🛸\"+str(s.get(\"alien_index\",0))+\"→" + to_string(_alien_target) + "\",\"미시작\",\"외계인 지수 천장 돌파\"])) for i,s in enumerate(d.get(\"sections\",[])) if s.get(\"alien_index\",0)<" + to_string(_alien_target) + "]' 2>/dev/null"
-            out = out + exec(prod_cmd)
+            let prod_raw = read_file(_dev + "/n6-architecture/config/products.json")
+            // sections 배열 내 각 항목에서 title + alien_index 추출
+            let sec_parts = prod_raw.split("\"title\":")
+            let mut si: i64 = 0
+            for sp in sec_parts {
+                if si == 0 { si = si + 1; continue }  // 첫 split은 앞부분
+                let title = sp.trim().split("\"")[1]
+                let mut alien: i64 = 0
+                if sp.contains("\"alien_index\"") {
+                    alien = _json_int(sp, "alien_index")
+                }
+                if alien < _alien_target {
+                    out = out + to_string(299 + si) + "\tCRITICAL\t승격\t" + title + " 🛸" + to_string(alien) + "→" + to_string(_alien_target) + "\t미시작\t외계인 지수 천장 돌파\n"
+                }
+                si = si + 1
+            }
         } catch e {}
-        // goal.md 미작성 도메인
+        // goal.md 미작성 도메인 (hexa native — 단일 shell 호출)
         try {
-            let goal_cmd = "/usr/bin/python3 -c 'import os,json; d=json.load(open(\"" + _dev + "/n6-architecture/config/products.json\")); doms=[p[\"name\"] for s in d.get(\"sections\",[]) for p in s.get(\"products\",[])]; base=\"" + _dev + "/n6-architecture/docs\"; missing=[x for x in os.listdir(base) if os.path.isdir(os.path.join(base,x)) and not os.path.exists(os.path.join(base,x,\"goal.md\"))]; [print(chr(9).join([str(i+400),\"IMPORTANT\",\"설계\",m+\" goal.md 생성\",\"미시작\",\"궁극 아키텍처 완성\"])) for i,m in enumerate(missing[:20])]' 2>/dev/null"
-            out = out + exec(goal_cmd)
+            let _gm_raw = exec("for d in $(ls -1 " + _dev + "/n6-architecture/docs 2>/dev/null); do test -d " + _dev + "/n6-architecture/docs/\"$d\" && ! test -f " + _dev + "/n6-architecture/docs/\"$d\"/goal.md && echo \"$d\"; done | head -20")
+            let _gm_lines = _gm_raw.split("\n")
+            let mut gi: i64 = 0
+            for _gml in _gm_lines {
+                let d = _gml.trim()
+                if d == "" { continue }
+                gi = gi + 1
+                out = out + to_string(399 + gi) + "\tIMPORTANT\t설계\t" + d + " goal.md 생성\t미시작\t궁극 아키텍처 완성\n"
+            }
         } catch e {}
     }
 
@@ -172,10 +339,17 @@ fn load_project_breakthroughs(name: string) -> string {
 
     if name == "papers" {
         try {
-            let draft_count = exec("/usr/bin/python3 -c 'import json; d=json.load(open(\"" + _dev + "/papers/manifest.json\")); print(sum(1 for p in d.get(\"papers\",[]) if p.get(\"status\")==\"Draft\"))' 2>/dev/null").trim()
-            let dc = safe_int(draft_count)
+            let mani_raw = read_file(_dev + "/papers/manifest.json")
+            let mani_lines = mani_raw.split("\"status\"")
+            let mut dc: i64 = 0
+            for ml in mani_lines {
+                if ml.contains(":") {
+                    let sv = ml.split(":")[1].trim().split("\"")[1]
+                    if sv == "Draft" { dc = dc + 1 }
+                }
+            }
             if dc > 0 {
-                out = out + "300\tCRITICAL\t발행\tDraft " + draft_count + "편 Zenodo DOI 발행\t미시작\t100% 발행 달성\n"
+                out = out + "300\tCRITICAL\t발행\tDraft " + to_string(dc) + "편 Zenodo DOI 발행\t미시작\t100% 발행 달성\n"
             }
         } catch e {}
         out = out + "301\tIMPORTANT\t동기화\tn6-arch 신규 논문 → papers 복사\t미시작\tmanifest 최신화\n"
@@ -383,7 +557,7 @@ fn print_project(name: string, bt_lines: string) {
             // DSE 미탐색
             if gen < need {
                 try {
-                    let dse_m = exec("/usr/bin/python3 -c 'import os; toml_dir=\"" + _shared + "/dse/domains\"; have=set(f.replace(\".toml\",\"\") for f in os.listdir(toml_dir) if f.endswith(\".toml\")); doc_dir=\"" + _dev + "/n6-architecture/docs\"; docs=set(d for d in os.listdir(doc_dir) if os.path.isdir(os.path.join(doc_dir,d))); missing=sorted(docs-have); [print(m) for m in missing[:5]]' 2>/dev/null")
+                    let dse_m = exec("comm -23 <(ls -1 " + _dev + "/n6-architecture/docs 2>/dev/null | while read d; do test -d " + _dev + "/n6-architecture/docs/\"$d\" && echo \"$d\"; done | sort) <(ls -1 " + _shared + "/dse/domains/*.toml 2>/dev/null | xargs -I{} basename {} .toml | sort) | head -5")
                     let dse_lines = dse_m.split("\n")
                     for dl in dse_lines {
                         if dl.trim() == "" || gen >= need { continue }
@@ -396,7 +570,7 @@ fn print_project(name: string, bt_lines: string) {
             // goal.md 부실 보강
             if gen < need {
                 try {
-                    let weak_list = exec("/usr/bin/python3 -c 'import os; base=\"" + _dev + "/n6-architecture/docs\"; thr=" + to_string(_goal_min) + "; [(print(f\"{d}\\t{n}\")) for d,n in sorted([(d,sum(1 for _ in open(os.path.join(base,d,\"goal.md\")))) for d in os.listdir(base) if os.path.isdir(os.path.join(base,d)) and os.path.exists(os.path.join(base,d,\"goal.md\"))],key=lambda x:x[1]) if n<thr][:5]' 2>/dev/null")
+                    let weak_list = exec("for d in $(ls -1 " + _dev + "/n6-architecture/docs 2>/dev/null); do f=" + _dev + "/n6-architecture/docs/$d/goal.md; test -f \"$f\" && n=$(wc -l < \"$f\") && [ \"$n\" -lt " + to_string(_goal_min) + " ] && printf '%s\\t%s\\n' \"$d\" \"$n\"; done | sort -t'\t' -k2 -n | head -5")
                     let wl = weak_list.split("\n")
                     for wline in wl {
                         if wline.trim() == "" || gen >= need { continue }
@@ -411,7 +585,7 @@ fn print_project(name: string, bt_lines: string) {
             // 렌즈 미구현
             if gen < need {
                 try {
-                    let lens_r = safe_int(exec("/usr/bin/python3 -c \"import json; d=json.load(open('" + _shared + "/lens_registry.json')); print(sum(1 for l in d.get('lenses',[]) if l.get('status')=='registered'))\" 2>/dev/null").trim())
+                    let lens_r = _count_lens_status("registered")
                     if lens_r > 0 {
                         gen = gen + 1; row_id = row_id + 1; proposed = proposed + 1
                         tsv = tsv + to_string(row_id) + "\t렌즈\tregistered " + to_string(lens_r) + "건 → .rs 구현\t탐색 확대\t제안\n"
@@ -462,7 +636,7 @@ fn print_project(name: string, bt_lines: string) {
             // 외계인지수 승격
             if gen < need {
                 try {
-                    let alien_list = exec("/usr/bin/python3 -c 'import json; d=json.load(open(\"" + _dev + "/n6-architecture/config/products.json\")); items=[(s[\"title\"],s.get(\"alien_index\",0)) for s in d.get(\"sections\",[]) if s.get(\"alien_index\",0)<" + to_string(_alien_target) + "]; [print(f\"{t}\\t{a}\") for t,a in sorted(items,key=lambda x:x[1])[:3]]' 2>/dev/null")
+                    let alien_list = _alien_items_below(_alien_target)
                     let al = alien_list.split("\n")
                     for aline in al {
                         if aline.trim() == "" || gen >= need { continue }
@@ -479,7 +653,7 @@ fn print_project(name: string, bt_lines: string) {
                 let vbase = _P["verify_n6_base"]
                 if _is_missing(vbase) == false {
                     try {
-                        let vscan = exec("/usr/bin/python3 -c 'import os,glob\nbase=\"" + vbase + "\"\nrows=[]\nfor d in sorted(os.listdir(base)):\n    p=os.path.join(base,d)\n    if not os.path.isdir(p): continue\n    if not os.path.exists(os.path.join(p,\"goal.md\")): continue\n    hit=glob.glob(os.path.join(p,\"verify_*_n6.hexa\"))\n    st=\"완료\" if hit else \"미시작\"\n    rows.append((d,st))\nrows.sort(key=lambda r:(r[1]==\"완료\",r[0]))\nfor d,st in rows[:8]: print(f\"{d}\\t{st}\")' 2>/dev/null")
+                        let vscan = exec("for d in $(ls -1 " + vbase + " 2>/dev/null | sort); do test -d " + vbase + "/\"$d\" || continue; test -f " + vbase + "/\"$d\"/goal.md || continue; ls " + vbase + "/\"$d\"/verify_*_n6.hexa >/dev/null 2>&1 && st=완료 || st=미시작; printf '%s\\t%s\\n' \"$d\" \"$st\"; done | sort -t'\t' -k2 | head -8")
                         let vl = vscan.split("\n")
                         for vline in vl {
                             if vline.trim() == "" || gen >= need { continue }
@@ -558,7 +732,7 @@ fn print_project(name: string, bt_lines: string) {
             // 렌즈 .rs 구현
             if gen < need {
                 try {
-                    let lr = safe_int(exec("/usr/bin/python3 -c \"import json; d=json.load(open('" + _shared + "/lens_registry.json')); print(sum(1 for l in d.get('lenses',[]) if l.get('status')=='registered'))\" 2>/dev/null").trim())
+                    let lr = _count_lens_status("registered")
                     if lr > 0 {
                         gen = gen + 1; row_id = row_id + 1; proposed = proposed + 1
                         tsv = tsv + to_string(row_id) + "\t렌즈\tregistered " + to_string(lr) + "건 → .rs 구현\t탐색 확대\t제안\n"
@@ -631,7 +805,25 @@ fn print_project(name: string, bt_lines: string) {
         if name == "papers" {
             if gen < need {
                 try {
-                    let draft = exec("/usr/bin/python3 -c \"import json; d=json.load(open('" + _dev + "/papers/manifest.json')); [print(p.get('title','?')) for p in d.get('papers',[]) if p.get('status')=='Draft'][:5]\" 2>/dev/null")
+                    // papers manifest hexa native — Draft 제목 추출
+                    let _mani_raw = read_file(_dev + "/papers/manifest.json")
+                    // 각 paper 블록에서 status=Draft인 것의 title 추출
+                    let _paper_blocks = _mani_raw.split("\"title\":")
+                    let mut _draft_list = ""
+                    let mut _dcount: i64 = 0
+                    for _pb in _paper_blocks {
+                        if _dcount >= 5 { break }
+                        if !_pb.contains("\"status\"") { continue }
+                        let _st = _pb.split("\"status\"")[1]
+                        if !_st.contains(":") { continue }
+                        let _sv = _st.split(":")[1].trim().split("\"")[1]
+                        if _sv != "Draft" { continue }
+                        let _tt = _pb.trim().split("\"")[1]
+                        if _tt == "" { continue }
+                        _draft_list = _draft_list + _tt + "\n"
+                        _dcount = _dcount + 1
+                    }
+                    let draft = _draft_list
                     let dl = draft.split("\n")
                     for dline in dl {
                         if dline.trim() == "" || gen >= need { continue }
@@ -817,7 +1009,7 @@ fn _bulk_scan_deprecated(project: string) {
         println("")
         println("## 3. goal.md 미작성 도메인 전수")
         try {
-            let missing = exec("/usr/bin/python3 -c 'import os; base=\"" + _dev + "/n6-architecture/docs\"; dirs=[d for d in sorted(os.listdir(base)) if os.path.isdir(os.path.join(base,d)) and not os.path.exists(os.path.join(base,d,\"goal.md\"))]; [print(f\"  {i+1}. {d}\") for i,d in enumerate(dirs)]; print(f\"> 미작성 {len(dirs)}건\")' 2>/dev/null")
+            let missing = exec("i=0; for d in $(ls -1 " + _dev + "/n6-architecture/docs 2>/dev/null | sort); do test -d " + _dev + "/n6-architecture/docs/\"$d\" || continue; test -f " + _dev + "/n6-architecture/docs/\"$d\"/goal.md && continue; i=$((i+1)); echo \"  $i. $d\"; done; echo \"> 미작성 ${i}건\"")
             println(missing)
         } catch e {
             println("> goal.md 스캔 불가")
@@ -827,7 +1019,7 @@ fn _bulk_scan_deprecated(project: string) {
         println("")
         println("## 4. goal.md 부실 (" + to_string(_goal_min) + "줄 미만) 전수")
         try {
-            let weak = exec("/usr/bin/python3 -c 'import os; base=\"" + _dev + "/n6-architecture/docs\"; thr=" + to_string(_goal_min) + "; items=[]; [items.append((d,sum(1 for _ in open(os.path.join(base,d,\"goal.md\"))))) for d in sorted(os.listdir(base)) if os.path.isdir(os.path.join(base,d)) and os.path.exists(os.path.join(base,d,\"goal.md\"))]; weak=[(d,n) for d,n in items if n<thr]; [print(f\"  {i+1}. {d} ({n}줄)\") for i,(d,n) in enumerate(sorted(weak,key=lambda x:x[1]))]; print(f\"> 부실 {len(weak)}건 / 전체 {len(items)}건\")' 2>/dev/null")
+            let weak = exec("i=0; total=0; for d in $(ls -1 " + _dev + "/n6-architecture/docs 2>/dev/null | sort); do f=" + _dev + "/n6-architecture/docs/$d/goal.md; test -d " + _dev + "/n6-architecture/docs/\"$d\" || continue; test -f \"$f\" || continue; total=$((total+1)); n=$(wc -l < \"$f\"); [ \"$n\" -lt " + to_string(_goal_min) + " ] && { i=$((i+1)); echo \"  $i. $d (${n}줄)\"; }; done; echo \"> 부실 ${i}건 / 전체 ${total}건\"")
             println(weak)
         } catch e {
             println("> goal.md 줄수 스캔 불가")
@@ -837,7 +1029,7 @@ fn _bulk_scan_deprecated(project: string) {
         println("")
         println("## 5. BT 도메인별 분포")
         try {
-            let bt_dist = exec("/usr/bin/python3 -c 'import re,collections; f=open(\"" + _dev + "/n6-architecture/docs/breakthrough-theorems.md\"); lines=f.readlines(); domains=collections.Counter(); [domains.update([re.sub(r\"[^가-힣a-zA-Z/ ]\",\"\",l.split(\":\")[0].replace(\"## BT-\",\"\").strip()).strip()]) for l in lines if l.startswith(\"## BT-\")]; [print(f\"  {d}: {c}건\") for d,c in domains.most_common(30)]; print(f\"> BT 총 {sum(domains.values())}건, {len(domains)}개 도메인\")' 2>/dev/null")
+            let bt_dist = exec("grep '^## BT-' " + _dev + "/n6-architecture/docs/breakthrough-theorems.md 2>/dev/null | sed 's/## BT-//;s/:.*//' | sed 's/[^가-힣a-zA-Z/ ]//g' | sed 's/^ *//;s/ *$//' | sort | uniq -c | sort -rn | head -30 | awk '{cnt=$1; $1=\"\"; sub(/^ /,\"\"); printf \"  %s: %d건\\n\",$0,cnt}'; total=$(grep -c '^## BT-' " + _dev + "/n6-architecture/docs/breakthrough-theorems.md 2>/dev/null); doms=$(grep '^## BT-' " + _dev + "/n6-architecture/docs/breakthrough-theorems.md 2>/dev/null | sed 's/## BT-//;s/:.*//' | sed 's/[^가-힣a-zA-Z/ ]//g' | sed 's/^ *//;s/ *$//' | sort -u | wc -l); echo \"> BT 총 ${total}건, ${doms}개 도메인\"")
             println(bt_dist)
         } catch e {
             println("> BT 분포 스캔 불가")
@@ -847,8 +1039,15 @@ fn _bulk_scan_deprecated(project: string) {
         println("")
         println("## 6. DSE TOML 미탐색 도메인")
         try {
-            let dse_miss = exec("/usr/bin/python3 -c 'import os; toml_dir=\"" + _shared + "/dse/domains\"; have=set(f.replace(\".toml\",\"\") for f in os.listdir(toml_dir) if f.endswith(\".toml\")); doc_dir=\"" + _dev + "/n6-architecture/docs\"; docs=set(d for d in os.listdir(doc_dir) if os.path.isdir(os.path.join(doc_dir,d))); missing=sorted(docs-have); [print(f\"  {i+1}. {d}\") for i,d in enumerate(missing[:50])]; print(f\"> DSE 미탐색 {len(missing)}건 (상위 50건)\")' 2>/dev/null")
-            println(dse_miss)
+            let dse_miss_raw = _dse_missing_domains(50)
+            let dse_miss_lines = dse_miss_raw.split("\n")
+            let mut dsi: i64 = 0
+            for dml in dse_miss_lines {
+                if dml.trim() == "" { continue }
+                dsi = dsi + 1
+                println("  " + to_string(dsi) + ". " + dml.trim())
+            }
+            println("> DSE 미탐색 " + to_string(dsi) + "건 (상위 50건)")
         } catch e {
             println("> DSE 스캔 불가")
         }
@@ -857,8 +1056,25 @@ fn _bulk_scan_deprecated(project: string) {
         println("")
         println("## 7. 렌즈 미구현 (registered only)")
         try {
-            let lens_miss = exec("/usr/bin/python3 -c \"import json; d=json.load(open('" + _shared + "/lens_registry.json')); reg=[l for l in d.get('lenses',[]) if l.get('status')=='registered']; [print(f'  {i+1}. {l.get(chr(105)+chr(100),chr(63))}: {l.get(chr(110)+chr(97)+chr(109)+chr(101),chr(63))}') for i,l in enumerate(reg[:50])]; print(f'> 미구현 {len(reg)}건 (상위 50건)')\" 2>/dev/null")
-            println(lens_miss)
+            // hexa native — lens_registry.json에서 registered 렌즈 id:name 추출
+            let _lens_raw = read_file(_shared + "/lens_registry.json")
+            // 각 렌즈 블록 분리 ('{' 기준)
+            let _lens_blocks = _lens_raw.split("{")
+            let mut _li: i64 = 0
+            let _lr_total = _count_lens_status("registered")
+            for _lb in _lens_blocks {
+                if _li >= 50 { break }
+                if !_lb.contains("\"status\"") { continue }
+                let _ls = _lb.split("\"status\"")[1]
+                if !_ls.contains(":") { continue }
+                let _lsv = _ls.split(":")[1].trim().split("\"")[1]
+                if _lsv != "registered" { continue }
+                let _lid = _json_val(_lb, "id")
+                let _lname = _json_val(_lb, "name")
+                _li = _li + 1
+                println("  " + to_string(_li) + ". " + _lid + ": " + _lname)
+            }
+            println("> 미구현 " + to_string(_lr_total) + "건 (상위 50건)")
         } catch e {
             println("> 렌즈 스캔 불가")
         }
@@ -867,7 +1083,7 @@ fn _bulk_scan_deprecated(project: string) {
         println("")
         println("## 8. verify 실패 목록")
         try {
-            let vfail = exec("/usr/bin/python3 -c 'import os,subprocess; base=\"" + _dev + "/n6-architecture\"; scripts=[os.path.join(r,f) for r,ds,fs in os.walk(base) for f in fs if f.startswith(\"verify_\") and (f.endswith(\".py\") or f.endswith(\".hexa\"))]; fail=[]; [fail.append(s) if subprocess.run([\"python3\",s],capture_output=True,timeout=30).returncode!=0 else None for s in scripts[:20]]; print(f\"> 샘플 {min(20,len(scripts))}건 중 FAIL {len(fail)}건\") if fail else print(f\"> 샘플 {min(20,len(scripts))}건 전부 PASS\")' 2>/dev/null")
+            let vfail = exec("scripts=$(find " + _dev + "/n6-architecture -name 'verify_*.py' -o -name 'verify_*.hexa' 2>/dev/null | head -20); total=$(echo \"$scripts\" | grep -c .); fail=0; for s in $scripts; do if [[ \"$s\" == *.py ]]; then python3 \"$s\" >/dev/null 2>&1 || fail=$((fail+1)); elif [[ \"$s\" == *.hexa ]]; then " + _hexa_bin + " \"$s\" >/dev/null 2>&1 || fail=$((fail+1)); fi; done; if [ $fail -gt 0 ]; then echo \"> 샘플 ${total}건 중 FAIL ${fail}건\"; else echo \"> 샘플 ${total}건 전부 PASS\"; fi")
             println(vfail)
         } catch e {
             println("> verify 스캔 불가")
@@ -877,7 +1093,19 @@ fn _bulk_scan_deprecated(project: string) {
         println("")
         println("## 9. 외계인지수 < 10 (승격 대상)")
         try {
-            let alien = exec("/usr/bin/python3 -c 'import json; d=json.load(open(\"" + _dev + "/n6-architecture/config/products.json\")); items=[(s[\"title\"],s.get(\"alien_index\",0)) for s in d.get(\"sections\",[]) if s.get(\"alien_index\",0)<" + to_string(_alien_target) + "]; [print(f\"  {t}: 🛸{a}\") for t,a in sorted(items,key=lambda x:x[1])]; print(f\"> 승격 대상 {len(items)}건\")' 2>/dev/null")
+            let _alien_raw = _alien_items_below(_alien_target)
+            let _alien_lines = _alien_raw.split("\n")
+            let mut _alien_out = ""
+            let mut _ac: i64 = 0
+            for _al in _alien_lines {
+                if _al.trim() == "" { continue }
+                let _ap = _al.split("\t")
+                if _ap.len() < 2 { continue }
+                _ac = _ac + 1
+                _alien_out = _alien_out + "  " + _ap[0] + ": 🛸" + _ap[1] + "\n"
+            }
+            _alien_out = _alien_out + "> 승격 대상 " + to_string(_ac) + "건"
+            let alien = _alien_out
             println(alien)
         } catch e {
             println("> products 스캔 불가")
@@ -908,8 +1136,12 @@ fn _bulk_scan_deprecated(project: string) {
         println("")
         println("## 4. 렌즈 레지스트리")
         try {
-            let lens_stat = exec("/usr/bin/python3 -c \"import json; d=json.load(open('" + _shared + "/lens_registry.json')); total=len(d.get('lenses',[])); impl=sum(1 for l in d.get('lenses',[]) if l.get('status')=='implemented'); reg=sum(1 for l in d.get('lenses',[]) if l.get('status')=='registered'); print(f'  전체: {total}\\n  implemented: {impl}\\n  registered: {reg}')\" 2>/dev/null")
-            println(lens_stat)
+            let _ls_impl = _count_lens_status("implemented")
+            let _ls_reg = _count_lens_status("registered")
+            let _ls_total = _ls_impl + _ls_reg
+            println("  전체: " + to_string(_ls_total))
+            println("  implemented: " + to_string(_ls_impl))
+            println("  registered: " + to_string(_ls_reg))
         } catch e {
             println("> 렌즈 스캔 불가")
         }
@@ -918,8 +1150,33 @@ fn _bulk_scan_deprecated(project: string) {
         println("")
         println("## 5. seed 현황")
         try {
-            let seed_count = exec("/usr/bin/python3 -c \"import json,os; seeds=[f for f in os.listdir('" + _shared + "/seeds') if f.endswith('.json')]; print(f'  seed 파일: {len(seeds)}개'); total=0; [exec(f'') for _ in []]; items=[]; [(lambda f: items.append((f.replace('.json',''), len(json.load(open(os.path.join('" + _shared + "/seeds',f))).get('seeds',[])))))(f) for f in seeds]; [print(f'  {n}: {c}개') for n,c in sorted(items,key=lambda x:-x[1])[:15]]; print(f'  합계: {sum(c for _,c in items)}개')\" 2>/dev/null")
-            println(seed_count)
+            // hexa native — seed 파일 카운트 + 각 파일의 seeds 배열 크기
+            let _seed_files = exec("ls -1 " + _shared + "/seeds/*.json 2>/dev/null")
+            let _sf_lines = _seed_files.split("\n")
+            let mut _sf_count: i64 = 0
+            let mut _sf_total: i64 = 0
+            let mut _sf_out = ""
+            for _sf in _sf_lines {
+                if _sf.trim() == "" { continue }
+                _sf_count = _sf_count + 1
+                try {
+                    let _sf_raw = read_file(_sf.trim())
+                    // "seeds" 배열의 항목 수 = '"seeds"' 이후 '}' 카운트 (근사)
+                    let _sc = _sf_raw.split("\"seeds\"")
+                    if _sc.len() >= 2 {
+                        let _sarr = _sc[1].split("[")[1].split("]")[0]
+                        let _sitems = _sarr.split("{")
+                        let _scount = _sitems.len() - 1
+                        _sf_total = _sf_total + _scount
+                        let _sfname = _sf.trim().split("/")
+                        let _sfbase = _sfname[_sfname.len() - 1].replace(".json", "")
+                        _sf_out = _sf_out + "  " + _sfbase + ": " + to_string(_scount) + "개\n"
+                    }
+                } catch e3 {}
+            }
+            println("  seed 파일: " + to_string(_sf_count) + "개")
+            if _sf_out != "" { print(_sf_out) }
+            println("  합계: " + to_string(_sf_total) + "개")
         } catch e {
             // 간단 버전
             try {
@@ -934,7 +1191,8 @@ fn _bulk_scan_deprecated(project: string) {
         println("")
         println("## 6. BT 전체 통계")
         try {
-            let bt_stat = exec("/usr/bin/python3 -c 'f=open(\"" + _dev + "/n6-architecture/docs/breakthrough-theorems.md\"); lines=f.readlines(); sections=sum(1 for l in lines if l.startswith(\"## BT-\")); exact=sum(1 for l in lines if \"EXACT\" in l); near=sum(1 for l in lines if \"NEAR\" in l); miss=sum(1 for l in lines if \"MISS\" in l); print(f\"  BT 섹션: {sections}\\n  EXACT 언급: {exact}\\n  NEAR 언급: {near}\\n  MISS 언급: {miss}\")' 2>/dev/null")
+            let _btf = _dev + "/n6-architecture/docs/breakthrough-theorems.md"
+            let bt_stat = exec("sec=$(grep -c '^## BT-' " + _btf + " 2>/dev/null); ex=$(grep -c 'EXACT' " + _btf + " 2>/dev/null); ne=$(grep -c 'NEAR' " + _btf + " 2>/dev/null); mi=$(grep -c 'MISS' " + _btf + " 2>/dev/null); printf '  BT 섹션: %s\\n  EXACT 언급: %s\\n  NEAR 언급: %s\\n  MISS 언급: %s\\n' \"$sec\" \"$ex\" \"$ne\" \"$mi\"")
             println(bt_stat)
         } catch e {
             println("> BT 스캔 불가")
@@ -971,8 +1229,14 @@ fn _bulk_scan_deprecated(project: string) {
             for cl in clines {
                 if cl.trim() == "" { continue }
                 let cpath = _shared + "/convergence/" + cl.trim() + ".json"
-                let cstat = exec("/usr/bin/python3 -c \"import json; d=json.load(open('" + cpath + "')); o=d.get('ossified',0); s=d.get('stable',0); f=d.get('failed',0); print(f'  " + cl.trim() + ": 골화={o} 안정={s} 실패={f}')\" 2>/dev/null")
-                println(cstat)
+                // hexa native — convergence JSON에서 ossified/stable/failed 추출
+                try {
+                    let _craw = read_file(cpath)
+                    let _co = _json_int(_craw, "ossified")
+                    let _cs = _json_int(_craw, "stable")
+                    let _cf = _json_int(_craw, "failed")
+                    println("  " + cl.trim() + ": 골화=" + to_string(_co) + " 안정=" + to_string(_cs) + " 실패=" + to_string(_cf))
+                } catch e4 {}
             }
         } catch e {
             println("> convergence 스캔 불가")
@@ -1036,7 +1300,21 @@ fn _bulk_scan_deprecated(project: string) {
         println("")
         println("## 6. ANIMA 학습 상태")
         try {
-            let status = exec("/usr/bin/python3 -c \"import json; d=json.load(open('" + _dev + "/airgenome/consciousness_engine_status.json')); [print(f'  {k}: {v}') for k,v in list(d.items())[:10]]\" 2>/dev/null")
+            // hexa native — consciousness_engine_status.json k:v 추출
+            let _ce_raw = read_file(_dev + "/airgenome/consciousness_engine_status.json")
+            let _ce_pairs = _ce_raw.split("\"")
+            let mut _ce_out = ""
+            let mut _ci: i64 = 0
+            let mut _ck = ""
+            for _cp in _ce_pairs {
+                if _ci >= 20 { break }  // 10쌍 = 20 tokens
+                if _ci % 4 == 1 { _ck = _cp }
+                if _ci % 4 == 3 {
+                    _ce_out = _ce_out + "  " + _ck + ": " + _cp + "\n"
+                }
+                _ci = _ci + 1
+            }
+            let status = _ce_out.trim()
             println(status)
         } catch e {
             println("> 학습 상태 스캔 불가")
@@ -1048,7 +1326,10 @@ fn _bulk_scan_deprecated(project: string) {
         println("")
         println("## 3. 논문 발행 현황")
         try {
-            let paper_stat = exec("/usr/bin/python3 -c \"import json; d=json.load(open('" + _dev + "/papers/manifest.json')); papers=d.get('papers',[]); pub=sum(1 for p in papers if p.get('status')=='Published'); draft=sum(1 for p in papers if p.get('status')=='Draft'); print(f'  전체: {len(papers)}\\n  Published: {pub}\\n  Draft: {draft}')\" 2>/dev/null")
+            let _pt = _papers_total()
+            let _pp = _papers_count_status("Published")
+            let _pd = _papers_count_status("Draft")
+            let paper_stat = "  전체: " + to_string(_pt) + "\n  Published: " + to_string(_pp) + "\n  Draft: " + to_string(_pd)
             println(paper_stat)
         } catch e {
             println("> 논문 스캔 불가")
@@ -1057,7 +1338,30 @@ fn _bulk_scan_deprecated(project: string) {
         println("")
         println("## 4. DOI 현황")
         try {
-            let doi_stat = exec("/usr/bin/python3 -c \"import json; d=json.load(open('" + _dev + "/papers/manifest.json')); papers=d.get('papers',[]); has_doi=sum(1 for p in papers if p.get('doi','')); no_doi=[p.get('title','?') for p in papers if not p.get('doi','')]; print(f'  DOI 발행: {has_doi}/{len(papers)}'); [print(f'  미발행: {t}') for t in no_doi[:10]]\" 2>/dev/null")
+            // hexa native — DOI 발행 통계
+            let _doi_has = _papers_doi_count()
+            let _doi_total = _papers_total()
+            let mut _doi_out = "  DOI 발행: " + to_string(_doi_has) + "/" + to_string(_doi_total)
+            // 미발행 제목 추출
+            try {
+                let _doi_raw = read_file(_dev + "/papers/manifest.json")
+                let _doi_blocks = _doi_raw.split("\"title\":")
+                let mut _doi_miss: i64 = 0
+                for _db in _doi_blocks {
+                    if _doi_miss >= 10 { break }
+                    if !_db.contains("\"doi\"") { continue }
+                    let _dv = _db.split("\"doi\"")[1]
+                    if !_dv.contains(":") { continue }
+                    let _dvs = _dv.split(":")[1].trim()
+                    // doi가 ""이거나 null이면 미발행
+                    if _dvs.starts_with("\"\"") || _dvs.starts_with("null") {
+                        let _dt = _db.trim().split("\"")[1]
+                        _doi_out = _doi_out + "\n  미발행: " + _dt
+                        _doi_miss = _doi_miss + 1
+                    }
+                }
+            } catch e5 {}
+            let doi_stat = _doi_out
             println(doi_stat)
         } catch e {
             println("> DOI 스캔 불가")
@@ -1066,7 +1370,19 @@ fn _bulk_scan_deprecated(project: string) {
         println("")
         println("## 5. 논문 도메인 분포")
         try {
-            let dom_stat = exec("/usr/bin/python3 -c \"import json,collections; d=json.load(open('" + _dev + "/papers/manifest.json')); c=collections.Counter(p.get('domain','?') for p in d.get('papers',[])); [print(f'  {k}: {v}편') for k,v in c.most_common(15)]\" 2>/dev/null")
+            // hexa native — 도메인 분포 (shell sort|uniq -c)
+            let _dom_raw = read_file(_dev + "/papers/manifest.json")
+            let _dom_parts = _dom_raw.split("\"domain\"")
+            let mut _dom_list = ""
+            for _dp in _dom_parts {
+                if !_dp.contains(":") { continue }
+                let _dv2 = _dp.split(":")[1].trim().split("\"")[1]
+                if _dv2 != "" {
+                    _dom_list = _dom_list + _dv2 + "\n"
+                }
+            }
+            write_file("/tmp/_todo_dom.txt", _dom_list)
+            let dom_stat = exec("sort /tmp/_todo_dom.txt | uniq -c | sort -rn | head -15 | awk '{cnt=$1; $1=\"\"; sub(/^ /,\"\"); printf \"  %s: %d편\\n\",$0,cnt}'")
             println(dom_stat)
         } catch e {
             println("> 도메인 분포 스캔 불가")
@@ -1132,7 +1448,21 @@ fn _bulk_scan_deprecated(project: string) {
         println("")
         println("## 5. AIRGENOME 의식 엔진 상태")
         try {
-            let ce_stat = exec("/usr/bin/python3 -c \"import json; d=json.load(open('" + _dev + "/airgenome/consciousness_engine_status.json')); [print(f'  {k}: {v}') for k,v in list(d.items())[:10]]\" 2>/dev/null")
+            // hexa native — consciousness_engine_status.json k:v 추출
+            let _ce_raw2 = read_file(_dev + "/airgenome/consciousness_engine_status.json")
+            let _ce_pairs2 = _ce_raw2.split("\"")
+            let mut _ce_out2 = ""
+            let mut _ci2: i64 = 0
+            let mut _ck2 = ""
+            for _cp2 in _ce_pairs2 {
+                if _ci2 >= 20 { break }
+                if _ci2 % 4 == 1 { _ck2 = _cp2 }
+                if _ci2 % 4 == 3 {
+                    _ce_out2 = _ce_out2 + "  " + _ck2 + ": " + _cp2 + "\n"
+                }
+                _ci2 = _ci2 + 1
+            }
+            let ce_stat = _ce_out2.trim()
             println(ce_stat)
         } catch e {
             println("> 의식 엔진 스캔 불가")
@@ -1173,7 +1503,7 @@ fn _bulk_scan_deprecated(project: string) {
     if project == "n6-architecture" {
         // goal.md 부실
         try {
-            let weak_count = exec("/usr/bin/python3 -c 'import os; base=\"" + _dev + "/n6-architecture/docs\"; thr=" + to_string(_goal_min) + "; items=[(d,sum(1 for _ in open(os.path.join(base,d,\"goal.md\")))) for d in os.listdir(base) if os.path.isdir(os.path.join(base,d)) and os.path.exists(os.path.join(base,d,\"goal.md\")) and sum(1 for _ in open(os.path.join(base,d,\"goal.md\")))<thr]; print(len(items))' 2>/dev/null").trim()
+            let weak_count = to_string(_goal_weak_count(_goal_min))
             let wc = safe_int(weak_count)
             if wc > 0 {
                 println("| " + to_string(auto_id) + " | goal.md 보강 | " + to_string(_goal_min) + "줄 미만 도메인 보강 | " + weak_count + "건 | 🔴 |")
@@ -1183,7 +1513,7 @@ fn _bulk_scan_deprecated(project: string) {
 
         // goal.md 미작성
         try {
-            let miss_count = exec("/usr/bin/python3 -c 'import os; base=\"" + _dev + "/n6-architecture/docs\"; dirs=[d for d in os.listdir(base) if os.path.isdir(os.path.join(base,d)) and not os.path.exists(os.path.join(base,d,\"goal.md\"))]; print(len(dirs))' 2>/dev/null").trim()
+            let miss_count = to_string(_goal_missing_count())
             let mc = safe_int(miss_count)
             if mc > 0 {
                 println("| " + to_string(auto_id) + " | goal.md 생성 | 미작성 도메인 goal.md 생성 | " + miss_count + "건 | 🔴 |")
@@ -1193,7 +1523,7 @@ fn _bulk_scan_deprecated(project: string) {
 
         // DSE 미탐색
         try {
-            let dse_miss = exec("/usr/bin/python3 -c 'import os; toml_dir=\"" + _shared + "/dse/domains\"; have=set(f.replace(\".toml\",\"\") for f in os.listdir(toml_dir) if f.endswith(\".toml\")); doc_dir=\"" + _dev + "/n6-architecture/docs\"; docs=set(d for d in os.listdir(doc_dir) if os.path.isdir(os.path.join(doc_dir,d))); print(len(docs-have))' 2>/dev/null").trim()
+            let dse_miss = exec("comm -23 <(ls -1 " + _dev + "/n6-architecture/docs 2>/dev/null | while read d; do test -d " + _dev + "/n6-architecture/docs/\"$d\" && echo \"$d\"; done | sort) <(ls -1 " + _shared + "/dse/domains/*.toml 2>/dev/null | xargs -I{} basename {} .toml | sort) | wc -l").trim()
             let dm = safe_int(dse_miss)
             if dm > 0 {
                 println("| " + to_string(auto_id) + " | DSE TOML | 미탐색 도메인 TOML 생성 | " + dse_miss + "건 | 🟡 |")
@@ -1203,7 +1533,7 @@ fn _bulk_scan_deprecated(project: string) {
 
         // 렌즈 미구현
         try {
-            let lens_reg = exec("/usr/bin/python3 -c \"import json; d=json.load(open('" + _shared + "/lens_registry.json')); print(sum(1 for l in d.get('lenses',[]) if l.get('status')=='registered'))\" 2>/dev/null").trim()
+            let lens_reg = to_string(_count_lens_status("registered"))
             let lr = safe_int(lens_reg)
             if lr > 0 {
                 println("| " + to_string(auto_id) + " | 렌즈 구현 | registered → .rs implemented | " + lens_reg + "건 | 🟡 |")
@@ -1213,7 +1543,11 @@ fn _bulk_scan_deprecated(project: string) {
 
         // 외계인지수 승격
         try {
-            let alien_count = exec("/usr/bin/python3 -c 'import json; d=json.load(open(\"" + _dev + "/n6-architecture/config/products.json\")); print(sum(1 for s in d.get(\"sections\",[]) if s.get(\"alien_index\",0)<" + to_string(_alien_target) + "))' 2>/dev/null").trim()
+            let _ac_raw = _alien_items_below(_alien_target)
+            let _ac_lines = _ac_raw.split("\n")
+            let mut _ac_cnt: i64 = 0
+            for _acl in _ac_lines { if _acl.trim() != "" { _ac_cnt = _ac_cnt + 1 } }
+            let alien_count = to_string(_ac_cnt)
             let ac = safe_int(alien_count)
             if ac > 0 {
                 println("| " + to_string(auto_id) + " | 승격 | 외계인지수 < 10 → 10 승격 | " + alien_count + "건 | 🟡 |")

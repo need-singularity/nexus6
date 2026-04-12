@@ -652,20 +652,24 @@ fn _valid_atlas_line(line: string) -> bool {
 
 // 안전 append: (1) schema 검증 (2) shell dedup (3) flock append.
 // 불변식: 결과는 항상 "\n"로 끝남 (다음 append 간 line boundary 보존).
-// dedup: atlas.n6 전용 — grep -Fxq shell dedup (hexa read_file OOM 회피).
+// dedup: atlas.n6 전용 — grep -Fxf 배치 dedup (hexa read_file OOM 회피).
 // 이전: read_file(13MB) + split("\n") → 69k line hashmap → 매 호출 ~200MB alloc.
-// 현재: 라인별 grep -Fxq → O(batch × grep) shell 위임, hexa 메모리 0.
+// v2(폐기): 라인별 grep -Fxq → O(batch × grep) shell 위임, 53회 exec 오버헤드.
+// v3(현재): 배치 grep -Fxf tmpfile → exec 1회, hexa 메모리 0. (ROI #16)
 fn _guarded_append_atlas(path: string, content: string) -> i64 {
     if len(content) == 0 { return 0 }
 
     let is_atlas = path.contains("atlas.n6")
 
-    // (1) schema 검증 + shell dedup 필터링
+    // (1) schema 검증 — 1차 패스: 유효 라인만 추출 + dedup 후보 수집
     let lines = content.split("\n")
-    let mut clean = ""
     let mut rejected: i64 = 0
     let mut deduped: i64 = 0
-    let mut first = true
+    // valid_lines: schema 통과한 원본 라인 (인덱스 보존)
+    // dedup_candidates: grep 검사 대상 (trimmed, 비어있지 않고 주석 아닌 atlas 라인)
+    let mut valid_lines: list = []
+    let mut valid_trimmed: list = []
+    let mut needs_dedup: list = []
     let mut i: i64 = 0
     while i < len(lines) {
         let line = lines[i]
@@ -674,26 +678,76 @@ fn _guarded_append_atlas(path: string, content: string) -> i64 {
             i = i + 1
             continue
         }
-        // dedup: atlas.n6 대상만 — 빈 줄/주석은 dedup 제외
         let t = line.trim()
-        if is_atlas && len(t) > 0 && !t.starts_with("#") {
-            // shell dedup: grep -Fxq (hexa 메모리에 파일 로드 안 함)
-            let mut already = false
-            try {
-                let gr = exec("grep -Fxq -- '" + t.replace("'", "'\\''") + "' '" + path + "' 2>/dev/null && echo Y || echo N")
-                already = gr.trim() == "Y"
-            } catch e {}
-            if already {
+        let do_dedup = is_atlas && len(t) > 0 && !t.starts_with("#")
+        valid_lines = valid_lines.push(line)
+        valid_trimmed = valid_trimmed.push(t)
+        needs_dedup = needs_dedup.push(do_dedup)
+        i = i + 1
+    }
+
+    // (2) 배치 dedup: grep -Fxf tmpfile (exec 1회)
+    // dedup 후보가 있으면 tmpfile에 모아서 한 번에 grep
+    let mut dup_set = #{}
+    let dedup_count: i64 = len(valid_lines)
+    let mut has_any_dedup = false
+    i = 0
+    while i < dedup_count {
+        if needs_dedup[i] { has_any_dedup = true }
+        i = i + 1
+    }
+
+    if has_any_dedup {
+        // 후보 라인을 tmpfile로 작성 → grep -Fxf 로 atlas에서 일치 검색
+        let _tmp = "/tmp/.blowup_dedup_batch." + to_string(exec("echo $$").trim())
+        let mut patterns = ""
+        i = 0
+        while i < dedup_count {
+            if needs_dedup[i] {
+                if len(patterns) > 0 { patterns = patterns + "\n" }
+                patterns = patterns + valid_trimmed[i]
+            }
+            i = i + 1
+        }
+        try {
+            // tmpfile에 패턴 기록
+            exec("cat > '" + _tmp + "' <<'__DEDUP_PAT__'\n" + patterns + "\n__DEDUP_PAT__")
+            // grep -Fxf: 패턴 파일의 각 라인을 고정 문자열 전체 라인 매치로 검색
+            // 결과 = atlas.n6에 이미 존재하는 라인 목록
+            let found_raw = exec("grep -Fxf '" + _tmp + "' '" + path + "' 2>/dev/null || true")
+            let found_lines = found_raw.split("\n")
+            for fl in found_lines {
+                let ft = fl.trim()
+                if len(ft) > 0 {
+                    dup_set[ft] = true
+                }
+            }
+        } catch e {}
+        // tmpfile 정리
+        try { exec("rm -f '" + _tmp + "' 2>/dev/null") } catch e {}
+    }
+
+    // (3) 최종 필터: dup_set에 있으면 dedup, 없으면 통과
+    let mut clean = ""
+    let mut first = true
+    i = 0
+    while i < dedup_count {
+        if needs_dedup[i] {
+            let t = valid_trimmed[i]
+            let mut is_dup = false
+            try { is_dup = dup_set[t] == true } catch e {}
+            if is_dup {
                 deduped = deduped + 1
                 i = i + 1
                 continue
             }
         }
         if !first { clean = clean + "\n" }
-        clean = clean + line
+        clean = clean + valid_lines[i]
         first = false
         i = i + 1
     }
+
     if rejected > 0 {
         println("  [schema guard] rejected " + to_string(rejected) + " invalid lines -> " + path)
     }
@@ -3371,28 +3425,126 @@ println("═══ Phase 8: 파동 전파 (Wave Propagation) ═══")
 
 // 발견이 있을 때만 파동 전파
 if logged > 0 {
-    // 인접 도메인 탐색 (growth_bus에서 최근 활성 도메인)
+    // 인접 도메인 탐색
+    // fast-path: edges.adjacency.json (ROI #6) — 특이점 그래프 위상 인접 O(1)
+    // fallback: growth_bus에서 최근 활성 도메인 (기존 방식)
     let mut wave_targets = []
     let mut wave_seen = [domain]
-    try {
-        let _h_gb = _HOME
-        let gb_raw = exec("tail -100 " + _ATLAS_PATH + " 2>/dev/null")
-        let gb_lines = gb_raw.split("\n")
-        for gbl in gb_lines {
-            let gt = gbl.trim()
-            if gt == "" || !gt.contains("::") { continue }
-            let gp = gt.split("::")
-            if len(gp) < 2 { continue }
-            let gd = gp[1].trim().split(" ")[0].trim()
-            if gd == "" || gd == domain { continue }
-            let mut gdup = false
-            for ws in wave_seen { if ws == gd { gdup = true } }
-            if gdup { continue }
-            wave_seen = wave_seen + [gd]
-            wave_targets = wave_targets + [gd]
-            if len(wave_targets) >= 3 { break }
-        }
-    } catch e {}
+    let _edges_adj_path = _NEXUS + "/shared/discovery/cycle/edges.adjacency.json"
+    let _topo_path = _NEXUS + "/shared/discovery/cycle/topology_mk2.jsonl"
+    let mut _adj_tried = false
+    if file_exists(_edges_adj_path) && file_exists(_topo_path) {
+        _adj_tried = true
+        try {
+            // python3: topology invariant text에서 domain 관련 노드 탐색
+            //          → adjacency에서 인접 노드 → known atlas domains 매칭 → top 3
+            let adj_py = "import json,sys,mmap\n" +
+                "topo='" + _topo_path + "'\n" +
+                "adj_f='" + _edges_adj_path + "'\n" +
+                "atlas='" + _ATLAS_PATH + "'\n" +
+                "dom='" + domain + "'\n" +
+                "dom_lo=dom.lower()\n" +
+                "# atlas.n6에서 known domains 추출\n" +
+                "kd=set()\n" +
+                "try:\n" +
+                "  with open(atlas) as f:\n" +
+                "    for l in f:\n" +
+                "      if '\"domain\"' not in l: continue\n" +
+                "      for p in l.split('\"domain\"')[1:]:\n" +
+                "        v=p.lstrip(':').lstrip().lstrip('\"').split('\"')[0]\n" +
+                "        if v and len(v)>2: kd.add(v.lower())\n" +
+                "except: pass\n" +
+                "kd.discard(dom_lo)\n" +
+                "if not kd: sys.exit(0)\n" +
+                "id2inv={}\n" +
+                "my_ids=[]\n" +
+                "with open(topo) as f:\n" +
+                "  for line in f:\n" +
+                "    line=line.strip()\n" +
+                "    if not line: continue\n" +
+                "    try:\n" +
+                "      o=json.loads(line)\n" +
+                "      nid=o['id']\n" +
+                "      inv=str(o.get('singularity',{}).get('invariant','')).lower()\n" +
+                "      id2inv[nid]=inv\n" +
+                "      if dom_lo in inv: my_ids.append(nid)\n" +
+                "    except: pass\n" +
+                "if not my_ids:\n" +
+                "  print('')\n" +
+                "  sys.exit(0)\n" +
+                "sample=my_ids[:50]\n" +
+                "nb_ids=set()\n" +
+                "with open(adj_f,'rb') as f:\n" +
+                "  mm=mmap.mmap(f.fileno(),0,access=mmap.ACCESS_READ)\n" +
+                "  for nid in sample:\n" +
+                "    pat=('\"'+nid+'\":').encode()\n" +
+                "    pos=mm.find(pat)\n" +
+                "    if pos<0: continue\n" +
+                "    mm.seek(pos+len(pat))\n" +
+                "    depth=0; buf=b''\n" +
+                "    while True:\n" +
+                "      ch=mm.read(1)\n" +
+                "      if not ch: break\n" +
+                "      buf+=ch\n" +
+                "      if ch==b'[': depth+=1\n" +
+                "      elif ch==b']': depth-=1\n" +
+                "      if depth==0: break\n" +
+                "    try:\n" +
+                "      nbs=json.loads(buf)\n" +
+                "      for nb in nbs[:30]: nb_ids.add(nb[0])\n" +
+                "    except: pass\n" +
+                "  mm.close()\n" +
+                "dc={}\n" +
+                "ms=set(my_ids)\n" +
+                "for nid in nb_ids:\n" +
+                "  if nid in ms: continue\n" +
+                "  inv=id2inv.get(nid,'')\n" +
+                "  if not inv: continue\n" +
+                "  for d in kd:\n" +
+                "    if d in inv: dc[d]=dc.get(d,0)+1\n" +
+                "top=sorted(dc.items(),key=lambda x:-x[1])[:3]\n" +
+                "print('|'.join(d for d,c in top))\n"
+            let adj_result = exec("python3 -c \"" + adj_py + "\" 2>/dev/null").trim()
+            if adj_result != "" {
+                let adj_doms = adj_result.split("|")
+                for ad in adj_doms {
+                    let adt = ad.trim()
+                    if adt == "" || adt == domain { continue }
+                    let mut adup = false
+                    for ws in wave_seen { if ws == adt { adup = true } }
+                    if adup { continue }
+                    wave_seen = wave_seen + [adt]
+                    wave_targets = wave_targets + [adt]
+                    if len(wave_targets) >= 3 { break }
+                }
+                if len(wave_targets) > 0 {
+                    println("  [adj] edges.adjacency.json fast-path: " + to_string(len(wave_targets)) + "개 인접 도메인")
+                }
+            }
+        } catch e {}
+    }
+    // fallback: growth_bus에서 최근 활성 도메인 (기존 방식)
+    if len(wave_targets) < 3 {
+        try {
+            let _h_gb = _HOME
+            let gb_raw = exec("tail -100 " + _ATLAS_PATH + " 2>/dev/null")
+            let gb_lines = gb_raw.split("\n")
+            for gbl in gb_lines {
+                let gt = gbl.trim()
+                if gt == "" || !gt.contains("::") { continue }
+                let gp = gt.split("::")
+                if len(gp) < 2 { continue }
+                let gd = gp[1].trim().split(" ")[0].trim()
+                if gd == "" || gd == domain { continue }
+                let mut gdup = false
+                for ws in wave_seen { if ws == gd { gdup = true } }
+                if gdup { continue }
+                wave_seen = wave_seen + [gd]
+                wave_targets = wave_targets + [gd]
+                if len(wave_targets) >= 3 { break }
+            }
+        } catch e {}
+    }
 
     if len(wave_targets) > 0 {
         // 현재 돌파의 seed를 파동으로 전파
