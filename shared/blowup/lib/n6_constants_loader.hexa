@@ -1,0 +1,138 @@
+// ═══════════════════════════════════════════════════════════
+// n6_constants_loader.hexa — 공유 상수 로더 + /tmp 캐시
+// ROI #12: 5 모듈 각 19MB I/O → 1회 로드 + 캐시 재사용
+//
+// 사용법 (standalone):
+//   hexa n6_constants_loader.hexa           캐시 생성/갱신
+//   hexa n6_constants_loader.hexa --force   강제 재생성
+//
+// 캐시 파일:
+//   /tmp/.n6_constants_cache       파싱된 TSV (name\tvalue)
+//   /tmp/.n6_constants_cache.mtime 원본 mtime 스탬프
+//
+// 모듈 내 copy-paste 패턴 (atlas_guard.hexa.inc 방식):
+//   → lib/n6_constants_loader.hexa의 load_n6_consts() 함수를
+//     모듈 상단에 복사. 전체 파서 대신 캐시 TSV만 읽음.
+//
+// 병렬 안전: flock 기반 배타 잠금. 동시 실행 시 1개만 파싱,
+// 나머지는 잠금 해제 후 캐시 읽기.
+// ═══════════════════════════════════════════════════════════
+
+let _HOME = exec("printenv HOME").trim()
+let _N6C_SOURCE = _HOME + "/Dev/nexus/shared/n6/n6_constants.jsonl"
+let _N6C_CACHE = "/tmp/.n6_constants_cache"
+let _N6C_MTIME = "/tmp/.n6_constants_cache.mtime"
+let _N6C_LOCK  = "/tmp/.n6_constants_cache.lock"
+
+// ─── 원본 mtime 조회 ───
+fn _get_source_mtime() -> string {
+    let mt = exec("stat -f '%m' '" + _N6C_SOURCE + "' 2>/dev/null || stat --format='%Y' '" + _N6C_SOURCE + "' 2>/dev/null || echo 0").trim()
+    return mt
+}
+
+// ─── 캐시 유효성 검사 ───
+fn _cache_valid() -> bool {
+    let check = exec("[ -f '" + _N6C_CACHE + "' ] && [ -f '" + _N6C_MTIME + "' ] && echo Y || echo N").trim()
+    if check != "Y" { return false }
+    let cached_mt = exec("cat '" + _N6C_MTIME + "' 2>/dev/null").trim()
+    let source_mt = _get_source_mtime()
+    return cached_mt == source_mt && source_mt != "0"
+}
+
+// ─── 원본 파싱 → TSV 캐시 생성 (flock 배타 잠금) ───
+fn _build_cache() {
+    // flock: 1개 프로세스만 파싱, 나머지 대기 후 캐시 읽기
+    let script = "exec 9>'" + _N6C_LOCK + "'; flock -x 9; " +
+        "SRC_MT=$(stat -f '%m' '" + _N6C_SOURCE + "' 2>/dev/null || stat --format='%Y' '" + _N6C_SOURCE + "' 2>/dev/null || echo 0); " +
+        "CACHED_MT=$(cat '" + _N6C_MTIME + "' 2>/dev/null || echo -1); " +
+        "if [ \"$SRC_MT\" = \"$CACHED_MT\" ] && [ -f '" + _N6C_CACHE + "' ]; then echo SKIP; exit 0; fi; " +
+        "/usr/bin/python3 -c '" +
+        "import json, sys\n" +
+        "out = []\n" +
+        "with open(\"" + _N6C_SOURCE + "\") as f:\n" +
+        "    for line in f:\n" +
+        "        line = line.strip()\n" +
+        "        if not line: continue\n" +
+        "        try:\n" +
+        "            obj = json.loads(line)\n" +
+        "            name = obj.get(\"name\", \"\")\n" +
+        "            value = obj.get(\"value\", 0.0)\n" +
+        "            if name: out.append(f\"{name}\\t{value}\")\n" +
+        "        except: pass\n" +
+        "with open(\"" + _N6C_CACHE + "\", \"w\") as f:\n" +
+        "    f.write(\"\\n\".join(out) + \"\\n\")\n" +
+        "' 2>/dev/null; " +
+        "echo \"$SRC_MT\" > '" + _N6C_MTIME + "'; " +
+        "echo BUILT"
+    let result = exec(script).trim()
+    if result == "BUILT" {
+        let lines = exec("wc -l < '" + _N6C_CACHE + "' 2>/dev/null").trim()
+        println("[n6_constants_loader] cache built: " + lines + " entries")
+    } else if result == "SKIP" {
+        println("[n6_constants_loader] cache valid (another process built it)")
+    }
+}
+
+// ─── 캐시에서 TSV 로드 → [names, values] 반환 ───
+fn load_n6_consts() -> list {
+    if !_cache_valid() { _build_cache() }
+    let mut raw = ""
+    try { raw = read_file(_N6C_CACHE) } catch e {
+        // 캐시 실패 시 원본 직접 파싱 (fallback)
+        return _load_n6_consts_direct()
+    }
+    let lines = raw.split("\n")
+    let mut names = []
+    let mut values = []
+    for line in lines {
+        let t = line.trim()
+        if t == "" { continue }
+        let parts = t.split("\t")
+        if parts.len() < 2 { continue }
+        names = names + [parts[0]]
+        values = values + [to_float(parts[1])]
+    }
+    [names, values]
+}
+
+// ─── Fallback: 원본 직접 파싱 (캐시 불가 환경용) ───
+fn _load_n6_consts_direct() -> list {
+    let mut raw = ""
+    try { raw = read_file(_N6C_SOURCE) } catch e { return [[], []] }
+    let lines = raw.split("\n")
+    let mut names = []
+    let mut values = []
+    for line in lines {
+        let t = line.trim()
+        if t == "" { continue }
+        let mut name = ""
+        let mut value = 0.0
+        if t.contains("\"name\":\"") {
+            let p = t.split("\"name\":\"")
+            if p.len() >= 2 { name = p[1].split("\"")[0] }
+        }
+        if t.contains("\"value\":") {
+            let p = t.split("\"value\":")
+            if p.len() >= 2 {
+                let num_str = p[1].split(",")[0].split("}")[0].trim()
+                value = to_float(num_str)
+            }
+        }
+        if name != "" {
+            names = names + [name]
+            values = values + [value]
+        }
+    }
+    [names, values]
+}
+
+// ─── Standalone 실행: 캐시 생성/갱신 ───
+let args = exec("echo $@").trim()
+if args == "--force" {
+    exec("rm -f '" + _N6C_CACHE + "' '" + _N6C_MTIME + "' 2>/dev/null")
+    println("[n6_constants_loader] forced rebuild")
+}
+_build_cache()
+let result = load_n6_consts()
+let names: list = result[0]
+println("[n6_constants_loader] " + to_string(len(names)) + " constants ready")

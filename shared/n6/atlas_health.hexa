@@ -25,6 +25,52 @@ if !file_exists(_ATLAS_PATH) {
     exit(1)
 }
 
+// ─── mtime 캐시 체크 (exec 4회 → 0회 fast path) ───
+let _STATS_PATH = _ATLAS_PATH + ".stats"
+let mut _cache_hit = false
+
+// 현재 파일 mtime 취득 (1 exec)
+let mut _cur_mtime = ""
+try {
+    _cur_mtime = to_string(exec("stat -f '%m' '" + _ATLAS_PATH + "' 2>/dev/null || stat -c '%Y' '" + _ATLAS_PATH + "' 2>/dev/null")).trim()
+} catch e {}
+
+// 캐시 사이드카 읽기 + mtime 비교
+let mut _c_size: i64 = 0
+let mut _c_lines: i64 = 0
+let mut _c_nodes: i64 = 0
+let mut _c_edges: i64 = 0
+if _cur_mtime != "" && file_exists(_STATS_PATH) {
+    let mut _stats_raw = ""
+    try { _stats_raw = read_file(_STATS_PATH).trim() } catch e {}
+    if _stats_raw != "" {
+        // 수동 JSON 파싱: "key":value 패턴 추출
+        fn _json_int(raw: string, key: string) -> i64 {
+            let mut v: i64 = 0
+            let marker = "\"" + key + "\":"
+            let idx = raw.index_of(marker)
+            if idx >= 0 {
+                let after = raw.slice(idx + len(marker), len(raw))
+                let mut end = after.index_of(",")
+                let end2 = after.index_of("}")
+                if end < 0 || (end2 >= 0 && end2 < end) { end = end2 }
+                if end > 0 {
+                    try { v = to_int(after.slice(0, end).trim()) } catch e {}
+                }
+            }
+            return v
+        }
+        let cached_mtime = to_string(_json_int(_stats_raw, "mtime"))
+        if cached_mtime == _cur_mtime {
+            _c_size = _json_int(_stats_raw, "size")
+            _c_lines = _json_int(_stats_raw, "line_count")
+            _c_nodes = _json_int(_stats_raw, "nodes")
+            _c_edges = _json_int(_stats_raw, "edges")
+            if _c_size > 0 && _c_lines > 0 { _cache_hit = true }
+        }
+    }
+}
+
 // ─── 통계 수집 (exec 경유 fast path) ───
 // path 는 모두 single-quote 로 감쌈 (공백/특수문자 대응)
 fn _stat_size(path: string) -> i64 {
@@ -54,10 +100,21 @@ fn _line_count(path: string) -> i64 {
     return r
 }
 
-let size_bytes = _stat_size(_ATLAS_PATH)
-let lines = _line_count(_ATLAS_PATH)
-let nodes = _grep_count(_ATLAS_PATH, "\"type\":\"node\"")
-let edges = _grep_count(_ATLAS_PATH, "\"type\":\"edge\"")
+let mut size_bytes: i64 = 0
+let mut lines: i64 = 0
+let mut nodes: i64 = 0
+let mut edges: i64 = 0
+if _cache_hit {
+    size_bytes = _c_size
+    lines = _c_lines
+    nodes = _c_nodes
+    edges = _c_edges
+} else {
+    size_bytes = _stat_size(_ATLAS_PATH)
+    lines = _line_count(_ATLAS_PATH)
+    nodes = _grep_count(_ATLAS_PATH, "\"type\":\"node\"")
+    edges = _grep_count(_ATLAS_PATH, "\"type\":\"edge\"")
+}
 
 println("=== atlas.n6 health: " + _ATLAS_PATH + " ===")
 println("  size:          " + to_string(size_bytes) + " bytes")
@@ -184,6 +241,16 @@ let formula_status = if formula_errors == 0 { "✓" } else { "⚠️" }
 println("  formula errors:" + to_string(formula_errors) + "  " + formula_status)
 if verbose && formula_errors > 0 {
     println("  --- run: hexa shared/n6/verify_formulas.hexa for details ---")
+}
+
+// ─── 캐시 갱신 (miss 시 사이드카 재작성) ───
+if !_cache_hit && _cur_mtime != "" {
+    let mut _head_hash = ""
+    try {
+        _head_hash = to_string(exec("head -c 256 '" + _ATLAS_PATH + "' 2>/dev/null | md5 -q 2>/dev/null || head -c 256 '" + _ATLAS_PATH + "' 2>/dev/null | md5sum | cut -d' ' -f1")).trim()
+    } catch e {}
+    let _stats_json = "{\"schema\":2,\"mtime\":" + _cur_mtime + ",\"size\":" + to_string(size_bytes) + ",\"line_count\":" + to_string(lines) + ",\"head_hash\":\"" + _head_hash + "\",\"nodes\":" + to_string(nodes) + ",\"edges\":" + to_string(edges) + ",\"hubs\":" + to_string(node_uniq) + "}"
+    try { write_file(_STATS_PATH, _stats_json + "\n") } catch e {}
 }
 
 // ─── exit code ───

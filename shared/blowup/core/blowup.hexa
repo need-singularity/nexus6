@@ -335,17 +335,117 @@ fn match_grade_name(value: f64) -> string {
     return "NEAR|"
 }
 
+// OPT-19: sector_of 배치 최적화 — 27개 .contains() × N줄 → grep -E 1회 배치
+// _sector_cache: 텍스트 → 섹터 매핑 (batch_sector_classify 에서 일괄 생성)
+let mut _sector_cache = #{}
+let mut _sector_cache_built = false
+
 fn sector_of(text: string) -> string {
-    if text.contains("omega") || text.contains("dark") || text.contains("cosmolog") { return "cosmology" }
-    if text.contains("alpha") || text.contains("137") || text.contains("electroweak") { return "quantum" }
-    if text.contains("sigma") || text.contains("sopfr") || text.contains("tau") { return "n6" }
-    if text.contains("phi") || text.contains("mu") || text.contains("M3") { return "n6" }
-    if text.contains("J2") || text.contains("P1") || text.contains("P2") || text.contains("P3") || text.contains("P4") { return "n6" }
-    if text.contains("meta_fp") || text.contains("transcend") { return "n6" }
-    if text.contains("ded_") || text.contains("sym_") || text.contains("bif_") || text.contains("comp_") { return "n6" }
-    if text.contains("blowup") || text.contains("d0_") || text.contains("d1_") || text.contains("d2_") { return "n6" }
-    if text.contains("sqrt") || text.contains("proj") || text.contains("geom") { return "geometric" }
-    return "unknown"
+    // O(1) 캐시 조회 — batch_sector_classify 로 사전 구축
+    let mut _sc_hit = false
+    try { let _sv = _sector_cache[text]; _sc_hit = true } catch e {}
+    if _sc_hit {
+        return to_string(_sector_cache[text])
+    }
+    // 캐시 미스 시 fallback (소수 케이스) — 결과를 캐시에 추가
+    let mut result = "unknown"
+    if text.contains("omega") || text.contains("dark") || text.contains("cosmolog") { result = "cosmology" }
+    else if text.contains("alpha") || text.contains("137") || text.contains("electroweak") { result = "quantum" }
+    else if text.contains("sigma") || text.contains("sopfr") || text.contains("tau") { result = "n6" }
+    else if text.contains("phi") || text.contains("mu") || text.contains("M3") { result = "n6" }
+    else if text.contains("J2") || text.contains("P1") || text.contains("P2") || text.contains("P3") || text.contains("P4") { result = "n6" }
+    else if text.contains("meta_fp") || text.contains("transcend") { result = "n6" }
+    else if text.contains("ded_") || text.contains("sym_") || text.contains("bif_") || text.contains("comp_") { result = "n6" }
+    else if text.contains("blowup") || text.contains("d0_") || text.contains("d1_") || text.contains("d2_") { result = "n6" }
+    else if text.contains("sqrt") || text.contains("proj") || text.contains("geom") { result = "geometric" }
+    _sector_cache[text] = result
+    return result
+}
+
+// OPT-19: 배치 섹터 분류 — buf_lines 의 expr 필드(parts[2])를 한 번에 분류
+// 27개 .contains() × N줄 (142+) → grep -E 3회 (cosmology/quantum/geometric) + 나머지 n6
+// 호출 시점: Phase 4 완료 후, Phase 6.7/7 소비 전
+fn batch_sector_classify(lines: list) {
+    if _sector_cache_built { return }
+    let n = len(lines)
+    if n == 0 { _sector_cache_built = true; return }
+
+    // 1. 고유 도메인 텍스트 수집 → 임시 파일
+    let mut domain_set = #{}
+    let mut domain_list = []
+    let mut di: i64 = 0
+    while di < n {
+        let ln = to_string(lines[di])
+        if len(ln) > 5 {
+            let pp = ln.split("\t")
+            if len(pp) >= 3 {
+                let dt = to_string(pp[2])
+                let mut _dh = false
+                try { let _dv = domain_set[dt]; _dh = true } catch e {}
+                if !_dh {
+                    domain_set[dt] = 1
+                    domain_list = domain_list.push(dt)
+                }
+            }
+        }
+        di = di + 1
+    }
+    let dn = len(domain_list)
+    if dn == 0 { _sector_cache_built = true; return }
+
+    // 2. 임시 파일에 도메인 텍스트 쓰기
+    let _tmp = "/tmp/blowup_sector_batch.txt"
+    let mut _wbuf = ""
+    di = 0
+    while di < dn {
+        _wbuf = _wbuf + domain_list[di] + "\n"
+        di = di + 1
+    }
+    try { write_file(_tmp, _wbuf) } catch e { _sector_cache_built = true; return }
+
+    // 3. grep -E 배치 — 섹터별 1회씩 (총 3회, 나머지는 n6 default)
+    // cosmology 패턴
+    let _cosmo_re = "omega|dark|cosmolog"
+    // quantum 패턴
+    let _quant_re = "alpha|137|electroweak"
+    // geometric 패턴
+    let _geom_re = "sqrt|proj|geom"
+    // n6 패턴 (가장 큰 그룹 — 나머지 모두)
+    let _n6_re = "sigma|sopfr|tau|phi|mu|M3|J2|P1|P2|P3|P4|meta_fp|transcend|ded_|sym_|bif_|comp_|blowup|d0_|d1_|d2_"
+
+    // 단일 grep -En 호출: 4섹터 패턴을 awk로 우선순위 매칭 (grep 1회 + awk 분류)
+    let mut _batch_result = ""
+    try {
+        _batch_result = to_string(exec("awk '{" +
+            "if(/" + _cosmo_re + "/)print $0\"\\t\"\"cosmology\";" +
+            "else if(/" + _quant_re + "/)print $0\"\\t\"\"quantum\";" +
+            "else if(/" + _n6_re + "/)print $0\"\\t\"\"n6\";" +
+            "else if(/" + _geom_re + "/)print $0\"\\t\"\"geometric\";" +
+            "else print $0\"\\t\"\"unknown\"" +
+            "}' '" + _tmp + "' 2>/dev/null")).trim()
+    } catch e {}
+
+    // 4. 결과 파싱 → _sector_cache 저장
+    if len(_batch_result) > 0 {
+        let result_lines = _batch_result.split("\n")
+        let mut ri: i64 = 0
+        while ri < len(result_lines) {
+            let rl = result_lines[ri]
+            if len(rl) > 0 {
+                let rp = rl.split("\t")
+                if len(rp) >= 2 {
+                    let _text = to_string(rp[0])
+                    let _sect = to_string(rp[len(rp) - 1])
+                    _sector_cache[_text] = _sect
+                }
+            }
+            ri = ri + 1
+        }
+    }
+
+    // 5. 정리
+    try { exec("rm -f '" + _tmp + "'") } catch e {}
+    _sector_cache_built = true
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -2393,6 +2493,11 @@ if len(_reload_tsv) > 0 {
     buf_lines = _reload_tsv.split("\n")
 }
 println("  [FILTER] restored " + to_string(len(buf_lines)) + " lines from compact files")
+
+// OPT-19: 배치 섹터 분류 — Phase 6.7/7에서 sector_of() N회 호출 대신 awk 1회로 사전 분류
+// 27개 .contains() × N줄 → awk 패턴매칭 1회 (O(N×27) → O(N×1))
+batch_sector_classify(buf_lines)
+try { exec("printf '%s [phase-4-sector-batch] classified " + to_string(len(buf_lines)) + " lines\\n' \"$(date +%H:%M:%S)\" >> " + _TRACE_PATH) } catch e {}
 
 // ═══════════════════════════════════════════════════════════
 // PHASE 5: Telescope Verification

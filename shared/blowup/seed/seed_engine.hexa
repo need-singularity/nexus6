@@ -59,14 +59,128 @@ fn seed_quality(v: f64) -> f64 {
 let _se_home = exec("printenv HOME")
 let _se_shared = _se_home + "/Dev/nexus/shared"
 
+// ─── LRU FILE CACHE (/tmp/seed_cache.jsonl) ───
+// atlas.n6 cold scan 51s → cache hit ~5s. mtime 기반 무효화.
+// 포맷: 한 줄 = key\tatlас_mtime\tresult
+// LRU 100 entries, 오래된 것 자동 퇴출.
+
+let _cache_path = "/tmp/seed_cache.jsonl"
+let _cache_max = 100
+
+// atlas.n6 현재 mtime 문자열 반환 (stat -f %m, 초 단위 epoch)
+fn _atlas_mtime() -> string {
+    let atlas = _se_shared + "/n6/atlas.n6"
+    if !file_exists(atlas) { return "0" }
+    let mut mt = "0"
+    try { mt = exec("stat -f %m " + atlas).trim() } catch e { mt = "0" }
+    return mt
+}
+
+// 캐시에서 key 조회. atlas mtime 불일치 시 miss. 반환: result 또는 ""
+fn _cache_get(key: string) -> string {
+    if !file_exists(_cache_path) { return "" }
+    let cur_mt = _atlas_mtime()
+    let mut content = ""
+    try { content = read_file(_cache_path) } catch e { return "" }
+    let lines = content.split("\n")
+    let mut i = 0
+    while i < lines.len() {
+        let line = lines[i]
+        if line.len() > 0 {
+            let cols = line.split("\t")
+            if cols.len() >= 3 && cols[0] == key && cols[1] == cur_mt {
+                return cols[2]
+            }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// 캐시에 key=result 저장. 기존 동일 key 제거 + LRU 100 유지.
+fn _cache_put(key: string, result: string) {
+    let cur_mt = _atlas_mtime()
+    let entry = key + "\t" + cur_mt + "\t" + result
+    let mut old_content = ""
+    if file_exists(_cache_path) {
+        try { old_content = read_file(_cache_path) } catch e { old_content = "" }
+    }
+    let mut new_lines = [entry]
+    if old_content.len() > 0 {
+        let old_lines = old_content.split("\n")
+        let mut oi = 0
+        while oi < old_lines.len() && new_lines.len() < _cache_max {
+            let ol = old_lines[oi]
+            if ol.len() > 0 {
+                let cols = ol.split("\t")
+                // 동일 key 또는 stale mtime 제거
+                if cols.len() >= 3 && cols[0] != key && cols[1] == cur_mt {
+                    new_lines = new_lines + [ol]
+                }
+            }
+            oi = oi + 1
+        }
+    }
+    // 재조립
+    let mut out = ""
+    let mut wi = 0
+    while wi < new_lines.len() {
+        if wi > 0 { out = out + "\n" }
+        out = out + new_lines[wi]
+        wi = wi + 1
+    }
+    try { write_file(_cache_path, out) } catch e {}
+}
+
+// ─── LAZY ATLAS LOADER ───
+// atlas.n6 전체를 읽지 않고 tail -n N 으로 필요한 섹션만 로드.
+// 결과를 캐시하여 동일 세션 내 재호출 시 즉시 반환.
+
+// atlas.n6 tail N줄에서 EXACT 줄만 추출 (캐시 키: "exact_tail_N")
+fn _lazy_load_exact_lines(tail_n: i64) -> string {
+    let cache_key = "exact_tail_" + to_string(tail_n)
+    let cached = _cache_get(cache_key)
+    if cached.len() > 0 { return cached }
+
+    let path = _se_shared + "/n6/atlas.n6"
+    if !file_exists(path) { return "" }
+    let mut raw = ""
+    try { raw = exec("tail -n " + to_string(tail_n) + " " + path + " | grep 'EXACT'") } catch e { return "" }
+    // 결과를 캐시에 저장
+    if raw.len() > 0 {
+        _cache_put(cache_key, raw)
+    }
+    return raw
+}
+
+// atlas.n6 tail N줄에서 특정 도메인의 EXACT 줄만 추출 (캐시 키: "exact_dom_N_domain")
+fn _lazy_load_exact_domain(tail_n: i64, domain: string) -> string {
+    let cache_key = "exact_dom_" + to_string(tail_n) + "_" + domain
+    let cached = _cache_get(cache_key)
+    if cached.len() > 0 { return cached }
+
+    let path = _se_shared + "/n6/atlas.n6"
+    if !file_exists(path) { return "" }
+    let mut raw = ""
+    try { raw = exec("tail -n " + to_string(tail_n) + " " + path + " | grep 'EXACT' | grep '" + domain + "'") } catch e { return "" }
+    if raw.len() > 0 {
+        _cache_put(cache_key, raw)
+    }
+    return raw
+}
+
 // ─── DISCOVERY SOURCE ───
 
 fn load_discovery() -> string {
+    // 캐시 키: merge 결과 전체를 캐시 (load_discovery 단독)
+    let disc_cached = _cache_get("discovery_seeds")
+    if disc_cached.len() > 0 { return disc_cached }
+
     let path = _se_shared + "/n6/atlas.n6"
     if !file_exists(path) { return "" }
-    // atlas.n6 tail로 최근 3000줄만 (EXACT 30개 충분)
-    let mut content = ""
-    try { content = exec("tail -n 3000 " + path) } catch e { return "" }
+    // lazy-load: tail 3000줄의 EXACT 줄만 (전체 파일 로드 회피)
+    let mut content = _lazy_load_exact_lines(3000)
+    if content.len() == 0 { return "" }
     let lines = content.split("\n")
     let mut result = ""
     let mut count = 0
@@ -89,6 +203,8 @@ fn load_discovery() -> string {
         }
         i = i + 1
     }
+    // 결과 캐시
+    if result.len() > 0 { _cache_put("discovery_seeds", result) }
     return result
 }
 
@@ -144,6 +260,10 @@ fn load_atlas() -> string {
 // ─── MERGE ───
 
 fn merge_all() -> string {
+    // 캐시: merge 결과 전체 (가장 비싼 경로)
+    let merge_cached = _cache_get("merge_all")
+    if merge_cached.len() > 0 { return merge_cached }
+
     // list .contains() 기반 dedup (pipe 문자열 분할 오버헤드 제거)
     let mut seen = ["6", "12", "2", "4", "5", "24", "7"]
     let mut result = "6|12|2|4|5|24|7"
@@ -316,6 +436,8 @@ fn merge_all() -> string {
         }
         placed = placed + 1
     }
+    // 결과 캐시
+    if sorted_seeds.len() > 0 { _cache_put("merge_all", sorted_seeds) }
     return sorted_seeds
 }
 
@@ -323,11 +445,16 @@ fn merge_all() -> string {
 
 // growth_bus에서 특정 도메인의 EXACT 값 추출 (tail + string split, /usr/bin/python3 금지)
 fn wave_extract_exact(domain: string) -> string {
+    // 캐시: 도메인별 wave seeds
+    let wave_cache_key = "wave_seeds_" + domain
+    let wave_cached = _cache_get(wave_cache_key)
+    if wave_cached.len() > 0 { return wave_cached }
+
     let bus = _se_shared + "/n6/atlas.n6"
     if !file_exists(bus) { return "" }
-    // tail로 최근 5000줄 — 도메인당 EXACT 충분
-    let mut raw = ""
-    try { raw = exec("tail -n 5000 " + bus + " | grep 'EXACT' | grep '" + domain + "'") } catch e { return "" }
+    // lazy-load: tail 5000줄의 도메인별 EXACT 줄만 (캐시 경유)
+    let mut raw = _lazy_load_exact_domain(5000, domain)
+    if raw.len() == 0 { return "" }
     let lines = raw.split("\n")
     let mut result = ""
     let mut count = 0
@@ -350,6 +477,8 @@ fn wave_extract_exact(domain: string) -> string {
         }
         i = i + 1
     }
+    // 결과 캐시
+    if result.len() > 0 { _cache_put(wave_cache_key, result) }
     return result
 }
 
@@ -362,9 +491,9 @@ fn wave_find_adjacent(domain: string) -> string {
     if my_seeds.len() == 0 { return "" }
     let my_vals = my_seeds.split("|")
 
-    // 2) atlas.n6에서 다른 도메인 중 동일 값을 가진 도메인 카운트
-    let mut raw = ""
-    try { raw = exec("tail -n 5000 " + _se_shared + "/n6/atlas.n6 | grep 'EXACT'") } catch e { return "" }
+    // 2) atlas.n6에서 다른 도메인 중 동일 값을 가진 도메인 카운트 (lazy-load 캐시 경유)
+    let mut raw = _lazy_load_exact_lines(5000)
+    if raw.len() == 0 { return "" }
     let lines = raw.split("\n")
 
     // 도메인별 공유값 카운트 — pipe-separated "dom:count" 리스트
