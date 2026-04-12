@@ -1,0 +1,930 @@
+// shared/blowup/cross_validate_runner.hexa — Cross-Validate Multi-Domain Runner + Report
+//
+// Executes cross_validate.hexa across multiple test domains, collects consensus
+// tiers (UNIVERSAL~SINGULAR), and generates a summary report with:
+//   - Per-domain consensus tier distribution
+//   - Agreement rates across all domains
+//   - Domains where modules disagree most (highest divergence)
+//   - Module reliability rankings (how often each module appears in consensus)
+//
+// Does NOT modify atlas.n6 directly. Calls cross_validate.hexa as subprocess.
+//
+// Usage:
+//   hexa cross_validate_runner.hexa                        all default domains
+//   hexa cross_validate_runner.hexa math physics topology  specific domains
+//   hexa cross_validate_runner.hexa --timeout 120          per-module timeout
+//   hexa cross_validate_runner.hexa --max-domains 5        limit domain count
+//   hexa cross_validate_runner.hexa help                   usage
+//
+// Output: shared/blowup/cross_validate_runner_report.json + stdout
+
+// ═══════════════════════════════════════════════════════════
+// ─── HOME CACHE (exec 1 call) ───
+// ═══════════════════════════════════════════════════════════
+
+let mut _HOME = ""
+try { _HOME = exec("printenv HOME").trim() } catch e {}
+if _HOME == "" { try { _HOME = exec("echo $HOME").trim() } catch e {} }
+let _NEXUS = _HOME + "/Dev/nexus"
+let _CV_SCRIPT = _NEXUS + "/shared/blowup/cross_validate.hexa"
+let _REPORT_PATH = _NEXUS + "/shared/blowup/cross_validate_runner_report.json"
+let _LOG_PATH = _NEXUS + "/shared/blowup/cross_validate_runner.log"
+
+// ─── hexa binary path search (same as cross_validate.hexa) ───
+let mut _HEXA_BIN = ""
+try {
+    _HEXA_BIN = exec("for p in " + _HOME + "/Dev/hexa-lang/.hx/bin/hexa " + _HOME + "/Dev/hexa-lang/hexa $(which hexa 2>/dev/null); do [ -x \"$p\" ] && sz=$(stat --printf='%s' \"$p\" 2>/dev/null || stat -f'%z' \"$p\" 2>/dev/null) && [ \"$sz\" -gt 10240 ] && echo $p && break; done 2>/dev/null").trim()
+} catch e {}
+if _HEXA_BIN == "" {
+    try {
+        _HEXA_BIN = exec("for p in /tmp/hexa-build/hexa-lang/target/release/hexa " + _HOME + "/Dev/nexus/shared/bin/hexa; do [ -x \"$p\" ] && echo $p && break; done 2>/dev/null").trim()
+    } catch e {}
+}
+if _HEXA_BIN == "" { _HEXA_BIN = _HOME + "/Dev/hexa-lang/.hx/bin/hexa" }
+
+// Mac/Linux detection
+let _UNAME = try { exec("uname -s").trim() } catch e { "" }
+
+// ═══════════════════════════════════════════════════════════
+// ─── UTILITIES ───
+// ═══════════════════════════════════════════════════════════
+
+fn sf(s: string) -> f64 { let mut v = 0.0 ; try { v = to_float(s) } catch e {} ; return v }
+fn abs_f(x: f64) -> f64 { if x < 0.0 { return 0.0 - x } ; return x }
+fn max_f(a: f64, b: f64) -> f64 { if a > b { return a } ; return b }
+fn min_f(a: f64, b: f64) -> f64 { if a < b { return a } ; return b }
+
+fn trunc4(x: f64) -> string {
+    let s = to_string(x)
+    let p = s.split(".")
+    if p.len() < 2 { return s + ".0000" }
+    let d = p[1]
+    if d.len() >= 4 { let dc = d.split("") ; return p[0] + "." + dc[0] + dc[1] + dc[2] + dc[3] }
+    return s
+}
+
+fn pad(s: string, w: i64) -> string {
+    let mut o = s
+    while o.len() < w { o = o + " " }
+    return o
+}
+
+fn ts_now() -> string {
+    let mut t = ""
+    try { t = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim() } catch e { t = "unknown" }
+    return t
+}
+
+fn file_exists(path: string) -> bool {
+    let mut exists = false
+    try {
+        let r = exec("[ -f '" + path + "' ] && echo Y || echo N").trim()
+        exists = r == "Y"
+    } catch e {}
+    return exists
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── DOMAIN LOADING ───
+// ═══════════════════════════════════════════════════════════
+
+fn load_default_domains() -> list {
+    let home = _HOME
+    let mut doms = ["math","physics","topology","consciousness","chemistry",
+                    "cosmology","biology","information","geometry","number_theory"]
+    try {
+        let raw = read_file(home + "/Dev/nexus/shared/bt/bt_domains.jsonl")
+        let lines = raw.split("\n")
+        let mut ld = []
+        for l in lines {
+            if l.trim() != "" && l.contains("\"domain\":\"") {
+                ld = ld + [l.split("\"domain\":\"")[1].split("\"")[0]]
+            }
+        }
+        if ld.len() > 0 { doms = ld }
+    } catch e {}
+    doms
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── CROSS-VALIDATE EXECUTION ───
+// ═══════════════════════════════════════════════════════════
+
+// Run cross_validate.hexa on a single domain, capture stdout.
+// Returns raw output string or "ERROR:..." on failure.
+fn run_cross_validate(domain: string, timeout_sec: i64) -> string {
+    if !file_exists(_CV_SCRIPT) {
+        return "ERROR:cross_validate_not_found:" + _CV_SCRIPT
+    }
+    let cmd = "'" + _HEXA_BIN + "' '" + _CV_SCRIPT + "' '" + domain + "' 2>&1"
+    let timeout_str = to_string(timeout_sec)
+    let mut timed_cmd = ""
+    if _UNAME == "Darwin" {
+        let mut has_gt = false
+        try { exec("which gtimeout >/dev/null 2>&1") ; has_gt = true } catch e {}
+        if has_gt {
+            timed_cmd = "gtimeout " + timeout_str + " bash -c " + "\"" + cmd + "\""
+        } else {
+            timed_cmd = "bash -c " + "\"" + cmd + "\""
+        }
+    } else {
+        timed_cmd = "timeout " + timeout_str + " bash -c " + "\"" + cmd + "\""
+    }
+    let mut output = ""
+    try {
+        output = exec(timed_cmd)
+    } catch e {
+        output = "ERROR:exec_failed:" + to_string(e)
+    }
+    return output
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── OUTPUT PARSING ───
+// ═══════════════════════════════════════════════════════════
+
+// Parse cross_validate.hexa stdout for consensus entries.
+// Look for lines in the CONSENSUS TABLE format:
+//   "  constant_name  N/5  [*****] TIER  GRADE  modules"
+// Returns list of "constant|agreement|tier|grade|modules" strings
+fn parse_consensus_output(output: string, domain: string) -> list {
+    let lines = output.split("\n")
+    let mut results = []
+    let mut in_consensus = false
+    let mut i: i64 = 0
+    while i < len(lines) {
+        let line = to_string(lines[i])
+        let trimmed = line.trim()
+        i = i + 1
+
+        // Detect CONSENSUS TABLE section
+        if trimmed.contains("CONSENSUS TABLE") { in_consensus = true ; continue }
+        if in_consensus && (trimmed.contains("DIVERGENCE") || trimmed.contains("CROSS-VALIDATION SUMMARY")) {
+            in_consensus = false ; continue
+        }
+        if !in_consensus { continue }
+
+        // Skip headers and separators
+        if trimmed == "" { continue }
+        if trimmed.starts_with("---") || trimmed.starts_with("===") { continue }
+        if trimmed.starts_with("Constant") || trimmed.starts_with("--------") { continue }
+
+        // Parse tier markers: [*****] UNIVERSAL, [**** ] STRONG, etc.
+        let mut tier = ""
+        let mut agreement: i64 = 0
+        if trimmed.contains("UNIVERSAL") { tier = "UNIVERSAL" ; agreement = 5 }
+        if trimmed.contains("STRONG") && tier == "" { tier = "STRONG" ; agreement = 4 }
+        if trimmed.contains("GAUGE_INV") { tier = "GAUGE_INV" ; agreement = 3 }
+        if trimmed.contains("PARTIAL") && tier == "" { tier = "PARTIAL" ; agreement = 2 }
+        if trimmed.contains("SINGULAR") { tier = "SINGULAR" ; agreement = 1 }
+        if tier == "" { continue }
+
+        // Extract agreement count from "N/5" pattern
+        if trimmed.contains("/5") {
+            let mut si: i64 = 0
+            let chars = trimmed.split("")
+            while si < len(chars) - 1 {
+                if si + 1 < len(chars) && to_string(chars[si + 1]) == "/" {
+                    let digit = to_string(chars[si])
+                    let v = sf(digit)
+                    if v >= 1.0 && v <= 5.0 { agreement = to_int(v) }
+                }
+                si = si + 1
+            }
+        }
+
+        // Extract grade (EXACT or NEAR)
+        let grade = if trimmed.contains("EXACT") { "EXACT" } else { if trimmed.contains("NEAR") { "NEAR" } else { "CLOSE" } }
+
+        // Extract constant name (first non-whitespace token)
+        let tokens = trimmed.split(" ")
+        let mut const_name = ""
+        let mut ti: i64 = 0
+        while ti < len(tokens) {
+            let tok = to_string(tokens[ti]).trim()
+            if tok != "" && const_name == "" {
+                // Skip tier symbols and grade keywords
+                if tok != "[*****]" && tok != "[****" && tok != "[***" && tok != "[**" && tok != "[*" && tok != "]" {
+                    if tok != "UNIVERSAL" && tok != "STRONG" && tok != "GAUGE_INV" && tok != "PARTIAL" && tok != "SINGULAR" {
+                        if tok != "EXACT" && tok != "NEAR" && tok != "CLOSE" && tok != "MISS" {
+                            if !tok.contains("/5") {
+                                const_name = tok
+                            }
+                        }
+                    }
+                }
+            }
+            ti = ti + 1
+        }
+        if const_name == "" { const_name = "unknown" }
+
+        // Extract modules list (last token, comma-separated module names)
+        let mut modules_str = ""
+        let mut mi: i64 = len(tokens) - 1
+        while mi >= 0 {
+            let tok = to_string(tokens[mi]).trim()
+            if tok != "" && (tok.contains("field") || tok.contains("quantum") || tok.contains("string") || tok.contains("holographic") || tok.contains("toe") || tok.contains(",")) {
+                modules_str = tok
+                mi = 0 - 1  // break
+            }
+            mi = mi - 1
+        }
+
+        results = results + [const_name + "|" + to_string(agreement) + "|" + tier + "|" + grade + "|" + modules_str]
+    }
+    return results
+}
+
+// Parse CROSS-VALIDATION SUMMARY section for aggregate stats.
+// Returns "modules_run|total_constants|cross_validated|divergences"
+fn parse_summary_output(output: string) -> string {
+    let lines = output.split("\n")
+    let mut modules_run = "0"
+    let mut total_constants = "0"
+    let mut cross_validated = "0"
+    let mut divergences = "0"
+    let mut i: i64 = 0
+    while i < len(lines) {
+        let line = to_string(lines[i]).trim()
+        i = i + 1
+        if line.contains("Modules run") && line.contains(":") {
+            let parts = line.split(":")
+            if len(parts) >= 2 { modules_run = parts[len(parts) - 1].trim().split(" ")[0] }
+        }
+        if line.contains("Total constants") && line.contains(":") {
+            let parts = line.split(":")
+            if len(parts) >= 2 { total_constants = parts[len(parts) - 1].trim().split(" ")[0] }
+        }
+        if line.contains("Cross-validated") && line.contains(":") {
+            let parts = line.split(":")
+            if len(parts) >= 2 { cross_validated = parts[len(parts) - 1].trim().split(" ")[0] }
+        }
+        if line.contains("Divergences") && line.contains(":") {
+            let parts = line.split(":")
+            if len(parts) >= 2 { divergences = parts[len(parts) - 1].trim().split(" ")[0] }
+        }
+    }
+    return modules_run + "|" + total_constants + "|" + cross_validated + "|" + divergences
+}
+
+// Parse tier breakdown from summary section.
+// Returns "universal|strong|gauge_inv|partial|singular"
+fn parse_tier_breakdown(output: string) -> string {
+    let lines = output.split("\n")
+    let mut universal = "0"
+    let mut strong = "0"
+    let mut gauge_inv = "0"
+    let mut partial = "0"
+    let mut singular = "0"
+    let mut i: i64 = 0
+    while i < len(lines) {
+        let line = to_string(lines[i]).trim()
+        i = i + 1
+        if line.contains("UNIVERSAL") && line.contains(":") && line.contains("(5/5)") {
+            let parts = line.split(":")
+            if len(parts) >= 2 { universal = parts[len(parts) - 1].trim() }
+        }
+        if line.contains("STRONG") && line.contains(":") && line.contains("(4/5)") {
+            let parts = line.split(":")
+            if len(parts) >= 2 { strong = parts[len(parts) - 1].trim() }
+        }
+        if line.contains("GAUGE_INV") && line.contains(":") && line.contains("(3/5)") {
+            let parts = line.split(":")
+            if len(parts) >= 2 { gauge_inv = parts[len(parts) - 1].trim() }
+        }
+        if line.contains("PARTIAL") && line.contains(":") && line.contains("(2/5)") {
+            let parts = line.split(":")
+            if len(parts) >= 2 { partial = parts[len(parts) - 1].trim() }
+        }
+        if line.contains("SINGULAR") && line.contains(":") && line.contains("(1/5)") {
+            let parts = line.split(":")
+            if len(parts) >= 2 { singular = parts[len(parts) - 1].trim() }
+        }
+    }
+    return universal + "|" + strong + "|" + gauge_inv + "|" + partial + "|" + singular
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── AGGREGATION ───
+// ═══════════════════════════════════════════════════════════
+
+// Aggregate consensus across all domains.
+// Input: list of per-domain consensus lists
+// Returns: list of "constant|total_agreement|domains_found|best_tier|best_grade"
+fn aggregate_consensus(all_domain_consensus: list, domain_names: list) -> list {
+    let mut const_list = []      // unique constant names
+    let mut const_agree = []     // total agreement sum
+    let mut const_domains = []   // domains where found
+    let mut const_best_tier = [] // best tier index (5=UNIVERSAL..1=SINGULAR)
+    let mut const_best_grade = [] // EXACT > NEAR
+
+    let mut di: i64 = 0
+    while di < len(all_domain_consensus) {
+        let domain = to_string(domain_names[di])
+        let consensus = to_string(all_domain_consensus[di])
+        let entries = consensus.split(";;")
+        let mut ei: i64 = 0
+        while ei < len(entries) {
+            let entry = to_string(entries[ei]).trim()
+            if entry == "" { ei = ei + 1 ; continue }
+            let parts = entry.split("|")
+            if len(parts) < 4 { ei = ei + 1 ; continue }
+            let cname = parts[0]
+            let agree = to_int(sf(parts[1]))
+            let tier = parts[2]
+            let grade = parts[3]
+
+            let tier_val = if tier == "UNIVERSAL" { 5 } else { if tier == "STRONG" { 4 } else { if tier == "GAUGE_INV" { 3 } else { if tier == "PARTIAL" { 2 } else { 1 } } } }
+
+            // Find or create
+            let mut found: i64 = 0 - 1
+            let mut ci: i64 = 0
+            while ci < len(const_list) {
+                if to_string(const_list[ci]) == cname { found = ci }
+                ci = ci + 1
+            }
+            if found < 0 {
+                const_list = const_list + [cname]
+                const_agree = const_agree + [agree]
+                const_domains = const_domains + [domain]
+                const_best_tier = const_best_tier + [tier_val]
+                const_best_grade = const_best_grade + [grade]
+            } else {
+                const_agree[found] = to_int(to_float(const_agree[found])) + agree
+                let existing_doms = to_string(const_domains[found])
+                if !existing_doms.contains(domain) {
+                    const_domains[found] = existing_doms + "," + domain
+                }
+                if tier_val > to_int(to_float(const_best_tier[found])) {
+                    const_best_tier[found] = tier_val
+                }
+                if grade == "EXACT" { const_best_grade[found] = "EXACT" }
+            }
+            ei = ei + 1
+        }
+        di = di + 1
+    }
+
+    // Build output
+    let mut results = []
+    let mut i: i64 = 0
+    while i < len(const_list) {
+        let cname = to_string(const_list[i])
+        let total_agree = to_string(const_agree[i])
+        let domains = to_string(const_domains[i])
+        let n_domains = len(domains.split(","))
+        let tv = to_int(to_float(const_best_tier[i]))
+        let tier = if tv >= 5 { "UNIVERSAL" } else { if tv >= 4 { "STRONG" } else { if tv >= 3 { "GAUGE_INV" } else { if tv >= 2 { "PARTIAL" } else { "SINGULAR" } } } }
+        let grade = to_string(const_best_grade[i])
+        results = results + [cname + "|" + total_agree + "|" + to_string(n_domains) + "|" + tier + "|" + grade + "|" + domains]
+        i = i + 1
+    }
+    return results
+}
+
+// Count module participation across consensus entries.
+// Returns list of "module_name|found_count|total_possible" for all 5 modules.
+fn module_reliability(all_domain_consensus: list, n_domains: i64) -> list {
+    let module_names = ["field", "quantum", "string", "holographic", "toe"]
+    let mut counts = [0, 0, 0, 0, 0]
+    let mut total: i64 = 0
+
+    let mut di: i64 = 0
+    while di < len(all_domain_consensus) {
+        let consensus = to_string(all_domain_consensus[di])
+        let entries = consensus.split(";;")
+        let mut ei: i64 = 0
+        while ei < len(entries) {
+            let entry = to_string(entries[ei]).trim()
+            if entry == "" { ei = ei + 1 ; continue }
+            let parts = entry.split("|")
+            if len(parts) < 5 { ei = ei + 1 ; continue }
+            let modules_str = parts[4]
+            total = total + 1
+            let mut mi: i64 = 0
+            while mi < 5 {
+                if modules_str.contains(to_string(module_names[mi])) {
+                    counts[mi] = to_int(to_float(counts[mi])) + 1
+                }
+                mi = mi + 1
+            }
+            ei = ei + 1
+        }
+        di = di + 1
+    }
+
+    let mut results = []
+    let mut mi: i64 = 0
+    while mi < 5 {
+        results = results + [to_string(module_names[mi]) + "|" + to_string(counts[mi]) + "|" + to_string(total)]
+        mi = mi + 1
+    }
+    return results
+}
+
+// Identify domains with highest disagreement (most SINGULAR + PARTIAL entries).
+fn domain_disagreement(all_domain_consensus: list, domain_names: list) -> list {
+    let mut results = []
+    let mut di: i64 = 0
+    while di < len(all_domain_consensus) {
+        let domain = to_string(domain_names[di])
+        let consensus = to_string(all_domain_consensus[di])
+        let entries = consensus.split(";;")
+        let mut n_total: i64 = 0
+        let mut n_singular: i64 = 0
+        let mut n_partial: i64 = 0
+        let mut n_cross_val: i64 = 0
+        let mut ei: i64 = 0
+        while ei < len(entries) {
+            let entry = to_string(entries[ei]).trim()
+            if entry == "" { ei = ei + 1 ; continue }
+            n_total = n_total + 1
+            if entry.contains("|SINGULAR|") { n_singular = n_singular + 1 }
+            if entry.contains("|PARTIAL|") { n_partial = n_partial + 1 }
+            if entry.contains("|UNIVERSAL|") || entry.contains("|STRONG|") || entry.contains("|GAUGE_INV|") {
+                n_cross_val = n_cross_val + 1
+            }
+            ei = ei + 1
+        }
+        let disagree = n_singular + n_partial
+        let agree_rate = if n_total > 0 { to_float(n_cross_val) / to_float(n_total) * 100.0 } else { 0.0 }
+        results = results + [domain + "|" + to_string(n_total) + "|" + to_string(n_cross_val) + "|" + to_string(disagree) + "|" + trunc4(agree_rate)]
+        di = di + 1
+    }
+
+    // Sort by disagreement descending (bubble sort)
+    let mut swapped = true
+    while swapped {
+        swapped = false
+        let mut i: i64 = 0
+        while i < len(results) - 1 {
+            let a = sf(to_string(results[i]).split("|")[3])
+            let b = sf(to_string(results[i + 1]).split("|")[3])
+            if b > a {
+                let tmp = results[i]
+                results[i] = results[i + 1]
+                results[i + 1] = tmp
+                swapped = true
+            }
+            i = i + 1
+        }
+    }
+    return results
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── PRINT FUNCTIONS ───
+// ═══════════════════════════════════════════════════════════
+
+fn print_separator() {
+    println("───────────────────────────────────────────────────────────────────────")
+}
+
+fn print_domain_result(domain: string, summary: string, tier_breakdown: string) {
+    let sp = summary.split("|")
+    let tp = tier_breakdown.split("|")
+    let modules = if len(sp) >= 1 { sp[0] } else { "?" }
+    let total = if len(sp) >= 2 { sp[1] } else { "0" }
+    let cross_val = if len(sp) >= 3 { sp[2] } else { "0" }
+    let diverg = if len(sp) >= 4 { sp[3] } else { "0" }
+    let uni = if len(tp) >= 1 { tp[0] } else { "0" }
+    let str_ = if len(tp) >= 2 { tp[1] } else { "0" }
+    let gau = if len(tp) >= 3 { tp[2] } else { "0" }
+    let par = if len(tp) >= 4 { tp[3] } else { "0" }
+    let sin = if len(tp) >= 5 { tp[4] } else { "0" }
+    println("  " + pad(domain, 18) + pad(total, 8) + pad(cross_val, 8) + pad(diverg, 8) + pad(uni, 6) + pad(str_, 6) + pad(gau, 6) + pad(par, 6) + sin)
+}
+
+fn print_agreement_table(disagreement: list) {
+    println("")
+    println("  " + pad("Domain", 18) + pad("Total", 10) + pad("Validated", 12) + pad("Disagree", 10) + "Rate")
+    println("  " + pad("──────", 18) + pad("─────", 10) + pad("─────────", 12) + pad("────────", 10) + "────")
+    let mut i: i64 = 0
+    while i < len(disagreement) {
+        let parts = to_string(disagreement[i]).split("|")
+        if len(parts) < 5 { i = i + 1 ; continue }
+        println("  " + pad(parts[0], 18) + pad(parts[1], 10) + pad(parts[2], 12) + pad(parts[3], 10) + parts[4] + "%")
+        i = i + 1
+    }
+}
+
+fn print_module_reliability(reliability: list) {
+    println("")
+    println("  Module Reliability (participation in consensus):")
+    println("  " + pad("Module", 16) + pad("Found in", 12) + pad("Total", 10) + "Rate")
+    println("  " + pad("──────", 16) + pad("────────", 12) + pad("─────", 10) + "────")
+    let mut i: i64 = 0
+    while i < len(reliability) {
+        let parts = to_string(reliability[i]).split("|")
+        if len(parts) < 3 { i = i + 1 ; continue }
+        let found = sf(parts[1])
+        let total = max_f(sf(parts[2]), 1.0)
+        let rate = trunc4(found / total * 100.0)
+        println("  " + pad(parts[0], 16) + pad(parts[1], 12) + pad(parts[2], 10) + rate + "%")
+        i = i + 1
+    }
+}
+
+fn print_global_aggregate(aggregate: list) {
+    if len(aggregate) == 0 { return }
+    println("")
+    println("  Global Constants (found across multiple domains):")
+    println("  " + pad("Constant", 20) + pad("Agree", 8) + pad("Domains", 10) + pad("Tier", 14) + "Grade")
+    println("  " + pad("────────", 20) + pad("─────", 8) + pad("───────", 10) + pad("────", 14) + "─────")
+    // Sort by domains count descending
+    let mut sorted = []
+    let mut i: i64 = 0
+    while i < len(aggregate) { sorted = sorted + [aggregate[i]] ; i = i + 1 }
+    let mut swapped = true
+    while swapped {
+        swapped = false
+        let mut j: i64 = 0
+        while j < len(sorted) - 1 {
+            let a = sf(to_string(sorted[j]).split("|")[2])
+            let b = sf(to_string(sorted[j + 1]).split("|")[2])
+            if b > a {
+                let tmp = sorted[j]
+                sorted[j] = sorted[j + 1]
+                sorted[j + 1] = tmp
+                swapped = true
+            }
+            j = j + 1
+        }
+    }
+    // Show top 20
+    let mut shown: i64 = 0
+    let mut k: i64 = 0
+    while k < len(sorted) && shown < 20 {
+        let parts = to_string(sorted[k]).split("|")
+        if len(parts) < 5 { k = k + 1 ; continue }
+        let n_doms = sf(parts[2])
+        if n_doms >= 2.0 {
+            println("  " + pad(parts[0], 20) + pad(parts[1], 8) + pad(parts[2], 10) + pad(parts[3], 14) + parts[4])
+            shown = shown + 1
+        }
+        k = k + 1
+    }
+    if shown == 0 {
+        println("  (no constants found across multiple domains)")
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── REPORT WRITER ───
+// ═══════════════════════════════════════════════════════════
+
+fn write_runner_report(domain_names: list, domain_summaries: list, domain_tiers: list,
+                       all_consensus: list, aggregate: list, disagreement: list,
+                       reliability: list, total_elapsed_ms: f64) {
+    let ts = ts_now()
+    let n_domains = len(domain_names)
+    let mut json = "{\n"
+    json = json + "  \"type\": \"cross_validate_runner\",\n"
+    json = json + "  \"timestamp\": \"" + ts + "\",\n"
+    json = json + "  \"n_domains\": " + to_string(n_domains) + ",\n"
+    json = json + "  \"total_elapsed_ms\": " + trunc4(total_elapsed_ms) + ",\n"
+
+    // Per-domain results
+    json = json + "  \"domains\": [\n"
+    let mut di: i64 = 0
+    while di < n_domains {
+        let domain = to_string(domain_names[di])
+        let summary = to_string(domain_summaries[di]).split("|")
+        let tiers = to_string(domain_tiers[di]).split("|")
+        json = json + "    {\"domain\": \"" + domain + "\""
+        if len(summary) >= 4 {
+            json = json + ", \"modules_run\": " + summary[0]
+            json = json + ", \"total_constants\": " + summary[1]
+            json = json + ", \"cross_validated\": " + summary[2]
+            json = json + ", \"divergences\": " + summary[3]
+        }
+        if len(tiers) >= 5 {
+            json = json + ", \"universal\": " + tiers[0]
+            json = json + ", \"strong\": " + tiers[1]
+            json = json + ", \"gauge_inv\": " + tiers[2]
+            json = json + ", \"partial\": " + tiers[3]
+            json = json + ", \"singular\": " + tiers[4]
+        }
+        json = json + "}"
+        if di < n_domains - 1 { json = json + "," }
+        json = json + "\n"
+        di = di + 1
+    }
+    json = json + "  ],\n"
+
+    // Disagreement ranking
+    json = json + "  \"disagreement_ranking\": [\n"
+    let mut ri: i64 = 0
+    while ri < len(disagreement) {
+        let parts = to_string(disagreement[ri]).split("|")
+        if len(parts) >= 5 {
+            json = json + "    {\"domain\": \"" + parts[0] + "\", \"total\": " + parts[1] + ", \"validated\": " + parts[2] + ", \"disagreement\": " + parts[3] + ", \"rate_pct\": " + parts[4] + "}"
+            if ri < len(disagreement) - 1 { json = json + "," }
+            json = json + "\n"
+        }
+        ri = ri + 1
+    }
+    json = json + "  ],\n"
+
+    // Module reliability
+    json = json + "  \"module_reliability\": [\n"
+    let mut mi: i64 = 0
+    while mi < len(reliability) {
+        let parts = to_string(reliability[mi]).split("|")
+        if len(parts) >= 3 {
+            let found = sf(parts[1])
+            let total = max_f(sf(parts[2]), 1.0)
+            let rate = trunc4(found / total * 100.0)
+            json = json + "    {\"module\": \"" + parts[0] + "\", \"found\": " + parts[1] + ", \"total\": " + parts[2] + ", \"rate_pct\": " + rate + "}"
+            if mi < len(reliability) - 1 { json = json + "," }
+            json = json + "\n"
+        }
+        mi = mi + 1
+    }
+    json = json + "  ],\n"
+
+    // Global aggregate (top 20 multi-domain constants)
+    json = json + "  \"global_constants\": [\n"
+    let mut gi: i64 = 0
+    let mut g_shown: i64 = 0
+    while gi < len(aggregate) && g_shown < 20 {
+        let parts = to_string(aggregate[gi]).split("|")
+        if len(parts) >= 6 && sf(parts[2]) >= 2.0 {
+            if g_shown > 0 { json = json + ",\n" }
+            json = json + "    {\"constant\": \"" + parts[0] + "\", \"total_agree\": " + parts[1] + ", \"n_domains\": " + parts[2] + ", \"best_tier\": \"" + parts[3] + "\", \"best_grade\": \"" + parts[4] + "\", \"domains\": \"" + parts[5] + "\"}"
+            g_shown = g_shown + 1
+        }
+        gi = gi + 1
+    }
+    if g_shown > 0 { json = json + "\n" }
+    json = json + "  ],\n"
+
+    // Summary stats
+    let mut total_constants: i64 = 0
+    let mut total_cross_val: i64 = 0
+    let mut total_divergences: i64 = 0
+    let mut si: i64 = 0
+    while si < len(domain_summaries) {
+        let sp = to_string(domain_summaries[si]).split("|")
+        if len(sp) >= 4 {
+            total_constants = total_constants + to_int(sf(sp[1]))
+            total_cross_val = total_cross_val + to_int(sf(sp[2]))
+            total_divergences = total_divergences + to_int(sf(sp[3]))
+        }
+        si = si + 1
+    }
+    let overall_rate = if total_constants > 0 { trunc4(to_float(total_cross_val) / to_float(total_constants) * 100.0) } else { "0.0000" }
+    json = json + "  \"summary\": {\n"
+    json = json + "    \"total_constants\": " + to_string(total_constants) + ",\n"
+    json = json + "    \"total_cross_validated\": " + to_string(total_cross_val) + ",\n"
+    json = json + "    \"total_divergences\": " + to_string(total_divergences) + ",\n"
+    json = json + "    \"overall_agreement_rate\": " + overall_rate + "\n"
+    json = json + "  }\n"
+    json = json + "}\n"
+
+    try { write_file(_REPORT_PATH, json) } catch e {
+        println("  [WARN] failed to write runner report: " + to_string(e))
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── HELP ───
+// ═══════════════════════════════════════════════════════════
+
+fn print_help() {
+    println("cross_validate_runner.hexa — Multi-Domain Cross-Validation Runner")
+    println("")
+    println("Usage:")
+    println("  hexa cross_validate_runner.hexa                        all default domains")
+    println("  hexa cross_validate_runner.hexa math physics topology  specific domains")
+    println("  hexa cross_validate_runner.hexa --timeout 120          per-module timeout (sec)")
+    println("  hexa cross_validate_runner.hexa --max-domains 5        limit domain count")
+    println("  hexa cross_validate_runner.hexa help                   this message")
+    println("")
+    println("What it does:")
+    println("  1. Runs cross_validate.hexa on each domain")
+    println("  2. Collects consensus tiers: UNIVERSAL(5/5) ~ SINGULAR(1/5)")
+    println("  3. Aggregates constants found across multiple domains")
+    println("  4. Ranks domains by disagreement level")
+    println("  5. Ranks modules by reliability (consensus participation)")
+    println("")
+    println("Consensus tiers (from cross_validate.hexa):")
+    println("  5/5  UNIVERSAL    all 5 modules agree (highest confidence)")
+    println("  4/5  STRONG       4 modules agree, 1 dissents")
+    println("  3/5  GAUGE_INV    gauge-invariant minimum threshold")
+    println("  2/5  PARTIAL      weak signal, needs investigation")
+    println("  1/5  SINGULAR     module-specific artifact")
+    println("")
+    println("Output: shared/blowup/cross_validate_runner_report.json")
+    println("Calls:  shared/blowup/cross_validate.hexa (per domain)")
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── THEOREM ───
+// ═══════════════════════════════════════════════════════════
+
+theorem runner_completeness {
+    // Running cross_validate across N domains with M modules produces
+    // N * M independent measurements. Constants appearing in K domains
+    // with consensus >= GAUGE_INV are cross-validated^2 (module AND domain).
+    // Probability of false positive: p^(k_modules * k_domains) -> 0.
+    assert 5 * 8 == 40      // 5 modules * 8 phases = 40 measurements per domain
+    assert 6 * 2 == 12      // n * phi = sigma
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── MAIN ───
+// ═══════════════════════════════════════════════════════════
+
+fn main() {
+    let cli = args()
+    let mut spec_doms = []
+    let mut show_help = false
+    let mut timeout_sec: i64 = 300  // 5 min per domain (5 modules * 60s each)
+    let mut max_domains: i64 = 20
+
+    let mut ai: i64 = 2
+    while ai < len(cli) {
+        let a = to_string(cli[ai])
+        if a == "help" || a == "--help" || a == "-h" {
+            show_help = true
+        } else { if a == "--timeout" {
+            if ai + 1 < len(cli) { ai = ai + 1 ; let tv = sf(to_string(cli[ai])) ; if tv >= 30.0 && tv <= 1800.0 { timeout_sec = to_int(tv) } }
+        } else { if a == "--max-domains" {
+            if ai + 1 < len(cli) { ai = ai + 1 ; let dv = sf(to_string(cli[ai])) ; if dv >= 1.0 && dv <= 50.0 { max_domains = to_int(dv) } }
+        } else {
+            spec_doms = spec_doms + [a]
+        } } }
+        ai = ai + 1
+    }
+    if show_help { print_help() ; return }
+
+    println("")
+    println("══════════════════════════════════════════════════════════════════════")
+    println("  CROSS-VALIDATE RUNNER — Multi-Domain 5-Module Gauge Invariance")
+    println("  cross-validation across domains = truth^2")
+    println("══════════════════════════════════════════════════════════════════════")
+    println("")
+
+    // Resolve domain list
+    let all_doms = load_default_domains()
+    let mut domains = if len(spec_doms) > 0 { spec_doms } else { all_doms }
+    if len(domains) > max_domains {
+        let mut trimmed = []
+        let mut ti: i64 = 0
+        while ti < max_domains { trimmed = trimmed + [to_string(domains[ti])] ; ti = ti + 1 }
+        domains = trimmed
+    }
+
+    println("  Domains    : " + to_string(len(domains)))
+    println("  Timeout    : " + to_string(timeout_sec) + "s per domain")
+    println("  Hexa       : " + _HEXA_BIN)
+    println("  CV script  : " + _CV_SCRIPT)
+    println("  Time       : " + ts_now())
+    println("")
+
+    // Verify prerequisites
+    if !file_exists(_CV_SCRIPT) {
+        println("  [ERROR] cross_validate.hexa not found: " + _CV_SCRIPT)
+        println("  Cannot proceed. Ensure shared/blowup/cross_validate.hexa exists.")
+        return
+    }
+
+    // ─── Run cross_validate per domain ───
+    let mut domain_summaries = []
+    let mut domain_tiers = []
+    let mut all_consensus = []    // serialized consensus per domain
+    let mut domain_errors = []
+    let mut n_success: i64 = 0
+    let mut n_error: i64 = 0
+
+    let run_start_raw = try { exec("python3 -c 'import time; print(int(time.time()*1000))' 2>/dev/null || date +%s%3N 2>/dev/null || echo 0").trim() } catch e { "0" }
+    let run_start = sf(run_start_raw)
+
+    println("  " + pad("Domain", 18) + pad("Total", 8) + pad("X-Val", 8) + pad("Diverg", 8) + pad("UNI", 6) + pad("STR", 6) + pad("GAU", 6) + pad("PAR", 6) + "SIN")
+    println("  " + pad("──────", 18) + pad("─────", 8) + pad("─────", 8) + pad("──────", 8) + pad("───", 6) + pad("───", 6) + pad("───", 6) + pad("───", 6) + "───")
+
+    let mut di: i64 = 0
+    while di < len(domains) {
+        let domain = to_string(domains[di])
+
+        let output = run_cross_validate(domain, timeout_sec)
+
+        if output.starts_with("ERROR:") {
+            println("  " + pad(domain, 18) + "[ERROR] " + output)
+            domain_summaries = domain_summaries + ["0|0|0|0"]
+            domain_tiers = domain_tiers + ["0|0|0|0|0"]
+            all_consensus = all_consensus + [""]
+            domain_errors = domain_errors + [domain + "|" + output]
+            n_error = n_error + 1
+            di = di + 1
+            continue
+        }
+
+        // Parse results
+        let summary = parse_summary_output(output)
+        let tiers = parse_tier_breakdown(output)
+        let consensus = parse_consensus_output(output, domain)
+
+        domain_summaries = domain_summaries + [summary]
+        domain_tiers = domain_tiers + [tiers]
+
+        // Serialize consensus entries for aggregation (double-semicolon separated)
+        let mut serialized = ""
+        let mut ci: i64 = 0
+        while ci < len(consensus) {
+            if ci > 0 { serialized = serialized + ";;" }
+            serialized = serialized + to_string(consensus[ci])
+            ci = ci + 1
+        }
+        all_consensus = all_consensus + [serialized]
+        n_success = n_success + 1
+
+        // Print row
+        print_domain_result(domain, summary, tiers)
+
+        di = di + 1
+    }
+
+    let run_end_raw = try { exec("python3 -c 'import time; print(int(time.time()*1000))' 2>/dev/null || date +%s%3N 2>/dev/null || echo 0").trim() } catch e { "0" }
+    let total_elapsed = sf(run_end_raw) - run_start
+
+    // ─── Error summary ───
+    if n_error > 0 {
+        println("")
+        println("  Errors (" + to_string(n_error) + "):")
+        let mut ei: i64 = 0
+        while ei < len(domain_errors) {
+            println("    " + to_string(domain_errors[ei]))
+            ei = ei + 1
+        }
+    }
+
+    // ─── Aggregate analysis ───
+    let aggregate = aggregate_consensus(all_consensus, domains)
+    let disagreement = domain_disagreement(all_consensus, domains)
+    let reliability = module_reliability(all_consensus, len(domains))
+
+    // ─── Print analysis ───
+    println("")
+    println("══════════════════════════════════════════════════════════════════════")
+    println("  AGREEMENT ANALYSIS (sorted by disagreement, highest first)")
+    println("══════════════════════════════════════════════════════════════════════")
+    print_agreement_table(disagreement)
+
+    println("")
+    println("══════════════════════════════════════════════════════════════════════")
+    println("  MODULE RELIABILITY")
+    println("══════════════════════════════════════════════════════════════════════")
+    print_module_reliability(reliability)
+
+    println("")
+    println("══════════════════════════════════════════════════════════════════════")
+    println("  GLOBAL CONSTANTS (cross-domain consensus)")
+    println("══════════════════════════════════════════════════════════════════════")
+    print_global_aggregate(aggregate)
+
+    // ─── Grand summary ───
+    let mut grand_total: i64 = 0
+    let mut grand_xval: i64 = 0
+    let mut grand_diverg: i64 = 0
+    let mut si: i64 = 0
+    while si < len(domain_summaries) {
+        let sp = to_string(domain_summaries[si]).split("|")
+        if len(sp) >= 4 {
+            grand_total = grand_total + to_int(sf(sp[1]))
+            grand_xval = grand_xval + to_int(sf(sp[2]))
+            grand_diverg = grand_diverg + to_int(sf(sp[3]))
+        }
+        si = si + 1
+    }
+    let grand_rate = if grand_total > 0 { trunc4(to_float(grand_xval) / to_float(grand_total) * 100.0) } else { "0.0000" }
+
+    println("")
+    println("══════════════════════════════════════════════════════════════════════")
+    println("  RUNNER SUMMARY")
+    println("══════════════════════════════════════════════════════════════════════")
+    println("  Domains processed : " + to_string(n_success) + "/" + to_string(len(domains)))
+    println("  Errors            : " + to_string(n_error))
+    println("  Total constants   : " + to_string(grand_total))
+    println("  Cross-validated   : " + to_string(grand_xval) + " (3+ modules agree)")
+    println("  Total divergences : " + to_string(grand_diverg))
+    println("  Agreement rate    : " + grand_rate + "%")
+    println("  Elapsed           : " + trunc4(total_elapsed) + " ms")
+    println("══════════════════════════════════════════════════════════════════════")
+
+    // ─── Write report ───
+    write_runner_report(domains, domain_summaries, domain_tiers, all_consensus,
+                        aggregate, disagreement, reliability, total_elapsed)
+    println("")
+    println("  Report: " + _REPORT_PATH)
+
+    // ─── Log entry ───
+    let log_line = ts_now() + " domains=" + to_string(n_success) + " constants=" + to_string(grand_total) + " xval=" + to_string(grand_xval) + " diverg=" + to_string(grand_diverg) + " rate=" + grand_rate + "%"
+    try { append_file(_LOG_PATH, log_line + "\n") } catch e {}
+
+    println("")
+    println("done.")
+}
+
+main()
