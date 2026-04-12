@@ -1,0 +1,198 @@
+// drift-guard.hexa — 범용 레지스트리/문서 드리프트 탐지 + 자동 수정
+// 모든 NEXUS-6 프로젝트에서 동작 (n6-architecture, nexus, anima, hexa-lang, ...)
+//
+// 용법: hexa drift-guard.hexa [--fix] [--commit] [--push]
+//   --fix    : 불일치 자동 수정
+//   --commit : 수정 후 git commit (--fix 포함)
+//   --push   : commit 후 git push (--fix,--commit 포함)
+//
+// 점검 대상:
+//   1. 모든 CLAUDE.md 헤더 숫자 vs 해당 디렉토리 실제 파일 수
+//   2. 모든 _registry.json _total vs 실제 배열 크기
+//   3. README.md 통계 블록 카운트 vs 실제
+//   4. 고아 파일 (파일O 레지스트리X) / 유령 (레지스트리O 파일X) 탐지
+
+let ARGS = args()
+let DO_FIX = ARGS.contains("--fix") || ARGS.contains("--commit") || ARGS.contains("--push")
+let DO_COMMIT = ARGS.contains("--commit") || ARGS.contains("--push")
+let DO_PUSH = ARGS.contains("--push")
+
+let ROOT = to_string(exec("git rev-parse --show-toplevel 2>/dev/null || pwd")).trim()
+let PROJECT = to_string(exec("basename '" + ROOT + "'")).trim()
+
+let drift_count = 0
+let fix_count = 0
+
+fn log_drift(msg: string) {
+    println("[DRIFT] " + msg)
+    drift_count = drift_count + 1
+}
+fn log_ok(msg: string)  { println("[OK]    " + msg) }
+fn log_fix(msg: string) {
+    println("[FIX]   " + msg)
+    fix_count = fix_count + 1
+}
+fn log_info(msg: string) { println("[INFO]  " + msg) }
+
+// ---- 유틸 ----
+
+fn count_files(dir: string, pattern: string) -> int {
+    let r = to_string(exec("find '" + dir + "' -name '" + pattern + "' -type f 2>/dev/null | wc -l")).trim()
+    return to_int(r)
+}
+
+fn extract_num(text: string) -> int {
+    let r = to_string(exec("echo '" + text + "' | grep -oE '[0-9]+' | head -1 2>/dev/null")).trim()
+    if len(r) == 0 { return 0 }
+    return to_int(r)
+}
+
+fn head1(file: string) -> string {
+    return to_string(exec("head -1 '" + file + "' 2>/dev/null")).trim()
+}
+
+// ---- 1. CLAUDE.md 헤더 카운트 범용 점검 ----
+// 패턴: "# <name> -- <label> N종/N편/N개" 형태의 헤더에서 N 추출
+// 해당 디렉토리의 .hexa/.md/.toml/.rs 파일 수와 비교
+
+fn check_claude_md_headers() {
+    println("=== CLAUDE.md 헤더 카운트 점검 ===")
+
+    // 한글 카운터(종/편/개/건) 포함 헤더만 점검 — "3d","5g","n6" 같은 이름 오탐 방지
+    let result = to_string(exec("python3 -c \"\nimport os, re, glob\nroot = '" + ROOT + "'\nfor path in glob.glob(os.path.join(root, '**', 'CLAUDE.md'), recursive=True):\n    if '/.git/' in path: continue\n    with open(path) as f:\n        header = f.readline().strip()\n    # 한글 카운터 패턴: 숫자+종/편/개/��\n    m = re.search(r'(\\d+)\\s*[종편개건]', header)\n    if not m: continue\n    count = int(m.group(1))\n    d = os.path.dirname(path)\n    rel = os.path.relpath(d, root)\n    # 해당 디렉토리 주요 확장자별 파일 수\n    exts = {}\n    for ext in ['hexa','md','toml','rs']:\n        files = glob.glob(os.path.join(d, '**', f'*.{ext}'), recursive=True)\n        if ext == 'md':\n            files = [f for f in files if 'CLAUDE' not in os.path.basename(f) and 'README' not in os.path.basename(f)]\n        if ext == 'hexa':\n            files = [f for f in files if not os.path.basename(f).startswith('test_')]\n        exts[ext] = len(files)\n    best_ext = max(exts, key=exts.get)\n    best_n = exts[best_ext]\n    if best_n == 0: continue\n    if count != best_n:\n        print(f'DRIFT|{rel}|{count}|{best_n}|{best_ext}|{path}')\n    else:\n        print(f'OK|{rel}|{count}')\n\" 2>/dev/null")).trim()
+
+    if len(result) == 0 { return }
+
+    let lines = result.split("\n")
+    for line in lines {
+        if len(line) == 0 { continue }
+        let parts = line.split("|")
+        if parts[0] == "DRIFT" {
+            let rel = parts[1]
+            let old_n = parts[2]
+            let new_n = parts[3]
+            let ext = parts[4]
+            let path = parts[5]
+            log_drift(rel + "/CLAUDE.md 헤더=" + old_n + " != 실제 ." + ext + "=" + new_n)
+            if DO_FIX {
+                exec("sed -i '' '1s/" + old_n + "/" + new_n + "/' '" + path + "'")
+                log_fix(rel + "/CLAUDE.md -> " + new_n)
+            }
+        } else if parts[0] == "OK" {
+            log_ok(parts[1] + "/CLAUDE.md=" + parts[2] + " 정합")
+        }
+    }
+}
+
+// ---- 2. _registry.json 정합 점검 ----
+
+fn check_registries() {
+    println("")
+    println("=== _registry.json 점검 ===")
+
+    let reg_files = to_string(exec("find '" + ROOT + "' -name '_registry.json' -not -path '*/.git/*' 2>/dev/null")).trim()
+    if len(reg_files) == 0 {
+        log_ok("_registry.json 없음")
+        return
+    }
+
+    let lines = reg_files.split("\n")
+    for reg_path in lines {
+        if len(reg_path) == 0 { continue }
+
+        let relative = to_string(exec("python3 -c \"import os; print(os.path.relpath('" + reg_path + "','" + ROOT + "'))\" 2>/dev/null")).trim()
+
+        // _total 필드 있는지 확인 + 실제 배열 카운트
+        let check = to_string(exec("python3 -c \"\nimport json, os, glob\ntry:\n    with open('" + reg_path + "') as f: d=json.load(f)\nexcept: exit(0)\n\n# _total 기반 레지스트리\nif '_total' in d:\n    recorded = d['_total']\n    # 배열들의 합\n    arrays = 0\n    for k,v in d.items():\n        if isinstance(v, list) and not k.startswith('_'):\n            arrays += len(v)\n    # sota 아이템\n    if 'sota' in d and isinstance(d['sota'], dict) and 'items' in d['sota']:\n        arrays += len(d['sota']['items'])\n    sota_total = d.get('_sota_total', arrays)\n    print(f'TOTAL:{recorded}|ARRAYS:{arrays}|SOTA:{sota_total}')\n    # 디렉토리 파일 수\n    dir_path = os.path.dirname('" + reg_path + "')\n    hexa = len(glob.glob(os.path.join(dir_path, '**/*.hexa'), recursive=True))\n    md = len([f for f in glob.glob(os.path.join(dir_path, '**/*.md'), recursive=True) if 'CLAUDE' not in f and 'README' not in f])\n    print(f'HEXA:{hexa}|MD:{md}')\n\n# _meta.total_papers 등\nelif '_meta' in d and isinstance(d['_meta'], dict):\n    for k,v in d['_meta'].items():\n        if 'total' in k.lower() and isinstance(v, int):\n            print(f'META:{k}={v}')\n\" 2>/dev/null")).trim()
+
+        if len(check) == 0 { continue }
+
+        if check.contains("TOTAL:") {
+            let parts = check.split("\n")
+            log_info(relative + " -> " + parts[0])
+            if len(parts) > 1 {
+                log_info("  파일: " + parts[1])
+            }
+        } else if check.contains("META:") {
+            log_info(relative + " -> " + check)
+        }
+    }
+}
+
+// ---- 3. README.md 통계 + 제품 테이블 자동 갱신 ----
+
+fn check_readme_stats() {
+    let readme = ROOT + "/README.md"
+    if file_exists(readme) == false { return }
+
+    println("")
+    println("=== README.md 통계/제품 테이블 점검 ===")
+
+    // AUTO:STATS 블록 카운트 vs 실제 파일 수 대조
+    let result = to_string(exec("python3 -c \"\nimport os, re, glob\nroot = '" + ROOT + "'\nreadme = root + '/README.md'\nwith open(readme) as f: content = f.read()\nlines = content.split('\\n')\nfixes = []\n\n# 1. AI techniques 카운트\ntech_dir = os.path.join(root, 'techniques')\nif os.path.isdir(tech_dir):\n    hexa = [f for f in glob.glob(os.path.join(tech_dir, '**/*.hexa'), recursive=True) if 'test_techniques' not in f]\n    actual = len(hexa)\n    # AUTO:STATS 블록\n    for i, line in enumerate(lines):\n        m = re.match(r'(\\s+AI techniques:\\s+)(\\d+)', line)\n        if m and int(m.group(2)) != actual:\n            fixes.append(f'STAT|{i}|{m.group(2)}|{actual}|AI techniques')\n            lines[i] = m.group(1) + str(actual)\n\n# 2. DSE domains 카운트\ndse_dir = os.path.join(root, 'nexus/origins/universal-dse/domains')\nif os.path.isdir(dse_dir):\n    toml_n = len(glob.glob(os.path.join(dse_dir, '*.toml')))\n    for i, line in enumerate(lines):\n        m = re.match(r'(\\s+DSE domains:\\s+)(\\d+)', line)\n        if m and int(m.group(2)) != toml_n:\n            fixes.append(f'STAT|{i}|{m.group(2)}|{toml_n}|DSE domains')\n            lines[i] = m.group(1) + str(toml_n)\n\n# 3. 제품 테이블 N Techniques 행 — 카테고리별 카운트 자동 갱신\nif os.path.isdir(tech_dir):\n    cats = {}\n    for f in hexa:\n        subdir = os.path.basename(os.path.dirname(f))\n        cats[subdir] = cats.get(subdir, 0) + 1\n    cat_str = ', '.join(f'{k} {v}' for k, v in sorted(cats.items()))\n    for i, line in enumerate(lines):\n        m = re.search(r'\\*\\*(\\d+) Techniques\\*\\*', line)\n        if m:\n            old_n = int(m.group(1))\n            if old_n != actual:\n                lines[i] = line.replace(f'**{old_n} Techniques**', f'**{actual} Techniques**')\n                fixes.append(f'PROD|{i}|{old_n}|{actual}|Techniques 제품')\n    # N기법 패턴도\n    for i, line in enumerate(lines):\n        m = re.search(r'(\\d+)기법', line)\n        if m:\n            old_n = int(m.group(1))\n            if old_n != actual and old_n > 50:  # 작은 숫자 오탐 방지\n                lines[i] = line.replace(f'{old_n}기법', f'{actual}기법')\n                fixes.append(f'PROD|{i}|{old_n}|{actual}|N기법')\n\n# 4. 프로젝트 설명 AI techniques 수\nfor i, line in enumerate(lines):\n    m = re.search(r'(\\d+) AI techniques', line)\n    if m:\n        old_n = int(m.group(1))\n        if old_n != actual and old_n > 10:\n            lines[i] = line.replace(f'{old_n} AI techniques', f'{actual} AI techniques')\n            fixes.append(f'DESC|{i}|{old_n}|{actual}|프로젝트 설명')\n\nif fixes:\n    for f in fixes: print(f)\n    with open(readme, 'w') as fw: fw.write('\\n'.join(lines))\nelse:\n    print('OK')\n\" 2>/dev/null")).trim()
+
+    if result == "OK" {
+        log_ok("README 통계/제품 전체 정합")
+    } else {
+        let lines = result.split("\n")
+        for line in lines {
+            if len(line) == 0 { continue }
+            let p = line.split("|")
+            if len(p) >= 5 {
+                log_drift("README " + p[4] + ": " + p[2] + " -> " + p[3])
+                if DO_FIX {
+                    log_fix("README " + p[4] + " -> " + p[3])
+                }
+            }
+        }
+        if DO_FIX {
+            log_info("README 자동 수정 적용됨")
+        }
+    }
+}
+
+// ---- 4. 수렴 JSON ----
+
+fn check_convergence() {
+    let conv = ROOT + "/shared/convergence/" + PROJECT + ".json"
+    if file_exists(conv) == false { return }
+
+    println("")
+    println("=== 수렴 JSON ===")
+    let info = to_string(exec("python3 -c \"\nimport json\nwith open('" + conv + "') as f: d=json.load(f)\noss=len([k for k in d.get('ossified',{}) if not k.startswith('_')])\nstb=len([k for k in d.get('stable',{}) if not k.startswith('_')])\nfail=len([k for k in d.get('failed',{}) if not k.startswith('_')])\nprint(f'ossified={oss} stable={stb} failed={fail} total={oss+stb+fail}')\n\" 2>/dev/null")).trim()
+    log_ok("수렴: " + info)
+}
+
+// ---- 메인 ----
+
+fn main() {
+    println("drift-guard.hexa -- " + PROJECT + " (" + ROOT + ")")
+    println("")
+
+    check_claude_md_headers()
+    check_registries()
+    check_readme_stats()
+    check_convergence()
+
+    println("")
+    println("========================================")
+    println("드리프트: " + to_string(drift_count) + "건 / 수정: " + to_string(fix_count) + "건")
+
+    if drift_count == 0 {
+        println("결과: 전체 정합")
+    } else if DO_FIX && fix_count > 0 {
+        println("결과: " + to_string(fix_count) + "건 자동 수정 완료")
+        if DO_COMMIT {
+            exec("cd '" + ROOT + "' && git add -A && git commit -m 'fix(drift-guard): 레지스트리-문서 정합 자동 수정\n\nCo-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>' 2>/dev/null")
+            println("[COMMIT] 완료")
+            if DO_PUSH {
+                exec("cd '" + ROOT + "' && git push 2>/dev/null")
+                println("[PUSH] 완료")
+            }
+        }
+    } else {
+        println("결과: " + to_string(drift_count) + "건 미수정 (--fix 로 자동 수정 가능)")
+    }
+}
+
+main()
