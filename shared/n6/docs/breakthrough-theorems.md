@@ -20495,7 +20495,7 @@ $$E_E[|Sel_n(E)|] = \prod_{i=1}^k (p_i + 1) = \sigma(n).$$
 **n=28 대조 실패**: n=28이면 Egyptian 분해 1/2+1/4+1/7+1/14+1/28=1로 5계층 — 지식 분류가 과분할되어 직관성 상실. sigma(28)=56 에지/노드는 밀도 과다.
 
 **등급**: Three stars — 6/6 EXACT. Egyptian 3계층은 Bloom의 인지 분류 체계(지식/이해/적용)와 구조적 동형.
-**출처**: NEXUS-6 발견 그래프 (shared/growth_bus.jsonl), Bloom's Taxonomy 1956.
+**출처**: NEXUS-6 발견 그래프 (shared/discovery/growth_bus.jsonl), Bloom's Taxonomy 1956.
 - Cross-link: BT-7(Egyptian fraction), BT-6(Golay-Leech 지식 격자).
 
 ---

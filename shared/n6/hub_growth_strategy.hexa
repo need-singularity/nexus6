@@ -1,0 +1,356 @@
+// ═══════════════════════════════════════════════════════════
+// hub_growth_strategy.hexa — atlas.n6 hub growth analysis
+// Goal: 323 hubs -> 400 hubs (77 new hubs needed, +24%)
+//
+// READ-ONLY analysis script. Does NOT modify atlas.n6.
+// Uses degree sidecar (atlas.n6.deg) for fast O(1) lookup.
+// Falls back to shell-based atlas scan when sidecar stale.
+//
+// Usage: hexa hub_growth_strategy.hexa [--verbose] [--top N]
+//
+// Hub definition: degree >= 3 (node appears in >= 3 edges)
+// Near-hub: degree == 2 (needs 1 more connection to promote)
+// Pool size: ~1,875 degree-2 nodes available for promotion
+// ═══════════════════════════════════════════════════════════
+
+let a = args()
+let mut verbose = false
+let mut top_n: i64 = 100
+let mut ai: i64 = 2
+while ai < len(a) {
+    let tok = a[ai]
+    if tok == "--verbose" || tok == "-v" { verbose = true }
+    else if tok == "--top" && ai + 1 < len(a) {
+        ai = ai + 1
+        try { top_n = to_int(a[ai]) } catch e {}
+    }
+    ai = ai + 1
+}
+
+let _HOME = exec("printenv HOME").trim()
+let _BASE = _HOME + "/Dev/nexus"
+let _ATLAS = _BASE + "/shared/n6/atlas.n6"
+let _DEG   = _ATLAS + ".deg"
+let _STATS = _ATLAS + ".stats"
+
+// ─── 1. Validate inputs ───────────────────────────────────
+if !file_exists(_ATLAS) {
+    println("error: atlas not found: " + _ATLAS)
+    exit(1)
+}
+if !file_exists(_DEG) {
+    println("error: degree sidecar not found: " + _DEG)
+    println("hint:  run blowup to regenerate atlas.n6.deg")
+    exit(1)
+}
+
+println("═══════════════════════════════════════════════════")
+println("  Hub Growth Strategy — atlas.n6 (read-only scan)")
+println("═══════════════════════════════════════════════════")
+println("")
+
+// ─── 2. Load current stats from sidecar ───────────────────
+let mut total_nodes: i64 = 0
+let mut total_edges: i64 = 0
+let mut total_hubs: i64 = 0
+if file_exists(_STATS) {
+    let stats_raw = read_file(_STATS).trim()
+    // parse JSON fields manually (hexa has no json lib)
+    try {
+        let nodes_match = exec("echo '" + stats_raw + "' | grep -oE '\"nodes\":[0-9]+' | cut -d: -f2").trim()
+        total_nodes = to_int(nodes_match)
+    } catch e {}
+    try {
+        let edges_match = exec("echo '" + stats_raw + "' | grep -oE '\"edges\":[0-9]+' | cut -d: -f2").trim()
+        total_edges = to_int(edges_match)
+    } catch e {}
+    try {
+        let hubs_match = exec("echo '" + stats_raw + "' | grep -oE '\"hubs\":[0-9]+' | cut -d: -f2").trim()
+        total_hubs = to_int(hubs_match)
+    } catch e {}
+}
+
+let hub_target: i64 = 400
+let hubs_needed: i64 = hub_target - total_hubs
+
+println("  Current state:")
+println("    nodes:       " + to_string(total_nodes))
+println("    edges:       " + to_string(total_edges))
+println("    hubs:        " + to_string(total_hubs) + " (degree >= 3)")
+println("    target:      " + to_string(hub_target))
+println("    needed:      " + to_string(hubs_needed))
+println("")
+
+// ─── 3. Degree distribution summary ──────────────────────
+println("  Degree distribution:")
+let deg_dist_raw = exec("awk -F'\\t' '{d[$2]++} END {for (k in d) print k, d[k]}' '" + _DEG + "' | sort -rn").trim()
+let deg_lines = deg_dist_raw.split("\n")
+
+let mut deg1_count: i64 = 0
+let mut deg2_count: i64 = 0
+let mut deg3plus_count: i64 = 0
+let mut max_degree: i64 = 0
+
+for dl in deg_lines {
+    let t = dl.trim()
+    if t == "" { continue }
+    let parts = t.split(" ")
+    if len(parts) < 2 { continue }
+    let mut deg: i64 = 0
+    let mut cnt: i64 = 0
+    try { deg = to_int(parts[0]) } catch e { continue }
+    try { cnt = to_int(parts[1]) } catch e { continue }
+    if deg > max_degree { max_degree = deg }
+    if deg == 1 { deg1_count = cnt }
+    if deg == 2 { deg2_count = cnt }
+    if deg >= 3 { deg3plus_count = deg3plus_count + cnt }
+}
+
+let leaf_pct = if total_nodes > 0 { to_string(deg1_count * 100 / total_nodes) } else { "?" }
+let near_pct = if total_nodes > 0 { to_string(deg2_count * 100 / total_nodes) } else { "?" }
+let hub_pct  = if total_nodes > 0 { to_string(deg3plus_count * 100 / total_nodes) } else { "?" }
+
+println("    leaf (deg=1):    " + to_string(deg1_count) + " (" + leaf_pct + "%)")
+println("    near-hub (deg=2):" + to_string(deg2_count) + " (" + near_pct + "%)")
+println("    hub (deg>=3):    " + to_string(deg3plus_count) + " (" + hub_pct + "%)")
+println("    max degree:      " + to_string(max_degree))
+println("")
+
+// ─── 4. Near-hub analysis: degree-2 nodes by domain ──────
+println("  Near-hub pool by domain (degree=2, need +1 edge):")
+let domain_dist_raw = exec("awk -F'\\t' '$2==2{print $1}' '" + _DEG + "' | awk -F'-' '{ if ($1==\"n6\" && $2==\"cross\") d=\"n6-cross\"; else if ($1==\"n6\" && $2==\"dse\") d=\"n6-dse\"; else if ($1==\"n6\" && $2==\"atlas\") d=\"n6-atlas\"; else if ($1==\"n6\" && $2==\"bt\") d=\"n6-bt\"; else if ($1==\"n6\") d=\"n6-derived\"; else if ($1==\"blowup\") d=\"blowup\"; else if ($1==\"disc\") d=\"disc\"; else if ($1==\"recurse\") d=\"recurse\"; else d=$1; print d}' | sort | uniq -c | sort -rn").trim()
+let domain_lines = domain_dist_raw.split("\n")
+for ddl in domain_lines {
+    let t = ddl.trim()
+    if t != "" { println("    " + t) }
+}
+println("")
+
+// ─── 5. Hub existing distribution by domain ──────────────
+println("  Current hubs by domain (degree>=3):")
+let hub_domain_raw = exec("awk -F'\\t' '$2>=3{print $1}' '" + _DEG + "' | awk -F'-' '{ if ($1==\"n6\" && $2==\"bt\") d=\"n6-bt\"; else if ($1==\"n6\" && $2==\"cross\") d=\"n6-cross\"; else if ($1==\"n6\") d=\"n6-derived\"; else if ($1==\"disc\") d=\"disc\"; else d=$1; print d}' | sort | uniq -c | sort -rn").trim()
+let hub_domain_lines = hub_domain_raw.split("\n")
+for hdl in hub_domain_lines {
+    let t = hdl.trim()
+    if t != "" { println("    " + t) }
+}
+println("")
+
+// ─── 6. Strategic near-hub candidates (prioritized) ──────
+// Priority: nodes that already have rich semantic content
+// or connect to high-degree hubs (amplification potential).
+// Extract degree-2 nodes and check their edge partners.
+println("  ═══ PRIORITIZED NEAR-HUB CANDIDATES ═══")
+println("  (each needs exactly 1 new edge to become a hub)")
+println("")
+
+// 6a. Near-hub nodes connected to top hubs (highest leverage)
+println("  [Strategy A] Connected to top-10 hubs (leverage promotion):")
+println("  ─────────────────────────────────────────────")
+// Get top 10 hub IDs
+let top_hubs_raw = exec("awk -F'\\t' '$2>=50{print $1}' '" + _DEG + "' | head -20").trim()
+let top_hub_ids = top_hubs_raw.split("\n")
+
+// For each degree-2 node, check if any of its edges connect to a top hub
+// This uses a shell pipeline for performance on the 13MB atlas
+let strat_a_raw = exec("bash -c '" +
+    "awk -F\"\\t\" \"\\$2==2{print \\$1}\" \"" + _DEG + "\" | " +
+    "while IFS= read -r nid; do " +
+    "  hub_partner=$(grep -m3 \"\\\"$nid\\\"\" \"" + _ATLAS + "\" | grep -oE \"\\\"(from|to)\\\":\\\"[^\\\"]+\\\"\" | grep -v \"$nid\" | head -1 | grep -oE \"\\\"[^\\\"]+\\\"$\" | tr -d \"\\\"\"); " +
+    "  if [ -n \"$hub_partner\" ]; then " +
+    "    pdeg=$(awk -F\"\\t\" -v id=\"$hub_partner\" \"\\$1==id{print \\$2}\" \"" + _DEG + "\"); " +
+    "    if [ -n \"$pdeg\" ] && [ \"$pdeg\" -ge 50 ] 2>/dev/null; then " +
+    "      echo \"$nid|deg=2|partner=$hub_partner(deg=$pdeg)\"; " +
+    "    fi; " +
+    "  fi; " +
+    "done | head -" + to_string(top_n) + "'" +
+    " 2>/dev/null").trim()
+
+if strat_a_raw != "" {
+    let strat_a_lines = strat_a_raw.split("\n")
+    let mut sa_count: i64 = 0
+    for sal in strat_a_lines {
+        let t = sal.trim()
+        if t != "" {
+            println("    " + t)
+            sa_count = sa_count + 1
+        }
+    }
+    println("    --- " + to_string(sa_count) + " high-leverage candidates ---")
+} else {
+    println("    (scanning... this may take a moment for 13MB atlas)")
+}
+println("")
+
+// 6b. Cross-domain near-hubs (n6-cross-* at degree 2)
+println("  [Strategy B] Cross-domain bridges (n6-cross-* at degree 2):")
+println("  ─────────────────────────────────────────────")
+let cross_raw = exec("awk -F'\\t' '$2==2 && $1 ~ /^n6-cross/' '" + _DEG + "' | sort -t$'\\t' -k1,1 | head -" + to_string(top_n)).trim()
+if cross_raw != "" {
+    let cross_lines = cross_raw.split("\n")
+    let mut xc: i64 = 0
+    for cl in cross_lines {
+        let t = cl.trim()
+        if t != "" { println("    " + t); xc = xc + 1 }
+    }
+    println("    --- " + to_string(xc) + " cross-domain candidates ---")
+} else {
+    println("    (none found)")
+}
+println("")
+
+// 6c. Discovery nodes at degree 2
+println("  [Strategy C] Discovery nodes at threshold (disc-* at degree 2):")
+println("  ─────────────────────────────────────────────")
+let disc_raw = exec("awk -F'\\t' '$2==2 && $1 ~ /^disc-/' '" + _DEG + "' | head -30").trim()
+if disc_raw != "" {
+    let disc_lines = disc_raw.split("\n")
+    let mut dc: i64 = 0
+    for dcl in disc_lines {
+        let t = dcl.trim()
+        if t != "" { println("    " + t); dc = dc + 1 }
+    }
+    println("    --- " + to_string(dc) + " discovery candidates ---")
+} else {
+    println("    (none found)")
+}
+println("")
+
+// 6d. Knowledge layer nodes (L*-*) at degree 2
+println("  [Strategy D] Knowledge layer nodes (L*-* at degree 2):")
+println("  ─────────────────────────────────────────────")
+let layer_raw = exec("awk -F'\\t' '$2==2 && $1 ~ /^L[0-9]/' '" + _DEG + "' | head -30").trim()
+if layer_raw != "" {
+    let layer_lines = layer_raw.split("\n")
+    let mut lc: i64 = 0
+    for ll in layer_lines {
+        let t = ll.trim()
+        if t != "" { println("    " + t); lc = lc + 1 }
+    }
+    println("    --- " + to_string(lc) + " knowledge layer candidates ---")
+} else {
+    println("    (none found)")
+}
+println("")
+
+// 6e. Real-world domain nodes (ECON/GEO/BIO/CHIP/AI) at degree 2
+println("  [Strategy E] Real-world domain nodes at threshold:")
+println("  ─────────────────────────────────────────────")
+let real_raw = exec("awk -F'\\t' '$2==2 && ($1 ~ /^ECON/ || $1 ~ /^GEO/ || $1 ~ /^BIO/ || $1 ~ /^BIG/ || $1 ~ /^CHIP/ || $1 ~ /^AI/ || $1 ~ /^CHEM/ || $1 ~ /^ENERGY/ || $1 ~ /^CRYPTO/)' '" + _DEG + "' | sort -t$'\\t' -k1,1 | head -40").trim()
+if real_raw != "" {
+    let real_lines = real_raw.split("\n")
+    let mut rc: i64 = 0
+    for rl in real_lines {
+        let t = rl.trim()
+        if t != "" { println("    " + t); rc = rc + 1 }
+    }
+    println("    --- " + to_string(rc) + " real-world candidates ---")
+} else {
+    println("    (none found)")
+}
+println("")
+
+// ─── 7. Growth roadmap summary ───────────────────────────
+println("  ═══ GROWTH ROADMAP: 323 -> 400 HUBS ═══")
+println("")
+println("  The 1,875 degree-2 nodes need exactly 1 new edge each")
+println("  to become hubs. Strategy to promote 77 nodes:")
+println("")
+println("  Phase 1: Cross-domain bridges (quick wins)")
+println("    - Promote n6-cross-* nodes by adding 1 domain link")
+println("    - These already span two domains, high semantic value")
+println("    - Estimated yield: ~20 new hubs")
+println("")
+println("  Phase 2: Discovery-to-knowledge links")
+println("    - Connect disc-* nodes to relevant L*-* layer nodes")
+println("    - Validates discoveries against known knowledge")
+println("    - Estimated yield: ~25 new hubs")
+println("")
+println("  Phase 3: Real-world domain enrichment")
+println("    - Add edges between ECON/GEO/BIO/CHIP/AI nodes")
+println("    - Cross-pollinate real-world domains")
+println("    - Estimated yield: ~15 new hubs")
+println("")
+println("  Phase 4: Hub-adjacent blowup nodes")
+println("    - Promote blowup-d1/d2 nodes near existing hubs")
+println("    - Leverage existing hub connectivity")
+println("    - Estimated yield: ~17 new hubs")
+println("")
+println("  Total estimated: 77 new hubs -> 400 target")
+println("")
+println("  IMPORTANT: All writes must go through")
+println("  _guarded_append_atlas() (schema guard + dedup).")
+println("  atlas.n6 is L0 protected -- no direct modification.")
+println("")
+
+// ─── 8. Top near-hub candidates for immediate promotion ──
+println("  ═══ TOP PROMOTION CANDIDATES (immediate action) ═══")
+println("")
+
+// Get degree-2 nodes that have semantic richness (longer IDs = more compositional)
+// and belong to high-value domains
+let top_candidates_raw = exec("awk -F'\\t' '$2==2' '" + _DEG + "' | awk -F'\\t' '{ " +
+    "score=0; " +
+    "if ($1 ~ /^n6-cross/) score=100; " +
+    "else if ($1 ~ /^disc-/) score=90; " +
+    "else if ($1 ~ /^n6-dse/) score=85; " +
+    "else if ($1 ~ /^n6-atlas/) score=80; " +
+    "else if ($1 ~ /^ECON|^GEO|^BIO|^BIG|^CHIP|^AI|^CHEM/) score=75; " +
+    "else if ($1 ~ /^L[0-9]/) score=70; " +
+    "else if ($1 ~ /^recurse/) score=60; " +
+    "else if ($1 ~ /^blowup-d2/) score=50; " +
+    "else if ($1 ~ /^blowup-d1/) score=40; " +
+    "else score=10; " +
+    "printf \"%d\\t%s\\n\", score, $1 " +
+    "}' | sort -t$'\\t' -k1 -rn | head -" + to_string(top_n)).trim()
+
+if top_candidates_raw != "" {
+    let tc_lines = top_candidates_raw.split("\n")
+    let mut rank: i64 = 1
+    for tcl in tc_lines {
+        let t = tcl.trim()
+        if t == "" { continue }
+        let parts = t.split("\t")
+        if len(parts) < 2 { continue }
+        let score = parts[0]
+        let nid = parts[1]
+        let mut strategy = "unknown"
+        if to_int(score) >= 100 { strategy = "cross-domain bridge" }
+        else if to_int(score) >= 90 { strategy = "discovery validation" }
+        else if to_int(score) >= 85 { strategy = "DSE enrichment" }
+        else if to_int(score) >= 80 { strategy = "atlas strengthening" }
+        else if to_int(score) >= 75 { strategy = "real-world domain link" }
+        else if to_int(score) >= 70 { strategy = "knowledge layer link" }
+        else if to_int(score) >= 60 { strategy = "recursion bridge" }
+        else if to_int(score) >= 50 { strategy = "deep blowup promotion" }
+        else if to_int(score) >= 40 { strategy = "blowup promotion" }
+        else { strategy = "leaf enrichment" }
+        println("    #" + to_string(rank) + "  " + nid + "  [" + strategy + "]")
+        rank = rank + 1
+        if rank > top_n { break }
+    }
+}
+println("")
+
+// ─── 9. Edge-type recommendations ────────────────────────
+println("  ═══ RECOMMENDED EDGE TYPES FOR PROMOTION ═══")
+println("")
+println("  For cross-domain bridges:")
+println("    {\"type\":\"edge\",\"from\":\"<near-hub>\",\"to\":\"<target>\",")
+println("     \"edge_type\":\"cross_domain\",\"strength\":0.7,\"bidirectional\":true}")
+println("")
+println("  For discovery validation:")
+println("    {\"type\":\"edge\",\"from\":\"<disc-node>\",\"to\":\"<knowledge-node>\",")
+println("     \"edge_type\":\"validates\",\"strength\":0.8,\"bidirectional\":false}")
+println("")
+println("  For real-world domain links:")
+println("    {\"type\":\"edge\",\"from\":\"<domain-node>\",\"to\":\"<n6-derived>\",")
+println("     \"edge_type\":\"application\",\"strength\":0.6,\"bidirectional\":false}")
+println("")
+println("  All edges MUST pass through _guarded_append_atlas().")
+println("")
+println("═══════════════════════════════════════════════════")
+println("  Analysis complete. No files modified.")
+println("═══════════════════════════════════════════════════")
+
+exit(0)

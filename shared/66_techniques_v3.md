@@ -1,1 +1,0 @@
-n6/66_techniques_v3.md
