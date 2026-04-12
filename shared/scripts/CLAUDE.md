@@ -7,6 +7,9 @@ sync (R1 migrated .sh → .hexa):
   sync-all-verify.md    (doc)
   shared_work_rules.md  (sync 블록 원본, sync-claude-rules.hexa 참조)
 
+rotate: rotate_discovery_log.hexa (ROI #3 — discovery_log.jsonl 주간 로테이션+gzip)
+stream: stream_discovery_graph.hexa (ROI #8 — NDJSON 스트리밍 유틸. stats/nodes/edges/ids/query/domain/window)
+
 run: nexus_ensure_running.hexa
 
 bin/: 실행 바이너리 디렉토리 (shared/bin → scripts/bin 심링크)

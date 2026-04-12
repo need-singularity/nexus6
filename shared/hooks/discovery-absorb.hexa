@@ -1,12 +1,43 @@
 // discovery-absorb.hexa — discovery_log.jsonl BT-candidate → atlas.n6 자동 흡수
 // growth-tick.hexa에서 호출. 쿨다운 60초 (atlas 과다 편집 방지).
 // 안전: _guarded_append_atlas 사용 (schema guard + dedup + 중간 삽입 금지).
+// ROI#13: 배치 쓰기 — 버퍼 100건 or 60초 경과 시 일괄 flush
 
 let HOME = env("HOME")
 let SHARED = HOME + "/Dev/nexus/shared"
 let ATLAS = SHARED + "/n6/atlas.n6"
 let DISC_LOG = SHARED + "/discovery/discovery_log.jsonl"
 let COOLDOWN_FILE = "/tmp/nexus_atlas_absorb_tick"
+let BUFFER_FILE = "/tmp/.discovery_absorb_buffer.jsonl"
+let BUFFER_THRESHOLD: i64 = 100
+let BUFFER_AGE_LIMIT: i64 = 60
+
+// ═══ buffer helpers ═══
+fn _buffer_count() -> i64 {
+    if file_exists(BUFFER_FILE) == false { return 0 }
+    let raw = to_string(exec("wc -l < " + BUFFER_FILE)).trim()
+    if len(raw) == 0 { return 0 }
+    return to_int(to_float(raw))
+}
+
+fn _buffer_age_seconds(now_epoch: i64) -> i64 {
+    if file_exists(BUFFER_FILE) == false { return 0 }
+    let mtime_raw = to_string(exec("stat -f %m " + BUFFER_FILE + " 2>/dev/null || stat -c %Y " + BUFFER_FILE + " 2>/dev/null || echo 0")).trim()
+    if len(mtime_raw) == 0 { return 0 }
+    let mtime = to_int(to_float(mtime_raw))
+    if mtime == 0 { return 0 }
+    return now_epoch - mtime
+}
+
+fn _should_flush(now_epoch: i64) -> bool {
+    let count = _buffer_count()
+    if count == 0 { return false }
+    if count >= BUFFER_THRESHOLD { return true }
+    let age = _buffer_age_seconds(now_epoch)
+    if age >= BUFFER_AGE_LIMIT { return true }
+    return false
+}
+// ═══ end buffer helpers ═══
 
 // ═══ atlas guard (atlas_guard.hexa.inc copy-paste, hexa import 미지원) ═══
 fn _valid_atlas_line(line: string) -> bool {
@@ -83,28 +114,25 @@ fn _guarded_append_atlas(path: string, content: string) -> i64 {
 }
 // ═══ end atlas guard ═══
 
-fn main() {
-    // 쿨다운 60초
-    let now = to_string(exec("date +%s")).trim()
-    let last = to_string(exec("cat " + COOLDOWN_FILE + " 2>/dev/null || echo 0")).trim()
-    let diff = to_int(to_float(now)) - to_int(to_float(last))
-    if diff < 60 { return }
-
-    if file_exists(DISC_LOG) == false { return }
-    if file_exists(ATLAS) == false { return }
-
-    // BT-candidate 항목 추출
-    let log_raw = read_file(DISC_LOG)
-    let lines = log_raw.split("\n")
+// ═══ flush: 버퍼 → atlas.n6 + discovery_log 일괄 처리 ═══
+fn _flush_buffer() {
+    if file_exists(BUFFER_FILE) == false { return }
+    let buf_raw = read_file(BUFFER_FILE)
+    let buf_lines = buf_raw.split("\n")
     let mut candidates = []
-    for line in lines {
+    for line in buf_lines {
         let trimmed = line.trim()
-        if trimmed.contains("\"BT-candidate\"") {
+        if len(trimmed) > 0 {
             candidates = candidates + [trimmed]
         }
     }
+    if candidates.len() == 0 {
+        // 빈 버퍼 — 정리만
+        try { exec("> " + BUFFER_FILE) } catch e {}
+        return
+    }
 
-    if candidates.len() == 0 { return }
+    if file_exists(ATLAS) == false { return }
 
     // 마지막 BT 번호 추출
     let last_bt_raw = to_string(exec("grep -o 'n6-bt-[0-9]*' '" + ATLAS + "' | sort -t- -k3 -n | tail -1")).trim()
@@ -116,7 +144,7 @@ fn main() {
         }
     }
 
-    // 각 candidate → @X 엔트리 생성 + append
+    // 각 candidate → @X 엔트리 생성 (배치)
     let mut bt_assignments = []
     let mut atlas_block = ""
     for c in candidates {
@@ -150,31 +178,79 @@ fn main() {
         bt_assignments = bt_assignments + [bt_id]
     }
 
-    // atlas.n6에 안전하게 append (schema guard + dedup)
+    // atlas.n6에 안전하게 append (schema guard + dedup) — 1회 배치 쓰기
     _guarded_append_atlas(ATLAS, "\n" + atlas_block)
 
-    // discovery_log 갱신 (BT-candidate → BT-번호)
-    let mut new_log_lines = []
-    let mut bi = 0
-    for line in lines {
-        let trimmed = line.trim()
-        if trimmed.contains("\"BT-candidate\"") && bi < bt_assignments.len() {
-            let replaced = trimmed.replace("\"BT-candidate\"", "\"" + bt_assignments[bi] + "\"")
-            new_log_lines = new_log_lines + [replaced]
-            bi = bi + 1
-        } else {
-            new_log_lines = new_log_lines + [line]
+    // discovery_log 갱신 (BT-candidate → BT-번호) — 1회 배치 쓰기
+    if file_exists(DISC_LOG) {
+        let log_raw = read_file(DISC_LOG)
+        let lines = log_raw.split("\n")
+        let mut new_log_lines = []
+        let mut bi = 0
+        for line in lines {
+            let trimmed = line.trim()
+            if trimmed.contains("\"BT-candidate\"") && bi < bt_assignments.len() {
+                let replaced = trimmed.replace("\"BT-candidate\"", "\"" + bt_assignments[bi] + "\"")
+                new_log_lines = new_log_lines + [replaced]
+                bi = bi + 1
+            } else {
+                new_log_lines = new_log_lines + [line]
+            }
         }
+        try { write_file(DISC_LOG, new_log_lines.join("\n")) } catch e {}
     }
-    try { write_file(DISC_LOG, new_log_lines.join("\n")) } catch e {}
 
-    // 쿨다운 갱신
-    try { write_file(COOLDOWN_FILE, now) } catch e {}
+    // 버퍼 클리어 (atomic: truncate only after successful writes)
+    try { exec("> " + BUFFER_FILE) } catch e {}
 
     // 디버그 로그
     let ts_str = to_string(exec("date +%Y-%m-%dT%H:%M:%S")).trim()
-    let msg = ts_str + " discovery-absorb: " + to_string(candidates.len()) + "건 atlas 흡수 (BT-" + to_string(last_bt_num - candidates.len() + 1) + "~" + to_string(last_bt_num) + ")\n"
+    let msg = ts_str + " discovery-absorb: " + to_string(candidates.len()) + "건 atlas 흡수 (BT-" + to_string(last_bt_num - candidates.len() + 1) + "~" + to_string(last_bt_num) + ") [batch flush]\n"
     try { append_file("/tmp/nexus_growth_debug.log", msg) } catch e {}
+}
+// ═══ end flush ═══
+
+fn main() {
+    // 쿨다운 60초
+    let now = to_string(exec("date +%s")).trim()
+    let last = to_string(exec("cat " + COOLDOWN_FILE + " 2>/dev/null || echo 0")).trim()
+    let now_epoch = to_int(to_float(now))
+    let diff = now_epoch - to_int(to_float(last))
+    if diff < 60 { return }
+
+    if file_exists(DISC_LOG) == false { return }
+    if file_exists(ATLAS) == false { return }
+
+    // BT-candidate 항목 추출 → 버퍼에 append (메인 로그 직접 수정 안 함)
+    let log_raw = read_file(DISC_LOG)
+    let lines = log_raw.split("\n")
+    let mut new_candidates = ""
+    let mut count: i64 = 0
+    for line in lines {
+        let trimmed = line.trim()
+        if trimmed.contains("\"BT-candidate\"") {
+            new_candidates = new_candidates + trimmed + "\n"
+            count = count + 1
+        }
+    }
+
+    // 새 candidate가 있으면 버퍼에 추가
+    if count > 0 {
+        try { append_file(BUFFER_FILE, new_candidates) } catch e {}
+    }
+
+    // flush 조건 판정: 버퍼 100건 이상 or 60초 경과
+    if _should_flush(now_epoch) {
+        _flush_buffer()
+    }
+
+    // 쿨다운 갱신
+    try { write_file(COOLDOWN_FILE, now) } catch e {}
+}
+
+// 외부에서 강제 flush 호출용 (graceful shutdown 등)
+fn flush() {
+    _flush_buffer()
 }
 
 main()

@@ -30,7 +30,7 @@
 - `architecture_design` — daemon 전용, 실시간 Mac vitals
 
 ### 상태 파일 (`shared/discovery/cycle/`)
-- `topology.jsonl` — 점(singularities), append-only
+- `topology_mk2.jsonl` — 점(singularities), append-only (mk2; legacy topology.jsonl은 deprecated)
 - `edges.jsonl` — 엣지(simhash distance ≤ eps=0.3)
 - `budget.json`, `wal.jsonl`, `state.lock`, `halt`
 
@@ -48,7 +48,7 @@
 
 **진행 중** ✅
 - `singularity-backfill` 프로세스 (PID 30333) 04:08AM부터 12시간째 흡수 중
-- `topology.jsonl`: **1,455점** (723KB)
+- `topology_mk2.jsonl`: SSOT (legacy topology.jsonl deprecated)
 - `edges.jsonl`: **9.0 MB**
 - halt 파일 없음
 
@@ -62,8 +62,8 @@
 ```bash
 # 상태
 bash tools/install-cycle-tick.sh status
-wc -l shared/discovery/cycle/topology.jsonl
-tail -1 shared/discovery/cycle/topology.jsonl
+wc -l shared/discovery/cycle/topology_mk2.jsonl
+tail -1 shared/discovery/cycle/topology_mk2.jsonl
 
 # 정지/재개
 touch shared/discovery/cycle/halt     # 정지 (tick skip)

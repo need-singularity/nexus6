@@ -1,0 +1,151 @@
+// rotate_discovery_log.hexa — discovery_log.jsonl 로테이션 + gzip + 메타 인덱스
+// 사용: hexa shared/scripts/rotate_discovery_log.hexa
+// 멱등: 임계값 미만이면 스킵. 반복 호출 안전.
+
+let HOME = env("HOME")
+let BASE = HOME + "/Dev/nexus/shared"
+let LOG_FILE = BASE + "/discovery_log.jsonl"
+let META_FILE = BASE + "/discovery_log.meta.json"
+
+// --- 설정 ---
+let MAX_SIZE_MB = 100
+let MAX_LINES = 500000
+let KEEP_ROTATED = 4
+
+println("=== discovery_log.jsonl 로테이션 ===")
+println("")
+
+// --- 1. 파일 존재 확인 ---
+let exists = to_string(exec("test -f '" + LOG_FILE + "' && echo y || echo n")).trim()
+if exists == "n" {
+    println("[SKIP] " + LOG_FILE + " 없음")
+    exit(0)
+}
+
+// --- 2. 현재 상태 수집 ---
+let size_bytes = to_int(to_string(exec("stat -f %z '" + LOG_FILE + "' 2>/dev/null || echo 0")).trim())
+let size_mb = size_bytes / 1048576
+let line_count = to_int(to_string(exec("wc -l < '" + LOG_FILE + "' 2>/dev/null || echo 0")).trim())
+let mtime = to_string(exec("stat -f %m '" + LOG_FILE + "' 2>/dev/null || echo 0")).trim()
+
+println("  크기: " + to_string(size_mb) + "MB (" + to_string(size_bytes) + " bytes)")
+println("  라인: " + to_string(line_count))
+
+// --- 3. 임계값 확인 ---
+let need_rotate = false
+if size_mb >= MAX_SIZE_MB {
+    println("  [!] 크기 임계값 초과 (" + to_string(MAX_SIZE_MB) + "MB)")
+    need_rotate = true
+}
+if line_count >= MAX_LINES {
+    println("  [!] 라인 임계값 초과 (" + to_string(MAX_LINES) + ")")
+    need_rotate = true
+}
+
+if !need_rotate {
+    println("  [OK] 임계값 미만 — 로테이션 불필요")
+    // 메타만 갱신
+    _update_meta(LOG_FILE, META_FILE, line_count, size_bytes, mtime)
+    exit(0)
+}
+
+// --- 4. 타임스탬프 추출 (첫/끝 줄) ---
+let first_ts = to_string(exec("head -1 '" + LOG_FILE + "' 2>/dev/null | /usr/bin/python3 -c \"import sys,json; d=json.loads(sys.stdin.readline()); print(d.get('ts',d.get('timestamp',d.get('t',''))))\" 2>/dev/null || echo ''")).trim()
+let last_ts = to_string(exec("tail -1 '" + LOG_FILE + "' 2>/dev/null | /usr/bin/python3 -c \"import sys,json; d=json.loads(sys.stdin.readline()); print(d.get('ts',d.get('timestamp',d.get('t',''))))\" 2>/dev/null || echo ''")).trim()
+
+// --- 5. 로테이션 실행 ---
+let date = to_string(exec("date +%Y-%m-%d")).trim()
+
+// 같은 날 이미 로테이션된 파일이 있으면 시간 접미사 추가
+let rotated_base = BASE + "/discovery_log." + date + ".jsonl"
+let rotated_gz = rotated_base + ".gz"
+let gz_exists = to_string(exec("test -f '" + rotated_gz + "' && echo y || echo n")).trim()
+
+let final_name = rotated_base
+if gz_exists == "y" {
+    let ts = to_string(exec("date +%H%M%S")).trim()
+    final_name = BASE + "/discovery_log." + date + "_" + ts + ".jsonl"
+}
+
+println("")
+println("[1/4] 로테이션: " + LOG_FILE + " -> " + final_name)
+exec("mv '" + LOG_FILE + "' '" + final_name + "'")
+
+println("[2/4] gzip 압축 중...")
+exec("gzip '" + final_name + "'")
+let compressed = final_name + ".gz"
+let gz_size = to_int(to_string(exec("stat -f %z '" + compressed + "' 2>/dev/null || echo 0")).trim())
+let gz_mb = gz_size / 1048576
+println("  압축 완료: " + to_string(gz_mb) + "MB")
+
+println("[3/4] 빈 로그 파일 생성")
+exec("touch '" + LOG_FILE + "'")
+
+// --- 6. 오래된 로테이션 파일 정리 (최근 KEEP_ROTATED 개만 유지) ---
+println("[4/4] 오래된 로테이션 파일 정리 (최근 " + to_string(KEEP_ROTATED) + "개 유지)")
+let rotated_files = to_string(exec("ls -1t " + BASE + "/discovery_log.????-??-??*.jsonl.gz 2>/dev/null")).trim()
+
+if len(rotated_files) > 0 {
+    let files = rotated_files.split("\n")
+    let total = files.len()
+    if total > KEEP_ROTATED {
+        let mut deleted = 0
+        let mut i = KEEP_ROTATED
+        while i < total {
+            let old_file = files[i]
+            if len(old_file) > 0 {
+                exec("rm -f '" + old_file + "'")
+                println("  삭제: " + old_file)
+                deleted = deleted + 1
+            }
+            i = i + 1
+        }
+        println("  " + to_string(deleted) + "개 삭제됨")
+    } else {
+        println("  정리 불필요 (" + to_string(total) + "개)")
+    }
+}
+
+// --- 7. 메타 갱신 ---
+_update_meta(LOG_FILE, META_FILE, 0, 0, mtime)
+
+println("")
+println("=== 로테이션 완료 ===")
+println("  원본: " + to_string(line_count) + "줄 / " + to_string(size_mb) + "MB -> " + compressed + " (" + to_string(gz_mb) + "MB)")
+println("  새 로그: " + LOG_FILE + " (빈 파일)")
+
+// --- 메타 갱신 함수 ---
+fn _update_meta(log_path: str, meta_path: str, lines: int, size: int, mtime_str: str) {
+    let first = to_string(exec("head -1 '" + log_path + "' 2>/dev/null | /usr/bin/python3 -c \"import sys,json; d=json.loads(sys.stdin.readline()); print(d.get('ts',d.get('timestamp',d.get('t',''))))\" 2>/dev/null || echo ''")).trim()
+    let last = to_string(exec("tail -1 '" + log_path + "' 2>/dev/null | /usr/bin/python3 -c \"import sys,json; d=json.loads(sys.stdin.readline()); print(d.get('ts',d.get('timestamp',d.get('t',''))))\" 2>/dev/null || echo ''")).trim()
+    let now = to_string(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()
+
+    // 현재 로테이션 목록 수집
+    let archives = to_string(exec("ls -1t " + BASE + "/discovery_log.????-??-??*.jsonl.gz 2>/dev/null | head -10")).trim()
+    let archive_list = if len(archives) > 0 { archives.split("\n") } else { [] }
+
+    let mut archive_json = "["
+    let mut ai = 0
+    for a in archive_list {
+        if len(a) == 0 { continue }
+        let a_size = to_string(exec("stat -f %z '" + a + "' 2>/dev/null || echo 0")).trim()
+        if ai > 0 { archive_json = archive_json + "," }
+        archive_json = archive_json + "\n    {\"file\": \"" + a + "\", \"size\": " + a_size + "}"
+        ai = ai + 1
+    }
+    archive_json = archive_json + "\n  ]"
+
+    let meta = "{\n"
+        + "  \"log_file\": \"" + log_path + "\",\n"
+        + "  \"line_count\": " + to_string(lines) + ",\n"
+        + "  \"size_bytes\": " + to_string(size) + ",\n"
+        + "  \"first_ts\": \"" + first + "\",\n"
+        + "  \"last_ts\": \"" + last + "\",\n"
+        + "  \"mtime\": \"" + mtime_str + "\",\n"
+        + "  \"updated_at\": \"" + now + "\",\n"
+        + "  \"archives\": " + archive_json + "\n"
+        + "}\n"
+
+    write_file(meta_path, meta)
+    println("  [META] " + meta_path + " 갱신")
+}

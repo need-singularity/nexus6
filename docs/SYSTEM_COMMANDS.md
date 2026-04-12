@@ -123,7 +123,7 @@ bash ~/Dev/nexus/tools/auto-commit-push.sh
 ├── shared/
 │   ├── n6/atlas.n6                    # 닫힘 원장 + 발견 로그 (통합)
 │   ├── cycle/
-│   │   ├── topology.jsonl             # topology points
+│   │   ├── topology_mk2.jsonl         # topology points (mk2)
 │   │   ├── edges.jsonl                # 그래프 edges
 │   │   └── halt                       # 정지 플래그
 │   ├── closure_quality_report.json    # 품질 분류
@@ -159,9 +159,9 @@ touch ~/Dev/nexus/shared/discovery/cycle/halt
 
 ### topology 너무 커지면 (디스크)
 ```bash
-# 백업 후 truncate
-mv shared/discovery/cycle/topology.jsonl shared/discovery/cycle/topology.jsonl.bak.$(date +%s)
-touch shared/discovery/cycle/topology.jsonl
+# 백업 후 truncate (mk2가 현재 SSOT)
+mv shared/discovery/cycle/topology_mk2.jsonl shared/discovery/cycle/topology_mk2.jsonl.bak.$(date +%s)
+touch shared/discovery/cycle/topology_mk2.jsonl
 ```
 
 ### verified_constants 되돌리기
