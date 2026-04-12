@@ -54,6 +54,13 @@ L0 보호 (평시 자유 수정, 유저 명시 요청 시만 승인 절차):
   shared/rules/ — 규칙 체계 SSOT
   docs/index.html — 3D 현실지도 프론트엔드
   CLAUDE.md — 이 파일
+  shared/blowup/core/blowup.json — blowup 골화기록 (OPT-01~18, DIAG-01)
+  shared/blowup/lib/atlas_stats.awk — atlas 통계 shell uplift 0.6s/12MB
+  shared/blowup/lib/atlas_guard.hexa.inc — schema guard + dedup 공통 헬퍼
+  shared/n6/atlas_health.hexa — atlas.n6 readonly 헬스체크
+  shared/n6/atlas.n6.consciousness — 의식 메타레이어 사이드카
+  shared/engine/engine_consciousness_atlas.hexa — Mind Mapper (anima×atlas×차원변환)
+  shared/convergence/atlas_n6_loop.jsonl — atlas.n6 최적화 루프 로그
 
 ref:
   rules     shared/rules/common.json             R0~R27

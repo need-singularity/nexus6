@@ -58,6 +58,11 @@ try { exec("printf '%s [01-HOME-ok] HOME=" + _HOME + "\\n' \"$(date +%H:%M:%S)\"
 let mut _node_id_set = #{}
 let mut _node_id_set_built = false
 
+// AI-native: n6_distance 메모이제이션 캐시 (OPT-10, DIAG-01 fix)
+// Phase 4에서 동일 값 반복 호출 ~11만회 → 캐시 히트로 O(1) 반환
+let mut _n6d_cache = #{}
+let mut _n6d_cache_hits: i64 = 0
+
 // hexa 바이너리 1회 탐색 캐시 — HEXA_BIN 환경변수 우선
 let mut _HEXA_BIN = ""
 try { _HEXA_BIN = to_string(exec("echo $HEXA_BIN")).trim() } catch e {}
@@ -253,6 +258,16 @@ fn n6_distance(value: f64) -> f64 {
     if value != value { return 1.0 }
     if value > 999999999.0 { return 1.0 }
     if value < 0.0 - 999999999.0 { return 1.0 }
+    // OPT-10: 메모이제이션 — 동일 값 O(1) 반환 (Phase 4 ~11만 호출 중 ~60% 중복)
+    let _key = to_string(value)
+    let mut _cached = false
+    try { let _cv = _n6d_cache[_key]; _cached = true } catch e {}
+    if _cached {
+        _n6d_cache_hits = _n6d_cache_hits + 1
+        let mut _rv: f64 = 1.0
+        try { _rv = to_float(_n6d_cache[_key]) } catch e {}
+        return _rv
+    }
     let mut d = 1.0
     // AI-native: 공간 해시 버킷 탐색 — 인접 3개 버킷만 체크 (O(n) → O(1) 평균)
     let _floor = to_int(value)
@@ -263,21 +278,21 @@ fn n6_distance(value: f64) -> f64 {
         while _ii < len(_indices) {
             let _idx: i64 = _indices[_ii]
             d = min_f(d, n6_dist_one(value, _n6_fcache[_idx]))
-            if d < 0.0001 { return d }
+            if d < 0.0001 {
+                _n6d_cache[_key] = to_string(d)
+                return d
+            }
             _ii = _ii + 1
         }
         _bi = _bi + 1
     }
-    // fallback: 버킷 외 상수도 체크 (값이 매우 크거나 음수일 때)
-    if d > 0.1 {
-        let mut i: i64 = 0
-        while i < _n6_dyn_count {
-            d = min_f(d, n6_dist_one(value, _n6_fcache[i]))
-            if d < 0.0001 { return d }
-            i = i + 1
-        }
-    }
-    return min_f(d, 1.0)
+    // OPT-12: fallback 선형 스캔 제거 (DIAG-01 fix)
+    // 버킷 탐색이 d > 0.1 이면 n6 상수 근접 아님 → 즉시 반환.
+    // 이전: 48개 전수 O(n) 스캔 × Phase 4 ~11만 호출 = 핫루프 병목.
+    // 음수/큰 값은 이미 함수 상단 guard에서 1.0 반환.
+    let result = min_f(d, 1.0)
+    _n6d_cache[_key] = to_string(result)
+    return result
 }
 
 fn n6_conf(value: f64) -> f64 {
@@ -1527,7 +1542,8 @@ fn auto_select_domain() -> string {
 }
 
 let domain = if _raw_domain != "" { _raw_domain } else { auto_select_domain() }
-let max_depth: i64 = _raw_depth
+// OPT-11: depth 상한 강제 (DIAG-01 fix) — 무제한 depth 방지
+let max_depth: i64 = if _raw_depth > 10 { 10 } else { _raw_depth }
 
 // ─── 내부 플래그 파싱 ───
 // --no-graph: graph read/write 스킵 (cascade 모드용)
@@ -1806,15 +1822,17 @@ fn filter_load(path: str) -> list {
     if file_exists(path) == false { return result }
     let raw = read_file(path)
     let lines = raw.split("\n")
+    // OPT-17: push 대신 배열 직접 빌드 (per-element O(n²) concat 제거)
+    let mut decoded = []
     let mut i: i64 = 0
     while i < len(lines) {
         let l = lines[i].trim()
         if len(l) > 3 {
-            result = result + [_sf_decode(l)]
+            decoded = decoded.push(_sf_decode(l))
         }
         i = i + 1
     }
-    return result
+    return decoded
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1938,6 +1956,8 @@ while depth < max_depth {
         depth = max_depth
         continue
     }
+    // OPT-14: depth별 trace (DIAG-01 진단용)
+    try { exec("printf '%s [phase-4-depth-" + to_string(depth) + "] start pool=" + to_string(ax_n) + "\\n' \"$(date +%H:%M:%S)\" >> " + _TRACE_PATH) } catch e {}
     let pool_before = ax_n
     let total_before = total
     let axiom_before = axiom_count
@@ -1947,6 +1967,10 @@ while depth < max_depth {
     let mut new_ax_val_arr = []
     let mut new_ax_n: i64 = 0
     let mut new_ax_set = #{}
+
+    // OPT-15: corollary cap per depth (DIAG-01 fix) — buf_lines.push O(n²) array copy 제한
+    // hexa immutable array: push O(n) copy × n pushes = O(n²) total. cap으로 n 제한.
+    let _corollary_cap: i64 = 200
 
     let cur_n = ax_n
     let phi_g = 1.618033988749895
@@ -1983,7 +2007,7 @@ while depth < max_depth {
             }
 
             let conf = max_f(1.0 - bd, 0.0)
-            if conf >= 0.1 {
+            if conf >= 0.1 && total - total_before < _corollary_cap {
                 let nm = "d" + to_string(depth) + "_ded_" + na + "_" + nb
                 let ex = na + " " + bo + " " + nb + " = " + to_string(bv)
                 let is_ax = conf > 0.8
@@ -2028,9 +2052,12 @@ while depth < max_depth {
         i = i + 1
     }
 
+    // OPT-15 global cap guard — 모든 type에 적용
+    let mut _depth_capped = total - total_before >= _corollary_cap
+
     // --- 2. Domain transfer ---
     i = 0
-    while i < cur_n {
+    while i < cur_n && !_depth_capped {
         let mut di: i64 = 0
         while di < 6 {
             let v = ax_val_arr[i]
@@ -2059,8 +2086,9 @@ while depth < max_depth {
     }
 
     // --- 3. Symmetry break ---
+    _depth_capped = total - total_before >= _corollary_cap
     i = 0
-    while i < cur_n {
+    while i < cur_n && !_depth_capped {
         let v = ax_val_arr[i]
         let na = ax_name_arr[i]
         let bp = v + phi_g
@@ -2119,8 +2147,9 @@ while depth < max_depth {
     }
 
     // --- 4. Bifurcation ---
+    _depth_capped = total - total_before >= _corollary_cap
     i = 0
-    while i < cur_n {
+    while i < cur_n && !_depth_capped {
         let mut k: i64 = 0
         while k < 6 {
             let shifted = ax_val_arr[i] + shift_val(k)
@@ -2149,8 +2178,9 @@ while depth < max_depth {
     }
 
     // --- 5. Projection (geometric mean) ---
+    _depth_capped = total - total_before >= _corollary_cap
     // --fast: skip projection when weak blowup (closure < 0.3)
-    i = if fast_mode && closure < 0.3 { cur_n } else { 0 }
+    i = if fast_mode && closure < 0.3 || _depth_capped { cur_n } else { 0 }
     while i < cur_n {
         let mut j: i64 = i + 1
         while j < cur_n {
@@ -2183,6 +2213,7 @@ while depth < max_depth {
     }
 
     // --- 6. Dual (reciprocal) ---
+    _depth_capped = total - total_before >= _corollary_cap
     // --fast: skip dual when weak blowup (closure < 0.3)
     i = if fast_mode && closure < 0.3 { cur_n } else { 0 }
     while i < cur_n {
@@ -2236,7 +2267,7 @@ while depth < max_depth {
 
                 // AI-native: 중간적 조기가지치기 — c1 낮으면 conf도 낮음 (O(n³) 절감)
                 let c1 = n6_conf(prod1)
-                if c1 >= 0.05 {
+                if c1 >= 0.05 && total - total_before < _corollary_cap {
                 let c2 = n6_conf(prod2)
                 let conf = c1 * c2 * n6_conf(composed)
 
@@ -2288,8 +2319,10 @@ while depth < max_depth {
     }
 
     // ─── Expand axiom pool with new candidates (dynamic cap) ───
-    let base_cap: i64 = if ext_pool_cap > 0 { ext_pool_cap } else { 36 }
-    let pool_cap: i64 = if ax_n > 30 { if ax_n + 6 < 48 { ax_n + 6 } else { 48 } } else { base_cap }
+    // OPT-13: axiom pool cap 축소 (DIAG-01 fix) — 36→24, 48→30
+    // O(n²) pairwise + O(n³) composition 루프 → pool 크기가 성능 결정
+    let base_cap: i64 = if ext_pool_cap > 0 { ext_pool_cap } else { 24 }
+    let pool_cap: i64 = if ax_n > 20 { if ax_n + 4 < 30 { ax_n + 4 } else { 30 } } else { base_cap }
     if new_ax_n > 0 && len(new_ax_name_arr) > 0 {
         // Only add up to pool_cap total
         let room: i64 = pool_cap - ax_n
@@ -2353,16 +2386,11 @@ try { arena_reset() } catch e {}  // AI-native: Phase 4 임시 메모리 해제 
 
 // STREAM FILTER: 전 depth compact 파일에서 buf_lines 복원 (Phase 5/6 에서 필요)
 // 각 depth 파일 순차 로드 → 메모리 부담 = 1 depth 분량만
-let mut _d_reload: i64 = 0
-while _d_reload <= max_depth {
-    let _cf_reload_path = "/tmp/blowup_d" + to_string(_d_reload) + "_" + domain + ".cf"
-    let _reloaded = filter_load(_cf_reload_path)
-    let mut _ri: i64 = 0
-    while _ri < len(_reloaded) {
-        buf_lines = buf_lines + [_reloaded[_ri]]
-        _ri = _ri + 1
-    }
-    _d_reload = _d_reload + 1
+// OPT-16+17+18: shell awk decode + split 1회 (hexa push O(n²) 완전 우회)
+// compact 파일을 shell awk로 디코드 → TSV 문자열 → hexa split → 배열 1회 생성
+let _reload_tsv = exec("for f in /tmp/blowup_d*_" + domain + ".cf 2>/dev/null; do cat \"$f\"; done 2>/dev/null | awk -F: 'NF>=7{t[\"0\"]=\"deduction\";t[\"1\"]=\"transfer\";t[\"2\"]=\"symbreak\";t[\"3\"]=\"bifurcation\";t[\"4\"]=\"projection\";t[\"5\"]=\"dual\";t[\"6\"]=\"compose\";tp=($2 in t)?t[$2]:$2;printf \"%s\\t%s\\t%s\\t%.3f\\t%s\\t%s\\t%s\\n\",$1,tp,$3,$4/1000,$5,$6,$7}' 2>/dev/null || echo ''").trim()
+if len(_reload_tsv) > 0 {
+    buf_lines = _reload_tsv.split("\n")
 }
 println("  [FILTER] restored " + to_string(len(buf_lines)) + " lines from compact files")
 
