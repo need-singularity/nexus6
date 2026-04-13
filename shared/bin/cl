@@ -81,17 +81,19 @@ auto_pick() {
 }
 
 show_dashboard() {
-    render_dashboard -1
+    CL_EOL="" render_dashboard -1
 }
 
 # render_dashboard <cursor_idx> — cursor_idx<0 이면 커서 표시 없음
+# CL_EOL 환경변수로 행 끝 ANSI 제어 시퀀스 주입 (인터랙티브: \033[K, 비대화형: 빈문자)
 render_dashboard() {
     local cursor="${1:--1}"
+    local eol="${CL_EOL-}"
     local active; active="$(current_active)"
     local names; names="$(jq -r '.accounts[].name' "$ACCOUNTS")"
-    printf "cl — Claude accounts    active=%s    store=%s\n" "${active:-none}" "$CL_HOME"
-    printf "    %-3s  %-10s  %4s  %-20s  %4s  %-20s  %s\n" "no" "name" "wk%" "[week_all]" "ss%" "[session]" "err"
-    echo   "    -------------------------------------------------------------------------------"
+    printf "cl — Claude accounts    active=%s    store=%s%s\n" "${active:-none}" "$CL_HOME" "$eol"
+    printf "    %-3s  %-10s  %4s  %-20s  %4s  %-20s  %s%s\n" "no" "name" "wk%" "[week_all]" "ss%" "[session]" "err" "$eol"
+    printf "    -------------------------------------------------------------------------------%s\n" "$eol"
     local i=0
     while IFS= read -r name; do
         [ -z "$name" ] && continue
@@ -111,12 +113,11 @@ render_dashboard() {
         elif [ "$i" -eq 9 ]; then num_label="0";
         else num_label="-"; fi
         if [ "$i" -eq "$cursor" ]; then
-            pointer="\033[7m▶ "
-            printf " ${pointer}%-3s %s%-10s  %3s%%  %s  %3s%%  %s  %s\033[0m\n" \
-                "$num_label" "$act_mark" "$name" "$wi" "$(bar $wi)" "$si" "$(bar $si)" "${err:-}"
+            printf " \033[7m▶ %-3s %s%-10s  %3s%%  %s  %3s%%  %s  %s\033[0m%s\n" \
+                "$num_label" "$act_mark" "$name" "$wi" "$(bar $wi)" "$si" "$(bar $si)" "${err:-}" "$eol"
         else
-            printf "    %-3s %s%-10s  %3s%%  %s  %3s%%  %s  %s\n" \
-                "$num_label" "$act_mark" "$name" "$wi" "$(bar $wi)" "$si" "$(bar $si)" "${err:-}"
+            printf "    %-3s %s%-10s  %3s%%  %s  %3s%%  %s  %s%s\n" \
+                "$num_label" "$act_mark" "$name" "$wi" "$(bar $wi)" "$si" "$(bar $si)" "${err:-}" "$eol"
         fi
         i=$((i+1))
     done <<< "$names"
@@ -156,18 +157,43 @@ cmd_interactive() {
     fi
 
     local total_lines=$(( count + 4 ))   # 헤더1 + 컬럼1 + 구분1 + n + 푸터1
-    local first=1 selected="" key
+    local first=1 selected="" key moved=0 idx footer
+
+    # 커서 숨김 + 종료 시 복원 (Ctrl-C 포함)
+    printf '\033[?25l'
+    trap 'printf "\033[?25h"' EXIT INT TERM
+
+    # 인터랙티브에서는 행 끝에 \033[K 주입 → 덮어쓸 때 잔존 문자 제거
+    local CL_EOL=$'\033[K'
+
     while true; do
-        if [ $first -eq 1 ]; then first=0; else printf '\033[%dA\033[J' "$total_lines"; fi
-        render_dashboard "$cursor"
-        printf "  ↑↓←→ 이동  Enter 선택  1-9/0 점프  q 취소  (그 외 키 → auto: %s)\n" "${auto:-none}"
+        if [ $first -eq 1 ]; then
+            first=0
+        else
+            # 커서만 위로 올리고 같은 자리에 덮어쓰기. \033[J 생략 → 깜빡임 없음.
+            printf '\033[%dA\r' "$total_lines"
+        fi
+        CL_EOL="$CL_EOL" render_dashboard "$cursor"
+
+        # 푸터 미리보기 — moved 전후 분기
+        if [ "$moved" -eq 0 ] && [ -n "$auto" ] && [ "${names[$cursor]}" != "$auto" ]; then
+            footer=$(printf "  ↑↓←→ 이동  Enter→%s  1-9/0 점프  q 취소  (그 외 → %s 추천)" \
+                "${names[$cursor]}" "$auto")
+        elif [ "$moved" -eq 0 ]; then
+            footer=$(printf "  ↑↓←→ 이동  Enter→%s  1-9/0 점프  q 취소  (그 외 → 추천)" \
+                "${names[$cursor]}")
+        else
+            footer=$(printf "  ↑↓←→ 이동  Enter→%s  1-9/0 점프  q 취소" \
+                "${names[$cursor]}")
+        fi
+        printf '%s\033[K\n' "$footer"
 
         key=$(read_key)
         case "$key" in
             $'\x1b[A'|$'\x1b[D'|$'\x1bOA'|$'\x1bOD')
-                cursor=$(( (cursor - 1 + count) % count )) ;;
+                cursor=$(( (cursor - 1 + count) % count )); moved=1 ;;
             $'\x1b[B'|$'\x1b[C'|$'\x1bOB'|$'\x1bOC')
-                cursor=$(( (cursor + 1) % count )) ;;
+                cursor=$(( (cursor + 1) % count )); moved=1 ;;
             "")  selected="${names[$cursor]}"; break ;;
             [1-9])
                 idx=$(( key - 1 ))
@@ -175,10 +201,21 @@ cmd_interactive() {
             0)
                 if [ "$count" -ge 10 ]; then selected="${names[9]}"; break; fi ;;
             q|Q|$'\x1b')
-                printf '\n취소\n'; return 1 ;;
-            *)  selected="${auto:-${names[$cursor]}}"; break ;;
+                printf '\n취소\n'
+                printf '\033[?25h'; trap - EXIT INT TERM
+                return 1 ;;
+            *)
+                # 한 번이라도 이동했으면 커서 위치 선택, 아니면 추천
+                if [ "$moved" -eq 1 ]; then
+                    selected="${names[$cursor]}"
+                else
+                    selected="${auto:-${names[$cursor]}}"
+                fi
+                break ;;
         esac
     done
+
+    printf '\033[?25h'; trap - EXIT INT TERM
 
     set_active "$selected"
     local dir; dir=$(config_dir_for "$selected")
@@ -240,11 +277,11 @@ cl — Claude Code multi-account launcher (nexus-managed)
   cl help
 
 대화형 키:
-  ↑↓←→     커서 이동
+  ↑↓←→     커서 이동 (이동 후엔 "그 외 키" 추천 진입 비활성 → 명시 선택만)
   Enter    커서 위치 선택
   1-9 / 0  번호 점프 (0 = 10번)
   q / ESC  취소
-  그 외     auto-pick 즉시 진입
+  그 외     auto-pick 즉시 진입 (단, 이동 전일 때만)
 
 Store: $CL_HOME
 USAGE
