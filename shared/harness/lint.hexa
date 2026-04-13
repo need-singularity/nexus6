@@ -902,6 +902,121 @@ fn check_n61_r2(path: string) -> string {
     return ""
 }
 
+// ─── N6-DAG-SYNC (n6-architecture) — frontmatter requires(to:) ↔ _dag.json edges sync ───
+// scope: papers/* or domains/* .md (canonical scope)
+// _dag.json 없으면 skip pass (build_dag 미실행 상태). 해당 도메인 노드가 없으면 error.
+fn check_n6_dag_sync(path: string) -> string {
+    if !_n6_canonical_in_scope(path) { return "" }
+    let full = REPO_ROOT + "/" + path
+    if _n6_canonical_exempt(full) { return "" }
+    let mk = to_int(_str(exec("grep -c '@allow-dag-sync' '" + full + "' 2>/dev/null || echo 0")).trim())
+    if mk > 0 { return "" }
+    let dag_path = REPO_ROOT + "/papers/_dag.json"
+    let dag_exists = _str(exec("[ -f '" + dag_path + "' ] && echo y || echo n")).trim()
+    if dag_exists != "y" { return "" }
+    // jq 가용성 확인
+    let has_jq = _str(exec("command -v jq >/dev/null 2>&1 && echo y || echo n")).trim()
+    if has_jq != "y" {
+        return "N6-DAG-SYNC|warn|jq 미설치 — DAG sync 검증 스킵 (// @allow-dag-sync)"
+    }
+    // 1. frontmatter domain 추출
+    let awk_dom = "awk 'NR==1 && /^---[[:space:]]*$/ { in_fm=1; next } in_fm && /^---[[:space:]]*$/ { exit } in_fm && /^[[:space:]]*domain:[[:space:]]*/ { sub(/^[[:space:]]*domain:[[:space:]]*/,\"\"); sub(/[[:space:]]*#.*$/,\"\"); sub(/[[:space:]]+$/,\"\"); gsub(/^[\"\\x27]|[\"\\x27]$/,\"\"); print; exit }' '" + full + "' 2>/dev/null"
+    let domain = _str(exec(awk_dom)).trim()
+    if domain == "" { return "" }
+    // 2. frontmatter to: 집합 (정렬 unique)
+    let awk_to = "awk 'NR==1 && /^---[[:space:]]*$/ { in_fm=1; next } in_fm && /^---[[:space:]]*$/ { exit } in_fm && /^[[:space:]]*-?[[:space:]]*to:[[:space:]]*/ { sub(/^[[:space:]]*-?[[:space:]]*to:[[:space:]]*/,\"\"); sub(/[[:space:]]*#.*$/,\"\"); sub(/[[:space:]]+$/,\"\"); gsub(/^[\"\\x27]|[\"\\x27]$/,\"\"); print }' '" + full + "' 2>/dev/null | sort -u"
+    let fm_to = _str(exec(awk_to)).trim()
+    // 3. _dag.json 에서 해당 domain 의 outgoing edges to 집합
+    let dag_to = _str(exec("jq -r --arg d '" + domain + "' '.edges[] | select(.from==$d) | .to' '" + dag_path + "' 2>/dev/null | sort -u")).trim()
+    // 4. nodes 에 domain 자체 존재 여부 — 양쪽 다 비어있을 때 노드 없음 판단에 사용
+    let node_exists = _str(exec("jq -r --arg d '" + domain + "' '[.nodes[] | select(.id==$d)] | length' '" + dag_path + "' 2>/dev/null")).trim()
+    if node_exists == "" || node_exists == "0" {
+        // 노드 없음. fm_to 도 비어있으면 양쪽 일치 (둘다 없음) → pass
+        if fm_to == "" { return "" }
+        return "N6-DAG-SYNC|error|" + domain + ": _dag.json nodes 에 노드 없음 / frontmatter requires 존재 → build_dag.hexa 재실행 필요 (// @allow-dag-sync)"
+    }
+    if fm_to == dag_to { return "" }
+    let fm_disp = fm_to.replace("\n", ",")
+    let dag_disp = dag_to.replace("\n", ",")
+    return "N6-DAG-SYNC|error|" + domain + ": frontmatter requires [" + fm_disp + "] ≠ _dag.json edges [" + dag_disp + "] — build_dag.hexa 재실행 필요 (// @allow-dag-sync)"
+}
+
+// ─── N6-DAG-DANGLE (n6-architecture) — _dag.json edges.to 가 실재 paper 로 resolve ───
+// scope: papers/_dag.json 이 staged 일 때만
+fn check_n6_dag_dangle(path: string) -> string {
+    if _project_name() != "n6-architecture" { return "" }
+    if path != "papers/_dag.json" { return "" }
+    let full = REPO_ROOT + "/" + path
+    let mk = to_int(_str(exec("grep -c '@allow-dag-dangle' '" + full + "' 2>/dev/null || echo 0")).trim())
+    if mk > 0 { return "" }
+    let has_jq = _str(exec("command -v jq >/dev/null 2>&1 && echo y || echo n")).trim()
+    if has_jq != "y" {
+        return "N6-DAG-DANGLE|warn|jq 미설치 — DAG dangle 검증 스킵 (// @allow-dag-dangle)"
+    }
+    // 모든 edges.to (unique)
+    let to_list = _str(exec("jq -r '.edges[].to' '" + full + "' 2>/dev/null | sort -u")).trim()
+    if to_list == "" { return "" }
+    let targets = to_list.split("\n")
+    let mut dangling: [string] = []
+    for t in targets {
+        let nm = _str(t).trim()
+        if nm == "" { continue }
+        // node id 매칭
+        let in_nodes = _str(exec("jq -r --arg d '" + nm + "' '[.nodes[] | select(.id==$d)] | length' '" + full + "' 2>/dev/null")).trim()
+        if in_nodes != "" && in_nodes != "0" { continue }
+        // papers/n6-<to>.md 존재
+        let p1 = REPO_ROOT + "/papers/n6-" + nm + ".md"
+        let e1 = _str(exec("[ -f '" + p1 + "' ] && echo y || echo n")).trim()
+        if e1 == "y" { continue }
+        // domains/**/<to>/<to>.md 존재
+        let p2_check = _str(exec("ls " + REPO_ROOT + "/domains/*/" + nm + "/" + nm + ".md 2>/dev/null | head -1")).trim()
+        if p2_check != "" { continue }
+        // domains/**/<to>.md 일반 매칭
+        let p3_check = _str(exec("find " + REPO_ROOT + "/domains -type f -name '" + nm + ".md' 2>/dev/null | head -1")).trim()
+        if p3_check != "" { continue }
+        dangling = dangling.push(nm)
+    }
+    if len(dangling) == 0 { return "" }
+    let mut disp = ""
+    let mut di: i64 = 0
+    for d in dangling {
+        if di > 0 { disp = disp + "," }
+        disp = disp + _str(d)
+        di = di + 1
+    }
+    return "N6-DAG-DANGLE|error|_dag.json: " + to_string(len(dangling)) + "개 dangling edge → " + disp + " (파일 없음 또는 nodes 누락) (// @allow-dag-dangle)"
+}
+
+// ─── N6-DAG-CYCLE (n6-architecture) — _dag.json edges 에 cycle 금지 ───
+fn check_n6_dag_cycle(path: string) -> string {
+    if _project_name() != "n6-architecture" { return "" }
+    if path != "papers/_dag.json" { return "" }
+    let full = REPO_ROOT + "/" + path
+    let mk = to_int(_str(exec("grep -c '@allow-dag-cycle' '" + full + "' 2>/dev/null || echo 0")).trim())
+    if mk > 0 { return "" }
+    let has_jq = _str(exec("command -v jq >/dev/null 2>&1 && echo y || echo n")).trim()
+    if has_jq != "y" {
+        return "N6-DAG-CYCLE|warn|jq 미설치 — DAG cycle 검증 스킵 (// @allow-dag-cycle)"
+    }
+    // 1) _meta.cycles 우선 사용 (build_dag 가 미리 계산)
+    let meta_cnt = _str(exec("jq -r '._meta.cycles | length // 0' '" + full + "' 2>/dev/null")).trim()
+    if meta_cnt != "" && meta_cnt != "0" {
+        // cycle 디스플레이 — 첫 3개
+        let disp = _str(exec("jq -r '._meta.cycles | .[0:3] | map(if type==\"array\" then join(\"→\") else tostring end) | join(\" / \")' '" + full + "' 2>/dev/null")).trim()
+        return "N6-DAG-CYCLE|error|_dag.json: cycle " + meta_cnt + "개 발견 → " + disp + " — 의존성 순환 불가 (// @allow-dag-cycle)"
+    }
+    // 2) _meta.cycles 없거나 비어있으면 직접 DFS — jq 로 토폴로지 시도
+    // tsort 가용 시 사용 (BSD/macOS 기본 포함)
+    let has_tsort = _str(exec("command -v tsort >/dev/null 2>&1 && echo y || echo n")).trim()
+    if has_tsort != "y" { return "" }
+    // edges 를 "from to\n" 페어로 출력
+    let pair_out = _str(exec("jq -r '.edges[] | \"\\(.from) \\(.to)\"' '" + full + "' 2>/dev/null | tsort 2>&1 1>/dev/null | head -3")).trim()
+    if pair_out == "" { return "" }
+    // tsort 의 cycle 메시지: "tsort: cycle in data"
+    if pair_out.index_of("cycle") < 0 { return "" }
+    return "N6-DAG-CYCLE|error|_dag.json: cycle 발견 → " + pair_out.replace("\n", " / ") + " — 의존성 순환 불가 (// @allow-dag-cycle)"
+}
+
 // ─── VP-M1 (n6-architecture) — ```python 블록에 'MISSING DATA' 금지 ───
 fn check_vp_m1(path: string) -> string {
     if !_n6_canonical_in_scope(path) { return "" }
@@ -1601,6 +1716,8 @@ for f in files {
         if n_r1 != "" { violations = violations.push(path + "|" + n_r1) }
         let n_r2 = check_n61_r2(path)
         if n_r2 != "" { violations = violations.push(path + "|" + n_r2) }
+        let n_dsync = check_n6_dag_sync(path)
+        if n_dsync != "" { violations = violations.push(path + "|" + n_dsync) }
         let n_vm1 = check_vp_m1(path)
         if n_vm1 != "" { violations = violations.push(path + "|" + n_vm1) }
         let n_vm2 = check_vp_m2(path)
@@ -1608,6 +1725,12 @@ for f in files {
         let n_jp = check_n6_jsonpair(path)
         if n_jp != "" { violations = violations.push(path + "|" + n_jp) }
     }
+
+    // ─── n6 DAG 무결성 (papers/_dag.json 전용) ───
+    let n_ddang = check_n6_dag_dangle(path)
+    if n_ddang != "" { violations = violations.push(path + "|" + n_ddang) }
+    let n_dcyc = check_n6_dag_cycle(path)
+    if n_dcyc != "" { violations = violations.push(path + "|" + n_dcyc) }
 
     // check_project_rules: shared/rules/<project>.lint.jsonl 자동 로드 + 디스패치
     let v17 = check_project_rules(path)
