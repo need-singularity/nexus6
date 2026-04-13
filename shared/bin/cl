@@ -1,0 +1,159 @@
+#!/bin/bash
+# shared/bin/cl — Claude Code multi-account launcher (nexus-managed, bash)
+# 독립 명령. 자동 계정 선택(week_all_pct 최저) + rate-limit 수동 재선택.
+#
+# Store: ~/.claude-accounts/
+#   accounts.json    {"accounts":[{"name","config_dir"}]}
+#   cl-state.json    {"active":"<name>"}
+#   usage-cache.json {"<name>":{week_all_pct,session_pct,error,resets}}
+#
+# Subcommands:
+#   cl              대시보드 (동일: cl u)
+#   cl u            usage bars
+#   cl status       간단 요약
+#   cl pick [NAME]  활성 계정 전환. NAME 없으면 week_all_pct 최저 자동
+#   cl env          현재 활성 계정의 CLAUDE_CONFIG_DIR export 라인 출력
+#   cl help
+#
+# AirGenome 기존 cl 은 hexa 기반으로 void-method 이슈로 깨짐.
+# 본 스크립트는 기존 코드 무시, 자동 선택 로직만 참고하여 재작성.
+
+set -euo pipefail
+
+CL_HOME="${CL_HOME:-$HOME/.claude-accounts}"
+ACCOUNTS="$CL_HOME/accounts.json"
+STATE="$CL_HOME/cl-state.json"
+USAGE="$CL_HOME/usage-cache.json"
+
+mkdir -p "$CL_HOME"
+
+# 1회성 seed — store 비어있으면 ~/.airgenome 에서 복사 (airgenome 의존 끊기 위한 이행 단계)
+seed_from_airgenome() {
+    local src="$HOME/.airgenome"
+    [ -d "$src" ] || return 0
+    [ ! -f "$ACCOUNTS" ] && [ -f "$src/accounts.json"   ] && cp "$src/accounts.json"   "$ACCOUNTS"   || true
+    [ ! -f "$STATE"    ] && [ -f "$src/cl-state.json"   ] && cp "$src/cl-state.json"   "$STATE"      || true
+    [ ! -f "$USAGE"    ] && [ -f "$src/usage-cache.json" ] && cp "$src/usage-cache.json" "$USAGE"     || true
+}
+seed_from_airgenome
+
+[ -f "$ACCOUNTS" ] || { echo "ERROR(cl): $ACCOUNTS 없음" >&2; exit 2; }
+command -v jq >/dev/null 2>&1 || { echo "ERROR(cl): jq 필요" >&2; exit 3; }
+
+current_active() {
+    jq -r '.active // empty' "$STATE" 2>/dev/null
+}
+
+set_active() {
+    local name="$1"
+    local tmp="$STATE.tmp.$$"
+    jq -n --arg a "$name" '{active:$a}' > "$tmp" && mv "$tmp" "$STATE"
+}
+
+config_dir_for() {
+    local name="$1"
+    jq -r --arg n "$name" '.accounts[] | select(.name == $n) | .config_dir' "$ACCOUNTS"
+}
+
+# pct(정수 0..100) → 20칸 바
+bar() {
+    local pct=${1:-0}
+    local filled=$(( (pct + 2) / 5 ))
+    [ $filled -gt 20 ] && filled=20
+    [ $filled -lt 0 ] && filled=0
+    local empty=$((20 - filled))
+    printf '%*s' "$filled" '' | tr ' ' '#'
+    printf '%*s' "$empty" '' | tr ' ' '.'
+}
+
+# usage-cache 에서 week_all_pct 최저(error=null, <95) 계정 선택
+auto_pick() {
+    [ -f "$USAGE" ] || { echo "" ; return; }
+    jq -r '
+        [to_entries[]
+            | select(.key != "_ts")
+            | select(.value.error == null)
+            | select((.value.week_all_pct // 100) < 95)
+            | {name:.key, wk:(.value.week_all_pct // 100)}]
+        | sort_by(.wk)
+        | .[0].name // empty
+    ' "$USAGE" 2>/dev/null
+}
+
+show_dashboard() {
+    local active; active="$(current_active)"
+    local names; names="$(jq -r '.accounts[].name' "$ACCOUNTS")"
+    printf "cl — Claude accounts    active=%s    store=%s\n" "${active:-none}" "$CL_HOME"
+    printf "  %-10s  %4s  %-20s  %4s  %-20s  %s\n" "name" "wk%" "[week_all]" "ss%" "[session]" "err"
+    echo "  ------------------------------------------------------------------------------"
+    while IFS= read -r name; do
+        [ -z "$name" ] && continue
+        local week sess err wi si marker
+        if [ -f "$USAGE" ]; then
+            week=$(jq -r --arg n "$name" '.[$n].week_all_pct // 0' "$USAGE" 2>/dev/null)
+            sess=$(jq -r --arg n "$name" '.[$n].session_pct // 0' "$USAGE" 2>/dev/null)
+            err=$(jq -r --arg n "$name" '.[$n].error // ""' "$USAGE" 2>/dev/null)
+        else
+            week=0; sess=0; err="no-cache"
+        fi
+        wi=$(printf '%.0f' "${week:-0}")
+        si=$(printf '%.0f' "${sess:-0}")
+        marker=" "
+        [ "$name" = "$active" ] && marker="*"
+        printf "%s %-10s  %3s%%  %s  %3s%%  %s  %s\n" \
+            "$marker" "$name" "$wi" "$(bar $wi)" "$si" "$(bar $si)" "${err:-}"
+    done <<< "$names"
+}
+
+show_status() {
+    local active; active="$(current_active)"
+    local count; count=$(jq '.accounts | length' "$ACCOUNTS")
+    echo "active: ${active:-none}"
+    echo "count : $count"
+    echo "store : $CL_HOME"
+}
+
+cmd_pick() {
+    local target="${1:-}"
+    if [ -z "$target" ]; then
+        target="$(auto_pick)"
+        [ -n "$target" ] || { echo "ERROR(cl): 가용 계정 없음 (모두 ≥95% 또는 error)" >&2; exit 1; }
+        echo "auto-pick: $target"
+    fi
+    local exists; exists=$(jq -r --arg n "$target" '.accounts[] | select(.name == $n) | .name' "$ACCOUNTS")
+    [ -n "$exists" ] || { echo "ERROR(cl): 계정 '$target' 없음" >&2; exit 1; }
+    set_active "$target"
+    local dir; dir=$(config_dir_for "$target")
+    echo "active → $target ($dir)"
+}
+
+cmd_env() {
+    local active; active="$(current_active)"
+    [ -n "$active" ] || { echo "ERROR(cl): active 없음. 'cl pick' 먼저" >&2; exit 1; }
+    local dir; dir=$(config_dir_for "$active")
+    [ -n "$dir" ] || { echo "ERROR(cl): '$active' config_dir 없음" >&2; exit 1; }
+    # eval "$(cl env)" 로 사용
+    printf 'export CLAUDE_CONFIG_DIR=%q\n' "$dir"
+}
+
+case "${1:-dashboard}" in
+    ""|u|dashboard) show_dashboard ;;
+    status)         show_status ;;
+    pick)           shift || true; cmd_pick "${1:-}" ;;
+    env)            cmd_env ;;
+    help|-h|--help)
+        cat <<USAGE
+cl — Claude Code multi-account launcher (nexus-managed)
+
+  cl              대시보드 (usage bars)
+  cl u            동일
+  cl status       요약
+  cl pick [NAME]  활성 계정 전환 (NAME 없으면 최저 week_all_pct 자동)
+  cl env          eval "\$(cl env)" → CLAUDE_CONFIG_DIR export
+  cl help
+
+Store: $CL_HOME
+USAGE
+        ;;
+    *) echo "ERROR(cl): unknown subcommand '$1' — 'cl help'" >&2; exit 64 ;;
+esac
