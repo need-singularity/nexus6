@@ -2,10 +2,10 @@
 
 commands: shared/config/commands.json — autonomous 블록으로 Claude Code가 작업 중 smash/free/todo/go/keep 자율 판단·실행
 rules: shared/rules/common.json (R0~R27) + shared/rules/n6-architecture.json (N61~N65)
-L0 Guard: `hexa ~/Dev/nexus/shared/harness/l0_guard.hexa <verify|sync|merge|status>`
+L0 Guard: `hexa $NEXUS/shared/harness/l0_guard.hexa <verify|sync|merge|status>`
 
 atlas.n6 — 현실지도 SSOT:
-  경로: /Users/ghost/Dev/nexus/shared/n6/atlas.n6 (단일 파일, 60K+ 줄)
+  경로: $NEXUS/shared/n6/atlas.n6 (단일 파일, 60K+ 줄)
   구 구조 폐기: reality_map_live.json / L6_n6atlas.json / 별도 level 파일 없음. 전부 atlas.n6 흡수
   포맷: `@R {id} = {measured} {unit} :: n6atlas [등급]`
   등급: [10*]=EXACT검증 [10]=EXACT [9]=NEAR [7]=EMPIRICAL(승격대상) [5~8]=중간 [N?]=CONJECTURE [N!]=breakthrough

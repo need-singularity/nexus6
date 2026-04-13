@@ -1620,7 +1620,7 @@ Create `launchd/com.nexus.cycle-tick.plist`:
         <string>singularity-tick</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>/Users/ghost/Dev/nexus</string>
+    <string>$NEXUS</string>
     <key>KeepAlive</key>
     <true/>
     <key>ThrottleInterval</key>

@@ -1187,7 +1187,7 @@ if __name__ == "__main__":
 
 - [ ] **Step 2: 드라이런 실행**
 
-Run: `cd /Users/ghost/Dev/nexus && python3 tools/migrate_grades_to_alien_index.py --dry-run`
+Run: `cd $NEXUS && python3 tools/migrate_grades_to_alien_index.py --dry-run`
 Expected: 매핑 통계 출력 (Mapped ~660+, Skipped ~27, r별 분포).
 
 - [ ] **Step 3: 실제 파일 생성**

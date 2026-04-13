@@ -87,7 +87,7 @@ Expected: 에러 없음
 
 - [ ] **Step 5: 루프 테스트**
 
-Run: `NEXUS_ROOT=/Users/ghost/Dev/nexus nexus loop --cycles 1 2>&1 | head -30`
+Run: `NEXUS_ROOT=$NEXUS nexus loop --cycles 1 2>&1 | head -30`
 Expected: [0/8] ~ [7/8] 모든 단계 출력
 
 - [ ] **Step 6: Commit**
@@ -352,7 +352,7 @@ Expected: 에러 없음
 
 - [ ] **Step 5: 테스트 (2회 제한)**
 
-Run: `NEXUS_ROOT=/Users/ghost/Dev/nexus nexus daemon --max-loops 1 --interval 0`
+Run: `NEXUS_ROOT=$NEXUS nexus daemon --max-loops 1 --interval 0`
 Expected: 1회 루프 실행 후 종료
 
 - [ ] **Step 6: Commit**
@@ -376,7 +376,7 @@ git commit -m "feat(daemon): 무한 자율 루프 데몬 모드 구현"
 # nexus-daemon.sh — LaunchAgent에서 호출하는 데몬 래퍼
 set -euo pipefail
 
-export NEXUS_ROOT="/Users/ghost/Dev/nexus"
+export NEXUS_ROOT="$NEXUS"
 export PATH="$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
 export HOME="${HOME:-/Users/ghost}"
 
@@ -439,7 +439,7 @@ cp ~/Library/LaunchAgents/com.n6.sync.nexus.plist \
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>/Users/ghost/Dev/nexus/scripts/nexus-daemon.sh</string>
+        <string>$NEXUS/scripts/nexus-daemon.sh</string>
     </array>
 
     <key>RunAtLoad</key>
@@ -467,7 +467,7 @@ cp ~/Library/LaunchAgents/com.n6.sync.nexus.plist \
         <key>PATH</key>
         <string>/usr/local/bin:/usr/bin:/bin:/Users/ghost/.cargo/bin:/Users/ghost/.local/bin</string>
         <key>NEXUS_ROOT</key>
-        <string>/Users/ghost/Dev/nexus</string>
+        <string>$NEXUS</string>
     </dict>
 </dict>
 </plist>

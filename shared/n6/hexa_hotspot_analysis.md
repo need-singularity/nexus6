@@ -2,7 +2,7 @@
 
 Date: 2026-04-12
 Status: ANALYSIS ONLY (no modifications)
-Binary: ~/Dev/hexa-lang/hexa (2026-04-12 00:18)
+Binary: $HEXA_LANG/hexa (2026-04-12 00:18)
 
 ## 1. Binary profile
 
@@ -34,11 +34,11 @@ The `shared/bin/hexa` referenced in the ROI item is a Bash wrapper, not the comp
 
 ```
 ~/.hx/bin/hexa (symlink)
-  -> ~/Dev/airgenome/nexus/shared/bin/hexa (Bash script, 152 lines)
+  -> $AIRGENOME/nexus/shared/bin/hexa (Bash script, 152 lines)
      -> L0 guard check (python3)
      -> Mac-only passthrough OR remote routing (ubu/hetzner)
      -> exec $LOCAL_HEXA "$@"
-        -> ~/Dev/hexa-lang/hexa (actual Rust binary, 6.6 MB)
+        -> $HEXA_LANG/hexa (actual Rust binary, 6.6 MB)
 ```
 
 There is also `shared/scripts/bin/hexa` (a lighter resolver) and `~/.hx/bin/hx` (the package manager).
@@ -162,7 +162,7 @@ If JIT is needed for compute-heavy workloads (bench_chi2, seed_engine), **Path A
 
 ## 7. Dependencies
 
-- Primary: hexa-lang project (`~/Dev/hexa-lang/`)
+- Primary: hexa-lang project (`$HEXA_LANG/`)
 - Cranelift: vendored as Rust dependency (cranelift-codegen crate)
 - Rule R12: src/*.rs changes require user explicit approval (L0 locked)
 - Rule R12 exception: self/*.hexa modifications are freely allowed

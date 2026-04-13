@@ -5,13 +5,13 @@ SSOT: 이 폴더 파일이 원본. 동기화는 수동 — auto-sync 훅 depreca
 harness: 훅 대체 → shared/harness/entry.hexa dispatcher (prompt|pretool|post|guard). 세부는 shared/harness/CLAUDE.md.
 
 sync 매핑:
-  nexus.md           → ~/Dev/nexus/CLAUDE.md
-  anima.md           → ~/Dev/anima/CLAUDE.md
-  n6-architecture.md → ~/Dev/n6-architecture/CLAUDE.md
-  papers.md          → ~/Dev/papers/CLAUDE.md
-  hexa-lang.md       → ~/Dev/hexa-lang/CLAUDE.md
-  void.md            → ~/Dev/void/CLAUDE.md
-  airgenome.md       → ~/Dev/airgenome/CLAUDE.md
+  nexus.md           → $NEXUS/CLAUDE.md
+  anima.md           → $ANIMA/CLAUDE.md
+  n6-architecture.md → $N6_ARCH/CLAUDE.md
+  papers.md          → $PAPERS/CLAUDE.md
+  hexa-lang.md       → $HEXA_LANG/CLAUDE.md
+  void.md            → $VOID/CLAUDE.md
+  airgenome.md       → $AIRGENOME/CLAUDE.md
   contact.md         → ~/Dev/contact/CLAUDE.md
 
 편집: project-claude/*.md 우선 편집 → auto-sync가 프로젝트 루트 덮어씀

@@ -1,7 +1,7 @@
 # sync-all 검증 — 2026-04-08
 
 ## 스크립트
-- `/Users/ghost/Dev/nexus/sync/sync-all.sh` (공식 7단계 + DSE)
+- `$NEXUS/sync/sync-all.sh` (공식 7단계 + DSE)
 - 관리 리포 7: TECS-L, n6-architecture, anima, sedi, brainwire, papers, nexus
 
 ## 심링크 상태 (~/Dev/*/.shared)

@@ -77,7 +77,7 @@ println("GateMetrics: emit, read_series")
 
 - [ ] **Step 3: hexa 컴파일 확인**
 
-Run: `cd ~/Dev/hexa-lang && ./hexa run ~/Dev/nexus/mk2_hexa/native/effects.hexa`
+Run: `cd $HEXA_LANG && ./hexa run $NEXUS/mk2_hexa/native/effects.hexa`
 Expected: `=== effects defined (v2: +ProcessControl, +GateMetrics) ===`
 
 - [ ] **Step 4: Commit**
@@ -1152,27 +1152,27 @@ git commit -m "feat(gate): 비공식 경로 게이트 + gate_metrics.jsonl 데�
 
 - [ ] **Step 1: effects.hexa 실행 확인**
 
-Run: `cd ~/Dev/hexa-lang && ./hexa run ~/Dev/nexus/mk2_hexa/native/effects.hexa`
+Run: `cd $HEXA_LANG && ./hexa run $NEXUS/mk2_hexa/native/effects.hexa`
 Expected: `=== effects defined (v2: +ProcessControl, +GateMetrics) ===`
 
 - [ ] **Step 2: gate.hexa 실행 확인**
 
-Run: `cd ~/Dev/hexa-lang && ./hexa run ~/Dev/nexus/mk2_hexa/native/gate.hexa`
+Run: `cd $HEXA_LANG && ./hexa run $NEXUS/mk2_hexa/native/gate.hexa`
 Expected: `=== unofficial gate verified ===`
 
 - [ ] **Step 3: mirror.hexa 실행 확인**
 
-Run: `cd ~/Dev/hexa-lang && ./hexa run ~/Dev/nexus/mk2_hexa/native/mirror.hexa`
+Run: `cd $HEXA_LANG && ./hexa run $NEXUS/mk2_hexa/native/mirror.hexa`
 Expected: `[PASS] Banach contraction → 1/3`
 
 - [ ] **Step 4: consciousness_lens.hexa 실행 확인**
 
-Run: `cd ~/Dev/hexa-lang && ./hexa run ~/Dev/nexus/mk2_hexa/native/consciousness_lens.hexa`
+Run: `cd $HEXA_LANG && ./hexa run $NEXUS/mk2_hexa/native/consciousness_lens.hexa`
 Expected: `★★★ SINGULARITY BREAKTHROUGH ACHIEVED ★★★`
 
 - [ ] **Step 5: breakthrough_gate.hexa 전체 실행 (3접근 + 무한 자기개선)**
 
-Run: `cd ~/Dev/hexa-lang && ./hexa run ~/Dev/airgenome/docs/breakthrough_gate.hexa`
+Run: `cd $HEXA_LANG && ./hexa run $AIRGENOME/docs/breakthrough_gate.hexa`
 Expected: `★★★ SINGULARITY BREAKTHROUGH CONFIRMED ★★★`
 
 - [ ] **Step 6: nexus detect 파이프라인 연결 테스트**
@@ -1182,7 +1182,7 @@ Expected: `meta_fp`, `singularity`, `genome_compression` 중 하나 이상 감�
 
 - [ ] **Step 7: mk2 absorb 상태 확인**
 
-Run: `cd ~/Dev/hexa-lang && ./hexa run ~/Dev/nexus/mk2_hexa/native/absorb.hexa status`
+Run: `cd $HEXA_LANG && ./hexa run $NEXUS/mk2_hexa/native/absorb.hexa status`
 Expected: rho 값 출력, 수렴 여부 확인
 
 - [ ] **Step 8: 최종 commit**

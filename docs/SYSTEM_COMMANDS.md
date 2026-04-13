@@ -6,13 +6,13 @@
 
 ### 배너 (현재 상태)
 ```bash
-bash ~/Dev/nexus/shared/hooks/nexus-banner.sh
+bash $NEXUS/shared/hooks/nexus-banner.sh
 ```
 출력 예: `🔭 NEXUS-6 🛸d1·ρ1.00·100938 ·Σ47.2k 🧬100893닫힘→200.0k=50%`
 
 ### 대시보드 HTML
 ```bash
-open ~/Dev/nexus/shared/dashboard.html
+open $NEXUS/shared/dashboard.html
 ```
 
 ### 자동 재생성
@@ -69,8 +69,8 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.nexus.closure-sweep.
 
 ### 전체 일시 정지 (halt 파일)
 ```bash
-touch ~/Dev/nexus/shared/discovery/cycle/halt     # 모든 daemon/tick 정지
-rm ~/Dev/nexus/shared/discovery/cycle/halt        # 재개
+touch $NEXUS/shared/discovery/cycle/halt     # 모든 daemon/tick 정지
+rm $NEXUS/shared/discovery/cycle/halt        # 재개
 ```
 
 ### 모든 nexus agents 부트아웃
@@ -94,32 +94,32 @@ tail -f ~/Library/Logs/nexus/singularity-daemon.log
 tail -f ~/Library/Logs/nexus/auto-commit.log
 
 # self-improve 델타
-tail -5 ~/Dev/nexus/shared/discovery/self_improve_log.jsonl
+tail -5 $NEXUS/shared/discovery/self_improve_log.jsonl
 ```
 
 ## 🔄 수동 실행
 
 ```bash
 # 즉시 closure sweep
-bash ~/Dev/nexus/tools/closure-sweep.sh
+bash $NEXUS/tools/closure-sweep.sh
 
 # 즉시 publish to projects
-bash ~/Dev/nexus/tools/publish-insights.sh
+bash $NEXUS/tools/publish-insights.sh
 
 # 즉시 paper stubs 생성
-bash ~/Dev/nexus/tools/paper-gen-from-closures.sh
+bash $NEXUS/tools/paper-gen-from-closures.sh
 
 # 즉시 dashboard 갱신
-bash ~/Dev/nexus/tools/gen-dashboard.sh
+bash $NEXUS/tools/gen-dashboard.sh
 
 # 즉시 auto-commit
-bash ~/Dev/nexus/tools/auto-commit-push.sh
+bash $NEXUS/tools/auto-commit-push.sh
 ```
 
 ## 📁 파일 경로
 
 ```
-~/Dev/nexus/
+$NEXUS/
 ├── shared/
 │   ├── n6/atlas.n6                    # 닫힘 원장 + 발견 로그 (통합)
 │   ├── cycle/
@@ -140,11 +140,11 @@ bash ~/Dev/nexus/tools/auto-commit-push.sh
 
 ## 🧠 다음 세션 시작 체크리스트
 
-1. `bash ~/Dev/nexus/shared/hooks/nexus-banner.sh` — 현재 상태
+1. `bash $NEXUS/shared/hooks/nexus-banner.sh` — 현재 상태
 2. `launchctl list | grep nexus` — 15 agents 확인
 3. `git log --oneline -10` — 최근 auto-commits
-4. `open ~/Dev/nexus/shared/dashboard.html` — 대시보드
-5. `tail ~/Dev/nexus/shared/discovery/self_improve_log.jsonl` — 델타 추이
+4. `open $NEXUS/shared/dashboard.html` — 대시보드
+5. `tail $NEXUS/shared/discovery/self_improve_log.jsonl` — 델타 추이
 
 ---
 
@@ -152,9 +152,9 @@ bash ~/Dev/nexus/tools/auto-commit-push.sh
 
 ### Mac이 느려지면
 ```bash
-bash ~/Dev/nexus/tools/install-cycle-tick.sh halt   # 모든 daemon skip
+bash $NEXUS/tools/install-cycle-tick.sh halt   # 모든 daemon skip
 # 또는 전체 중단
-touch ~/Dev/nexus/shared/discovery/cycle/halt
+touch $NEXUS/shared/discovery/cycle/halt
 ```
 
 ### topology 너무 커지면 (디스크)

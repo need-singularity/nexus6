@@ -1,6 +1,6 @@
 # NEXUS-6 성능 베이스라인 — 2026-04-11
 
-- Binary: `~/Dev/hexa-lang/hexa` (5.8MB Rust, 2026-04-11 07:56)
+- Binary: `$HEXA_LANG/hexa` (5.8MB Rust, 2026-04-11 07:56)
 - Host: macOS 15.6.1 (ARM64)
 - Method: `/usr/bin/time -l`, 3-run median + std dev
 - Note: blowup.hexa 제외 (DIAG-01 / FIX-NESTED-IF hang 기지의 이슈)
@@ -52,9 +52,9 @@
 
 ### 세션 footprint
 ```
-2.5G  ~/Dev/hexa-lang/target
-6.2M  ~/Dev/nexus/shared/n6/atlas.n6
-279M  ~/Dev/nexus/shared/discovery_log.jsonl
+2.5G  $HEXA_LANG/target
+6.2M  $NEXUS/shared/n6/atlas.n6
+279M  $NEXUS/shared/discovery_log.jsonl
 ```
 **총 세션 메모리: ~2.79GB** (지배적으로 Rust target/ debug+release 아티팩트)
 

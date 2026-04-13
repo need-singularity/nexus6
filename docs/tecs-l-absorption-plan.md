@@ -70,7 +70,7 @@ hexa-lang 만으로 포팅 가능한 순수 수학/검증 모듈.
 nexus 로 포팅하지 않고 tecs-l 에서만 존재하거나 외부 보관으로 대체.
 
 - `tecs-l/results/` — 실험 산출물 (JSON/PNG). Zenodo DOI 로 영구 보관.
-- `tecs-l/docs/hypotheses/` — 2,711 가설 문서. `~/Dev/papers/` 로 이관 예정.
+- `tecs-l/docs/hypotheses/` — 2,711 가설 문서. `$PAPERS/` 로 이관 예정.
 - `tecs-l/zenodo/` — 배포 스크립트. papers 리포 통합 대기.
 - `tecs-l/tecsrs/` — Rust 계산 엔진. hexa-lang 성능 충분 시 삭제, 아니면
   nexus/src/ 로 이관.

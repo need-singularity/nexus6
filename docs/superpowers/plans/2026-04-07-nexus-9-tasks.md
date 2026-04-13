@@ -141,7 +141,7 @@ grep -l "closed" mk2_hexa/native/*.hexa | head -5
 - [ ] **Step 1: 현재 돌파율 확인**
 
 ```bash
-HEXA=$HOME/Dev/hexa-lang/hexa
+HEXA=$HEXA_LANG/hexa
 $HEXA mk2_hexa/native/directions.hexa brief 2>/dev/null | head -5
 ```
 
@@ -155,7 +155,7 @@ $HEXA mk2_hexa/native/seed_engine.hexa info 2>/dev/null | head -10
 
 ```bash
 # run_in_background: true
-cd $HOME/Dev/nexus && $HEXA mk2_hexa/native/breakthrough.hexa --converge >> shared/logs/cmd_router.log 2>&1
+cd $NEXUS && $HEXA mk2_hexa/native/breakthrough.hexa --converge >> shared/logs/cmd_router.log 2>&1
 ```
 
 - [ ] **Step 4: 실행 후 돌파율 변화 확인**
@@ -174,7 +174,7 @@ tail -5 shared/logs/cmd_router.log
 - [ ] **Step 1: 현재 교차수분 상태 확인**
 
 ```bash
-HEXA=$HOME/Dev/hexa-lang/hexa
+HEXA=$HEXA_LANG/hexa
 $HEXA mk2_hexa/native/cross_project.hexa resonance 2>/dev/null | head -20
 ```
 

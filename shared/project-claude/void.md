@@ -2,7 +2,7 @@
 
 commands: shared/config/commands.json — autonomous 블록으로 Claude Code가 작업 중 smash/free/todo/go/keep 자율 판단·실행
 rules: shared/rules/common.json (R0~R27) + rules.json (VD1~VD5)
-L0 Guard: `hexa ~/Dev/nexus/shared/harness/l0_guard.hexa <verify|sync|merge|status>`
+L0 Guard: `hexa $NEXUS/shared/harness/l0_guard.hexa <verify|sync|merge|status>`
 SSoT: state.json. 참조 기준: macOS Terminal.app (iTerm2/kitty/Warp/Ghostty/Alacritty 제외 VD1)
 
 state files:
@@ -20,7 +20,7 @@ layers (L1=OS브릿지 5골화, L2=VT파서 6골화, L3=앱+이벤트 5골화, �
   L2_term: smoke_*.hexa — VT파서/스크린버퍼/UTF-8/SGR/CSI/OSC
   L3_app:  smoke_app_entry.hexa, smoke_interactive.hexa — 엔트리+이벤트루프+drawRect
 
-build: ~/Dev/hexa-lang/hexa run ~/Dev/hexa-lang/self/build_c.hexa src/smoke_XXX.hexa src/sys_pty.c src/sys_appkit.m -framework Cocoa   (stage1 CLI 반영, 2026-04-13~)
+build: $HEXA_LANG/hexa run $HEXA_LANG/self/build_c.hexa src/smoke_XXX.hexa src/sys_pty.c src/sys_appkit.m -framework Cocoa   (stage1 CLI 반영, 2026-04-13~)
 blocker: VB1 — native build_c 45분 timeout (self-compile 병목)
 
 next (void_main.hexa): drawRect→screen buffer Core Text 렌더, persistent event loop, key→PTY→VT→screen→drawRect 파이프라인, OSC 0 title passthrough
@@ -31,6 +31,6 @@ ref:
   lockdown     shared/rules/lockdown.json     L0/L1/L2
   convergence  shared/convergence/void.json   19건 골화
   state        state.json                     SSoT
-  compiler     ~/Dev/hexa-lang/hexa
-  build_c      ~/Dev/hexa-lang/self/build_c.hexa
+  compiler     $HEXA_LANG/hexa
+  build_c      $HEXA_LANG/self/build_c.hexa
   archived     ~/archive/void_20260411_pre_terminalapp/

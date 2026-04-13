@@ -319,6 +319,190 @@ fn check_cmds_hardcoded(path: string) -> string {
     return ""
 }
 
+// ─── H-CMD-DRIFT / H-CMD-SCHEMA / H-CMD-DEAD — commands.json SSOT 드리프트 ───
+// 트리거: 대상 파일 목록에 shared/config/commands.json 포함 시 1회만 호출.
+// 비용 절감: jq 가용 시만 동작 (없으면 silent skip).
+// 반환: "rule|severity|message" 라인을 \n 으로 join (0~N건). 없으면 "".
+
+fn _hcmd_jq_available() -> bool {
+    let has_jq = _str(exec("command -v jq >/dev/null 2>&1 && echo y || echo n")).trim()
+    if has_jq == "y" { return true }
+    return false
+}
+
+// commands[*] 키 목록 (한 줄 당 1개). commands 없으면 "".
+fn _hcmd_keys(cj: string) -> string {
+    return _str(exec("jq -r '.commands | keys[]' '" + cj + "' 2>/dev/null")).trim()
+}
+
+// H-CMD-DRIFT: 키워드 교집합 > 0 검출
+fn check_cmd_drift(cj: string) -> string {
+    if !_hcmd_jq_available() { return "" }
+    // "cmd|keyword" 라인 전체 추출 후 awk 로 중복 keyword 집계
+    let cmd = "jq -r '.commands | to_entries[] | .key as $k | (.value.keywords // []) | .[] | \"\\($k)|\\(.)\"' '" + cj + "' 2>/dev/null | awk -F'|' '{cnt[$2]++; if(cnt[$2]==1) owners[$2]=$1; else owners[$2]=owners[$2]\",\"$1} END{for(k in cnt) if(cnt[k]>1) print k\"|\"owners[k]}'"
+    let raw = _str(exec(cmd)).trim()
+    if raw == "" { return "" }
+    let mut out = ""
+    let lines = raw.split("\n")
+    for ln in lines {
+        let l = _str(ln).trim()
+        if l == "" { continue }
+        let bar = l.index_of("|")
+        if bar < 0 { continue }
+        let kw = l.substring(0, bar)
+        let owners = l.substring(bar + 1, len(l))
+        if out != "" { out = out + "\n" }
+        out = out + "H-CMD-DRIFT|error|H-CMD-DRIFT: keyword \"" + kw + "\" duplicated in [" + owners + "]"
+    }
+    return out
+}
+
+// H-CMD-SCHEMA: 필수 필드 description/action/keywords + format_preset 참조 유효성
+fn check_cmd_schema(cj: string) -> string {
+    if !_hcmd_jq_available() { return "" }
+    let keys = _hcmd_keys(cj)
+    if keys == "" { return "" }
+    let mut out = ""
+    let names = keys.split("\n")
+    for nm in names {
+        let k = _str(nm).trim()
+        if k == "" { continue }
+        let cmd = "jq -r --arg k '" + k + "' '.commands[$k] | \"\\(if has(\"description\") then 1 else 0 end)|\\(if has(\"action\") then 1 else 0 end)|\\(if has(\"keywords\") then 1 else 0 end)|\\(.format_preset // \"\")\"' '" + cj + "' 2>/dev/null"
+        let r = _str(exec(cmd)).trim()
+        if r == "" { continue }
+        let parts = r.split("|")
+        if len(parts) < 4 { continue }
+        let has_desc = _str(parts[0])
+        let has_action = _str(parts[1])
+        let has_kw = _str(parts[2])
+        let fp = _str(parts[3])
+        if has_desc == "0" {
+            if out != "" { out = out + "\n" }
+            out = out + "H-CMD-SCHEMA|error|H-CMD-SCHEMA: command \"" + k + "\" missing field \"description\""
+        }
+        if has_action == "0" {
+            if out != "" { out = out + "\n" }
+            out = out + "H-CMD-SCHEMA|error|H-CMD-SCHEMA: command \"" + k + "\" missing field \"action\""
+        }
+        if has_kw == "0" {
+            if out != "" { out = out + "\n" }
+            out = out + "H-CMD-SCHEMA|error|H-CMD-SCHEMA: command \"" + k + "\" missing field \"keywords\""
+        }
+        if fp != "" && fp != "null" {
+            let exist = _str(exec("jq -r --arg p '" + fp + "' '(.format_presets // {}) | has($p) | tostring' '" + cj + "' 2>/dev/null")).trim()
+            if exist != "true" {
+                if out != "" { out = out + "\n" }
+                out = out + "H-CMD-SCHEMA|error|H-CMD-SCHEMA: command \"" + k + "\" format_preset \"" + fp + "\" not defined in format_presets"
+            }
+        }
+    }
+    return out
+}
+
+// H-CMD-DEAD: auto.hit_count==0 이고 updated 로부터 30일 경과 (file mtime 또는 .updated)
+// rules_usage.jsonl 미존재 시 skip (silent).
+fn check_cmd_dead(cj: string) -> string {
+    if !_hcmd_jq_available() { return "" }
+    let usage = NEXUS_HARNESS + "/rules_usage.jsonl"
+    if !file_exists(usage) { return "" }
+    // 기준 시각: commands.json .updated 필드 (YYYY-MM-DD) 또는 file mtime
+    let now_s = _str(exec("date +%s")).trim()
+    let now = _to_int0(now_s)
+    let upd = _str(exec("jq -r '.updated // \"\"' '" + cj + "' 2>/dev/null")).trim()
+    let mut base_ts: i64 = 0
+    if upd != "" {
+        let ts_s = _str(exec("date -j -f '%Y-%m-%d' '" + upd + "' +%s 2>/dev/null || date -d '" + upd + "' +%s 2>/dev/null")).trim()
+        base_ts = _to_int0(ts_s)
+    }
+    if base_ts == 0 {
+        let mt_s = _str(exec("stat -f '%m' '" + cj + "' 2>/dev/null || stat -c '%Y' '" + cj + "' 2>/dev/null")).trim()
+        base_ts = _to_int0(mt_s)
+    }
+    if base_ts == 0 { return "" }
+    let elapsed = now - base_ts
+    let thirty_days: i64 = 2592000
+    if elapsed < thirty_days { return "" }
+    // hit_count==0 명령 목록
+    let cmd = "jq -r '.commands | to_entries[] | select((.value.auto.hit_count // -1) == 0) | .key' '" + cj + "' 2>/dev/null"
+    let raw = _str(exec(cmd)).trim()
+    if raw == "" { return "" }
+    let mut out = ""
+    let names = raw.split("\n")
+    for nm in names {
+        let k = _str(nm).trim()
+        if k == "" { continue }
+        if out != "" { out = out + "\n" }
+        out = out + "H-CMD-DEAD|warn|H-CMD-DEAD: command \"" + k + "\" dormant 0 hit for 30+ days → bitter-gate audit 후보"
+    }
+    return out
+}
+
+// 통합: 3 룰 실행 후 멀티라인 합치기 (violations push 에 사용)
+fn run_cmd_checks(cj_rel: string) -> string {
+    let cj = REPO_ROOT + "/" + cj_rel
+    if !file_exists(cj) { return "" }
+    let a = check_cmd_drift(cj)
+    let b = check_cmd_schema(cj)
+    let c = check_cmd_dead(cj)
+    let mut out = ""
+    if a != "" { out = a }
+    if b != "" { if out != "" { out = out + "\n" }; out = out + b }
+    if c != "" { if out != "" { out = out + "\n" }; out = out + c }
+    return out
+}
+
+// ─── H-PROJ-HARDCODE (warn) — projects.json SSOT 프로젝트 이름 하드코딩 검출 ───
+// Why: 프로젝트 이름 5개 이상 동시 하드코딩 시 projects.json 드리프트. SSOT 동적 로드 강제.
+// 대상 확장자: .json/.jsonl/.md/.hexa. 제외: projects.json/nexus-projects.json 본체.
+// 동적 추출: `jq '.projects | keys'` — 룰 자체가 프로젝트 이름 하드코딩이면 irony.
+
+fn _hproj_available() -> bool {
+    let has_jq = _str(exec("command -v jq >/dev/null 2>&1 && echo y || echo n")).trim()
+    if has_jq == "y" { return true }
+    return false
+}
+
+// projects.json 에서 프로젝트 이름 개행 구분 리스트 (실패 시 "").
+fn _hproj_names() -> string {
+    if !_hproj_available() { return "" }
+    let pj = REPO_ROOT + "/shared/config/projects.json"
+    if !file_exists(pj) { return "" }
+    return _str(exec("jq -r '.projects | keys | .[]' '" + pj + "' 2>/dev/null")).trim()
+}
+
+fn check_proj_hardcode(path: string) -> string {
+    let e = ext_of(path)
+    if e != ".json" && e != ".jsonl" && e != ".md" && e != ".hexa" { return "" }
+    // SSOT 본체 skip
+    if path == "shared/config/projects.json" { return "" }
+    if path == "shared/config/nexus-projects.json" { return "" }
+    let names = _hproj_names()
+    if names == "" { return "" }
+    let full = REPO_ROOT + "/" + path
+    if !file_exists(full) { return "" }
+    let mut content = ""
+    try { content = read_file(full) } catch e {}
+    if content == "" { return "" }
+    // 룰 자기참조 skip (lint.hexa 자체 등)
+    if content.index_of("H-PROJ-HARDCODE") >= 0 { return "" }
+    let mut hits = 0
+    let mut matched = ""
+    let plist = names.split("\n")
+    for nm in plist {
+        let n = _str(nm).trim()
+        if n == "" { continue }
+        if content.index_of(n) >= 0 {
+            hits = hits + 1
+            if matched == "" { matched = n } else { matched = matched + "," + n }
+            if hits >= 5 {
+                // 짧은 파일 최적화: 5+ 즉시 반환
+                return "H-PROJ-HARDCODE|warn|H-PROJ-HARDCODE: " + path + " contains 5+ project names hardcoded [" + matched + "] → reference shared/config/projects.json"
+            }
+        }
+    }
+    return ""
+}
+
 // ─── Check R34: 로드맵 최소 경로 문법 ───
 // 대상: roadmap*.json | */roadmaps/*.json | *.roadmap.json
 // 금지 키: depends_on/deps/priority/weight/roi/est/val/phases/tracks/gate_exit/
@@ -1345,6 +1529,84 @@ fn check_h_noblock(path: string) -> string {
     return ""
 }
 
+// ─── H-NOARCHIVE (공통) — 신규 archive/backup 파일·폴더 생성 금지 ───
+// Why: 사용자 정책 — *.bak / *.backup / *.old / archive/ / backup/ 별도 사본 금지.
+//      git history/branch/tag 가 단일 진실. 별도 사본은 drift 원인.
+// 우회: '@allow-archive' 토큰 또는 'NEXUS_ARCHIVE_OK=1' envvar prefix.
+// 격리 예외 (이미 합의된 archaeological 공간): /shared/backups/, /shared/archive/, /shared/discovery/archive/, /archive/deprecated_json/
+fn check_h_noarchive(path: string) -> string {
+    let e = ext_of(path)
+    if e != ".hexa" && e != ".sh" { return "" }
+    if path.index_of("/shared/backups/") >= 0 { return "" }
+    if path.index_of("/shared/archive/") >= 0 { return "" }
+    if path.index_of("/shared/discovery/archive/") >= 0 { return "" }
+    if path.index_of("/archive/deprecated_json/") >= 0 { return "" }
+    let full = REPO_ROOT + "/" + path
+    if !file_exists(full) { return "" }
+    let mut content = ""
+    try { content = read_file(full) } catch e {}
+    if content == "" { return "" }
+    if content.index_of("@allow-archive") >= 0 { return "" }
+    if content.index_of("NEXUS_ARCHIVE_OK=1") >= 0 { return "" }
+    if content.index_of("check_h_noarchive") >= 0 { return "" }
+    if content.index_of("check_no_archive_") >= 0 { return "" }
+    if content.index_of("H-NOARCHIVE") >= 0 { return "" }
+
+    let mut hits = 0
+    let mut kinds = ""
+    let mk_hits = _to_int0(_str(exec("awk '/mkdir[[:space:]]+(-p[[:space:]]+)?(backup|backups|archive|archives)([[:space:]]|$|\\/)/{c++} END{print c+0}' '" + full + "' 2>/dev/null")).trim())
+    if mk_hits > 0 { hits = hits + 1; kinds = kinds + "mkdir-archive(" + to_string(mk_hits) + ") " }
+    let cp_hits = _to_int0(_str(exec("awk '/(cp|mv|rsync)[[:space:]]+[^|;&]+[.](bak|backup|old|orig)([[:space:]]|$)/{c++} END{print c+0}' '" + full + "' 2>/dev/null")).trim())
+    if cp_hits > 0 { hits = hits + 1; kinds = kinds + "cp-bak(" + to_string(cp_hits) + ") " }
+    let wf_hits = _to_int0(_str(exec("awk '/(write_file|append_file)\\([^,]*[.](bak|backup|old|orig)/{c++} END{print c+0}' '" + full + "' 2>/dev/null")).trim())
+    if wf_hits > 0 { hits = hits + 1; kinds = kinds + "write-bak(" + to_string(wf_hits) + ") " }
+    let tar_hits = _to_int0(_str(exec("awk '/(backup|archive)[._-](tar|tgz|zip)/{c++} END{print c+0}' '" + full + "' 2>/dev/null")).trim())
+    if tar_hits > 0 { hits = hits + 1; kinds = kinds + "tar-archive(" + to_string(tar_hits) + ") " }
+    if hits > 0 {
+        return "H-NOARCHIVE|warn|archive/backup 파일·폴더 생성 패턴 감지: " + kinds.trim() + "— git commit/branch/tag 사용. 격리 예외: shared/backups/, shared/archive/. 우회: '// @allow-archive' 또는 NEXUS_ARCHIVE_OK=1 prefix"
+    }
+    return ""
+}
+
+// ─── H-NOARCHIVE (공통) — 신규 archive/backup 파일·폴더 생성 금지 ───
+// Why: 사용자 정책 — *.bak / *.backup / *.old / archive/ / backup/ 별도 사본 금지.
+//      git history/branch/tag 가 단일 진실. 별도 사본은 drift 원인.
+// 우회: '@allow-archive' 토큰 또는 'NEXUS_ARCHIVE_OK=1' envvar prefix.
+// 격리 예외: shared/backups/, shared/archive/, shared/discovery/archive/, archive/deprecated_json/
+fn check_h_noarchive(path: string) -> string {
+    let e = ext_of(path)
+    if e != ".hexa" && e != ".sh" { return "" }
+    if path.index_of("shared/backups/") >= 0 { return "" }
+    if path.index_of("shared/archive/") >= 0 { return "" }
+    if path.index_of("shared/discovery/archive/") >= 0 { return "" }
+    if path.index_of("archive/deprecated_json/") >= 0 { return "" }
+    let full = REPO_ROOT + "/" + path
+    if !file_exists(full) { return "" }
+    let mut content = ""
+    try { content = read_file(full) } catch e {}
+    if content == "" { return "" }
+    if content.index_of("@allow-archive") >= 0 { return "" }
+    if content.index_of("NEXUS_ARCHIVE_OK=1") >= 0 { return "" }
+    if content.index_of("check_h_noarchive") >= 0 { return "" }
+    if content.index_of("check_no_archive_") >= 0 { return "" }
+    if content.index_of("H-NOARCHIVE") >= 0 { return "" }
+
+    let mut hits = 0
+    let mut kinds = ""
+    let mk_hits = _to_int0(_str(exec("awk '/mkdir[[:space:]]+(-p[[:space:]]+)?(backup|backups|archive|archives)([[:space:]]|$|\\/)/{c++} END{print c+0}' '" + full + "' 2>/dev/null")).trim())
+    if mk_hits > 0 { hits = hits + 1; kinds = kinds + "mkdir-archive(" + to_string(mk_hits) + ") " }
+    let cp_hits = _to_int0(_str(exec("awk '/(cp|mv|rsync)[[:space:]]+[^|;&]+[.](bak|backup|old|orig)([[:space:]]|$)/{c++} END{print c+0}' '" + full + "' 2>/dev/null")).trim())
+    if cp_hits > 0 { hits = hits + 1; kinds = kinds + "cp-bak(" + to_string(cp_hits) + ") " }
+    let wf_hits = _to_int0(_str(exec("awk '/(write_file|append_file)\\([^,]*[.](bak|backup|old|orig)/{c++} END{print c+0}' '" + full + "' 2>/dev/null")).trim())
+    if wf_hits > 0 { hits = hits + 1; kinds = kinds + "write-bak(" + to_string(wf_hits) + ") " }
+    let tar_hits = _to_int0(_str(exec("awk '/(backup|archive)[._-](tar|tgz|zip)/{c++} END{print c+0}' '" + full + "' 2>/dev/null")).trim())
+    if tar_hits > 0 { hits = hits + 1; kinds = kinds + "tar-archive(" + to_string(tar_hits) + ") " }
+    if hits > 0 {
+        return "H-NOARCHIVE|warn|archive/backup 파일·폴더 생성 패턴 감지: " + kinds.trim() + "— git commit/branch/tag 사용. 격리 예외: shared/backups/, shared/archive/. 우회: '// @allow-archive' 또는 NEXUS_ARCHIVE_OK=1 prefix"
+    }
+    return ""
+}
+
 // ─── H-HEXA-EXIT (공통) — hexa 호출의 exit() 가 부모로 전파 안 됨 ───
 // Why: hexa 런타임 한계로 child script 의 exit(N) 이 부모 exec() 결과에 N 으로 전파되지 않음.
 // 예: health.hexa atlas → atlas_health.hexa 의 exit(1) WARN 이 0 으로 관측됨.
@@ -2259,25 +2521,31 @@ fn check_hardcoded_path(path: string) -> string {
 }
 
 // ─── Check 8b (공통): hardcoded dev path 금지 (warn) ───
-// 원칙: ~/Dev/, /Users/<u>/Dev/, /home/<u>/Dev/ 리터럴 금지. $HOME/Dev/<proj>/ 사용.
-// 적용: .json / .md (데이터/안내문). .hexa 코드의 env("HOME") + "/Dev/" 패턴은 ABSPATH 가 별도 처리.
-// Why: 사용자 지시 2026-04-14 — 데이터/문서 응답에서 ~/Dev/ 노출 회피, 변수 사용 강제.
-// 예외: archive/, harness 자신, append-only 로그, // @allow-devpath (라인 단위)
+// 원칙: ~/Dev/<proj>/, /Users/<u>/Dev/<proj>/, /home/<u>/Dev/<proj>/, $HOME/Dev/<proj>/ 리터럴 금지.
+//        프로젝트 변수 사용: $NEXUS / $ANIMA / $HEXA_LANG / $N6_ARCH / $AIRGENOME / $VOID / $PAPERS
+//        (~/.zshrc 정의, hexa 자식 프로세스에 환경 상속됨)
+// 적용: .json / .jsonl / .md / .hexa / .sh (데이터/문서/코드 string literal).
+//        .hexa 코드의 `env("HOME") + "/Dev/<proj>"` 패턴도 string literal "/Dev/<proj>" 로 검출됨.
+// Why: 사용자 지시 2026-04-14 — 데이터/문서/코드 모두 ~/Dev/ 노출 회피, 프로젝트 변수 강제.
+// 예외: archive/, lint.hexa 자신, append-only 로그, // @allow-devpath, .zshrc 정의 라인
 fn check_devpath(path: string) -> string {
     let e = ext_of(path)
-    if e != ".json" && e != ".md" { return "" }
+    if e != ".json" && e != ".jsonl" && e != ".md" && e != ".hexa" && e != ".sh" { return "" }
     if path.starts_with("archive/") { return "" }
     if path.index_of("/_archive/") >= 0 { return "" }
     if path.index_of("/archive/") >= 0 { return "" }
     if path == "shared/harness/lint.hexa" { return "" }
     let bn = basename_of(path)
-    if bn == "mistakes.jsonl" || bn == "lint_log.jsonl" { return "" }
+    if bn == "mistakes.jsonl" || bn == "lint_log.jsonl" || bn == "gc_log.jsonl" { return "" }
+    if bn == "rules_usage.jsonl" || bn == "autofix_proposals.jsonl" || bn == "cleanup_log.jsonl" { return "" }
+    if bn == "lockdown_log.jsonl" || bn == "errors.jsonl" || bn == "sync_log.jsonl" { return "" }
     let full = REPO_ROOT + "/" + path
-    // 검출: ~/Dev/, /Users/<u>/Dev/, /home/<u>/Dev/
-    let cmd = "grep -nE '(~|/Users/[A-Za-z0-9_.-]+|/home/[A-Za-z0-9_.-]+)/Dev/' '" + full + "' 2>/dev/null | grep -v '@allow-devpath' | wc -l"
+    // 검출: (~|$HOME|${HOME}|/Users/<u>|/home/<u>)/Dev/(화이트리스트 프로젝트)
+    //   .hexa 코드의 `"/Dev/nexus/"` string literal 도 /Dev/nexus 로 잡힘
+    let cmd = "grep -nE '(~|/Users/[A-Za-z0-9_.-]+|/home/[A-Za-z0-9_.-]+|\\$HOME|\\$\\{HOME\\})/Dev/(nexus|anima|hexa-lang|n6-architecture|airgenome|void|papers)' '" + full + "' 2>/dev/null | grep -v '@allow-devpath' | wc -l"
     let hit = _to_int0(_str(exec(cmd)).trim())
     if hit > 0 {
-        return "H-DEVPATH|warn|hardcoded dev path " + to_string(hit) + "건 — $HOME/Dev/<proj>/ 사용 (// @allow-devpath)"
+        return "H-DEVPATH|warn|hardcoded dev path " + to_string(hit) + "건 — $NEXUS / $ANIMA / $HEXA_LANG / $N6_ARCH / $AIRGENOME / $VOID / $PAPERS 변수 사용 (// @allow-devpath)"
     }
     return ""
 }
@@ -2369,12 +2637,9 @@ fn _vparse_l0_hexa_paths(project: string) -> string {
 }
 
 // 단일 L0 .hexa 파일 parse 검사. 반환: (rel_path, pe_count) — pe>0 이면 실패.
-// `// @allow-parse-fail` 마커가 파일 앞쪽(head 5줄)에 있으면 PASS 로 처리 (archive/폐기 경로).
 fn _vparse_one(rel: string) -> string {
     let abs = REPO_ROOT + "/" + rel
     if !file_exists(abs) { return rel + "|MISSING" }
-    let head = _str(exec("head -5 '" + abs + "' 2>/dev/null"))
-    if head.contains("@allow-parse-fail") { return rel + "|0" }
     let HEXA = HOME + "/Dev/hexa-lang/hexa"
     // `grep -c 'Parse error'` — _to_int0 로 첫 줄만 파싱 (안전)
     let pe_raw = _str(exec(HEXA + " '" + abs + "' 2>&1 < /dev/null | awk '/Parse error/{c++} END{print c+0}'")).trim()
@@ -2513,6 +2778,27 @@ if vp != "" {
     violations = violations.push("shared/lockdown/L0-hexa-paths|" + vp)
 }
 
+// ─── H-CMD-{DRIFT,SCHEMA,DEAD} one-shot gate ───
+// commands.json 이 대상 파일 목록에 포함될 때만 1회 실행. 비용: jq 몇 호출.
+let _cj_rel = "shared/config/commands.json"
+let mut _cj_in_scope = false
+for _cf in files {
+    let _cp = _str(_cf).trim()
+    if _cp == "" { continue }
+    if _cp == _cj_rel { _cj_in_scope = true }
+}
+if _cj_in_scope {
+    let _cmd_res = run_cmd_checks(_cj_rel)
+    if _cmd_res != "" {
+        let _cmd_lines = _cmd_res.split("\n")
+        for _cl in _cmd_lines {
+            let _cls = _str(_cl).trim()
+            if _cls == "" { continue }
+            violations = violations.push(_cj_rel + "|" + _cls)
+        }
+    }
+}
+
 for f in files {
     let path = _str(f).trim()
     if path == "" { continue }
@@ -2614,6 +2900,12 @@ for f in files {
     if e == ".hexa" {
         let v12e = check_cmds_hardcoded(path)
         if v12e != "" { violations = violations.push(path + "|" + v12e) }
+    }
+
+    // check_proj_hardcode (H-PROJ-HARDCODE): projects.json 이름 5+ 하드코딩 감지
+    if e == ".json" || e == ".jsonl" || e == ".md" || e == ".hexa" {
+        let v12f = check_proj_hardcode(path)
+        if v12f != "" { violations = violations.push(path + "|" + v12f) }
     }
 
     // check_an2 (anima 프로젝트 전용): localStorage/sessionStorage 금지
@@ -2767,6 +3059,10 @@ for f in files {
     // check_h_noblock (공통, H-NOBLOCK): 세션 채팅 블로킹 패턴 감지 (.hexa/.sh)
     let v24 = check_h_noblock(path)
     if v24 != "" { violations = violations.push(path + "|" + v24) }
+
+    // check_h_noarchive (공통, H-NOARCHIVE): archive/backup 파일·폴더 생성 패턴 감지 (.hexa/.sh)
+    let v26 = check_h_noarchive(path)
+    if v26 != "" { violations = violations.push(path + "|" + v26) }
 
     // check_hexa_exit (공통, H-HEXA-EXIT): hexa child exit() 비전파 — stdout 마커 검사 권장 (.hexa)
     if e == ".hexa" {

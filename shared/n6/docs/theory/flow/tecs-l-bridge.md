@@ -24,7 +24,7 @@
 ## 공유 인프라
 
 ### 동기화 시스템
-- **중앙**: `~/Dev/TECS-L/.shared/`
+- **중앙**: `$HOME/Dev/TECS-L/.shared/`
 - **스크립트**: sync-calculators.sh, sync-readmes.sh, sync-claude-rules.sh, sync-dse.sh
 - **아틀라스**: scan_math_atlas.py → math_atlas.json (2,504 가설 + 339 상수맵)
 - **DSE 도메인**: .shared/dse/domains/ (306 TOML, n6에서 역동기화)
@@ -75,11 +75,11 @@
 cd ~/Dev/TECS-L && bash .shared/sync-calculators.sh
 
 # n6 → TECS-L (역방향: DSE 도메인)
-cp ~/Dev/n6-architecture/tools/universal-dse/domains/*.toml ~/Dev/TECS-L/.shared/dse/domains/
+cp $N6_ARCH/tools/universal-dse/domains/*.toml $HOME/Dev/TECS-L/.shared/dse/domains/
 
 # 아틀라스 스캔
-python3 ~/Dev/TECS-L/.shared/scan_math_atlas.py --save --summary
+python3 $HOME/Dev/TECS-L/.shared/scan_math_atlas.py --save --summary
 
 # 자동 등급화
-python3 ~/Dev/TECS-L/calc/auto_grade_n6.py
+python3 $HOME/Dev/TECS-L/calc/auto_grade_n6.py
 ```

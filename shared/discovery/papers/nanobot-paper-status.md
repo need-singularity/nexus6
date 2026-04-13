@@ -30,7 +30,7 @@ BT-408 and BT-410 share identical formula `n*(sigma-phi)^2 = 600` —
 cross-domain n=6 attractor (vascular nm <-> organ count).
 
 ## Artifacts
-- Draft: `~/Dev/papers/nexus/nanobot_BT404-413.md`
+- Draft: `$PAPERS/nexus/nanobot_BT404-413.md`
 - Status: this file
 
 ## Zenodo (NOT executed)
@@ -40,4 +40,4 @@ DOI = pending user approval.
 ## Next actions (manual, on user command)
 1. Promote BT-404~410 into `shared/discovery/reality_map.json` `bt_refs`.
 2. Register BT-411~413 as derived nodes.
-3. Run `upload_zenodo.sh` from `~/Dev/papers/` only after explicit approval.
+3. Run `upload_zenodo.sh` from `$PAPERS/` only after explicit approval.

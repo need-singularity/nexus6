@@ -102,7 +102,7 @@ Option 1 is the lowest-risk starter. Option 2 is the real fix. With rt#33 + rt#3
 
 ## File index
 
-- Source change: `/Users/ghost/Dev/hexa-lang/self/main.hexa` (cmd_run fast-exit, branch `rt-33-cold-start`)
+- Source change: `$HEXA_LANG/self/main.hexa` (cmd_run fast-exit, branch `rt-33-cold-start`)
 - Rebuilt binary (not installed): `/tmp/hexa_rt33`
 - Registry: `shared/hexa-lang/runtime-bottlenecks.json` item 33 (nexus-tracked; the directory is otherwise gitignored, the 4 existing JSONs are exempt)
 - This report: `shared/hexa/rt-33-cold-start-report.md` (canonical location; `shared/hexa-lang/` is gitignored per nexus `.gitignore:110`)
