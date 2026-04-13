@@ -13,6 +13,15 @@
 
 exec "$@" | sed -E \
   -e '/^[0-9]{8,}$/d' \
+  -e '/^Parse error at /d' \
+  -e '/^Runtime error: undefined function:/d' \
+  -e '/^Runtime error: unknown method /d' \
+  -e '/^Test [0-9]+:/d' \
+  -e '/^  PASS$/d' \
+  -e '/^ExprStmt\(/d' \
+  -e '/^AssignStmt\(/d' \
+  -e '/^=== HEXA Self-Hosting Parser ===/d' \
+  -e '/^=== Self-Hosting Parser: ALL /d' \
   -e '/^=== HEXA Self-Host Interpreter ===$/d' \
   -e '/^Core: eval_expr \+ exec_stmt/d' \
   -e '/^Type: int float bool char ord/d' \
