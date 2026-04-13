@@ -1,0 +1,157 @@
+// cleanup.hexa — shared_survey.json 폐기 후보 자동 실행
+// 기본 dry-run. HARNESS_CLEANUP_MODE=apply 로 실제 삭제.
+// 안전 가드: 삭제 전 shared/ 전체에서 basename 참조 grep.
+//   ref==0 → 안전 삭제
+//   ref>0  → 스킵 (force 모드 외엔 건드리지 않음)
+// 산출: shared/harness/cleanup_log.jsonl
+
+let REPO_ROOT = exec("git rev-parse --show-toplevel 2>/dev/null").trim()
+let SHARED = REPO_ROOT + "/shared"
+let SURVEY = REPO_ROOT + "/shared/harness/shared_survey.json"
+let CLEANUP_LOG = REPO_ROOT + "/shared/harness/cleanup_log.jsonl"
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn now_iso() -> string {
+    return exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+fn json_escape(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    return r
+}
+
+fn _rfind(s: string, ch: string) -> i64 {
+    let n = len(s)
+    let mut i: i64 = n - 1
+    while i >= 0 {
+        if s.substring(i, i + 1) == ch { return i }
+        i = i - 1
+    }
+    return -1
+}
+
+fn basename(path: string) -> string {
+    let slash = _rfind(path, "/")
+    if slash < 0 { return path }
+    return path.substring(slash + 1, len(path))
+}
+
+// shared_survey.json 에서 폐기 경로 목록 추출 (간이 파싱)
+// "path": "shared/..." 패턴 + 직전 "폐기" 컨텍스트 확인 생략하고 high_confidence 블록 내부만
+fn extract_discard_paths() -> [string] {
+    let mut paths: [string] = []
+    if !file_exists(SURVEY) { return paths }
+    // high_confidence 블록 라인 범위 추출 후 path 필드 grep
+    let cmd = "awk '/\"high_confidence\"/{flag=1;next} flag && /\\],$|\\]$/{flag=0} flag' '" + SURVEY + "' | grep -oE '\"path\":[[:space:]]*\"[^\"]+\"' | sed 's/.*\"path\":[[:space:]]*\"//; s/\"$//'"
+    let raw = _str(exec(cmd)).trim()
+    if raw == "" { return paths }
+    for ln in raw.split("\n") {
+        let p = _str(ln).trim()
+        if p == "" { continue }
+        paths = paths.push(p)
+    }
+    return paths
+}
+
+// basename 기준으로 shared/ 전체 ref 수 (자기 자신 + shared_survey.json 제외)
+fn ref_count(path: string) -> i64 {
+    let bn = basename(path)
+    if bn == "" { return 0 }
+    let self_esc = path.replace("/", "\\/")
+    let cmd = "grep -rl '" + bn + "' --include='*.hexa' --include='*.json' --include='*.jsonl' --include='*.md' '" + SHARED + "' 2>/dev/null | grep -v 'shared_survey.json' | grep -v '/" + bn + "$' | wc -l"
+    let r = to_int(_str(exec(cmd)).trim())
+    return r
+}
+
+// 파일 존재성 (와일드카드 없는 경우만)
+fn path_exists(path: string) -> bool {
+    let full = REPO_ROOT + "/" + path
+    return file_exists(full)
+}
+
+// 삭제 실행
+fn delete_file(path: string) -> bool {
+    let full = REPO_ROOT + "/" + path
+    try { exec("git -C '" + REPO_ROOT + "' rm -f '" + path + "' 2>/dev/null || rm -f '" + full + "'") } catch e { return false }
+    return !file_exists(full)
+}
+
+// ─── Main ───
+let mode = _str(env("HARNESS_CLEANUP_MODE")).trim()
+let force = mode == "force"
+let apply = mode == "apply" || force
+
+let paths = extract_discard_paths()
+if len(paths) == 0 {
+    println("폐기 후보 없음 (shared_survey.json 파싱 실패 가능)")
+    exit(0)
+}
+
+let ts = now_iso()
+let mut safe_count: i64 = 0
+let mut skip_count: i64 = 0
+let mut deleted: i64 = 0
+let mut missing: i64 = 0
+
+println("== cleanup " + mode + " (" + to_string(len(paths)) + " 후보) ==")
+
+for p in paths {
+    let path = _str(p).trim()
+    if path == "" { continue }
+    if path.index_of("*") >= 0 { continue }
+    // 존재 확인
+    if !path_exists(path) {
+        missing = missing + 1
+        println("  MISSING  " + path)
+        continue
+    }
+    let refs = ref_count(path)
+    let safe = refs == 0
+    let action = if apply && (safe || force) { "DELETE" } else { if safe { "READY" } else { "SKIP" } }
+    let line = "{\"ts\":\"" + ts + "\",\"mode\":\"" + mode + "\",\"path\":\"" + json_escape(path) + "\",\"refs\":" + to_string(refs) + ",\"action\":\"" + action + "\"}"
+    try { exec("echo '" + line.replace("'", "'\\''") + "' >> '" + CLEANUP_LOG + "'") } catch e {}
+
+    if safe {
+        safe_count = safe_count + 1
+        if apply {
+            if delete_file(path) {
+                deleted = deleted + 1
+                println("  DELETED  " + path)
+            } else {
+                println("  FAIL     " + path)
+            }
+        } else {
+            println("  READY    " + path + " (refs=0)")
+        }
+    } else {
+        if force && apply {
+            if delete_file(path) {
+                deleted = deleted + 1
+                println("  FORCED   " + path + " (refs=" + to_string(refs) + ")")
+            }
+        } else {
+            skip_count = skip_count + 1
+            println("  SKIP     " + path + " (refs=" + to_string(refs) + ")")
+        }
+    }
+}
+
+println("")
+println("safe:    " + to_string(safe_count))
+println("skip:    " + to_string(skip_count) + " (live refs — force 필요)")
+println("deleted: " + to_string(deleted))
+println("missing: " + to_string(missing))
+println("log:     shared/harness/cleanup_log.jsonl")
+println("")
+if !apply {
+    println("실제 삭제: HARNESS_CLEANUP_MODE=apply hexa shared/harness/cleanup.hexa")
+    println("참조 있는 것도 강제: HARNESS_CLEANUP_MODE=force hexa shared/harness/cleanup.hexa")
+}
+exit(0)
