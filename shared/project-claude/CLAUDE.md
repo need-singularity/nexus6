@@ -1,7 +1,8 @@
 # project-claude/ — 프로젝트 CLAUDE.md 마스터
 
-SSOT: 이 폴더 파일이 원본. 동기화는 shared/hooks/auto-sync.hexa PostToolUse 훅 담당.
+SSOT: 이 폴더 파일이 원본. 동기화는 수동 — auto-sync 훅 deprecated (2026-04-14, shared/archive/hooks-20260414/auto-sync.hexa).
 심링크 폐기 (07e314c6, 2026-04-11): GitHub 렌더링 위해 심링크→실제 파일 전환.
+harness: 훅 대체 → shared/harness/entry.hexa dispatcher (prompt|pretool|post|guard). 세부는 shared/harness/CLAUDE.md.
 
 sync 매핑:
   nexus.md           → ~/Dev/nexus/CLAUDE.md

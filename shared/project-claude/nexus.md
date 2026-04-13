@@ -5,6 +5,15 @@ rules: shared/rules/common.json (R0~R27) + shared/rules/nexus.json (NX1~NX3)
 L0 Guard: `hexa ~/Dev/nexus/shared/lockdown/l0_guard.hexa <verify|sync|merge|status>`
 전역 불변식: todo/할일 실행은 반드시 shared/bin/hexa resolver 경유. 직접 바이너리 하드코딩 금지.
 
+harness (훅 시스템 대체, 2026-04-14~):
+  dispatcher: shared/harness/entry.hexa <prompt|pretool|post|guard|self_check>
+  sub-modules: prompt_scan.hexa / pre_tool_guard.hexa / post_bash.hexa / post_edit.hexa / cmd_gate.hexa
+  exec wrapper: shared/bin/exec_validated (smash/free seed gate, hexa exit 미전파 우회)
+  permissions SSOT: shared/config/permissions_ssot.json (deny 28패턴)
+  settings.json 정책: 전 프로젝트 hooks={} — 훅 실행 없음. 대신 Claude가 매 프롬프트/Write/Bash 후 entry.hexa 자율 호출.
+  관례: 사용자 입력 직후 `entry.hexa prompt`, Write/Edit 후 `entry.hexa post write_edit`, Bash 후 `entry.hexa post bash`, Agent 호출 전 `entry.hexa guard`.
+  archive: shared/hooks → shared/archive/hooks-20260414/ (symlink 하위호환, 신규 참조 금지)
+
 blowup infra:
   fast-path: exact(mtime+size O(1) ~83ms) → incremental(tail O(Δ)) → shell(awk ~0.6s/12MB) → hexa(소규모만)
   sidecar: atlas.n6.stats (mtime/size/lines/hash/nodes/edges/hubs), atlas.n6.deg (degree TSV)
@@ -16,7 +25,8 @@ blowup infra:
 
 shared/ tree:
   blowup/        돌파 엔진 — core/guard/modules(6)/lens/ouroboros/seed (총 44 .hexa)
-  hooks/         Claude Code 훅 (.hexa)
+  harness/       Claude Code 하네스 — entry dispatcher + gate + lint (훅 대체)
+  hooks/         → archive/hooks-20260414 (symlink, deprecated)
   rules/         AI-native 규칙
   config/        SSOT 정책
   discovery/     발견 허브
@@ -30,7 +40,11 @@ shared/ tree:
 
 L0 보호 (평시 자유 수정, 유저 명시 요청 시만 승인 절차):
   shared/bin — compat 심링크
-  shared/hooks/*.hexa — 공용 훅 엔진 전체
+  shared/harness/entry.hexa — 하네스 dispatcher
+  shared/harness/cmd_gate.hexa — seed 검증 gate
+  shared/harness/{prompt_scan,pre_tool_guard,post_bash,post_edit}.hexa — sub-modules
+  shared/bin/exec_validated — gate 적용 실행 래퍼
+  shared/config/permissions_ssot.json — deny 패턴 SSOT
   shared/blowup/core/blowup.hexa — 9-phase 파이프라인
   shared/blowup/modules/*.hexa — 6종 변종
   shared/blowup/lib/atlas_guard.hexa.inc — 공통 헬퍼
