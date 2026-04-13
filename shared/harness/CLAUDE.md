@@ -9,6 +9,7 @@ ssot:
   summary.json         총설명 (EN)
   evolution.json       L1→L2→L3→bitter 진화 그래프
   convergence.json     구현 상태 추적
+  severity_map.json    H-ERR-ROUTE 분류 SSOT — block/defer/warn (73 lint_rule + 10 gc_kind + 17 exit_signal + 14 source_default)
 
 engine (.hexa):
   entry.hexa           dispatcher — prompt|pretool|post|guard|self_check 서브커맨드, sub-modules 호출
@@ -29,6 +30,7 @@ engine (.hexa):
   session_prompt_gen.hexa   새 세션 이어받기 프롬프트 자동 생성
   health.hexa               atlas + nexus 헬스 라우터 — list|atlas|nexus|all (atlas_health/nexus_ensure_running 위임)
   sync.hexa                 sync 라우터 v1 — 9 원본 sync*.hexa 통합 + N/M/T 신규. manifest SSOT: sync_manifest.json (29 태스크)
+  errors.hexa               H-ERR-ROUTE/DRAIN/PROMOTE CLI — severity_map 분류 → errors.jsonl 큐. lib: lib/errors.hexa.inc (copy-paste 소스)
 
 convention (2026-04-14~ 훅 시스템 대체):
   사용자 입력 후       entry.hexa prompt
@@ -44,6 +46,7 @@ logs (append-only):
   mistakes.jsonl       실패만 누적 (P1 실수기록)
   autofix_proposals.jsonl  L2 제안
   rules_usage.jsonl    규칙 히트 감사 (bitter-gate 산출)
+  errors.jsonl         H-ERR 오류 큐 — severity/source/file/code/msg/status(open|fixed|stale), drain 임계치 10
 
 cooldown:
   .gc_weekly_cooldown  unix ts — 7일 제한
@@ -69,6 +72,9 @@ entrypoints:
   hexa cli_budget_gate.hexa             세션 usage 임계치 감지 (UserPromptSubmit 자동 실행, cooldown 상태 파일로 중복 방지)
   hexa health.hexa all                  atlas + nexus 종합 헬스 (cron 30분 주기 권장 — com.nexus.health)
   hexa sync.hexa list|diff|all|<id>     sync 라우터 — list(29태스크)/diff(drift)/all(active)/단일(id) [--dry-run] [--no-git]
+  hexa errors.hexa route <src> <file> <line> <code> [msg]  오류 라우팅 (severity_map 분류)
+  hexa errors.hexa drain_check [N=10]   큐 임계치 체크 (prompt_scan 자동 호출, 우회=NEXUS_DRAIN_OK=1)
+  hexa errors.hexa count_open|promote|mark_fixed <key>    통계/승격/완료 처리
 
 pending:
   hooks-config.json 등록   gc-weekly 주간 체인 (shared/harness/hooks-config-patch.json 참조)
