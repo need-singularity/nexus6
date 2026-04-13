@@ -89,6 +89,22 @@ fetch_usage() {
         -H "Authorization: Bearer $1" -H "anthropic-beta: $BETA" 2>/dev/null
 }
 
+# ── CLI 경유 refresh — direct POST 가 IP rate_limit 걸린 경우 fallback ──
+# claude CLI 가 startup auth 체크에서 만료 토큰을 내부 refresh path 로 갱신.
+# 이 경로는 Anthropic /v1/oauth/token IP rate_limit 과 별개로 동작.
+# quota 소비 0 (mcp list 는 auth check 만).
+refresh_via_cli() {
+    local name="$1"
+    local cfg
+    cfg=$(jq -r --arg n "$name" '.accounts[] | select(.name==$n) | .config_dir' "$ACCOUNTS" 2>/dev/null)
+    [ -n "$cfg" ] && [ -d "$cfg" ] || return 1
+    command -v claude >/dev/null 2>&1 || return 1
+    CLAUDE_CONFIG_DIR="$cfg" claude mcp list >/dev/null 2>&1
+    # claude 종료 시 내부 refresh 가 수행됐다면 keychain 에 새 토큰 기록됨.
+    # 성공/실패는 호출자가 keychain 재조회로 판단.
+    return 0
+}
+
 # ── 계정 1개 처리 → $td/$name.json 에 entry 또는 {error:"..."} ────────
 process_one() {
     local name="$1" td="$2" allowed="$3"
@@ -105,14 +121,31 @@ process_one() {
 
     now=$(($(date -u +%s) * 1000))
     if [ "$ea" -lt "$((now + 60000))" ] 2>/dev/null; then
-        [ "$allowed" = "1" ] || { echo '{"error":"refresh-deferred"}' > "$out"; return; }
-        [ -n "$rt" ]         || { echo '{"error":"no-refresh-token"}' > "$out"; return; }
-        local new_blob
-        new_blob=$(refresh_token "$rt" "$blob")
-        [ -n "$new_blob" ]   || { echo '{"error":"refresh-failed"}'   > "$out"; return; }
-        write_blob "$h8" "$new_blob" || { echo '{"error":"keychain-write"}' > "$out"; return; }
-        at=$(jq -r '.claudeAiOauth.accessToken' <<< "$new_blob" 2>/dev/null)
-        log "refreshed: $name"
+        [ -n "$rt" ] || { echo '{"error":"no-refresh-token"}' > "$out"; return; }
+        local new_blob="" method=""
+        # allowed=1 (pre_check_expiry 가 cap 내 선정) → direct POST 시도.
+        # direct 가 rate_limit 으로 실패하거나 allowed=0 (deferred) → CLI fallback.
+        if [ "$allowed" = "1" ]; then
+            new_blob=$(refresh_token "$rt" "$blob")
+            if [ -n "$new_blob" ]; then
+                write_blob "$h8" "$new_blob" || { echo '{"error":"keychain-write"}' > "$out"; return; }
+                at=$(jq -r '.claudeAiOauth.accessToken' <<< "$new_blob" 2>/dev/null)
+                method="direct"
+            fi
+        fi
+        if [ -z "$new_blob" ]; then
+            # CLI 경유 fallback. claude 바이너리가 내부 refresh path 로 keychain 갱신.
+            refresh_via_cli "$name" || { echo '{"error":"refresh-failed"}' > "$out"; return; }
+            blob=$(read_blob "$h8")
+            [ -n "$blob" ] || { echo '{"error":"keychain-read-after-cli"}' > "$out"; return; }
+            at=$(jq -r '.claudeAiOauth.accessToken // empty' <<< "$blob" 2>/dev/null)
+            ea=$(jq -r '.claudeAiOauth.expiresAt // 0'      <<< "$blob" 2>/dev/null)
+            if [ "$ea" -lt "$((now + 60000))" ] 2>/dev/null; then
+                echo '{"error":"refresh-failed"}' > "$out"; return
+            fi
+            method="cli"
+        fi
+        log "refreshed($method): $name"
     fi
 
     resp=$(fetch_usage "$at")

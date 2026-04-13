@@ -143,6 +143,7 @@ cl_load_data() {
     CL_ACTIVE="$(current_active)"
     CL_AUTO="$(auto_pick)"
     CL_NAMES=(); CL_WK=(); CL_SS=(); CL_ERR=()
+    CL_SRT=(); CL_WRT=()   # reset epoch (초). 빈값 또는 과거면 "" / 0.
     CL_CACHE_TS=""; CL_STALE_H=0
     local raw now
     now=$(date -u +%s)
@@ -167,16 +168,36 @@ cl_load_data() {
             | ($e.session_resets | parse_ts) as $srt
             | (if $wrt != null and $wrt < $now then 0 else ($e.week_all_pct // 0) end) as $wk
             | (if $srt != null and $srt < $now then 0 else ($e.session_pct // 0) end) as $ss
-            | "\($n)\t\($wk)\t\($ss)\t\($e.error // "")"
+            | "\($n)|\($wk)|\($ss)|\($e.error // "")|\($srt // "")|\($wrt // "")"
         ' "$ACCOUNTS" 2>/dev/null | sort -V)
     else
-        raw=$(jq -r '.accounts[] | "\(.name)\t0\t0\tno-cache"' "$ACCOUNTS" 2>/dev/null | sort -V)
+        raw=$(jq -r '.accounts[] | "\(.name)|0|0|no-cache||"' "$ACCOUNTS" 2>/dev/null | sort -V)
     fi
-    local n w s e
-    while IFS=$'\t' read -r n w s e; do
+    # IFS=| (non-whitespace) — bash 3.2 read 는 whitespace IFS 에서 연속 delimiter 를 collapse 하므로
+    # empty 필드 (err 미존재 등) 가 뒤 필드로 시프트 되는 버그 회피.
+    local n w s e srt wrt
+    while IFS='|' read -r n w s e srt wrt; do
         [ -z "$n" ] && continue
         CL_NAMES+=("$n"); CL_WK+=("$w"); CL_SS+=("$s"); CL_ERR+=("$e")
+        CL_SRT+=("$srt"); CL_WRT+=("$wrt")
     done <<< "$raw"
+}
+
+# fmt_until <out_var> <target_epoch> — 현재부터 target 까지 남은 시간 (최대 7자).
+# "-" (데이터 없음) / "now" (과거) / "45m" / "4h12m" / "3d18h" 형식.
+fmt_until() {
+    local __out=$1 target="${2:-}" now diff
+    if [ -z "$target" ] || [ "$target" = "null" ]; then
+        printf -v "$__out" '%s' "-"; return
+    fi
+    now=$(date +%s)
+    diff=$(( target - now ))
+    if   [ "$diff" -le 0 ];     then printf -v "$__out" '%s' "now"
+    elif [ "$diff" -lt 60 ];    then printf -v "$__out" '%ds'    "$diff"
+    elif [ "$diff" -lt 3600 ];  then printf -v "$__out" '%dm'    $(( diff / 60 ))
+    elif [ "$diff" -lt 86400 ]; then printf -v "$__out" '%dh%02dm' $(( diff / 3600 ))      $(( (diff % 3600) / 60 ))
+    else                             printf -v "$__out" '%dd%02dh' $(( diff / 86400 ))     $(( (diff % 86400) / 3600 ))
+    fi
 }
 
 show_dashboard() {
@@ -195,15 +216,17 @@ build_frame_to() {
     # NOTE: 내부 누적 _buf — caller 의 'frame' 등과 dynamic scoping 충돌 방지.
     local _buf="" line b1 b2 stale_note=""
     local count=${#CL_NAMES[@]}
-    local i name wi si err act_mark num_label
+    local i name wi si err act_mark num_label s_in w_in
 
     # 정직성 게이트 후속: cache 나이 1h 이상이면 헤더에 STALE 경고.
     [ "${CL_STALE_H:-0}" -ge 1 ] && stale_note="    cache=${CL_STALE_H}h STALE→cl refresh"
     printf -v line "cl — Claude accounts    active=%s    store=%s%s%s\n" "${CL_ACTIVE:-none}" "$CL_HOME" "$stale_note" "$eol"
     _buf+="$line"
-    printf -v line "    %-3s  %-10s  %4s  %-20s  %4s  %-20s  %s%s\n" "no" "name" "wk%" "[week_all]" "ss%" "[session]" "err" "$eol"
+    # 컬럼 순서: session 을 앞쪽. 각 pct/bar 뒤에 reset 까지 남은 시간.
+    printf -v line "    %-3s  %-10s  %4s  %-20s  %-7s  %4s  %-20s  %-7s  %s%s\n" \
+        "no" "name" "ss%" "[session]" "resets" "wk%" "[week_all]" "resets" "err" "$eol"
     _buf+="$line"
-    printf -v line "    -------------------------------------------------------------------------------%s\n" "$eol"
+    printf -v line "    -----------------------------------------------------------------------------------------------%s\n" "$eol"
     _buf+="$line"
 
     for ((i=0; i<count; i++)); do
@@ -213,19 +236,21 @@ build_frame_to() {
         err="${CL_ERR[$i]:-}"
         bar_to b1 "$wi"
         bar_to b2 "$si"
+        fmt_until s_in "${CL_SRT[$i]:-}"
+        fmt_until w_in "${CL_WRT[$i]:-}"
         # * = 최선의 선택 (auto-pick: 여유 있고 wk% 최저). active 는 헤더에 표시.
         act_mark=" "
         [ "$name" = "$CL_AUTO" ] && act_mark="*"
         if [ "$i" -lt 9 ]; then num_label=$((i+1));
         elif [ "$i" -eq 9 ]; then num_label="0";
         else num_label="-"; fi
-        # prefix 4 col 고정. 커서 행 전체 reverse video. ASCII '>' (wide-char 모호성 회피).
+        # 순서: session(%,bar,resets) → week(%,bar,resets) → err. 커서 행 전체 reverse video.
         if [ "$i" -eq "$cursor" ]; then
-            printf -v line "\033[7m  > %-3s %s%-10s  %3s%%  %s  %3s%%  %s  %s\033[0m%s\n" \
-                "$num_label" "$act_mark" "$name" "$wi" "$b1" "$si" "$b2" "$err" "$eol"
+            printf -v line "\033[7m  > %-3s %s%-10s  %3s%%  %s  %-7s  %3s%%  %s  %-7s  %s\033[0m%s\n" \
+                "$num_label" "$act_mark" "$name" "$si" "$b2" "$s_in" "$wi" "$b1" "$w_in" "$err" "$eol"
         else
-            printf -v line "    %-3s %s%-10s  %3s%%  %s  %3s%%  %s  %s%s\n" \
-                "$num_label" "$act_mark" "$name" "$wi" "$b1" "$si" "$b2" "$err" "$eol"
+            printf -v line "    %-3s %s%-10s  %3s%%  %s  %-7s  %3s%%  %s  %-7s  %s%s\n" \
+                "$num_label" "$act_mark" "$name" "$si" "$b2" "$s_in" "$wi" "$b1" "$w_in" "$err" "$eol"
         fi
         _buf+="$line"
     done
