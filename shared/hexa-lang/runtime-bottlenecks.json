@@ -237,6 +237,37 @@
       }
     },
     {
+      "id": 34,
+      "category": "runtime",
+      "name": "cmd_run watchdog sleep 1 → sub-second poll (rt 34)",
+      "description": "rt 33 후 잔여 ~1000ms 바닥은 self/main.hexa cmd_run watchdog 의 `sleep 1` 폴링. child 가 30ms 에 끝나도 watchdog 의 sleep 1 한 사이클 때문에 shell pipeline 이 1초 동안 reap 되지 않음. 옵션 (c) 채택: sleep 1 → sleep 0.05 (20Hz) + `[ $PPID -eq 1 ]` short-circuit (이미 orphan 된 케이스 즉시 반응). 부분 polling cost 무시 가능 — kill -0 syscall 1회 ~수십 µs.",
+      "impact": "probe 1010ms → 70ms (-93%), real hook 1020ms → 70ms (-93%). Hook UX 누적 효과 큼 (편집당 N회 발사).",
+      "status": "done_hexa",
+      "verdict": "rt34_watchdog_subsecond",
+      "hexa_impl": "self/main.hexa cmd_run watch literal (rt-34-watchdog-sigchld branch)",
+      "priority": "P1",
+      "difficulty": "trivial",
+      "options_considered": {
+        "a_short_sleep": "sleep 0.05 단순 교체 (-95% floor)",
+        "b_sigchld_trap": "trap SIGCHLD + wait — 가장 효율적이나 sh 호환성 위험",
+        "c_hybrid_chosen": "sleep 0.05 + PPID=1 fast-path — 호환성+성능 균형",
+        "d_prctl_pdeathsig": "Linux PR_SET_PDEATHSIG — macOS 미지원",
+        "e_helper_binary": "Rust/C exec wrapper — R1 HEXA-FIRST 위배"
+      },
+      "compatibility": "macOS sh/bash + Linux 양쪽 fractional sleep 동작 확인 (sh -c 'sleep 0.05' OK).",
+      "zombie_smoke_test": {
+        "scenario": "parent shell SIGKILL 후 stage0 orphan 검증",
+        "result": "PASS — SIGKILL 후 2s 내 모든 stage0 child 사라짐 (~50ms 내 watchdog detect)",
+        "guarantee_preserved": true
+      },
+      "measurements": {
+        "probe_plain_script_ms": {"baseline_p50": 1010, "rt34_p50": 70, "delta_pct": -93.1},
+        "real_hook_ms": {"baseline_p50": 1020, "rt34_p50": 70, "delta_pct": -93.1},
+        "watchdog_poll_interval_ms": {"before": 1000, "after": 50},
+        "ppid_fast_path_ms": "<5"
+      }
+    },
+    {
       "id": 32,
       "category": "runtime",
       "name": "Val map→flat C struct (rt 32-G)",
@@ -255,15 +286,30 @@
         "native/hexa_cc.c: 동일 분기 C로 직접 패치 (stage0 재부팅 회피)",
         "smoke: 직접 C test 20 어서션 PASS, test_closures 16/16 PASS, Point/Color 구조체 회귀 없음"
       ],
-      "phase_1_plan": [
-        "853 field-access call-sites 스위프 — 대부분 hexa_map_get 경유라 자동 라우팅 중이지만, strdup 오염 시 누락 경로 식별",
-        "stage0 재부팅 + hexa_full.hexa 재전사 → 실제 interpreter가 valstruct 경로를 씀",
-        "d64 200-step 실측 (3.37M Val) — 목표 map_new <500K, RSS <3GB",
-        "build_c.hexa / interpreter.hexa parity (현재 SSOT divergence per bt 74-D — interpreter.hexa 불변 유지)"
-      ],
+      "phase_1_blocked": {
+        "branch": "rt-32-g-phase1",
+        "date": "2026-04-13",
+        "blocker_root_cause": "Phase 0 design flaw — HexaValStruct declares fn_params/fn_body/array_val/struct_fields as `const char*` (string-only), but the Hexa interpreter stores polymorphic Val (e.g. arrays, AST nodes) in those fields. val_closure() / val_fn() pass `params` and `body` arrays into fn_params/fn_body Val literal slots; hexa_valstruct_new_v coerces non-TAG_STR args to '' (empty), erasing the actual closure body. Result: rebootstrapped stage0 cannot execute closures — `let f = |x| x*2; f(6)` returns void instead of 12.",
+        "rebootstrap_smoke": "transpile (hexa_v2 self/hexa_full.hexa) PASS — 957KB C source. clang -O2 PASS. echo 'println(\"ok\")' smoke PASS. Pure arithmetic PASS.",
+        "verify_results_with_phase1_binary": {
+          "verify_g12_g13": "PASS (identical to pre-phase1)",
+          "verify_attr13": "PASS (identical)",
+          "verify_ir_phase1": "PASS 23/23 (identical)",
+          "verify_tests146": "PASS 453/146 (identical)",
+          "test_closures": "FAIL — only 'double(6)=void' printed, no closures execute"
+        },
+        "decision": "REVERT — pre-phase1 stage0 backup retained at build/hexa_stage0_pre_phase1_backup, build/hexa_stage0 NEVER overwritten (md5 unchanged: 405a899260a58c3af320fd9f30e0493c)",
+        "phase_1_redesign_required": [
+          "runtime.c HexaValStruct: change fn_params, fn_body, array_val, struct_fields, str_val, char_val, fn_name, struct_name from `const char*` to `HexaVal` (full polymorphic carrier)",
+          "Adjust hexa_valstruct_new + _new_v signatures + accessors to return stored HexaVal directly (no coercion)",
+          "Default-init unspecified slots to hexa_void() instead of HEXA_EMPTY_STR sentinel",
+          "Re-measure microbench — RSS savings shrink (12 HexaVal × ~24B = ~288B/struct vs 12 char* × 8B = 96B), but still vastly less than 13× hash insertion + 12 strdup of map-backed Val",
+          "Re-do codegen_c2.hexa + native/hexa_cc.c gen2_struct_decl Val branch to emit HexaVal-typed call",
+          "Re-bootstrap stage0 + verify test_closures 16/16 + d64 200-step measurement"
+        ]
+      },
       "phase_2_plan": [
         "HexaValStruct 필드 접근을 codegen 이 hexa_valstruct_int() 같은 typed accessor 로 인라인 (hexa_map_get dispatch 제거)",
-        "string field 소유권 정리 (현재는 caller 포인터 공유 — interpreter 레벨에선 안전)",
         "serialization / JSON / hash_of 경로에 TAG_VALSTRUCT case 추가",
         "HexaValStruct 풀 할당자 (~3.37M malloc → bump arena) — 재진입형 reset 지원"
       ],
@@ -276,7 +322,7 @@
         "microbench_10K_val_map_new": {"old": 10000, "new": 0}
       },
       "commit": "rt-32-g-phase0 branch (not yet pushed)",
-      "blocker_remaining": "Phase 1 stage0 재부팅 — hexa_full.hexa 재전사 필요"
+      "blocker_remaining": "Phase 1 stage0 재부팅 시도 (rt-32-g-phase1 branch) — design flaw 노출 (string-only 필드는 polymorphic Val 저장 불가). Phase 1 redesign 필요 — HexaValStruct 필드를 const char* → HexaVal 로 전환 후 재시도."
     }
   ],
   "summary": {
@@ -290,7 +336,7 @@
     "critical_path": "#6 (self-host bootstrap) → #10 (Array in-place) → #20 (fused kernel)",
     "fastest_win": "#6 — bootstrap 풀리면 done_hexa 6개 전부 pod 반영",
     "hook_ux_win": "#33 — fast-exit -39% on hook path; next rt#34 removes sleep 1 watchdog floor for another ~1000ms",
-    "rt_32_g_win": "#32 Phase 0 — 1M Val microbench wall -65%, RSS -97% (3.1GB→98MB). Phase 1 stage0 rebootstrap 으로 interpreter 실적용",
+    "rt_32_g_win": "#32 Phase 0 — 1M Val microbench wall -65%, RSS -97% (3.1GB→98MB). Phase 1 stage0 rebootstrap BLOCKED (rt-32-g-phase1) — string-only 필드가 polymorphic Val(closure body) 저장 불가, redesign 필요.",
     "forbidden": "Rust/cargo 절대 금지 (zero-Rust)"
   }
 }
