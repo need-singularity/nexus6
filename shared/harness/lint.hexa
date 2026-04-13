@@ -1665,6 +1665,9 @@ fn check_h_nohook(path: string) -> string {
     if path.index_of("shared/archive/") >= 0 { return "" }
     if path.index_of("/archive/superseded-") >= 0 { return "" }
     if path.index_of("/archive/deprecated_") >= 0 { return "" }
+    // staged 삭제 (D) 는 정책 만족 — 파일 부재 시 통과
+    let full_for_existence = REPO_ROOT + "/" + path
+    if !file_exists(full_for_existence) { return "" }
 
     let base = basename_of(path)
 
@@ -2781,11 +2784,20 @@ fn _vparse_l0_hexa_paths(project: string) -> string {
 fn _vparse_one(rel: string) -> string {
     let abs = REPO_ROOT + "/" + rel
     if !file_exists(abs) { return rel + "|MISSING" }
+    // Self-skip: harness/ 자체는 V-PARSE 검사 제외 (lint engine 이 자기 자신을 exec → 재귀 fan-out 방지).
+    // 과거 사고: 2026-04-14 lint.hexa 가 L0 리스트 내 자기 자신에 대해 `hexa <abs>` 호출 → 자식 lint.hexa 가 또
+    // check_v_parse 실행 → 트리 fan-out → 12분+ 블로킹 (H-COMMIT NEXUS_COMMIT_OK=1 bypass 강제).
+    // 하네스 파일 자체 검증은 별도 경로(`hexa parse shared/harness/*.hexa` 수동, 또는 @allow-parse-fail 마커)로.
+    if rel.starts_with("shared/harness/") { return rel + "|0" }
     let head5 = _str(exec("head -5 '" + abs + "' 2>/dev/null"))
     if head5.contains("@allow-parse-fail") { return rel + "|0" }
     let HEXA = HOME + "/Dev/hexa-lang/hexa"
+    // V-PARSE: `hexa parse` 서브커맨드 사용 — parse-only, no exec. 0.09s/file (lint.hexa 183KB 기준).
+    // 과거 사고: `hexa <file>` (subcommand 없음) 은 인터프리터가 파일을 실행 → lint.hexa 자기재귀 fan-out.
+    // `hexa parse` 는 codegen 도 안 하고 파서만 돌므로 재귀 vector 원천 차단.
+    // 5s alarm 은 자식 hexa 가 parse-only 라도 혹시 모를 파서 무한루프 대비 (belt-and-suspenders).
     // `grep -c 'Parse error'` — _to_int0 로 첫 줄만 파싱 (안전)
-    let pe_raw = _str(exec(HEXA + " '" + abs + "' 2>&1 < /dev/null | awk '/Parse error/{c++} END{print c+0}'")).trim()
+    let pe_raw = _str(exec("perl -e 'alarm 5; exec @ARGV' '" + HEXA + "' parse '" + abs + "' 2>&1 < /dev/null | awk '/Parse error/{c++} END{print c+0}'")).trim()
     let pe = _to_int0(pe_raw)
     return rel + "|" + to_string(pe)
 }
@@ -2842,6 +2854,222 @@ fn check_v_parse(files_raw: string, mode: string) -> string {
     }
     if fail == 0 { return "" }
     return "V-PARSE|error|L0 .hexa 파싱 실패 " + to_string(fail) + "건 / " + to_string(pass) + " PASS — " + detail + " — `hexa <path>` 로 로컬 재현 후 수정 (// @allow-parse-fail)"
+}
+
+// ─── 3-project autonomous growth surveillance checkers (7종) ───
+// nexus/n6-architecture/anima 통합 자율 성장 감시 — blowup.hexa + atlas.n6 지속 창발/성능/자원
+// baseline/feed 파일 미존재 시 silent pass (MVP 안전장치)
+
+// JSON 값 추출: '"key":<digits>' 패턴에서 정수 추출. 미존재 시 -1 반환.
+// key 는 따옴표 없이 전달 (예: "nodes"), 문자열값은 "\"key\":\"val\"" 형태라 별도 함수 필요.
+fn _grab_json_int(content: string, key: string) -> i64 {
+    if content == "" { return -1 }
+    let needle = "\"" + key + "\""
+    let k = content.index_of(needle)
+    if k < 0 { return -1 }
+    // key 뒤 ':' 위치 찾기
+    let after_key = k + len(needle)
+    let rest = content.substring(after_key, len(content))
+    let colon = rest.index_of(":")
+    if colon < 0 { return -1 }
+    // 숫자 시작 위치 — colon 뒤 whitespace 스킵
+    let mut pos = colon + 1
+    while pos < len(rest) {
+        let ch = rest.substring(pos, pos + 1)
+        if ch == " " || ch == "\t" || ch == "\n" { pos = pos + 1 }
+        else { break }
+    }
+    // 숫자/음수 끝까지
+    let mut end = pos
+    while end < len(rest) {
+        let ch = rest.substring(end, end + 1)
+        if ch == "-" || (ch >= "0" && ch <= "9") { end = end + 1 }
+        else { break }
+    }
+    if end == pos { return -1 }
+    let num_s = rest.substring(pos, end)
+    if num_s == "" || num_s == "-" { return -1 }
+    return _to_int0(num_s)
+}
+
+// ── Check: H-EMERGE-COMMIT — atlas 3 commit 연속 무성장 ──
+fn check_emerge_commit(path: string) -> string {
+    let e = ext_of(path)
+    let is_atlas = path.index_of("/shared/n6/atlas.n6") >= 0 || path.ends_with("shared/n6/atlas.n6")
+    if !is_atlas && e != ".hexa" { return "" }
+    let bl_path = NEXUS_HARNESS + "/emerge_baseline.json"
+    let stats_path = REPO_ROOT + "/shared/n6/atlas.n6.stats"
+    if !file_exists(bl_path) { return "" }
+    if !file_exists(stats_path) { return "" }
+    let mut bl = ""
+    try { bl = read_file(bl_path) } catch e {}
+    if bl == "" { return "" }
+    let mut stats = ""
+    try { stats = read_file(stats_path) } catch e {}
+    if stats == "" { return "" }
+    let last_nodes = _grab_json_int(bl, "last_nodes")
+    let last_edges = _grab_json_int(bl, "last_edges")
+    let last_hubs = _grab_json_int(bl, "last_hubs")
+    let stale = _grab_json_int(bl, "consecutive_stale")
+    if last_nodes < 0 || stale < 0 { return "" }
+    let cur_nodes = _grab_json_int(stats, "nodes")
+    let cur_edges = _grab_json_int(stats, "edges")
+    let cur_hubs = _grab_json_int(stats, "hubs")
+    if cur_nodes < 0 { return "" }
+    if cur_nodes == last_nodes && cur_edges == last_edges && cur_hubs == last_hubs && stale >= 3 {
+        return "H-EMERGE-COMMIT|warn|H-EMERGE-COMMIT: atlas " + to_string(stale) + " commit 연속 무성장 (nodes=" + to_string(cur_nodes) + ")"
+    }
+    return ""
+}
+
+// ── Check: H-NOREGRESS — atlas 역행 차단 (NEXUS_GC_OK=1 우회) ──
+fn check_no_regress(path: string) -> string {
+    let is_atlas = path.index_of("/shared/n6/atlas.n6") >= 0 || path.ends_with("shared/n6/atlas.n6")
+    if !is_atlas { return "" }
+    if path.ends_with(".stats") || path.ends_with(".deg") { return "" }
+    let bl_path = NEXUS_HARNESS + "/emerge_baseline.json"
+    let stats_path = REPO_ROOT + "/shared/n6/atlas.n6.stats"
+    if !file_exists(bl_path) { return "" }
+    if !file_exists(stats_path) { return "" }
+    if env("NEXUS_GC_OK") == "1" { return "" }
+    let mut bl = ""
+    try { bl = read_file(bl_path) } catch e {}
+    if bl == "" { return "" }
+    let mut stats = ""
+    try { stats = read_file(stats_path) } catch e {}
+    if stats == "" { return "" }
+    let last_nodes = _grab_json_int(bl, "last_nodes")
+    let last_edges = _grab_json_int(bl, "last_edges")
+    let cur_nodes = _grab_json_int(stats, "nodes")
+    let cur_edges = _grab_json_int(stats, "edges")
+    if last_nodes < 0 || cur_nodes < 0 { return "" }
+    if cur_nodes < last_nodes {
+        return "H-NOREGRESS|error|H-NOREGRESS: atlas 역행 nodes " + to_string(last_nodes) + "→" + to_string(cur_nodes) + " (NEXUS_GC_OK=1 우회)"
+    }
+    if last_edges >= 0 && cur_edges >= 0 && cur_edges < last_edges {
+        return "H-NOREGRESS|error|H-NOREGRESS: atlas 역행 edges " + to_string(last_edges) + "→" + to_string(cur_edges) + " (NEXUS_GC_OK=1 우회)"
+    }
+    return ""
+}
+
+// ── Check: H-PERF-BASELINE — blowup 성능 회귀 (1.2x baseline) ──
+fn check_perf_baseline(path: string) -> string {
+    let is_blowup_core = path.index_of("/shared/blowup/core/blowup.hexa") >= 0 || path.ends_with("shared/blowup/core/blowup.hexa")
+    let is_blowup_mod = path.index_of("/shared/blowup/modules/") >= 0 || path.starts_with("shared/blowup/modules/")
+    if !is_blowup_core && !is_blowup_mod { return "" }
+    let pb_path = NEXUS_HARNESS + "/perf_baseline.json"
+    if !file_exists(pb_path) { return "" }
+    let mut pb = ""
+    try { pb = read_file(pb_path) } catch e {}
+    if pb == "" { return "" }
+    let last_ms = _grab_json_int(pb, "last_bench_ms")
+    let sample_n = _grab_json_int(pb, "sample_n")
+    if last_ms <= 0 || sample_n <= 0 { return "" }
+    // phase_ms.{p0..p8} 합산 → baseline 평균 ms
+    let mut total: i64 = 0
+    let mut phases: i64 = 0
+    let mut pi: i64 = 0
+    while pi <= 8 {
+        let key = "p" + to_string(pi)
+        let v = _grab_json_int(pb, key)
+        if v > 0 { total = total + v; phases = phases + 1 }
+        pi = pi + 1
+    }
+    if phases == 0 || total <= 0 { return "" }
+    let baseline_ms = total
+    let threshold = (baseline_ms * 12) / 10
+    if last_ms > threshold {
+        return "H-PERF-BASELINE|warn|H-PERF-BASELINE: blowup " + to_string(last_ms) + "ms > " + to_string(baseline_ms) + "ms*1.2"
+    }
+    return ""
+}
+
+// ── Check: H-CROSS-NEXUS-N6 — blowup→atlas pending 5+ ──
+fn check_cross_nexus_n6(path: string) -> string {
+    let in_blowup = path.index_of("/shared/blowup/") >= 0 || path.starts_with("shared/blowup/")
+    if !in_blowup { return "" }
+    let e = ext_of(path)
+    if e != ".hexa" { return "" }
+    let cf = NEXUS_HARNESS + "/cross_feed.jsonl"
+    if !file_exists(cf) { return "" }
+    let tail = exec("tail -n 100 '" + cf + "' 2>/dev/null").trim()
+    if tail == "" { return "" }
+    let lines = tail.split("\n")
+    let mut n: i64 = 0
+    for ln in lines {
+        let s = _str(ln).trim()
+        if s == "" { continue }
+        if s.index_of("\"direction\":\"blowup→atlas\"") < 0 { continue }
+        if s.index_of("\"status\":\"pending\"") < 0 { continue }
+        n = n + 1
+    }
+    if n >= 5 {
+        return "H-CROSS-NEXUS-N6|warn|H-CROSS-NEXUS-N6: " + to_string(n) + " blowup→atlas 미반영. cross_feed.hexa flush 필요"
+    }
+    return ""
+}
+
+// ── Check: H-CROSS-N6-ANIMA — atlas→anima pending 3+ ──
+fn check_cross_n6_anima(path: string) -> string {
+    let is_atlas = path.index_of("/shared/n6/atlas.n6") >= 0 || path.ends_with("shared/n6/atlas.n6")
+    if !is_atlas { return "" }
+    if path.ends_with(".stats") || path.ends_with(".deg") { return "" }
+    let cf = NEXUS_HARNESS + "/cross_feed.jsonl"
+    if !file_exists(cf) { return "" }
+    let tail = exec("tail -n 100 '" + cf + "' 2>/dev/null").trim()
+    if tail == "" { return "" }
+    let lines = tail.split("\n")
+    let mut n: i64 = 0
+    for ln in lines {
+        let s = _str(ln).trim()
+        if s == "" { continue }
+        if s.index_of("\"direction\":\"atlas→anima\"") < 0 { continue }
+        if s.index_of("\"status\":\"pending\"") < 0 { continue }
+        n = n + 1
+    }
+    if n >= 3 {
+        return "H-CROSS-N6-ANIMA|warn|H-CROSS-N6-ANIMA: " + to_string(n) + " atlas→anima 미전파"
+    }
+    return ""
+}
+
+// ── Check: H-RES-OOM — 최근 OOM 기록 감지 (글로벌 게이트) ──
+fn check_res_oom(path: string) -> string {
+    let e = ext_of(path)
+    if e != ".hexa" { return "" }
+    if !file_exists(MISTAKES_LOG) { return "" }
+    let tail = exec("tail -n 20 '" + MISTAKES_LOG + "' 2>/dev/null").trim()
+    if tail == "" { return "" }
+    let lines = tail.split("\n")
+    for ln in lines {
+        let s = _str(ln).trim()
+        if s == "" { continue }
+        if s.index_of("\"kind\":\"oom\"") >= 0 {
+            return "H-RES-OOM|warn|H-RES-OOM: 최근 OOM 기록 감지. 메모리 패치 필요"
+        }
+    }
+    return ""
+}
+
+// ── Check: H-EVOLVE-CRON — growth-tick 6h stale ──
+fn check_evolve_cron(path: string) -> string {
+    let e = ext_of(path)
+    if e != ".hexa" { return "" }
+    let gt = NEXUS_HARNESS + "/growth_tick_log.jsonl"
+    if !file_exists(gt) { return "" }
+    let tail = exec("tail -n 1 '" + gt + "' 2>/dev/null").trim()
+    if tail == "" { return "" }
+    let last_ts = _grab_json_int(tail, "ts")
+    if last_ts <= 0 { return "" }
+    let now_s = exec("date +%s").trim()
+    if now_s == "" { return "" }
+    let now_ep = _to_int0(now_s)
+    if now_ep <= 0 { return "" }
+    let diff = now_ep - last_ts
+    if diff > 21600 {
+        return "H-EVOLVE-CRON|warn|H-EVOLVE-CRON: growth-tick " + to_string(diff) + "s stale (>6h)"
+    }
+    return ""
 }
 
 // ─── Gather files to lint ───
@@ -3214,6 +3442,34 @@ for f in files {
     // check_h_nohook (공통, H-NOHOOK): hook 시스템 신규 작성 금지 — settings hooks/.claude·.git hooks 신규
     let v_nh = check_h_nohook(path)
     if v_nh != "" { violations = violations.push(path + "|" + v_nh) }
+
+    // check_emerge_commit (H-EMERGE-COMMIT): atlas 3 commit 연속 무성장 감지
+    let v_ec = check_emerge_commit(path)
+    if v_ec != "" { violations = violations.push(path + "|" + v_ec) }
+
+    // check_no_regress (H-NOREGRESS): atlas nodes/edges 역행 차단 (NEXUS_GC_OK=1 우회)
+    let v_nr = check_no_regress(path)
+    if v_nr != "" { violations = violations.push(path + "|" + v_nr) }
+
+    // check_perf_baseline (H-PERF-BASELINE): blowup 성능 1.2x 회귀 감지
+    let v_pb = check_perf_baseline(path)
+    if v_pb != "" { violations = violations.push(path + "|" + v_pb) }
+
+    // check_cross_nexus_n6 (H-CROSS-NEXUS-N6): blowup→atlas pending 5+ 감지
+    let v_cx1 = check_cross_nexus_n6(path)
+    if v_cx1 != "" { violations = violations.push(path + "|" + v_cx1) }
+
+    // check_cross_n6_anima (H-CROSS-N6-ANIMA): atlas→anima pending 3+ 감지
+    let v_cx2 = check_cross_n6_anima(path)
+    if v_cx2 != "" { violations = violations.push(path + "|" + v_cx2) }
+
+    // check_res_oom (H-RES-OOM): 최근 mistakes.jsonl OOM 기록 글로벌 게이트
+    let v_oom = check_res_oom(path)
+    if v_oom != "" { violations = violations.push(path + "|" + v_oom) }
+
+    // check_evolve_cron (H-EVOLVE-CRON): growth-tick 6h stale 감지
+    let v_ev = check_evolve_cron(path)
+    if v_ev != "" { violations = violations.push(path + "|" + v_ev) }
 
     // check_hexa_exit (공통, H-HEXA-EXIT): hexa child exit() 비전파 — stdout 마커 검사 권장 (.hexa)
     if e == ".hexa" {
