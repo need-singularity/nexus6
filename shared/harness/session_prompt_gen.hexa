@@ -1,12 +1,14 @@
 // ═══════════════════════════════════════════════════════════
 // session_prompt_gen.hexa — 새 세션용 이어받기 프롬프트 자동 생성
-// Usage: hexa shared/harness/session_prompt_gen.hexa [out_path]
-// 기본 출력: ~/.claude-claude10/projects/-<cwd>/memory/session-handoff-latest.md
-// MEMORY.md 인덱스 자동 등록. 새 세션 시작 시 자동 로드 가능.
+// Usage: hexa shared/harness/session_prompt_gen.hexa [out_path] [session_id]
+// 기본 출력:
+//   session_id 있음 → memory/session-handoff-<session_id>.md (다중 세션 대응)
+//   session_id 없음 → memory/session-handoff-latest.md (역호환)
+//   out_path 명시   → 그 경로 우선
 //
-// Why: CLI budget emergency 시 handoff_write.hexa 가 호출 → 이 생성기가
-//      gold standard 경로 / pending phase / 최근 commits / 병렬 Agent 전략 등
-//      구체적 프롬프트 섹션 자동 주입.
+// Why: CLI budget 임계치 도달 시 cli_budget_gate.hexa 가 session_id 와 함께 호출.
+//      세션별 독립 파일 → 한 계정 여러 세션이 동시에 한계 도달해도 덮어쓰기 없음.
+//      MEMORY.md 등록은 제거됨 (사용자 지시: 메모리 저장 대신 프롬프트만 남김).
 // ═══════════════════════════════════════════════════════════
 
 let HOME = env("HOME")
@@ -72,8 +74,46 @@ fn other_repo_head(path: string) -> string {
     return _str(exec("cd '" + path + "' 2>/dev/null && git log --oneline -1 2>/dev/null")).trim()
 }
 
+// JSONL 에서 user prompt tail N 개 추출 (handoff_write 에서 이식, P4)
+fn get_tail_messages(jsonl_path: string, n: i64) -> string {
+    if len(jsonl_path) == 0 { return "" }
+    let raw = _str(exec("tail -n 200 '" + jsonl_path + "' 2>/dev/null")).trim()
+    if len(raw) == 0 { return "" }
+    let lines = raw.split("\n")
+    let mut user_prompts = []
+    let mut i: i64 = 0
+    while i < len(lines) {
+        let ln = lines[i]
+        if ln.contains("\"type\":\"user\"") && ln.contains("\"content\"") {
+            let c_idx = ln.split("\"content\":")
+            if len(c_idx) >= 2 {
+                let raw_c = c_idx[1]
+                if raw_c.starts_with("\"") {
+                    let inner = raw_c.split("\"")
+                    if len(inner) >= 2 {
+                        let text = inner[1]
+                        if len(text) > 0 && len(text) < 500 {
+                            user_prompts = user_prompts + [text]
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    let total: i64 = len(user_prompts)
+    let start: i64 = if total > n { total - n } else { 0 }
+    let mut out = ""
+    let mut j: i64 = start
+    while j < total {
+        out = out + "- " + user_prompts[j] + "\n"
+        j = j + 1
+    }
+    return out
+}
+
 // markdown 본문 빌드
-fn build_prompt() -> string {
+fn build_prompt(session_id: string, jsonl_path: string) -> string {
     let ts = now_iso()
     let head = git_head_short()
     let branch = git_branch()
@@ -153,31 +193,45 @@ fn build_prompt() -> string {
     s = s + "# 8 Agent 병렬 발사 (background=true). 완료 시 카테고리별 commit + push\n"
     s = s + "```\n\n"
     s = s + "**원칙**: 안 물어보고 진행. 확인 질문 최소화. 완료까지 자동.\n"
+
+    // 세션별 tail user prompts + 메타 (P4)
+    if len(session_id) > 0 {
+        s = s + "\n## 이 세션 메타\n\n"
+        s = s + "- session_id: `" + session_id + "`\n"
+        if len(jsonl_path) > 0 { s = s + "- jsonl: `" + jsonl_path + "`\n" }
+        let tail = get_tail_messages(jsonl_path, 5)
+        if len(tail) > 0 {
+            s = s + "\n## 이 세션 최근 user 발화 (tail 5)\n\n" + tail
+        }
+    }
     return s
 }
 
 // 실행
 let cwd = exec("pwd").trim()
 let dashed = cwd_to_dash(cwd)
-let mem_dir = HOME + "/.claude-claude10/projects/" + dashed + "/memory"
-// mem_dir 없으면 생성
+let proj_dir = HOME + "/.claude-claude10/projects/" + dashed
+let mem_dir = proj_dir + "/memory"
 exec("mkdir -p '" + mem_dir + "' 2>/dev/null")
-let default_out = mem_dir + "/session-handoff-latest.md"
 
+// argv: [hexa_bin, script_path, out_path?, session_id?]
 let a = args()
-let mut out_path = default_out
-if len(a) >= 3 { out_path = a[2] }
+let mut out_path_arg = ""
+let mut session_id = ""
+if len(a) >= 3 { out_path_arg = a[2] }
+if len(a) >= 4 { session_id = a[3] }
 
-let content = build_prompt()
+// out_path 결정: 명시 인자 > session_id 기반 > latest fallback
+let mut out_path = mem_dir + "/session-handoff-latest.md"
+if len(session_id) > 0 { out_path = mem_dir + "/session-handoff-" + session_id + ".md" }
+if len(out_path_arg) > 0 { out_path = out_path_arg }
+
+// jsonl_path 추론 (session_id 기반)
+let mut jsonl_path = ""
+if len(session_id) > 0 { jsonl_path = proj_dir + "/" + session_id + ".jsonl" }
+
+let content = build_prompt(session_id, jsonl_path)
 write_file(out_path, content)
 println("session handoff prompt 생성: " + out_path)
 println("bytes=" + to_string(len(content)))
-
-// MEMORY.md 인덱스 자동 등록 (nexus memory 기본 경로)
-let mem_index = HOME + "/.claude-claude10/projects/-Users-ghost-Dev-nexus/memory/MEMORY.md"
-let idx_entry = "- [세션 이어받기 (최신 자동생성)](session-handoff-latest.md) — 하네스 자동 생성 — `hexa shared/harness/session_prompt_gen.hexa` 로 갱신"
-let has_entry = to_int(_str(exec("grep -c 'session-handoff-latest.md' '" + mem_index + "' 2>/dev/null")).trim())
-if has_entry == 0 {
-    exec("echo '" + idx_entry + "' >> '" + mem_index + "'")
-    println("MEMORY.md 인덱스 등록 완료")
-}
+// MEMORY.md 등록 제거됨 — 세션별 파일이라 인덱스 오염 방지

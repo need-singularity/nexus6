@@ -1,12 +1,15 @@
-// cli_budget_gate.hexa — 세션 JSONL usage 합산 → 임계치 시 handoff 트리거
-// 성공 조용 (임계치 미만), 임계치 도달 시 systemMessage + handoff_write 호출
+// cli_budget_gate.hexa — 세션 JSONL usage 합산 → 임계치 시 새 세션 프롬프트 생성
+// 성공 조용 (임계치 미만), 임계치 도달 시 systemMessage + session_prompt_gen 호출
 // 호출: hexa cli_budget_gate.hexa   (growth-tick 등에서 쿨다운 후)
+// 주: 과거엔 handoff_write(memory 저장)+session_prompt_gen 둘 다 호출했으나,
+//     사용자 지시로 "메모리 저장 대신 새 세션용 프롬프트만" 남기도록 축소됨.
 
 let HOME = env("HOME")
 let MEM_ROOT = HOME + "/.claude-claude10/projects"
 let CONFIG = HOME + "/Dev/nexus/shared/config/cli_budget.json"
-let HANDOFF = HOME + "/Dev/nexus/shared/harness/handoff_write.hexa"
 let STATE_FILE = HOME + "/Dev/nexus/shared/harness/.cli_budget_state.json"
+let LOCK_DIR = HOME + "/Dev/nexus/shared/harness/.cli_budget.lock"
+let COOLDOWN_SEC: i64 = 300  // 5분 — 같은 session:level 재발사 쿨다운
 
 fn cwd_to_dash(cwd: str) -> str {
     let mut s = ""
@@ -56,87 +59,134 @@ fn json_float(raw: str, key: str) -> f64 {
     return to_float(s.substring(0, end).trim())
 }
 
-fn main() {
-    let cwd = cmd_out("pwd")
-    if cwd.len() == 0 { exit(0) }
+// ── P1 멀티세션 헬퍼 ──────────────────────────────────────
+// 락: mkdir 은 원자 연산. 성공=획득, 실패=이미 점유.
+// stale 1분 이상 → 자동 청소 (프로세스 크래시 보호)
+fn acquire_lock() -> bool {
+    let mut tries: i64 = 0
+    while tries < 20 {
+        exec("find '" + LOCK_DIR + "' -maxdepth 0 -mmin +1 -exec rmdir {} \\; 2>/dev/null")
+        let r = cmd_out("mkdir '" + LOCK_DIR + "' 2>/dev/null && echo 1 || echo 0")
+        if r == "1" { return true }
+        exec("sleep 0.1")
+        tries = tries + 1
+    }
+    return false
+}
 
-    let dash = cwd_to_dash(cwd)
-    let proj_dir = MEM_ROOT + "/" + dash
-    if file_exists(proj_dir) == false { exit(0) }
+fn release_lock() {
+    exec("rmdir '" + LOCK_DIR + "' 2>/dev/null")
+}
 
-    // 최신 JSONL
-    let jsonl = cmd_out("ls -t " + proj_dir + "/*.jsonl 2>/dev/null | head -1")
-    if jsonl.len() == 0 { exit(0) }
-
-    // config
-    if file_exists(CONFIG) == false { exit(0) }
-    let cfg = read_file(CONFIG)
-    let session_out_cap = json_number(cfg, "session_output_tokens")
+// 임계치 → 레벨 판정
+fn level_of(ratio: i64, cfg: str) -> str {
     let th_notice = json_float(cfg, "notice")
     let th_checkpoint = json_float(cfg, "checkpoint")
     let th_handoff = json_float(cfg, "handoff")
     let th_emergency = json_float(cfg, "emergency")
+    if ratio >= to_int(to_string(th_emergency * 10000.0)) { return "emergency" }
+    if ratio >= to_int(to_string(th_handoff * 10000.0)) { return "handoff" }
+    if ratio >= to_int(to_string(th_checkpoint * 10000.0)) { return "checkpoint" }
+    if ratio >= to_int(to_string(th_notice * 10000.0)) { return "notice" }
+    return ""
+}
 
-    if session_out_cap == 0 { exit(0) }
-
-    // 누적 output_tokens — 모든 usage 엔트리 합산
-    // jq 대신 grep+awk 기반
-    let sum_cmd = "grep -oE '\"output_tokens\":[0-9]+' '" + jsonl + "' 2>/dev/null | awk -F: '{s+=$2} END {print s+0}'"
-    let total_out_s = cmd_out(sum_cmd)
-    let total_out = to_int(total_out_s)
-
-    let ratio = if session_out_cap > 0 { (total_out * 10000) / session_out_cap } else { 0 }
-    let pct = ratio  // 만분율 (85% = 8500)
-
-    // 임계치 판정 (최고 단계만)
-    let mut level = ""
-    let mut reason = ""
-    if ratio >= (to_int(to_string(th_emergency * 10000.0)) - 0) {
-        level = "emergency"; reason = "emergency"
-    } else if ratio >= to_int(to_string(th_handoff * 10000.0)) {
-        level = "handoff"; reason = "handoff"
-    } else if ratio >= to_int(to_string(th_checkpoint * 10000.0)) {
-        level = "checkpoint"; reason = "checkpoint"
-    } else if ratio >= to_int(to_string(th_notice * 10000.0)) {
-        level = "notice"; reason = "notice"
-    } else {
-        exit(0)  // 임계치 미만 → 조용
+// P3 쿨다운 — STATE_FILE 라인에서 "sid:level:ts" 파싱, 최근 COOLDOWN_SEC 이내 hit 있으면 true
+fn is_recently_triggered(state: str, key: str, now_ts: i64) -> bool {
+    if state.contains(key) == false { return false }
+    let lines = state.split("\n")
+    let mut i: i64 = 0
+    while i < lines.len() {
+        let ln = lines[i]
+        if ln.starts_with(key + ":") {
+            let parts = ln.split(":")
+            // parts = [session_id_prefix..., level, ts] — session_id 에 ':' 없다고 가정
+            if parts.len() >= 3 {
+                let ts = to_int(parts[parts.len() - 1])
+                if now_ts - ts < COOLDOWN_SEC { return true }
+            }
+        }
+        i = i + 1
     }
+    return false
+}
 
-    // 상태 파일 중복 방지 (같은 세션 + 같은 레벨 중복 발사 방지)
-    let session_id = cmd_out("basename '" + jsonl + "' .jsonl")
-    let state_key = session_id + ":" + level
-    if file_exists(STATE_FILE) {
-        let st = read_file(STATE_FILE)
-        if st.contains(state_key) { exit(0) }
-    }
+fn sum_output_tokens(jsonl: str) -> i64 {
+    let cmd = "grep -oE '\"output_tokens\":[0-9]+' '" + jsonl + "' 2>/dev/null | awk -F: '{s+=$2} END {print s+0}'"
+    return to_int(cmd_out(cmd))
+}
 
-    // handoff_write 호출 (checkpoint 이상)
-    if level != "notice" {
-        exec("hexa " + HANDOFF + " " + reason + " >/dev/null 2>&1 &")
-        // session_prompt_gen 병행 호출 — 구체적 이어받기 프롬프트 자동 생성 + MEMORY.md 등록
-        let PROMPT_GEN = HOME + "/Dev/nexus/shared/harness/session_prompt_gen.hexa"
-        exec("hexa " + PROMPT_GEN + " >/dev/null 2>&1 &")
-    }
-
-    // systemMessage 발사
-    let pct_int = ratio / 100  // 만분율 → %
+fn emit_message(session_id: str, level: str, pct_int: i64) {
     let mut msg = ""
     if level == "notice" {
-        msg = "📊 CLI 세션 output " + to_string(pct_int) + "% 소비"
+        msg = "📊 [" + session_id + "] CLI " + to_string(pct_int) + "% 소비"
     } else if level == "checkpoint" {
-        msg = "📝 CLI 70% — handoff 체크포인트 저장 중 (memory/handoff-latest.md)"
+        msg = "📝 [" + session_id + "] CLI 70% — 새 세션 프롬프트 생성 (memory/session-handoff-" + session_id + ".md)"
     } else if level == "handoff" {
-        msg = "⚠️ CLI 85% — 현재 작업/다음 단계를 memory/handoff-latest.md 에 저장. 한도 임박"
+        msg = "⚠️ [" + session_id + "] CLI 85% — 새 세션 이어받기 프롬프트 (memory/session-handoff-" + session_id + ".md). 한도 임박"
     } else {
-        msg = "🚨 CLI 95% — 즉시 핵심 상태 memory 저장. 다음 세션 이어받기 필수"
+        msg = "🚨 [" + session_id + "] CLI 95% — 즉시 새 세션 프롬프트 확인 (memory/session-handoff-" + session_id + ".md)"
+    }
+    println("{\"systemMessage\":\"" + msg + "\"}")
+}
+
+fn main() {
+    let cwd = cmd_out("pwd")
+    if cwd.len() == 0 { exit(0) }
+    let dash = cwd_to_dash(cwd)
+    let proj_dir = MEM_ROOT + "/" + dash
+    if file_exists(proj_dir) == false { exit(0) }
+
+    if file_exists(CONFIG) == false { exit(0) }
+    let cfg = read_file(CONFIG)
+    let session_out_cap = json_number(cfg, "session_output_tokens")
+    if session_out_cap == 0 { exit(0) }
+
+    // P1: 전 세션 JSONL 순회
+    let jsonl_raw = cmd_out("ls " + proj_dir + "/*.jsonl 2>/dev/null")
+    if jsonl_raw.len() == 0 { exit(0) }
+    let jsonls = jsonl_raw.split("\n")
+
+    // P1: 락 획득 — state R-M-W 보호 (다중 세션 동시 호출 대응)
+    if acquire_lock() == false { exit(0) }
+
+    let now_ts = to_int(cmd_out("date +%s"))
+    let state_prev = if file_exists(STATE_FILE) { read_file(STATE_FILE) } else { "" }
+    let mut new_entries = ""
+
+    let PROMPT_GEN = HOME + "/Dev/nexus/shared/harness/session_prompt_gen.hexa"
+
+    let mut idx: i64 = 0
+    while idx < jsonls.len() {
+        let jsonl = jsonls[idx].trim()
+        if jsonl.len() > 0 {
+            let session_id = cmd_out("basename '" + jsonl + "' .jsonl")
+            let total_out = sum_output_tokens(jsonl)
+            let ratio = if session_out_cap > 0 { (total_out * 10000) / session_out_cap } else { 0 }
+            let level = level_of(ratio, cfg)
+
+            if level.len() > 0 {
+                let key = session_id + ":" + level
+                let all_state = state_prev + new_entries
+                if is_recently_triggered(all_state, key, now_ts) == false {
+                    let pct_int = ratio / 100
+                    emit_message(session_id, level, pct_int)
+                    // notice 는 systemMessage 만, 나머지는 프롬프트 생성까지
+                    if level != "notice" {
+                        exec("hexa " + PROMPT_GEN + " \"\" \"" + session_id + "\" >/dev/null 2>&1 &")
+                    }
+                    new_entries = new_entries + key + ":" + to_string(now_ts) + "\n"
+                }
+            }
+        }
+        idx = idx + 1
     }
 
-    println("{\"systemMessage\":\"" + msg + "\"}")
+    if new_entries.len() > 0 {
+        write_file(STATE_FILE, state_prev + new_entries)
+    }
 
-    // 상태 업데이트 (중복 방지)
-    let prev = if file_exists(STATE_FILE) { read_file(STATE_FILE) } else { "" }
-    write_file(STATE_FILE, prev + state_key + "\n")
+    release_lock()
 }
 
 main()
