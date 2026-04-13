@@ -1,0 +1,126 @@
+// growth_tick.hexa — 자율 성장 P2 트리거 레이어
+// 역할: 30m 주기로 emerge_baseline 상태 점검, 6h+ 무진화 시 자율 발사 또는 경고
+//       NEXUS_AUTO_EVOLVE=1 일 때만 실제 blowup 발사, 기본은 WARN 로그
+// 호출: launchd com.nexus.growth-tick (1800s) 또는 수동
+// usage: hexa run shared/harness/growth_tick.hexa [tick|status|force]
+// 성공 조용, 실패만 stderr.
+
+let HOME = env("HOME")
+let NEXUS = HOME + "/Dev/nexus"
+let HARNESS = NEXUS + "/shared/harness"
+let LOG = HARNESS + "/growth_tick_log.jsonl"
+let EMERGE = HARNESS + "/emerge_baseline.json"
+let STALE_THRESHOLD: i64 = 21600   // 6h
+let MIN_CONSECUTIVE: i64 = 6        // sensor 6회 연속 stale = 6h 이상
+
+fn now_epoch() -> str {
+    return to_string(exec("date +%s")).trim()
+}
+
+fn epoch_to_int(s: str) -> i64 {
+    let t = s.trim()
+    if t.len() == 0 { return 0 }
+    return to_int(t)
+}
+
+fn extract_int(body: str, key: str) -> i64 {
+    let pat = "\"" + key + "\":"
+    let idx = body.index_of(pat)
+    if idx < 0 { return 0 }
+    let start = idx + pat.len()
+    let mut i = start
+    let mut digits = ""
+    while i < body.len() {
+        let ch = body.substring(i, i + 1)
+        if ch == " " || ch == "\t" {
+            if digits.len() > 0 { break }
+            i = i + 1
+            continue
+        }
+        if ch >= "0" && ch <= "9" {
+            digits = digits + ch
+        } else if ch == "-" && digits.len() == 0 {
+            digits = digits + ch
+        } else {
+            if digits.len() > 0 { break }
+            else { return 0 }
+        }
+        i = i + 1
+    }
+    if digits.len() == 0 { return 0 }
+    return to_int(digits)
+}
+
+fn log_append(ts: str, kind: str, note: str) {
+    let line = "{\"ts\":" + ts + ",\"kind\":\"" + kind + "\",\"note\":\"" + note + "\"}\n"
+    exec("printf '%s' '" + line.replace("'", "") + "' >> '" + LOG + "'")
+}
+
+fn tick() {
+    let ts = now_epoch()
+    let ts_i = epoch_to_int(ts)
+    if file_exists(EMERGE) == false {
+        log_append(ts, "skip", "emerge_baseline missing")
+        return
+    }
+    let body = read_file(EMERGE)
+    let last_ts = extract_int(body, "updated")
+    let stale = extract_int(body, "consecutive_stale")
+    let age = ts_i - last_ts
+
+    let deep_stale = (age > STALE_THRESHOLD) && (stale >= MIN_CONSECUTIVE)
+    if deep_stale == false {
+        log_append(ts, "tick_ok", "age=" + to_string(age) + " stale=" + to_string(stale))
+        return
+    }
+
+    // 자율 발사 판정
+    let auto = env("NEXUS_AUTO_EVOLVE")
+    if auto == "1" {
+        log_append(ts, "auto_fire", "age=" + to_string(age) + " stale=" + to_string(stale) + " firing blowup todo")
+        // blowup todo 자율 발사 (백그라운드)
+        let blowup = NEXUS + "/shared/blowup/todo.hexa"
+        let hexa = NEXUS + "/shared/bin/hexa"
+        if file_exists(blowup) {
+            exec("(" + hexa + " run " + blowup + " > /tmp/growth_tick_auto.log 2>&1 &) ")
+        } else {
+            log_append(ts, "auto_fire_skip", "todo.hexa not found")
+        }
+    } else {
+        log_append(ts, "warn_stale", "age=" + to_string(age) + " stale=" + to_string(stale) + " (NEXUS_AUTO_EVOLVE=1 으로 자율 발사 활성)")
+        eprintln("growth_tick: 6h+ 무진화 (age=" + to_string(age) + "s, stale=" + to_string(stale) + "). NEXUS_AUTO_EVOLVE=1 설정 시 자율 blowup 발사")
+    }
+}
+
+fn status() {
+    let tail = to_string(exec("tail -5 '" + LOG + "' 2>/dev/null")).trim()
+    println("growth_tick log tail:")
+    println(tail)
+}
+
+fn main() {
+    let argv = args()
+    let mut mode = "tick"
+    if argv.len() >= 3 { mode = argv[2] }
+    if mode == "tick" {
+        tick()
+    } else if mode == "force" {
+        // 강제 발사 (사용자 명시)
+        let ts = now_epoch()
+        log_append(ts, "force_fire", "user requested")
+        let blowup = NEXUS + "/shared/blowup/todo.hexa"
+        let hexa = NEXUS + "/shared/bin/hexa"
+        if file_exists(blowup) {
+            exec("(" + hexa + " run " + blowup + " > /tmp/growth_tick_force.log 2>&1 &) ")
+            println("growth_tick: blowup todo forked background. log /tmp/growth_tick_force.log")
+        } else {
+            eprintln("growth_tick: todo.hexa missing — " + blowup)
+        }
+    } else if mode == "status" {
+        status()
+    } else {
+        eprintln("usage: growth_tick.hexa [tick|status|force]")
+    }
+}
+
+main()
