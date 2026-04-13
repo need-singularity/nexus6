@@ -1,0 +1,227 @@
+// model_route.hexa — H-MODEL-ROUTE: task hint → model tier 추천
+// 역할: task_hint 키워드 매칭으로 haiku/sonnet/opus 자동 선택. agent_ledger 와 연계.
+// SSOT: shared/harness/model_route.jsonl (append-only)
+// dispatch: entry.hexa route <words...>  (이미 entry.hexa 에 라우팅 추가됨)
+//
+// modes:
+//   route <task_hint_words...>           — `tier=X reason=Y est_tokens=N` 한 줄
+//   route json <task_hint_words...>      — JSON 단일 라인 stdout
+//   route status                         — model_route.jsonl tail 10 요약
+//
+// heuristic:
+//   opus    architect|security|refactor|migration|5 files|5+ files|first attempt failed|critical|redesign|overhaul
+//   haiku   grep|list|search|simple|read|cat|ls|status|find|show|what is|count
+//   sonnet  default
+//   priority: opus > haiku > sonnet
+//
+// est_tokens (추정, 향후 실측 반영):
+//   haiku   1500
+//   sonnet  4000
+//   opus    8000
+//
+// pricing (참고용 주석, $/M tokens):
+//   haiku   0.80 in / 4.00 out
+//   sonnet  3.00 in / 15.00 out
+//   opus    15.00 in / 75.00 out
+//
+// sentinel: 성공 시 마지막 라인 `__HARNESS_ROUTE_RESULT__ PASS`
+// 우회: NEXUS_ROUTE_OK=1 (silent skip — JSONL append 만 스킵, stdout 추천은 그대로)
+
+let HOME = env("HOME")
+let JSONL = HOME + "/Dev/nexus/shared/harness/model_route.jsonl"
+let SENTINEL_PASS = "__HARNESS_ROUTE_RESULT__ PASS"
+let SENTINEL_BLOCK = "__HARNESS_ROUTE_RESULT__ BLOCK"
+
+// ─── helpers ───
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _to_int0(s: string) -> i64 {
+    if s == "" { return 0 }
+    let first = _str(s.split("\n")[0]).trim()
+    if first == "" { return 0 }
+    return to_int(first)
+}
+
+fn now_unix() -> i64 {
+    return _to_int0(_str(exec("date +%s")).trim())
+}
+
+fn now_iso() -> string {
+    return _str(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()
+}
+
+fn json_escape(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", " ")
+    r = r.replace("\r", " ")
+    r = r.replace("\t", " ")
+    return r
+}
+
+fn _ensure() {
+    if file_exists(JSONL) == false {
+        try { write_file(JSONL, "") } catch e {}
+    }
+}
+
+// ─── tier table ───
+fn est_tokens_for(tier: string) -> i64 {
+    if tier == "haiku" { return 1500 }
+    if tier == "opus" { return 8000 }
+    return 4000  // sonnet default
+}
+
+// ─── routing heuristic (priority: opus > haiku > sonnet) ───
+fn classify(hint_lower: string) -> [string] {
+    // opus 키워드 (구문 우선 순위)
+    let opus_kw = [
+        "architect", "security", "refactor", "migration",
+        "5 files", "5+ files", "first attempt failed",
+        "critical", "redesign", "overhaul"
+    ]
+    for kw in opus_kw {
+        if hint_lower.contains(kw) {
+            return ["opus", kw]
+        }
+    }
+    // haiku 키워드
+    let haiku_kw = [
+        "grep", "list", "search", "simple", "read",
+        "cat", "ls", "status", "find", "show",
+        "what is", "count"
+    ]
+    for kw in haiku_kw {
+        if hint_lower.contains(kw) {
+            return ["haiku", kw]
+        }
+    }
+    return ["sonnet", "default"]
+}
+
+// ─── argv → task_hint string ───
+fn collect_hint(argv: [string], start_idx: i64) -> string {
+    let mut out = ""
+    let mut i = start_idx
+    while i < argv.len() {
+        let part = _str(argv[i])
+        if part.len() == 0 { i = i + 1; continue }
+        if out.len() > 0 { out = out + " " }
+        out = out + part
+        i = i + 1
+    }
+    return out
+}
+
+// 120자 trim (jsonl 보호)
+fn trim120(s: string) -> string {
+    if s.len() <= 120 { return s }
+    return s.substring(0, 120)
+}
+
+// ─── append JSONL ───
+fn append_route(hint: string, tier: string, reason: string, est_tokens: i64) {
+    if env("NEXUS_ROUTE_OK") == "1" { return }
+    _ensure()
+    let ts = now_iso()
+    let row = "{\"ts\":\"" + ts + "\"," +
+              "\"task_hint\":\"" + json_escape(trim120(hint)) + "\"," +
+              "\"tier\":\"" + tier + "\"," +
+              "\"reason\":\"" + json_escape(reason) + "\"," +
+              "\"est_tokens\":" + to_string(est_tokens) + "}"
+    try { append_file(JSONL, row + "\n") } catch e {}
+}
+
+// ─── cmd: route (default text or json) ───
+fn cmd_route_text(hint: string) {
+    if hint.len() == 0 {
+        eprintln("usage: route <task_hint_words...>")
+        println(SENTINEL_BLOCK + " empty_hint")
+        exit(2)
+    }
+    let lower = hint.to_lower()
+    let result = classify(lower)
+    let tier = result[0]
+    let reason = result[1]
+    let est = est_tokens_for(tier)
+    append_route(hint, tier, reason, est)
+    println("tier=" + tier + " reason=" + reason + " est_tokens=" + to_string(est))
+    println(SENTINEL_PASS)
+}
+
+fn cmd_route_json(hint: string) {
+    if hint.len() == 0 {
+        eprintln("usage: route json <task_hint_words...>")
+        println(SENTINEL_BLOCK + " empty_hint")
+        exit(2)
+    }
+    let lower = hint.to_lower()
+    let result = classify(lower)
+    let tier = result[0]
+    let reason = result[1]
+    let est = est_tokens_for(tier)
+    append_route(hint, tier, reason, est)
+    let json = "{\"task_hint\":\"" + json_escape(trim120(hint)) + "\"," +
+               "\"tier\":\"" + tier + "\"," +
+               "\"reason\":\"" + json_escape(reason) + "\"," +
+               "\"est_tokens\":" + to_string(est) + "}"
+    println(json)
+    println(SENTINEL_PASS)
+}
+
+// ─── cmd: status — tail 10 요약 ───
+fn cmd_status() {
+    _ensure()
+    let tail = _str(exec("tail -n 10 '" + JSONL + "' 2>/dev/null")).trim()
+    if tail.len() == 0 {
+        println("(no routing history)")
+        println(SENTINEL_PASS)
+        return
+    }
+    println("=== model_route.jsonl tail 10 ===")
+    println(tail)
+    // 통계: tier 별 카운트
+    let stats_cmd = "tail -n 10 '" + JSONL + "' 2>/dev/null | " +
+                    "awk -F'\"tier\":\"' 'NF>1 { split($2, a, \"\\\"\"); print a[1] }' | " +
+                    "sort | uniq -c | awk '{ printf \"%s=%d \", $2, $1 }'"
+    let stats = _str(exec(stats_cmd)).trim()
+    if stats.len() > 0 {
+        println("tier_count: " + stats)
+    }
+    println(SENTINEL_PASS)
+}
+
+// ─── main dispatcher ───
+fn main() {
+    let argv = args()
+    // entry.hexa 가 route 모드를 뺀 rest 만 넘기므로:
+    //   직접 호출: hexa run model_route.hexa <hint...>          → argv[2..]
+    //   entry 경유: entry.hexa route <hint...>                  → argv[2..]  (entry 가 mode 제거)
+    //   json:      hexa run model_route.hexa json <hint...>    → argv[2]="json"
+    //   status:    hexa run model_route.hexa status            → argv[2]="status"
+    if argv.len() < 3 {
+        eprintln("usage: model_route.hexa <task_hint_words...> | json <hint...> | status")
+        println(SENTINEL_BLOCK + " usage")
+        exit(2)
+    }
+    let first = _str(argv[2]).trim()
+    if first == "status" {
+        cmd_status()
+        return
+    }
+    if first == "json" {
+        let hint = collect_hint(argv, 3)
+        cmd_route_json(hint)
+        return
+    }
+    // default: text route, argv[2..] 전체가 hint
+    let hint = collect_hint(argv, 2)
+    cmd_route_text(hint)
+}
+
+main()

@@ -1,0 +1,248 @@
+// agent_ledger.hexa — H-AGENT-LEDGER 가드
+// 역할: Agent 호출 전후로 작업 등록·마감. 동일 area 동시 활성 감지 → WARN (block X).
+//       9-agent 동시 발사 시 race + 중복 작업 흡수 재발 방지.
+// SSOT: shared/harness/work_registry.jsonl (append-only)
+// 우회: NEXUS_LEDGER_OK=1 (silent skip)
+//
+// modes:
+//   register [--model <tier>] [--tokens <n>] <area> <prompt_hash>
+//                                          — 신규 active 등록 + 중복 WARN
+//                                            model/tokens 옵션 없으면 ""/0 default
+//   complete <agent_id>                    — done 마감
+//   dup_check <area>                       — 활성 동일 area 수 출력
+//   gc                                     — 3600s+ 활성 → stale 마감
+//   list                                   — 현재 활성 agent 목록
+//
+// 역호환: 구버전 `register <area> <prompt_hash>` 시그니처 그대로 작동.
+// 성공 조용, 실패 시끄럽게 (H1).
+
+let HOME = env("HOME")
+let REGISTRY = HOME + "/Dev/nexus/shared/harness/work_registry.jsonl"
+let STALE_AFTER: i64 = 3600  // 1시간 후 active → stale
+
+// void-safe coercion — "".split() 첫 원소 void 반환 우회
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _to_int0(s: string) -> i64 {
+    if s == "" { return 0 }
+    let first = _str(s.split("\n")[0]).trim()
+    if first == "" { return 0 }
+    return to_int(first)
+}
+
+fn now_unix() -> i64 {
+    return _to_int0(_str(exec("date +%s")).trim())
+}
+
+fn _ensure() {
+    if file_exists(REGISTRY) == false {
+        try { write_file(REGISTRY, "") } catch e {}
+    }
+}
+
+fn json_escape(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", " ")
+    r = r.replace("\r", " ")
+    r = r.replace("\t", " ")
+    return r
+}
+
+// ─── agent_id: ts+pid+area 해시 8자 ───
+fn make_agent_id(area: string) -> string {
+    let ts = to_string(now_unix())
+    let pid = _str(exec("echo $$")).trim()
+    let raw = ts + "|" + pid + "|" + area
+    let esc = raw.replace("'", "")
+    let cmd = "printf '%s' '" + esc + "' | /usr/bin/shasum -a 256 2>/dev/null | cut -c1-8"
+    let r = _str(exec(cmd)).trim()
+    if r == "" {
+        // fallback
+        return ts
+    }
+    return "a" + r
+}
+
+// ─── 활성 동일 area 카운트 ───
+fn count_active_area(area: string) -> i64 {
+    _ensure()
+    let esc_area = area.replace("'", "")
+    // active status + area 일치
+    let cmd = "grep '\"status\":\"active\"' '" + REGISTRY + "' 2>/dev/null | " +
+              "grep -c '\"area\":\"" + esc_area + "\"' 2>/dev/null"
+    return _to_int0(_str(exec(cmd)).trim())
+}
+
+// ─── register ───
+// 옵션 파싱: argv[3..] 에서 `--model <tier>` `--tokens <n>` 추출 후 잔여 positional = [area, prompt_hash]
+fn parse_register_opts(argv: [string]) -> [string] {
+    // 반환: [area, prompt_hash, model, tokens_str]
+    let mut model = ""
+    let mut tokens = "0"
+    let mut pos = []
+    let mut i = 3
+    while i < argv.len() {
+        let a = _str(argv[i])
+        if a == "--model" && i + 1 < argv.len() {
+            model = _str(argv[i + 1]).trim()
+            i = i + 2
+            continue
+        }
+        if a == "--tokens" && i + 1 < argv.len() {
+            tokens = _str(argv[i + 1]).trim()
+            if tokens == "" { tokens = "0" }
+            i = i + 2
+            continue
+        }
+        pos = pos.push(a)
+        i = i + 1
+    }
+    let mut area = ""
+    let mut hash = ""
+    if pos.len() >= 1 { area = _str(pos[0]).trim() }
+    if pos.len() >= 2 { hash = _str(pos[1]).trim() }
+    return [area, hash, model, tokens]
+}
+
+fn cmd_register(argv: [string]) {
+    if env("NEXUS_LEDGER_OK") == "1" { return }
+    let parsed = parse_register_opts(argv)
+    let area = parsed[0]
+    let prompt_hash = parsed[1]
+    let model = parsed[2]
+    let tokens_est = _to_int0(parsed[3])
+    if area.len() == 0 || prompt_hash.len() == 0 {
+        eprintln("usage: register [--model <tier>] [--tokens <n>] <area> <prompt_hash>")
+        exit(2)
+    }
+
+    _ensure()
+    let active = count_active_area(area)
+    let agent_id = make_agent_id(area)
+    let ts = now_unix()
+
+    let row = "{\"agent_id\":\"" + agent_id + "\"," +
+              "\"area\":\"" + json_escape(area) + "\"," +
+              "\"prompt_hash\":\"" + json_escape(prompt_hash) + "\"," +
+              "\"ts_start\":" + to_string(ts) + "," +
+              "\"ts_end\":null," +
+              "\"status\":\"active\"," +
+              "\"model\":\"" + json_escape(model) + "\"," +
+              "\"tokens_est\":" + to_string(tokens_est) + "}"
+    try { append_file(REGISTRY, row + "\n") } catch e {
+        eprintln("FAIL: append_file 실패 — " + REGISTRY)
+        exit(1)
+    }
+
+    if active > 0 {
+        // WARN (block X — overzealous 회피)
+        eprintln("[H-AGENT-LEDGER WARN] area='" + area + "' 이미 활성 " + to_string(active) + "건 — 중복/race 위험. 등록은 진행 (agent_id=" + agent_id + ")")
+    }
+    // agent_id 는 stdout 으로 — 호출자가 complete 시 사용
+    println(agent_id)
+}
+
+// ─── complete ───
+fn cmd_complete(argv: [string]) {
+    if env("NEXUS_LEDGER_OK") == "1" { return }
+    if argv.len() < 4 {
+        eprintln("usage: complete <agent_id>")
+        exit(2)
+    }
+    let agent_id = argv[3].trim()
+    if agent_id.len() == 0 { return }
+
+    _ensure()
+    let ts = to_string(now_unix())
+    // BSD/GNU sed 호환: key=agent_id 라인 → status=done, ts_end=ts
+    // "status":"active" → "status":"done"
+    let esc_id = agent_id.replace("'", "")
+    let cmd1 = "/usr/bin/sed -i.bak '/\"agent_id\":\"" + esc_id + "\"/ s/\"status\":\"active\"/\"status\":\"done\"/' '" + REGISTRY + "' && rm -f '" + REGISTRY + ".bak'"
+    exec(cmd1)
+    // "ts_end":null → "ts_end":<ts>
+    let cmd2 = "/usr/bin/sed -i.bak '/\"agent_id\":\"" + esc_id + "\"/ s/\"ts_end\":null/\"ts_end\":" + ts + "/' '" + REGISTRY + "' && rm -f '" + REGISTRY + ".bak'"
+    exec(cmd2)
+    // silent success
+}
+
+// ─── dup_check ───
+fn cmd_dup_check(argv: [string]) {
+    if argv.len() < 4 {
+        eprintln("usage: dup_check <area>")
+        exit(2)
+    }
+    let area = argv[3].trim()
+    let n = count_active_area(area)
+    println(to_string(n))
+}
+
+// ─── gc — stale 마감 ───
+fn cmd_gc(argv: [string]) {
+    _ensure()
+    let now = now_unix()
+    let cutoff = now - STALE_AFTER
+    // awk 로 ts_start + status=active 추출 → cutoff 이전이면 stale 처리 대상
+    // 단순화: sed 로 ts_start < cutoff 매칭 불가하므로 awk 경유 → key 수집 후 loop
+    let awk_cmd = "awk -v c=" + to_string(cutoff) +
+                  " -F'[,:]' '/\"status\":\"active\"/ { " +
+                  " for(i=1;i<=NF;i++){ " +
+                  "   if($i ~ /\"ts_start\"/){ gsub(/[^0-9]/,\"\",$(i+1)); ts=$(i+1)+0 } " +
+                  "   if($i ~ /\"agent_id\"/){ gsub(/[\"\\\\ ]/,\"\",$(i+1)); aid=$(i+1) } " +
+                  " } if(ts>0 && ts<c) print aid " +
+                  "}' '" + REGISTRY + "' 2>/dev/null"
+    let stale_ids = _str(exec(awk_cmd)).trim()
+    if stale_ids == "" {
+        println("gc: 0 stale")
+        return
+    }
+    let mut count: i64 = 0
+    let ts = to_string(now)
+    for aid in stale_ids.split("\n") {
+        let id = _str(aid).trim()
+        if id.len() == 0 { continue }
+        let esc_id = id.replace("'", "")
+        let cmd1 = "/usr/bin/sed -i.bak '/\"agent_id\":\"" + esc_id + "\"/ s/\"status\":\"active\"/\"status\":\"stale\"/' '" + REGISTRY + "' && rm -f '" + REGISTRY + ".bak'"
+        exec(cmd1)
+        let cmd2 = "/usr/bin/sed -i.bak '/\"agent_id\":\"" + esc_id + "\"/ s/\"ts_end\":null/\"ts_end\":" + ts + "/' '" + REGISTRY + "' && rm -f '" + REGISTRY + ".bak'"
+        exec(cmd2)
+        count = count + 1
+    }
+    println("gc: " + to_string(count) + " stale")
+}
+
+// ─── list ───
+fn cmd_list(argv: [string]) {
+    _ensure()
+    let out = _str(exec("grep '\"status\":\"active\"' '" + REGISTRY + "' 2>/dev/null")).trim()
+    if out == "" {
+        println("(no active agents)")
+        return
+    }
+    println(out)
+}
+
+fn main() {
+    let argv = args()
+    if argv.len() < 3 {
+        eprintln("usage: agent_ledger <register|complete|dup_check|gc|list> [args...]")
+        exit(2)
+    }
+    let mode = argv[2].trim()
+    if mode == "register" { cmd_register(argv) }
+    else if mode == "complete" { cmd_complete(argv) }
+    else if mode == "dup_check" { cmd_dup_check(argv) }
+    else if mode == "gc" { cmd_gc(argv) }
+    else if mode == "list" { cmd_list(argv) }
+    else {
+        eprintln("REJECT: unknown mode '" + mode + "' — modes: register|complete|dup_check|gc|list")
+        exit(2)
+    }
+}
+
+main()

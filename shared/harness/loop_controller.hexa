@@ -1,0 +1,424 @@
+// loop_controller.hexa — autonomous loop stall + cost drift 감시
+// 역할: nexus 자율 루프(commands.json autonomous 블록)의
+//        ① stall 감지 — mistakes.jsonl 동일 {file,rule,fix} 2회 이상 반복
+//        ② cost drift — work_registry.jsonl 최근 1시간 tokens_est 합산 100K 초과
+//       WARN-only (block X). entry.hexa 의 `loop` 라우팅에서 호출.
+//
+// SSOT: shared/harness/loop_state.jsonl (append-only, kind=start|stall|cost_drift|stop)
+//
+// modes:
+//   start                 — 새 루프 시작 (ts_start 기록)
+//   status                — 현재 루프 상태 한 줄 (loop: started ..., stall=N cost_1h=N/100K)
+//   stall_check           — mistakes.jsonl tail 50 → 동일 sig 2+ 회 stderr WARN
+//   cost_check            — 최근 1h tokens_est 합산 → 100K 초과 시 stderr WARN
+//   stop                  — 루프 종료 마크
+//
+// 성공 조용 (H1), 실패 stderr.
+// stdout sentinel 마지막 라인: __HARNESS_LOOP_RESULT__ PASS|WARN
+// (PASS=정상, WARN=stall/drift 감지)
+//
+// @no-lock-needed (호출 짧음, atomic append + sed 만 사용)
+// @allow-bare-exec (date/grep/tail/awk/shasum 단발 호출 — perl_timeout 불필요)
+
+let HOME = env("HOME")
+let HARNESS = HOME + "/Dev/nexus/shared/harness"
+let STATE = HARNESS + "/loop_state.jsonl"
+let MISTAKES = HARNESS + "/mistakes.jsonl"
+let REGISTRY = HARNESS + "/work_registry.jsonl"
+
+let STALL_TAIL: i64 = 50          // mistakes.jsonl tail 라인 수
+let STALL_REPEAT: i64 = 2          // 동일 sig N+회 시 stall
+let COST_WINDOW_SEC: i64 = 3600    // 최근 1시간
+let COST_THRESHOLD: i64 = 100000   // tokens/hr WARN 임계
+
+// ─── void-safe coercion (agent_ledger 패턴) ───
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _to_int0(s: string) -> i64 {
+    if s == "" { return 0 }
+    let first = _str(s.split("\n")[0]).trim()
+    if first == "" { return 0 }
+    return to_int(first)
+}
+
+fn now_unix() -> i64 {
+    return _to_int0(_str(exec("date +%s")).trim())
+}
+
+fn now_iso() -> string {
+    return _str(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()
+}
+
+fn json_escape(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", " ")
+    r = r.replace("\r", " ")
+    r = r.replace("\t", " ")
+    return r
+}
+
+fn sentinel_pass() {
+    println("__HARNESS_LOOP_RESULT__ PASS")
+}
+
+fn sentinel_warn() {
+    println("__HARNESS_LOOP_RESULT__ WARN")
+}
+
+fn _ensure() {
+    if file_exists(STATE) == false {
+        try { write_file(STATE, "") } catch e {}
+    }
+}
+
+// ─── session_id: TERM_SESSION_ID sha1-8, 없으면 p<PID> ───
+fn make_session_id() -> string {
+    let term = _str(env("TERM_SESSION_ID")).trim()
+    if term.len() > 0 {
+        let esc = term.replace("'", "")
+        let cmd = "printf '%s' '" + esc + "' | /usr/bin/shasum -a 1 2>/dev/null | cut -c1-8"
+        let r = _str(exec(cmd)).trim()  // @allow-bare-exec
+        if r.len() > 0 { return r }
+    }
+    let pid = _str(exec("echo $$")).trim()
+    if pid.len() > 0 { return "p" + pid }
+    return "unknown"
+}
+
+// ─── append_state ───
+fn append_state(kind: string, sid: string, details: string, metric: i64) {
+    _ensure()
+    let ts = now_iso()
+    let row = "{\"ts\":\"" + ts + "\"," +
+              "\"kind\":\"" + kind + "\"," +
+              "\"session_id\":\"" + sid + "\"," +
+              "\"details\":\"" + json_escape(details) + "\"," +
+              "\"metric\":" + to_string(metric) + "}"
+    try { append_file(STATE, row + "\n") } catch e {
+        eprintln("FAIL: append_file " + STATE)
+    }
+}
+
+// ─── 마지막 active 세션 (start ↔ stop pair) 찾기 ───
+// 반환: [ts_start_unix, ts_iso, found("1"|"0")]
+fn find_active_session(sid: string) -> [string] {
+    if file_exists(STATE) == false {
+        return ["0", "", "0"]
+    }
+    // 같은 session_id 의 가장 최근 start, 그 뒤 stop 없으면 active
+    // grep + tail + jq 로 ts_start 추출
+    let cmd = "grep '\"session_id\":\"" + sid + "\"' '" + STATE + "' 2>/dev/null | tail -1"
+    let last = _str(exec(cmd)).trim()  // @allow-bare-exec
+    if last == "" { return ["0", "", "0"] }
+    if last.contains("\"kind\":\"stop\"") {
+        return ["0", "", "0"]
+    }
+    if last.contains("\"kind\":\"start\"") == false {
+        // 마지막이 stall/cost_drift 면 start 마커 별도 검색
+        let cmd2 = "grep '\"session_id\":\"" + sid + "\"' '" + STATE + "' 2>/dev/null | " +
+                   "grep '\"kind\":\"start\"' | tail -1"
+        let last_start = _str(exec(cmd2)).trim()  // @allow-bare-exec
+        if last_start == "" { return ["0", "", "0"] }
+        let ts = extract_ts(last_start)
+        let unix_ts = iso_to_unix(ts)
+        return [to_string(unix_ts), ts, "1"]
+    }
+    let ts = extract_ts(last)
+    let unix_ts = iso_to_unix(ts)
+    return [to_string(unix_ts), ts, "1"]
+}
+
+// ─── ts ISO 추출 (단일 row JSON) ───
+fn extract_ts(row: string) -> string {
+    let tag = "\"ts\":\""
+    let idx = row.index_of(tag)
+    if idx < 0 { return "" }
+    let after = row.substring(idx + tag.len(), row.len())
+    let mut j = 0
+    while j < after.len() {
+        if after.substring(j, j + 1) == "\"" { break }
+        j = j + 1
+    }
+    return after.substring(0, j)
+}
+
+fn iso_to_unix(iso: string) -> i64 {
+    if iso == "" { return 0 }
+    let esc = iso.replace("'", "")
+    // BSD date: -j -f "%Y-%m-%dT%H:%M:%SZ"
+    let cmd = "date -ju -f '%Y-%m-%dT%H:%M:%SZ' '" + esc + "' +%s 2>/dev/null"
+    let r = _str(exec(cmd)).trim()  // @allow-bare-exec
+    if r != "" { return _to_int0(r) }
+    // GNU fallback
+    let cmd2 = "date -u -d '" + esc + "' +%s 2>/dev/null"
+    return _to_int0(_str(exec(cmd2)).trim())  // @allow-bare-exec
+}
+
+// ─── stall sig hash: file|rule|fix → sha1-12 ───
+fn sig_hash(s: string) -> string {
+    if s == "" { return "" }
+    let esc = s.replace("'", "")
+    let cmd = "printf '%s' '" + esc + "' | /usr/bin/shasum -a 1 2>/dev/null | cut -c1-12"
+    let r = _str(exec(cmd)).trim()  // @allow-bare-exec
+    if r == "" {
+        // fallback — len 기반
+        return "h" + to_string(s.len())
+    }
+    return r
+}
+
+// ─── single mistake row 에서 file/rule/fix 필드 추출 ───
+fn field_str(row: string, key: string) -> string {
+    let tag = "\"" + key + "\":\""
+    let idx = row.index_of(tag)
+    if idx < 0 { return "" }
+    let after = row.substring(idx + tag.len(), row.len())
+    let mut j = 0
+    let mut escape = false
+    while j < after.len() {
+        let c = after.substring(j, j + 1)
+        if escape { escape = false; j = j + 1; continue }
+        if c == "\\" { escape = true; j = j + 1; continue }
+        if c == "\"" { break }
+        j = j + 1
+    }
+    return after.substring(0, j)
+}
+
+// ─── stall_check ───
+// mistakes.jsonl tail STALL_TAIL → file|rule|fix sig 카운트 → 2+ 출현 시 WARN
+fn cmd_stall_check() {
+    if file_exists(MISTAKES) == false {
+        sentinel_pass()
+        return
+    }
+    let cmd = "tail -" + to_string(STALL_TAIL) + " '" + MISTAKES + "' 2>/dev/null"
+    let raw = _str(exec(cmd)).trim()  // @allow-bare-exec
+    if raw == "" {
+        sentinel_pass()
+        return
+    }
+
+    // sig → count 누적 (병렬 list — hexa hashmap iterate 우회 + index 할당 no-op 우회)
+    let mut keys: [string] = []
+    let mut counts: [i64] = []
+    let mut samples: [string] = []  // "file rule" 첫 발견 sample
+
+    for line in raw.split("\n") {
+        let lt = _str(line).trim()
+        if lt.len() == 0 { continue }
+        let f = field_str(lt, "file")
+        let r = field_str(lt, "rule")
+        let fx = field_str(lt, "fix")
+        if f == "" && r == "" && fx == "" { continue }
+        let sig = sig_hash(f + "|" + r + "|" + fx)
+        if sig == "" { continue }
+
+        // keys 안에서 검색 (선형, tail 50 만 → O(50²) OK)
+        let mut found: i64 = -1
+        let mut i: i64 = 0
+        while i < keys.len() {
+            if keys[i] == sig { found = i; i = keys.len() } else { i = i + 1 }
+        }
+        if found >= 0 {
+            // index 할당 no-op → counts 전체 rebuild
+            let mut new_counts: [i64] = []
+            let mut j: i64 = 0
+            while j < counts.len() {
+                if j == found { new_counts = new_counts.push(counts[j] + 1) }
+                else { new_counts = new_counts.push(counts[j]) }
+                j = j + 1
+            }
+            counts = new_counts
+        } else {
+            keys = keys.push(sig)
+            counts = counts.push(1)
+            samples = samples.push(f + " " + r)
+        }
+    }
+
+    let mut warn = false
+    let sid = make_session_id()
+    let mut idx: i64 = 0
+    while idx < keys.len() {
+        let n = counts[idx]
+        if n >= STALL_REPEAT {
+            let smp = samples[idx]
+            eprintln("[loop_controller] stall detected: " + smp + " (seen " + to_string(n) + " times)")
+            append_state("stall", sid, smp, n)
+            warn = true
+        }
+        idx = idx + 1
+    }
+
+    if warn { sentinel_warn() } else { sentinel_pass() }
+}
+
+// ─── cost_check ───
+// work_registry.jsonl 전체 → ts_start >= now-3600 → tokens_est 합산
+fn cmd_cost_check() {
+    if file_exists(REGISTRY) == false {
+        sentinel_pass()
+        return
+    }
+    let now = now_unix()
+    let cutoff = now - COST_WINDOW_SEC
+    // awk 로 ts_start + tokens_est 추출 후 합산
+    // tokens_est 키 없으면 0
+    let cmd = "awk -v c=" + to_string(cutoff) +
+              " '{" +
+              " ts=0; tk=0; " +
+              " if (match($0, /\"ts_start\":[0-9]+/)) { " +
+              "   s=substr($0, RSTART+12, RLENGTH-12); ts=s+0 " +
+              " } " +
+              " if (match($0, /\"tokens_est\":[0-9]+/)) { " +
+              "   s=substr($0, RSTART+14, RLENGTH-14); tk=s+0 " +
+              " } " +
+              " if (ts >= c) sum += tk " +
+              "} END { print sum+0 }' '" + REGISTRY + "' 2>/dev/null"
+    let total = _to_int0(_str(exec(cmd)).trim())  // @allow-bare-exec
+
+    let sid = make_session_id()
+    if total > COST_THRESHOLD {
+        eprintln("[loop_controller] cost drift: " + to_string(total) + " tokens/hr > " +
+                 to_string(COST_THRESHOLD) + " threshold")
+        append_state("cost_drift", sid, "tokens_per_hr", total)
+        sentinel_warn()
+    } else {
+        sentinel_pass()
+    }
+}
+
+// ─── start ───
+fn cmd_start() {
+    let sid = make_session_id()
+    append_state("start", sid, "loop_started", 0)
+    sentinel_pass()
+}
+
+// ─── stop ───
+fn cmd_stop() {
+    let sid = make_session_id()
+    append_state("stop", sid, "loop_stopped", 0)
+    sentinel_pass()
+}
+
+// ─── status ───
+// "loop: started 2026-04-14T11:20:00Z, 45min ago, stall=N cost_1h=N/100000"
+fn cmd_status() {
+    let sid = make_session_id()
+    let act = find_active_session(sid)
+    let ts_unix = _to_int0(act[0])
+    let ts_iso = act[1]
+    let found = act[2]
+    if found != "1" || ts_unix == 0 {
+        println("loop: no active session")
+        sentinel_pass()
+        return
+    }
+    let now = now_unix()
+    let elapsed = now - ts_unix
+    let mins = elapsed / 60
+
+    // stall count 계산 (silent — eprintln 없음)
+    let stall_n = count_stall_silent()
+
+    // cost 계산 (silent)
+    let cost_n = compute_cost_silent()
+
+    println("loop: started " + ts_iso + ", " + to_string(mins) + "min ago, " +
+            "stall=" + to_string(stall_n) + " cost_1h=" + to_string(cost_n) +
+            "/" + to_string(COST_THRESHOLD))
+    sentinel_pass()
+}
+
+// ─── silent helpers (status mode) ───
+fn count_stall_silent() -> i64 {
+    if file_exists(MISTAKES) == false { return 0 }
+    let cmd = "tail -" + to_string(STALL_TAIL) + " '" + MISTAKES + "' 2>/dev/null"
+    let raw = _str(exec(cmd)).trim()  // @allow-bare-exec
+    if raw == "" { return 0 }
+    let mut keys: [string] = []
+    let mut counts: [i64] = []
+    for line in raw.split("\n") {
+        let lt = _str(line).trim()
+        if lt.len() == 0 { continue }
+        let f = field_str(lt, "file")
+        let r = field_str(lt, "rule")
+        let fx = field_str(lt, "fix")
+        if f == "" && r == "" && fx == "" { continue }
+        let sig = sig_hash(f + "|" + r + "|" + fx)
+        if sig == "" { continue }
+        let mut found: i64 = -1
+        let mut i: i64 = 0
+        while i < keys.len() {
+            if keys[i] == sig { found = i; i = keys.len() } else { i = i + 1 }
+        }
+        if found >= 0 {
+            // index 할당 no-op → counts rebuild
+            let mut new_counts: [i64] = []
+            let mut j: i64 = 0
+            while j < counts.len() {
+                if j == found { new_counts = new_counts.push(counts[j] + 1) }
+                else { new_counts = new_counts.push(counts[j]) }
+                j = j + 1
+            }
+            counts = new_counts
+        } else {
+            keys = keys.push(sig)
+            counts = counts.push(1)
+        }
+    }
+    let mut total: i64 = 0
+    let mut idx: i64 = 0
+    while idx < keys.len() {
+        if counts[idx] >= STALL_REPEAT { total = total + 1 }
+        idx = idx + 1
+    }
+    return total
+}
+
+fn compute_cost_silent() -> i64 {
+    if file_exists(REGISTRY) == false { return 0 }
+    let now = now_unix()
+    let cutoff = now - COST_WINDOW_SEC
+    let cmd = "awk -v c=" + to_string(cutoff) +
+              " '{" +
+              " ts=0; tk=0; " +
+              " if (match($0, /\"ts_start\":[0-9]+/)) { " +
+              "   s=substr($0, RSTART+12, RLENGTH-12); ts=s+0 " +
+              " } " +
+              " if (match($0, /\"tokens_est\":[0-9]+/)) { " +
+              "   s=substr($0, RSTART+14, RLENGTH-14); tk=s+0 " +
+              " } " +
+              " if (ts >= c) sum += tk " +
+              "} END { print sum+0 }' '" + REGISTRY + "' 2>/dev/null"
+    return _to_int0(_str(exec(cmd)).trim())  // @allow-bare-exec
+}
+
+fn main() {
+    let argv = args()
+    if argv.len() < 3 {
+        eprintln("usage: loop_controller.hexa <start|status|stall_check|cost_check|stop>")
+        sentinel_warn()
+        return
+    }
+    let mode = _str(argv[2]).trim()
+    if mode == "start" { cmd_start() }
+    else if mode == "status" { cmd_status() }
+    else if mode == "stall_check" { cmd_stall_check() }
+    else if mode == "cost_check" { cmd_cost_check() }
+    else if mode == "stop" { cmd_stop() }
+    else {
+        eprintln("REJECT: unknown mode '" + mode + "' — modes: start|status|stall_check|cost_check|stop")
+        sentinel_warn()
+    }
+}
+
+main()
