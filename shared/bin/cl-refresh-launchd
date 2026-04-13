@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+# cl-refresh-launchd — nexus `cl refresh` 30분 주기 launchd 관리 스크립트
+#
+# 사용법:
+#   cl-refresh-launchd install    — plist 설치 + bootstrap
+#   cl-refresh-launchd uninstall  — bootout + plist 제거
+#   cl-refresh-launchd status     — 상태 + 최근 로그 20줄
+#   cl-refresh-launchd run-now    — 즉시 1회 실행 (kickstart -k)
+#   cl-refresh-launchd logs       — stdout/stderr tail -50
+#   cl-refresh-launchd help       — 이 도움말
+#
+# 모던 launchctl (bootstrap/bootout/kickstart) 사용. deprecated load/unload 회피.
+
+set -euo pipefail
+
+# 경로/라벨 상수
+readonly LABEL="com.nexus.cl-refresh"
+readonly REPO_ROOT="/Users/ghost/Dev/nexus"
+readonly SRC_PLIST="${REPO_ROOT}/shared/launchd/${LABEL}.plist"
+readonly DST_PLIST="${HOME}/Library/LaunchAgents/${LABEL}.plist"
+readonly LOG_DIR="${REPO_ROOT}/shared/logs"
+readonly STDOUT_LOG="${LOG_DIR}/cl-refresh.stdout.log"
+readonly STDERR_LOG="${LOG_DIR}/cl-refresh.stderr.log"
+
+# gui/$(id -u) 도메인 타겟 (사용자 GUI 세션 LaunchAgent)
+readonly GUI_DOMAIN="gui/$(id -u)"
+readonly SERVICE_TARGET="${GUI_DOMAIN}/${LABEL}"
+
+# 현재 서비스가 로드돼 있는지 확인
+is_loaded() {
+    launchctl print "${SERVICE_TARGET}" >/dev/null 2>&1
+}
+
+# install — plist 복사 후 bootstrap. 이미 로드돼 있으면 먼저 bootout.
+cmd_install() {
+    if [[ ! -f "${SRC_PLIST}" ]]; then
+        echo "[err] 원본 plist 없음: ${SRC_PLIST}" >&2
+        exit 1
+    fi
+
+    # 로그 디렉토리 보장
+    mkdir -p "${LOG_DIR}"
+
+    # LaunchAgents 디렉토리 보장
+    mkdir -p "${HOME}/Library/LaunchAgents"
+
+    # 이미 로드돼 있으면 선 bootout (멱등성)
+    if is_loaded; then
+        echo "[info] 이미 로드됨 — 재로드를 위해 bootout 수행"
+        launchctl bootout "${SERVICE_TARGET}" 2>/dev/null || true
+    fi
+
+    # plist 복사 (심볼릭 링크 대신 실체 복사 — launchd 요구사항)
+    cp -f "${SRC_PLIST}" "${DST_PLIST}"
+    chmod 644 "${DST_PLIST}"
+    echo "[ok] plist 복사: ${DST_PLIST}"
+
+    # bootstrap — gui/$(id -u) 도메인에 등록
+    launchctl bootstrap "${GUI_DOMAIN}" "${DST_PLIST}"
+    echo "[ok] bootstrap 완료: ${SERVICE_TARGET}"
+    echo "[info] 30분 주기로 'cl refresh' 자동 실행됨"
+}
+
+# uninstall — bootout + plist 파일 제거
+cmd_uninstall() {
+    if is_loaded; then
+        launchctl bootout "${SERVICE_TARGET}" 2>/dev/null || true
+        echo "[ok] bootout 완료: ${SERVICE_TARGET}"
+    else
+        echo "[info] 서비스 로드되지 않음 — bootout 생략"
+    fi
+
+    if [[ -e "${DST_PLIST}" ]]; then
+        rm -f "${DST_PLIST}"
+        echo "[ok] plist 제거: ${DST_PLIST}"
+    else
+        echo "[info] plist 파일 없음 — 제거 생략"
+    fi
+}
+
+# status — 로드 여부 + 요약 + 로그 tail 20
+cmd_status() {
+    echo "=== launchctl list (grep cl-refresh) ==="
+    launchctl list 2>/dev/null | grep -E "cl-refresh|^PID" || echo "[info] 등록된 항목 없음"
+    echo ""
+
+    echo "=== launchctl print ${SERVICE_TARGET} (요약) ==="
+    if is_loaded; then
+        launchctl print "${SERVICE_TARGET}" 2>/dev/null \
+            | grep -E "^\s*(state|path|pid|last exit code|run interval|program|next run)" \
+            || launchctl print "${SERVICE_TARGET}" 2>/dev/null | head -30
+    else
+        echo "[info] 서비스 로드되지 않음"
+    fi
+    echo ""
+
+    echo "=== 최근 stdout (tail -20) ==="
+    if [[ -f "${STDOUT_LOG}" ]]; then
+        tail -20 "${STDOUT_LOG}"
+    else
+        echo "[info] 로그 파일 없음: ${STDOUT_LOG}"
+    fi
+    echo ""
+
+    echo "=== 최근 stderr (tail -20) ==="
+    if [[ -f "${STDERR_LOG}" ]]; then
+        tail -20 "${STDERR_LOG}"
+    else
+        echo "[info] 로그 파일 없음: ${STDERR_LOG}"
+    fi
+}
+
+# run-now — kickstart -k 로 즉시 실행 (이미 실행중이면 kill 후 재시작)
+cmd_run_now() {
+    if ! is_loaded; then
+        echo "[err] 서비스가 로드되지 않음. 먼저 'install' 실행 필요." >&2
+        exit 1
+    fi
+    launchctl kickstart -k "${SERVICE_TARGET}"
+    echo "[ok] kickstart 완료 — 즉시 실행 요청됨"
+    echo "[info] 'status' 또는 'logs' 로 결과 확인"
+}
+
+# logs — 양쪽 로그 tail -50
+cmd_logs() {
+    echo "=== stdout (tail -50): ${STDOUT_LOG} ==="
+    if [[ -f "${STDOUT_LOG}" ]]; then
+        tail -50 "${STDOUT_LOG}"
+    else
+        echo "[info] 로그 파일 없음"
+    fi
+    echo ""
+    echo "=== stderr (tail -50): ${STDERR_LOG} ==="
+    if [[ -f "${STDERR_LOG}" ]]; then
+        tail -50 "${STDERR_LOG}"
+    else
+        echo "[info] 로그 파일 없음"
+    fi
+}
+
+# help — 사용법
+cmd_help() {
+    cat <<'EOF'
+cl-refresh-launchd — nexus `cl refresh` 30분 주기 launchd 관리
+
+사용법:
+  cl-refresh-launchd <서브커맨드>
+
+서브커맨드:
+  install    plist를 ~/Library/LaunchAgents/ 로 복사 후 bootstrap 로드
+             (이미 로드돼 있으면 선-bootout 후 재로드)
+  uninstall  bootout + plist 파일 제거
+  status     launchctl list/print 요약 + 최근 로그 tail 20줄
+  run-now    launchctl kickstart -k 로 즉시 1회 실행
+  logs       stdout/stderr 로그 tail 50줄
+  help       이 도움말 출력
+
+도메인 타겟: gui/$(id -u)/com.nexus.cl-refresh
+원본 plist : /Users/ghost/Dev/nexus/shared/launchd/com.nexus.cl-refresh.plist
+설치 경로  : ~/Library/LaunchAgents/com.nexus.cl-refresh.plist
+로그 위치  : /Users/ghost/Dev/nexus/shared/logs/cl-refresh.{stdout,stderr}.log
+주기       : 30분 (StartInterval=1800, ThrottleInterval=1800)
+RunAtLoad  : false  (부팅/install 시 즉시 실행 안 함 — 첫 실행은 30분 후)
+EOF
+}
+
+# 메인 디스패치 — 인자 없으면 help
+main() {
+    local sub="${1:-help}"
+    case "${sub}" in
+        install)   cmd_install ;;
+        uninstall) cmd_uninstall ;;
+        status)    cmd_status ;;
+        run-now)   cmd_run_now ;;
+        logs)      cmd_logs ;;
+        help|-h|--help) cmd_help ;;
+        *)
+            echo "[err] 알 수 없는 서브커맨드: ${sub}" >&2
+            echo "" >&2
+            cmd_help >&2
+            exit 2
+            ;;
+    esac
+}
+
+main "$@"

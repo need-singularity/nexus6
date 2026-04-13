@@ -1,0 +1,307 @@
+{
+  "name": "cl-refresh",
+  "purpose": "nexus cl 런처의 usage-cache.json을 airgenome/ccmon 0의존으로 자체 갱신",
+  "status": "spec",
+  "created": "2026-04-14",
+  "owner": "nexus",
+  "supersedes": [
+    "~/Dev/claude-code/scripts/refresh-tokens.py",
+    "~/Dev/claude-code/scripts/fix-expired-tokens.py",
+    "~/Dev/claude-code/ccmon/usage_api.py",
+    "~/.airgenome/usage-cache.json-via-gui"
+  ],
+
+  "dependencies": {
+    "bash_only_viable": true,
+    "required_cli": ["bash>=3.2", "jq", "curl", "security"],
+    "optional_cli": ["parallel", "xargs"],
+    "python_required": false,
+    "hexa_viable": false,
+    "hexa_blockers": [
+      "hexa.real: void split / last_index_of 부재",
+      "subprocess stdout capture로 security 호출 시 바이너리 JSON 파싱 함정",
+      "HTTP/curl 호출 추상화 없음 → 어차피 curl subprocess",
+      "토큰 ms epoch 비교는 정수 산술로 OK이나 이익 없음"
+    ]
+  },
+
+  "input": {
+    "accounts_json": {
+      "path": "~/.claude-accounts/accounts.json",
+      "schema": {
+        "accounts": [
+          {"name": "claude<N>", "config_dir": "/Users/ghost/.claude-claude<N>"}
+        ]
+      },
+      "verified_existing": true,
+      "account_count": 10,
+      "naming": "claude1..claude10 (claude10 포함)"
+    },
+
+    "token_source": {
+      "store": "macOS login keychain (login.keychain-db)",
+      "entry_class": "genp (generic password)",
+      "label_pattern": "Claude Code-credentials-<hex8>",
+      "service_pattern": "Claude Code-credentials-<hex8> (label과 동일)",
+      "account_attr": "ghost (macOS user name, 전 계정 공통)",
+      "hex8_mapping_source": "ccmon/usage_api.py KEYCHAIN_LABELS (hardcoded)",
+      "hex8_mapping_current": {
+        "claude1":  "2b949392",
+        "claude2":  "26492e81",
+        "claude3":  "200a5e32",
+        "claude4":  "2adfc64a",
+        "claude5":  "7f9319ca",
+        "claude6":  "71a31b2a",
+        "claude7":  "02580ebb",
+        "claude8":  "156d23f8",
+        "claude9":  "90c36814",
+        "claude10": "90defae3"
+      },
+      "hex8_mapping_storage": "nexus 자체 SSOT로 이관 필요 — shared/config/claude_keychain_map.json",
+      "read_cmd_template": "security find-generic-password -l 'Claude Code-credentials-<hex8>' -w",
+      "write_cmd_template_delete_then_add": [
+        "security delete-generic-password -s 'Claude Code-credentials-<hex8>' -a ghost",
+        "security add-generic-password -l 'Claude Code-credentials-<hex8>' -s 'Claude Code-credentials-<hex8>' -a ghost -w '<json_blob>'"
+      ],
+      "blob_format": "JSON string with top-level key 'claudeAiOauth' = {accessToken, refreshToken, expiresAt(ms epoch), scopes, subscriptionType}"
+    }
+  },
+
+  "api": {
+    "usage_endpoint": {
+      "url": "https://api.anthropic.com/api/oauth/usage",
+      "method": "GET",
+      "headers": {
+        "Authorization": "Bearer <access_token>",
+        "anthropic-beta": "oauth-2025-04-20"
+      },
+      "body": null,
+      "response_schema": {
+        "five_hour":         {"utilization": "number 0..100", "resets_at": "ISO8601 string"},
+        "seven_day":         {"utilization": "number 0..100", "resets_at": "ISO8601 string"},
+        "seven_day_sonnet":  {"utilization": "number 0..100|null", "resets_at": "ISO8601|null"}
+      },
+      "error_shape": {"error": "present if auth failure / rate limit / server error"},
+      "error_when_no_auth": "HTTP 429 observed (no auth headers)",
+      "valid_response_marker": "'five_hour' key present"
+    },
+
+    "token_refresh_endpoint": {
+      "url": "https://platform.claude.com/v1/oauth/token",
+      "method": "POST",
+      "headers": {"Content-Type": "application/json"},
+      "body_json": {
+        "grant_type": "refresh_token",
+        "refresh_token": "<refresh_token from keychain>",
+        "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+      },
+      "success_response_keys": ["access_token", "refresh_token", "expires_in"],
+      "error_response": {"error": {"type": "<e.g. rate_limit_exceeded>"}}
+    }
+  },
+
+  "output": {
+    "usage_cache_path": "~/.claude-accounts/usage-cache.json",
+    "usage_cache_schema": {
+      "<account_name>": {
+        "session_pct":        "number|null (= five_hour.utilization)",
+        "session_resets":     "ISO8601|null (= five_hour.resets_at)",
+        "week_all_pct":       "number|null (= seven_day.utilization)",
+        "week_resets":        "ISO8601|null (= seven_day.resets_at)  NOTE: cl은 'week_resets' 키 사용, ccmon은 'week_all_resets' — nexus는 'week_resets'로 통일",
+        "week_sonnet_pct":    "number|null (optional)",
+        "week_sonnet_resets": "ISO8601|null (optional)",
+        "error":              "null on success, string on failure"
+      },
+      "_ts": "number (unix epoch seconds at write time)"
+    },
+    "key_incompatibility_note": "ccmon은 'week_all_resets', cl 현재 코드는 'week_resets'. 기존 cache는 'week_resets' 이므로 nexus refresh는 'week_resets'로 작성. cl jq 쿼리 (.value.week_all_pct // 100) 는 그대로 호환.",
+
+    "derived_fields": {
+      "session_pct":    "response.five_hour.utilization",
+      "session_resets": "response.five_hour.resets_at",
+      "week_all_pct":   "response.seven_day.utilization",
+      "week_resets":    "response.seven_day.resets_at"
+    },
+
+    "refresh_log_path": "~/.claude-accounts/cl-refresh.log",
+    "cooldown_state_path": "~/.claude-accounts/cl-refresh-cooldown.json"
+  },
+
+  "flow": {
+    "per_account": [
+      {"step": 1, "action": "keychain read",      "cmd": "security find-generic-password -l <label> -w"},
+      {"step": 2, "action": "parse blob",         "cmd": "jq '.claudeAiOauth' from stdin"},
+      {"step": 3, "action": "check expiry",       "cmd": "jq '.expiresAt' → ms epoch → compare (now*1000 + 60000)"},
+      {"step": 4, "action": "refresh if expired", "cmd": "curl POST token_refresh_endpoint → new accessToken/refreshToken/expiresAt"},
+      {"step": 5, "action": "update keychain",    "cmd": "delete + add-generic-password with new JSON blob"},
+      {"step": 6, "action": "call usage API",     "cmd": "curl GET usage_endpoint with Bearer + anthropic-beta"},
+      {"step": 7, "action": "parse usage",        "cmd": "jq '{session_pct:.five_hour.utilization, session_resets:.five_hour.resets_at, week_all_pct:.seven_day.utilization, week_resets:.seven_day.resets_at}'"},
+      {"step": 8, "action": "merge into cache",   "cmd": "jq --slurpfile prev to overwrite single account entry + update _ts"}
+    ],
+    "global": [
+      {"step": 0, "action": "acquire PID lock",           "path": "~/.claude-accounts/cl-refresh.lock"},
+      {"step": 1, "action": "load accounts.json names",   "cmd": "jq -r '.accounts[].name'"},
+      {"step": 2, "action": "load keychain map (hex8)",   "cmd": "jq -r from shared/config/claude_keychain_map.json"},
+      {"step": 3, "action": "parallel per_account",       "cmd": "xargs -P 10 or bash & wait"},
+      {"step": 4, "action": "atomic cache write",         "cmd": "write to usage-cache.json.tmp.$$ then mv"},
+      {"step": 5, "action": "release lock + append log",  "cmd": "rm lockfile + echo summary to cl-refresh.log"}
+    ]
+  },
+
+  "parallel_strategy": {
+    "recommended": "bash background jobs with wait — 10개 동시, 계정당 독립 tmp 파일, 최종 jq merge",
+    "rationale": [
+      "계정 수 고정 10개 (확장성 불필요) — xargs 오버헤드보다 & wait가 가볍다",
+      "각 job이 자기 tmp 파일만 쓰고, 마스터 프로세스가 단일 jq로 merge → race 없음",
+      "python asyncio는 의존성 추가 (python_required=false 원칙 위반)",
+      "usage API는 token refresh와 달리 IP rate limit 느슨함 — 동시 10 OK (ccmon 검증)"
+    ],
+    "alternative_xargs": "xargs -P 10 -I {} bash -c 'fetch_one {}' (더 간결, 동등 성능)",
+    "token_refresh_concurrency": "순차 또는 P=2 권장 — IP 기반 rate_limit cascade 위험 (ccmon 경험상 30s stagger + 사이클당 2개 제한)"
+  },
+
+  "rate_limit_policy": {
+    "detection": {
+      "token_refresh": "response.error.type contains 'rate_limit' OR HTTP 429",
+      "usage_api":    "HTTP 429 OR response.error present"
+    },
+    "backoff": {
+      "per_account": "exponential 20m → 40m → 60m (cap 1h)",
+      "global_ip":   "fixed 5min (token_refresh_endpoint만 적용, usage API는 글로벌 쿨다운 무시 가능)",
+      "concurrent_refresh_cap": "한 사이클당 토큰 갱신 최대 2개, usage fetch는 10개 동시 OK"
+    },
+    "cooldown_persistence": "~/.claude-accounts/cl-refresh-cooldown.json {name:{t:epoch,n:fail_count}}"
+  },
+
+  "partial_failure_policy": {
+    "rule": "실패 계정은 기존 cache entry 유지 (_ts는 갱신). entry가 아예 없으면 {error:'first_fetch_failed'} 삽입.",
+    "never_zero_out": true,
+    "success_accounts_cleared_of_error": true,
+    "merge_strategy": "jq '. * $new' (right-side override, 미실행 계정의 과거 데이터 보존)",
+    "reason": "airgenome orphan snapshot 사태 재발 방지 — 일부 실패로 전체 cache 리셋 금지"
+  },
+
+  "estimated_wall_time_10_accounts_ms": {
+    "cold_all_tokens_valid": 3000,
+    "cold_with_1_refresh":   8000,
+    "cold_with_3_refresh":   20000,
+    "warm_cache_hit_skip":   100,
+    "rationale": [
+      "usage API: 10 동시 × ~500ms = 500ms + jq merge 100ms + keychain read 10×50ms 병렬 → ~1.5s",
+      "token refresh: 필요 시 순차 30s stagger (rate limit cascade 회피)",
+      "대부분 사이클은 토큰 유효 → 1~3초"
+    ]
+  },
+
+  "implementation_language_recommendation": {
+    "primary": "bash + curl + jq + security",
+    "reasoning": [
+      "기존 cl (bash)과 동일 런타임 → 추가 의존 0",
+      "keychain 접근이 security CLI 외 대안 없음 — 어느 언어든 subprocess 필연",
+      "usage-cache.json은 cl이 jq로 읽음 → bash가 가장 직결",
+      "nexus shared/ 정책: py/sh→hexa 변환 완료라지만 이 케이스는 네이티브 macOS CLI bridge라서 예외 허용 (shell 래퍼 OK)",
+      "hexa.real 현재 함정 (void split 부재 등)으로 JSON 조작 / curl 호출 비효율",
+      "python은 ccmon에서 실증되었으나 의존성 폭발 (click, rich, orjson...) — nexus는 bash-only 선호"
+    ],
+    "rejected_alternatives": {
+      "python": "pyproject.toml 4개 의존성, ccmon이 이미 존재 — '자체 refresh 엔진' 목적과 충돌",
+      "hexa":   "hexa.real 인터프리터 5대 함정 (void split, last_index_of 부재, args() 빈, list index no-op) + HTTP/keychain 래핑 없음",
+      "rust":   "오버킬, 빌드 체인 추가"
+    },
+    "file_location": "shared/bin/cl-refresh (bash, +x) — cl과 나란히 배치",
+    "invocation_patterns": [
+      "cl-refresh              # 전체 갱신",
+      "cl-refresh <name>       # 단일 계정",
+      "cl-refresh --force      # 토큰 유효해도 usage만 재조회",
+      "cl-refresh --expired    # 만료된 토큰만 갱신 (fix-expired 대체)",
+      "cl refresh              # cl 서브커맨드로 위임 (권장 UX)"
+    ]
+  },
+
+  "cl_integration": {
+    "subcommand_add": "cl refresh [--force|--expired|<name>]",
+    "cl_script_changes": [
+      "case 'refresh') shift; exec \"$(dirname \"$0\")/cl-refresh\" \"$@\" ;;",
+      "seed_from_airgenome() 제거 또는 cl-refresh 1회 호출로 대체",
+      "help 텍스트 갱신"
+    ],
+    "launchd_recommendation": {
+      "plist_path": "~/Library/LaunchAgents/com.nexus.cl-refresh.plist",
+      "interval_sec": 600,
+      "program": "/Users/ghost/Dev/nexus/shared/bin/cl-refresh",
+      "stdout_path": "~/.claude-accounts/cl-refresh.log",
+      "stderr_path": "~/.claude-accounts/cl-refresh.log",
+      "note": "10분 간격. 토큰은 1h 만료 → 10분 사이클이면 만료 직전 safe refresh 가능"
+    }
+  },
+
+  "security_notes": {
+    "token_handling": [
+      "access_token/refresh_token은 stdout 출력 금지 — jq -r 결과를 bash 변수로만 받고 `set +x` 유지",
+      "curl -v / --trace 옵션 금지 (헤더에 Bearer 노출)",
+      "cl-refresh.log에는 계정명+성공/실패+expires_in(초)만 기록. 토큰 본체 절대 금지",
+      "keychain blob 내용 전체를 임시파일에 쓸 때는 mktemp + chmod 600 + trap으로 cleanup",
+      "jq로 blob 파싱 시 --arg 대신 --argjson 사용해 shell escape 회피",
+      "keychain write은 delete + add 2단계 race — 실패 시 계정 완전 손실 가능 → 복구 없이는 동작 금지. 기존 blob을 먼저 temp에 snapshot."
+    ],
+    "keychain_access": [
+      "security 명령은 TTY/GUI 프롬프트 유발 가능 → 최초 1회 'Always Allow' 체크 필수",
+      "sudo 금지 (GUI prompt 우회 실패 → 자동화 불가)",
+      "launchd에서 호출 시 사용자 세션 언락 상태 필요 (screen lock 시 실패 허용)"
+    ],
+    "file_permissions": [
+      "~/.claude-accounts/usage-cache.json: 0600",
+      "~/.claude-accounts/cl-refresh.lock: 0600",
+      "~/.claude-accounts/cl-refresh.log: 0600",
+      "shared/config/claude_keychain_map.json: 0644 (hex만, 토큰 없음 → 공개 OK)"
+    ],
+    "log_rotation": "1MB 초과 시 tail -n 500 → 덮어쓰기 (ccmon 방식 복제)",
+    "never_log": ["accessToken", "refreshToken", "keychain blob raw content", "Authorization header value"]
+  },
+
+  "migration_plan": {
+    "phase_1_parity": [
+      "shared/config/claude_keychain_map.json 생성 (nexus SSOT)",
+      "shared/bin/cl-refresh bash 스크립트 구현",
+      "단일 수동 실행 → usage-cache.json 정상 갱신 확인",
+      "cl u 로 새 cache 표시 정상 확인"
+    ],
+    "phase_2_automation": [
+      "com.nexus.cl-refresh.plist launchd 등록",
+      "10분 주기 백그라운드 실행 검증 (1시간 관찰)",
+      "기존 ccmon launchd 잔존 여부 확인 → 없다면 skip, 있다면 unload"
+    ],
+    "phase_3_cutover": [
+      "cl 스크립트에서 seed_from_airgenome() 제거",
+      "cl refresh 서브커맨드 추가 (수동 트리거 경로)",
+      "~/.airgenome/usage-cache.json 의존 0 확인"
+    ],
+    "phase_4_cleanup": [
+      "~/Dev/claude-code/ccmon 아카이브 또는 read-only 마크",
+      "~/Dev/claude-code/scripts/{refresh-tokens,fix-expired-tokens}.py 아카이브",
+      "airgenome GUI는 건드리지 않음 (별도 용도)"
+    ]
+  },
+
+  "rollback": {
+    "trigger": "cl-refresh 실패 3회 연속 또는 usage-cache.json 손상 감지",
+    "action": "launchd unload + cl-refresh.bak.<ts>로 이름 변경 + ccmon refresh-tokens.py 1회 수동 실행",
+    "data_recovery": "usage-cache.json은 backup_path = ~/.claude-accounts/usage-cache.json.bak — 매 성공 실행마다 덮어씀"
+  },
+
+  "verification_checklist": [
+    "usage-cache.json._ts 가 실행 직후 갱신됨",
+    "모든 계정 entry에 session_pct / week_all_pct 존재 (null 허용)",
+    "cl u 출력이 새 데이터 반영",
+    "cl-refresh.log에 토큰 raw 문자열 0건 (grep -c 'sk-ant\\|eyJ' must == 0)",
+    "lock file이 정상 종료 시 삭제됨",
+    "실패 계정 1개 시 나머지 9개 정상 갱신됨 (partial_failure 테스트)",
+    "키체인 blob 내용이 변경 후에도 claudeAiOauth 하위 전 필드 보존"
+  ],
+
+  "open_questions": [
+    "hex8 suffix는 계정별 영구 고정인가 vs 재로그인 시 변경? ccmon은 하드코딩 → nexus도 동일 가정이나 재로그인 워크플로우 정립 필요",
+    "week_sonnet_pct 필드를 cl UI가 표시할지 (현재 cl은 session/week_all만 표시) — 현재는 캐시에만 기록하고 UI는 건드리지 않는 게 안전",
+    "global_ip rate_limit cooldown을 공유할지 ccmon과 분리할지 — 분리 권장 (nexus는 사이클당 2개 제한으로 충분히 보수적)"
+  ]
+}

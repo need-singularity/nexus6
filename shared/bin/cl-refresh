@@ -1,0 +1,709 @@
+#!/bin/bash
+# shared/bin/cl-refresh — nexus 자체 usage-cache 갱신 엔진 (airgenome/ccmon 0의존)
+#
+# 책임:
+#   macOS login keychain에서 claude1~claude10 토큰을 꺼내
+#   Anthropic usage API (https://api.anthropic.com/api/oauth/usage)를 병렬 호출
+#   → 응답 파싱 → ~/.claude-accounts/usage-cache.json 원자적 덮어쓰기.
+#
+# spec: shared/engine/cl_refresh_spec.json
+# SSOT:
+#   shared/config/claude_keychain_map.json   hex8 suffix 매핑 (별도 Agent 생성)
+#   ~/.claude-accounts/accounts.json         계정 목록 (기존)
+#   ~/.claude-accounts/usage-cache.json      출력 (cl이 읽음)
+#
+# 보안:
+#   - 토큰 raw 값은 변수에만 보관. stdout/stderr/log 유출 절대 금지.
+#   - set -x / curl -v 금지. jq 에러 메시지에 blob 섞이지 않도록 2>/dev/null.
+#   - keychain delete+add race 위험 → 원본 blob 을 tmp 에 snapshot 후 실패 시 복원.
+#
+# Subcommands:
+#   cl-refresh              전체 계정 fetch → cache 갱신
+#   cl-refresh <name>       단일 계정만 갱신
+#   cl-refresh --dry-run    keychain 접근/파싱 테스트 (API 호출 X)
+#   cl-refresh --verify     현재 cache 상태 요약
+#   cl-refresh help
+#
+# 부분 실패 정책: 실패 계정의 기존 cache entry 유지 (zero-out 금지).
+# airgenome orphan 재발 방지.
+
+set -euo pipefail
+
+# --- 경로 상수 -----------------------------------------------------------------
+NEXUS_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# CL_HOME 기본값: nexus shared/.runtime/accounts (R14 SSOT, 2026-04-14 이관).
+# 레거시 ~/.claude-accounts 는 cl 실행 시 migrate_legacy_home() 이 1회 흡수.
+CL_HOME="${CL_HOME:-$NEXUS_ROOT/shared/.runtime/accounts}"
+ACCOUNTS="$CL_HOME/accounts.json"
+USAGE="$CL_HOME/usage-cache.json"
+USAGE_BAK="$CL_HOME/usage-cache.json.bak"
+LOCK="$CL_HOME/cl-refresh.lock"
+LOG="$CL_HOME/cl-refresh.log"
+COOLDOWN="$CL_HOME/cl-refresh-cooldown.json"
+KEYMAP="$NEXUS_ROOT/shared/config/claude_keychain_map.json"
+
+# --- API 상수 -----------------------------------------------------------------
+USAGE_URL="https://api.anthropic.com/api/oauth/usage"
+TOKEN_URL="https://platform.claude.com/v1/oauth/token"
+OAUTH_CLIENT_ID="9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+OAUTH_BETA="oauth-2025-04-20"
+CURL_TIMEOUT=10
+KEYCHAIN_USER="ghost"   # macOS account_attr, 전 계정 공통
+REFRESH_CAP_PER_CYCLE=2   # spec: IP rate limit cascade 회피 — 한 사이클당 토큰 refresh 최대 2개
+
+mkdir -p "$CL_HOME"
+
+# --- 의존성 체크 ---------------------------------------------------------------
+check_deps() {
+    local missing=()
+    for bin in jq curl security bash awk; do
+        command -v "$bin" >/dev/null 2>&1 || missing+=("$bin")
+    done
+    if [ "${#missing[@]}" -gt 0 ]; then
+        echo "ERROR(cl-refresh): 필수 의존성 누락 — ${missing[*]}" >&2
+        echo "  brew install ${missing[*]}" >&2
+        exit 3
+    fi
+}
+
+# --- 로그 (토큰 절대 포함 금지) -------------------------------------------------
+log() {
+    local msg="$1"
+    local ts; ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    printf '[%s] %s\n' "$ts" "$msg" >> "$LOG" 2>/dev/null || true
+}
+
+# log 로테이션 — 1MB 초과 시 마지막 500줄만 보존 (ccmon 방식)
+log_rotate() {
+    [ -f "$LOG" ] || return 0
+    local size
+    size=$(stat -f%z "$LOG" 2>/dev/null || stat -c%s "$LOG" 2>/dev/null || echo 0)
+    if [ "$size" -gt 1048576 ]; then
+        local tmp="$LOG.rot.$$"
+        tail -n 500 "$LOG" > "$tmp" 2>/dev/null && mv "$tmp" "$LOG"
+        chmod 600 "$LOG" 2>/dev/null || true
+    fi
+}
+
+# --- 입력 파일 체크 ------------------------------------------------------------
+require_inputs() {
+    if [ ! -f "$ACCOUNTS" ]; then
+        echo "ERROR(cl-refresh): $ACCOUNTS 없음" >&2
+        exit 2
+    fi
+    if [ ! -f "$KEYMAP" ]; then
+        echo "ERROR(cl-refresh): shared/config/claude_keychain_map.json 없음. Agent 6 작업 완료 후 재시도." >&2
+        echo "  expected: $KEYMAP" >&2
+        exit 2
+    fi
+    # keymap 구조 최소 검증 — {"claude1":"2b949392",...} 또는 {"mapping":{...}} 둘 다 허용
+    if ! jq -e 'type == "object"' "$KEYMAP" >/dev/null 2>&1; then
+        echo "ERROR(cl-refresh): $KEYMAP JSON 파싱 실패" >&2
+        exit 2
+    fi
+}
+
+# --- PID 락 -------------------------------------------------------------------
+acquire_lock() {
+    if [ -f "$LOCK" ]; then
+        local old_pid
+        old_pid=$(cat "$LOCK" 2>/dev/null || echo "")
+        if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+            echo "ERROR(cl-refresh): 이미 실행 중 (pid=$old_pid)" >&2
+            exit 4
+        fi
+        # stale lock
+        rm -f "$LOCK"
+    fi
+    echo "$$" > "$LOCK"
+    chmod 600 "$LOCK" 2>/dev/null || true
+    trap 'rm -f "$LOCK"' EXIT INT TERM
+}
+
+# --- keychain 매핑 조회: name → hex8 -------------------------------------------
+# SSOT 형식: shared/config/claude_keychain_map.json 의 .map[name]
+# 레거시 호환: .mapping[name] 또는 최상위 {name: hex8} 도 허용
+hex8_for() {
+    local name="$1"
+    jq -r --arg n "$name" '
+        (.map // .mapping // .) as $m
+        | $m[$n] // empty
+    ' "$KEYMAP" 2>/dev/null
+}
+
+# --- 계정 config_dir 조회 ------------------------------------------------------
+config_dir_for() {
+    local name="$1"
+    jq -r --arg n "$name" '.accounts[] | select(.name == $n) | .config_dir' "$ACCOUNTS" 2>/dev/null
+}
+
+account_exists() {
+    local name="$1"
+    [ -n "$name" ] || return 1
+    jq -e --arg n "$name" '.accounts[] | select(.name == $n)' "$ACCOUNTS" >/dev/null 2>&1
+}
+
+list_account_names() {
+    jq -r '.accounts[].name' "$ACCOUNTS" 2>/dev/null
+}
+
+# --- keychain 읽기 -------------------------------------------------------------
+# read_keychain_blob <hex8> → stdout 으로 blob JSON, stderr 에는 아무것도 안 씀.
+# 실패 시 exit 1. 호출자는 $(...) 로 캡처하되 이 결과를 print 하지 말 것.
+read_keychain_blob() {
+    local hex8="$1"
+    local label="Claude Code-credentials-$hex8"
+    # -w 옵션: 비밀번호 (blob) 만 stdout 출력. security 자체가 TTY/GUI prompt 유발 가능.
+    security find-generic-password -l "$label" -a "$KEYCHAIN_USER" -w 2>/dev/null
+}
+
+# --- keychain 쓰기 (delete + add) ---------------------------------------------
+# 원본 blob snapshot 후 실패 시 복원. raw blob 은 argv 로 전달되지 않도록 stdin 사용.
+# write_keychain_blob <hex8> <blob_json>
+# NOTE: security add-generic-password 는 -w 값을 argv 로 받는데, 이는 `ps` 로 노출 위험.
+#       macOS security 에는 stdin 옵션이 없어 argv 불가피. 대신 실행 직후 trap 으로 cleanup,
+#       그리고 blob snapshot 후 실패 복원 로직으로 race 완화.
+write_keychain_blob() {
+    local hex8="$1" blob="$2"
+    local label="Claude Code-credentials-$hex8"
+    local snapshot
+    # 1) 원본 snapshot (복원용)
+    snapshot=$(security find-generic-password -l "$label" -a "$KEYCHAIN_USER" -w 2>/dev/null || echo "")
+    if [ -z "$snapshot" ]; then
+        # 기존 entry 없음 → 바로 add 시도
+        if security add-generic-password -l "$label" -s "$label" -a "$KEYCHAIN_USER" -w "$blob" 2>/dev/null; then
+            return 0
+        fi
+        return 1
+    fi
+    # 2) delete
+    if ! security delete-generic-password -s "$label" -a "$KEYCHAIN_USER" >/dev/null 2>&1; then
+        return 1
+    fi
+    # 3) add (실패 시 snapshot 복원)
+    if security add-generic-password -l "$label" -s "$label" -a "$KEYCHAIN_USER" -w "$blob" 2>/dev/null; then
+        return 0
+    fi
+    # 3b) 복원 시도
+    security add-generic-password -l "$label" -s "$label" -a "$KEYCHAIN_USER" -w "$snapshot" 2>/dev/null || true
+    return 1
+}
+
+# --- blob 파싱 -----------------------------------------------------------------
+# 입력: blob JSON (stdin), 출력: access_token\trefresh_token\texpires_ms
+# 실패 시 exit 1, 빈 출력.
+parse_blob() {
+    jq -r '
+        .claudeAiOauth as $o
+        | if ($o.accessToken // "") == "" then error("no accessToken")
+          else "\($o.accessToken)\t\($o.refreshToken // "")\t\($o.expiresAt // 0)"
+          end
+    ' 2>/dev/null
+}
+
+# --- 토큰 refresh -------------------------------------------------------------
+# refresh_token <refresh_token_value> → stdout: access\trefresh\texpires_ms (성공), 비어있음 (실패).
+# curl -v 금지. 응답만 파싱.
+refresh_token() {
+    local rt="$1"
+    local body
+    # refresh_token 은 argv 로 전달하지 않고 --data @- (stdin) 사용.
+    body=$(jq -n --arg rt "$rt" --arg cid "$OAUTH_CLIENT_ID" \
+        '{grant_type:"refresh_token", refresh_token:$rt, client_id:$cid}')
+    local resp
+    resp=$(printf '%s' "$body" | curl -s --max-time "$CURL_TIMEOUT" \
+        -X POST "$TOKEN_URL" \
+        -H "Content-Type: application/json" \
+        --data @- 2>/dev/null || true)
+    [ -z "$resp" ] && return 1
+    # error 필드 있으면 실패
+    if printf '%s' "$resp" | jq -e '.error' >/dev/null 2>&1; then
+        return 1
+    fi
+    # 필수 키: access_token, refresh_token, expires_in
+    # refresh_token 이 응답에 없으면 빈 문자열 — 호출자가 기존 값 보존할 책임.
+    printf '%s' "$resp" | jq -r '
+        if (.access_token // "") == "" then error("no access_token")
+        else "\(.access_token)\t\(.refresh_token // "")\t\((now * 1000 + (.expires_in // 3600) * 1000) | floor)"
+        end
+    ' 2>/dev/null
+}
+
+# --- 새 blob 생성 (refresh 결과 → keychain 쓰기용) -----------------------------
+# build_new_blob <old_blob> <new_access> <new_refresh> <new_expires_ms>
+# 기존 blob 의 scopes/subscriptionType 등 비-토큰 필드 보존.
+build_new_blob() {
+    local old="$1" access="$2" refresh="$3" expires="$4"
+    # refresh_token 이 빈 문자열이면 기존 값 보존 (API 가 refresh_token 을 돌려주지 않는 경우 방어)
+    printf '%s' "$old" | jq -c \
+        --arg at "$access" \
+        --arg rt "$refresh" \
+        --argjson exp "$expires" \
+        '.claudeAiOauth.accessToken = $at
+         | (if $rt == "" then . else .claudeAiOauth.refreshToken = $rt end)
+         | .claudeAiOauth.expiresAt = $exp' 2>/dev/null
+}
+
+# --- usage API 호출 ------------------------------------------------------------
+# call_usage_api <access_token> → stdout: usage response JSON (성공) 또는 error JSON.
+# 실패 시 exit 1 + 빈 출력.
+call_usage_api() {
+    local at="$1"
+    local resp
+    # Authorization 헤더는 argv 노출되지만 curl 은 환경변수/stdin 방식이 없다.
+    # ps 에서 잠깐 보이는 건 불가피 — security CLI 와 동일 수준 리스크.
+    resp=$(curl -s --max-time "$CURL_TIMEOUT" \
+        -H "Authorization: Bearer $at" \
+        -H "anthropic-beta: $OAUTH_BETA" \
+        "$USAGE_URL" 2>/dev/null || true)
+    [ -z "$resp" ] && return 1
+    printf '%s' "$resp"
+}
+
+# --- 단일 계정 fetch (병렬 워커 진입점) ----------------------------------------
+# fetch_one <name> <tmp_dir>
+# 결과를 $tmp_dir/<name>.json 에 다음 스키마로 저장:
+#   {"ok":true,  "entry":{session_pct,session_resets,week_all_pct,week_resets,error}}
+#   {"ok":false, "reason":"<string>", "entry":{error:"..."}}
+# stdout/stderr 에는 토큰 출력 금지.
+fetch_one() {
+    local name="$1" tmp_dir="$2"
+    local out="$tmp_dir/$name.json"
+    local hex8 blob parsed access refresh expires now_ms
+    local refreshed=0 ok=0 reason=""
+
+    hex8="$(hex8_for "$name")"
+    if [ -z "$hex8" ]; then
+        jq -n --arg n "$name" --arg r "no_hex8_mapping" \
+            '{ok:false, reason:$r, entry:{error:$r}}' > "$out"
+        return 0
+    fi
+
+    blob="$(read_keychain_blob "$hex8")"
+    if [ -z "$blob" ]; then
+        jq -n --arg r "keychain_read_failed" \
+            '{ok:false, reason:$r, entry:{error:$r}}' > "$out"
+        return 0
+    fi
+
+    parsed="$(printf '%s' "$blob" | parse_blob)"
+    if [ -z "$parsed" ]; then
+        jq -n --arg r "blob_parse_failed" \
+            '{ok:false, reason:$r, entry:{error:$r}}' > "$out"
+        return 0
+    fi
+    IFS=$'\t' read -r access refresh expires <<< "$parsed"
+
+    # 만료 체크: 현재 ms + 60s 버퍼
+    now_ms=$(($(date -u +%s) * 1000))
+    if [ -z "$expires" ] || [ "$expires" = "null" ]; then expires=0; fi
+    if [ "$expires" -lt "$((now_ms + 60000))" ] 2>/dev/null; then
+        # refresh cap — master 가 .refresh_allowed.<name> 마커를 둔 계정만 refresh 수행.
+        # 그 외 expired 계정은 "deferred" 로 마킹하고 다음 사이클에 재시도.
+        if [ ! -f "$tmp_dir/.refresh_allowed.$name" ]; then
+            jq -n --arg r "token_expired_refresh_deferred" \
+                '{ok:false, reason:$r, entry:{error:$r}}' > "$out"
+            return 0
+        fi
+        # 만료됨 → refresh 시도
+        if [ -n "$refresh" ]; then
+            local r2 new_access new_refresh new_expires
+            r2="$(refresh_token "$refresh" || true)"
+            if [ -n "$r2" ]; then
+                IFS=$'\t' read -r new_access new_refresh new_expires <<< "$r2"
+                # 새 blob 조립 후 keychain 갱신
+                local new_blob
+                new_blob="$(build_new_blob "$blob" "$new_access" "$new_refresh" "$new_expires")"
+                if [ -n "$new_blob" ] && write_keychain_blob "$hex8" "$new_blob"; then
+                    access="$new_access"
+                    refreshed=1
+                else
+                    jq -n --arg r "keychain_write_failed" \
+                        '{ok:false, reason:$r, entry:{error:$r}}' > "$out"
+                    return 0
+                fi
+            else
+                jq -n --arg r "token_refresh_failed" \
+                    '{ok:false, reason:$r, entry:{error:$r}}' > "$out"
+                return 0
+            fi
+        else
+            jq -n --arg r "token_expired_no_refresh" \
+                '{ok:false, reason:$r, entry:{error:$r}}' > "$out"
+            return 0
+        fi
+    fi
+
+    # usage API 호출
+    local usage_resp
+    usage_resp="$(call_usage_api "$access" || true)"
+    if [ -z "$usage_resp" ]; then
+        jq -n --arg r "usage_api_no_response" \
+            '{ok:false, reason:$r, entry:{error:$r}}' > "$out"
+        return 0
+    fi
+
+    # HTTP 401 인 경우엔 응답에 error 필드가 있을 가능성 + curl 로는 HTTP 코드 안 들어옴.
+    # 유효 응답 marker = "five_hour" 키 존재.
+    if ! printf '%s' "$usage_resp" | jq -e '.five_hour' >/dev/null 2>&1; then
+        # 401 의심 → refresh 없이 온 경우엔 한 번 더 refresh 시도
+        if [ "$refreshed" -eq 0 ] && [ -n "$refresh" ]; then
+            local r3 new_access new_refresh new_expires
+            r3="$(refresh_token "$refresh" || true)"
+            if [ -n "$r3" ]; then
+                IFS=$'\t' read -r new_access new_refresh new_expires <<< "$r3"
+                local new_blob
+                new_blob="$(build_new_blob "$blob" "$new_access" "$new_refresh" "$new_expires")"
+                if [ -n "$new_blob" ] && write_keychain_blob "$hex8" "$new_blob"; then
+                    access="$new_access"
+                    usage_resp="$(call_usage_api "$access" || true)"
+                fi
+            fi
+        fi
+        if ! printf '%s' "$usage_resp" | jq -e '.five_hour' >/dev/null 2>&1; then
+            # 에러 타입 추출 (단, 토큰/민감값 포함 안 함)
+            local etype
+            etype="$(printf '%s' "$usage_resp" | jq -r '.error.type // .error // "usage_api_invalid"' 2>/dev/null || echo "usage_api_invalid")"
+            # 길이 제한 — 토큰 본체 방어용
+            etype="${etype:0:80}"
+            jq -n --arg r "$etype" \
+                '{ok:false, reason:$r, entry:{error:$r}}' > "$out"
+            return 0
+        fi
+    fi
+
+    # 정상 응답 → 스키마 빌드
+    printf '%s' "$usage_resp" | jq -c '
+        {
+            ok: true,
+            entry: {
+                session_pct:        (.five_hour.utilization // null),
+                session_resets:     (.five_hour.resets_at // null),
+                week_all_pct:       (.seven_day.utilization // null),
+                week_resets:        (.seven_day.resets_at // null),
+                week_sonnet_pct:    (.seven_day_sonnet.utilization // null),
+                week_sonnet_resets: (.seven_day_sonnet.resets_at // null),
+                error: null
+            }
+        }
+    ' > "$out"
+    ok=1
+    return 0
+}
+
+# --- 병렬 fetch (전체) ---------------------------------------------------------
+# fetch_all → $1 에 tmp_dir 경로 반환
+fetch_all() {
+    local out_var="$1"; shift
+    local names=("$@")
+    # 내부 변수명은 caller 의 변수와 이름 충돌 방지 목적. printf -v 간접할당이
+    # caller 의 'tmp_dir' 을 가리키는 경우, 여기 local 이 shadow 하면 안 됨.
+    local _td
+    _td="$(mktemp -d -t cl-refresh.XXXXXX)"
+    chmod 700 "$_td" 2>/dev/null || true
+
+    # refresh cap — expired 토큰 pre-scan 후 선착순 REFRESH_CAP_PER_CYCLE 개만 .refresh_allowed 마커 부여.
+    # IP 기반 rate_limit cascade 회피. 나머지는 다음 사이클에 다시 시도.
+    local now_ms allowed=0 name hex8 blob ea
+    now_ms=$(($(date -u +%s) * 1000))
+    for name in "${names[@]}"; do
+        [ "$allowed" -ge "$REFRESH_CAP_PER_CYCLE" ] && break
+        hex8="$(hex8_for "$name")"
+        [ -z "$hex8" ] && continue
+        blob="$(read_keychain_blob "$hex8")"
+        [ -z "$blob" ] && continue
+        ea="$(printf '%s' "$blob" | jq -r '.claudeAiOauth.expiresAt // 0' 2>/dev/null)"
+        [ -z "$ea" ] || [ "$ea" = "null" ] && ea=0
+        if [ "$ea" -lt "$((now_ms + 60000))" ] 2>/dev/null; then
+            touch "$_td/.refresh_allowed.$name"
+            allowed=$((allowed+1))
+            log "refresh allowed: $name"
+        fi
+    done
+    [ "$allowed" -gt 0 ] && log "refresh cap=$REFRESH_CAP_PER_CYCLE allowed=$allowed this cycle"
+
+    # export 해서 background job 이 함수 찾게 만들기
+    export -f fetch_one read_keychain_blob write_keychain_blob parse_blob refresh_token \
+               build_new_blob call_usage_api hex8_for
+    export KEYMAP KEYCHAIN_USER OAUTH_CLIENT_ID OAUTH_BETA TOKEN_URL USAGE_URL CURL_TIMEOUT
+    local pids=()
+    for name in "${names[@]}"; do
+        ( fetch_one "$name" "$_td" ) &
+        pids+=($!)
+    done
+    # 모든 워커 대기
+    local pid
+    for pid in "${pids[@]}"; do
+        wait "$pid" || true
+    done
+    printf -v "$out_var" '%s' "$_td"
+}
+
+# --- cache merge (부분 실패 보존) ----------------------------------------------
+# merge_cache <tmp_dir> <names_json_array>
+# 기존 cache 불러와 각 계정별로 success 면 전체 override, 실패면 error 필드만 갱신(기존 수치 보존).
+merge_cache() {
+    local tmp_dir="$1" names_json="$2"
+    # 정수 epoch. cl.cl_load_data 의 awk 계산은 int/float 모두 허용.
+    # python3 호출 금지 — ~/.hx/bin/python3 가 원격(hetzner) 라우팅될 수 있음.
+    local now_ts
+    now_ts=$(date -u +%s)
+
+    # 기존 cache 로드 (없으면 빈 객체)
+    local prev='{}'
+    [ -f "$USAGE" ] && prev="$(cat "$USAGE" 2>/dev/null || echo '{}')"
+    # _ts 제거 (나중에 다시 주입)
+    prev="$(printf '%s' "$prev" | jq 'del(._ts)' 2>/dev/null || echo '{}')"
+
+    # 결과 조립
+    local acc="$prev"
+    local names name result_file result ok reason
+    names=$(printf '%s' "$names_json" | jq -r '.[]')
+    while IFS= read -r name; do
+        [ -z "$name" ] && continue
+        result_file="$tmp_dir/$name.json"
+        if [ ! -f "$result_file" ]; then
+            # 워커가 아예 결과를 못 남겼음 — 드문 케이스, fetch_one 내부에서 항상 써야 함
+            ok="false"; reason="worker_no_output"
+            acc="$(printf '%s' "$acc" | jq --arg n "$name" --arg r "$reason" '
+                .[$n] = ((.[$n] // {}) + {error:$r})
+            ' 2>/dev/null || printf '%s' "$acc")"
+            log "fetch $name: FAIL ($reason)"
+            continue
+        fi
+        ok="$(jq -r '.ok // false' "$result_file" 2>/dev/null)"
+        if [ "$ok" = "true" ]; then
+            acc="$(printf '%s' "$acc" | jq --slurpfile r "$result_file" --arg n "$name" '
+                .[$n] = $r[0].entry
+            ' 2>/dev/null || printf '%s' "$acc")"
+            log "fetch $name: OK"
+        else
+            reason="$(jq -r '.reason // "unknown"' "$result_file" 2>/dev/null)"
+            # 기존 entry 보존 + error 필드만 추가 (never_zero_out)
+            acc="$(printf '%s' "$acc" | jq --arg n "$name" --arg r "$reason" '
+                .[$n] = ((.[$n] // {}) + {error:$r})
+            ' 2>/dev/null || printf '%s' "$acc")"
+            log "fetch $name: FAIL ($reason)"
+        fi
+    done <<< "$names"
+
+    # _ts 주입 + 원자적 쓰기
+    local final tmp_out="$USAGE.tmp.$$"
+    final="$(printf '%s' "$acc" | jq --argjson ts "$now_ts" '. + {_ts:$ts}' 2>/dev/null)"
+    if [ -z "$final" ]; then
+        echo "ERROR(cl-refresh): merge 실패 — cache 갱신 취소" >&2
+        return 1
+    fi
+    printf '%s' "$final" > "$tmp_out"
+    chmod 600 "$tmp_out" 2>/dev/null || true
+    # backup
+    [ -f "$USAGE" ] && cp "$USAGE" "$USAGE_BAK" 2>/dev/null || true
+    mv "$tmp_out" "$USAGE"
+    return 0
+}
+
+# --- 요약 출력 (성공/실패) -----------------------------------------------------
+summarize_run() {
+    local tmp_dir="$1" names_json="$2"
+    local names name ok reason
+    local total=0 oks=0 fails=0
+    printf '%-12s  %-8s  %s\n' "account" "status" "detail"
+    printf '%-12s  %-8s  %s\n' "-----------" "--------" "--------------------"
+    names=$(printf '%s' "$names_json" | jq -r '.[]')
+    while IFS= read -r name; do
+        [ -z "$name" ] && continue
+        total=$((total+1))
+        local f="$tmp_dir/$name.json"
+        if [ -f "$f" ]; then
+            ok="$(jq -r '.ok // false' "$f" 2>/dev/null)"
+            if [ "$ok" = "true" ]; then
+                local wk ss
+                wk="$(jq -r '.entry.week_all_pct // "null"' "$f" 2>/dev/null)"
+                ss="$(jq -r '.entry.session_pct // "null"' "$f" 2>/dev/null)"
+                printf '%-12s  %-8s  wk=%s%% ss=%s%%\n' "$name" "OK" "$wk" "$ss"
+                oks=$((oks+1))
+            else
+                reason="$(jq -r '.reason // "unknown"' "$f" 2>/dev/null)"
+                printf '%-12s  %-8s  %s\n' "$name" "FAIL" "$reason"
+                fails=$((fails+1))
+            fi
+        else
+            printf '%-12s  %-8s  %s\n' "$name" "FAIL" "no_worker_output"
+            fails=$((fails+1))
+        fi
+    done <<< "$names"
+    printf '%-12s  %-8s  %s\n' "-----------" "--------" "--------------------"
+    printf 'total=%d  ok=%d  fail=%d\n' "$total" "$oks" "$fails"
+}
+
+# --- Subcommand: --dry-run ----------------------------------------------------
+# keychain 접근 + blob 파싱만 테스트. API 호출 없음. 토큰 내용 절대 출력 안 함.
+cmd_dry_run() {
+    check_deps
+    require_inputs
+    local names name hex8 blob parsed access refresh expires has_access has_refresh
+    printf '%-12s  %-10s  %-10s  %-10s  %s\n' "account" "hex8" "keychain" "access" "expires"
+    printf '%-12s  %-10s  %-10s  %-10s  %s\n' "-----------" "--------" "--------" "--------" "----------"
+    names=$(list_account_names)
+    while IFS= read -r name; do
+        [ -z "$name" ] && continue
+        hex8="$(hex8_for "$name")"
+        if [ -z "$hex8" ]; then
+            printf '%-12s  %-10s  %-10s  %-10s  %s\n' "$name" "MISSING" "-" "-" "no_hex8_mapping"
+            continue
+        fi
+        blob="$(read_keychain_blob "$hex8")"
+        if [ -z "$blob" ]; then
+            printf '%-12s  %-10s  %-10s  %-10s  %s\n' "$name" "$hex8" "FAIL" "-" "keychain_read_failed"
+            continue
+        fi
+        parsed="$(printf '%s' "$blob" | parse_blob)"
+        if [ -z "$parsed" ]; then
+            printf '%-12s  %-10s  %-10s  %-10s  %s\n' "$name" "$hex8" "OK" "-" "blob_parse_failed"
+            continue
+        fi
+        IFS=$'\t' read -r access refresh expires <<< "$parsed"
+        # access/refresh 존재 여부만 (값은 절대 출력 X)
+        [ -n "$access" ] && has_access="present" || has_access="absent"
+        [ -n "$refresh" ] && has_refresh="present" || has_refresh="absent"
+        # expires 를 ISO 로 변환
+        local exp_human="-"
+        if [ -n "$expires" ] && [ "$expires" != "0" ] && [ "$expires" != "null" ]; then
+            local exp_sec=$((expires / 1000))
+            exp_human="$(date -u -r "$exp_sec" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo "$expires")"
+        fi
+        printf '%-12s  %-10s  %-10s  %-10s  %s\n' \
+            "$name" "$hex8" "OK" "$has_access" "$exp_human (refresh=$has_refresh)"
+    done <<< "$names"
+}
+
+# --- Subcommand: --verify -----------------------------------------------------
+cmd_verify() {
+    check_deps
+    if [ ! -f "$USAGE" ]; then
+        echo "ERROR(cl-refresh): $USAGE 없음" >&2
+        exit 1
+    fi
+    local ts now age_s age_h
+    ts="$(jq -r '._ts // empty' "$USAGE" 2>/dev/null)"
+    now=$(date -u +%s)
+    if [ -n "$ts" ] && [ "$ts" != "null" ]; then
+        age_s=$(awk -v n="$now" -v t="$ts" 'BEGIN{a=int(n-t); if(a<0)a=0; print a}')
+        age_h=$(awk -v n="$now" -v t="$ts" 'BEGIN{a=(n-t)/3600; if(a<0)a=0; printf "%.2f", a}')
+    else
+        age_s="?"; age_h="?"
+    fi
+    printf 'cache : %s\n' "$USAGE"
+    printf '_ts   : %s (age=%ss / %sh)\n' "${ts:-missing}" "$age_s" "$age_h"
+    printf '\n'
+    printf '%-12s  %-6s  %-6s  %s\n' "account" "wk%" "ss%" "error"
+    printf '%-12s  %-6s  %-6s  %s\n' "-----------" "------" "------" "--------------------"
+    jq -r '
+        to_entries[]
+        | select(.key != "_ts")
+        | "\(.key)\t\(.value.week_all_pct // "null")\t\(.value.session_pct // "null")\t\(.value.error // "null")"
+    ' "$USAGE" 2>/dev/null | sort -V | while IFS=$'\t' read -r n wk ss err; do
+        printf '%-12s  %-6s  %-6s  %s\n' "$n" "$wk" "$ss" "$err"
+    done
+}
+
+# --- Subcommand: 전체/단일 fetch ----------------------------------------------
+cmd_refresh() {
+    local target="${1:-}"
+    check_deps
+    require_inputs
+    acquire_lock
+    log_rotate
+
+    # 대상 계정 목록 조립
+    local names_array_json
+    if [ -n "$target" ]; then
+        if ! account_exists "$target"; then
+            echo "ERROR(cl-refresh): 계정 '$target' 없음" >&2
+            exit 1
+        fi
+        names_array_json="$(jq -n --arg n "$target" '[$n]')"
+    else
+        names_array_json="$(list_account_names | jq -R . | jq -s .)"
+    fi
+
+    # 배열 → bash 배열
+    local names=()
+    while IFS= read -r n; do
+        [ -n "$n" ] && names+=("$n")
+    done < <(printf '%s' "$names_array_json" | jq -r '.[]')
+
+    if [ "${#names[@]}" -eq 0 ]; then
+        echo "ERROR(cl-refresh): 대상 계정 없음" >&2
+        exit 1
+    fi
+
+    log "refresh start: ${#names[@]} account(s) [${names[*]}]"
+
+    # 병렬 fetch
+    local tmp_dir
+    fetch_all tmp_dir "${names[@]}"
+
+    # merge
+    if ! merge_cache "$tmp_dir" "$names_array_json"; then
+        rm -rf "$tmp_dir"
+        exit 5
+    fi
+
+    # 요약
+    summarize_run "$tmp_dir" "$names_array_json"
+
+    rm -rf "$tmp_dir"
+    log "refresh done"
+}
+
+# --- Subcommand: help ---------------------------------------------------------
+cmd_help() {
+    cat <<'USAGE'
+cl-refresh — nexus 자체 Anthropic usage-cache 갱신 엔진
+
+Subcommands:
+  cl-refresh              모든 계정(claude1~claude10) 병렬 fetch → cache 갱신
+  cl-refresh <name>       단일 계정만 (예: cl-refresh claude3)
+  cl-refresh --dry-run    keychain 접근/파싱 테스트 (API 호출 없음)
+  cl-refresh --verify     현재 cache 상태 요약
+  cl-refresh help         이 도움말
+
+파일:
+  ~/.claude-accounts/accounts.json         계정 목록 (입력)
+  ~/.claude-accounts/usage-cache.json      출력 (cl이 읽음)
+  ~/.claude-accounts/cl-refresh.log        실행 로그 (토큰 X)
+  ~/.claude-accounts/cl-refresh.lock       PID 락
+  shared/config/claude_keychain_map.json   hex8 suffix 매핑 (SSOT)
+
+정책:
+  - 실패 계정은 기존 cache entry 유지 (zero-out 금지)
+  - 토큰 raw 값은 로그/stdout/stderr 절대 노출 금지
+  - curl --max-time 10, 10계정 병렬 (background jobs + wait)
+  - 만료(또는 401) 감지 시 refresh_token 갱신 후 재시도
+  - keychain delete+add race → snapshot 복원 로직
+
+호출 패턴:
+  cl refresh              # cl 서브커맨드로 위임 (권장)
+  cl-refresh --dry-run    # keychain 접근 테스트
+  cl-refresh --verify     # 현재 cache 요약
+USAGE
+}
+
+# --- 엔트리 ------------------------------------------------------------------
+case "${1:-}" in
+    ""|all)           shift || true; cmd_refresh "" ;;
+    --dry-run)        cmd_dry_run ;;
+    --verify)         cmd_verify ;;
+    help|-h|--help)   cmd_help ;;
+    claude*|claude10) cmd_refresh "$1" ;;
+    *)
+        # 계정명으로 직접 들어올 수도 있음 (예: cl-refresh someacct) — 존재 확인
+        if [ -f "$ACCOUNTS" ] && account_exists "$1"; then
+            cmd_refresh "$1"
+        else
+            echo "ERROR(cl-refresh): unknown argument '$1' — 'cl-refresh help'" >&2
+            exit 64
+        fi
+        ;;
+esac

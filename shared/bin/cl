@@ -27,27 +27,36 @@
 #   - stderr rate-limit 감지 시 usage-cache 에 error 마킹 + 다음 후보로 1회 재시도
 #   - 각 계정별 CLAUDE_CONFIG_DIR 독립 → projects/memory 분리 (one-shot 에 안전)
 #
-# AirGenome 기존 cl 은 hexa 기반으로 void-method 이슈로 깨짐.
-# 본 스크립트는 기존 코드 무시, 자동 선택 로직만 참고하여 재작성.
+# 이관 이력: 2026-04-14 airgenome/ccmon 의존 완전 제거. CL_HOME 기본값 shared/.runtime/accounts.
+# 레거시 ~/.claude-accounts 존재 시 migrate_legacy_home() 이 1회 흡수 후 .migrated_from_home 마커.
+# 골화 상태: shared/convergence/cl.json (ossified.SHARED_SSOT_MIGRATION / CL_REFRESH_ENGINE / LAUNCHD_MANAGER)
 
 set -euo pipefail
 
-CL_HOME="${CL_HOME:-$HOME/.claude-accounts}"
+CL_HOME="${CL_HOME:-/Users/ghost/Dev/nexus/shared/.runtime/accounts}"
 ACCOUNTS="$CL_HOME/accounts.json"
 STATE="$CL_HOME/cl-state.json"
 USAGE="$CL_HOME/usage-cache.json"
 
 mkdir -p "$CL_HOME"
 
-# 1회성 seed — store 비어있으면 ~/.airgenome 에서 복사 (airgenome 의존 끊기 위한 이행 단계)
-seed_from_airgenome() {
-    local src="$HOME/.airgenome"
-    [ -d "$src" ] || return 0
-    [ ! -f "$ACCOUNTS" ] && [ -f "$src/accounts.json"   ] && cp "$src/accounts.json"   "$ACCOUNTS"   || true
-    [ ! -f "$STATE"    ] && [ -f "$src/cl-state.json"   ] && cp "$src/cl-state.json"   "$STATE"      || true
-    [ ! -f "$USAGE"    ] && [ -f "$src/usage-cache.json" ] && cp "$src/usage-cache.json" "$USAGE"     || true
+# 1회성 레거시 흡수 — ~/.claude-accounts 존재 시 3 파일 mv 후 .migrated_from_home 마커.
+# airgenome 경로는 참조 0 (완전 제거). 마커 존재 시 즉시 return.
+migrate_legacy_home() {
+    local marker="$CL_HOME/.migrated_from_home"
+    [ -f "$marker" ] && return 0
+    local legacy="$HOME/.claude-accounts"
+    if [ -d "$legacy" ]; then
+        local f
+        for f in accounts.json cl-state.json usage-cache.json; do
+            if [ -f "$legacy/$f" ] && [ ! -f "$CL_HOME/$f" ]; then
+                mv "$legacy/$f" "$CL_HOME/$f" 2>/dev/null || true
+            fi
+        done
+    fi
+    : > "$marker"
 }
-seed_from_airgenome
+migrate_legacy_home
 
 [ -f "$ACCOUNTS" ] || { echo "ERROR(cl): $ACCOUNTS 없음" >&2; exit 2; }
 command -v jq >/dev/null 2>&1 || { echo "ERROR(cl): jq 필요" >&2; exit 3; }
@@ -84,15 +93,27 @@ bar_to() {
     printf -v "$__var" '%s%s' "${hashes:0:filled}" "${dots:0:$((20-filled))}"
 }
 
-# usage-cache 에서 week_all_pct 최저(error=null, <95) 계정 선택
+# usage-cache 에서 week_all_pct 최저(error=null, <95) 계정 선택.
+# 정직성 게이트: week_resets 가 현재보다 과거면 stale → 0% 로 간주 (이미 리셋됐을 것).
 auto_pick() {
     [ -f "$USAGE" ] || { echo "" ; return; }
-    jq -r '
+    local now; now=$(date -u +%s)
+    jq -r --argjson now "$now" '
+        def parse_ts:
+          if . == null or . == "" then null
+          else
+            (. | sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z"))
+            | try fromdateiso8601
+          end;
         [to_entries[]
             | select(.key != "_ts")
             | select(.value.error == null)
-            | select((.value.week_all_pct // 100) < 95)
-            | {name:.key, wk:(.value.week_all_pct // 100)}]
+            | . as $e
+            | (($e.value.week_resets // $e.value.week_all_resets) | parse_ts) as $wrt
+            | (if $wrt != null and $wrt < $now then 0
+               else ($e.value.week_all_pct // 100) end) as $wk
+            | {name:.key, wk:$wk}
+            | select(.wk < 95)]
         | sort_by(.wk)
         | .[0].name // empty
     ' "$USAGE" 2>/dev/null
@@ -105,20 +126,48 @@ CL_NAMES=()
 CL_WK=()
 CL_SS=()
 CL_ERR=()
+CL_CACHE_TS=""   # _ts epoch. stale 표시용.
+CL_STALE_H=0     # cache 나이(시간 단위, floor). 1 이상이면 헤더에 STALE 표시.
 
 # 단일 jq 호출로 accounts.json + usage-cache.json 결합 → name\tweek\tsess\terr.
 # 정렬은 sort -V (자연 정렬: claude9 < claude10).
 # Before: 30+ jq 호출/프레임 (10계정 × 3필드). After: 1 jq 호출/세션.
+#
+# 정직성 게이트 (R-honesty): resets 시각이 현재보다 과거면 해당 pct 를 0 으로 override.
+# 이유: cache 가 stale 하면 "5% 쓴 상태로 세션 리셋" 같은 낡은 숫자를 붙잡고 있음.
+# resets 지난 시점에는 실제 서버에서 리셋됐을 가능성이 크므로 0 으로 간주 (허위 fullness 차단).
+# 단, 세션 도중 cache 작성 후 100% 로 치달은 케이스는 여기서 못 잡음 → cl refresh 로 실측 필요.
+#
+# stale 표시: _ts 와 현재 시각 차이를 시간 단위로 CL_STALE_H 에 저장 → 헤더에 표시.
 cl_load_data() {
     CL_ACTIVE="$(current_active)"
     CL_AUTO="$(auto_pick)"
     CL_NAMES=(); CL_WK=(); CL_SS=(); CL_ERR=()
-    local raw
+    CL_CACHE_TS=""; CL_STALE_H=0
+    local raw now
+    now=$(date -u +%s)
     if [ -f "$USAGE" ]; then
-        raw=$(jq -r --slurpfile usage "$USAGE" '
+        CL_CACHE_TS=$(jq -r '._ts // empty' "$USAGE" 2>/dev/null)
+        if [ -n "$CL_CACHE_TS" ] && [ "$CL_CACHE_TS" != "null" ]; then
+            CL_STALE_H=$(awk -v n="$now" -v t="$CL_CACHE_TS" \
+                'BEGIN{a=int((n-t)/3600); if(a<0)a=0; print a}')
+        fi
+        raw=$(jq -r --slurpfile usage "$USAGE" --argjson now "$now" '
+            def parse_ts:
+              if . == null or . == "" then null
+              else
+                (. | sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z"))
+                | try fromdateiso8601
+              end;
             $usage[0] as $u
             | .accounts[]
-            | "\(.name)\t\(($u[.name].week_all_pct // 0))\t\(($u[.name].session_pct // 0))\t\(($u[.name].error // ""))"
+            | .name as $n
+            | ($u[$n] // {}) as $e
+            | (($e.week_resets // $e.week_all_resets) | parse_ts) as $wrt
+            | ($e.session_resets | parse_ts) as $srt
+            | (if $wrt != null and $wrt < $now then 0 else ($e.week_all_pct // 0) end) as $wk
+            | (if $srt != null and $srt < $now then 0 else ($e.session_pct // 0) end) as $ss
+            | "\($n)\t\($wk)\t\($ss)\t\($e.error // "")"
         ' "$ACCOUNTS" 2>/dev/null | sort -V)
     else
         raw=$(jq -r '.accounts[] | "\(.name)\t0\t0\tno-cache"' "$ACCOUNTS" 2>/dev/null | sort -V)
@@ -144,11 +193,13 @@ build_frame_to() {
     local cursor="${2:--1}"
     local eol="${CL_EOL-}"
     # NOTE: 내부 누적 _buf — caller 의 'frame' 등과 dynamic scoping 충돌 방지.
-    local _buf="" line b1 b2
+    local _buf="" line b1 b2 stale_note=""
     local count=${#CL_NAMES[@]}
     local i name wi si err act_mark num_label
 
-    printf -v line "cl — Claude accounts    active=%s    store=%s%s\n" "${CL_ACTIVE:-none}" "$CL_HOME" "$eol"
+    # 정직성 게이트 후속: cache 나이 1h 이상이면 헤더에 STALE 경고.
+    [ "${CL_STALE_H:-0}" -ge 1 ] && stale_note="    cache=${CL_STALE_H}h STALE→cl refresh"
+    printf -v line "cl — Claude accounts    active=%s    store=%s%s%s\n" "${CL_ACTIVE:-none}" "$CL_HOME" "$stale_note" "$eol"
     _buf+="$line"
     printf -v line "    %-3s  %-10s  %4s  %-20s  %4s  %-20s  %s%s\n" "no" "name" "wk%" "[week_all]" "ss%" "[session]" "err" "$eol"
     _buf+="$line"
@@ -401,6 +452,7 @@ case "${1:-interactive}" in
     status)          show_status ;;
     pick)            shift || true; cmd_pick "${1:-}" ;;
     env)             cmd_env ;;
+    refresh)         shift || true; exec "$(dirname "$0")/cl-refresh" "$@" ;;
     --)              shift; cmd_passthrough "" "$@" ;;
     help|-h|--help)
         cat <<USAGE
@@ -412,6 +464,11 @@ Subcommands:
   cl status            요약
   cl pick [NAME]       active 전환만 (런칭 X). NAME 없으면 자동
   cl env               eval "\$(cl env)" → CLAUDE_CONFIG_DIR export
+  cl refresh [...]     usage-cache.json 갱신 (cl-refresh 위임)
+                         cl refresh            # 전체 계정 병렬 갱신
+                         cl refresh <name>     # 단일 계정
+                         cl refresh --dry-run  # keychain 접근 테스트
+                         cl refresh --verify   # 현재 cache 요약
   cl help
 
 Passthrough (타 프로젝트 자동화 용 — claude 대체재):
