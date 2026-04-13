@@ -86,69 +86,91 @@ auto_pick() {
     ' "$USAGE" 2>/dev/null
 }
 
+# 글로벌 데이터 캐시. 인터랙티브 루프 전 1회 로드 → 프레임 빌드 시 jq 호출 0.
+CL_ACTIVE=""
+CL_NAMES=()
+CL_WK=()
+CL_SS=()
+CL_ERR=()
+
+# 단일 jq 호출로 accounts.json + usage-cache.json 결합 → name\tweek\tsess\terr.
+# 정렬은 sort -V (자연 정렬: claude9 < claude10).
+# Before: 30+ jq 호출/프레임 (10계정 × 3필드). After: 1 jq 호출/세션.
+cl_load_data() {
+    CL_ACTIVE="$(current_active)"
+    CL_NAMES=(); CL_WK=(); CL_SS=(); CL_ERR=()
+    local raw
+    if [ -f "$USAGE" ]; then
+        raw=$(jq -r --slurpfile usage "$USAGE" '
+            $usage[0] as $u
+            | .accounts[]
+            | "\(.name)\t\(($u[.name].week_all_pct // 0))\t\(($u[.name].session_pct // 0))\t\(($u[.name].error // ""))"
+        ' "$ACCOUNTS" 2>/dev/null | sort -V)
+    else
+        raw=$(jq -r '.accounts[] | "\(.name)\t0\t0\tno-cache"' "$ACCOUNTS" 2>/dev/null | sort -V)
+    fi
+    local n w s e
+    while IFS=$'\t' read -r n w s e; do
+        [ -z "$n" ] && continue
+        CL_NAMES+=("$n"); CL_WK+=("$w"); CL_SS+=("$s"); CL_ERR+=("$e")
+    done <<< "$raw"
+}
+
 show_dashboard() {
+    cl_load_data
     local frame
     CL_EOL="" build_frame_to frame -1
     printf '%s' "$frame"
 }
 
-# build_frame_to <out_var> <cursor_idx> — 전체 대시보드를 단일 문자열로 빌드 (출력 X)
-# CL_EOL 환경변수로 행 끝 ANSI 제어 시퀀스 주입 (인터랙티브: \033[K, 비대화형: 빈문자)
-# 모든 printf -v 사용 → 서브셸/파이프 없음. 한 번의 printf 로 atomic 출력 가능.
+# build_frame_to <out_var> <cursor_idx> — 캐시(CL_*)에서 frame 빌드.
+# printf -v 만 사용 → 서브셸/파이프/jq 0개. 한 번의 printf 로 atomic 출력 가능.
 build_frame_to() {
     local __out=$1
     local cursor="${2:--1}"
     local eol="${CL_EOL-}"
-    local active; active="$(current_active)"
-    local names; names="$(list_accounts)"
-    # NOTE: 내부 누적 변수는 _buf — caller 가 'frame' 같은 흔한 이름을 쓸 때
-    # printf -v "$__out" 가 dynamic scoping 으로 우리 local 을 덮는 사고 방지.
+    # NOTE: 내부 누적 _buf — caller 의 'frame' 등과 dynamic scoping 충돌 방지.
     local _buf="" line b1 b2
-    local i=0 name week sess err wi si act_mark num_label
+    local count=${#CL_NAMES[@]}
+    local i name wi si err act_mark num_label
 
-    printf -v line "cl — Claude accounts    active=%s    store=%s%s\n" "${active:-none}" "$CL_HOME" "$eol"
+    printf -v line "cl — Claude accounts    active=%s    store=%s%s\n" "${CL_ACTIVE:-none}" "$CL_HOME" "$eol"
     _buf+="$line"
     printf -v line "    %-3s  %-10s  %4s  %-20s  %4s  %-20s  %s%s\n" "no" "name" "wk%" "[week_all]" "ss%" "[session]" "err" "$eol"
     _buf+="$line"
     printf -v line "    -------------------------------------------------------------------------------%s\n" "$eol"
     _buf+="$line"
 
-    while IFS= read -r name; do
-        [ -z "$name" ] && continue
-        if [ -f "$USAGE" ]; then
-            week=$(jq -r --arg n "$name" '.[$n].week_all_pct // 0' "$USAGE" 2>/dev/null)
-            sess=$(jq -r --arg n "$name" '.[$n].session_pct // 0' "$USAGE" 2>/dev/null)
-            err=$(jq -r --arg n "$name" '.[$n].error // ""' "$USAGE" 2>/dev/null)
-        else
-            week=0; sess=0; err="no-cache"
-        fi
-        printf -v wi '%.0f' "${week:-0}"
-        printf -v si '%.0f' "${sess:-0}"
+    for ((i=0; i<count; i++)); do
+        name="${CL_NAMES[$i]}"
+        printf -v wi '%.0f' "${CL_WK[$i]:-0}"
+        printf -v si '%.0f' "${CL_SS[$i]:-0}"
+        err="${CL_ERR[$i]:-}"
         bar_to b1 "$wi"
         bar_to b2 "$si"
         act_mark=" "
-        [ "$name" = "$active" ] && act_mark="*"
+        [ "$name" = "$CL_ACTIVE" ] && act_mark="*"
         if [ "$i" -lt 9 ]; then num_label=$((i+1));
         elif [ "$i" -eq 9 ]; then num_label="0";
         else num_label="-"; fi
         # prefix 4 col 고정. 커서 행 전체 reverse video. ASCII '>' (wide-char 모호성 회피).
         if [ "$i" -eq "$cursor" ]; then
             printf -v line "\033[7m  > %-3s %s%-10s  %3s%%  %s  %3s%%  %s  %s\033[0m%s\n" \
-                "$num_label" "$act_mark" "$name" "$wi" "$b1" "$si" "$b2" "${err:-}" "$eol"
+                "$num_label" "$act_mark" "$name" "$wi" "$b1" "$si" "$b2" "$err" "$eol"
         else
             printf -v line "    %-3s %s%-10s  %3s%%  %s  %3s%%  %s  %s%s\n" \
-                "$num_label" "$act_mark" "$name" "$wi" "$b1" "$si" "$b2" "${err:-}" "$eol"
+                "$num_label" "$act_mark" "$name" "$wi" "$b1" "$si" "$b2" "$err" "$eol"
         fi
         _buf+="$line"
-        i=$((i+1))
-    done <<< "$names"
+    done
 
     printf -v "$__out" '%s' "$_buf"
 }
 
-# 단일 키 읽기 — 이스케이프 시퀀스(화살표) 결합 처리
+# 단일 키 읽기 — 결과는 글로벌 CL_KEY 에. 서브셸 회피 (호출당 ~5ms 절약).
 # bash 3.2 호환: -t 는 정수 초만 지원. 화살표는 ESC[X 가 atomic 으로 버퍼링되므로
 # ESC 감지 후 2 바이트 더 읽기. lone ESC 는 1초 timeout (q 로 즉시 취소 가능).
+CL_KEY=""
 read_key() {
     local key rest
     IFS= read -rsn1 key
@@ -157,7 +179,7 @@ read_key() {
         IFS= read -rsn2 -t 1 rest 2>/dev/null || true
         key+="${rest}"
     fi
-    printf '%s' "$key"
+    CL_KEY="$key"
 }
 
 cmd_interactive() {
@@ -165,22 +187,21 @@ cmd_interactive() {
         show_dashboard
         return 0
     fi
-    local names=()
-    while IFS= read -r n; do [ -n "$n" ] && names+=("$n"); done < <(list_accounts)
-    local count=${#names[@]}
+    # 데이터 1회 로드 — 루프 안에서는 jq 호출 없음
+    cl_load_data
+    local count=${#CL_NAMES[@]}
     [ "$count" -gt 0 ] || { echo "ERROR(cl): 계정 없음" >&2; exit 1; }
 
-    local active; active="$(current_active)"
-    local auto;   auto="$(auto_pick)"
+    local auto; auto="$(auto_pick)"
     local cursor=0 i
     if [ -n "$auto" ]; then
-        for i in "${!names[@]}"; do [ "${names[$i]}" = "$auto" ] && cursor=$i && break; done
-    elif [ -n "$active" ]; then
-        for i in "${!names[@]}"; do [ "${names[$i]}" = "$active" ] && cursor=$i && break; done
+        for ((i=0; i<count; i++)); do [ "${CL_NAMES[$i]}" = "$auto" ] && cursor=$i && break; done
+    elif [ -n "$CL_ACTIVE" ]; then
+        for ((i=0; i<count; i++)); do [ "${CL_NAMES[$i]}" = "$CL_ACTIVE" ] && cursor=$i && break; done
     fi
 
     local total_lines=$(( count + 4 ))   # 헤더1 + 컬럼1 + 구분1 + n + 푸터1
-    local first=1 selected="" key moved=0 idx footer
+    local first=1 selected="" moved=0 idx footer
 
     # 커서 숨김 + 종료 시 복원 (Ctrl-C 포함)
     printf '\033[?25l'
@@ -198,36 +219,37 @@ cmd_interactive() {
             printf -v prefix '\033[%dA\r' "$total_lines"
         fi
 
-        # 2. 대시보드 본문 (단일 문자열)
+        # 2. 대시보드 본문 (단일 문자열, 캐시에서 빌드 → jq 0)
         CL_EOL="$CL_EOL" build_frame_to body "$cursor"
 
         # 3. 푸터 미리보기 — moved 전후 분기
-        if [ "$moved" -eq 0 ] && [ -n "$auto" ] && [ "${names[$cursor]}" != "$auto" ]; then
+        if [ "$moved" -eq 0 ] && [ -n "$auto" ] && [ "${CL_NAMES[$cursor]}" != "$auto" ]; then
             printf -v footer "  ↑↓←→ 이동  Enter→%s  1-9/0 점프  q 취소  (그 외 → %s 추천)\033[K\n" \
-                "${names[$cursor]}" "$auto"
+                "${CL_NAMES[$cursor]}" "$auto"
         elif [ "$moved" -eq 0 ]; then
             printf -v footer "  ↑↓←→ 이동  Enter→%s  1-9/0 점프  q 취소  (그 외 → 추천)\033[K\n" \
-                "${names[$cursor]}"
+                "${CL_NAMES[$cursor]}"
         else
             printf -v footer "  ↑↓←→ 이동  Enter→%s  1-9/0 점프  q 취소\033[K\n" \
-                "${names[$cursor]}"
+                "${CL_NAMES[$cursor]}"
         fi
 
-        # 4. ATOMIC: 단일 printf 로 전체 프레임 한 번에 write → tty 가 부분 frame 못 봄
+        # 4. ATOMIC: 단일 printf 로 전체 프레임 한 번에 write
         printf '%s%s%s' "$prefix" "$body" "$footer"
 
-        key=$(read_key)
-        case "$key" in
+        # 5. 키 입력 (서브셸 없이 글로벌 CL_KEY 로)
+        read_key
+        case "$CL_KEY" in
             $'\x1b[A'|$'\x1b[D'|$'\x1bOA'|$'\x1bOD')
                 cursor=$(( (cursor - 1 + count) % count )); moved=1 ;;
             $'\x1b[B'|$'\x1b[C'|$'\x1bOB'|$'\x1bOC')
                 cursor=$(( (cursor + 1) % count )); moved=1 ;;
-            "")  selected="${names[$cursor]}"; break ;;
+            "")  selected="${CL_NAMES[$cursor]}"; break ;;
             [1-9])
-                idx=$(( key - 1 ))
-                if [ "$idx" -lt "$count" ]; then selected="${names[$idx]}"; break; fi ;;
+                idx=$(( CL_KEY - 1 ))
+                if [ "$idx" -lt "$count" ]; then selected="${CL_NAMES[$idx]}"; break; fi ;;
             0)
-                if [ "$count" -ge 10 ]; then selected="${names[9]}"; break; fi ;;
+                if [ "$count" -ge 10 ]; then selected="${CL_NAMES[9]}"; break; fi ;;
             q|Q|$'\x1b')
                 printf '\n취소\n'
                 printf '\033[?25h'; trap - EXIT INT TERM
@@ -235,9 +257,9 @@ cmd_interactive() {
             *)
                 # 한 번이라도 이동했으면 커서 위치 선택, 아니면 추천
                 if [ "$moved" -eq 1 ]; then
-                    selected="${names[$cursor]}"
+                    selected="${CL_NAMES[$cursor]}"
                 else
-                    selected="${auto:-${names[$cursor]}}"
+                    selected="${auto:-${CL_NAMES[$cursor]}}"
                 fi
                 break ;;
         esac
