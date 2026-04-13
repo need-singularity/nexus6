@@ -17,6 +17,7 @@ engine (.hexa):
   gc-weekly.hexa       L3 — 7일 쿨다운 래퍼 (growth-tick/cron 안전)
   bitter-gate.hexa     새 규칙 추가 전 mandatory — dormant 규칙 폐기 우선
   hook_stdin_gate.hexa  hexa binary read_stdin() round-trip 검증 (stale build 회귀 감지)
+  global_claude_guard.hexa  ~/.claude/ 외부 설정 오염 감지 (hooks/CLAUDE.md 금지, settings.json 만 허용)
 
 logs (append-only):
   lint_log.jsonl       모든 lint 실행 기록
@@ -44,6 +45,7 @@ entrypoints:
   hexa autofix.hexa --analyze           mistakes 누적 후 수동
   hexa bitter-gate.hexa --audit         새 규칙 추가 전 mandatory
   hexa hook_stdin_gate.hexa             hexa binary 회귀 감지 (실패 시 mistakes.jsonl + stderr, 성공 무출력)
+  hexa global_claude_guard.hexa         ~/.claude/ 오염 감지 (CLAUDE.md/hooks/* 발견 시 mistakes.jsonl + stderr)
 
 pending:
   hooks-config.json 등록   gc-weekly 주간 체인 (shared/harness/hooks-config-patch.json 참조)
