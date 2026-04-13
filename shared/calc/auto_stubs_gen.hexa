@@ -1,0 +1,272 @@
+// ═══════════════════════════════════════════════════════════
+// auto_stubs_gen.hexa — closure-sweep verify stub generator (R1 ai-native)
+//
+// 역할: nexus closure-sweep 가 발사하던 calc/auto_stubs/verify_*.py 스텁을
+//       .hexa 로 발사하는 ai-native 발사기. 원본 generator (15m cron 의
+//       gen-calc-stubs) 가 리포에 부재하여 본 모듈이 단일 SSOT 가 됨.
+//
+// 입력: shared/calc/auto_stubs/manifest.jsonl
+//       각 라인 = {"id":<10char hex>,"target":<num str>,"expr":<str>,"hyp":<str>,"closure":<str>}
+//
+// 출력: shared/calc/auto_stubs/verify_<id>.hexa  (manifest 라인당 1개)
+//
+// usage:
+//   hexa shared/calc/auto_stubs_gen.hexa --emit                # manifest → .hexa
+//   hexa shared/calc/auto_stubs_gen.hexa --import-py           # 기존 .py → manifest 추출 (1회성 마이그레이션)
+//   hexa shared/calc/auto_stubs_gen.hexa --status              # manifest 라인 / 출력 .hexa 수 비교
+//
+// 성공 조용, 실패 시끄럽게 (H1).
+// ═══════════════════════════════════════════════════════════
+
+let HOME = env("HOME")
+let REPO_ROOT = exec("git rev-parse --show-toplevel 2>/dev/null").trim()
+let STUBS_DIR = REPO_ROOT + "/shared/calc/auto_stubs"
+let MANIFEST = STUBS_DIR + "/manifest.jsonl"
+
+// ─── helpers (stage1 hexa-lang 함정 회피) ───
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _rfind(s: string, ch: string) -> i64 {
+    let n = len(s)
+    let mut i: i64 = n - 1
+    while i >= 0 {
+        if s.substring(i, i + 1) == ch { return i }
+        i = i - 1
+    }
+    return -1
+}
+
+fn json_escape(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", "\\n")
+    r = r.replace("\r", "")
+    r = r.replace("\t", " ")
+    return r
+}
+
+// 한 줄 JSON 값 추출 (간단 키:값, escape 미고려 — manifest 는 우리가 emit 하므로 안전)
+fn jget(line: string, key: string) -> string {
+    let pat = "\"" + key + "\":\""
+    let i = line.index_of(pat)
+    if i < 0 { return "" }
+    let start = i + len(pat)
+    // 다음 미 escape 따옴표 찾기
+    let mut j: i64 = start
+    let n = len(line)
+    while j < n {
+        let ch = line.substring(j, j + 1)
+        if ch == "\\" { j = j + 2; continue }
+        if ch == "\"" { break }
+        j = j + 1
+    }
+    if j >= n { return "" }
+    return line.substring(start, j).replace("\\\"", "\"").replace("\\\\", "\\")
+}
+
+// ─── .py → manifest 추출 (1회성 import) ───
+//
+// 패턴 (verify_*.py 27줄 고정 템플릿):
+//   line 5: "Closure: <closure_str>"
+//   line 6: "Full: HYP[<hyp>]: <closure_str>"
+//   line 18: "target = <num>"
+//   line 19: "claimed_expr = '<expr>'"
+//   파일명: verify_<10char hex>.py
+
+fn extract_one_py(path: string) -> string {
+    // returns JSON line or "" on failure
+    let bn = path.substring(_rfind(path, "/") + 1, len(path))
+    if !bn.starts_with("verify_") || !bn.ends_with(".py") { return "" }
+    let id = bn.substring(7, len(bn) - 3)
+    if len(id) != 10 { return "" }
+
+    let txt = _str(exec("cat '" + path + "' 2>/dev/null"))
+    if txt == "" { return "" }
+    let lines = txt.split("\n")
+    if len(lines) < 20 { return "" }
+
+    let mut closure = ""
+    let mut hyp = ""
+    let mut target = ""
+    let mut expr = ""
+
+    for raw in lines {
+        let l = _str(raw)
+        let lt = l.trim()
+        if lt.starts_with("Closure: ") {
+            closure = lt.substring(9, len(lt))
+        }
+        if lt.starts_with("Full: HYP[") {
+            // Full: HYP[<hyp>]: <closure>
+            let rest = lt.substring(10, len(lt))
+            let rb = rest.index_of("]")
+            if rb > 0 { hyp = rest.substring(0, rb) }
+        }
+        if lt.starts_with("target = ") {
+            target = lt.substring(9, len(lt))
+        }
+        if lt.starts_with("claimed_expr = ") {
+            let v = lt.substring(15, len(lt))
+            let mut stripped = v
+            // 양 끝 따옴표 제거
+            if len(v) >= 2 {
+                let q = v.substring(0, 1)
+                if q == "'" || q == "\"" {
+                    let last = v.substring(len(v) - 1, len(v))
+                    if last == q { stripped = v.substring(1, len(v) - 1) }
+                }
+            }
+            expr = stripped
+        }
+    }
+
+    if target == "" || expr == "" { return "" }
+
+    return "{\"id\":\"" + id + "\"" +
+           ",\"target\":\"" + json_escape(target) + "\"" +
+           ",\"expr\":\"" + json_escape(expr) + "\"" +
+           ",\"hyp\":\"" + json_escape(hyp) + "\"" +
+           ",\"closure\":\"" + json_escape(closure) + "\"}"
+}
+
+fn cmd_import_py() -> i64 {
+    let listing = _str(exec("ls " + STUBS_DIR + "/verify_*.py 2>/dev/null")).trim()
+    if listing == "" {
+        println("import-py: no verify_*.py found in " + STUBS_DIR)
+        return 0
+    }
+    let mut buf = ""
+    let mut ok: i64 = 0
+    let mut bad: i64 = 0
+    for raw in listing.split("\n") {
+        let p = _str(raw).trim()
+        if p == "" { continue }
+        let line = extract_one_py(p)
+        if line == "" {
+            bad = bad + 1
+            continue
+        }
+        buf = buf + line + "\n"
+        ok = ok + 1
+    }
+    try { write_file(MANIFEST, buf) } catch e {
+        println("ERR: write manifest failed: " + MANIFEST)
+        return 1
+    }
+    println("import-py: ok=" + to_string(ok) + " bad=" + to_string(bad) + " → " + MANIFEST)
+    return 0
+}
+
+// ─── manifest → .hexa emit ───
+
+fn render_stub(id: string, target: string, expr: string, hyp: string, closure: string) -> string {
+    let mut s = ""
+    s = s + "// ═══════════════════════════════════════════════════════════\n"
+    s = s + "// AUTO-GENERATED stub from nexus closure-sweep.\n"
+    s = s + "// Generator: shared/calc/auto_stubs_gen.hexa (manifest line " + id + ")\n"
+    s = s + "//\n"
+    s = s + "// Closure: " + closure + "\n"
+    s = s + "// Full: HYP[" + hyp + "]: " + closure + "\n"
+    s = s + "//\n"
+    s = s + "// Human task: verify the expression algebraically. Mark as VERIFIED or REJECTED.\n"
+    s = s + "// ═══════════════════════════════════════════════════════════\n"
+    s = s + "\n"
+    s = s + "// n=6 primitives\n"
+    s = s + "let n: i64 = 6\n"
+    s = s + "let sigma: i64 = 12\n"
+    s = s + "let tau: i64 = 4\n"
+    s = s + "let phi: i64 = 2\n"
+    s = s + "let sopfr: i64 = 5\n"
+    s = s + "let J2: i64 = 24\n"
+    s = s + "\n"
+    s = s + "// Multi-n primitives (from meta FP ladder)\n"
+    s = s + "// n=15: sigma=24, phi=8, tau=4, sopfr=8\n"
+    s = s + "// n=35: sigma=48, phi=24, tau=4, sopfr=12\n"
+    s = s + "// n=105: sigma=192, phi=48, tau=8, sopfr=15\n"
+    s = s + "\n"
+    s = s + "let target = \"" + target + "\"\n"
+    s = s + "let claimed_expr = \"" + expr.replace("\"", "\\\"") + "\"\n"
+    s = s + "\n"
+    s = s + "// TODO: compute expected from claimed_expr (ai-native evaluator)\n"
+    s = s + "// TODO: assert |expected - target| < 1e-6\n"
+    s = s + "println(\"stub: target=\" + target + \", claim=\" + claimed_expr)\n"
+    s = s + "println(\"status: STUB (human verification needed)\")\n"
+    return s
+}
+
+fn cmd_emit() -> i64 {
+    if !file_exists(MANIFEST) {
+        println("ERR: manifest not found: " + MANIFEST)
+        println("hint: run --import-py first")
+        return 1
+    }
+    let raw = _str(read_file(MANIFEST))
+    if raw == "" {
+        println("ERR: manifest empty")
+        return 1
+    }
+    let mut written: i64 = 0
+    let mut skipped: i64 = 0
+    for line in raw.split("\n") {
+        let l = _str(line).trim()
+        if l == "" { continue }
+        if !l.starts_with("{") { continue }
+        let id = jget(l, "id")
+        let target = jget(l, "target")
+        let expr = jget(l, "expr")
+        let hyp = jget(l, "hyp")
+        let closure = jget(l, "closure")
+        if id == "" || target == "" || expr == "" {
+            skipped = skipped + 1
+            continue
+        }
+        let body = render_stub(id, target, expr, hyp, closure)
+        let out = STUBS_DIR + "/verify_" + id + ".hexa"
+        try { write_file(out, body); written = written + 1 } catch e {
+            println("ERR: write failed " + out)
+            skipped = skipped + 1
+        }
+    }
+    println("emit: written=" + to_string(written) + " skipped=" + to_string(skipped))
+    return 0
+}
+
+fn cmd_status() -> i64 {
+    let mlines = _str(exec("wc -l < '" + MANIFEST + "' 2>/dev/null")).trim()
+    let hexa_n = _str(exec("ls " + STUBS_DIR + "/verify_*.hexa 2>/dev/null | wc -l")).trim()
+    let py_n = _str(exec("ls " + STUBS_DIR + "/verify_*.py 2>/dev/null | wc -l")).trim()
+    println("manifest:       " + mlines + " lines (" + MANIFEST + ")")
+    println("verify_*.hexa:  " + hexa_n)
+    println("verify_*.py:    " + py_n + "  (R1 violation if > 0)")
+    return 0
+}
+
+// ─── main ───
+
+fn main() {
+    // args(): [0]=binary [1]=script [2..]=user args
+    let argv = args()
+    if argv.len() < 3 {
+        println("usage: hexa shared/calc/auto_stubs_gen.hexa <--emit|--import-py|--status>")
+        return
+    }
+    let mode = _str(argv[2])
+    if mode == "--emit" {
+        cmd_emit()
+    } else if mode == "--import-py" {
+        cmd_import_py()
+    } else if mode == "--status" {
+        cmd_status()
+    } else {
+        println("ERR: unknown mode: " + mode)
+        println("usage: hexa shared/calc/auto_stubs_gen.hexa <--emit|--import-py|--status>")
+    }
+}
+
+main()

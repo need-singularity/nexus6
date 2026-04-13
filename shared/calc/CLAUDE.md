@@ -13,7 +13,8 @@ verifiers:
 tools:
   hypothesis_verifier.py r_spectrum.py statistical_tester.py experimental_protocol.py validate_calculators.py
 sub:
-  auto_stubs/  verify_*.py (140) — 자동 생성 스텁
+  auto_stubs/        verify_*.hexa (140, gitignored) — 자동 생성 스텁
+  auto_stubs_gen.hexa  스텁 발사기 — --import-py(1회) / --emit / --status. SSOT: auto_stubs/manifest.jsonl
   data/MNIST   검증 데이터셋
 
 parent: ../CLAUDE.md → "calc"
