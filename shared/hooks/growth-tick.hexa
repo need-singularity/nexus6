@@ -1,50 +1,82 @@
 // growth-tick.hexa — 활동 1건 = 성장 +1 (growth-tick.sh 대체)
 // 쿨다운 5초 (같은 훅 연타 방지). 모든 출력 억제.
+// 2026-04-13: atomic mkdir lockdir 추가 — 동시 중복 실행 → Load Avg 폭주 차단.
+// stage0 early-return bug workaround: nested positive if-blocks instead of
+// `if X { return }` to avoid HexaVal pointer leak + non-terminating return.
 
 let HOME = env("HOME")
 let HEXA = HOME + "/Dev/nexus/shared/scripts/bin/hexa"
+let LOCKDIR = "/tmp/nexus-hook-growth-tick.lockdir"
+let STALE_SEC = 120
 
-let a = args()
-let mode = if a.len() >= 3 { a[2] } else { "unknown" }
-
-// 디버그 로그
-let ts = to_string(exec("date +%Y-%m-%dT%H:%M:%S")).trim()
-try { append_file("/tmp/nexus_growth_debug.log", ts + " growth-tick called: " + mode + "\n") } catch e {}
-
-// 쿨다운 체크
-let tick_file = "/tmp/nexus_growth_tick"
-let now = to_string(exec("date +%s")).trim()
-let last = to_string(exec("cat " + tick_file + " 2>/dev/null || echo 0")).trim()
-let diff = to_int(to_float(now)) - to_int(to_float(last))
-if diff < 5 { return }
-
-try { write_file(tick_file, now) } catch e {}
-
-// bridge notify — 순수 hexa (/usr/bin/python3 제거)
-let growth_bus = HOME + "/Dev/nexus/shared/discovery/growth_bus.jsonl"
-if file_exists(growth_bus) {
-    let project = to_string(exec("basename $(git rev-parse --show-toplevel 2>/dev/null || pwd) || echo ''")).trim()
-    let tick_ts = to_string(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()
-    try { append_file(growth_bus, "{\"ts\":\"" + tick_ts + "\",\"domain\":\"" + project + "\",\"type\":\"tick\",\"mode\":\"" + mode + "\"}\n") } catch e {}
+// atomic mkdir 잠금 — skip/takeover 결정을 shell 측에 집중, hexa if 최소화.
+// 반환 "ok" = 단독 소유, 그 외 "no" = 중복, 즉시 종료.
+fn acquire_lock() -> string {
+    let mut got = "no"
+    let r1 = to_string(exec("mkdir '" + LOCKDIR + "' 2>/dev/null && echo ok || echo no")).trim()
+    if r1 == "ok" {
+        exec("echo $PPID > '" + LOCKDIR + "/pid'")
+        got = "ok"
+    }
+    if r1 == "no" {
+        let cmd = "PID=$(cat '" + LOCKDIR + "/pid' 2>/dev/null); AGE=$(( $(date +%s) - $(stat -f %m '" + LOCKDIR + "' 2>/dev/null || echo 0) )); STALE=" + to_string(STALE_SEC) + "; if [ -z \"$PID\" ] && [ $AGE -lt 5 ]; then echo skip; elif [ -n \"$PID\" ] && kill -0 $PID 2>/dev/null && [ $AGE -lt $STALE ]; then echo skip; else rm -rf '" + LOCKDIR + "' && mkdir '" + LOCKDIR + "' 2>/dev/null && echo $PPID > '" + LOCKDIR + "/pid' && echo ok || echo skip; fi"
+        let r2 = to_string(exec(cmd)).trim()
+        if r2 == "ok" { got = "ok" }
+    }
+    return got
 }
 
-// growth_state.json 직접 업데이트 — hexa 엔진
-let growth_json = HOME + "/Dev/anima/anima/config/growth_state.json"
-if file_exists(growth_json) == false { return }
+fn do_tick(mode: string) {
+    // 디버그 로그
+    let ts = to_string(exec("date +%Y-%m-%dT%H:%M:%S")).trim()
+    try { append_file("/tmp/nexus_growth_debug.log", ts + " growth-tick called: " + mode + "\n") } catch e {}
 
-let hexa_growth_tick = HOME + "/Dev/nexus/shared/hooks/growth_tick.hexa"
-if file_exists(hexa_growth_tick) {
-    try { exec(HEXA + " " + hexa_growth_tick + " " + mode + " " + growth_json + " 2>/dev/null") } catch e {}
+    // 쿨다운 체크
+    let tick_file = "/tmp/nexus_growth_tick"
+    let now = to_string(exec("date +%s")).trim()
+    let last = to_string(exec("cat " + tick_file + " || echo 0")).trim()
+    let diff = to_int(to_float(now)) - to_int(to_float(last))
+    if diff >= 5 {
+        try { write_file(tick_file, now) } catch e {}
+
+        // bridge notify — 순수 hexa (/usr/bin/python3 제거)
+        let growth_bus = HOME + "/Dev/nexus/shared/discovery/growth_bus.jsonl"
+        if file_exists(growth_bus) {
+            let project = to_string(exec("basename $(git rev-parse --show-toplevel || pwd) || echo ''")).trim()
+            let tick_ts = to_string(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()
+            try { append_file(growth_bus, "{\"ts\":\"" + tick_ts + "\",\"domain\":\"" + project + "\",\"type\":\"tick\",\"mode\":\"" + mode + "\"}\n") } catch e {}
+        }
+
+        // growth_state.json 직접 업데이트 — hexa 엔진
+        let growth_json = HOME + "/Dev/anima/anima/config/growth_state.json"
+        if file_exists(growth_json) {
+            let hexa_growth_tick = HOME + "/Dev/nexus/shared/hooks/growth_tick.hexa"
+            if file_exists(hexa_growth_tick) {
+                try { exec(HEXA + " run " + hexa_growth_tick + " " + mode + " " + growth_json + "") } catch e {}
+            }
+
+            // discovery_log → atlas.n6 자동 흡수 (BT-candidate → BT-{번호})
+            let absorb_hexa = HOME + "/Dev/nexus/shared/hooks/discovery-absorb.hexa"
+            if file_exists(absorb_hexa) {
+                try { exec(HEXA + " run " + absorb_hexa + "") } catch e {}
+            }
+
+            // dashboard 자동 동기화 — atlas.n6 → docs/atlas.n6
+            let sync_dash = HOME + "/Dev/nexus/shared/hooks/sync-dashboard-data.hexa"
+            if file_exists(sync_dash) {
+                try { exec(HEXA + " run " + sync_dash + "") } catch e {}
+            }
+        }
+    }
 }
 
-// discovery_log → atlas.n6 자동 흡수 (BT-candidate → BT-{번호})
-let absorb_hexa = HOME + "/Dev/nexus/shared/hooks/discovery-absorb.hexa"
-if file_exists(absorb_hexa) {
-    try { exec(HEXA + " " + absorb_hexa + " 2>/dev/null") } catch e {}
+fn main() {
+    let got = acquire_lock()
+    if got == "ok" {
+        let a = args()
+        let mode = if a.len() >= 3 { a[2] } else { "unknown" }
+        do_tick(mode)
+    }
 }
 
-// dashboard 자동 동기화 — atlas.n6 → docs/atlas.n6
-let sync_dash = HOME + "/Dev/nexus/shared/hooks/sync-dashboard-data.hexa"
-if file_exists(sync_dash) {
-    try { exec(HEXA + " " + sync_dash + " 2>/dev/null") } catch e {}
-}
+main()

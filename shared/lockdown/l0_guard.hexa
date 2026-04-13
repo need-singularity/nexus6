@@ -21,7 +21,7 @@ let CODEOWNERS = ".github/CODEOWNERS"
 // ─── Auto-detect project + REPO from cwd ───
 
 fn detect_root() {
-    return exec("git rev-parse --show-toplevel 2>/dev/null").trim()
+    return exec("git rev-parse --show-toplevel").trim()
 }
 
 fn detect_project() {
@@ -31,7 +31,7 @@ fn detect_project() {
 }
 
 fn detect_repo() {
-    let url = exec("git remote get-url origin 2>/dev/null").trim()
+    let url = exec("git remote get-url origin").trim()
     if url == "" { return "" }
     return exec("echo '" + url + "' | sed -E 's|.*github\\.com[:/]||; s|\\.git$||'").trim()
 }
@@ -39,14 +39,14 @@ fn detect_repo() {
 // ─── L0 paths from lockdown.json ───
 
 fn get_l0_paths(project) {
-    let raw = exec("python3 -c \"import json; [print(e['path']) for e in json.load(open('" + LOCKDOWN + "'))['projects'].get('" + project + "',{}).get('L0',[])]\" 2>/dev/null")
+    let raw = exec("python3 -c \"import json; [print(e['path']) for e in json.load(open('" + LOCKDOWN + "'))['projects'].get('" + project + "',{}).get('L0',[])]\"")
     return raw.trim()
 }
 
 // ─── GitHub protection via gh CLI ───
 
 fn gh_check(repo, field) {
-    let r = exec("gh api repos/" + repo + "/branches/" + BRANCH + "/protection 2>/dev/null | python3 -c \"import sys,json; d=json.load(sys.stdin); " + field + "\" 2>/dev/null").trim()
+    let r = exec("gh api repos/" + repo + "/branches/" + BRANCH + "/protection | python3 -c \"import sys,json; d=json.load(sys.stdin); " + field + "\"").trim()
     if r == "True" { return true }
     if r == "true" { return true }
     return false
@@ -57,11 +57,11 @@ fn gh_enforce_admins_status(repo) {
 }
 
 fn gh_enforce_admins_on(repo) {
-    exec("gh api repos/" + repo + "/branches/" + BRANCH + "/protection/enforce_admins -X POST 2>/dev/null")
+    exec("gh api repos/" + repo + "/branches/" + BRANCH + "/protection/enforce_admins -X POST")
 }
 
 fn gh_enforce_admins_off(repo) {
-    exec("gh api repos/" + repo + "/branches/" + BRANCH + "/protection/enforce_admins -X DELETE 2>/dev/null")
+    exec("gh api repos/" + repo + "/branches/" + BRANCH + "/protection/enforce_admins -X DELETE")
 }
 
 fn check_require_pr(repo) {
@@ -349,7 +349,7 @@ fn cmd_merge(repo, pr_number) {
     gh_enforce_admins_on(repo)
 
     // 4. 결과 확인
-    let state = exec("gh pr view " + pr_number + " --json state -q '.state' 2>/dev/null").trim()
+    let state = exec("gh pr view " + pr_number + " --json state -q '.state'").trim()
     println("  [4/4] PR 상태: " + state)
     if state == "MERGED" {
         println("")
@@ -377,34 +377,40 @@ fn print_usage() {
 
 // ─── Entry ───
 
-fn main() {
-    let a = args()
-    if len(a) < 3 {
-        print_usage()
-        return
-    }
+// 2026-04-13: atomic mkdir lockdir — 동시 실행 방지 (Load Avg 폭주 차단).
+// stage0 early-return bug workaround: main() 내부 positive-gate 로 분기,
+// `if X { return }` 금지 (HexaVal pointer leak + non-terminating return 유발).
+let L0G_LOCKDIR = "/tmp/nexus-hook-l0-guard.lockdir"
+let L0G_STALE_SEC = 900
 
-    let project = detect_project()
-    let repo = detect_repo()
-
-    if project == "" {
-        println("FAIL: git 리포 안에서 실행하세요 (cwd 가 git 안이어야 함)")
-        return
+// atomic mkdir 잠금 — shell 측 결정, hexa if 최소화.
+// 반환 "ok" = 단독 소유, 그 외 = 중복, 즉시 종료.
+fn l0g_acquire() -> string {
+    let mut got = "no"
+    let r1 = exec("mkdir '" + L0G_LOCKDIR + "' 2>/dev/null && echo ok || echo no").trim()
+    if r1 == "ok" {
+        exec("echo $PPID > '" + L0G_LOCKDIR + "/pid'")
+        got = "ok"
     }
-    if repo == "" {
-        println("FAIL: git remote 'origin' 없음 — github.com 리포여야 함")
-        return
+    if r1 == "no" {
+        let cmd = "PID=$(cat '" + L0G_LOCKDIR + "/pid' 2>/dev/null); AGE=$(( $(date +%s) - $(stat -f %m '" + L0G_LOCKDIR + "' 2>/dev/null || echo 0) )); STALE=" + to_string(L0G_STALE_SEC) + "; if [ -z \"$PID\" ] && [ $AGE -lt 5 ]; then echo skip; elif [ -n \"$PID\" ] && kill -0 $PID 2>/dev/null && [ $AGE -lt $STALE ]; then echo skip; else rm -rf '" + L0G_LOCKDIR + "' && mkdir '" + L0G_LOCKDIR + "' 2>/dev/null && echo $PPID > '" + L0G_LOCKDIR + "/pid' && echo ok || echo skip; fi"
+        let r2 = exec(cmd).trim()
+        if r2 == "ok" { got = "ok" }
     }
+    return got
+}
 
+fn run_cmd(a, project, repo) {
     let cmd = a[2]
     if cmd == "verify" { cmd_verify(project, repo) }
     else if cmd == "sync" { cmd_sync(project, repo) }
     else if cmd == "merge" {
         if len(a) < 4 {
             println("Usage: hexa ~/Dev/nexus/shared/lockdown/l0_guard.hexa merge <PR#>")
-            return
         }
-        cmd_merge(repo, a[3])
+        if len(a) >= 4 {
+            cmd_merge(repo, a[3])
+        }
     }
     else if cmd == "status" { cmd_status(project, repo) }
     else if cmd == "L0" { cmd_lock(project) }
@@ -413,6 +419,34 @@ fn main() {
     else {
         println("Unknown command: " + cmd)
         print_usage()
+    }
+}
+
+fn main() {
+    let got = l0g_acquire()
+    if got == "ok" {
+        let a = args()
+        let has_cmd_str = if len(a) >= 3 { "y" } else { "n" }
+        if has_cmd_str == "n" {
+            print_usage()
+        }
+        if has_cmd_str == "y" {
+            let project = detect_project()
+            let repo = detect_repo()
+            let proj_ok_str = if project != "" { "y" } else { "n" }
+            let repo_ok_str = if repo != "" { "y" } else { "n" }
+            if proj_ok_str == "n" {
+                println("FAIL: git 리포 안에서 실행하세요 (cwd 가 git 안이어야 함)")
+            }
+            if proj_ok_str == "y" {
+                if repo_ok_str == "n" {
+                    println("FAIL: git remote 'origin' 없음 — github.com 리포여야 함")
+                }
+                if repo_ok_str == "y" {
+                    run_cmd(a, project, repo)
+                }
+            }
+        }
     }
 }
 

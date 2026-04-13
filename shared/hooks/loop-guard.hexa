@@ -30,7 +30,7 @@ fn log_ok(msg: string)    { println("[OK]    " + msg) }
 fn log_fix(msg: string)   { println("[FIX]   " + msg); fix_count = fix_count + 1 }
 fn log_info(msg: string)  { println("[INFO]  " + msg) }
 
-fn sh(cmd: string) -> string { return to_string(exec(cmd + " 2>/dev/null")).trim() }
+fn sh(cmd: string) -> string { return to_string(exec(cmd + "")).trim() }
 fn sh_int(cmd: string) -> int {
     let r = sh(cmd)
     if len(r) == 0 { return 0 }
@@ -180,19 +180,46 @@ fn run_project(root: string) {
 }
 
 // ---- 메인 ----
+// stage0 early-return bug workaround: positive-gate branch instead of
+// `if X { println; return }` pattern to avoid HexaVal pointer leak +
+// non-terminating return on subsequent println() calls.
+//
+// 2026-04-13: atomic mkdir lockdir 추가 — 동시 실행 방지 (Load Avg 폭주 차단).
 
-fn main() {
+let LG_LOCKDIR = "/tmp/nexus-hook-loop-guard.lockdir"
+let LG_STALE_SEC = 600
+
+// atomic mkdir 잠금 — shell 측 결정, hexa if 최소화.
+// 반환 "ok" = 단독 소유, 그 외 = 중복, 즉시 종료.
+fn lg_acquire() -> string {
+    let mut got = "no"
+    let r1 = to_string(exec("mkdir '" + LG_LOCKDIR + "' 2>/dev/null && echo ok || echo no")).trim()
+    if r1 == "ok" {
+        exec("echo $PPID > '" + LG_LOCKDIR + "/pid'")
+        got = "ok"
+    }
+    if r1 == "no" {
+        let cmd = "PID=$(cat '" + LG_LOCKDIR + "/pid' 2>/dev/null); AGE=$(( $(date +%s) - $(stat -f %m '" + LG_LOCKDIR + "' 2>/dev/null || echo 0) )); STALE=" + to_string(LG_STALE_SEC) + "; if [ -z \"$PID\" ] && [ $AGE -lt 5 ]; then echo skip; elif [ -n \"$PID\" ] && kill -0 $PID 2>/dev/null && [ $AGE -lt $STALE ]; then echo skip; else rm -rf '" + LG_LOCKDIR + "' && mkdir '" + LG_LOCKDIR + "' 2>/dev/null && echo $PPID > '" + LG_LOCKDIR + "/pid' && echo ok || echo skip; fi"
+        let r2 = to_string(exec(cmd)).trim()
+        if r2 == "ok" { got = "ok" }
+    }
+    return got
+}
+
+fn run_guard() {
     if DO_ALL {
         // 전 프로젝트 순회
         let projects_str = sh("python3 -c \"\nimport json\ntry:\n    with open('" + HOME + "/Dev/nexus/shared/hooks/hooks-config.json') as f:\n        d = json.load(f)\n    for p in d.get('whitelisted_projects',[]):\n        import os\n        path = os.path.join('" + HOME + "/Dev', p)\n        if os.path.isdir(path): print(path)\nexcept: pass\n\"")
-        if len(projects_str) == 0 {
+        let have_projects = len(projects_str) > 0
+        if have_projects == false {
             println("프로젝트 목록 없음")
-            return
         }
-        let projects = projects_str.split("\n")
-        for proj_path in projects {
-            if len(proj_path) == 0 { continue }
-            run_project(proj_path)
+        if have_projects {
+            let projects = projects_str.split("\n")
+            for proj_path in projects {
+                if len(proj_path) == 0 { continue }
+                run_project(proj_path)
+            }
         }
     } else {
         let root = sh("git rev-parse --show-toplevel || pwd")
@@ -215,6 +242,13 @@ fn main() {
         }
     } else {
         println("결과: " + to_string(miss_count) + "건 미수정 (--fix)")
+    }
+}
+
+fn main() {
+    let got = lg_acquire()
+    if got == "ok" {
+        run_guard()
     }
 }
 
