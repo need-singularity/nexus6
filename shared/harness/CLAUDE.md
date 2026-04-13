@@ -11,6 +11,12 @@ ssot:
   convergence.json     구현 상태 추적
 
 engine (.hexa):
+  entry.hexa           dispatcher — prompt|pretool|post|guard|self_check 서브커맨드, sub-modules 호출
+  cmd_gate.hexa        smash/free seed 검증 (추상 단독 토큰 REJECT, 컨텍스트 결합 강제)
+  prompt_scan.hexa     UserPromptSubmit 대응 — 사용자 발화 패턴 스캔
+  pre_tool_guard.hexa  PreToolUse 대응 — Write/Edit/Bash/Agent 공통 guard
+  post_bash.hexa       PostToolUse(Bash) — exit 코드 + stderr 수집
+  post_edit.hexa       PostToolUse(Write|Edit) — 산출 파일 검증
   lint.hexa            L1 — R1/R14/L0/pitfalls 체커. --staged/--all/--file
   gc.hexa              L1 — drift/dead/violation 3종 스캔
   autofix.hexa         L2 — mistakes.jsonl 반복 패턴 감지 → 제안만
@@ -20,6 +26,15 @@ engine (.hexa):
   global_claude_guard.hexa  ~/.claude/ 외부 설정 오염 감지 (hooks/CLAUDE.md 금지, settings.json 만 허용)
   handoff_write.hexa        세션 handoff MD writer — git delta + JSONL tail + next-actions → memory/handoff-latest.md
   cli_budget_gate.hexa      JSONL usage 합산 → 임계치 시 handoff_write 호출 + systemMessage (config: shared/config/cli_budget.json)
+  session_prompt_gen.hexa   새 세션 이어받기 프롬프트 자동 생성
+
+convention (2026-04-14~ 훅 시스템 대체):
+  사용자 입력 후       entry.hexa prompt
+  Write|Edit 후        entry.hexa post write_edit
+  Bash 후              entry.hexa post bash
+  Agent 호출 전        entry.hexa guard
+  smash|free 실행      shared/bin/exec_validated {mode} "{seed}" {engine} {args} (cmd_gate 적용)
+  전 프로젝트 settings.json hooks={} — 자동 훅 없음. 위 호출은 Claude 자율 실행.
 
 logs (append-only):
   lint_log.jsonl       모든 lint 실행 기록
