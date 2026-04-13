@@ -1,0 +1,141 @@
+// ═══════════════════════════════════════════════════════════
+// autofix.hexa — 하네스 L2 자동 교정 루프 (제안 기반)
+// 원칙: mistakes.jsonl 반복 패턴 감지 → 제안만 기록. 코드 자동 수정 X
+//       반복 = (file × rule) count >= threshold (기본 3)
+// Usage:
+//   hexa shared/harness/autofix.hexa --analyze        (최근 N개 mistake 분석)
+//   hexa shared/harness/autofix.hexa --threshold 5    (반복 기준 조정)
+//   hexa shared/harness/autofix.hexa --window 200     (분석 대상 최근 N줄)
+//   hexa shared/harness/autofix.hexa --report         (최근 제안 요약)
+// 출력: shared/harness/autofix_proposals.jsonl
+// ═══════════════════════════════════════════════════════════
+
+let REPO_ROOT = exec("git rev-parse --show-toplevel 2>/dev/null").trim()
+let SHARED_DIR = REPO_ROOT + "/shared"
+let MISTAKES = SHARED_DIR + "/harness/mistakes.jsonl"
+let PROPOSALS = SHARED_DIR + "/harness/autofix_proposals.jsonl"
+
+fn now_iso() -> string {
+    return exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+fn json_escape(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", "\\n")
+    return r
+}
+
+// ─── JSONL key extractor (간이) ───
+fn extract_field(line: string, key: string) -> string {
+    let marker = "\"" + key + "\":\""
+    let idx = line.index_of(marker)
+    if idx < 0 { return "" }
+    let after = line.substring(idx + len(marker), len(line))
+    let end = after.index_of("\"")
+    if end < 0 { return "" }
+    return after.substring(0, end)
+}
+
+// ─── Known fix templates (rule → suggestion) ───
+fn fix_template(rule: string) -> string {
+    if rule == "R1" { return "rename to .hexa; wrap original in exec() if bootstrap-required; or move to shared/scripts/ (exception)" }
+    if rule == "R14" { return "convert .md body to JSON/JSONL; or merge into CLAUDE.md if it's a map/index" }
+    if rule == "L0" { return "add 'chore(lockdown):' or 'L0-approved' marker to commit message" }
+    if rule == "P-PY-HEAVY" { return "extract python3 -c calls to a reusable hexa helper; or consider whole-file rewrite in hexa" }
+    if rule.starts_with("P-") { return "check shared/hexa_pitfalls_log.jsonl for canonical fix" }
+    return "review rule definition; consider exception or tuning"
+}
+
+// ─── Main ───
+let a = args()
+let mut mode = "analyze"
+let mut threshold: i64 = 3
+let mut window: i64 = 500
+let mut ai: i64 = 2
+while ai < len(a) {
+    let t = a[ai]
+    if t == "--analyze" { mode = "analyze" }
+    else if t == "--report" { mode = "report" }
+    else if t == "--threshold" {
+        if ai + 1 < len(a) { try { threshold = to_int(a[ai + 1]) } catch e {}; ai = ai + 1 }
+    }
+    else if t == "--window" {
+        if ai + 1 < len(a) { try { window = to_int(a[ai + 1]) } catch e {}; ai = ai + 1 }
+    }
+    ai = ai + 1
+}
+
+if mode == "report" {
+    let last = exec("tail -5 '" + PROPOSALS + "' 2>/dev/null").trim()
+    if last == "" { println("(autofix_proposals.jsonl empty)") } else { println(last) }
+    exit(0)
+}
+
+if !file_exists(MISTAKES) {
+    println("mistakes.jsonl 없음 — 아직 실패 누적 없음")
+    exit(0)
+}
+
+// 최근 window 줄 읽기
+let recent_raw = exec("tail -" + to_string(window) + " '" + MISTAKES + "' 2>/dev/null").trim()
+if recent_raw == "" {
+    println("mistakes.jsonl 비어있음")
+    exit(0)
+}
+
+// (file|rule) → count 집계 — 문자열 배열로 단순 카운팅
+let lines = recent_raw.split("\n")
+let mut keys: [string] = []
+let mut counts: [i64] = []
+let mut last_seen: [string] = []
+
+for ln in lines {
+    let l = ln.trim()
+    if l == "" { continue }
+    let file = extract_field(l, "file")
+    let rule = extract_field(l, "rule")
+    let ts = extract_field(l, "ts")
+    if file == "" || rule == "" { continue }
+    let key = file + "|" + rule
+
+    let mut found = false
+    let mut i: i64 = 0
+    while i < len(keys) {
+        if keys[i] == key {
+            counts[i] = counts[i] + 1
+            last_seen[i] = ts
+            found = true
+            break
+        }
+        i = i + 1
+    }
+    if !found {
+        keys.push(key)
+        counts.push(1)
+        last_seen.push(ts)
+    }
+}
+
+// 임계값 초과 패턴 → 제안 append
+let mut emitted: i64 = 0
+let now = now_iso()
+let mut i: i64 = 0
+while i < len(keys) {
+    if counts[i] >= threshold {
+        let parts = keys[i].split("|")
+        let file = parts[0]
+        let rule = parts[1]
+        let fix = fix_template(rule)
+        let line = "{\"ts\":\"" + now + "\",\"file\":\"" + json_escape(file) + "\",\"rule\":\"" + rule + "\",\"count\":" + to_string(counts[i]) + ",\"last_seen\":\"" + json_escape(last_seen[i]) + "\",\"fix_template\":\"" + json_escape(fix) + "\",\"status\":\"proposed\"}"
+        try { exec("echo '" + line.replace("'", "'\\''") + "' >> '" + PROPOSALS + "'") } catch e {}
+        println("proposal: " + file + " × " + rule + " (count=" + to_string(counts[i]) + ")")
+        emitted = emitted + 1
+    }
+    i = i + 1
+}
+
+println("analyzed: " + to_string(len(keys)) + " unique (file×rule), threshold=" + to_string(threshold))
+println("proposed: " + to_string(emitted))
+exit(0)

@@ -1,0 +1,198 @@
+// ═══════════════════════════════════════════════════════════
+// gc.hexa — 하네스 P3 가비지 컬렉션
+// 3 스캔: drift (문서↔실제) / dead (미참조) / violation (규칙 위반)
+// Usage:
+//   hexa shared/harness/gc.hexa --scan          (3 전부)
+//   hexa shared/harness/gc.hexa --drift         (drift 만)
+//   hexa shared/harness/gc.hexa --violation     (violation 만)
+//   hexa shared/harness/gc.hexa --dead          (dead 만, 느림)
+//   hexa shared/harness/gc.hexa --report        (최근 로그 요약)
+// 출력: shared/harness/gc_log.jsonl (append), stdout 요약
+// ═══════════════════════════════════════════════════════════
+
+let REPO_ROOT = exec("git rev-parse --show-toplevel 2>/dev/null").trim()
+let SHARED_DIR = REPO_ROOT + "/shared"
+let GC_LOG = SHARED_DIR + "/harness/gc_log.jsonl"
+let MISTAKES_LOG = SHARED_DIR + "/harness/mistakes.jsonl"
+
+fn now_iso() -> string {
+    return exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+fn json_escape(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", "\\n")
+    return r
+}
+
+// ─── Scan 1: DRIFT — CLAUDE.md 에 언급된 경로가 실제 존재하는가 ───
+
+fn scan_drift() -> [string] {
+    let mut findings: [string] = []
+    // 대상 CLAUDE.md 목록
+    let cmd = "find " + REPO_ROOT + " -maxdepth 4 -name 'CLAUDE.md' -not -path '*/node_modules/*' -not -path '*/.git/*' 2>/dev/null"
+    let claude_files_raw = exec(cmd).trim()
+    if claude_files_raw == "" { return findings }
+
+    for cf in claude_files_raw.split("\n") {
+        let cfp = cf.trim()
+        if cfp == "" { continue }
+        // 경로 후보 추출: "shared/xxx/yyy.ext" 패턴
+        // python3 한 줄로 추출 (regex)
+        let ext_cmd = "python3 -c \"import re,sys; t=open('" + cfp + "').read(); [print(m) for m in sorted(set(re.findall(r'(shared/[A-Za-z0-9._/\\-]+\\.(?:hexa|json|jsonl|md|txt|html))', t)))]\" 2>/dev/null"
+        let refs_raw = exec(ext_cmd).trim()
+        if refs_raw == "" { continue }
+        for r in refs_raw.split("\n") {
+            let rel = r.trim()
+            if rel == "" { continue }
+            // glob 패턴 (*) 제외 — 존재 검증 불가능
+            if rel.index_of("*") >= 0 { continue }
+            let abs = REPO_ROOT + "/" + rel
+            if !file_exists(abs) {
+                findings.push("drift|warn|" + cfp.replace(REPO_ROOT + "/", "") + "|" + rel + "|missing")
+            }
+        }
+    }
+    return findings
+}
+
+// ─── Scan 2: VIOLATION — 규칙 위반 grep ───
+
+fn scan_violations() -> [string] {
+    let mut findings: [string] = []
+    // R1: shared/ 아래 .py/.sh (exceptions: shared/scripts/, shared/bin/)
+    let cmd1 = "find " + SHARED_DIR + " -type f \\( -name '*.py' -o -name '*.sh' \\) -not -path '*/scripts/*' -not -path '*/bin/*' -not -path '*/.git/*' 2>/dev/null"
+    let r1_raw = exec(cmd1).trim()
+    if r1_raw != "" {
+        for f in r1_raw.split("\n") {
+            let fp = f.trim()
+            if fp == "" { continue }
+            let rel = fp.replace(REPO_ROOT + "/", "")
+            findings.push("violation|error|" + rel + "|R1|HEXA-FIRST 위반: .hexa 로 변환")
+        }
+    }
+    // R14: shared/rules/ 아래 .md 파일 (CLAUDE.md 제외)
+    let cmd2 = "find " + SHARED_DIR + "/rules -type f -name '*.md' 2>/dev/null"
+    let r2_raw = exec(cmd2).trim()
+    if r2_raw != "" {
+        for f in r2_raw.split("\n") {
+            let fp = f.trim()
+            if fp == "" { continue }
+            let bn = fp.substring(fp.last_index_of("/") + 1, len(fp))
+            if bn == "CLAUDE.md" { continue }
+            let rel = fp.replace(REPO_ROOT + "/", "")
+            findings.push("violation|warn|" + rel + "|R14|rules SSOT 는 JSON 만")
+        }
+    }
+    return findings
+}
+
+// ─── Scan 3: DEAD — shared/ 파일 중 어디서도 참조되지 않는 것 ───
+
+fn scan_dead() -> [string] {
+    let mut findings: [string] = []
+    // 대상: shared/ 아래 .hexa / .json 중 90일 이상 미변경
+    let cmd = "find " + SHARED_DIR + " -type f \\( -name '*.hexa' -o -name '*.json' \\) -mtime +90 -not -path '*/.git/*' -not -path '*/backups/*' -not -path '*/archive/*' 2>/dev/null"
+    let files_raw = exec(cmd).trim()
+    if files_raw == "" { return findings }
+
+    for f in files_raw.split("\n") {
+        let fp = f.trim()
+        if fp == "" { continue }
+        let bn = fp.substring(fp.last_index_of("/") + 1, len(fp))
+        // 자기자신 제외 grep — shared/ 전체에서 basename 참조 개수
+        let cnt_cmd = "grep -r --include='*.hexa' --include='*.json' --include='*.jsonl' --include='*.md' -l '" + bn + "' " + SHARED_DIR + " 2>/dev/null | grep -v '" + fp + "' | head -1"
+        let has_ref = exec(cnt_cmd).trim()
+        if has_ref == "" {
+            let rel = fp.replace(REPO_ROOT + "/", "")
+            findings.push("dead|info|" + rel + "|unreferenced|90일+ 미변경, 타 파일 참조 0")
+        }
+    }
+    return findings
+}
+
+// ─── Append findings to gc_log.jsonl + mistakes.jsonl ───
+
+fn log_findings(scan_type: string, findings: [string]) {
+    let ts = now_iso()
+    let mut items_json = "["
+    let mut i: i64 = 0
+    for f in findings {
+        let parts = f.split("|")
+        if len(parts) < 5 { continue }
+        if i > 0 { items_json = items_json + "," }
+        items_json = items_json + "{\"kind\":\"" + parts[0] + "\",\"severity\":\"" + parts[1] + "\",\"file\":\"" + json_escape(parts[2]) + "\",\"rule\":\"" + json_escape(parts[3]) + "\",\"hint\":\"" + json_escape(parts[4]) + "\"}"
+        i = i + 1
+    }
+    items_json = items_json + "]"
+    let line = "{\"ts\":\"" + ts + "\",\"scan\":\"" + scan_type + "\",\"count\":" + to_string(len(findings)) + ",\"findings\":" + items_json + "}"
+    try { exec("echo '" + line.replace("'", "'\\''") + "' >> '" + GC_LOG + "'") } catch e {}
+
+    // mistakes.jsonl 에도 가끔 append (warn/error 만)
+    for f in findings {
+        let parts = f.split("|")
+        if len(parts) < 5 { continue }
+        let sev = parts[1]
+        if sev == "info" { continue }
+        let m = "{\"ts\":\"" + ts + "\",\"kind\":\"gc_" + parts[0] + "\",\"file\":\"" + json_escape(parts[2]) + "\",\"rule\":\"" + json_escape(parts[3]) + "\",\"fix\":\"" + json_escape(parts[4]) + "\"}"
+        try { exec("echo '" + m.replace("'", "'\\''") + "' >> '" + MISTAKES_LOG + "'") } catch e {}
+    }
+}
+
+// ─── Main ───
+
+let a = args()
+let mut do_drift = false
+let mut do_violation = false
+let mut do_dead = false
+let mut do_report = false
+let mut ai: i64 = 2
+while ai < len(a) {
+    let t = a[ai]
+    if t == "--scan" { do_drift = true; do_violation = true; do_dead = true }
+    else if t == "--drift" { do_drift = true }
+    else if t == "--violation" { do_violation = true }
+    else if t == "--dead" { do_dead = true }
+    else if t == "--report" { do_report = true }
+    ai = ai + 1
+}
+
+if !do_drift && !do_violation && !do_dead && !do_report {
+    println("usage: hexa shared/harness/gc.hexa --scan | --drift | --violation | --dead | --report")
+    exit(1)
+}
+
+if do_report {
+    let last = exec("tail -5 '" + GC_LOG + "' 2>/dev/null").trim()
+    if last == "" { println("(gc_log.jsonl empty)") } else { println(last) }
+    exit(0)
+}
+
+let mut total: i64 = 0
+
+if do_drift {
+    let f = scan_drift()
+    log_findings("drift", f)
+    println("drift:     " + to_string(len(f)) + " findings")
+    total = total + len(f)
+}
+
+if do_violation {
+    let f = scan_violations()
+    log_findings("violation", f)
+    println("violation: " + to_string(len(f)) + " findings")
+    total = total + len(f)
+}
+
+if do_dead {
+    let f = scan_dead()
+    log_findings("dead", f)
+    println("dead:      " + to_string(len(f)) + " findings")
+    total = total + len(f)
+}
+
+println("total:     " + to_string(total))
+println("log:       " + GC_LOG.replace(REPO_ROOT + "/", ""))
+exit(0)

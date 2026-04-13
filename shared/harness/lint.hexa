@@ -1,0 +1,258 @@
+// ═══════════════════════════════════════════════════════════
+// lint.hexa — 하네스 P2 자동 강제 린터
+// AI-native, .hexa-only (R1), 성공 조용/실패 시끄럽게
+// Usage:
+//   hexa shared/harness/lint.hexa --staged     (git staged files)
+//   hexa shared/harness/lint.hexa --all        (전체 shared/ 트리)
+//   hexa shared/harness/lint.hexa --file PATH  (단일 파일)
+// 실패 시 stderr JSON 라인 + exit 1, lint_log.jsonl 에 결과 append
+// ═══════════════════════════════════════════════════════════
+
+let HOME = env("HOME")
+let REPO_ROOT = exec("git rev-parse --show-toplevel 2>/dev/null").trim()
+let SHARED_DIR = REPO_ROOT + "/shared"
+let LINT_LOG = SHARED_DIR + "/harness/lint_log.jsonl"
+let MISTAKES_LOG = SHARED_DIR + "/harness/mistakes.jsonl"
+
+fn now_ts() {
+    return exec("date +%s").trim()
+}
+
+fn now_iso() {
+    return exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+fn json_escape(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", "\\n")
+    r = r.replace("\r", "\\r")
+    r = r.replace("\t", "\\t")
+    return r
+}
+
+// ─── File classification ───
+
+fn is_under_shared(path: string) -> bool {
+    return path.starts_with("shared/")
+}
+
+fn ext_of(path: string) -> string {
+    let dot = path.last_index_of(".")
+    if dot < 0 { return "" }
+    return path.substring(dot, len(path))
+}
+
+fn basename_of(path: string) -> string {
+    let slash = path.last_index_of("/")
+    if slash < 0 { return path }
+    return path.substring(slash + 1, len(path))
+}
+
+// ─── Check 1: R1 HEXA-FIRST (no new .py/.sh under shared/) ───
+// exception: shared/scripts/ (기존 bootstrap bin 포함), shared/bin/ (C helper)
+
+fn is_hexa_only_exception(path: string) -> bool {
+    if path.starts_with("shared/scripts/") { return true }
+    if path.starts_with("shared/bin/") { return true }
+    return false
+}
+
+fn check_hexa_only(path: string) -> string {
+    let e = ext_of(path)
+    if e != ".py" && e != ".sh" { return "" }
+    if !is_under_shared(path) { return "" }
+    if is_hexa_only_exception(path) { return "" }
+    return "R1|error|HEXA-FIRST — shared/ 아래 .py/.sh 금지. .hexa 로 변환"
+}
+
+// ─── Check 2: AI-native (R14) — prose .md in rules/config ───
+
+fn check_ai_native(path: string) -> string {
+    let e = ext_of(path)
+    if e != ".md" { return "" }
+    let bn = basename_of(path)
+    // CLAUDE.md 는 프로젝트 지도로 허용
+    if bn == "CLAUDE.md" { return "" }
+    if bn == "SECRET.md" { return "" }
+    if path.starts_with("shared/rules/") {
+        return "R14|warn|rules SSOT 는 JSON 만. prose .md 금지"
+    }
+    if path.starts_with("shared/config/") {
+        return "R14|warn|config SSOT 는 JSON/JSONL 만. prose .md 금지"
+    }
+    return ""
+}
+
+// ─── Check 3: L0 lockdown — L0 보호 영역 수정 감지 (grep 기반, python 우회) ───
+// python3 호출은 hetzner 라우팅 위험 — 로컬 grep 만 사용
+
+fn check_l0_lockdown(path: string) -> string {
+    let LOCKDOWN = REPO_ROOT + "/shared/lockdown/lockdown.json"
+    if !file_exists(LOCKDOWN) { return "" }
+    // lockdown.json 에 해당 path 또는 그 prefix 가 있는지 grep
+    // glob (*) 는 단순화 — 파일 전체 grep
+    let escaped = path.replace("/", "\\/")
+    let hit = to_int(exec("grep -c '\"" + escaped + "\"' '" + LOCKDOWN + "' 2>/dev/null || echo 0").trim())
+    if hit == 0 {
+        // prefix 매칭 (shared/bin/* 같은 glob)
+        let dir = path.substring(0, path.last_index_of("/"))
+        if dir == "" { return "" }
+        let hit2 = to_int(exec("grep -c '\"" + dir.replace("/", "\\/") + "/\\*\"' '" + LOCKDOWN + "' 2>/dev/null || echo 0").trim())
+        if hit2 == 0 { return "" }
+    }
+    let msg_raw = exec("cat '" + REPO_ROOT + "/.git/COMMIT_EDITMSG' 2>/dev/null").trim()
+    if msg_raw.index_of("chore(lockdown):") >= 0 { return "" }
+    if msg_raw.index_of("L0-approved") >= 0 { return "" }
+    return "L0|warn|L0 보호 영역 수정 — 커밋 메시지에 'chore(lockdown):' 또는 'L0-approved' 포함 권장"
+}
+
+// ─── Check 4: pitfalls grep ───
+
+fn check_pitfalls(path: string) -> string {
+    let e = ext_of(path)
+    if e != ".hexa" { return "" }
+    // Python sys 의존 탐지
+    let py_call = to_int(exec("grep -c 'python3 -c' '" + REPO_ROOT + "/" + path + "' 2>/dev/null || echo 0").trim())
+    if py_call > 10 {
+        return "P-PY-HEAVY|info|.hexa 내 python3 -c 호출 >10회. 순수 hexa 함수로 추출 고려"
+    }
+    return ""
+}
+
+// ─── Gather files to lint ───
+
+fn get_staged_files() -> string {
+    return exec("git diff --cached --name-only 2>/dev/null").trim()
+}
+
+fn get_all_shared_files() -> string {
+    return exec("find " + SHARED_DIR + " -type f \\( -name '*.hexa' -o -name '*.py' -o -name '*.sh' -o -name '*.md' -o -name '*.json' -o -name '*.jsonl' \\) 2>/dev/null | sed 's|" + REPO_ROOT + "/||'").trim()
+}
+
+// ─── Main ───
+
+let a = args()
+let mut mode = "staged"
+let mut single = ""
+let mut ai: i64 = 2
+while ai < len(a) {
+    let tok = a[ai]
+    if tok == "--staged" { mode = "staged" }
+    else if tok == "--all" { mode = "all" }
+    else if tok == "--file" {
+        mode = "file"
+        if ai + 1 < len(a) { single = a[ai + 1]; ai = ai + 1 }
+    }
+    ai = ai + 1
+}
+
+let mut files_raw = ""
+if mode == "staged" { files_raw = get_staged_files() }
+else if mode == "all" { files_raw = get_all_shared_files() }
+else if mode == "file" { files_raw = single }
+
+if files_raw == "" {
+    // 검사할 파일 없음 — 조용히 통과
+    let log = "{\"ts\":\"" + now_iso() + "\",\"mode\":\"" + mode + "\",\"files\":[],\"pass\":true,\"violations\":[]}"
+    try { exec("echo '" + log + "' >> '" + LINT_LOG + "'") } catch e {}
+    exit(0)
+}
+
+let files = files_raw.split("\n")
+let mut violations: [string] = []
+let mut checked: i64 = 0
+
+for f in files {
+    let path = f.trim()
+    if path == "" { continue }
+    checked = checked + 1
+
+    // Fast prefilter: skip checks that obviously don't apply by ext/path
+    let e = ext_of(path)
+    let under_shared = is_under_shared(path)
+
+    // check_hexa_only: only .py/.sh under shared/
+    if (e == ".py" || e == ".sh") && under_shared {
+        let v1 = check_hexa_only(path)
+        if v1 != "" { violations.push(path + "|" + v1) }
+    }
+
+    // check_ai_native: only .md under rules/ or config/
+    if e == ".md" && (path.starts_with("shared/rules/") || path.starts_with("shared/config/")) {
+        let v2 = check_ai_native(path)
+        if v2 != "" { violations.push(path + "|" + v2) }
+    }
+
+    // check_l0_lockdown: only shared/ files
+    if under_shared {
+        let v3 = check_l0_lockdown(path)
+        if v3 != "" { violations.push(path + "|" + v3) }
+    }
+
+    // check_pitfalls: only .hexa files
+    if e == ".hexa" {
+        let v4 = check_pitfalls(path)
+        if v4 != "" { violations.push(path + "|" + v4) }
+    }
+}
+
+let pass = len(violations) == 0
+
+// ─── Log append (lint_log.jsonl) ───
+
+let mut files_json = "["
+let mut fi: i64 = 0
+for f in files {
+    let p = f.trim()
+    if p == "" { continue }
+    if fi > 0 { files_json = files_json + "," }
+    files_json = files_json + "\"" + json_escape(p) + "\""
+    fi = fi + 1
+}
+files_json = files_json + "]"
+
+let mut viol_json = "["
+let mut vi: i64 = 0
+let mut has_error = false
+for v in violations {
+    let parts = v.split("|")
+    if len(parts) < 4 { continue }
+    let vfile = parts[0]
+    let vrule = parts[1]
+    let vsev = parts[2]
+    let vhint = parts[3]
+    if vsev == "error" { has_error = true }
+    if vi > 0 { viol_json = viol_json + "," }
+    viol_json = viol_json + "{\"file\":\"" + json_escape(vfile) + "\",\"rule\":\"" + vrule + "\",\"severity\":\"" + vsev + "\",\"fix_hint\":\"" + json_escape(vhint) + "\"}"
+    vi = vi + 1
+}
+viol_json = viol_json + "]"
+
+let log_line = "{\"ts\":\"" + now_iso() + "\",\"mode\":\"" + mode + "\",\"checked\":" + to_string(checked) + ",\"pass\":" + (if pass { "true" } else { "false" }) + ",\"files\":" + files_json + ",\"violations\":" + viol_json + "}"
+try { exec("echo '" + log_line.replace("'", "'\\''") + "' >> '" + LINT_LOG + "'") } catch e {}
+
+// ─── Output: pass = silent, fail = loud ───
+
+if pass { exit(0) }
+
+// 실패는 시끄럽게 — stderr 에 JSON 라인 per violation
+for v in violations {
+    let parts = v.split("|")
+    if len(parts) < 4 { continue }
+    let vfile = parts[0]
+    let vrule = parts[1]
+    let vsev = parts[2]
+    let vhint = parts[3]
+    let line = "{\"file\":\"" + json_escape(vfile) + "\",\"rule\":\"" + vrule + "\",\"severity\":\"" + vsev + "\",\"fix_hint\":\"" + json_escape(vhint) + "\"}"
+    // stderr 로
+    try { exec("echo '" + line.replace("'", "'\\''") + "' >&2") } catch e {}
+    // mistakes.jsonl 누적
+    let m = "{\"ts\":\"" + now_iso() + "\",\"kind\":\"lint_fail\",\"file\":\"" + json_escape(vfile) + "\",\"rule\":\"" + vrule + "\",\"fix\":\"" + json_escape(vhint) + "\"}"
+    try { exec("echo '" + m.replace("'", "'\\''") + "' >> '" + MISTAKES_LOG + "'") } catch e {}
+}
+
+// error 가 있으면 차단, warn/info 만이면 통과
+if has_error { exit(1) }
+exit(0)
