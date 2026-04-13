@@ -16,6 +16,7 @@ engine (.hexa):
   autofix.hexa         L2 — mistakes.jsonl 반복 패턴 감지 → 제안만
   gc-weekly.hexa       L3 — 7일 쿨다운 래퍼 (growth-tick/cron 안전)
   bitter-gate.hexa     새 규칙 추가 전 mandatory — dormant 규칙 폐기 우선
+  hook_stdin_gate.hexa  hexa binary read_stdin() round-trip 검증 (stale build 회귀 감지)
 
 logs (append-only):
   lint_log.jsonl       모든 lint 실행 기록
@@ -42,6 +43,7 @@ entrypoints:
   hexa gc-weekly.hexa                   쿨다운 자동 판정
   hexa autofix.hexa --analyze           mistakes 누적 후 수동
   hexa bitter-gate.hexa --audit         새 규칙 추가 전 mandatory
+  hexa hook_stdin_gate.hexa             hexa binary 회귀 감지 (실패 시 mistakes.jsonl + stderr, 성공 무출력)
 
 pending:
   hooks-config.json 등록   gc-weekly 주간 체인 (shared/harness/hooks-config-patch.json 참조)
