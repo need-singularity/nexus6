@@ -248,7 +248,7 @@ nexus_hub tick
 ## 빠른 시작
 
 ```bash
-HEXA=$HOME/Dev/hexa-lang/target/release/hexa
+HEXA=$HEXA_LANG/target/release/hexa
 
 # 중앙 지휘
 $HEXA mk2_hexa/native/command_router.hexa "전체 상태"
