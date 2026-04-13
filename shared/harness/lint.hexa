@@ -167,10 +167,82 @@ fn check_l0_lockdown(path: string) -> string {
 fn check_pitfalls(path: string) -> string {
     let e = ext_of(path)
     if e != ".hexa" { return "" }
+    let full = REPO_ROOT + "/" + path
     // Python sys 의존 탐지
-    let py_call = to_int(exec("grep -c 'python3 -c' '" + REPO_ROOT + "/" + path + "' 2>/dev/null || echo 0").trim())
+    let py_call = to_int(_str(exec("grep -c 'python3 -c' '" + full + "' 2>/dev/null || echo 0")).trim())
     if py_call > 10 {
         return "P-PY-HEAVY|info|.hexa 내 python3 -c 호출 >10회. 순수 hexa 함수로 추출 고려"
+    }
+    return ""
+}
+
+// ─── Check 5: AI-native — CLAUDE.md line cap + prose detection ───
+fn check_claude_md(path: string) -> string {
+    let bn = basename_of(path)
+    if bn != "CLAUDE.md" { return "" }
+    let full = REPO_ROOT + "/" + path
+    let lines_cnt = to_int(_str(exec("wc -l < '" + full + "' 2>/dev/null || echo 0")).trim())
+    if lines_cnt > 250 {
+        return "AI-NATIVE|warn|CLAUDE.md > 250 라인 (" + to_string(lines_cnt) + ") — ai-native 간결화 필요"
+    }
+    // prose detection: 80자+ 마침표 끝 비-리스트/헤더/테이블/코드 라인 3+ 연속
+    let prose_cmd = "awk 'BEGIN{run=0;max=0} { if (length($0)>=80 && ($0 ~ /[.]$/ || $0 ~ /다\\.$/ || $0 ~ /요\\.$/) && $0 !~ /^[|\\-*#`]/ && $0 !~ /^[[:space:]]*[a-zA-Z_][a-zA-Z0-9_]*:/) { run++; if(run>max) max=run } else run=0 } END{print max}' '" + full + "' 2>/dev/null"
+    let prose_run = to_int(_str(exec(prose_cmd)).trim())
+    if prose_run >= 3 {
+        return "AI-NATIVE|warn|CLAUDE.md 연속 prose " + to_string(prose_run) + "줄 — key:value/표/리스트로 재작성"
+    }
+    return ""
+}
+
+// ─── Check 6: AI-native — JSON/JSONL 포맷 ───
+fn check_json(path: string) -> string {
+    let e = ext_of(path)
+    if e != ".json" && e != ".jsonl" { return "" }
+    let full = REPO_ROOT + "/" + path
+    // JSONL: 모든 비-빈 라인이 { 또는 [ 로 시작해야 함
+    if e == ".jsonl" {
+        let bad = to_int(_str(exec("awk 'NF>0 && $0 !~ /^[{\\[]/' '" + full + "' 2>/dev/null | wc -l")).trim())
+        if bad > 0 {
+            return "AI-NATIVE|error|JSONL 에 비-JSON 라인 " + to_string(bad) + "건 — 각 라인 { 또는 [ 로 시작"
+        }
+    }
+    // JSON: 단일 string 값 2000자+ (prose 누출)
+    if e == ".json" {
+        let long_val = to_int(_str(exec("grep -oE '\"[^\"]{2000,}\"' '" + full + "' 2>/dev/null | wc -l")).trim())
+        if long_val > 0 {
+            return "AI-NATIVE|warn|JSON string 값 2000자+ — prose 누출, 별도 파일 또는 배열 분할"
+        }
+    }
+    return ""
+}
+
+// ─── Check 7: AI-native — .hexa 알고리즘 함정 ───
+// 메타 사용 (grep/exec 내부 문자열) 제외 — 자기 자신 false positive 방지
+fn check_hexa_algorithm(path: string) -> string {
+    let e = ext_of(path)
+    if e != ".hexa" { return "" }
+    // lint/autofix/gc/bitter-gate/gc-weekly 자신은 스킵 — 메타 grep 사용함
+    if path == "shared/harness/lint.hexa" { return "" }
+    if path == "shared/harness/autofix.hexa" { return "" }
+    if path == "shared/harness/gc.hexa" { return "" }
+    if path == "shared/harness/gc-weekly.hexa" { return "" }
+    if path == "shared/harness/bitter-gate.hexa" { return "" }
+    if path == "shared/harness/triage.hexa" { return "" }
+    let full = REPO_ROOT + "/" + path
+    // 코멘트(//) 제거 후 grep 하도록 sed 전처리 + grep/exec 메타 라인 제외
+    let sed_clean = "sed 's|//.*||' '" + full + "' | grep -v 'grep ' | grep -v 'exec('"
+    // R0 위반: `xs.push(` 앞에 `=` 없으면 silent no-op
+    let noop_push = to_int(_str(exec(sed_clean + " | grep -nE '^[[:space:]]+[a-z_][a-zA-Z0-9_]*\\.push\\(' | wc -l")).trim())
+    if noop_push > 0 {
+        return "HEXA-ALGO|error|R0 pass-by-value — xs.push(v) " + to_string(noop_push) + "건 silent no-op (xs = xs.push(v) 패턴)"
+    }
+    let lio = to_int(_str(exec(sed_clean + " | grep -c '\\.last_index_of('")).trim())
+    if lio > 0 {
+        return "HEXA-ALGO|error|.last_index_of() 미지원 — _rfind(s, ch) 수동 구현 사용"
+    }
+    let ac = to_int(_str(exec(sed_clean + " | grep -c 'args()'")).trim())
+    if ac > 0 {
+        return "HEXA-ALGO|warn|args() 빈 배열 반환 — env var 또는 기본 모드 사용 권장"
     }
     return ""
 }
@@ -262,6 +334,24 @@ for f in files {
     if e == ".hexa" {
         let v4 = check_pitfalls(path)
         if v4 != "" { violations = violations.push(path + "|" + v4) }
+    }
+
+    // check_claude_md: only CLAUDE.md files
+    if e == ".md" {
+        let v5 = check_claude_md(path)
+        if v5 != "" { violations = violations.push(path + "|" + v5) }
+    }
+
+    // check_json: .json / .jsonl
+    if e == ".json" || e == ".jsonl" {
+        let v6 = check_json(path)
+        if v6 != "" { violations = violations.push(path + "|" + v6) }
+    }
+
+    // check_hexa_algorithm: .hexa ai-native 알고리즘 강제
+    if e == ".hexa" {
+        let v7 = check_hexa_algorithm(path)
+        if v7 != "" { violations = violations.push(path + "|" + v7) }
     }
 }
 
