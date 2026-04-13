@@ -54,6 +54,164 @@ fn check_shared_protected(tool: str, file_path: str) -> str {
     return ""
 }
 
+// H-MD2PDF: MD→PDF 변환은 md-to-pdf 전용. pandoc/xelatex 호출 차단.
+// arg = Bash command (entry.hexa 가 argv[3] 으로 cmd 전달)
+fn check_md_to_pdf_cmd(tool: str, arg: str) -> str {
+    if tool != "Bash" { return "" }
+    if arg.len() == 0 { return "" }
+    // 명시 우회 — 사용자가 pandoc/xelatex 직접 요청한 비-PDF 작업
+    if arg.contains("NEXUS_PDF_OK=1") { return "" }
+
+    let has_pandoc = arg.contains("pandoc")
+    let has_xelatex = arg.contains("xelatex") || arg.contains("pdflatex") || arg.contains("lualatex")
+    if has_pandoc == false && has_xelatex == false { return "" }
+
+    // pandoc 의 경우 — md→pdf 또는 .pdf 출력 시에만 차단 (md→html 등은 허용)
+    if has_pandoc {
+        let to_pdf = arg.contains(".pdf") || arg.contains("--to=pdf") || arg.contains("-t pdf") || arg.contains("--to pdf")
+        if to_pdf == false { return "" }
+        return "REJECT: pandoc PDF 변환 금지 (H-MD2PDF) — `md-to-pdf <file.md>` 사용. 우회: NEXUS_PDF_OK=1 prefix"
+    }
+
+    // xelatex/pdflatex/lualatex — 항상 차단
+    return "REJECT: xelatex/pdflatex/lualatex 금지 (H-MD2PDF) — MD→PDF 는 `md-to-pdf` 사용. 우회: NEXUS_PDF_OK=1 prefix"
+}
+
+// R20: pkill/pgrep -f substring 금지 — -xf 정확매칭 또는 PID 파일 기반만 허용
+// 우회: @allow-pkill-f 토큰 명시
+fn check_pkill_f_cmd(tool: str, arg: str) -> str {
+    if tool != "Bash" { return "" }
+    if arg.len() == 0 { return "" }
+    if arg.contains("@allow-pkill-f") { return "" }
+    if arg.contains("-xf") { return "" }
+
+    // pkill -f 또는 pgrep -f (단독 -f, -xf 는 위에서 제외됨)
+    let has_pkill_f = arg.contains("pkill -f") || arg.contains("pgrep -f")
+    if has_pkill_f == false { return "" }
+    return "REJECT: pkill/pgrep -f substring 금지 (R20) — 무고한 프로세스 silent kill 위험. -xf 정확매칭 / PID 파일 / pgrep -x <basename> 사용. 우회: @allow-pkill-f 주석"
+}
+
+// R22: 스크립트 인터프리터 절대경로 강제 — bare python3/ruby/node 금지
+// 우회: NEXUS_INTERP_OK=1 prefix (일회성 ad-hoc)
+fn check_bare_interpreter_cmd(tool: str, arg: str) -> str {
+    if tool != "Bash" { return "" }
+    if arg.len() == 0 { return "" }
+    if arg.contains("NEXUS_INTERP_OK=1") { return "" }
+
+    // 절대경로 호출은 통과 (/usr/bin/python3, /usr/local/bin/node 등)
+    // bare 호출만 차단: 라인 시작/공백/세미콜론/파이프/&& 직후 python3/ruby/node
+    let patterns = [
+        ["python3 ", "python3 (R22) — /usr/bin/python3 절대경로 필수 (hetzner 라우팅 회피)"],
+        ["ruby ", "ruby (R22) — 절대경로 필수"],
+        ["node ", "node (R22) — 절대경로 필수"]
+    ]
+    for p in patterns {
+        // bare 호출 시작 위치 — 'python3 ' 가 있고 바로 앞이 절대경로의 끝(/py...) 이 아닐 때
+        let idx = arg.index_of(p[0])
+        if idx < 0 { continue }
+        // 앞 문자 검사 — 절대경로면 스킵 (e.g. '/usr/bin/python3 ')
+        if idx > 0 {
+            let prev = arg.substring(idx - 1, idx)
+            if prev == "/" { continue }  // 절대경로 말미
+            if prev == "=" { continue }  // VAR=python3 … 변수 대입 제외
+        }
+        return "REJECT: bare interpreter 호출 금지 — " + p[1] + ". 우회: NEXUS_INTERP_OK=1 prefix"
+    }
+    return ""
+}
+
+// R28: 폐기된 JSON 발견 저장소 신규 생성 금지 — atlas.n6 단일 SSOT
+// 우회: @allow-deprecated-json 주석 또는 archive/deprecated_json/ 경로
+fn check_discovery_json_path(tool: str, file_path: str) -> str {
+    if tool != "Write" { return "" }
+    // 기존 파일 덮어쓰기는 다른 가드(BLOW6)가 lint에서 경고. 여기는 신규 생성 차단.
+    let exists = to_string(exec("test -f '" + file_path + "' && echo y || echo n")).trim()
+    if exists == "y" { return "" }
+    // archive/deprecated_json/ 은 허용 (read-only 보관)
+    if file_path.contains("/archive/deprecated_json/") { return "" }
+
+    let banned = [
+        "discovery_graph.json",
+        "discovery_log.jsonl",
+        "growth_bus.json",
+        "verified_constants.json",
+        "module_candidates.json",
+        "reality_map.json"
+    ]
+    let base = to_string(exec("basename '" + file_path + "'")).trim()
+    for b in banned {
+        if base == b {
+            return "REJECT: 폐기 JSON '" + b + "' 신규 생성 금지 (R28) — atlas.n6 단일 SSOT. archive/deprecated_json/ 외 생성 불가"
+        }
+    }
+    return ""
+}
+
+// R29: 계산기/검증/스캐너 .hexa 는 shared/n6/scripts/ 단일 SSOT
+// 우회: @allow-project-hexa 명시 (프로젝트 전용 도구 필요 시 수동 승인)
+fn check_calculator_ssot(tool: str, file_path: str) -> str {
+    if tool != "Write" { return "" }
+    if file_path.ends_with(".hexa") == false { return "" }
+    // 기존 파일은 통과 (마이그레이션 중)
+    let exists = to_string(exec("test -f '" + file_path + "' && echo y || echo n")).trim()
+    if exists == "y" { return "" }
+    // 단일 SSOT 허용 경로
+    if file_path.contains("/shared/n6/scripts/") { return "" }
+
+    // 금지 경로 — 이론/예측/증명/돌파/논문 하위 신규 .hexa
+    let banned_segments = [
+        "/theory/",
+        "/predictions/",
+        "/proofs/",
+        "/breakthroughs/",
+        "/papers/",
+        "/hexa-lang/docs/"
+    ]
+    for s in banned_segments {
+        if file_path.contains(s) {
+            return "REJECT: 계산기/검증 .hexa 는 shared/n6/scripts/ 단일 SSOT (R29) — '" + s + "' 하위 신규 작성 금지. 이론 repo 는 .md 전용"
+        }
+    }
+    return ""
+}
+
+// H-SEND-GUARD: 외부 발송/등록 (이메일, github issue/PR, webhook) — 사용자 명시 요청 전 차단.
+// 우회: NEXUS_SEND_OK=1 prefix (사용자가 직접 요청한 경우 Claude 가 명시 부여).
+fn check_external_send_cmd(tool: str, arg: str) -> str {
+    if tool != "Bash" { return "" }
+    if arg.len() == 0 { return "" }
+    if arg.contains("NEXUS_SEND_OK=1") { return "" }
+
+    // 패턴: [pattern, label]
+    let patterns = [
+        ["gh issue create", "github issue 등록"],
+        ["gh issue comment", "github issue 댓글"],
+        ["gh issue close", "github issue 종료"],
+        ["gh issue reopen", "github issue 재오픈"],
+        ["gh pr create", "github PR 생성"],
+        ["gh pr comment", "github PR 댓글"],
+        ["gh pr merge", "github PR 머지"],
+        ["gh pr close", "github PR 종료"],
+        ["gh pr review", "github PR 리뷰"],
+        ["gh release create", "github release 발행"],
+        ["gh gist create", "github gist 발행"],
+        ["sendmail ", "이메일 발송 (sendmail)"],
+        ["msmtp ", "이메일 발송 (msmtp)"],
+        ["swaks ", "이메일 발송 (swaks)"],
+        ["mutt -s", "이메일 발송 (mutt)"],
+        ["mail -s", "이메일 발송 (mail)"],
+        ["hooks.slack.com", "slack webhook"],
+        ["discord.com/api/webhooks", "discord webhook"],
+        ["discordapp.com/api/webhooks", "discord webhook"]
+    ]
+    for p in patterns {
+        if arg.contains(p[0]) {
+            return "REJECT: 외부 발송/등록 차단 (H-SEND-GUARD) — " + p[1] + ". 사용자 명시 요청 필요. 우회: NEXUS_SEND_OK=1 prefix"
+        }
+    }
+    return ""
+}
+
 fn main() {
     let argv = args()
     if argv.len() < 4 { return }  // 인자 부족 시 silent pass
@@ -65,7 +223,9 @@ fn main() {
     let checks = [
         check_forbidden_ext(tool, file_path),
         check_global_claude(tool, file_path),
-        check_shared_protected(tool, file_path)
+        check_shared_protected(tool, file_path),
+        check_md_to_pdf_cmd(tool, file_path),
+        check_external_send_cmd(tool, file_path)
     ]
 
     for c in checks {
