@@ -4,8 +4,7 @@ sync (R1 migrated .sh → .hexa):
   sync_claude_md.hexa   sync_settings.hexa
   sync-calculators.hexa sync-claude-rules.hexa sync-dse.hexa
   sync-math-atlas.hexa  sync-nexus-lenses.hexa sync-readmes.hexa
-  sync-all-verify.md    (doc)
-  shared_work_rules.md  (sync 블록 원본, sync-claude-rules.hexa 참조)
+  (2026-04-14 산문 md 제거 — sync-all-verify.md/shared_work_rules.md → harness/CLAUDE.md SSOT 단일화)
 
 rotate: rotate_discovery_log.hexa (ROI #3 — discovery_log.jsonl 주간 로테이션+gzip)
         rotate_auto_gap.hexa (ROI #19 — auto_gap.log 일간+크기(5MB) 듀얼 트리거 로테이션+gzip, keep 7일)

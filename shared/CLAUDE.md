@@ -14,7 +14,7 @@ alien/       alien_index_*
 acceleration/ acceleration_*,explosive_growth_prompts
 monte_carlo/ monte_carlo_v6_*
 papers/      paper_candidates
-scripts/     sync-*.hexa(R1),sync-all-verify.md,shared_work_rules.md,nexus_ensure_running.hexa,bin/hexa(bootstrap resolver 예외)
+scripts/     sync-*.hexa(R1),nexus_ensure_running.hexa,bin/hexa(bootstrap resolver 예외)
 bin/         cl(런처),cl-refresh(usage fetch),cl-refresh-launchd(30m launchd),health-launchd(30m launchd),exec_validated(→harness/),hexa(resolver)
 launchd/     com.nexus.cl-refresh.plist(30m 주기),com.nexus.health.plist(30m 헬스 all --verbose)
 logs/        cmd_router.log,cl-refresh.{stdout,stderr}.log(gitignore)
