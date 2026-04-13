@@ -1988,7 +1988,8 @@ fn check_hexa_algorithm(path: string) -> string {
 //   서브셸은 POSIX asynchronous_list 규칙상 자식 stdin 을 /dev/null 로
 //   재지정 → Claude Code UserPromptSubmit hook 전체 조용한 실패.
 //   fix: exec 3<&0; ... <&3 (rt 35).
-// 동작: hook 파일이 없으면 무비용 스킵. 있으면 1회 프로브.
+// 동작: hook 파일이 없으면 무비용 스킵. 있으면 SSOT gate 위임.
+// SSOT: shared/harness/hook_stdin_gate.hexa (probe 로직 단일 소스)
 fn check_h9_hook_stdin_gate(all_files: string) -> string {
     let mut has_hook = false
     let paths = all_files.split("\n")
@@ -2001,16 +2002,17 @@ fn check_h9_hook_stdin_gate(all_files: string) -> string {
     }
     if !has_hook { return "" }
 
-    let pid = _str(exec("echo $$")).trim()
-    let probe = "STDIN_H9_OK_" + pid
-    let script = "/tmp/.h9_probe_" + pid + ".hexa"
-    try { write_file(script, "println(read_stdin())\n") } catch e { return "" }
-    let cmd = "printf '%s' '" + probe + "' | hexa '" + script + "' 2>&1"
-    let out = _str(exec(cmd)).trim()
-    exec("rm -f '" + script + "'")
-
-    if out == probe { return "" }
-    return "H9|error|hexa read_stdin() 회귀 — expected=[" + probe + "] got=[" + out + "] — ~/Dev/hexa-lang/scripts/regression_stdin.hexa 로 확인, self/main.hexa:565 fd 3 redirect 검사"
+    // delegate to hook_stdin_gate.hexa — probe + mistakes.jsonl + stderr 는 거기서 처리
+    // popen("r") 은 stdout 만 캡처하므로 gate 의 stderr(eprintln) 는 lint 의 stderr
+    // 로 자연스럽게 전달 → pre-commit 이 사용자 터미널에 HOOK-STDIN-GATE FAIL 표시.
+    let gate = HOME + "/Dev/nexus/shared/harness/hook_stdin_gate.hexa"
+    let raw = _str(exec("hexa '" + gate + "' >/dev/null; echo __RC=$?")).trim()
+    let mark = "__RC="
+    let idx = raw.index_of(mark)
+    if idx < 0 { return "" }
+    let rc = raw.substring(idx + 5, len(raw)).trim()
+    if rc == "0" { return "" }
+    return "H9|error|hook_stdin_gate FAIL (rc=" + rc + ") — hexa read_stdin() 회귀. 상단 HOOK-STDIN-GATE 메시지 + shared/harness/mistakes.jsonl 참조"
 }
 
 // ─── Gather files to lint ───
@@ -2071,8 +2073,16 @@ let mut checked: i64 = 0
 
 // ─── H9 one-shot gate: hook stdin round-trip 회귀 감지 ───
 // hooks/*.hexa 가 스코프에 있으면 1회만 실행. 없으면 조용히 스킵.
+// gate 실패 시 lint 의 후속 check 에서 runtime 에러가 나도 확실히 차단하도록
+// 즉시 log + exit 1. hook_stdin_gate 는 이미 stderr + mistakes.jsonl 기록함.
 let h9 = check_h9_hook_stdin_gate(files_raw)
-if h9 != "" { violations = violations.push("shared/hooks/*.hexa|" + h9) }
+if h9 != "" {
+    violations = violations.push("shared/hooks/*.hexa|" + h9)
+    let log_line = "{\"ts\":\"" + now_iso() + "\",\"mode\":\"" + mode + "\",\"checked\":0,\"pass\":false,\"gate\":\"H9\",\"violation\":\"" + json_escape(h9) + "\"}"
+    try { exec("echo '" + log_line.replace("'", "'\\''") + "' >> '" + LINT_LOG + "'") } catch e {}
+    try { exec("echo '{\"ts\":\"" + now_iso() + "\",\"kind\":\"lint_fail\",\"rule\":\"H9\",\"fix\":\"" + json_escape(h9) + "\"}' >> '" + MISTAKES_LOG + "'") } catch e {}
+    exit(1)
+}
 
 for f in files {
     let path = _str(f).trim()
