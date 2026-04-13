@@ -1,23 +1,38 @@
 // ═══════════════════════════════════════════════════════════
-// gc.hexa — 하네스 P3 가비지 컬렉션
-// 3 스캔: drift (문서↔실제) / dead (미참조) / violation (규칙 위반)
-// Usage:
-//   hexa shared/harness/gc.hexa --scan          (3 전부)
-//   hexa shared/harness/gc.hexa --drift         (drift 만)
-//   hexa shared/harness/gc.hexa --violation     (violation 만)
-//   hexa shared/harness/gc.hexa --dead          (dead 만, 느림)
-//   hexa shared/harness/gc.hexa --rotate        (대용량 jsonl 회전, keep 10000)
-//   hexa shared/harness/gc.hexa --report        (최근 로그 요약)
-// 출력: shared/harness/gc_log.jsonl (append), stdout 요약
+// gc.hexa — 하네스 P3 가비지 컬렉션 단일 라우터
+// (gc-weekly + cleanup 흡수, 2026-04-14)
+// 모드:
+//   --scan          drift + violation + dead + prompt_gc (기본)
+//   --drift         CLAUDE.md 경로 ↔ 실제 존재 불일치
+//   --violation     규칙 위반 (R1 HEXA-FIRST, R14 rules SSOT)
+//   --dead          shared/ 90일+ 미참조 파일 (느림)
+//   --rotate        대용량 jsonl 회전 (keep 10000)
+//   --prompt-gc     ~/.claude-claude10/** session-handoff-*.md 7일+
+//   --report        최근 gc_log.jsonl tail 5
+//   --weekly        7일 쿨다운 후 scan 실행 (gc-weekly 흡수)
+//                   env HARNESS_GC_WEEKLY_MODE=force|status 대응
+//   --cleanup       shared_survey.json 폐기 후보 실행 (cleanup 흡수)
+//                   env HARNESS_CLEANUP_MODE=apply|force 대응
+// 출력: shared/harness/gc_log.jsonl + cleanup_log.jsonl + stdout 요약
 // ═══════════════════════════════════════════════════════════
 
 let REPO_ROOT = exec("git rev-parse --show-toplevel 2>/dev/null").trim()
 let SHARED_DIR = REPO_ROOT + "/shared"
 let GC_LOG = SHARED_DIR + "/harness/gc_log.jsonl"
 let MISTAKES_LOG = SHARED_DIR + "/harness/mistakes.jsonl"
+let WEEKLY_COOLDOWN = SHARED_DIR + "/harness/.gc_weekly_cooldown"
+let WEEK_SEC: i64 = 604800
+let SURVEY = SHARED_DIR + "/harness/shared_survey.json"
+let CLEANUP_LOG = SHARED_DIR + "/harness/cleanup_log.jsonl"
 
 fn now_iso() -> string {
     return exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+fn now_sec() -> i64 {
+    let mut r: i64 = 0
+    try { r = to_int(exec("date +%s").trim()) } catch e {}
+    return r
 }
 
 fn json_escape(s: string) -> string {
@@ -46,11 +61,16 @@ fn _rfind(s: string, ch: string) -> i64 {
     return -1
 }
 
+fn basename(path: string) -> string {
+    let slash = _rfind(path, "/")
+    if slash < 0 { return path }
+    return path.substring(slash + 1, len(path))
+}
+
 // ─── Scan 1: DRIFT — CLAUDE.md 에 언급된 경로가 실제 존재하는가 ───
 
 fn scan_drift() -> [string] {
     let mut findings: [string] = []
-    // 대상 CLAUDE.md 목록
     let cmd = "find " + REPO_ROOT + " -maxdepth 4 -name 'CLAUDE.md' -not -path '*/node_modules/*' -not -path '*/.git/*' -not -path '*/.claude/worktrees/*' -not -path '*/archive/*' -not -path '*/_archive/*' 2>/dev/null"
     let claude_files_raw = _str(exec(cmd)).trim()
     if claude_files_raw == "" { return findings }
@@ -58,16 +78,12 @@ fn scan_drift() -> [string] {
     for cf in claude_files_raw.split("\n") {
         let cfp = _str(cf).trim()
         if cfp == "" { continue }
-        // 경로 후보 추출: "shared/xxx/yyy.ext" 패턴
-        // python3 한 줄로 추출 (regex)
-        // alternation 우선순위: 긴 확장자 먼저 (hexa.inc/jsonl) → .hexa.inc 와 .jsonl 정확 매칭
         let ext_cmd = "python3 -c \"import re,sys; t=open('" + cfp + "').read(); [print(m) for m in sorted(set(re.findall(r'(shared/[A-Za-z0-9._/\\-]+\\.(?:hexa\\.inc|jsonl|hexa|json|md|txt|html))', t)))]\" 2>/dev/null"
         let refs_raw = _str(exec(ext_cmd)).trim()
         if refs_raw == "" { continue }
         for r in refs_raw.split("\n") {
             let rel = _str(r).trim()
             if rel == "" { continue }
-            // glob 패턴 (*) 제외 — 존재 검증 불가능
             if rel.index_of("*") >= 0 { continue }
             let abs = REPO_ROOT + "/" + rel
             if !file_exists(abs) {
@@ -82,7 +98,6 @@ fn scan_drift() -> [string] {
 
 fn scan_violations() -> [string] {
     let mut findings: [string] = []
-    // R1: shared/ 아래 .rs/.py/.sh (exceptions: shared/scripts/, shared/bin/)
     let cmd1 = "find " + SHARED_DIR + " -type f \\( -name '*.py' -o -name '*.sh' -o -name '*.rs' \\) -not -path '*/scripts/*' -not -path '*/bin/*' -not -path '*/.git/*' -not -path '*/.claude/worktrees/*' -not -path '*/archive/*' -not -path '*/_archive/*' 2>/dev/null"
     let r1_raw = _str(exec(cmd1)).trim()
     if r1_raw != "" {
@@ -93,7 +108,6 @@ fn scan_violations() -> [string] {
             findings = findings.push("violation|error|" + rel + "|R1|HEXA-FIRST 위반: ai-native algorism 으로 재작성")
         }
     }
-    // R14: shared/rules/ 아래 .md 파일 (CLAUDE.md 제외). .claude/worktrees/ 제외 방어.
     let cmd2 = "find " + SHARED_DIR + "/rules -type f -name '*.md' -not -path '*/.claude/worktrees/*' 2>/dev/null"
     let r2_raw = _str(exec(cmd2)).trim()
     if r2_raw != "" {
@@ -113,7 +127,6 @@ fn scan_violations() -> [string] {
 
 fn scan_dead() -> [string] {
     let mut findings: [string] = []
-    // 대상: shared/ 아래 .hexa / .json 중 90일 이상 미변경
     let cmd = "find " + SHARED_DIR + " -type f \\( -name '*.hexa' -o -name '*.json' \\) -mtime +90 -not -path '*/.git/*' -not -path '*/.claude/worktrees/*' -not -path '*/archive/*' -not -path '*/_archive/*' -not -path '*/backups/*' -not -path '*/archive/*' 2>/dev/null"
     let files_raw = _str(exec(cmd)).trim()
     if files_raw == "" { return findings }
@@ -122,7 +135,6 @@ fn scan_dead() -> [string] {
         let fp = _str(f).trim()
         if fp == "" { continue }
         let bn = fp.substring(_rfind(fp, "/") + 1, len(fp))
-        // 자기자신 제외 grep — shared/ 전체에서 basename 참조 개수
         let cnt_cmd = "grep -r --include='*.hexa' --include='*.json' --include='*.jsonl' --include='*.md' -l '" + bn + "' " + SHARED_DIR + " 2>/dev/null | grep -v '" + fp + "' | head -1"
         let has_ref = _str(exec(cnt_cmd)).trim()
         if has_ref == "" {
@@ -136,13 +148,11 @@ fn scan_dead() -> [string] {
 // ─── Scan 4: ROTATE — 대용량 jsonl 회전 (keep last N lines, in-place) ───
 
 fn rotate_one(path: string, keep: i64) -> [i64] {
-    // 라인 수 조사 (wc -l)
     let wc_raw = _str(exec("wc -l < '" + path + "' 2>/dev/null")).trim()
     if wc_raw == "" { return [0, 0] }
     let mut total: i64 = 0
     try { total = to_int(wc_raw) } catch e { total = 0 }
     if total <= keep { return [0, total] }
-    // tail -n keep > tmp && mv tmp path (in-place)
     let tmp = path + ".tmp"
     exec("tail -n " + to_string(keep) + " '" + path + "' > '" + tmp + "' && mv '" + tmp + "' '" + path + "' 2>/dev/null")
     let removed = total - keep
@@ -152,7 +162,6 @@ fn rotate_one(path: string, keep: i64) -> [i64] {
 fn scan_rotate() -> [string] {
     let mut findings: [string] = []
     let keep: i64 = 10000
-    // 대상 jsonl 목록 (harness/ 아래)
     let targets = [
         "lint_log.jsonl",
         "mistakes.jsonl",
@@ -185,8 +194,6 @@ fn scan_rotate() -> [string] {
 }
 
 // ─── Scan 5: PROMPT-GC — session-handoff-*.md 7일+ 파일 정리 ───
-// 대상: ~/.claude-claude10/projects/*/memory/session-handoff-*.md (latest 제외, 7일+)
-// cli_budget_gate 가 세션별로 생성하는 프롬프트 파일 — 이어받기 완료 후 누적 방지
 
 fn scan_stale_session_prompts() -> [string] {
     let mut findings: [string] = []
@@ -226,7 +233,6 @@ fn log_findings(scan_type: string, findings: [string]) {
     let line = "{\"ts\":\"" + ts + "\",\"scan\":\"" + scan_type + "\",\"count\":" + to_string(len(findings)) + ",\"findings\":" + items_json + "}"
     try { exec("echo '" + line.replace("'", "'\\''") + "' >> '" + GC_LOG + "'") } catch e {}
 
-    // mistakes.jsonl 에도 가끔 append (warn/error 만)
     for f in findings {
         let fs = _str(f)
         if fs == "" { continue }
@@ -239,6 +245,129 @@ fn log_findings(scan_type: string, findings: [string]) {
     }
 }
 
+// ─── Cleanup 모드 (cleanup.hexa 흡수) ───
+
+fn cleanup_extract_discard_paths() -> [string] {
+    let mut paths: [string] = []
+    if !file_exists(SURVEY) { return paths }
+    let cmd = "awk '/\"high_confidence\"/{flag=1;next} flag && /\\],$|\\]$/{flag=0} flag' '" + SURVEY + "' | grep -oE '\"path\":[[:space:]]*\"[^\"]+\"' | sed 's/.*\"path\":[[:space:]]*\"//; s/\"$//'"
+    let raw = _str(exec(cmd)).trim()
+    if raw == "" { return paths }
+    for ln in raw.split("\n") {
+        let p = _str(ln).trim()
+        if p == "" { continue }
+        paths = paths.push(p)
+    }
+    return paths
+}
+
+fn cleanup_ref_count(path: string) -> i64 {
+    let bn = basename(path)
+    if bn == "" { return 0 }
+    let excl = " | grep -v 'shared_survey.json' | grep -v 'shared/harness/archive/' | grep -v 'archive/survey_pending_review.json' | grep -v 'archive/full_cleanup_list.json' | grep -v 'shared/harness/lint_log.jsonl' | grep -v 'shared/harness/gc_log.jsonl' | grep -v 'shared/harness/mistakes.jsonl' | grep -v 'shared/harness/autofix_proposals.jsonl' | grep -v 'shared/harness/cleanup_log.jsonl' | grep -v 'shared/harness/rules_usage.jsonl'"
+    let cmd = "grep -rl '" + bn + "' --include='*.hexa' --include='*.json' --include='*.jsonl' --include='*.md' '" + SHARED_DIR + "' '" + REPO_ROOT + "/archive' 2>/dev/null" + excl + " | grep -v '/" + bn + "$' | wc -l"
+    let mut r: i64 = 0
+    try { r = to_int(_str(exec(cmd)).trim()) } catch e { r = 0 }
+    return r
+}
+
+fn cleanup_path_exists(path: string) -> bool {
+    let full = REPO_ROOT + "/" + path
+    return file_exists(full)
+}
+
+fn cleanup_delete_file(path: string) -> bool {
+    let full = REPO_ROOT + "/" + path
+    try { exec("git -C '" + REPO_ROOT + "' rm -f '" + path + "' 2>/dev/null || rm -f '" + full + "'") } catch e { return false }
+    return !file_exists(full)
+}
+
+fn run_cleanup() -> i64 {
+    let mode = _str(env("HARNESS_CLEANUP_MODE")).trim()
+    let force = mode == "force"
+    let apply = mode == "apply" || force
+
+    let paths = cleanup_extract_discard_paths()
+    if len(paths) == 0 {
+        println("cleanup:   폐기 후보 없음 (shared_survey.json 파싱 실패 가능)")
+        return 0
+    }
+
+    let ts = now_iso()
+    let mut safe_count: i64 = 0
+    let mut skip_count: i64 = 0
+    let mut deleted: i64 = 0
+    let mut missing: i64 = 0
+
+    println("== cleanup " + mode + " (" + to_string(len(paths)) + " 후보) ==")
+
+    for p in paths {
+        let path = _str(p).trim()
+        if path == "" { continue }
+        if path.index_of("*") >= 0 { continue }
+        if !cleanup_path_exists(path) {
+            missing = missing + 1
+            println("  MISSING  " + path)
+            continue
+        }
+        let refs = cleanup_ref_count(path)
+        let safe = refs == 0
+        let action = if apply && (safe || force) { "DELETE" } else { if safe { "READY" } else { "SKIP" } }
+        let line = "{\"ts\":\"" + ts + "\",\"mode\":\"" + mode + "\",\"path\":\"" + json_escape(path) + "\",\"refs\":" + to_string(refs) + ",\"action\":\"" + action + "\"}"
+        try { exec("echo '" + line.replace("'", "'\\''") + "' >> '" + CLEANUP_LOG + "'") } catch e {}
+
+        if safe {
+            safe_count = safe_count + 1
+            if apply {
+                if cleanup_delete_file(path) {
+                    deleted = deleted + 1
+                    println("  DELETED  " + path)
+                } else {
+                    println("  FAIL     " + path)
+                }
+            } else {
+                println("  READY    " + path + " (refs=0)")
+            }
+        } else {
+            if force && apply {
+                if cleanup_delete_file(path) {
+                    deleted = deleted + 1
+                    println("  FORCED   " + path + " (refs=" + to_string(refs) + ")")
+                }
+            } else {
+                skip_count = skip_count + 1
+                println("  SKIP     " + path + " (refs=" + to_string(refs) + ")")
+            }
+        }
+    }
+
+    println("")
+    println("safe:    " + to_string(safe_count))
+    println("skip:    " + to_string(skip_count) + " (live refs — force 필요)")
+    println("deleted: " + to_string(deleted))
+    println("missing: " + to_string(missing))
+    println("log:     shared/harness/cleanup_log.jsonl")
+    if !apply {
+        println("")
+        println("실제 삭제: HARNESS_CLEANUP_MODE=apply hexa shared/harness/gc.hexa --cleanup")
+        println("참조 있는 것도 강제: HARNESS_CLEANUP_MODE=force hexa shared/harness/gc.hexa --cleanup")
+    }
+    return safe_count + skip_count + deleted + missing
+}
+
+// ─── Weekly 모드 (gc-weekly.hexa 흡수) ───
+
+fn weekly_read_last() -> i64 {
+    if !file_exists(WEEKLY_COOLDOWN) { return 0 }
+    let mut r: i64 = 0
+    try { r = to_int(exec("cat '" + WEEKLY_COOLDOWN + "' 2>/dev/null").trim()) } catch e {}
+    return r
+}
+
+fn weekly_write_last(ts: i64) {
+    try { exec("echo " + to_string(ts) + " > '" + WEEKLY_COOLDOWN + "'") } catch e {}
+}
+
 // ─── Main ───
 
 let a = args()
@@ -248,6 +377,8 @@ let mut do_dead = false
 let mut do_rotate = false
 let mut do_report = false
 let mut do_prompt_gc = false
+let mut do_weekly = false
+let mut do_cleanup = false
 let mut ai: i64 = 2
 while ai < len(a) {
     let t = a[ai]
@@ -258,10 +389,12 @@ while ai < len(a) {
     else if t == "--rotate" { do_rotate = true }
     else if t == "--report" { do_report = true }
     else if t == "--prompt-gc" { do_prompt_gc = true }
+    else if t == "--weekly" { do_weekly = true }
+    else if t == "--cleanup" { do_cleanup = true }
     ai = ai + 1
 }
 
-if !do_drift && !do_violation && !do_dead && !do_rotate && !do_report && !do_prompt_gc {
+if !do_drift && !do_violation && !do_dead && !do_rotate && !do_report && !do_prompt_gc && !do_weekly && !do_cleanup {
     // no-arg default = --scan (args() forwarding 이슈 우회)
     do_drift = true
     do_violation = true
@@ -273,6 +406,51 @@ if do_report {
     let last = exec("tail -5 '" + GC_LOG + "' 2>/dev/null").trim()
     if last == "" { println("(gc_log.jsonl empty)") } else { println(last) }
     exit(0)
+}
+
+// Weekly 모드 단독 처리 — 쿨다운 판정 후 scan 체인 실행
+if do_weekly {
+    let mode = _str(env("HARNESS_GC_WEEKLY_MODE")).trim()
+    let force = mode == "force"
+    let status_only = mode == "status"
+
+    let now = now_sec()
+    let last = weekly_read_last()
+    let age = if last > 0 { now - last } else { -1 }
+    let remaining = WEEK_SEC - age
+
+    if status_only {
+        if last == 0 { println("never run") }
+        else {
+            println("last_run_ts: " + to_string(last))
+            println("age_sec:     " + to_string(age))
+            if age >= WEEK_SEC { println("status:      due (쿨다운 만료)") }
+            else { println("status:      cooldown (남은 " + to_string(remaining) + "s)") }
+        }
+        exit(0)
+    }
+
+    if !force && last > 0 && age < WEEK_SEC {
+        // 쿨다운 중 — 조용히 통과
+        exit(0)
+    }
+
+    println("gc-weekly: running scan chain")
+    // 쿨다운 통과 시 do_drift/violation/dead/prompt_gc 활성화
+    do_drift = true
+    do_violation = true
+    do_dead = true
+    do_prompt_gc = true
+    weekly_write_last(now)
+}
+
+// Cleanup 모드 단독 처리 — 다른 scan 과 독립적으로 돌아도 무방
+if do_cleanup {
+    let _cnt = run_cleanup()
+    // cleanup 만 요청 시 다른 scan 없으면 종료
+    if !do_drift && !do_violation && !do_dead && !do_rotate && !do_prompt_gc {
+        exit(0)
+    }
 }
 
 let mut total: i64 = 0
@@ -299,7 +477,6 @@ if do_dead {
 }
 
 if do_rotate {
-    // rotate 는 gc_log.jsonl 자체도 truncate 하므로 log_findings 가 그 후 1줄만 append
     let f = scan_rotate()
     log_findings("rotate", f)
     println("rotate:    " + to_string(len(f)) + " files")
