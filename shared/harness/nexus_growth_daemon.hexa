@@ -1,0 +1,204 @@
+// nexus_growth_daemon.hexa — 1-shot LaunchAgent 변종 (harness 복제본)
+// 역할: launchd StartInterval 기반 1tick 실행 후 종료 (KeepAlive 데몬과 별도)
+//       canonical 장기실행 데몬: $N6_ARCH/bridge/scripts/nexus_growth_daemon.hexa
+// 모드: 본 파일은 싱글샷 — pid 보호 + 1 growth_tick 위임 + stale pid cleanup
+// usage: hexa run shared/harness/nexus_growth_daemon.hexa [tick|status|stop]
+// pid_file: ~/.nexus/daemon.pid (canonical daemon과 공유 — 충돌 회피)
+// log: shared/harness/daemon_log.jsonl (append)
+// ai-native: stdout JSONL 라인만. 산문 금지.
+
+let HOME = env("HOME")
+let NEXUS_STATE = HOME + "/.nexus"
+let PID_FILE = NEXUS_STATE + "/daemon.pid"
+let SHUTDOWN_FLAG = NEXUS_STATE + "/daemon.shutdown"
+let SHOT_PID_FILE = NEXUS_STATE + "/daemon_shot.pid"
+let mut NEXUS_ROOT = env("NEXUS")
+if NEXUS_ROOT.len() == 0 { NEXUS_ROOT = HOME + "/Dev/nexus" }
+let LOG = NEXUS_ROOT + "/shared/harness/daemon_log.jsonl"
+let GROWTH_TICK = NEXUS_ROOT + "/shared/harness/growth_tick.hexa"
+let HEXA_BIN = NEXUS_ROOT + "/shared/bin/hexa"
+
+fn _sh(cmd: str) -> str {
+    let mut out = ""
+    try { out = to_string(exec(cmd)) } catch e { out = "" }
+    return out.trim()
+}
+
+fn _now_epoch() -> str {
+    return _sh("date +%s")
+}
+
+fn _now_iso() -> str {
+    return _sh("date -u +%Y-%m-%dT%H:%M:%SZ")
+}
+
+fn _pid_alive(pid: str) -> bool {
+    if pid.len() == 0 { return false }
+    let r = _sh("kill -0 " + pid + " 2>/dev/null && echo y || echo n")
+    return r == "y"
+}
+
+fn _my_pid() -> str {
+    // exec("sh -c 'echo $PPID'") — spawn한 sh의 부모 = hexa daemon 프로세스
+    // exec("echo $$") 는 subshell pid 반환 → 즉시 죽음 (canonical 버그 주석 참조)
+    return _sh("sh -c 'echo $PPID'")
+}
+
+fn _ensure_state_dir() {
+    if dir_exists(NEXUS_STATE) == false { mkdir(NEXUS_STATE) }
+}
+
+fn _log_jsonl(event: str, data: str) {
+    // {"ts":<iso>,"epoch":<s>,"event":"<event>","data":"<data>"}
+    let ts = _now_iso()
+    let ep = _now_epoch()
+    let safe_data = data.replace("\"", "\\\"")
+    let line = "{\"ts\":\"" + ts + "\",\"epoch\":" + ep + ",\"event\":\"" + event + "\",\"data\":\"" + safe_data + "\"}"
+    // append via printf (LOG 가 shared/harness 하위이므로 디렉토리는 항상 존재)
+    try { exec("printf '%s\\n' " + _shq(line) + " >> " + _shq(LOG)) } catch e {}
+}
+
+fn _shq(s: str) -> str {
+    let mut out = "'"
+    let n = s.len()
+    let mut i: i64 = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "'" { out = out + "'\\''" }
+        else { out = out + c }
+        i = i + 1
+    }
+    out = out + "'"
+    return out
+}
+
+// ─── singleton with stale pid cleanup ────────────────────────────
+fn acquire_lock() -> i64 {
+    // returns 0 on success, 1 on busy, 2 on error
+    _ensure_state_dir()
+    // shot_pid_file 검사 — 본 1-shot 변종 끼리만 상호 배제
+    if file_exists(SHOT_PID_FILE) {
+        let existing = _sh("cat '" + SHOT_PID_FILE + "' 2>/dev/null | tr -d '[:space:]'")
+        if existing.len() > 0 && _pid_alive(existing) {
+            _log_jsonl("busy", "alive_shot_pid=" + existing)
+            eprintln("REJECT: 1-shot daemon already running (pid=" + existing + ")")
+            return 1
+        } else if existing.len() > 0 {
+            _log_jsonl("stale_cleanup", "dead_shot_pid=" + existing)
+            try { exec("rm -f '" + SHOT_PID_FILE + "'") } catch e {}
+        }
+    }
+    // canonical daemon 과는 공존 가능 — PID_FILE 건드리지 않음
+    let mypid = _my_pid()
+    if mypid.len() == 0 {
+        _log_jsonl("error", "my_pid_empty")
+        return 2
+    }
+    try { exec("printf '%s' '" + mypid + "' > '" + SHOT_PID_FILE + "'") } catch e {}
+    _log_jsonl("lock_acquired", "shot_pid=" + mypid)
+    return 0
+}
+
+fn release_lock() {
+    try { exec("rm -f '" + SHOT_PID_FILE + "'") } catch e {}
+    _log_jsonl("lock_released", "")
+}
+
+// ─── tick (growth_tick 위임) ──────────────────────────────────────
+fn run_tick() -> i64 {
+    // shutdown flag 체크
+    if file_exists(SHUTDOWN_FLAG) {
+        _log_jsonl("shutdown_skip", "flag=" + SHUTDOWN_FLAG)
+        return 0
+    }
+    if file_exists(GROWTH_TICK) == false {
+        _log_jsonl("error", "growth_tick missing: " + GROWTH_TICK)
+        eprintln("ERROR: growth_tick.hexa not found")
+        return 2
+    }
+    // canonical daemon 이 실행 중이면 tick 스킵 (중복 성장 방지)
+    if file_exists(PID_FILE) {
+        let canon = _sh("cat '" + PID_FILE + "' 2>/dev/null | tr -d '[:space:]'")
+        if canon.len() > 0 && _pid_alive(canon) {
+            _log_jsonl("skip_canon_alive", "pid=" + canon)
+            return 0
+        }
+    }
+    _log_jsonl("tick_start", "delegate=growth_tick.hexa")
+    // growth_tick.hexa 는 자체 sentinel __HARNESS_GROWTH_RESULT__ 출력
+    let cmd = HEXA_BIN + " run " + GROWTH_TICK + " tick 2>&1"
+    let out = _sh(cmd)
+    let pass = out.index_of("__HARNESS_GROWTH_RESULT__ PASS") >= 0
+    let fail = out.index_of("__HARNESS_GROWTH_RESULT__ FAIL") >= 0
+    if pass {
+        _log_jsonl("tick_pass", "")
+        return 0
+    }
+    if fail {
+        _log_jsonl("tick_fail", "")
+        return 1
+    }
+    _log_jsonl("tick_unknown", "no sentinel in output")
+    return 1
+}
+
+// ─── SIGTERM trap (best-effort: hexa sys_signal 부재 → exit path에 lock release) ──
+// hexa-lang sys_signal 미지원 — main 정상/에러 경로 모두에서 release_lock 호출
+// launchd SIGTERM 강제종료 시 lock 누수는 다음 실행의 stale_cleanup 이 회수
+
+// ─── modes ────────────────────────────────────────────────────────
+fn mode_tick() -> i64 {
+    let lock_rc = acquire_lock()
+    if lock_rc != 0 { return lock_rc }
+    let tick_rc = run_tick()
+    release_lock()
+    return tick_rc
+}
+
+fn mode_status() -> i64 {
+    println("=== nexus_growth_daemon 1-shot status ===")
+    let canon_alive = if file_exists(PID_FILE) {
+        let p = _sh("cat '" + PID_FILE + "' 2>/dev/null | tr -d '[:space:]'")
+        if p.len() > 0 && _pid_alive(p) { "alive pid=" + p } else { "stale-or-dead" }
+    } else { "not-running" }
+    let shot_state = if file_exists(SHOT_PID_FILE) {
+        let p = _sh("cat '" + SHOT_PID_FILE + "' 2>/dev/null | tr -d '[:space:]'")
+        if p.len() > 0 && _pid_alive(p) { "alive pid=" + p } else { "stale" }
+    } else { "idle" }
+    println("  canonical_daemon: " + canon_alive)
+    println("  shot_lock:        " + shot_state)
+    println("  pid_file:         " + PID_FILE)
+    println("  shot_pid_file:    " + SHOT_PID_FILE)
+    println("  shutdown_flag:    " + SHUTDOWN_FLAG)
+    println("  log:              " + LOG)
+    return 0
+}
+
+fn mode_stop() -> i64 {
+    // shutdown_flag 생성 + 기존 shot lock 해제
+    _ensure_state_dir()
+    try { exec("touch '" + SHUTDOWN_FLAG + "'") } catch e {}
+    _log_jsonl("stop_requested", "flag=" + SHUTDOWN_FLAG)
+    try { exec("rm -f '" + SHOT_PID_FILE + "'") } catch e {}
+    println("shutdown flag created: " + SHUTDOWN_FLAG)
+    return 0
+}
+
+fn main() {
+    let argv = args()
+    let mut mode = "tick"
+    if argv.len() >= 3 { mode = argv[2] }
+    let mut rc: i64 = 0
+    if mode == "tick" { rc = mode_tick() }
+    else if mode == "status" { rc = mode_status() }
+    else if mode == "stop" { rc = mode_stop() }
+    else {
+        eprintln("usage: nexus_growth_daemon.hexa [tick|status|stop]")
+        rc = 2
+    }
+    // sentinel (harness exit 미전파 우회)
+    if rc == 0 { print("__HARNESS_DAEMON_RESULT__ PASS") }
+    else { print("__HARNESS_DAEMON_RESULT__ FAIL rc=" + to_string(rc)) }
+}
+
+main()
