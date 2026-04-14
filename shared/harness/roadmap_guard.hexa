@@ -1,0 +1,273 @@
+// roadmap_guard.hexa — 3-프로젝트 로드맵 하네스 강제관리
+//
+// 대상 (SPA 동기 = 단일 진실):
+//   shared/roadmaps/anima.json
+//   shared/roadmaps/nexus.json
+//   shared/roadmaps/n6-architecture.json
+//
+// 서브커맨드:
+//   verify     SCHEMA.json 정합성 (enum/required/pattern) — hard-fail
+//   artifacts  task.artifact 파일 존재 확인 — warn (work-in-progress OK)
+//   status     phase/task 진척도 테이블
+//   all        verify + artifacts + status (리포트 생성)
+//
+// 플래그:
+//   --project <anima|nexus|n6-architecture>  단일 프로젝트만 실행
+//   --report                                  shared/roadmaps/_report.md 쓰기
+//
+// exit codes:
+//   0  PASS (verify 통과, artifacts는 경고만)
+//   1  verify 실패 (schema 위반)
+//   2  usage 에러
+
+let HOME = env("HOME")
+let NEXUS = HOME + "/Dev/nexus"
+let ROADMAPS = NEXUS + "/shared/roadmaps"
+let SCHEMA_PATH = ROADMAPS + "/SCHEMA.json"
+let REPORT_PATH = ROADMAPS + "/_report.md"
+
+fn print_usage() {
+    println("roadmap_guard — 3-project roadmap enforcement")
+    println("")
+    println("  verify     SCHEMA 정합성 (hard-fail)")
+    println("  artifacts  task.artifact 파일 존재 확인 (warn)")
+    println("  status     phase/task 진척도 테이블")
+    println("  all        verify + artifacts + status")
+    println("")
+    println("flags:")
+    println("  --project <anima|nexus|n6-architecture>")
+    println("  --report  (all 모드에서 shared/roadmaps/_report.md 생성)")
+}
+
+// ─── python3 helpers (JSON is easier in python) ────────────────
+// 절대경로 /usr/bin/python3 사용 — hetzner 라우팅 게이트 우회 (R22 허용).
+// tmp 이름은 PID+sequence 로 충돌 회피. write_file 실패해도 exec 는 진행.
+
+let mut _py_seq: i64 = 0
+
+fn run_py(script: str) -> str {
+    _py_seq = _py_seq + 1
+    let tmp = "/tmp/roadmap_guard_" + to_string(_py_seq) + ".py"
+    let _ = write_file(tmp, script)
+    // @allow-bare-interp — 절대경로로 hetzner 라우팅 게이트 우회 (R22)
+    let out = to_string(exec("/usr/bin/python3 " + tmp + " 2>&1"))
+    let _ = exec("rm -f " + tmp)
+    return out
+}
+
+// Build a python snippet that loads one project's JSON and emits a
+// single-line verdict (PASS/FAIL + details). Keeps hexa code compact.
+fn verify_script(project: str) -> str {
+    return "import json, sys, re\n" +
+        "p = '" + ROADMAPS + "/" + project + ".json'\n" +
+        "s = json.load(open('" + SCHEMA_PATH + "'))\n" +
+        "d = json.load(open(p))\n" +
+        "errors = []\n" +
+        "req_top = s.get('required', [])\n" +
+        "for k in req_top:\n" +
+        "    if k not in d: errors.append(f'missing top-level key: {k}')\n" +
+        "meta = d.get('_meta', {})\n" +
+        "meta_schema = s['properties']['_meta']\n" +
+        "for k in meta_schema.get('required', []):\n" +
+        "    if k not in meta: errors.append(f'_meta.{k} missing')\n" +
+        "proj_enum = meta_schema['properties']['project']['enum']\n" +
+        "if meta.get('project') not in proj_enum:\n" +
+        "    errors.append(f\"_meta.project '{meta.get('project')}' not in {proj_enum}\")\n" +
+        "if 'updated' in meta and not re.match(r'^\\d{4}-\\d{2}-\\d{2}', str(meta['updated'])):\n" +
+        "    errors.append(f\"_meta.updated not YYYY-MM-DD format: {meta['updated']}\")\n" +
+        "phases = d.get('phases', [])\n" +
+        "if not isinstance(phases, list): errors.append('phases must be list')\n" +
+        "else:\n" +
+        "    for i, ph in enumerate(phases):\n" +
+        "        pid = ph.get('id','?')\n" +
+        "        if not re.match(r'^P[0-9]+$', str(pid)):\n" +
+        "            # pattern check only; P-number phases are the canonical form.\n" +
+        "            errors.append(f'phases[{i}].id invalid: {pid}')\n" +
+        "        if ph.get('status') not in ('planned','in_progress','done','blocked','aborted','complete'):\n" +
+        "            errors.append(f'phases[{i}].status invalid: {ph.get(\"status\")}')\n" +
+        "if errors:\n" +
+        "    print('FAIL ' + p)\n" +
+        "    for e in errors: print('  · ' + e)\n" +
+        "    sys.exit(1)\n" +
+        "else:\n" +
+        "    print('PASS ' + p + '  (' + str(len(phases)) + ' phases)')\n" +
+        "    sys.exit(0)\n"
+}
+
+fn artifacts_script(project: str) -> str {
+    return "import json, os, sys\n" +
+        "project = \"" + project + "\"\n" +
+        "p = '" + ROADMAPS + "/" + project + ".json'\n" +
+        "d = json.load(open(p))\n" +
+        "missing = []\n" +
+        "total = 0\n" +
+        "found = 0\n" +
+        "base_map = {'anima': '" + HOME + "/Dev/anima', 'nexus': '" + NEXUS + "', 'n6-architecture': '" + HOME + "/Dev/n6-architecture'}\n" +
+        "base = base_map.get(project, '')\n" +
+        "def walk_tasks(phases):\n" +
+        "    for ph in phases:\n" +
+        "        for tr in ph.get('parallel', []):\n" +
+        "            for t in tr.get('tasks', []):\n" +
+        "                yield ph.get('id','?'), tr.get('track','?'), t\n" +
+        "        for t in ph.get('tasks', []):\n" +
+        "            yield ph.get('id','?'), '_', t\n" +
+        "for pid, tr, t in walk_tasks(d.get('phases', [])):\n" +
+        "    art = t.get('artifact')\n" +
+        "    if not art: continue\n" +
+        "    total += 1\n" +
+        "    full = os.path.join(base, art)\n" +
+        "    if os.path.exists(full): found += 1\n" +
+        "    else:\n" +
+        "        tid = t.get('id','?')\n" +
+        "        missing.append((pid, tr, tid, art, t.get('status','?')))\n" +
+        "print(f'[{project}] artifacts {found}/{total} present')\n" +
+        "for pid, tr, tid, art, st in missing:\n" +
+        "    print(f'  MISSING  {pid}/{tr}/{tid:<12} [{st}]  {art}')\n" +
+        "sys.exit(0)\n"
+}
+
+fn status_script(project: str) -> str {
+    return "import json, sys\n" +
+        "project = \"" + project + "\"\n" +
+        "p = '" + ROADMAPS + "/" + project + ".json'\n" +
+        "d = json.load(open(p))\n" +
+        "print(f'=== {project} ===')\n" +
+        "counts = {'done':0,'in_progress':0,'planned':0,'complete':0,'blocked':0,'aborted':0,'other':0}\n" +
+        "task_counts = {'done':0,'todo':0,'in_progress':0,'other':0}\n" +
+        "def walk_tasks(phases):\n" +
+        "    for ph in phases:\n" +
+        "        for tr in ph.get('parallel', []):\n" +
+        "            for t in tr.get('tasks', []):\n" +
+        "                yield t\n" +
+        "        for t in ph.get('tasks', []):\n" +
+        "            yield t\n" +
+        "phases = d.get('phases', [])\n" +
+        "for ph in phases:\n" +
+        "    st = ph.get('status','other')\n" +
+        "    counts[st] = counts.get(st, 0) + 1\n" +
+        "for t in walk_tasks(phases):\n" +
+        "    st = t.get('status') or 'todo'\n" +
+        "    task_counts[st] = task_counts.get(st, 0) + 1\n" +
+        "print(f'  phases: {counts}')\n" +
+        "print(f'  tasks:  {task_counts}')\n" +
+        "for ph in phases:\n" +
+        "    pid = ph.get('id','?'); nm = ph.get('name','?')[:50]; st = ph.get('status','?')\n" +
+        "    mark = {'done':'✓','complete':'✓','in_progress':'→','planned':'·','blocked':'!','aborted':'x'}.get(st,'?')\n" +
+        "    print(f'  [{mark}] {pid} [{st:<12}] {nm}')\n"
+}
+
+// ─── Subcommand runners ────────────────────────────────────────
+
+fn run_verify(projects: [str]) -> i64 {
+    println("=== verify ===")
+    let mut any_fail = false
+    for p in projects {
+        let out = run_py(verify_script(p)).trim()
+        println(out)
+        if out.starts_with("FAIL") { any_fail = true }
+    }
+    if any_fail { return 1 }
+    return 0
+}
+
+fn run_artifacts(projects: [str]) -> i64 {
+    println("=== artifacts ===")
+    for p in projects {
+        let out = run_py(artifacts_script(p)).trim()
+        println(out)
+    }
+    return 0
+}
+
+fn run_status(projects: [str]) -> i64 {
+    println("=== status ===")
+    for p in projects {
+        let out = run_py(status_script(p)).trim()
+        println(out)
+    }
+    return 0
+}
+
+fn write_report(projects: [str]) {
+    let mut body = "# Roadmap Report\n\n"
+    body = body + "Generated by shared/harness/roadmap_guard.hexa\n\n"
+    for p in projects {
+        let v = run_py(verify_script(p)).trim()
+        let a = run_py(artifacts_script(p)).trim()
+        let s = run_py(status_script(p)).trim()
+        body = body + "## " + p + "\n\n"
+        body = body + "### verify\n\n```\n" + v + "\n```\n\n"
+        body = body + "### artifacts\n\n```\n" + a + "\n```\n\n"
+        body = body + "### status\n\n```\n" + s + "\n```\n\n"
+    }
+    let _ = write_file(REPORT_PATH, body)
+    println("report: " + REPORT_PATH)
+}
+
+// ─── CLI entry ─────────────────────────────────────────────────
+
+fn main() {
+    let a = args()
+    if len(a) < 3 {
+        print_usage()
+        exit(2)
+    }
+    let cmd = a[2]
+
+    // Parse optional flags
+    let mut project_filter = ""
+    let mut want_report = false
+    let mut i = 3
+    while i < len(a) {
+        if a[i] == "--project" {
+            if i + 1 < len(a) { project_filter = a[i+1] }
+            i = i + 2
+        } else if a[i] == "--report" {
+            want_report = true
+            i = i + 1
+        } else {
+            i = i + 1
+        }
+    }
+
+    let all_projects = ["anima", "nexus", "n6-architecture"]
+    let mut projects: [str] = []
+    if len(project_filter) > 0 {
+        let mut ok = false
+        for p in all_projects {
+            if p == project_filter { projects = projects + [p]; ok = true }
+        }
+        if ok == false {
+            eprintln("invalid --project: " + project_filter)
+            exit(2)
+        }
+    } else {
+        projects = all_projects
+    }
+
+    let mut rc: i64 = 0
+
+    if cmd == "verify" {
+        rc = run_verify(projects)
+    } else if cmd == "artifacts" {
+        rc = run_artifacts(projects)
+    } else if cmd == "status" {
+        rc = run_status(projects)
+    } else if cmd == "all" {
+        let v = run_verify(projects)
+        let _ = run_artifacts(projects)
+        let _ = run_status(projects)
+        if want_report { write_report(projects) }
+        rc = v
+    } else if cmd == "help" || cmd == "--help" || cmd == "-h" {
+        print_usage()
+        rc = 0
+    } else {
+        eprintln("unknown command: " + cmd)
+        print_usage()
+        rc = 2
+    }
+    exit(rc)
+}
+
+main()
