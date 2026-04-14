@@ -1,0 +1,543 @@
+// roadmap.hexa — user-facing roadmap actions (next/extend/auto)
+//
+// 역할: 사용자가 `roadmap` 명령 입력 시 다음 스텝을 보여주고 (→ `go` 로 실행),
+//       로드맵 소진 시 NEXUS 창발(blowup) 로 다음 phase 를 자동 생성.
+//       verify|artifacts|status|crossref|all 은 roadmap_guard.hexa 에 위임.
+//
+// 서브커맨드:
+//   next      다음 undone task 1 개 출력 (exit 0=found, 42=exhausted)
+//   extend    NEXUS 창발 seed → 새 phase 1 개 append (planned 상태)
+//   auto      next; 소진 시 extend → next 재시도 (사용자가 subcommand 생략 시 기본값)
+//   list      전 5 프로젝트 next 요약
+//   verify|artifacts|status|crossref|all  → roadmap_guard.hexa 위임
+//
+// 플래그:
+//   --project <nexus|anima|anima-train|n6-architecture|zeta-surpass>
+//   --force   extend 시 emergence 실패해도 템플릿으로 append
+//   --dry     extend write 안 함 (plan 만 출력)
+//
+// exit codes:
+//   0   성공 (next found / extend wrote / auto completed)
+//   42  next exhausted (auto 에서만 extend 트리거, 단독 next 는 42 반환)
+//   1   emergence 실패 (--force 없이)
+//   2   usage error
+//   3   write error
+
+let HOME = env("HOME")
+let NEXUS = HOME + "/Dev/nexus"
+let ROADMAPS = NEXUS + "/shared/roadmaps"
+let HARNESS = NEXUS + "/shared/harness"
+let HEXA = NEXUS + "/shared/bin/hexa"
+
+fn print_usage() {
+    println("roadmap — user-facing roadmap actions (next/extend/auto)")
+    println("")
+    println("  next      다음 할일 1개 출력 (exit 42=소진)")
+    println("  extend    NEXUS 창발로 새 phase 1개 append")
+    println("  auto      next; 소진 시 extend → next (기본값)")
+    println("  list      전 프로젝트 next 요약")
+    println("  status    roadmap_guard 위임 (phase/task 진척도)")
+    println("  verify    roadmap_guard 위임 (SCHEMA 정합성)")
+    println("")
+    println("flags:")
+    println("  --project <nexus|anima|anima-train|n6-architecture|zeta-surpass>")
+    println("  --force   extend 시 emergence 실패해도 템플릿으로 append")
+    println("  --dry     extend write 안함 (plan 출력)")
+}
+
+// ─── python3 helper — roadmap_guard.hexa 와 동일 패턴 ─────────────
+// R22: 절대경로 /usr/bin/python3 로 hetzner 라우팅 게이트 우회.
+
+let mut _py_seq: i64 = 0
+
+fn run_py(script: str) -> str {
+    _py_seq = _py_seq + 1
+    let tmp = "/tmp/roadmap_" + to_string(_py_seq) + ".py"
+    let _ = write_file(tmp, script)
+    // @allow-bare-interp
+    let out = to_string(exec("/usr/bin/python3 " + tmp + " 2>&1"))
+    let _ = exec("rm -f " + tmp)
+    return out
+}
+
+fn str_to_i64(s: str) -> i64 {
+    // hexa 에 to_i64/parse_int 없음 — 수동 디지트 파싱.
+    if s.len() == 0 { return 0 }
+    let mut n: i64 = 0
+    let mut i = 0
+    let mut neg = false
+    if s.substring(0, 1) == "-" { neg = true; i = 1 }
+    while i < len(s) {
+        let c = s.substring(i, i + 1)
+        if c == "0" { n = n * 10 }
+        else if c == "1" { n = n * 10 + 1 }
+        else if c == "2" { n = n * 10 + 2 }
+        else if c == "3" { n = n * 10 + 3 }
+        else if c == "4" { n = n * 10 + 4 }
+        else if c == "5" { n = n * 10 + 5 }
+        else if c == "6" { n = n * 10 + 6 }
+        else if c == "7" { n = n * 10 + 7 }
+        else if c == "8" { n = n * 10 + 8 }
+        else if c == "9" { n = n * 10 + 9 }
+        else { return n }
+        i = i + 1
+    }
+    if neg { return 0 - n }
+    return n
+}
+
+fn run_py_exit(script: str) -> [str] {
+    _py_seq = _py_seq + 1
+    let tmp = "/tmp/roadmap_" + to_string(_py_seq) + ".py"
+    let _ = write_file(tmp, script)
+    // @allow-bare-interp
+    let out = to_string(exec("/usr/bin/python3 " + tmp + " 2>&1; echo \"EXIT:$?\""))
+    let _ = exec("rm -f " + tmp)
+    // out 끝에 "EXIT:N" → split
+    let lines = out.split("\n")
+    let mut body = ""
+    let mut code = "0"
+    let mut i = 0
+    while i < len(lines) {
+        let line = lines[i]
+        if line.starts_with("EXIT:") {
+            code = line.substring(5, len(line)).trim()
+        } else {
+            if body.len() > 0 { body = body + "\n" }
+            body = body + line
+        }
+        i = i + 1
+    }
+    return [body, code]
+}
+
+// ─── 프로젝트 감지 ───────────────────────────────────────────────
+// cwd basename 우선, 매핑 테이블 대조. 없으면 "nexus".
+
+fn detect_project() -> str {
+    let cwd = to_string(exec("pwd")).trim()
+    // cwd 끝부분 basename
+    let parts = cwd.split("/")
+    let base = if len(parts) > 0 { parts[len(parts) - 1] } else { "nexus" }
+    let known = ["nexus", "anima", "anima-train", "n6-architecture", "zeta-surpass"]
+    for k in known {
+        if base == k { return k }
+    }
+    // shared/ 내부거나 미매칭 → nexus 기본
+    return "nexus"
+}
+
+fn is_valid_project(p: str) -> bool {
+    let known = ["nexus", "anima", "anima-train", "n6-architecture", "zeta-surpass"]
+    for k in known {
+        if p == k { return true }
+    }
+    return false
+}
+
+// ─── next: 다음 undone task 1개 ──────────────────────────────────
+
+fn next_script(project: str) -> str {
+    return "import json, sys, os\n" +
+        "p = '" + ROADMAPS + "/" + project + ".json'\n" +
+        "if not os.path.exists(p):\n" +
+        "    print(f'MISSING {p}'); sys.exit(2)\n" +
+        "d = json.load(open(p))\n" +
+        "DONE = ('done','complete','aborted','skipped')\n" +
+        "def tstat(t): return t.get('status') or 'todo'\n" +
+        "def walk(phases):\n" +
+        "    for ph in phases:\n" +
+        "        if ph.get('status') in DONE: continue\n" +
+        "        for tr in ph.get('parallel', []):\n" +
+        "            for t in tr.get('tasks', []):\n" +
+        "                if tstat(t) in DONE: continue\n" +
+        "                yield ph, tr.get('track','_'), t\n" +
+        "        for t in ph.get('tasks', []):\n" +
+        "            if tstat(t) in DONE: continue\n" +
+        "            yield ph, '_', t\n" +
+        "phases = d.get('phases', [])\n" +
+        "gen = walk(phases)\n" +
+        "first = next(gen, None)\n" +
+        "proj = d.get('_meta',{}).get('project', '" + project + "')\n" +
+        "if first is None:\n" +
+        "    n_ph = len(phases)\n" +
+        "    done_ph = sum(1 for ph in phases if ph.get('status') in DONE)\n" +
+        "    print(f'EXHAUSTED {proj}  phases:{done_ph}/{n_ph} all-done')\n" +
+        "    sys.exit(42)\n" +
+        "ph, tr, t = first\n" +
+        "name = (t.get('task') or t.get('name') or '?')\n" +
+        "if len(name) > 90: name = name[:87] + '...'\n" +
+        "print(f'NEXT {proj}/{ph.get(\"id\",\"?\")}/{tr}/{t.get(\"id\",\"?\")}  [{tstat(t)}]  {name}')\n" +
+        "print(f'  phase: {ph.get(\"name\",\"?\")[:80]}')\n" +
+        "if ph.get('gate_exit'):\n" +
+        "    ge = ph['gate_exit']\n" +
+        "    if isinstance(ge, dict): ge = ge.get('description') or ge.get('summary') or str(ge)[:80]\n" +
+        "    print(f'  gate:  {str(ge)[:80]}')\n" +
+        "if t.get('artifact'): print(f'  artifact: {t[\"artifact\"]}')\n" +
+        "if t.get('ssot_ref'): print(f'  ssot:     {t[\"ssot_ref\"]}')\n" +
+        "if t.get('depends_on'): print(f'  deps:     {\",\".join(t[\"depends_on\"])}')\n" +
+        "sys.exit(0)\n"
+}
+
+fn run_next(project: str) -> i64 {
+    let r = run_py_exit(next_script(project))
+    print(r[0])
+    if r[0].len() > 0 { println("") }
+    return str_to_i64(r[1])
+}
+
+// ─── extend: NEXUS 창발 seed → 새 phase append ───────────────────
+// Emergence sources (우선순위):
+//   1. shared/discovery/breakthroughs.jsonl  (최근 돌파 signal)
+//   2. shared/bt/bt_keywords.jsonl           (돌파 키워드 풀)
+//   3. shared/discovery/forge_cross_candidates.jsonl (forge 후보)
+//   4. shared/blowup/core/blowup.hexa        (blowup 엔진 직접 호출, 30s timeout)
+//   5. --force 시 템플릿 fallback
+
+fn emergence_collect(project: str) -> str {
+    // JSON payload 형식으로 모든 소스 집계 → python 에 전달
+    let bt_kw = NEXUS + "/shared/bt/bt_keywords.jsonl"
+    let bt_path = NEXUS + "/shared/discovery/breakthroughs.jsonl"
+    let forge = NEXUS + "/shared/discovery/forge_cross_candidates.jsonl"
+
+    let mut payload = "{"
+    // breakthroughs tail 10
+    if file_exists(bt_path) {
+        let out = to_string(exec("tail -10 " + bt_path + " 2>/dev/null"))
+        payload = payload + "\"breakthroughs\":" + json_quote(out) + ","
+    } else {
+        payload = payload + "\"breakthroughs\":\"\","
+    }
+    // bt_keywords all
+    if file_exists(bt_kw) {
+        let out = to_string(exec("cat " + bt_kw + " 2>/dev/null"))
+        payload = payload + "\"keywords\":" + json_quote(out) + ","
+    } else {
+        payload = payload + "\"keywords\":\"\","
+    }
+    // forge candidates tail 10
+    if file_exists(forge) {
+        let out = to_string(exec("tail -10 " + forge + " 2>/dev/null"))
+        payload = payload + "\"forge\":" + json_quote(out) + ","
+    } else {
+        payload = payload + "\"forge\":\"\","
+    }
+    // blowup 은 무거우므로 default off — 환경변수 NEXUS_ROADMAP_BLOWUP=1 일때만
+    let use_blowup = env("NEXUS_ROADMAP_BLOWUP")
+    if use_blowup == "1" {
+        let blowup = NEXUS + "/shared/blowup/core/blowup.hexa"
+        if file_exists(blowup) {
+            let seed = "roadmap:" + project + ":next_phase"
+            // @allow-bare-interp
+            let cmd = "timeout 30 " + HEXA + " run " + blowup + " 2 \"" + seed + "\" 2>&1 | tail -30"
+            let out = to_string(exec(cmd))
+            payload = payload + "\"blowup\":" + json_quote(out) + ","
+        } else {
+            payload = payload + "\"blowup\":\"\","
+        }
+    } else {
+        payload = payload + "\"blowup\":\"\","
+    }
+    payload = payload + "\"project\":\"" + project + "\"}"
+    return payload
+}
+
+fn json_quote(s: str) -> str {
+    // minimal JSON string escape — python 파싱용
+    let mut r = "\""
+    let mut i = 0
+    while i < len(s) {
+        let c = s.substring(i, i + 1)
+        if c == "\\" { r = r + "\\\\" }
+        else if c == "\"" { r = r + "\\\"" }
+        else if c == "\n" { r = r + "\\n" }
+        else if c == "\r" { r = r + "\\r" }
+        else if c == "\t" { r = r + "\\t" }
+        else { r = r + c }
+        i = i + 1
+    }
+    return r + "\""
+}
+
+fn extend_script(project: str, payload_file: str, force: bool, dry: bool) -> str {
+    let force_s = if force { "True" } else { "False" }
+    let dry_s = if dry { "True" } else { "False" }
+    return "import json, sys, os, re, time, shutil\n" +
+        "ROADMAPS = '" + ROADMAPS + "'\n" +
+        "project = '" + project + "'\n" +
+        "force = " + force_s + "\n" +
+        "dry = " + dry_s + "\n" +
+        "payload = json.load(open('" + payload_file + "'))\n" +
+        "p = ROADMAPS + '/' + project + '.json'\n" +
+        "d = json.load(open(p))\n" +
+        "phases = d.get('phases', [])\n" +
+        "# 기존 phase id 최대값\n" +
+        "max_n = -1\n" +
+        "for ph in phases:\n" +
+        "    pid = ph.get('id','P0')\n" +
+        "    m = re.match(r'^P(\\d+)$', pid)\n" +
+        "    if m: max_n = max(max_n, int(m.group(1)))\n" +
+        "new_id = f'P{max_n+1}'\n" +
+        "# 기존 phase 이름 집합 (중복 회피)\n" +
+        "existing_names = set()\n" +
+        "for ph in phases:\n" +
+        "    nm = (ph.get('name') or '').lower()\n" +
+        "    for tok in re.findall(r'[가-힣a-zA-Z0-9]+', nm):\n" +
+        "        if len(tok) >= 2: existing_names.add(tok.lower())\n" +
+        "# ── emergence 시드 추출 ──\n" +
+        "candidates = []\n" +
+        "# breakthroughs.jsonl — keyword|description 추출\n" +
+        "for line in payload.get('breakthroughs','').splitlines():\n" +
+        "    line = line.strip()\n" +
+        "    if not line: continue\n" +
+        "    try:\n" +
+        "        o = json.loads(line)\n" +
+        "        for k in ('keyword','name','title','topic','discovery'):\n" +
+        "            v = o.get(k)\n" +
+        "            if isinstance(v, str) and len(v) >= 3: candidates.append(('bt', v, o))\n" +
+        "    except: pass\n" +
+        "# bt_keywords — keyword 필드\n" +
+        "for line in payload.get('keywords','').splitlines():\n" +
+        "    line = line.strip()\n" +
+        "    if not line: continue\n" +
+        "    try:\n" +
+        "        o = json.loads(line)\n" +
+        "        kw = o.get('keyword')\n" +
+        "        if isinstance(kw, str) and len(kw) >= 2: candidates.append(('kw', kw, o))\n" +
+        "    except: pass\n" +
+        "# forge — candidate.name\n" +
+        "for line in payload.get('forge','').splitlines():\n" +
+        "    line = line.strip()\n" +
+        "    if not line: continue\n" +
+        "    try:\n" +
+        "        o = json.loads(line)\n" +
+        "        for k in ('name','candidate','topic','cluster'):\n" +
+        "            v = o.get(k)\n" +
+        "            if isinstance(v, str) and len(v) >= 3: candidates.append(('fg', v, o))\n" +
+        "    except: pass\n" +
+        "# blowup stdout — EMERGE/candidate 라인에서 토큰 추출\n" +
+        "for line in payload.get('blowup','').splitlines():\n" +
+        "    line = line.strip()\n" +
+        "    if 'EMERGE' in line or 'candidate' in line.lower() or 'seed' in line.lower():\n" +
+        "        toks = re.findall(r'[가-힣a-zA-Z][가-힣a-zA-Z0-9_]{2,}', line)\n" +
+        "        for tok in toks[:3]:\n" +
+        "            candidates.append(('bu', tok, {'line': line}))\n" +
+        "# 기존 phase 이름에 없는 후보 필터\n" +
+        "fresh = []\n" +
+        "for src, name, meta in candidates:\n" +
+        "    nlc = name.lower()\n" +
+        "    toks = re.findall(r'[가-힣a-zA-Z0-9]+', nlc)\n" +
+        "    if any(t in existing_names for t in toks if len(t) >= 3): continue\n" +
+        "    fresh.append((src, name, meta))\n" +
+        "# 소스 우선순위: forge > breakthrough > keyword > blowup\n" +
+        "prio = {'fg':0, 'bt':1, 'kw':2, 'bu':3}\n" +
+        "fresh.sort(key=lambda x: prio.get(x[0], 9))\n" +
+        "# 신 candidate 없으면 --force 아닌 이상 fail\n" +
+        "if not fresh:\n" +
+        "    if not force:\n" +
+        "        print('EMERGENCE_FAIL no fresh candidates (use --force for template fallback)')\n" +
+        "        sys.exit(1)\n" +
+        "    fresh = [('tmpl', 'emergence_' + time.strftime('%Y%m%d'), {})]\n" +
+        "src, seed_name, seed_meta = fresh[0]\n" +
+        "# ── 신 phase 골격 빌드 (SCHEMA 준수) ──\n" +
+        "tracks_keys = list(d.get('tracks', {}).keys())\n" +
+        "if not tracks_keys:\n" +
+        "    tracks_keys = ['MAIN', 'SIDE', 'VERIFY']  # 스키마 minProperties=2, 3 이면 안전\n" +
+        "phase_name = f'창발 단조 — {seed_name}'[:80]\n" +
+        "parallel = []\n" +
+        "for i, trk in enumerate(tracks_keys[:3]):\n" +
+        "    tasks = [{\n" +
+        "        'id': f'{trk}-{new_id}-1',\n" +
+        "        'task': f'{seed_name} ({trk} 트랙) — 설계/구현 초안',\n" +
+        "        'status': 'todo',\n" +
+        "    }, {\n" +
+        "        'id': f'{trk}-{new_id}-2',\n" +
+        "        'task': f'{seed_name} ({trk} 트랙) — 검증/수렴',\n" +
+        "        'status': 'todo',\n" +
+        "    }]\n" +
+        "    parallel.append({'track': trk, 'tasks': tasks})\n" +
+        "new_phase = {\n" +
+        "    'id': new_id,\n" +
+        "    'name': phase_name,\n" +
+        "    'status': 'planned',\n" +
+        "    'parallel': parallel,\n" +
+        "    'gate_exit': f'{seed_name} 3-트랙 통합 완료 — convergence 검증 통과',\n" +
+        "    '_emergence': {\n" +
+        "        'source': src,\n" +
+        "        'seed': seed_name,\n" +
+        "        'generated_at': time.strftime('%Y-%m-%dT%H:%M:%S'),\n" +
+        "        'meta': seed_meta if isinstance(seed_meta, dict) else {'raw': str(seed_meta)[:200]},\n" +
+        "    },\n" +
+        "}\n" +
+        "# ── dry-run: 플랜만 출력 ──\n" +
+        "if dry:\n" +
+        "    print('EXTEND_PLAN')\n" +
+        "    print(json.dumps(new_phase, ensure_ascii=False, indent=2))\n" +
+        "    sys.exit(0)\n" +
+        "# ── 원자적 write: backup → tmp → rename ──\n" +
+        "bak = p + '.bak.' + time.strftime('%Y%m%d_%H%M%S')\n" +
+        "shutil.copy2(p, bak)\n" +
+        "d['phases'].append(new_phase)\n" +
+        "# _meta.updated 갱신\n" +
+        "if '_meta' in d: d['_meta']['updated'] = time.strftime('%Y-%m-%d')\n" +
+        "tmp = p + '.tmp'\n" +
+        "with open(tmp, 'w') as f:\n" +
+        "    json.dump(d, f, ensure_ascii=False, indent=2)\n" +
+        "os.replace(tmp, p)\n" +
+        "print(f'EXTEND_OK {project} +{new_id} \"{phase_name}\"  (source={src}, backup={bak})')\n" +
+        "sys.exit(0)\n"
+}
+
+fn run_extend(project: str, force: bool, dry: bool) -> i64 {
+    // emergence 데이터 수집 → /tmp JSON 파일
+    let payload = emergence_collect(project)
+    _py_seq = _py_seq + 1
+    let payload_file = "/tmp/roadmap_payload_" + to_string(_py_seq) + ".json"
+    let _ = write_file(payload_file, payload)
+    let r = run_py_exit(extend_script(project, payload_file, force, dry))
+    print(r[0])
+    if r[0].len() > 0 { println("") }
+    let _ = exec("rm -f " + payload_file)
+    return str_to_i64(r[1])
+}
+
+// ─── auto: next; 소진 시 extend → next ──────────────────────────
+
+fn run_auto(project: str, force: bool) -> i64 {
+    let rc = run_next(project)
+    if rc == 0 { return 0 }
+    if rc != 42 { return rc }
+    // 소진 → extend
+    println("--- roadmap 소진 감지 → NEXUS 창발 extend ---")
+    let ext = run_extend(project, force, false)
+    if ext != 0 { return ext }
+    println("--- 새 phase 추가됨 → next 재시도 ---")
+    return run_next(project)
+}
+
+// ─── list: 전 프로젝트 next 요약 ────────────────────────────────
+
+fn run_list() -> i64 {
+    let projects = ["nexus", "anima", "anima-train", "n6-architecture", "zeta-surpass"]
+    println("=== roadmap list (5 projects) ===")
+    for p in projects {
+        let r = run_py_exit(next_script(p))
+        let code = r[1]
+        let first_line = r[0].split("\n")[0]
+        let pad = pad_right(p, 18)
+        if code == "42" {
+            println("  " + pad + " EXHAUSTED — extend 필요")
+        } else if code == "0" {
+            println("  " + pad + " " + first_line)
+        } else if code == "2" {
+            println("  " + pad + " MISSING roadmap file")
+        } else {
+            println("  " + pad + " ERROR (exit " + code + ")")
+        }
+    }
+    return 0
+}
+
+fn pad_right(s: str, n: i64) -> str {
+    let mut r = s
+    while r.len() < n { r = r + " " }
+    return r
+}
+
+// ─── delegate: verify|status|artifacts|crossref|all → roadmap_guard ──
+
+fn delegate_guard(rest: [str]) -> i64 {
+    let guard_path = HARNESS + "/roadmap_guard.hexa"
+    if file_exists(guard_path) == false {
+        eprintln("roadmap_guard.hexa not found: " + guard_path)
+        return 2
+    }
+    let mut cmd = HEXA + " run " + guard_path
+    for a in rest { cmd = cmd + " \"" + a.replace("\"", "\\\"") + "\"" }
+    // @allow-bare-interp
+    let out = to_string(exec(cmd + "; echo \"EXIT:$?\""))
+    let lines = out.split("\n")
+    let mut body = ""
+    let mut code = "0"
+    let mut i = 0
+    while i < len(lines) {
+        let line = lines[i]
+        if line.starts_with("EXIT:") {
+            code = line.substring(5, len(line)).trim()
+        } else {
+            if body.len() > 0 { body = body + "\n" }
+            body = body + line
+        }
+        i = i + 1
+    }
+    print(body)
+    return str_to_i64(code)
+}
+
+// ─── CLI entry ───────────────────────────────────────────────────
+
+fn main() {
+    let a = args()
+    // roadmap_guard.hexa 와 동일: a[2] 부터 subcommand
+    if len(a) < 3 {
+        let proj = detect_project()
+        exit(run_auto(proj, false))
+    }
+
+    let cmd = a[2]
+
+    // flags 파싱
+    let mut project = ""
+    let mut force = false
+    let mut dry = false
+    let mut i = 3
+    while i < len(a) {
+        if a[i] == "--project" {
+            if i + 1 < len(a) { project = a[i+1] }
+            i = i + 2
+        } else if a[i] == "--force" {
+            force = true
+            i = i + 1
+        } else if a[i] == "--dry" || a[i] == "--dry-run" {
+            dry = true
+            i = i + 1
+        } else {
+            i = i + 1
+        }
+    }
+
+    if project.len() == 0 {
+        project = detect_project()
+    } else if is_valid_project(project) == false {
+        eprintln("invalid --project: " + project)
+        exit(2)
+    }
+
+    if cmd == "next" {
+        exit(run_next(project))
+    } else if cmd == "extend" {
+        exit(run_extend(project, force, dry))
+    } else if cmd == "auto" {
+        exit(run_auto(project, force))
+    } else if cmd == "list" {
+        exit(run_list())
+    } else if cmd == "status" || cmd == "verify" || cmd == "artifacts" || cmd == "crossref" || cmd == "all" {
+        // 원본 인자 그대로 guard 로 전달 (--project 포함)
+        let mut rest: [str] = [cmd]
+        let mut j = 3
+        while j < len(a) {
+            rest = rest + [a[j]]
+            j = j + 1
+        }
+        exit(delegate_guard(rest))
+    } else if cmd == "help" || cmd == "--help" || cmd == "-h" {
+        print_usage()
+        exit(0)
+    } else {
+        eprintln("unknown subcommand: " + cmd)
+        print_usage()
+        exit(2)
+    }
+}
+
+main()
