@@ -10,6 +10,7 @@ ssot:
   evolution.json       L1→L2→L3→bitter 진화 그래프
   convergence.json     구현 상태 추적
   severity_map.json    H-ERR-ROUTE 분류 SSOT — block/defer/warn (73 lint_rule + 10 gc_kind + 17 exit_signal + 14 source_default)
+  enforcement_registry.json  하네스 강제 레이어 맵 — 각 H-룰 × layer(prompt/pre_write/pre_bash/lint/permissions) × file:fn:line × action. 공용 17 + 프로젝트별(nexus 4). 조회: jq '.rules[] | select(.id=="H-NOHOOK")' ~/.../enforcement_registry.json
 
 engine (.hexa):
   entry.hexa           dispatcher — prompt|pretool|post|guard|self_check 서브커맨드, sub-modules 호출
