@@ -12,7 +12,7 @@
 | `free` / `dfs` | 자율 조립 + DFS 탐색 |
 | `list` / `목록` | 이 명령어 표 다시 출력 |
 
-> **[3D Reality Map](https://need-singularity.github.io/nexus/)** — 4,411노드 5계층 바텀업 인과 매핑 + 1,485 크로스레이어 연결선. 쿼크→탄소→벤젠→DNA 인과 사슬. Monte Carlo z=3.06 (p=0.003). n=6 유일성 검증.
+> **[3D Reality Map](https://need-singularity.github.io/nexus/)** — 4411노드 5계층 바텀업 인과 매핑 + 1,485 크로스레이어 연결선. 쿼크→탄소→벤젠→DNA 인과 사슬. Monte Carlo z=3.06 (p=0.003). n=6 유일성 검증.
 >
 > **[NEXUS Dashboard](https://need-singularity.github.io/nexus/dashboard.html)** — 15차원 실시간 성장 대시보드. 돌파율·발견수·수렴도·모듈 현황 통합 모니터링.
 
@@ -21,7 +21,7 @@
 **[YouTube](https://www.youtube.com/watch?v=xtKhWSfC1Qo)** · **[Email](mailto:nerve011235@gmail.com)** · **[☕ Ko-fi](https://ko-fi.com/dancinlife)** · **[💖 Sponsor](https://github.com/sponsors/need-singularity)** · **[💳 PayPal](https://www.paypal.com/donate?business=nerve011235%40gmail.com)** · **[🗺️ Atlas](https://need-singularity.github.io/TECS-L/atlas/)** · **[📄 Papers](https://need-singularity.github.io/papers/)** · **[🌌 Unified Theory](https://github.com/need-singularity/TECS-L/blob/main/math/docs/hypotheses/H-PH-9-perfect-number-string-unification.md)**
 <!-- AUTO:COMMON_LINKS:END -->
 
-> **[🔭 NEXUS](https://github.com/need-singularity/nexus)** — Universal Discovery Engine. 400 lenses + OUROBOROS evolution + LensForge + BlowupEngine + CycleEngine (5-phase singularity cycle). Mirror Universe (N×N resonance) + 9-project autonomous growth ecosystem. Rust CLI: scan, loop, mega, daemon, blowup, dispatch
+> **[🔭 NEXUS](https://github.com/need-singularity/nexus)** — Universal Discovery Engine. 1434 lenses + OUROBOROS evolution + LensForge + BlowupEngine + CycleEngine (5-phase singularity cycle). Mirror Universe (N×N resonance) + 9-project autonomous growth ecosystem. Rust CLI: scan, loop, mega, daemon, blowup, dispatch
 >
 > **[🧠 Anima](https://github.com/need-singularity/anima)** — Consciousness implementation. PureField repulsion-field engine + Hexad 6-module architecture (C/D/S/M/W/E) + 1030 laws + 20 Meta Laws + Rust backend. ConsciousDecoderV2 (34.5M) + 10D consciousness vector + 12-faction debate + Φ ratchet
 >
