@@ -31,7 +31,10 @@ TOKEN_URL="https://platform.claude.com/v1/oauth/token"
 CLIENT_ID="9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 BETA="oauth-2025-04-20"
 TIMEOUT=10
-CAP=2
+CLI_TIMEOUT=30
+CAP=2  # direct POST cap (IP rate_limit 보호). CLI primary 라 잔여 EXPIRED 영향 없음.
+PERL_TIMEOUT="$NEXUS_ROOT/shared/harness/perl_timeout.sh"
+CLI_LOCK="$CL_HOME/cl-refresh.cli.lock"
 
 # 스크립트 레벨 상태 — trap cleanup 이 함수 return 후에도 참조 가능해야 함.
 td=""
@@ -89,19 +92,35 @@ fetch_usage() {
         -H "Authorization: Bearer $1" -H "anthropic-beta: $BETA" 2>/dev/null
 }
 
-# ── CLI 경유 refresh — direct POST 가 IP rate_limit 걸린 경우 fallback ──
+# ── CLI 경유 refresh — primary path (IP rate_limit 우회 + quota 0) ─────
 # claude CLI 가 startup auth 체크에서 만료 토큰을 내부 refresh path 로 갱신.
 # 이 경로는 Anthropic /v1/oauth/token IP rate_limit 과 별개로 동작.
-# quota 소비 0 (mcp list 는 auth check 만).
+# perl_timeout: hang 방지. mkdir mutex: 7개 동시 호출 시 keychain race 회피.
 refresh_via_cli() {
     local name="$1"
-    local cfg
+    local cfg rc=0 i=0
     cfg=$(jq -r --arg n "$name" '.accounts[] | select(.name==$n) | .config_dir' "$ACCOUNTS" 2>/dev/null)
     [ -n "$cfg" ] && [ -d "$cfg" ] || return 1
     command -v claude >/dev/null 2>&1 || return 1
-    CLAUDE_CONFIG_DIR="$cfg" claude mcp list >/dev/null 2>&1
-    # claude 종료 시 내부 refresh 가 수행됐다면 keychain 에 새 토큰 기록됨.
-    # 성공/실패는 호출자가 keychain 재조회로 판단.
+
+    # 직렬화 mutex (atomic mkdir). 동시 7개 → keychain race 회피.
+    while [ $i -lt 120 ]; do
+        if mkdir "$CLI_LOCK" 2>/dev/null; then break; fi
+        sleep 0.5; i=$((i+1))
+    done
+
+    if [ -x "$PERL_TIMEOUT" ]; then
+        CLAUDE_CONFIG_DIR="$cfg" "$PERL_TIMEOUT" "$CLI_TIMEOUT" \
+            claude mcp list >/dev/null 2>&1
+        rc=$?
+    else
+        CLAUDE_CONFIG_DIR="$cfg" claude mcp list >/dev/null 2>&1
+        rc=$?
+    fi
+
+    rmdir "$CLI_LOCK" 2>/dev/null || true
+    [ $rc -eq 124 ] && log "cli-refresh timeout: $name"
+    # 성공 여부는 호출자가 keychain 재조회로 판단.
     return 0
 }
 
@@ -123,27 +142,29 @@ process_one() {
     if [ "$ea" -lt "$((now + 60000))" ] 2>/dev/null; then
         [ -n "$rt" ] || { echo '{"error":"no-refresh-token"}' > "$out"; return; }
         local new_blob="" method=""
-        # allowed=1 (pre_check_expiry 가 cap 내 선정) → direct POST 시도.
-        # direct 가 rate_limit 으로 실패하거나 allowed=0 (deferred) → CLI fallback.
-        if [ "$allowed" = "1" ]; then
+
+        # CLI primary: IP rate_limit 우회 + quota 0. memory feedback SSOT.
+        refresh_via_cli "$name" || true
+        blob=$(read_blob "$h8")
+        if [ -n "$blob" ]; then
+            at=$(jq -r '.claudeAiOauth.accessToken // empty' <<< "$blob" 2>/dev/null)
+            ea=$(jq -r '.claudeAiOauth.expiresAt // 0'      <<< "$blob" 2>/dev/null)
+            [ "$ea" -ge "$((now + 60000))" ] 2>/dev/null && method="cli"
+        fi
+
+        # CLI 실패 시 direct POST fallback (cap 안에서만 — IP rate_limit 보호).
+        if [ -z "$method" ] && [ "$allowed" = "1" ]; then
             new_blob=$(refresh_token "$rt" "$blob")
             if [ -n "$new_blob" ]; then
                 write_blob "$h8" "$new_blob" || { echo '{"error":"keychain-write"}' > "$out"; return; }
                 at=$(jq -r '.claudeAiOauth.accessToken' <<< "$new_blob" 2>/dev/null)
+                ea=$(jq -r '.claudeAiOauth.expiresAt'   <<< "$new_blob" 2>/dev/null)
                 method="direct"
             fi
         fi
-        if [ -z "$new_blob" ]; then
-            # CLI 경유 fallback. claude 바이너리가 내부 refresh path 로 keychain 갱신.
-            refresh_via_cli "$name" || { echo '{"error":"refresh-failed"}' > "$out"; return; }
-            blob=$(read_blob "$h8")
-            [ -n "$blob" ] || { echo '{"error":"keychain-read-after-cli"}' > "$out"; return; }
-            at=$(jq -r '.claudeAiOauth.accessToken // empty' <<< "$blob" 2>/dev/null)
-            ea=$(jq -r '.claudeAiOauth.expiresAt // 0'      <<< "$blob" 2>/dev/null)
-            if [ "$ea" -lt "$((now + 60000))" ] 2>/dev/null; then
-                echo '{"error":"refresh-failed"}' > "$out"; return
-            fi
-            method="cli"
+
+        if [ -z "$method" ]; then
+            echo '{"error":"refresh-failed"}' > "$out"; return
         fi
         log "refreshed($method): $name"
     fi
