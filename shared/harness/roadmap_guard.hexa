@@ -30,10 +30,11 @@ let REPORT_PATH = ROADMAPS + "/_report.md"
 fn print_usage() {
     println("roadmap_guard — 4-project roadmap enforcement")
     println("")
-    println("  verify     SCHEMA 정합성 (hard-fail)")
+    println("  verify     SCHEMA 정합성 + parent_project/parent_roadmap 존재 (hard-fail)")
     println("  artifacts  task.artifact 파일 존재 확인 (warn)")
     println("  status     phase/task 진척도 테이블")
-    println("  all        verify + artifacts + status")
+    println("  crossref   부모↔자식 의존 맵 + 선행조건 경고 (zeta-surpass ← anima)")
+    println("  all        verify + artifacts + status + crossref")
     println("")
     println("flags:")
     println("  --project <anima|nexus|n6-architecture|zeta-surpass>")
@@ -59,8 +60,9 @@ fn run_py(script: str) -> str {
 // Build a python snippet that loads one project's JSON and emits a
 // single-line verdict (PASS/FAIL + details). Keeps hexa code compact.
 fn verify_script(project: str) -> str {
-    return "import json, sys, re\n" +
-        "p = '" + ROADMAPS + "/" + project + ".json'\n" +
+    return "import json, sys, re, os\n" +
+        "ROADMAPS = '" + ROADMAPS + "'\n" +
+        "p = ROADMAPS + '/" + project + ".json'\n" +
         "s = json.load(open('" + SCHEMA_PATH + "'))\n" +
         "d = json.load(open(p))\n" +
         "errors = []\n" +
@@ -76,6 +78,22 @@ fn verify_script(project: str) -> str {
         "    errors.append(f\"_meta.project '{meta.get('project')}' not in {proj_enum}\")\n" +
         "if 'updated' in meta and not re.match(r'^\\d{4}-\\d{2}-\\d{2}', str(meta['updated'])):\n" +
         "    errors.append(f\"_meta.updated not YYYY-MM-DD format: {meta['updated']}\")\n" +
+        "# crossref — parent_project 가 지정되면 해당 로드맵이 실제로 존재해야\n" +
+        "pp = meta.get('parent_project')\n" +
+        "if pp:\n" +
+        "    parent_enum = meta_schema['properties'].get('parent_project',{}).get('enum', [])\n" +
+        "    if parent_enum and pp not in parent_enum:\n" +
+        "        errors.append(f\"_meta.parent_project '{pp}' not in {parent_enum}\")\n" +
+        "    parent_path = ROADMAPS + '/' + pp + '.json'\n" +
+        "    if not os.path.exists(parent_path):\n" +
+        "        errors.append(f\"parent roadmap missing: {parent_path}\")\n" +
+        "pr = meta.get('parent_roadmap')\n" +
+        "if pr:\n" +
+        "    # parent_roadmap 은 리포 루트 기준 상대경로\n" +
+        "    nexus_root = '" + NEXUS + "'\n" +
+        "    parent_full = os.path.join(nexus_root, pr)\n" +
+        "    if not os.path.exists(parent_full):\n" +
+        "        errors.append(f\"parent_roadmap path missing: {pr}\")\n" +
         "phases = d.get('phases', [])\n" +
         "if not isinstance(phases, list): errors.append('phases must be list')\n" +
         "else:\n" +
@@ -91,7 +109,8 @@ fn verify_script(project: str) -> str {
         "    for e in errors: print('  · ' + e)\n" +
         "    sys.exit(1)\n" +
         "else:\n" +
-        "    print('PASS ' + p + '  (' + str(len(phases)) + ' phases)')\n" +
+        "    parent_hint = f' [parent: {pp}]' if pp else ''\n" +
+        "    print('PASS ' + p + '  (' + str(len(phases)) + ' phases)' + parent_hint)\n" +
         "    sys.exit(0)\n"
 }
 
@@ -189,6 +208,60 @@ fn run_status(projects: [str]) -> i64 {
     return 0
 }
 
+// ─── crossref: 부모↔자식 의존 관계 맵 + 선행조건 경고 ──────────
+fn crossref_script() -> str {
+    return "import json, os\n" +
+        "ROADMAPS = '" + ROADMAPS + "'\n" +
+        "children = {}\n" +
+        "metas = {}\n" +
+        "for proj in ['anima','nexus','n6-architecture','zeta-surpass']:\n" +
+        "    fp = ROADMAPS + '/' + proj + '.json'\n" +
+        "    if not os.path.exists(fp): continue\n" +
+        "    d = json.load(open(fp))\n" +
+        "    m = d.get('_meta', {})\n" +
+        "    metas[proj] = (m, d)\n" +
+        "    pp = m.get('parent_project')\n" +
+        "    if pp:\n" +
+        "        children.setdefault(pp, []).append(proj)\n" +
+        "print('=== crossref ===')\n" +
+        "for parent in ['anima','nexus','n6-architecture']:\n" +
+        "    kids = children.get(parent, [])\n" +
+        "    if not kids: continue\n" +
+        "    print(f'{parent}:')\n" +
+        "    for k in kids:\n" +
+        "        m, d = metas[k]\n" +
+        "        phase_summary = []\n" +
+        "        for ph in d.get('phases', []):\n" +
+        "            phase_summary.append(f\"{ph.get('id','?')}:{ph.get('status','?')}\")\n" +
+        "        print(f'  └─ {k}  parent_roadmap={m.get(\"parent_roadmap\",\"—\")}')\n" +
+        "        print(f'     phases: ' + ' '.join(phase_summary))\n" +
+        "# 선행조건 힌트: 자식 P1 이 진행중/done 인데 부모 관련 phase 가 planned 이면 경고\n" +
+        "warnings = []\n" +
+        "for parent, kids in children.items():\n" +
+        "    if parent not in metas: continue\n" +
+        "    pmeta, pdata = metas[parent]\n" +
+        "    parent_phases = {ph.get('id'): ph.get('status') for ph in pdata.get('phases', [])}\n" +
+        "    for k in kids:\n" +
+        "        _, kdata = metas[k]\n" +
+        "        for ph in kdata.get('phases', []):\n" +
+        "            ks = ph.get('status', 'planned')\n" +
+        "            if ks in ('in_progress','done','complete'):\n" +
+        "                # 부모 동명 phase 가 done 아니면 경고\n" +
+        "                pst = parent_phases.get(ph.get('id'))\n" +
+        "                if pst and pst not in ('done','complete'):\n" +
+        "                    warnings.append(f'{k}/{ph.get(\"id\")} [{ks}] 이 부모 {parent}/{ph.get(\"id\")} [{pst}] 보다 앞섬 — 의존성 역전 가능')\n" +
+        "if warnings:\n" +
+        "    print('')\n" +
+        "    print('warnings:')\n" +
+        "    for w in warnings: print('  ⚠ ' + w)\n"
+}
+
+fn run_crossref() -> i64 {
+    let out = run_py(crossref_script()).trim()
+    println(out)
+    return 0
+}
+
 fn write_report(projects: [str]) {
     let mut body = "# Roadmap Report\n\n"
     body = body + "Generated by shared/harness/roadmap_guard.hexa\n\n"
@@ -254,10 +327,13 @@ fn main() {
         rc = run_artifacts(projects)
     } else if cmd == "status" {
         rc = run_status(projects)
+    } else if cmd == "crossref" {
+        rc = run_crossref()
     } else if cmd == "all" {
         let v = run_verify(projects)
         let _ = run_artifacts(projects)
         let _ = run_status(projects)
+        let _ = run_crossref()
         if want_report { write_report(projects) }
         rc = v
     } else if cmd == "help" || cmd == "--help" || cmd == "-h" {
