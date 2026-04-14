@@ -1,0 +1,549 @@
+// nexus_cli.hexa — 외부 프로젝트(hive 등) 전용 단일 CLI 진입점
+//
+// usage: hexa run shared/engine/nexus_cli.hexa <subcmd> [flags...]
+// wrapper: shared/bin/nexus-cli (bash thin, hexa resolver 경유)
+// spec: shared/engine/nexus_cli_spec.json (SSOT)
+//
+// 설계 원칙:
+//   - hexa-only, 기존 엔진 래핑 (재구현 금지)
+//   - harness 경유 필수 (cmd_gate/permissions_ssot)
+//   - $NEXUS 환경변수 기준, 하드코딩 경로 금지
+//   - exit code: 0 성공, 1 실행오류, 2 인자오류, 3 gate 거부
+//   - default=pretty, --json=기계 파싱
+//   - 모든 호출 shared/logs/nexus_cli.log audit
+//
+// @no-lock-needed
+
+let VERSION = "0.1.0"
+
+// ─── 환경 ───
+
+let HOME = env("HOME")
+let NEXUS = env("NEXUS")
+fn nexus_root() -> str {
+    if NEXUS.len() > 0 { return NEXUS }
+    return HOME + "/Dev/nexus"  // @allow-devpath
+}
+
+let NX = nexus_root()
+let HEXA_BIN = NX + "/shared/bin/hexa"
+let ENTRY = NX + "/shared/harness/entry.hexa"
+let EXEC_VAL = NX + "/shared/harness/exec_validated"
+let BLOWUP = NX + "/shared/blowup/core/blowup.hexa"
+let COMPOSE = NX + "/shared/blowup/compose.hexa"
+let LENS_REG = NX + "/shared/config/lens_registry.json"
+let ATLAS_HEALTH = NX + "/shared/n6/atlas_health.hexa"
+let DISC_QUERY = NX + "/shared/discovery/discovery_query.hexa"
+let LOG_PATH = NX + "/shared/logs/nexus_cli.log"
+
+// ─── 유틸 ───
+
+fn shq(s: str) -> str {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn ts_now() -> str {
+    return exec("date -u '+%Y-%m-%dT%H:%M:%SZ'").trim()
+}
+
+fn sanitize(s: str) -> str {
+    // shell metacharacter 제거 — ; | & $ ` \ " ' < > ( ) { } ! # ~ 개행
+    let bad = [";", "|", "&", "$", "`", "\\", "\"", "'", "<", ">", "(", ")", "{", "}", "!", "#", "~"]
+    let mut out = s.replace("\n", " ").replace("\r", " ")
+    for c in bad {
+        out = out.replace(c, "")
+    }
+    return out.trim()
+}
+
+fn find_flag(a: [str], flag: str, default_val: str) -> str {
+    let n = len(a)
+    let mut i = 0
+    while i < n {
+        if a[i] == flag {
+            if i + 1 < n { return a[i + 1] }
+        }
+        i = i + 1
+    }
+    return default_val
+}
+
+fn has_flag(a: [str], flag: str) -> bool {
+    for x in a {
+        if x == flag { return true }
+    }
+    return false
+}
+
+fn json_mode(a: [str]) -> bool {
+    return has_flag(a, "--json")
+}
+
+fn caller_id(a: [str]) -> str {
+    let c = find_flag(a, "--caller", "")
+    if c.len() > 0 { return c }
+    return "unknown"
+}
+
+// ─── audit log ───
+
+fn audit_log(caller: str, subcmd: str, args_str: str, exit_code: i64, start_ts: str) {
+    let end_ts = ts_now()
+    let line = "{\"ts\":\"" + end_ts + "\",\"caller\":\"" + caller + "\",\"subcmd\":\"" + subcmd + "\",\"args\":\"" + args_str.replace("\"", "\\\"") + "\",\"exit_code\":" + to_string(exit_code) + "}"
+    exec("echo " + shq(line) + " >> " + shq(LOG_PATH) + " 2>/dev/null")
+}
+
+// ─── 엔진 호출 ───
+
+fn run_hexa(script: str, a: [str]) -> str {
+    let mut cmd = shq(HEXA_BIN) + " run " + shq(script)
+    for x in a {
+        cmd = cmd + " " + shq(x)
+    }
+    return exec(cmd + " 2>&1")
+}
+
+fn run_entry(mode: str, rest: [str]) -> str {
+    let mut a = [mode]
+    for x in rest { a = a + [x] }
+    return run_hexa(ENTRY, a)
+}
+
+fn run_exec_validated(mode: str, seed: str, engine: str, extra: [str]) -> str {
+    let mut cmd = shq(EXEC_VAL) + " " + mode + " " + shq(seed) + " " + shq(engine)
+    for x in extra {
+        cmd = cmd + " " + shq(x)
+    }
+    return exec(cmd + " 2>&1")
+}
+
+// ─── JSON 래퍼 ───
+
+fn json_wrap(subcmd: str, body: str) -> str {
+    return "{\"nexus_cli\":\"" + VERSION + "\",\"subcmd\":\"" + subcmd + "\",\"result\":" + shq_json(body) + "}"
+}
+
+fn shq_json(s: str) -> str {
+    // JSON string escaping (최소한)
+    let escaped = s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+    return "\"" + escaped + "\""
+}
+
+fn emit(a: [str], subcmd: str, raw: str) {
+    if json_mode(a) {
+        println(json_wrap(subcmd, raw.trim()))
+    } else {
+        println(raw.trim())
+    }
+}
+
+// ─── subcommand: thinking ───
+
+fn cmd_thinking(a: [str]) {
+    let query = sanitize(find_flag(a, "--query", ""))
+    if query.len() == 0 {
+        eprintln("nexus-cli thinking: --query required")
+        exit(2)
+    }
+    let depth = find_flag(a, "--depth", "6")
+    let raw = run_entry("thinking", ["query", query])
+    emit(a, "thinking", raw)
+}
+
+// ─── subcommand: smash ───
+
+fn cmd_smash(a: [str]) {
+    let seed = sanitize(find_flag(a, "--seed", ""))
+    if seed.len() == 0 {
+        eprintln("nexus-cli smash: --seed required")
+        exit(2)
+    }
+    let depth = find_flag(a, "--depth", "3")
+    let raw = run_exec_validated("smash", seed, BLOWUP, [depth])
+    // cmd_gate REJECT 감지
+    if raw.contains("REJECT") {
+        eprintln("nexus-cli smash: gate 거부 — " + raw.trim())
+        exit(3)
+    }
+    emit(a, "smash", raw)
+}
+
+// ─── subcommand: free ───
+
+fn cmd_free(a: [str]) {
+    let seed = sanitize(find_flag(a, "--seed", ""))
+    if seed.len() == 0 {
+        eprintln("nexus-cli free: --seed required")
+        exit(2)
+    }
+    let dfs = find_flag(a, "--dfs", "3")
+    let raw = run_exec_validated("free_dfs", seed, COMPOSE, ["--modules", "all", "--dfs", dfs])
+    if raw.contains("REJECT") {
+        eprintln("nexus-cli free: gate 거부 — " + raw.trim())
+        exit(3)
+    }
+    emit(a, "free", raw)
+}
+
+// ─── subcommand: lens ───
+
+fn cmd_lens(a: [str]) {
+    let query = sanitize(find_flag(a, "--query", ""))
+    if query.len() == 0 {
+        eprintln("nexus-cli lens: --query required")
+        exit(2)
+    }
+    let top_n = find_flag(a, "--top", "5")
+    // lens_registry.json 에서 grep 으로 매칭 — 기존 파일 재사용
+    let cmd = "grep -i " + shq(query) + " " + shq(LENS_REG) + " | head -n " + top_n
+    let raw = exec(cmd + " 2>&1")
+    if raw.trim().len() == 0 {
+        let msg = "no matching lenses for: " + query
+        emit(a, "lens", msg)
+        return
+    }
+    if json_mode(a) {
+        // 매칭 라인들을 JSON array 로 래핑
+        let lines = raw.trim().split("\n")
+        let mut items = "["
+        let mut first = true
+        for line in lines {
+            if line.trim().len() == 0 { continue }
+            if first == false { items = items + "," }
+            items = items + shq_json(line.trim())
+            first = false
+        }
+        items = items + "]"
+        println("{\"nexus_cli\":\"" + VERSION + "\",\"subcmd\":\"lens\",\"query\":" + shq_json(query) + ",\"matches\":" + items + "}")
+    } else {
+        println("lens search: " + query + " (top " + top_n + ")")
+        println(raw.trim())
+    }
+}
+
+// ─── subcommand: atlas ───
+
+fn cmd_atlas(a: [str]) {
+    let n = len(a)
+    // nexus-cli atlas search "..." [--limit N]
+    // nexus-cli atlas append --node/--edge ...
+    let mut sub = ""
+    // 서브커맨드 찾기 (search | append)
+    let mut i = 0
+    while i < n {
+        if a[i] == "atlas" {
+            if i + 1 < n { sub = a[i + 1] }
+            break
+        }
+        i = i + 1
+    }
+
+    if sub == "search" {
+        let mut query = ""
+        // atlas search 뒤의 non-flag 인자 = 검색어
+        let mut j = i + 2
+        while j < n {
+            if a[j].len() > 0 {
+                if a[j].len() >= 2 {
+                    let prefix = a[j][0..2]
+                    if prefix == "--" {
+                        j = j + 2  // flag + value skip
+                        continue
+                    }
+                }
+                query = sanitize(a[j])
+                break
+            }
+            j = j + 1
+        }
+        let limit = find_flag(a, "--limit", "10")
+        if query.len() == 0 {
+            eprintln("nexus-cli atlas search: query required")
+            exit(2)
+        }
+        // atlas.n6 에서 grep
+        let atlas_path = NX + "/shared/n6/atlas.n6"
+        let cmd = "grep -i " + shq(query) + " " + shq(atlas_path) + " | head -n " + limit
+        let raw = exec(cmd + " 2>&1")
+        emit(a, "atlas search", raw)
+    } else if sub == "append" {
+        let node_json = find_flag(a, "--node", "")
+        let edge_json = find_flag(a, "--edge", "")
+        if node_json.len() == 0 && edge_json.len() == 0 {
+            eprintln("nexus-cli atlas append: --node or --edge required")
+            exit(2)
+        }
+        // atlas_health.hexa 위임 (append 모드 없으면 raw append 안전 래핑)
+        let raw = run_hexa(ATLAS_HEALTH, ["append", if node_json.len() > 0 { node_json } else { edge_json }])
+        emit(a, "atlas append", raw)
+    } else {
+        eprintln("nexus-cli atlas: unknown sub '" + sub + "' — use search|append")
+        exit(2)
+    }
+}
+
+// ─── subcommand: discovery query ───
+
+fn cmd_discovery(a: [str]) {
+    let n = len(a)
+    // nexus-cli discovery query "..."
+    let mut sub = ""
+    let mut i = 0
+    while i < n {
+        if a[i] == "discovery" {
+            if i + 1 < n { sub = a[i + 1] }
+            break
+        }
+        i = i + 1
+    }
+    if sub != "query" {
+        eprintln("nexus-cli discovery: unknown sub '" + sub + "' — use query")
+        exit(2)
+    }
+    // query 뒤의 non-flag 인자
+    let mut query_str = ""
+    let mut j = i + 2
+    while j < n {
+        if a[j].len() > 0 {
+            if a[j].len() >= 2 {
+                let prefix = a[j][0..2]
+                if prefix == "--" {
+                    j = j + 2
+                    continue
+                }
+            }
+            query_str = sanitize(a[j])
+            break
+        }
+        j = j + 1
+    }
+    if query_str.len() == 0 {
+        eprintln("nexus-cli discovery query: query argument required")
+        exit(2)
+    }
+    // discovery_query.hexa 위임 — "recent" 모드로 매핑
+    let raw = run_hexa(DISC_QUERY, ["recent", query_str])
+    emit(a, "discovery", raw)
+}
+
+// ─── subcommand: roadmap ───
+
+fn cmd_roadmap(a: [str]) {
+    let n = len(a)
+    let mut sub = ""
+    let mut i = 0
+    while i < n {
+        if a[i] == "roadmap" {
+            if i + 1 < n { sub = a[i + 1] }
+            break
+        }
+        i = i + 1
+    }
+    if sub != "list" && sub != "status" {
+        eprintln("nexus-cli roadmap: unknown sub '" + sub + "' — use list|status")
+        exit(2)
+    }
+    let project = find_flag(a, "--project", "nexus")
+    let raw = run_entry("roadmap", [sub, "--project", project])
+    emit(a, "roadmap", raw)
+}
+
+// ─── subcommand: bus ───
+
+fn cmd_bus(a: [str]) {
+    let n = len(a)
+    let mut sub = ""
+    let mut i = 0
+    while i < n {
+        if a[i] == "bus" {
+            if i + 1 < n { sub = a[i + 1] }
+            break
+        }
+        i = i + 1
+    }
+    if sub == "publish" {
+        let topic = sanitize(find_flag(a, "--topic", ""))
+        let payload = find_flag(a, "--payload", "")
+        if topic.len() == 0 || payload.len() == 0 {
+            eprintln("nexus-cli bus publish: --topic and --payload required")
+            exit(2)
+        }
+        let msg = topic + " " + payload
+        let raw = run_entry("broadcast", ["append", msg])
+        emit(a, "bus publish", raw)
+    } else if sub == "tail" {
+        let limit = find_flag(a, "--limit", "20")
+        let raw = run_entry("broadcast", ["tail", limit])
+        emit(a, "bus tail", raw)
+    } else if sub == "history" {
+        let limit = find_flag(a, "--limit", "50")
+        let raw = run_entry("broadcast", ["list", limit])
+        emit(a, "bus history", raw)
+    } else {
+        eprintln("nexus-cli bus: unknown sub '" + sub + "' — use publish|tail|history")
+        exit(2)
+    }
+}
+
+// ─── subcommand: status ───
+
+fn cmd_status(a: [str]) {
+    let sc = run_entry("self_check", [])
+    let hp = run_entry("health", ["all"])
+    if json_mode(a) {
+        println("{\"nexus_cli\":\"" + VERSION + "\",\"subcmd\":\"status\",\"self_check\":" + shq_json(sc.trim()) + ",\"health\":" + shq_json(hp.trim()) + "}")
+    } else {
+        println("nexus-cli " + VERSION + " @ " + NX)
+        println("")
+        println("--- harness self-check ---")
+        println(sc.trim())
+        println("")
+        println("--- health ---")
+        println(hp.trim())
+    }
+}
+
+// ─── subcommand: version ───
+
+fn cmd_version() {
+    println("nexus-cli " + VERSION)
+}
+
+// ─── help ───
+
+fn cmd_help() {
+    println("nexus-cli " + VERSION + " — external project CLI (hive 등)")
+    println("")
+    println("usage: nexus-cli <subcmd> [flags...]")
+    println("")
+    println("subcommands:")
+    println("  thinking --query \"...\" [--depth 6]       anima 6-phase reflection")
+    println("  smash --seed \"...\" [--depth 3]           blowup 9-phase 돌파")
+    println("  free --seed \"...\" [--dfs 3]              compose DFS 탐색")
+    println("  lens --query \"...\" [--top 5]             렌즈 검색")
+    println("  atlas search \"...\" [--limit 10]          atlas.n6 검색")
+    println("  atlas append --node/--edge <json>        atlas.n6 추가")
+    println("  discovery query \"...\"                    discovery SQLite 쿼리")
+    println("  roadmap list|status [--project X]        로드맵 조회")
+    println("  bus publish|tail|history                 이벤트 버스")
+    println("  status                                   전체 헬스")
+    println("  version                                  버전 출력")
+    println("")
+    println("global flags:")
+    println("  --json          기계 파싱용 JSON stdout")
+    println("  --caller <name> 외부 호출자 식별 (audit log)")
+    println("  --help, -h      도움말")
+    println("")
+    println("exit codes: 0=성공 1=실행오류 2=인자오류 3=gate거부")
+    println("")
+    println("root: " + NX)
+    println("spec: shared/engine/nexus_cli_spec.json")
+}
+
+fn subcmd_help(sub: str) {
+    if sub == "thinking" {
+        println("nexus-cli thinking --query \"...\" [--depth 6] [--json]")
+        println("  anima 6-phase reflection")
+        println("  --query   (required) 질의 텍스트")
+        println("  --depth   reflection 깊이 (default: 6)")
+    } else if sub == "smash" {
+        println("nexus-cli smash --seed \"...\" [--depth 3] [--json]")
+        println("  blowup 9-phase 특이점 돌파")
+        println("  --seed    (required) 돌파 시드")
+        println("  --depth   돌파 깊이 (default: 3)")
+    } else if sub == "free" {
+        println("nexus-cli free --seed \"...\" [--dfs 3] [--json]")
+        println("  compose 5-module DFS 탐색")
+        println("  --seed    (required) DFS 시드")
+        println("  --dfs     재귀 깊이 (default: 3)")
+    } else if sub == "lens" {
+        println("nexus-cli lens --query \"...\" [--top 5] [--json]")
+        println("  렌즈 레지스트리 검색")
+        println("  --query   (required) 검색 키워드")
+        println("  --top     상위 N개 반환 (default: 5)")
+    } else if sub == "atlas" {
+        println("nexus-cli atlas search \"...\" [--limit 10] [--json]")
+        println("nexus-cli atlas append --node <json> | --edge <json> [--json]")
+        println("  atlas.n6 검색/추가")
+    } else if sub == "discovery" {
+        println("nexus-cli discovery query \"...\" [--json]")
+        println("  discovery_log SQLite 쿼리")
+    } else if sub == "roadmap" {
+        println("nexus-cli roadmap list|status [--project X] [--json]")
+        println("  로드맵 조회 (default project: nexus)")
+    } else if sub == "bus" {
+        println("nexus-cli bus publish --topic <t> --payload <json> [--json]")
+        println("nexus-cli bus tail [--limit 20] [--json]")
+        println("nexus-cli bus history [--limit 50] [--json]")
+        println("  이벤트 버스 — 향후 hive bus 연결")
+    } else if sub == "status" {
+        println("nexus-cli status [--json]")
+        println("  harness self-check + health all 종합")
+    } else {
+        cmd_help()
+    }
+}
+
+// ─── main dispatcher ───
+
+fn main() {
+    let a = args()
+    let n = len(a)
+
+    if n < 3 {
+        cmd_help()
+        return
+    }
+
+    let sub = a[2]
+    let caller = caller_id(a)
+    let start_ts = ts_now()
+
+    // --help 처리 (subcmd --help 또는 subcmd -h)
+    if has_flag(a, "--help") || has_flag(a, "-h") {
+        if sub == "--help" || sub == "-h" || sub == "help" {
+            cmd_help()
+        } else {
+            subcmd_help(sub)
+        }
+        return
+    }
+
+    if sub == "version" { cmd_version(); return }
+    if sub == "help" { cmd_help(); return }
+
+    // dispatch
+    if sub == "thinking" {
+        cmd_thinking(a)
+        audit_log(caller, "thinking", find_flag(a, "--query", ""), 0, start_ts)
+    } else if sub == "smash" {
+        cmd_smash(a)
+        audit_log(caller, "smash", find_flag(a, "--seed", ""), 0, start_ts)
+    } else if sub == "free" {
+        cmd_free(a)
+        audit_log(caller, "free", find_flag(a, "--seed", ""), 0, start_ts)
+    } else if sub == "lens" {
+        cmd_lens(a)
+        audit_log(caller, "lens", find_flag(a, "--query", ""), 0, start_ts)
+    } else if sub == "atlas" {
+        cmd_atlas(a)
+        audit_log(caller, "atlas", "", 0, start_ts)
+    } else if sub == "discovery" {
+        cmd_discovery(a)
+        audit_log(caller, "discovery", "", 0, start_ts)
+    } else if sub == "roadmap" {
+        cmd_roadmap(a)
+        audit_log(caller, "roadmap", find_flag(a, "--project", "nexus"), 0, start_ts)
+    } else if sub == "bus" {
+        cmd_bus(a)
+        audit_log(caller, "bus", "", 0, start_ts)
+    } else if sub == "status" {
+        cmd_status(a)
+        audit_log(caller, "status", "", 0, start_ts)
+    } else {
+        eprintln("nexus-cli: unknown subcommand '" + sub + "'")
+        eprintln("run 'nexus-cli help' for usage")
+        audit_log(caller, sub, "", 2, start_ts)
+        exit(2)
+    }
+}

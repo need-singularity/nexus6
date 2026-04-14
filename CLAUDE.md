@@ -89,6 +89,7 @@ ref:
   conv      shared/convergence/nexus.json
   cl_conv   shared/convergence/cl.json           cl 런처 골화/수렴/진화
   cl_spec   shared/engine/cl_refresh_spec.json   cl-refresh 엔진 스펙
+  cli_spec  shared/engine/nexus_cli_spec.json    nexus-cli 외부 진입점 스펙 (hive 등)
   lenses    shared/config/lens_registry.json     400종
   grammar   shared/config/hexa_grammar.jsonl     hexa-lang+pitfalls P1~P5
   api       shared/CLAUDE.md
