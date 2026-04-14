@@ -34,15 +34,17 @@ fn check_forbidden_ext(tool: str, file_path: str) -> str {
     return "REJECT: " + file_path + " — .py/.rs/.sh 신규 작성 금지 (HEXA-FIRST R1). .hexa로 작성하세요."
 }
 
-// L0: ~/.claude/ 글로벌 수정 차단 (settings.json 제외)
+// L0: ~/.claude/ 및 ~/.claude-<suffix>/ 글로벌 수정 차단 (settings.json 제외)
+//     멀티계정 .claude-claude11/.claude-claude12/ 등도 커버 (2026-04-14)
 fn check_global_claude(tool: str, file_path: str) -> str {
     if tool != "Write" && tool != "Edit" { return "" }
     let h = env("HOME")
-    let prefix = h + "/.claude/"
-    if file_path.starts_with(prefix) == false { return "" }
-    let rel = file_path.substring(prefix.len(), file_path.len())
-    if rel == "settings.json" { return "" }
-    return "REJECT: " + file_path + " — 글로벌 ~/.claude/ 내부 파일 수정 금지 (settings.json 제외). 프로젝트별 .claude/settings.json 경로 사용."
+    let in_main = file_path.starts_with(h + "/.claude/")
+    let in_multi = file_path.starts_with(h + "/.claude-")
+    if in_main == false && in_multi == false { return "" }
+    let base = to_string(exec("basename '" + file_path + "'")).trim()
+    if base == "settings.json" { return "" }
+    return "REJECT: " + file_path + " — 글로벌 ~/.claude*/ 내부 파일 수정 금지 (settings.json 제외). 프로젝트별 .claude/settings.json 경로 사용."
 }
 
 // L0: shared/hooks/, shared/config/ L0 파일 직접 수정 차단
