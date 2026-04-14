@@ -45,7 +45,7 @@ WINDOW_HOURS = 72
 def _run_tracker():
     """Invoke miss_to_exact_tracker.hexa and capture stdout."""
     cp = subprocess.run(
-        [str(HEXA_BIN), "run", str(TRACKER)],
+        [str(HEXA_BIN), str(TRACKER)],
         capture_output=True, text=True, timeout=120, cwd=str(NEXUS),
     )
     if cp.returncode != 0:
