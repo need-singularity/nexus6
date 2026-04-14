@@ -1,0 +1,294 @@
+// h100_idle_guard.hexa — ANIMA + HEXA-LANG H100 유휴 가드 (3-pod enforcement)
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// PURPOSE
+//   모든 가동 중인 H100 pod을 감시해 유휴 상태를 방지한다.
+//   - RunPod GraphQL로 가동 pod 목록 + 상태 조회
+//   - 각 slot의 heartbeat 파일 age 검사 (shared/state/h100_heartbeat/<slot>.json)
+//   - idle_policy.action_sequence 단계적 실행:
+//       5분  → warn (alert jsonl 기록)
+//      10분  → dispatch_fallback (큐 다음 작업 지시)
+//      15분  → terminate (runpodctl pod stop)
+//   - 예산 모니터링 (일일/월간 cap)
+//   - 사람이 읽는 상태표 출력
+//
+// ENFORCED BY
+//   - shared/config/loop/anima.json every_cycle[] → h100_idle_check
+//   - ScheduleWakeup (session-bound, 1200초 간격)
+//   - pre-commit hook (선택 — 과다 pod 기동 방지)
+//
+// SSOT
+//   shared/config/h100_plan.json                 ← 플랜 + 정책
+//   shared/state/h100_heartbeat/<slot>.json      ← pod이 주기 기록
+//   shared/harness/h100_alerts.jsonl             ← 가드 이벤트 로그
+//   ~/.runpod/config.toml                        ← API key
+//
+// USAGE
+//   hexa shared/harness/h100_idle_guard.hexa                # 기본 check
+//   hexa shared/harness/h100_idle_guard.hexa --dry          # 종료 없이 시뮬
+//   hexa shared/harness/h100_idle_guard.hexa --status       # 상태표만
+//   hexa shared/harness/h100_idle_guard.hexa --plan         # 3-pod 플랜표
+// ═══════════════════════════════════════════════════════════════════════════
+
+let HOME = env("HOME")
+let NEXUS = HOME + "/Dev/nexus"
+let PLAN = NEXUS + "/shared/config/h100_plan.json"
+let HB_DIR = NEXUS + "/shared/state/h100_heartbeat"
+let ALERTS = NEXUS + "/shared/harness/h100_alerts.jsonl"
+let RUNPOD_CFG = HOME + "/.runpod/config.toml"
+
+fn sh(cmd: string) -> string {
+    return to_string(exec(cmd + " 2>/dev/null")).trim()
+}
+
+fn sh_stderr(cmd: string) -> string {
+    return to_string(exec(cmd + " 2>&1")).trim()
+}
+
+fn read_api_key() -> string {
+    if file_exists(RUNPOD_CFG) == false { return "" }
+    let raw = sh("grep -E '^apikey' '" + RUNPOD_CFG + "' | head -1 | sed \"s/.*'\\(.*\\)'.*/\\1/\"")
+    return raw
+}
+
+fn file_mtime(path: string) -> int {
+    let s = sh("stat -f '%m' '" + path + "' 2>/dev/null || stat -c '%Y' '" + path + "' 2>/dev/null || echo 0")
+    return to_int(s)
+}
+
+fn now_epoch() -> int {
+    return to_int(sh("date +%s"))
+}
+
+fn iso_now() -> string {
+    return sh("date -u +%Y-%m-%dT%H:%M:%SZ")
+}
+
+fn jsonl_append(line: string) {
+    let esc = line.replace("'", "'\\''")
+    let _ = exec("printf '%s\\n' '" + esc + "' >> '" + ALERTS + "' 2>/dev/null")
+}
+
+// ── Plan loader (uses python3 — matches existing harness pattern) ──────────
+fn plan_get_int(path: string, key: string) -> int {
+    let cmd = "python3 -c \"import json;d=json.load(open('" + path + "'));print(d" + key + ")\" 2>/dev/null"
+    return to_int(sh(cmd))
+}
+
+fn plan_get_str(path: string, key: string) -> string {
+    let cmd = "python3 -c \"import json;d=json.load(open('" + path + "'));print(d" + key + ")\" 2>/dev/null"
+    return sh(cmd)
+}
+
+fn plan_pod_count() -> int {
+    return plan_get_int(PLAN, "['pods'].__len__()")
+}
+
+fn plan_pod_field(idx: int, field: string) -> string {
+    return plan_get_str(PLAN, "['pods'][" + to_string(idx) + "]['" + field + "']")
+}
+
+fn plan_pod_int(idx: int, field: string) -> int {
+    return plan_get_int(PLAN, "['pods'][" + to_string(idx) + "]['" + field + "']")
+}
+
+// ── RunPod GraphQL query ────────────────────────────────────────────────────
+fn query_pods(api_key: string) -> string {
+    if len(api_key) == 0 { return "" }
+    let q = "{\\\"query\\\":\\\"query { myself { pods { id name desiredStatus costPerHr machine { gpuDisplayName } runtime { uptimeInSeconds } } } }\\\"}"
+    let cmd = "curl -s -H 'Authorization: Bearer " + api_key + "' -H 'Content-Type: application/json' -X POST -d \"" + q + "\" https://api.runpod.io/graphql"
+    return sh(cmd)
+}
+
+let TMP_RESP = "/tmp/h100_guard_resp.json"
+
+fn stash_resp(resp: string) {
+    // JSON 응답을 tmp 파일로 저장 (shell quoting 우회)
+    write_file(TMP_RESP, resp)
+}
+
+fn count_running_pods(resp: string) -> int {
+    if len(resp) == 0 { return 0 }
+    stash_resp(resp)
+    let cmd = "python3 -c \"import json;d=json.load(open('" + TMP_RESP + "'));ps=(d.get('data') or {}).get('myself',{}).get('pods') or [];print(sum(1 for p in ps if p.get('desiredStatus')=='RUNNING'))\" 2>/dev/null"
+    return to_int(sh(cmd))
+}
+
+fn total_cost_per_hr(resp: string) -> string {
+    if len(resp) == 0 { return "0.00" }
+    stash_resp(resp)
+    let cmd = "python3 -c \"import json;d=json.load(open('" + TMP_RESP + "'));ps=(d.get('data') or {}).get('myself',{}).get('pods') or [];print('%.2f'%sum(float(p.get('costPerHr') or 0) for p in ps if p.get('desiredStatus')=='RUNNING'))\" 2>/dev/null"
+    let r = sh(cmd)
+    if len(r) == 0 { return "0.00" }
+    return r
+}
+
+// ── Heartbeat age check ─────────────────────────────────────────────────────
+fn hb_age_seconds(slot: string) -> int {
+    let p = HB_DIR + "/" + slot + ".json"
+    if file_exists(p) == false { return -1 }  // never heartbeated
+    let mt = file_mtime(p)
+    if mt == 0 { return -1 }
+    let now = now_epoch()
+    return now - mt
+}
+
+// ── Action: warn / dispatch / terminate ─────────────────────────────────────
+fn emit_alert(slot: string, kind: string, age_sec: int, note: string) {
+    let ts = iso_now()
+    let line = "{\"ts\":\"" + ts + "\",\"slot\":\"" + slot + "\",\"kind\":\"" + kind + "\",\"age_sec\":" + to_string(age_sec) + ",\"note\":\"" + note + "\"}"
+    jsonl_append(line)
+}
+
+fn action_for_age(age_sec: int, kill_minutes: int) -> string {
+    if age_sec < 0 { return "grace" }         // no heartbeat yet
+    let m = age_sec / 60
+    if m >= kill_minutes { return "terminate" }
+    if m >= (kill_minutes * 2 / 3) { return "dispatch_fallback" }
+    if m >= (kill_minutes / 3) { return "warn" }
+    return "ok"
+}
+
+fn dispatch_fallback(slot: string, fq_hint: string) {
+    // 현 단계 구현: alert jsonl에 "need fallback"만 기록 (loop.hexa가 읽고 에이전트 발사)
+    emit_alert(slot, "dispatch_fallback", 0, "hint=" + fq_hint)
+    println("  → fallback 권장: " + fq_hint)
+}
+
+fn terminate_pod(slot: string, dry: bool) -> string {
+    if dry { return "dry-run (skipped terminate)" }
+    // 현 단계 구현: runpodctl에 id 매핑 필요 (다음 iter). 지금은 alert로 마킹.
+    // 실제 kill은 pod_id 매핑 후 mutation podStop 수행.
+    emit_alert(slot, "terminate_requested", 0, "pod_id 매핑 필요 — alert jsonl 소비 후 Claude가 runpodctl pod stop 실행")
+    return "terminate alert emitted"
+}
+
+// ── Status table ────────────────────────────────────────────────────────────
+fn print_plan_table() {
+    println("")
+    println("═══ H100 3-POD PLAN ══════════════════════════════════════════════════")
+    let n = plan_pod_count()
+    println("  slot                role                              budget/day  idle_kill")
+    println("  ─────────────────── ────────────────────────────────  ──────────  ─────────")
+    let mut i = 0
+    while i < n {
+        let slot = plan_pod_field(i, "slot")
+        let role = plan_pod_field(i, "role")
+        let budget = plan_pod_int(i, "budget_usd_per_day_max")
+        let kill = plan_pod_int(i, "idle_kill_minutes")
+        let role_trim = if role.len() > 32 { role.substring(0, 32) } else { role }
+        println("  " + rpad(slot, 19) + " " + rpad(role_trim, 33) + " $" + rpad(to_string(budget), 9) + " " + to_string(kill) + "min")
+        i = i + 1
+    }
+    let daily = plan_get_int(PLAN, "['limits']['daily_budget_usd_total']")
+    let monthly = plan_get_int(PLAN, "['cost']['monthly_cap_usd']")
+    let maxp = plan_get_int(PLAN, "['limits']['max_concurrent_pods']")
+    let auto = plan_get_int(PLAN, "['limits']['auto_launch_authorized']")
+    println("")
+    println("  limits: max_pods=" + to_string(maxp) + "  daily=$" + to_string(daily) + "  monthly=$" + to_string(monthly) + "  auto_launch≤" + to_string(auto))
+    println("══════════════════════════════════════════════════════════════════════")
+}
+
+fn rpad(s: string, n: int) -> string {
+    let mut r = s
+    while r.len() < n { r = r + " " }
+    return r
+}
+
+fn print_status(running_pods: int, cost_per_hr: string) {
+    println("")
+    println("═══ H100 GUARD STATUS ═════════════════════════════════════════════════")
+    println("  time:         " + iso_now())
+    println("  running pods: " + to_string(running_pods))
+    println("  $/hr now:     " + cost_per_hr)
+    println("  slot                hb_age       action")
+    println("  ─────────────────── ────────────  ────────────────────")
+    let n = plan_pod_count()
+    let mut i = 0
+    while i < n {
+        let slot = plan_pod_field(i, "slot")
+        let kill = plan_pod_int(i, "idle_kill_minutes")
+        let age = hb_age_seconds(slot)
+        let age_s = if age < 0 { "(none)" } else { to_string(age / 60) + "m" + to_string(age % 60) + "s" }
+        let act = action_for_age(age, kill)
+        println("  " + rpad(slot, 19) + " " + rpad(age_s, 12) + " " + act)
+        i = i + 1
+    }
+    println("══════════════════════════════════════════════════════════════════════")
+}
+
+// ── Main ────────────────────────────────────────────────────────────────────
+fn main() {
+    let argv = args()
+    let mut dry = false
+    let mut status_only = false
+    let mut plan_only = false
+    for a in argv {
+        if a == "--dry" { dry = true }
+        else if a == "--status" { status_only = true }
+        else if a == "--plan" { plan_only = true }
+    }
+
+    if plan_only {
+        print_plan_table()
+        return
+    }
+
+    if file_exists(PLAN) == false {
+        println("REJECT: plan missing: " + PLAN)
+        return
+    }
+
+    let _ = exec("mkdir -p '" + HB_DIR + "' 2>/dev/null")
+
+    let api_key = read_api_key()
+    let pods_json = query_pods(api_key)
+    let running = count_running_pods(pods_json)
+    let costhr = total_cost_per_hr(pods_json)
+
+    print_plan_table()
+    print_status(running, costhr)
+
+    if status_only { return }
+
+    // enforcement pass
+    let n = plan_pod_count()
+    let mut actions_taken = 0
+    let mut i = 0
+    while i < n {
+        let slot = plan_pod_field(i, "slot")
+        let kill = plan_pod_int(i, "idle_kill_minutes")
+        let age = hb_age_seconds(slot)
+        let act = action_for_age(age, kill)
+        if act == "warn" {
+            emit_alert(slot, "warn", age, "heartbeat stale ≥ " + to_string(kill / 3) + "min")
+            actions_taken = actions_taken + 1
+        }
+        else if act == "dispatch_fallback" {
+            let fq = plan_get_str(PLAN, "['pods'][" + to_string(i) + "]['fallback_queue_keys'][0]")
+            dispatch_fallback(slot, fq)
+            actions_taken = actions_taken + 1
+        }
+        else if act == "terminate" {
+            let r = terminate_pod(slot, dry)
+            println("  [TERMINATE] " + slot + " — " + r)
+            actions_taken = actions_taken + 1
+        }
+        i = i + 1
+    }
+
+    // budget alert
+    let daily = plan_get_int(PLAN, "['limits']['daily_budget_usd_total']")
+    let projected = to_int(sh("python3 -c \"print(int(float('" + costhr + "')*24))\" 2>/dev/null"))
+    if projected > daily {
+        emit_alert("_global", "budget_over", projected, "24h projection $" + to_string(projected) + " > daily cap $" + to_string(daily))
+        println("  [BUDGET] 24h projection $" + to_string(projected) + " > cap $" + to_string(daily))
+        actions_taken = actions_taken + 1
+    }
+
+    println("")
+    println("guard: " + to_string(actions_taken) + " action(s) emitted → " + ALERTS)
+    if dry { println("(dry-run — no terminations executed)") }
+}
+
+main()
