@@ -1,0 +1,335 @@
+// balance_guard.hexa — 3-전선 WFQ 균형 가드
+//
+// SSOT: shared/config/balance.json
+// 호출: hexa run shared/harness/balance_guard.hexa {measure|check} [days]
+//
+// 3 전선:
+//   A impl  — zeta-surpass 파리티, anima phase 구현, 서빙 엔드포인트
+//   B train — anima-train 체크포인트 실산출, bench 검증
+//   C hexa  — hexa-lang interpreter/stage0, shared/harness/ 최적화
+//
+// 규칙:
+//   - 7 일 rolling window 에서 3 repo (nexus/anima/hexa-lang) 커밋 집계
+//   - 커밋 subject 에 `A:impl`, `B:train`, `C:hexa` 태그 포함 → 분류
+//   - 태그 없으면 변경 파일 경로로 fallback (C > B > A 우선 tie-break)
+//   - 중립 prefix (chore/docs/ref/wip/test/style/refactor/ci) → N 제외
+//   - balance score = 1 − 0.5 × sum(|target − actual|)    (total variation)
+//     ≥ 0.7  healthy
+//     ≥ 0.4  warn (뒤처진 전선 권장)
+//     < 0.4  BLOCK (enforcement=block 시)
+//   - bootstrap 기간 (2026-04-21 까지): BLOCK → WARN 자동 다운그레이드
+//
+// sentinel:
+//   __HARNESS_BALANCE__ PASS  score=... a=... b=... c=...
+//   __HARNESS_BALANCE__ WARN  ...
+//   __HARNESS_BALANCE__ BLOCK ...
+//
+// commit.hexa step 4c 가 이 sentinel 을 읽어 체인 verdict 갱신.
+
+let HOME = env("HOME")
+let NEXUS = HOME + "/Dev/nexus"
+let ANIMA = HOME + "/Dev/anima"
+let HEXA_LANG = HOME + "/Dev/hexa-lang"
+
+fn _str(v) -> string { return to_string(v) }
+
+fn _to_int0(s: string) -> i64 {
+    let t = s.trim()
+    if t.len() == 0 { return 0 }
+    return to_int(t)
+}
+
+fn iabs(x: i64) -> i64 {
+    if x < 0 { return 0 - x }
+    return x
+}
+
+// ─── git log window ──────────────────────────────────────────
+
+fn git_log_window(repo: string, days: i64) -> string {
+    let cmd = "cd '" + repo + "' && git log --since='" + to_string(days) + " days ago' --format='%H|%s' 2>/dev/null"
+    return _str(exec(cmd)).trim()
+}
+
+// ─── subject 분류 ────────────────────────────────────────────
+
+fn is_neutral(subject: string) -> bool {
+    let prefixes = ["chore", "docs", "ref", "wip", "refactor", "test", "style", "ci"]
+    let mut i = 0
+    while i < prefixes.len() {
+        let p = _str(prefixes[i])
+        if subject.starts_with(p + "(") { return true }
+        if subject.starts_with(p + ":") { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn classify_subject(subject: string) -> string {
+    if subject.contains("A:impl") { return "A" }
+    if subject.contains("B:train") { return "B" }
+    if subject.contains("C:hexa") { return "C" }
+    if is_neutral(subject) { return "N" }
+    return "U"
+}
+
+// ─── path 분류 (fallback) ────────────────────────────────────
+
+fn path_front(f: string) -> string {
+    // C 전선 — 하네스/hexa-lang/interpreter (최우선)
+    if f.starts_with("hexa-lang/") { return "C" }
+    if f.starts_with("shared/harness/") { return "C" }
+    if f == "shared/roadmaps/hexa-lang.json" { return "C" }
+    if f == "shared/config/balance.json" { return "C" }
+    if f.contains("build_c.hexa") { return "C" }
+    if f.contains("interpreter") { return "C" }
+    if f.contains("stage0") { return "C" }
+
+    // B 전선 — 학습/체크포인트/anima-train
+    if f.starts_with("training/") { return "B" }
+    if f.starts_with("anima-models/") { return "B" }
+    if f == "shared/roadmaps/anima-train.json" { return "B" }
+    if f.starts_with("bench/train_") { return "B" }
+    if f.starts_with("bench/persona_") { return "B" }
+    if f.starts_with("bench/clm_") { return "B" }
+    if f.starts_with("bench/alm_") { return "B" }
+    if f.starts_with("anima-agent/trading/") { return "B" }
+
+    // A 전선 — 구현/서빙/zeta-surpass
+    if f.starts_with("anima/modules/") { return "A" }
+    if f.starts_with("anima/core/") { return "A" }
+    if f.starts_with("anima-core/") { return "A" }
+    if f.starts_with("serving/") { return "A" }
+    if f.starts_with("web/") { return "A" }
+    if f.starts_with("bench/zeta_") { return "A" }
+    if f.starts_with("bench/bench_") { return "A" }
+    if f == "shared/roadmaps/zeta-surpass.json" { return "A" }
+    if f == "shared/roadmaps/anima.json" { return "A" }
+    if f.starts_with("docs/roadmap/") { return "A" }
+
+    return "U"
+}
+
+fn classify_by_paths(repo: string, sha: string) -> string {
+    let cmd = "cd '" + repo + "' && git show --name-only --format='' " + sha + " 2>/dev/null"
+    let raw = _str(exec(cmd)).trim()
+    if raw.len() == 0 { return "U" }
+    let lines = raw.split("\n")
+    let mut ca = 0
+    let mut cb = 0
+    let mut cc = 0
+    let mut i = 0
+    while i < lines.len() {
+        let f = _str(lines[i]).trim()
+        if f.len() > 0 {
+            let front = path_front(f)
+            if front == "A" { ca = ca + 1 }
+            if front == "B" { cb = cb + 1 }
+            if front == "C" { cc = cc + 1 }
+        }
+        i = i + 1
+    }
+    // Tie-break: C > B > A (높은 우선순위 전선)
+    if cc > 0 && cc >= cb && cc >= ca { return "C" }
+    if cb > 0 && cb >= ca { return "B" }
+    if ca > 0 { return "A" }
+    return "U"
+}
+
+// ─── measure all repos ──────────────────────────────────────
+// Returns [a, b, c, n, u] as int array.
+
+fn measure_all(days: i64) -> [i64] {
+    let repos = [NEXUS, ANIMA, HEXA_LANG]
+    let mut a = 0
+    let mut b = 0
+    let mut c = 0
+    let mut n = 0
+    let mut u = 0
+    let mut i = 0
+    while i < repos.len() {
+        let r = _str(repos[i])
+        let raw = git_log_window(r, days)
+        if raw.len() > 0 {
+            let lines = raw.split("\n")
+            let mut j = 0
+            while j < lines.len() {
+                let line = _str(lines[j]).trim()
+                if line.len() > 0 {
+                    let parts = line.split("|")
+                    if parts.len() >= 2 {
+                        let sha = _str(parts[0])
+                        let subject = _str(parts[1])
+                        let tag = classify_subject(subject)
+                        let final_tag = if tag == "U" { classify_by_paths(r, sha) } else { tag }
+                        if final_tag == "A" { a = a + 1 }
+                        else if final_tag == "B" { b = b + 1 }
+                        else if final_tag == "C" { c = c + 1 }
+                        else if final_tag == "N" { n = n + 1 }
+                        else { u = u + 1 }
+                    }
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    let mut out: [i64] = []
+    out = out.push(a)
+    out = out.push(b)
+    out = out.push(c)
+    out = out.push(n)
+    out = out.push(u)
+    return out
+}
+
+// ─── balance score ──────────────────────────────────────────
+// 부동소수 연산이 인터프리터에서 불안정 — 전부 int × 1000 스케일.
+
+fn compute_balance_x1000(a: i64, b: i64, c: i64) -> i64 {
+    // Returns balance × 1000. Range [0, 1000].
+    let total = a + b + c
+    if total == 0 { return 1000 }
+    // actual × 1000
+    let ra = (a * 1000) / total
+    let rb = (b * 1000) / total
+    let rc = (c * 1000) / total
+    // target × 1000: A=330, B=340, C=330
+    let da = iabs(ra - 330)
+    let db = iabs(rb - 340)
+    let dc = iabs(rc - 330)
+    let tv = (da + db + dc) / 2   // TV distance × 1000
+    let raw = 1000 - tv
+    if raw < 0 { return 0 }
+    return raw
+}
+
+fn floor_violations(a: i64, b: i64, c: i64) -> string {
+    let total = a + b + c
+    if total == 0 { return "" }
+    let ra = (a * 1000) / total
+    let rb = (b * 1000) / total
+    let rc = (c * 1000) / total
+    // floor = target × 0.5 × 1000: A=165, B=170, C=165
+    let mut out = ""
+    if ra < 165 { out = out + "A " }
+    if rb < 170 { out = out + "B " }
+    if rc < 165 { out = out + "C " }
+    return out.trim()
+}
+
+fn verdict_from_balance_x1000(balance_x1000: i64, violations: string, total: i64) -> string {
+    if total == 0 { return "PASS" }
+    // healthy ≥ 700, warn ≥ 400, block < 400
+    if balance_x1000 >= 700 && violations.len() == 0 { return "PASS" }
+    if balance_x1000 >= 400 { return "WARN" }
+    return "BLOCK"
+}
+
+fn format_score(x1000: i64) -> string {
+    // "0.591" 형태로 출력.
+    let whole = x1000 / 1000
+    let frac = x1000 - whole * 1000
+    let mut fs = to_string(frac)
+    while fs.len() < 3 { fs = "0" + fs }
+    return to_string(whole) + "." + fs
+}
+
+// bootstrap 기간 (2026-04-21 까지) — BLOCK → WARN 다운그레이드.
+fn downgrade_if_bootstrap(verdict: string) -> string {
+    // 단순 date check: `date +%Y%m%d` < 20260421 → bootstrap.
+    let today = _str(exec("date +%Y%m%d")).trim()
+    if today.len() == 0 { return verdict }
+    let today_n = _to_int0(today)
+    if today_n < 20260421 {
+        if verdict == "BLOCK" { return "WARN" }
+    }
+    return verdict
+}
+
+// ─── commands ───────────────────────────────────────────────
+
+fn cmd_measure(days: i64) {
+    let counts = measure_all(days)
+    let a = counts[0]
+    let b = counts[1]
+    let c = counts[2]
+    let n = counts[3]
+    let u = counts[4]
+    let total_cl = a + b + c
+    let total_all = total_cl + n + u
+    let bx = compute_balance_x1000(a, b, c)
+    let violations = floor_violations(a, b, c)
+    let raw_verdict = verdict_from_balance_x1000(bx, violations, total_cl)
+    let verdict = downgrade_if_bootstrap(raw_verdict)
+
+    // 실제 비율 (×10 = %)
+    let total_safe = if total_cl > 0 { total_cl } else { 1 }
+    let pa = (a * 1000) / total_safe
+    let pb = (b * 1000) / total_safe
+    let pc = (c * 1000) / total_safe
+
+    println("=== balance_guard — 3-전선 WFQ (" + to_string(days) + " day window) ===")
+    println("  repos:           nexus + anima + hexa-lang")
+    println("  total commits:   " + to_string(total_all))
+    println("  classified A+B+C:" + to_string(total_cl))
+    println("  neutral (chore): " + to_string(n))
+    println("  unclassified:    " + to_string(u))
+    println("")
+    println("  A impl  : " + to_string(a) + "   " + format_score(pa) + "  (target 0.33)")
+    println("  B train : " + to_string(b) + "   " + format_score(pb) + "  (target 0.34)")
+    println("  C hexa  : " + to_string(c) + "   " + format_score(pc) + "  (target 0.33)")
+    println("")
+    println("  balance score:   " + format_score(bx) + " / 1.000")
+    if violations.len() > 0 {
+        println("  floor violation: " + violations + " (아래 floor = target × 0.5)")
+    }
+    println("  raw verdict:     " + raw_verdict)
+    if verdict != raw_verdict {
+        println("  downgraded:      " + verdict + " (bootstrap 기간, 2026-04-21 까지)")
+    }
+    if verdict == "WARN" || verdict == "BLOCK" {
+        println("")
+        println("  → 권장: 뒤처진 전선의 task 에 다음 커밋 할당")
+        if violations.contains("A") {
+            println("     A impl:  zeta-surpass P1/P2 또는 anima P2/P3 구현")
+        }
+        if violations.contains("B") {
+            println("     B train: anima-train TALM-P1-1 (14B r4 수렴) / TCLM-P1-1 (CLM d64 KR)")
+        }
+        if violations.contains("C") {
+            println("     C hexa:  hexa-lang P3 interpreter native (TCC-P3-*)")
+        }
+    }
+}
+
+fn cmd_check(days: i64) {
+    let counts = measure_all(days)
+    let a = counts[0]
+    let b = counts[1]
+    let c = counts[2]
+    let n = counts[3]
+    let u = counts[4]
+    let total_cl = a + b + c
+    let bx = compute_balance_x1000(a, b, c)
+    let violations = floor_violations(a, b, c)
+    let raw_verdict = verdict_from_balance_x1000(bx, violations, total_cl)
+    let verdict = downgrade_if_bootstrap(raw_verdict)
+    println("__HARNESS_BALANCE__ " + verdict + " score=" + format_score(bx) + " a=" + to_string(a) + " b=" + to_string(b) + " c=" + to_string(c) + " n=" + to_string(n) + " u=" + to_string(u) + " violations=" + violations)
+}
+
+fn main() {
+    let argv = args()
+    let mode = if argv.len() >= 3 { argv[2].trim() } else { "measure" }
+    let days = if argv.len() >= 4 { _to_int0(_str(argv[3])) } else { 7 }
+    if mode == "measure" {
+        cmd_measure(days)
+    } else if mode == "check" {
+        cmd_check(days)
+    } else {
+        eprintln("usage: balance_guard.hexa {measure|check} [days]")
+        exit(2)
+    }
+}
+
+main()
