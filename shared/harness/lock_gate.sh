@@ -35,7 +35,13 @@ case "$cmd" in
             # age≤5s 구간은 무조건 보호 — bash 서브쉘 race (각 invocation 별 PID) 방지
             if [ -f "$lock/pid" ]; then
                 oldpid=$(cat "$lock/pid" 2>/dev/null)
-                oldts=$(cat "$lock/ts" 2>/dev/null || echo 0)
+                oldts=$(cat "$lock/ts" 2>/dev/null)
+                # cat-cat split race — release 가 사이에 rm -rf 한 경우 빈값.
+                # 빈값 stale=age 거대 오판 방지: 짧게 기다리고 재시도.
+                if [ -z "$oldpid" ] || [ -z "$oldts" ]; then
+                    sleep 0.1
+                    continue
+                fi
                 age=$(( $(date +%s) - oldts ))
                 stale=0
                 if [ "$age" -gt 600 ]; then
@@ -64,9 +70,8 @@ case "$cmd" in
         # 외에 hexa exec() 는 매번 새 bash subshell PID 라 strict 매칭 불가능.
         # NEXUS_LOCK_STRICT=1 명시 시에만 PID 검증.
         if [ -n "$NEXUS_LOCK_STRICT" ]; then
-            if [ -f "$lock/pid" ] && [ "$(cat "$lock/pid" 2>/dev/null)" = "$$" ]; then
-                rm -rf "$lock"
-            fi
+            # TOCTOU window 최소화 — 한 줄로 압축. flock 없이 완전 제거 불가능 (잔존 race).
+            [ -d "$lock" ] && [ "$(cat "$lock/pid" 2>/dev/null)" = "$$" ] && rm -rf "$lock"
         else
             rm -rf "$lock"
         fi
