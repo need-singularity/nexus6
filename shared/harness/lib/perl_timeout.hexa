@@ -1,0 +1,212 @@
+// ═══════════════════════════════════════════════════════════
+// lib/perl_timeout.hexa — timeout wrapper (hexa port of perl_timeout.sh)
+// H-NOZOMBIE 좀비 5층 방어 Layer 1 — timeout 강제.
+//
+// 실체: perl alarm() syscall (hexa signal primitive 부재).
+//       hexa 로직: 인자검증 + env bypass + 진단 로깅. 실제 timeout 은
+//       sys_perl_timeout 한 줄 wrapper (perl -e 'alarm N; exec @ARGV') 위임.
+//
+// usage (hexa run):
+//   hexa run lib/perl_timeout.hexa <seconds> <cmd> [args...]
+//
+// exit code (stdout sentinel __PERL_TIMEOUT_RC__ N — f-hexa-exit-sentinel):
+//   0..255   자식 프로세스 exit code
+//   124      timeout 발동 (TERM→KILL 단계)
+//   2        usage error
+//   127      perl 없음 / exec 실패
+//
+// 우회: NEXUS_NO_TIMEOUT=1 → timeout 미적용, 그대로 exec (exit code 전파)
+// 호출자 공존 경로: 기존 perl_timeout.sh 그대로 유지 (shell entry, exit 직접 반영)
+//   이 파일은 hexa 내부 호출자용 대체 경로 — .sh 부재 시 fallback 에 사용.
+// ═══════════════════════════════════════════════════════════
+
+fn _pt_str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn emit_rc(rc: i64) {
+    println("__PERL_TIMEOUT_RC__ " + to_string(rc))
+}
+
+fn shq(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+// ─── perl 존재 여부 ───
+fn perl_present() -> bool {
+    let r = _pt_str(exec("command -v perl >/dev/null 2>&1 && echo Y || echo N")).trim()
+    return r == "Y"
+}
+
+// ─── perl alarm+fork+setsid wrapper 를 inline 으로 실행 ───
+// perl_timeout.sh 의 Perl 스크립트와 동일. stdout/stderr 모두 투과.
+// 반환: 자식 exit code (0..255), 124 (timeout), 127 (exec 실패)
+// 방식: perl 의 실제 exit 은 shell $? 로 잡기 위해 `; echo __RC__=$?` sentinel 패턴.
+fn run_perl_timeout(timeout_s: i64, cmd_parts: [string]) -> i64 {
+    // perl 인자 리스트 조립 (각 인자 shq)
+    let mut perl_args = to_string(timeout_s)
+    let nparts = len(cmd_parts)
+    let mut i: i64 = 0
+    while i < nparts {
+        perl_args = perl_args + " " + shq(_pt_str(cmd_parts[i]))
+        i = i + 1
+    }
+    // perl -e '...' $args... ; echo __RC__=$?
+    // perl stdout/stderr 는 그대로 투과 (자식 tty 흉내 불가, 라인 버퍼링)
+    let perl_script = "use POSIX qw(setsid WNOHANG);" +
+        "my $t = shift; my @c = @ARGV;" +
+        "my $pid = fork();" +
+        "if (!defined $pid) { die \"fork failed: $!\\n\" }" +
+        "if ($pid == 0) { setsid(); exec { $c[0] } @c; die \"exec failed: $!\\n\"; }" +
+        "my $timed_out = 0;" +
+        "eval {" +
+        "  local $SIG{ALRM} = sub {" +
+        "    $timed_out = 1;" +
+        "    kill(\"TERM\", -$pid);" +
+        "    for my $i (1..10) {" +
+        "      select(undef, undef, undef, 0.1);" +
+        "      my $kid = waitpid($pid, WNOHANG); last if $kid == $pid;" +
+        "    }" +
+        "    kill(\"KILL\", -$pid); waitpid($pid, 0); die \"to\\n\";" +
+        "  };" +
+        "  alarm $t; waitpid($pid, 0); alarm 0;" +
+        "};" +
+        "if ($timed_out) {" +
+        "  print STDERR \"[perl_timeout ${t}s] killed pid=$pid cmd=@c\\n\";" +
+        "  exit 124;" +
+        "}" +
+        "exit($? >> 8);"
+    // perl -e 'script' <timeout> <cmd parts>
+    // $? 는 perl exit code. echo __RC__=$? 로 stdout 뒤에 붙여 read.
+    let full_cmd = "perl -e " + shq(perl_script) + " " + perl_args +
+                   "; echo \"__PT_RC__=$?\""
+    let raw = _pt_str(exec(full_cmd))
+    // raw 에서 __PT_RC__= 라인 추출 + 나머지는 stdout 그대로 출력 (perl 출력 투과)
+    let lines = raw.split("\n")
+    let n = len(lines)
+    let mut rc: i64 = 127
+    let mut body = ""
+    let mut j: i64 = 0
+    while j < n {
+        let ln = _pt_str(lines[j])
+        if ln.starts_with("__PT_RC__=") {
+            let v = ln.substring(10, len(ln)).trim()
+            let mut vi: i64 = 127
+            try { vi = to_int(v) } catch e { vi = 127 }
+            rc = vi
+        } else {
+            if len(body) > 0 { body = body + "\n" }
+            body = body + ln
+        }
+        j = j + 1
+    }
+    // trailing newline trim
+    if body.ends_with("\n") { body = body.substring(0, len(body) - 1) }
+    if len(body) > 0 { print(body + "\n") }
+    return rc
+}
+
+// ─── main ───
+let argv = args()
+let nargs = len(argv)
+// argv[0]=hexa argv[1]=script argv[2]=timeout_s argv[3..]=cmd...
+if nargs < 4 {
+    eprintln("usage: perl_timeout.hexa <seconds> <cmd> [args...]")
+    emit_rc(2)
+    exit(2)
+}
+
+let tsec_s = _pt_str(argv[2])
+let mut tsec: i64 = 0
+try { tsec = to_int(tsec_s) } catch e { tsec = 0 }
+if tsec <= 0 {
+    eprintln("perl_timeout.hexa: invalid timeout '" + tsec_s + "'")
+    emit_rc(2)
+    exit(2)
+}
+
+// cmd parts 수집 (argv[3..])
+let mut cmd_parts: [string] = []
+let mut k: i64 = 3
+while k < nargs {
+    cmd_parts = cmd_parts.push(_pt_str(argv[k]))
+    k = k + 1
+}
+
+// NEXUS_NO_TIMEOUT=1 → 그대로 exec (timeout 미적용)
+if env("NEXUS_NO_TIMEOUT") == "1" {
+    // perl 없이 직접 exec. stdout/stderr 투과 + exit code 잡기
+    let mut cmd_str = ""
+    let np = len(cmd_parts)
+    let mut ii: i64 = 0
+    while ii < np {
+        if ii > 0 { cmd_str = cmd_str + " " }
+        cmd_str = cmd_str + shq(_pt_str(cmd_parts[ii]))
+        ii = ii + 1
+    }
+    let raw = _pt_str(exec(cmd_str + "; echo \"__PT_RC__=$?\""))
+    let lines = raw.split("\n")
+    let n2 = len(lines)
+    let mut rc2: i64 = 127
+    let mut body2 = ""
+    let mut j2: i64 = 0
+    while j2 < n2 {
+        let ln = _pt_str(lines[j2])
+        if ln.starts_with("__PT_RC__=") {
+            let v = ln.substring(10, len(ln)).trim()
+            let mut vi: i64 = 127
+            try { vi = to_int(v) } catch e { vi = 127 }
+            rc2 = vi
+        } else {
+            if len(body2) > 0 { body2 = body2 + "\n" }
+            body2 = body2 + ln
+        }
+        j2 = j2 + 1
+    }
+    if body2.ends_with("\n") { body2 = body2.substring(0, len(body2) - 1) }
+    if len(body2) > 0 { print(body2 + "\n") }
+    emit_rc(rc2)
+    exit(rc2)
+}
+
+if !perl_present() {
+    eprintln("perl_timeout.hexa: perl 부재 — fallback plain exec")
+    // NEXUS_NO_TIMEOUT 경로와 동일 로직 재실행 (env 우회 없이)
+    let mut cmd_str = ""
+    let np = len(cmd_parts)
+    let mut ii: i64 = 0
+    while ii < np {
+        if ii > 0 { cmd_str = cmd_str + " " }
+        cmd_str = cmd_str + shq(_pt_str(cmd_parts[ii]))
+        ii = ii + 1
+    }
+    let raw = _pt_str(exec(cmd_str + "; echo \"__PT_RC__=$?\""))
+    let lines = raw.split("\n")
+    let n2 = len(lines)
+    let mut rc2: i64 = 127
+    let mut body2 = ""
+    let mut j2: i64 = 0
+    while j2 < n2 {
+        let ln = _pt_str(lines[j2])
+        if ln.starts_with("__PT_RC__=") {
+            let v = ln.substring(10, len(ln)).trim()
+            let mut vi: i64 = 127
+            try { vi = to_int(v) } catch e { vi = 127 }
+            rc2 = vi
+        } else {
+            if len(body2) > 0 { body2 = body2 + "\n" }
+            body2 = body2 + ln
+        }
+        j2 = j2 + 1
+    }
+    if body2.ends_with("\n") { body2 = body2.substring(0, len(body2) - 1) }
+    if len(body2) > 0 { print(body2 + "\n") }
+    emit_rc(rc2)
+    exit(rc2)
+}
+
+let rc = run_perl_timeout(tsec, cmd_parts)
+emit_rc(rc)
+exit(rc)

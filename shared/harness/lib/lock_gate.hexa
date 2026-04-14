@@ -1,0 +1,254 @@
+// ═══════════════════════════════════════════════════════════
+// lib/lock_gate.hexa — mkdir-atomic advisory lock (hexa port of lock_gate.sh)
+// H-NOZOMBIE 좀비 5층 방어 Layer 2 — lock_gate.sh 대체.
+//
+// usage (hexa run):
+//   hexa run lib/lock_gate.hexa acquire <name> [wait_s=0]
+//   hexa run lib/lock_gate.hexa release <name>
+//   hexa run lib/lock_gate.hexa status [<name>]
+//   hexa run lib/lock_gate.hexa gc
+//
+// exit code 전달: stdout 마지막 라인 __LOCK_GATE_RC__ N (f-hexa-exit-sentinel).
+//   .sh 엔트리 shim (lock_gate.sh) 이 파싱하여 실제 shell $? 반영.
+// 정책 (sh 과 동일):
+//   acquire — 성공 0 / busy 75 / usage 2
+//   release — 0
+//   status  — 0 (HELD/FREE/list 출력)
+//   gc      — 0 (purged 출력)
+// stale: age>600s (절대) OR age>5s + pid dead. age<=5s 구간은 race 보호.
+// env:
+//   NEXUS_LOCK_ROOT  default /tmp/nexus_locks
+//   NEXUS_LOCK_STRICT=1  release 시 PID strict 검증 (same-shell 패턴만)
+// hexa-only logic + exec() 시스템콜 wrapper (mkdir/rm/kill/cat/stat) — f-hexa-only-logic.
+// ═══════════════════════════════════════════════════════════
+
+let LOCK_ROOT = if env("NEXUS_LOCK_ROOT") != "" { env("NEXUS_LOCK_ROOT") } else { "/tmp/nexus_locks" }
+
+// ─── void-safe string coercion ───
+fn _lg_str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _lg_trim_str(x) -> string { return _lg_str(x).trim() }
+
+// ─── integer parse with default ───
+fn _lg_to_int0(s: string) -> i64 {
+    let t = s.trim()
+    if len(t) == 0 { return 0 }
+    let mut v: i64 = 0
+    try { v = to_int(t) } catch e { v = 0 }
+    return v
+}
+
+// ─── 출력 sentinel ───
+fn emit_rc(rc: i64) {
+    println("__LOCK_GATE_RC__ " + to_string(rc))
+}
+
+// ─── shell single-quote escape ───
+fn shq(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+// ─── 현재 unix ts ───
+fn now_ts() -> i64 {
+    return _lg_to_int0(_lg_trim_str(exec("date +%s")))
+}
+
+// ─── LOCK_ROOT 보장 ───
+fn ensure_root() {
+    exec("mkdir -p " + shq(LOCK_ROOT) + " 2>/dev/null")
+}
+
+// ─── lock 경로 ───
+fn lock_path(name: string) -> string { return LOCK_ROOT + "/" + name + ".lock" }
+
+// ─── mkdir-atomic 시도 (성공=획득) ───
+fn mkdir_atomic(lock: string) -> bool {
+    let r = _lg_trim_str(exec("mkdir " + shq(lock) + " 2>/dev/null && echo Y || echo N"))
+    return r == "Y"
+}
+
+// ─── lock 디렉토리 존재 확인 ───
+fn lock_dir_exists(lock: string) -> bool {
+    let r = _lg_trim_str(exec("[ -d " + shq(lock) + " ] && echo Y || echo N"))
+    return r == "Y"
+}
+
+// ─── lock 파일 존재 확인 ───
+fn lock_file_exists(lock: string, name: string) -> bool {
+    let r = _lg_trim_str(exec("[ -f " + shq(lock + "/" + name) + " ] && echo Y || echo N"))
+    return r == "Y"
+}
+
+// ─── read small file ───
+fn read_small(path: string) -> string {
+    return _lg_trim_str(exec("cat " + shq(path) + " 2>/dev/null"))
+}
+
+// ─── PID 살아있나 ───
+fn pid_alive(pid: string) -> bool {
+    if len(pid) == 0 { return false }
+    let r = _lg_trim_str(exec("kill -0 " + shq(pid) + " 2>/dev/null && echo Y || echo N"))
+    return r == "Y"
+}
+
+// ─── lock 삭제 ───
+fn lock_rm(lock: string) {
+    exec("rm -rf " + shq(lock) + " 2>/dev/null")
+}
+
+// ─── pid/ts 기록 ───
+fn lock_write_meta(lock: string) {
+    // 부모 쉘 PID — hexa exec 는 매번 새 subshell 이라 $$ 대신 ppid 사용
+    // 단, .sh 엔트리 쉘이 부모 → $$ 가 stable 하지 않음. 대신 `ps -p $$ -o ppid=` 로 상위 PID.
+    // 더 단순하게: hexa process 의 부모 PID (PPID) 를 사용.
+    let pid = _lg_trim_str(exec("echo $PPID"))
+    let ts = _lg_trim_str(exec("date +%s"))
+    exec("echo " + shq(pid) + " > " + shq(lock + "/pid") + " 2>/dev/null")
+    exec("echo " + shq(ts) + " > " + shq(lock + "/ts") + " 2>/dev/null")
+}
+
+// ─── 절대값 ───
+fn abs_i(x: i64) -> i64 { if x < 0 { return 0 - x } return x }
+
+// ─── acquire: 성공 0 / busy 75 / usage 2 ───
+fn do_acquire(name: string, wait_s: i64) -> i64 {
+    if len(name) == 0 {
+        eprintln("usage: lock_gate acquire <name> [wait_s]")
+        return 2
+    }
+    ensure_root()
+    let lock = lock_path(name)
+    let start = now_ts()
+    let deadline = start + wait_s
+    // bounded loop — 최대 (wait_s + 5) 초 동안 polling. 절대 상한: 600s (safety)
+    let max_iter: i64 = if wait_s > 0 { (wait_s * 2) + 20 } else { 4 }
+    let mut iter: i64 = 0
+    while iter < max_iter {
+        iter = iter + 1
+        if mkdir_atomic(lock) {
+            lock_write_meta(lock)
+            return 0
+        }
+        // stale check
+        if lock_file_exists(lock, "pid") {
+            let oldpid = read_small(lock + "/pid")
+            let oldts_s = read_small(lock + "/ts")
+            // cat-cat split race — release 가 사이 rm -rf 한 경우 빈값
+            if len(oldpid) == 0 || len(oldts_s) == 0 {
+                exec("sleep 0.1")
+                continue
+            }
+            let oldts = _lg_to_int0(oldts_s)
+            let age = now_ts() - oldts
+            let mut stale: i64 = 0
+            if age > 600 { stale = 1 }
+            else if age > 5 && !pid_alive(oldpid) { stale = 1 }
+            if stale == 1 {
+                lock_rm(lock)
+                continue
+            }
+        }
+        if now_ts() >= deadline { return 75 }
+        exec("sleep 0.5")
+    }
+    // safety — bounded loop 한계 도달 (never expected)
+    return 75
+}
+
+// ─── release: 항상 0 ───
+fn do_release(name: string) -> i64 {
+    if len(name) == 0 {
+        eprintln("usage: lock_gate release <name>")
+        return 2
+    }
+    let lock = lock_path(name)
+    if env("NEXUS_LOCK_STRICT") == "1" {
+        // TOCTOU window 최소화 — 한 줄로 압축. flock 없이 완전 제거 불가능 (잔존 race).
+        // hexa 에서는 bash 의 $$ = hexa process ppid. write_meta 와 일관.
+        let cmd = "[ -d " + shq(lock) + " ] && [ \"$(cat " + shq(lock + "/pid") +
+                  " 2>/dev/null)\" = \"$PPID\" ] && rm -rf " + shq(lock) + " 2>/dev/null; true"
+        exec(cmd)
+    } else {
+        lock_rm(lock)
+    }
+    return 0
+}
+
+// ─── status ───
+fn do_status(name: string) -> i64 {
+    if len(name) > 0 {
+        let lock = lock_path(name)
+        if lock_dir_exists(lock) {
+            let pid = read_small(lock + "/pid")
+            let ts = read_small(lock + "/ts")
+            println("HELD pid=" + pid + " ts=" + ts)
+        } else {
+            println("FREE")
+        }
+    } else {
+        let listing = _lg_str(exec("ls -1 " + shq(LOCK_ROOT) + " 2>/dev/null | sed 's/\\.lock$//'"))
+        if len(listing) > 0 { print(listing) }
+    }
+    return 0
+}
+
+// ─── gc: stale 청소 (600s+ OR dead pid) ───
+fn do_gc() -> i64 {
+    ensure_root()
+    let raw = _lg_str(exec("ls -1 " + shq(LOCK_ROOT) + " 2>/dev/null"))
+    let items = raw.split("\n")
+    let n = len(items)
+    let mut i: i64 = 0
+    while i < n {
+        let item = _lg_trim_str(items[i])
+        i = i + 1
+        if len(item) == 0 { continue }
+        if !item.ends_with(".lock") { continue }
+        let lock = LOCK_ROOT + "/" + item
+        if !lock_dir_exists(lock) { continue }
+        let oldpid = read_small(lock + "/pid")
+        let oldts_s = read_small(lock + "/ts")
+        let oldts = _lg_to_int0(oldts_s)
+        let age = now_ts() - oldts
+        if age > 600 || !pid_alive(oldpid) {
+            lock_rm(lock)
+            println("purged: " + lock)
+        }
+    }
+    return 0
+}
+
+// ─── main ───
+let argv = args()
+let nargs = len(argv)
+// argv[0]=hexa argv[1]=script argv[2]=cmd argv[3]=name argv[4]=wait_s
+if nargs < 3 {
+    eprintln("usage: lock_gate.hexa {acquire|release|status|gc} [name] [wait_s]")
+    emit_rc(2)
+    exit(2)
+}
+
+let cmd = _lg_str(argv[2])
+let name = if nargs > 3 { _lg_str(argv[3]) } else { "" }
+let wait_s = if nargs > 4 { _lg_to_int0(_lg_str(argv[4])) } else { 0 }
+
+let mut rc: i64 = 2
+if cmd == "acquire" {
+    rc = do_acquire(name, wait_s)
+} else if cmd == "release" {
+    rc = do_release(name)
+} else if cmd == "status" {
+    rc = do_status(name)
+} else if cmd == "gc" {
+    rc = do_gc()
+} else {
+    eprintln("usage: lock_gate.hexa {acquire|release|status|gc} [name] [wait_s]")
+    rc = 2
+}
+
+emit_rc(rc)
+exit(rc)
