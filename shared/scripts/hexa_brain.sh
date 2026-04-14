@@ -14,8 +14,8 @@ BRAIN_LOG="${LOG_DIR}/hexa_brain.jsonl"
 mkdir -p "$LOG_DIR"
 
 CLAUDE_BIN="${HEXA_BRAIN_CLAUDE:-$HOME/.local/bin/claude}"
-CL_BIN="$HOME/Dev/nexus/shared/bin/cl"
-PROMPT_FILE="$HOME/Dev/nexus/shared/harness/hexa_brain_prompt.md"
+CL_BIN="${NEXUS:-$HOME/Dev/nexus}/shared/bin/cl"
+PROMPT_FILE="${NEXUS:-$HOME/Dev/nexus}/shared/harness/hexa_brain_prompt.md"
 EFFORT="${HEXA_BRAIN_EFFORT:-low}"
 
 now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -68,11 +68,11 @@ if [[ -z "$SYS_PROMPT" ]]; then
 fi
 
 # --disallowedTools 로 모든 도구 차단 — 순수 판단만
-# NOTE: --disallowedTools 는 variadic → 마지막 positional prompt 삼킴. 콤마 구분 단일 인자.
-RESULT=$("$CLAUDE_BIN" -p --effort "$EFFORT" \
+# NOTE: --disallowedTools 는 variadic → 마지막 positional prompt 삼킴. 콤마 구분 + stdin 으로 prompt.
+RESULT=$(printf '%s' "$PAYLOAD" | "$CLAUDE_BIN" -p --effort "$EFFORT" \
     --append-system-prompt "$SYS_PROMPT" \
     --disallowedTools "Bash,Edit,Write,Read,Glob,Grep,Task,WebFetch,WebSearch" \
-    "$PAYLOAD" 2>&1)
+    2>&1)
 
 CLAUDE_EXIT=$?
 
@@ -87,6 +87,16 @@ printf '{"ts":"%s","tier":2,"exit":%d,"effort":"%s","output":%s}\n' \
 if printf '%s' "$RESULT" | tail -1 | jq -e . >/dev/null 2>&1; then
     BRAIN_JSON=$(printf '%s' "$RESULT" | tail -1)
     printf '{"ts":"%s","tier":2,"brain":%s}\n' "$(now_iso)" "$BRAIN_JSON" >> "$GUARD_LOG"
+
+    # recommend 를 action queue 에 append (1h TTL dedup)
+    ACTIONS_BIN="${NEXUS:-$HOME/Dev/nexus}/shared/scripts/hexa_actions.sh"
+    if [[ -x "$ACTIONS_BIN" ]]; then
+        printf '%s' "$BRAIN_JSON" | jq -r '.recommend[]? // empty' 2>/dev/null | \
+        while IFS= read -r rec; do
+            [[ -z "$rec" ]] && continue
+            "$ACTIONS_BIN" add brain "$rec" 1 >/dev/null 2>&1 || true
+        done
+    fi
 fi
 
 exit 0

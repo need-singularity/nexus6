@@ -52,6 +52,13 @@ policy (H-NOHOOK, 2026-04-14):
   exempt         shared/archive/, /archive/superseded-, /archive/deprecated_, .git/hooks/{commit-msg,pre-commit,post-commit,pre-push} (H-COMMIT), .githooks/{commit-msg,pre-commit}, *.sample
   bypass         NEXUS_HOOK_OK=1 prefix 또는 파일/경로 내 '@allow-hook' 토큰
 
+policy (H-NEXUSPATH, 2026-04-14):
+  rule           $NEXUS/$ANIMA/$HEXA_LANG/$N6_ARCH/$AIRGENOME/$VOID/$PAPERS 프로젝트 변수 강제 — $HOME/Dev/<proj> 리터럴 block
+  lint           check_devpath           .hexa/.sh/.json/.jsonl/.md 에서 (~|/Users/<u>|/home/<u>|$HOME|$HOME_DIR)/Dev/<proj> 검출 → error
+  canonical fb   ${NEXUS:-$HOME/Dev/nexus}  쉘 스크립트 안전 fallback 패턴 (정규식 예외 자동 허용)
+  .hexa fb       env("NEXUS") 우선, 실패 시 env("HOME")+"/Dev/nexus" + // @allow-devpath 마커
+  bypass         // @allow-devpath 토큰 (plist 문서 예시, archival evidence)
+
 msg_check_rules: HARNESS-LOCK / L0 / N6-JSONPAIR (commit-msg 훅 최종 검증 — pre-commit COMMIT_EDITMSG 는 N-1 msg 라 구조적 오탐 회피)
 
 convention (2026-04-14~ 훅 시스템 대체):

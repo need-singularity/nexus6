@@ -15,7 +15,7 @@
 # env: NEXUS_LOCK_ROOT (default /tmp/nexus_locks), NEXUS_LOCK_STRICT=1 (release PID 검증)
 
 HOME_DIR="${HOME:-/Users/ghost}"
-NEXUS_ROOT="${NEXUS_ROOT:-$HOME_DIR/Dev/nexus}"
+NEXUS_ROOT="${NEXUS_ROOT:-${NEXUS:-$HOME_DIR/Dev/nexus}}"  # @allow-devpath (last-resort fallback)
 HEXA="$NEXUS_ROOT/shared/bin/hexa"
 IMPL="$NEXUS_ROOT/shared/harness/lib/lock_gate.hexa"
 
