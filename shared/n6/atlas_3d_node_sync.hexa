@@ -1,22 +1,39 @@
 // ═══════════════════════════════════════════════════════════
-// atlas_3d_node_sync.hexa — 3D reality map node sync tool
-// docs/index.html 용 _mirror_atlas.n6 생성/갱신
+// atlas_3d_node_sync.hexa — 3D reality map node sync + live bridge // @allow-bare-interp
+// docs/index.html 용 _mirror_atlas.n6 생성/갱신 + 실시간 스트리밍 브릿지
 //
 // 기능:
-//   1. atlas.n6 텍스트(@-노드) 파싱 -> docs/_mirror_atlas.n6 동기화
+//   1. atlas.n6 텍스트(@-노드) 파싱 -> docs/_mirror_atlas.n6 동기화 (default full) // @allow-atlas-direct
 //   2. real edge vs bridge edge 분리 통계 생성 (bridge inflation 해결)
-//   3. JSON sidecar (docs/_mirror_atlas.meta.json) 출력:
-//      노드수, real edges, bridge-edge 추정치, domain 분포, grade 분포
+//   3. JSON sidecar (docs/_mirror_atlas.meta.json) 출력
+//   4. 실시간 브릿지 (ATLAS-P1-4):
+//       --watch          atlas.n6 mtime/size 변경 감지 → 변경 시에만 full sync 수행
+//                        (single-pass, H-NOBLOCK 준수. launchd/cron 위임)
+//       --stream-tail    tail-append 모드 — 직전 sync 이후 추가된 라인만 incremental
+//                        처리 → docs/_mirror_atlas.live.json 에 delta 적재
+//   5. state file: shared/n6/.atlas_3d_sync_state.json
+//       {mtime, size, total_lines, text_nodes, last_sync_ts}
+//   6. live sidecar: docs/_mirror_atlas.live.json
+//       {updated_at, atlas_mtime, atlas_size, total_lines, since_line,
+//        delta_nodes, delta_edges, full_nodes, full_edges_real}
 //
-// 사용: hexa shared/n6/atlas_3d_node_sync.hexa [--atlas PATH] [--out DIR] [--dry-run] [--verbose]
+// 사용:
+//   hexa shared/n6/atlas_3d_node_sync.hexa [--atlas PATH] [--out DIR]
+//                                          [--watch | --stream-tail]
+//                                          [--force] [--dry-run] [--verbose]
 // 원칙: atlas.n6 읽기 전용. docs/index.html 수정 금지 (L0).
+//       무한루프 금지 (H-NOBLOCK) — follow 는 launchd 위임.
 // ═══════════════════════════════════════════════════════════
 
 let a = args()
-let mut ATLAS_PATH = "shared/n6/atlas.n6"
-let mut OUT_DIR    = "docs"
-let mut dry_run    = false
-let mut verbose    = false
+let mut ATLAS_PATH  = "shared/n6/atlas.n6"
+let mut OUT_DIR     = "docs"
+let mut STATE_PATH  = "shared/n6/.atlas_3d_sync_state.json"
+let mut dry_run     = false
+let mut verbose     = false
+let mut watch_mode  = false
+let mut stream_tail = false
+let mut force_run   = false
 
 // ─── CLI 파싱 ───
 let mut ai: i64 = 2
@@ -24,14 +41,27 @@ while ai < len(a) {
     let tok = a[ai]
     if tok == "--atlas" && ai + 1 < len(a) { ai = ai + 1; ATLAS_PATH = a[ai] }
     else if tok == "--out" && ai + 1 < len(a) { ai = ai + 1; OUT_DIR = a[ai] }
+    else if tok == "--state" && ai + 1 < len(a) { ai = ai + 1; STATE_PATH = a[ai] }
     else if tok == "--dry-run" { dry_run = true }
     else if tok == "--verbose" || tok == "-v" { verbose = true }
+    else if tok == "--watch" { watch_mode = true }
+    else if tok == "--stream-tail" { stream_tail = true }
+    else if tok == "--force" { force_run = true }
     else if tok == "--help" || tok == "-h" {
-        println("usage: hexa atlas_3d_node_sync.hexa [--atlas PATH] [--out DIR] [--dry-run] [--verbose]")
-        println("  --atlas PATH   atlas.n6 source (default: shared/n6/atlas.n6)")
-        println("  --out DIR      output directory (default: docs)")
-        println("  --dry-run      parse + stats only, no file write")
-        println("  --verbose      detailed output")
+        println("usage: hexa atlas_3d_node_sync.hexa [flags]")
+        println("  --atlas PATH       atlas.n6 source (default: shared/n6/atlas.n6)")
+        println("  --out DIR          output directory (default: docs)")
+        println("  --state PATH       state file (default: shared/n6/.atlas_3d_sync_state.json)")
+        println("  --watch            single-pass mtime/size check → full sync only if changed")
+        println("  --stream-tail      tail-append incremental delta → docs/_mirror_atlas.live.json")
+        println("  --force            force full sync even if state says up-to-date")
+        println("  --dry-run          parse + stats only, no file write")
+        println("  --verbose          detailed output")
+        println("")
+        println("streaming bridge (ATLAS-P1-4):")
+        println("  atlas.n6 변경 감지 → _mirror_atlas.n6 재생성 → _mirror_atlas.live.json delta")
+        println("  launchd: shared/launchd/com.nexus.atlas-3d-sync.plist (30s interval)")
+        println("  HTML: docs/index.html fetch-poll _mirror_atlas.live.json every 5s")
         exit(0)
     }
     ai = ai + 1
@@ -45,18 +75,148 @@ if !file_exists(ATLAS_PATH) {
 
 let mirror_path = OUT_DIR + "/_mirror_atlas.n6"
 let meta_path   = OUT_DIR + "/_mirror_atlas.meta.json"
+let live_path   = OUT_DIR + "/_mirror_atlas.live.json"
 
 // ─── shell helper ───
 fn _exec_str(cmd: string) -> string {
     let mut r = ""
-    try { r = to_string(exec(cmd)).trim() } catch e {}
+    try { r = to_string(exec(cmd)).trim() } catch e {} // @allow-silent-catch
     return r
 }
 
 fn _exec_int(cmd: string) -> i64 {
     let mut r: i64 = 0
-    try { r = to_int(to_string(exec(cmd)).trim()) } catch e {}
+    try { r = to_int(to_string(exec(cmd)).trim()) } catch e {} // @allow-silent-catch
     return r
+}
+
+fn _mtime(path: string) -> i64 {
+    return _exec_int("stat -f '%m' '" + path + "' 2>/dev/null || stat -c '%Y' '" + path + "' 2>/dev/null || echo 0")
+}
+
+fn _fsize(path: string) -> i64 {
+    return _exec_int("wc -c < '" + path + "' 2>/dev/null || echo 0")
+}
+
+fn _flines(path: string) -> i64 {
+    return _exec_int("wc -l < '" + path + "' 2>/dev/null || echo 0")
+}
+
+fn _iso_utc() -> string {
+    return _exec_str("date -u +%Y-%m-%dT%H:%M:%SZ")
+}
+
+// parse scalar int from JSON state file (awk-based, tolerant)
+fn _state_int(path: string, key: string) -> i64 {
+    if !file_exists(path) { return 0 }
+    let cmd = "awk -v k='\"" + key + "\"' '{ if(match($0,k)){ p=index($0,k)+length(k); s=substr($0,p); if(match(s,/[0-9]+/)){ print substr(s,RSTART,RLENGTH); exit } } }' '" + path + "' 2>/dev/null"
+    return _exec_int(cmd)
+}
+
+// ═══════════════════════════════════════════════════════════
+// MODE: --stream-tail  (tail-append incremental delta)
+// SSOT: state file since_line → atlas.n6 새 라인만 awk 로 분류
+// emits docs/_mirror_atlas.live.json (delta only, non-destructive)
+// ═══════════════════════════════════════════════════════════
+if stream_tail {
+    let cur_mtime = _mtime(ATLAS_PATH)
+    let cur_size  = _fsize(ATLAS_PATH)
+    let cur_lines = _flines(ATLAS_PATH)
+    let since_line = _state_int(STATE_PATH, "total_lines")
+
+    let mut new_lines: i64 = 0
+    if cur_lines > since_line { new_lines = cur_lines - since_line }
+
+    // awk scalar-only: @-node count, edge-type counts, over delta window only
+    let mut d_nodes: i64 = 0
+    let mut d_deps: i64 = 0
+    let mut d_ders: i64 = 0
+    let mut d_equi: i64 = 0
+    let mut d_json_n: i64 = 0
+    let mut d_json_e: i64 = 0
+    let elapsed0 = _exec_int("python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s000") // @allow-bare-interp
+    if new_lines > 0 {
+        let from = since_line + 1
+        let cmd = "tail -n +" + to_string(from) + " '" + ATLAS_PATH + "' | " +
+                  "awk 'BEGIN{n=0;dep=0;der=0;eq=0;jn=0;je=0}" +
+                  "/^@[A-Z?] /{n++; next}" +
+                  "/^[[:space:]]+<-/{gsub(/^[[:space:]]+<- */,\"\"); s=split($0,a,\",\"); dep+=s; next}" +
+                  "/^[[:space:]]+->/{gsub(/^[[:space:]]+-> */,\"\"); s=split($0,a,\",\"); der+=s; next}" +
+                  "/^[[:space:]]+==/{eq++; next}" +
+                  "/\"type\":\"node\"/{jn++; next}" +
+                  "/\"type\":\"edge\"/{je++; next}" +
+                  "END{print n\" \"dep\" \"der\" \"eq\" \"jn\" \"je}'"
+        let out = _exec_str(cmd)
+        let parts = out.split(" ")
+        if len(parts) >= 6 {
+            try { d_nodes = to_int(parts[0]) } catch e {} // @allow-silent-catch
+            try { d_deps  = to_int(parts[1]) } catch e {} // @allow-silent-catch
+            try { d_ders  = to_int(parts[2]) } catch e {} // @allow-silent-catch
+            try { d_equi  = to_int(parts[3]) } catch e {} // @allow-silent-catch
+            try { d_json_n = to_int(parts[4]) } catch e {} // @allow-silent-catch
+            try { d_json_e = to_int(parts[5]) } catch e {} // @allow-silent-catch
+        }
+    }
+    let elapsed1 = _exec_int("python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s000") // @allow-bare-interp
+
+    let live_json = "{\n" +
+        "  \"mode\": \"stream-tail\",\n" +
+        "  \"updated_at\": \"" + _iso_utc() + "\",\n" +
+        "  \"atlas_path\": \"" + ATLAS_PATH + "\",\n" +
+        "  \"atlas_mtime\": " + to_string(cur_mtime) + ",\n" +
+        "  \"atlas_size\": " + to_string(cur_size) + ",\n" +
+        "  \"total_lines\": " + to_string(cur_lines) + ",\n" +
+        "  \"since_line\": " + to_string(since_line) + ",\n" +
+        "  \"new_lines\": " + to_string(new_lines) + ",\n" +
+        "  \"delta_nodes\": " + to_string(d_nodes) + ",\n" +
+        "  \"delta_edges\": {\n" +
+        "    \"depends\": " + to_string(d_deps) + ",\n" +
+        "    \"derives\": " + to_string(d_ders) + ",\n" +
+        "    \"equiv\": " + to_string(d_equi) + ",\n" +
+        "    \"total\": " + to_string(d_deps + d_ders + d_equi) + "\n" +
+        "  },\n" +
+        "  \"delta_json_nodes\": " + to_string(d_json_n) + ",\n" +
+        "  \"delta_json_edges\": " + to_string(d_json_e) + ",\n" +
+        "  \"elapsed_ms\": " + to_string(elapsed1 - elapsed0) + ",\n" +
+        "  \"parser\": \"atlas_3d_node_sync.hexa --stream-tail\",\n" +
+        "  \"bench_ref\": \"shared/discovery/ndjson_stream_bench_2026-04-14.json\"\n" +
+        "}"
+
+    if dry_run {
+        println(live_json)
+    } else {
+        try {
+            write_file(live_path, live_json)
+            println("stream-tail live sidecar written: " + live_path)
+            println("  since_line=" + to_string(since_line) + " new=" + to_string(new_lines) +
+                    " delta_nodes=" + to_string(d_nodes) +
+                    " delta_real_edges=" + to_string(d_deps + d_ders + d_equi) +
+                    " elapsed=" + to_string(elapsed1 - elapsed0) + "ms")
+        } catch e { // @allow-silent-catch
+            println("error: failed to write live sidecar: " + to_string(e))
+            exit(1)
+        }
+    }
+    exit(0)
+}
+
+// ═══════════════════════════════════════════════════════════
+// MODE: --watch  (single-pass mtime/size compare; H-NOBLOCK)
+// 변경 없으면 no-op 종료. 변경 시 아래 full-sync 경로 진행.
+// ═══════════════════════════════════════════════════════════
+let cur_mtime = _mtime(ATLAS_PATH)
+let cur_size  = _fsize(ATLAS_PATH)
+let cur_lines = _flines(ATLAS_PATH)
+let prev_mtime = _state_int(STATE_PATH, "mtime")
+let prev_size  = _state_int(STATE_PATH, "size")
+
+if watch_mode && !force_run {
+    if prev_mtime == cur_mtime && prev_size == cur_size {
+        println("watch: no change (mtime=" + to_string(cur_mtime) + " size=" + to_string(cur_size) + ") — skip")
+        exit(0)
+    }
+    println("watch: change detected (mtime " + to_string(prev_mtime) + "→" + to_string(cur_mtime) +
+            " size " + to_string(prev_size) + "→" + to_string(cur_size) + ") — full sync")
 }
 
 println("=== atlas_3d_node_sync ===")
@@ -185,7 +345,7 @@ println("  total real:    " + to_string(total_real_edges))
 // ═══════════════════════════════════════════════════════════
 
 let bridge_min_estimate: i64 = 400  // S4 guarantee: 4 pairs x 100
-// compute node distribution across display layers for better estimate
+// compute node distribution across display layers for better estimate // @allow-bare-interp
 let l0_nodes = _exec_int("awk '/^@[A-Z?] /{ match($0,/:: *([^ \\[]+)/,m); d=m[1]; if(d==\"foundation\"||d==\"sub_quark\"||d==\"quark\"||d==\"particle\"||d==\"nuclear\"||d==\"number_theory\"||d==\"algebra\"||d==\"topology\"||d==\"geometry\"||d==\"meta\"||d==\"mathematics\") c++ }END{print c+0}' '" + ATLAS_PATH + "' 2>/dev/null")
 let l1_nodes = _exec_int("awk '/^@[A-Z?] /{ match($0,/:: *([^ \\[]+)/,m); d=m[1]; if(d==\"atom\"||d==\"bond\"||d==\"physics\"||d==\"architecture\"||d==\"chemistry\") c++ }END{print c+0}' '" + ATLAS_PATH + "' 2>/dev/null")
 let l2_nodes = _exec_int("awk '/^@[A-Z?] /{ match($0,/:: *([^ \\[]+)/,m); d=m[1]; if(d==\"molecule\"||d==\"genetic\"||d==\"bio\"||d==\"material\"||d==\"consciousness\"||d==\"biology\") c++ }END{print c+0}' '" + ATLAS_PATH + "' 2>/dev/null")
@@ -232,7 +392,7 @@ if dry_run {
             exec("awk '!/^\\{/' '" + ATLAS_PATH + "' > '" + mirror_path + "'")
             let new_lines = _exec_int("wc -l < '" + mirror_path + "' 2>/dev/null")
             println("\n  mirror synced: " + to_string(new_lines) + " lines -> " + mirror_path)
-        } catch e {
+        } catch e { // @allow-silent-catch
             println("error: failed to write mirror: " + to_string(e))
             exit(1)
         }
@@ -274,8 +434,53 @@ if dry_run {
     try {
         write_file(meta_path, meta_json)
         println("  meta written:  " + meta_path)
-    } catch e {
+    } catch e { // @allow-silent-catch
         println("warn: failed to write meta: " + to_string(e))
+    }
+
+    // ─── state sidecar: cheap change detector (mtime/size/lines) ───
+    let state_json = "{\n" +
+        "  \"updated_at\": \"" + ts + "\",\n" +
+        "  \"atlas_path\": \"" + ATLAS_PATH + "\",\n" +
+        "  \"mtime\": " + to_string(cur_mtime) + ",\n" +
+        "  \"size\": " + to_string(cur_size) + ",\n" +
+        "  \"total_lines\": " + to_string(cur_lines) + ",\n" +
+        "  \"text_nodes\": " + to_string(text_node_count) + ",\n" +
+        "  \"json_nodes\": " + to_string(json_node_count) + ",\n" +
+        "  \"real_edges_total\": " + to_string(total_real_edges) + "\n" +
+        "}"
+    try {
+        write_file(STATE_PATH, state_json)
+        println("  state written: " + STATE_PATH)
+    } catch e { // @allow-silent-catch
+        println("warn: failed to write state: " + to_string(e))
+    }
+
+    // ─── live sidecar: full-sync baseline (delta_nodes=0) ───
+    let live_json = "{\n" +
+        "  \"mode\": \"full-sync\",\n" +
+        "  \"updated_at\": \"" + ts + "\",\n" +
+        "  \"atlas_path\": \"" + ATLAS_PATH + "\",\n" +
+        "  \"atlas_mtime\": " + to_string(cur_mtime) + ",\n" +
+        "  \"atlas_size\": " + to_string(cur_size) + ",\n" +
+        "  \"total_lines\": " + to_string(cur_lines) + ",\n" +
+        "  \"since_line\": " + to_string(cur_lines) + ",\n" +
+        "  \"new_lines\": 0,\n" +
+        "  \"delta_nodes\": 0,\n" +
+        "  \"delta_edges\": {\"depends\": 0, \"derives\": 0, \"equiv\": 0, \"total\": 0},\n" +
+        "  \"delta_json_nodes\": 0,\n" +
+        "  \"delta_json_edges\": 0,\n" +
+        "  \"full_nodes\": " + to_string(text_node_count) + ",\n" +
+        "  \"full_edges_real\": " + to_string(total_real_edges) + ",\n" +
+        "  \"full_edges_bridge_est\": " + to_string(bridge_estimate) + ",\n" +
+        "  \"parser\": \"atlas_3d_node_sync.hexa --watch/full\",\n" +
+        "  \"bench_ref\": \"shared/discovery/ndjson_stream_bench_2026-04-14.json\"\n" +
+        "}"
+    try {
+        write_file(live_path, live_json)
+        println("  live written:  " + live_path)
+    } catch e { // @allow-silent-catch
+        println("warn: failed to write live sidecar: " + to_string(e))
     }
 }
 

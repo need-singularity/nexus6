@@ -1,0 +1,194 @@
+// ═══════════════════════════════════════════════════════════
+// hypothesis_drop.hexa — atlas.n6 drop 후보 일괄 삭제 (one-shot)
+// R1 HEXA-FIRST. todo #5 refuted drop_candidates 117건 삭제 (1건 downgrade skip)
+// 방법: 전체 read → sorted drop indices → tempfile + atomic rename
+// 입력: shared/discovery/atlas_drop_candidates_2026-04-14.jsonl
+// ═══════════════════════════════════════════════════════════
+
+let atlas_path     = "shared/n6/atlas.n6"
+let tmp_path       = "shared/n6/atlas.n6.tmp.drop"
+let candidates_jsonl = "shared/discovery/atlas_drop_candidates_2026-04-14.jsonl"
+
+if !file_exists(atlas_path) {
+    println("error: atlas not found: " + atlas_path)
+    exit(1)
+}
+if !file_exists(candidates_jsonl) {
+    println("error: candidates jsonl not found: " + candidates_jsonl)
+    exit(1)
+}
+
+// ─── JSON line helpers ───
+fn _json_str(raw: string, key: string) -> string {
+    let marker = "\"" + key + "\":\""
+    let idx = raw.index_of(marker)
+    if idx < 0 { return "" }
+    let after = raw.substring(idx + len(marker), len(raw))
+    let end = after.index_of("\"")
+    if end < 0 { return "" }
+    return after.substring(0, end)
+}
+fn _json_int(raw: string, key: string) -> i64 {
+    let marker = "\"" + key + "\":"
+    let idx = raw.index_of(marker)
+    if idx < 0 { return -1 }
+    let after = raw.substring(idx + len(marker), len(raw))
+    let mut end = after.index_of(",")
+    let end2 = after.index_of("}")
+    if end < 0 || (end2 >= 0 && end2 < end) { end = end2 }
+    if end <= 0 { return -1 }
+    let mut v: i64 = -1
+    try { v = to_int(after.substring(0, end).trim()) } catch e {} // @allow-silent-catch
+    return v
+}
+
+// ─── Read candidates.jsonl ───
+let cand_raw = read_file(candidates_jsonl)
+let cand_lines = cand_raw.split("\n")
+
+// ─── Read atlas.n6 ───
+let raw = read_file(atlas_path)
+let lines = raw.split("\n")
+let total_lines: i64 = len(lines)
+
+// ─── drop_indices: sorted list of 0-based line indices to remove ───
+// candidates 는 이미 atlas_line 오름차순, body 확장도 순차 증가 → 자연 정렬
+let mut drop_indices = []
+let mut candidates_total: i64 = 0
+let mut will_drop_headers: i64 = 0
+let mut skipped_downgrade: i64 = 0
+let mut skipped_mismatch: i64 = 0
+let mut skipped_out_of_bounds: i64 = 0
+let mut skip_records = []
+
+let mut ci: i64 = 0
+while ci < len(cand_lines) {
+    let cline = cand_lines[ci].trim()
+    if cline == "" { ci = ci + 1; continue }
+    if !cline.starts_with("{") { ci = ci + 1; continue }
+    candidates_total = candidates_total + 1
+
+    let atlas_line = _json_int(cline, "atlas_line")
+    let node_id = _json_str(cline, "node_id")
+    let disp = _json_str(cline, "disposition")
+
+    // downgrade_to_dust → 삭제 X (본 script 대상 아님, hypothesis_promote 위임)
+    if disp == "downgrade_to_dust" {
+        skipped_downgrade = skipped_downgrade + 1
+        skip_records = skip_records.push("line " + to_string(atlas_line) + " " + node_id + " (downgrade_to_dust — skipped)")
+        ci = ci + 1
+        continue
+    }
+
+    if atlas_line <= 0 || atlas_line > total_lines {
+        skipped_out_of_bounds = skipped_out_of_bounds + 1
+        skip_records = skip_records.push("line " + to_string(atlas_line) + " " + node_id + " (out of bounds)")
+        ci = ci + 1
+        continue
+    }
+
+    let i0: i64 = atlas_line - 1  // 0-based
+    let header = lines[i0]
+    // 검증: header 가 "@" 로 시작하고 node_id 포함
+    if !header.starts_with("@") || header.index_of(node_id) < 0 {
+        skipped_mismatch = skipped_mismatch + 1
+        let short_h = if len(header) < 80 { header } else { header.substring(0, 80) }
+        skip_records = skip_records.push("line " + to_string(atlas_line) + " " + node_id + " (header mismatch: " + short_h + ")")
+        ci = ci + 1
+        continue
+    }
+
+    // Mark header
+    drop_indices = drop_indices.push(i0)
+    will_drop_headers = will_drop_headers + 1
+
+    // Mark following body lines (indented with leading space/tab, not new @ header, not empty, not comment)
+    let mut j: i64 = i0 + 1
+    while j < total_lines {
+        let nxt = lines[j]
+        if len(nxt) == 0 { break }                         // empty line ends body
+        let f = nxt[0..1]
+        if f == "@" { break }                              // next header
+        if f == "#" { break }                              // comment section break
+        if f == " " || f == "\t" {
+            drop_indices = drop_indices.push(j)
+            j = j + 1
+        } else {
+            break
+        }
+    }
+    ci = ci + 1
+}
+
+let total_drop: i64 = len(drop_indices)
+let kept: i64 = total_lines - total_drop
+
+println("=== drop preview ===")
+println("  candidates_total       : " + to_string(candidates_total))
+println("  headers marked         : " + to_string(will_drop_headers))
+println("  total lines dropped    : " + to_string(total_drop) + " (header + body)")
+println("  skipped_downgrade      : " + to_string(skipped_downgrade))
+println("  skipped_mismatch       : " + to_string(skipped_mismatch))
+println("  skipped_out_of_bounds  : " + to_string(skipped_out_of_bounds))
+println("  atlas_lines_before     : " + to_string(total_lines))
+println("  atlas_lines_after      : " + to_string(kept))
+
+let mut sk: i64 = 0
+while sk < len(skip_records) {
+    println("  skip: " + skip_records[sk])
+    sk = sk + 1
+}
+
+// ─── dry-run mode ───
+let a = args()
+let mut dry_run = false
+let mut ai: i64 = 0
+while ai < len(a) {
+    if a[ai] == "--dry-run" { dry_run = true }
+    ai = ai + 1
+}
+
+if dry_run {
+    println("")
+    println("[dry-run] no file written")
+    exit(0)
+}
+
+// ─── Rebuild atlas (kept lines only) → tempfile ───
+// 2-pointer scan: drop_indices 정렬 상태 가정 (candidates.jsonl atlas_line asc)
+let mut out = ""
+let mut li: i64 = 0
+let mut dp: i64 = 0   // drop pointer
+let mut wrote_one = false
+while li < total_lines {
+    let mut skip = false
+    if dp < total_drop {
+        if drop_indices[dp] == li { skip = true }
+    }
+    if skip {
+        dp = dp + 1
+    } else {
+        if wrote_one { out = out + "\n" }
+        out = out + lines[li]
+        wrote_one = true
+    }
+    li = li + 1
+}
+
+write_file(tmp_path, out)
+
+// ─── Atomic rename ───
+try {
+    exec("mv -f " + tmp_path + " " + atlas_path)
+} catch e { // @allow-silent-catch
+    println("error: atomic rename failed")
+    exit(2)
+}
+
+println("")
+println("=== drop complete ===")
+println("  atlas_path             : " + atlas_path)
+println("  lines_before           : " + to_string(total_lines))
+println("  lines_after            : " + to_string(kept))
+println("  lines_removed          : " + to_string(total_drop))
+println("  hypotheses_dropped     : " + to_string(will_drop_headers))
