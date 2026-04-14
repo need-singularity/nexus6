@@ -1,0 +1,223 @@
+// sedi_x_eeg.hexa — Cross-domain bisociation L3 (Montgomery-Dyson pair 1호)
+// 가설: SEDI 가설 size spectrum × anima learning timestamps. R2(r) 겹치면 unreasonable effectiveness.
+// 출력: sedi_spectrum.jsonl, eeg_spectrum.jsonl, sedi_x_eeg_verdict.json
+// 파이프: shell awk → unfold.hexa → pair_corr.hexa → wigner_fit.hexa → cross-metrics // @allow-bare-interp
+
+fn abs_f(x: f64) -> f64 { if x < 0.0 { return 0.0 - x }; return x }
+
+fn sqrt_f(x: f64) -> f64 {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    let mut i: i64 = 0
+    while i < 40 {
+        let nx = (g + x / g) / 2.0
+        if abs_f(nx - g) < g * 0.0000000000001 { return nx }
+        g = nx; i = i + 1
+    }
+    return g
+}
+
+fn safe_float(s: string) -> f64 {
+    let mut v = 0.0
+    try { v = to_float(s) } catch e {} // @allow-silent-catch
+    return v
+}
+
+fn _min_cut(s: string, from: i64) -> i64 {
+    let cands = [",", "}", " ", "\t", "\r", "]"]
+    let mut best: i64 = 0 - 1
+    let mut i: i64 = 0
+    while i < cands.len() {
+        let p = s.substring(from, s.len()).index_of(cands[i])
+        if p >= 0 {
+            let abs_p = from + p
+            if best < 0 || abs_p < best { best = abs_p }
+        }
+        i = i + 1
+    }
+    return best
+}
+
+fn json_get_num(line: string, key: string) -> f64 {
+    let pat = "\"" + key + "\""
+    let kp = line.index_of(pat)
+    if kp < 0 { return 0.0 }
+    let after_key = kp + pat.len()
+    let colon_rel = line.substring(after_key, line.len()).index_of(":")
+    if colon_rel < 0 { return 0.0 }
+    let mut num_start = after_key + colon_rel + 1
+    while num_start < line.len() {
+        let ch = line.substring(num_start, num_start + 1)
+        if ch == " " || ch == "\t" { num_start = num_start + 1 } else { break }
+    }
+    let cut = _min_cut(line, num_start)
+    let mut end = line.len()
+    if cut >= 0 { end = cut }
+    return safe_float(line.substring(num_start, end).trim())
+}
+
+// load R2 series, normalize mean→1 for shape-only comparison
+fn load_r2_norm(path: string) -> list {
+    let mut out: list = []
+    let mut raw = ""
+    try { raw = read_file(path) } catch e { return out } // @allow-silent-catch
+    for line in raw.split("\n") {
+        let l = line.trim()
+        if l.len() == 0 { continue }
+        if l.contains("\"R2\"") == false { continue }
+        out = out.push(json_get_num(l, "R2"))
+    }
+    let mut sum = 0.0
+    let mut i: i64 = 0
+    while i < out.len() { sum = sum + out[i]; i = i + 1 }
+    if sum <= 0.000000001 { return out }
+    let m = sum / to_float(out.len())
+    let mut nrm: list = []
+    i = 0
+    while i < out.len() { nrm.push(out[i] / m); i = i + 1 }
+    return nrm
+}
+
+fn read_verdict(path: string) -> list {
+    let mut raw = ""
+    try { raw = read_file(path) } catch e { return ["mixed", "0.5"] } // @allow-silent-catch
+    let v_pos = raw.index_of("\"verdict\":\"")
+    let s_pos = raw.index_of("\"score\":")
+    let mut verdict = "mixed"
+    let mut score: f64 = 0.5
+    if v_pos >= 0 {
+        let tail = raw.substring(v_pos + 11, raw.len())
+        let qend = tail.index_of("\"")
+        if qend >= 0 { verdict = tail.substring(0, qend) }
+    }
+    if s_pos >= 0 {
+        let tail = raw.substring(s_pos + 8, raw.len())
+        let cut  = _min_cut(tail, 0)
+        let mut end = tail.len()
+        if cut >= 0 { end = cut }
+        score = safe_float(tail.substring(0, end).trim())
+    }
+    return [verdict, to_string(score)]
+}
+
+// ─── env / paths ───
+let _HOME = env("HOME")
+let BASE = _HOME + "/Dev/nexus/shared/bisociation/cross"
+let HEXA = _HOME + "/Dev/nexus/shared/bin/hexa"
+let UF   = _HOME + "/Dev/nexus/shared/bisociation/spectra/unfold.hexa"
+let PC   = _HOME + "/Dev/nexus/shared/bisociation/spectra/pair_corr.hexa"
+let WG   = _HOME + "/Dev/nexus/shared/bisociation/spectra/wigner_fit.hexa"
+
+let SEDI_SPEC = BASE + "/sedi_spectrum.jsonl"
+let EEG_SPEC  = BASE + "/eeg_spectrum.jsonl"
+let VERDICT   = BASE + "/sedi_x_eeg_verdict.json"
+let S_UNF = "/tmp/.bs_sedi_unf.jsonl"; let S_PC = "/tmp/.bs_sedi_pc.jsonl"; let S_WG = "/tmp/.bs_sedi_wg.json"
+let E_UNF = "/tmp/.bs_eeg_unf.jsonl";  let E_PC = "/tmp/.bs_eeg_pc.jsonl";  let E_WG = "/tmp/.bs_eeg_wg.json"
+
+println("=== sedi_x_eeg — L3 cross-domain bisociation ===")
+
+// SEDI proxy: papers/sedi/PS-*.md + n6-arch n6-*-paper.md sizes
+let sedi_sh = "find " + _HOME + "/Dev/papers/sedi " + _HOME + "/Dev/n6-architecture/papers "
+    + "-name '*.md' -type f -not -path '*_archive*' "
+    + "-exec stat -f '%z' {} \\; 2>/dev/null | sort -n | "
+    + "awk '{ printf \"{\\\"idx\\\":%d,\\\"lambda\\\":%d}\\n\", NR-1, $1 }' > '" + SEDI_SPEC + "'"
+try { exec(sedi_sh) } catch e { println("ERR sedi build"); exit(1) } // @allow-silent-exit
+let sedi_n = to_int(exec("wc -l < '" + SEDI_SPEC + "'").trim())
+println("  SEDI: " + to_string(sedi_n) + " papers (size-sorted, hypothesis spectrum proxy)")
+
+// EEG proxy: anima learning_log timestamps → unix epoch
+let eeg_log = _HOME + "/Dev/anima/data/autonomous_learning/learning_log.jsonl"
+let eeg_sh = "grep -ho '\"timestamp\": \"[^\"]*\"' '" + eeg_log + "' "
+    + "| sed 's/.*: \"//;s/\"$//' | awk -F'.' '{print $1}' "
+    + "| while read t; do date -j -f '%Y-%m-%dT%H:%M:%S' \"$t\" '+%s' 2>/dev/null; done "
+    + "| sort -n | awk '{ printf \"{\\\"idx\\\":%d,\\\"lambda\\\":%d}\\n\", NR-1, $1 }' > '" + EEG_SPEC + "'"
+try { exec(eeg_sh) } catch e { println("ERR eeg build"); exit(1) } // @allow-silent-exit
+let eeg_n = to_int(exec("wc -l < '" + EEG_SPEC + "'").trim())
+println("  EEG : " + to_string(eeg_n) + " events (anima learning_log ts, brain tempo proxy)")
+
+if sedi_n < 8 || eeg_n < 8 { println("FAIL: insufficient samples"); exit(1) } // @allow-silent-exit
+
+// run pipeline (via shell)
+fn run_pipe(label: string, spec: string, unf: string, pc: string, wg: string,
+            hexa: string, ufp: string, pcp: string, wgp: string) {
+    println("  [" + label + "] unfold/pc/wigner...")
+    try { exec(hexa + " run " + ufp + " '" + spec + "' '" + unf + "' 2>&1") } catch e { exit(1) } // @allow-silent-catch // @allow-silent-exit
+    try { exec(hexa + " run " + pcp + " '" + unf  + "' '" + pc  + "' 2>&1") } catch e { exit(1) } // @allow-silent-catch // @allow-silent-exit
+    try { exec(hexa + " run " + wgp + " '" + pc   + "' '" + wg  + "' 2>&1") } catch e { exit(1) } // @allow-silent-catch // @allow-silent-exit
+}
+run_pipe("SEDI", SEDI_SPEC, S_UNF, S_PC, S_WG, HEXA, UF, PC, WG)
+run_pipe("EEG ", EEG_SPEC,  E_UNF, E_PC, E_WG, HEXA, UF, PC, WG)
+
+// load + cross metrics (normalized R2 shapes)
+let r2_sedi = load_r2_norm(S_PC)
+let r2_eeg  = load_r2_norm(E_PC)
+let nb = r2_sedi.len()
+if r2_eeg.len() != nb { println("FAIL: bin mismatch"); exit(1) } // @allow-silent-exit
+println("  R2 bins: " + to_string(nb))
+
+let mut ks = 0.0
+let mut sse = 0.0
+let mut sx = 0.0; let mut sy = 0.0
+let mut k: i64 = 0
+while k < nb {
+    let d = r2_sedi[k] - r2_eeg[k]
+    let ad = abs_f(d)
+    if ad > ks { ks = ad }
+    sse = sse + d * d
+    sx = sx + r2_sedi[k]; sy = sy + r2_eeg[k]
+    k = k + 1
+}
+let l2 = sqrt_f(sse / to_float(nb))
+let mx = sx / to_float(nb); let my = sy / to_float(nb)
+let mut sxy = 0.0; let mut sxx = 0.0; let mut syy = 0.0
+k = 0
+while k < nb {
+    let dx = r2_sedi[k] - mx; let dy = r2_eeg[k] - my
+    sxy = sxy + dx * dy; sxx = sxx + dx * dx; syy = syy + dy * dy
+    k = k + 1
+}
+let mut pearson = 0.0
+let denom = sqrt_f(sxx * syy)
+if denom > 0.000000000001 { pearson = sxy / denom }
+
+let sv = read_verdict(S_WG); let ev = read_verdict(E_WG)
+let sedi_verdict = sv[0]; let sedi_score = safe_float(sv[1])
+let eeg_verdict  = ev[0]; let eeg_score  = safe_float(ev[1])
+
+let mut judgment = "mixed"
+let mut md_cand  = "false"
+if ks < 0.15 && pearson > 0.7 { judgment = "congruent"; md_cand = "true" }
+else if ks > 0.5 || pearson < 0.2 { judgment = "divergent" }
+
+let out = "{\n"
+    + "  \"sedi\":  {\"source\":\"proxy_paper_size\",\"n\":" + to_string(sedi_n)
+    + ",\"verdict\":\"" + sedi_verdict + "\",\"score\":" + to_string(sedi_score) + "},\n"
+    + "  \"eeg\":   {\"source\":\"proxy_anima_learning_ts\",\"n\":" + to_string(eeg_n)
+    + ",\"verdict\":\"" + eeg_verdict + "\",\"score\":" + to_string(eeg_score) + "},\n"
+    + "  \"cross\": {\"ks\":" + to_string(ks) + ",\"pearson\":" + to_string(pearson)
+    + ",\"l2\":" + to_string(l2) + ",\"n_bins\":" + to_string(nb) + "},\n"
+    + "  \"judgment\":\"" + judgment + "\",\n"
+    + "  \"montgomery_dyson_candidate\":" + md_cand + ",\n"
+    + "  \"ts\":\"2026-04-14\",\"pair\":\"sedi_x_eeg\"\n}\n"
+try { write_file(VERDICT, out) } catch e { println("ERR write verdict"); exit(1) } // @allow-silent-exit
+
+println("")
+println("┌─ verdict ──────────────────────────────────")
+println("│ SEDI : n=" + to_string(sedi_n) + " v=" + sedi_verdict + " s=" + to_string(sedi_score))
+println("│ EEG  : n=" + to_string(eeg_n)  + " v=" + eeg_verdict  + " s=" + to_string(eeg_score))
+println("│ KS=" + to_string(ks) + " ρ=" + to_string(pearson) + " L2=" + to_string(l2))
+println("│ judgment=" + judgment + " MD-candidate=" + md_cand)
+println("└────────────────────────────────────────────")
+
+if judgment == "congruent" {
+    let bt = _HOME + "/Dev/nexus/shared/bisociation/breakthroughs.jsonl"
+    let line = "{\"ts\":\"2026-04-14\",\"kind\":\"cross_bisociation\",\"pair\":\"sedi_x_eeg\""
+        + ",\"judgment\":\"congruent\",\"ks\":" + to_string(ks)
+        + ",\"pearson\":" + to_string(pearson) + ",\"l2\":" + to_string(l2)
+        + ",\"sedi_verdict\":\"" + sedi_verdict + "\",\"eeg_verdict\":\"" + eeg_verdict + "\"}\n"
+    let mut prev = ""
+    try { prev = read_file(bt) } catch e {} // @allow-silent-catch
+    try { write_file(bt, prev + line); println("  → breakthroughs.jsonl appended") }
+    catch e { println("  WARN: bt append failed") }
+}

@@ -1,0 +1,297 @@
+// subgraph_decompose.hexa — atlas.n6 sub-graph spectrum verdicts
+// Global Laplacian = Poisson(0.224). Decompose by tag, find GUE-leaning sub-nets.
+// Pipeline: tag-extract (awk) → induced CSR → Lanczos K=50 → unfold/pair_corr/wigner_fit chain.
+// Out: subgraph_verdicts/{tag}.json + subgraph_summary.json.
+
+fn abs_f(x: f64) -> f64 { if x < 0.0 { return 0.0 - x }; return x }
+fn sqrt_f(x: f64) -> f64 {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0; if g < 1.0 { g = 1.0 }
+    let mut i: i64 = 0
+    while i < 40 { let nx = (g + x / g) / 2.0; if abs_f(nx - g) < g * 0.0000000000001 { return nx }; g = nx; i = i + 1 }
+    return g
+}
+fn hypot_f(a: f64, b: f64) -> f64 {
+    let aa = abs_f(a); let ab = abs_f(b)
+    if aa > ab { let r = ab / aa; return aa * sqrt_f(1.0 + r * r) }
+    if ab == 0.0 { return 0.0 }
+    let r = aa / ab; return ab * sqrt_f(1.0 + r * r)
+}
+fn load_int_lines(path: string) -> [i64] {
+    let lines = read_file(path).split("\n"); let mut out: [i64] = []; let mut i: i64 = 0
+    while i < len(lines) { let t = lines[i].trim(); if t != "" { let mut v: i64 = 0; try { v = to_int(t) } catch e {} ; out.push(v) }; i = i + 1 } // @allow-silent-catch
+    return out
+}
+fn matvec_L(x: [f64], deg: [i64], rp: [i64], cl: [i64], n: i64) -> [f64] {
+    let mut y: [f64] = []; let mut r: i64 = 0
+    while r < n {
+        let mut s = to_float(deg[r]) * x[r]; let so = rp[r]; let eo = rp[r + 1]; let mut k = so
+        while k < eo { s = s - x[cl[k]]; k = k + 1 }
+        y = y.push(s); r = r + 1 }
+    return y
+}
+fn dot(u: [f64], v: [f64], n: i64) -> f64 { let mut s = 0.0; let mut i: i64 = 0; while i < n { s = s + u[i] * v[i]; i = i + 1 }; return s }
+fn sub_scaled(u: [f64], v: [f64], a: f64, n: i64) -> [f64] { let mut o: [f64] = []; let mut i: i64 = 0; while i < n { o.push(u[i] - a * v[i]); i = i + 1 }; return o }
+fn norm2(u: [f64], n: i64) -> f64 { let mut s = 0.0; let mut i: i64 = 0; while i < n { s = s + u[i] * u[i]; i = i + 1 }; return sqrt_f(s) }
+fn scale_inv(u: [f64], b: f64, n: i64) -> [f64] { let mut o: [f64] = []; let mut i: i64 = 0; while i < n { o.push(u[i] / b); i = i + 1 }; return o }
+fn rebuild_with(li: [f64], i1: i64, v1: f64, i2: i64, v2: f64, i3: i64, v3: f64) -> [f64] {
+    let mut o: [f64] = []; let mut i: i64 = 0
+    while i < len(li) { let mut v = li[i]; if i == i1 { v = v1 }; if i == i2 { v = v2 }; if i == i3 { v = v3 }; o.push(v); i = i + 1 }
+    return o }
+fn qr_sweep(d_in: [f64], e_in: [f64], l: i64, p: i64) -> [[f64]] {
+    let dd = (d_in[p - 1] - d_in[p]) / 2.0; let b2 = e_in[p - 1] * e_in[p - 1]
+    let mut sgn = 1.0; if dd < 0.0 { sgn = -1.0 }
+    let mu = d_in[p] - b2 / (dd + sgn * sqrt_f(dd * dd + b2))
+    let mut dw = d_in; let mut ew = e_in
+    let mut x = dw[l] - mu; let mut z = ew[l]; let mut i: i64 = l
+    while i < p {
+        let r = hypot_f(x, z); let mut c = 1.0; let mut s = 0.0
+        if r > 0.0 { c = x / r; s = z / r }
+        let di = dw[i]; let di1 = dw[i + 1]; let ei = ew[i]
+        let nd = c * c * di + 2.0 * c * s * ei + s * s * di1
+        let nd1 = s * s * di - 2.0 * c * s * ei + c * c * di1
+        let ne = (c * c - s * s) * ei + c * s * (di1 - di)
+        dw = rebuild_with(dw, i, nd, i + 1, nd1, -1, 0.0)
+        if i > l { ew = rebuild_with(ew, i - 1, r, i, ne, -1, 0.0) } else { ew = rebuild_with(ew, i, ne, -1, 0.0, -1, 0.0) }
+        if i + 1 < p { let oei1 = ew[i + 1]; ew = rebuild_with(ew, i + 1, c * oei1, -1, 0.0, -1, 0.0); z = s * oei1 }
+        x = ne; i = i + 1
+    }
+    return [dw, ew]
+}
+fn lanczos_eigs(deg: [i64], rp: [i64], cl: [i64], n: i64, K_req: i64) -> [f64] {
+    let mut K = K_req; if K > n { K = n }; if K > 200 { K = 200 }
+    let mut v_init: [f64] = []; let mut s0 = 0.0; let mut ix: i64 = 0
+    while ix < n { let kk = (ix * 2654435761) % 1000003; let xv = to_float(kk) / 1000003.0 - 0.5; v_init.push(xv); s0 = s0 + xv * xv; ix = ix + 1 }
+    let nrm0 = sqrt_f(s0); if nrm0 < 0.000000001 { return [] }
+    let mut v_cur = scale_inv(v_init, nrm0, n)
+    let mut v_prev: [f64] = []; let mut vp: i64 = 0; while vp < n { v_prev.push(0.0); vp = vp + 1 }
+    let mut alphas: [f64] = []; let mut betas: [f64] = []; let mut bp = 0.0; let mut it: i64 = 0
+    while it < K {
+        let Lv = matvec_L(v_cur, deg, rp, cl, n)
+        let w1 = sub_scaled(Lv, v_prev, bp, n); let al = dot(w1, v_cur, n); alphas.push(al)
+        let w2 = sub_scaled(w1, v_cur, al, n); let dp = dot(w2, v_prev, n); let w3 = sub_scaled(w2, v_prev, dp, n)
+        let be = norm2(w3, n); if be < 0.00000000001 { break }
+        betas = betas.push(be); v_prev = v_cur; v_cur = scale_inv(w3, be, n); bp = be; it = it + 1
+    }
+    let k_eff = len(alphas)
+    if k_eff < 3 { return [] }
+    let mut d = alphas; let mut e: [f64] = []; let mut bi: i64 = 0
+    while bi < k_eff - 1 { e.push(betas[bi]); bi = bi + 1 }
+    let mut me = k_eff; let ms = 80 * k_eff; let mut sw: i64 = 0
+    while me > 1 && sw < ms {
+        sw = sw + 1; let mut li: i64 = 0; let mut fnd = false; let mut ls = me - 2
+        while ls >= 0 {
+            let thr = 0.0000000000001 * (abs_f(d[ls]) + abs_f(d[ls + 1]))
+            if abs_f(e[ls]) <= thr { e = rebuild_with(e, ls, 0.0, -1, 0.0, -1, 0.0); li = ls + 1; fnd = true; break }
+            ls = ls - 1
+        }
+        if !fnd { li = 0 }
+        if li == me - 1 { me = me - 1 } else { let p = me - 1; let res = qr_sweep(d, e, li, p); d = res[0]; e = res[1] }
+    }
+    let mut sorted_out: [f64] = []; let mut used: [bool] = []; let mut uu: i64 = 0
+    while uu < k_eff { used.push(false); uu = uu + 1 }
+    let mut pass: i64 = 0
+    while pass < k_eff {
+        let mut bi2: i64 = -1; let mut bv = 0.0; let mut j: i64 = 0
+        while j < k_eff { if !used[j] { if bi2 < 0 || d[j] < bv { bi2 = j; bv = d[j] } }; j = j + 1 }
+        if bi2 < 0 { break }
+        sorted_out = sorted_out.push(bv)
+        let mut u2: [bool] = []; let mut z: i64 = 0
+        while z < k_eff { if z == bi2 { u2.push(true) } else { u2.push(used[z]) }; z = z + 1 }
+        used = u2; pass = pass + 1
+    }
+    return sorted_out
+}
+
+let argv = args()
+let _HOME = env("HOME")
+let mut ATLAS = _HOME + "/Dev/nexus/shared/n6/atlas.n6"
+let mut MINDEG: i64 = 1; let mut HUB_TOP: i64 = 100
+let SPDIR = _HOME + "/Dev/nexus/shared/bisociation/spectra"
+let OUT_DIR = SPDIR + "/subgraph_verdicts"
+let mut ai: i64 = 2
+while ai < len(argv) {
+    let t = argv[ai]
+    if t == "--atlas"  && ai + 1 < len(argv) { ai = ai + 1; ATLAS  = argv[ai] }
+    else if t == "--mindeg" && ai + 1 < len(argv) { ai = ai + 1; MINDEG = to_int(argv[ai]) }
+    else if t == "--top"    && ai + 1 < len(argv) { ai = ai + 1; HUB_TOP = to_int(argv[ai]) }
+    ai = ai + 1
+}
+if !file_exists(ATLAS) { println("error: atlas missing"); exit(1) } // @allow-silent-exit
+try { exec("mkdir -p '" + OUT_DIR + "'") } catch e {} // @allow-silent-catch
+println("=== subgraph_decompose ==="); println("  atlas: " + ATLAS); println("  mindeg: " + to_string(MINDEG))
+
+let pid = to_string(to_int(exec("echo $$").trim()))
+let TAG = "/tmp/.sg_tag." + pid + ".tsv"     // node_id<TAB>nt|dom|prefix<TAB>deg
+let EDG = TAG + ".edges"                     // from<TAB>to<TAB>edge_type
+let awk_extract = "awk 'BEGIN{FS=\"\"; OFS=\"\\t\"} "
+    + "{ if(match($0,/\"type\":\"node\"/)){ id=\"\"; nt=\"\"; dm=\"\"; "
+    + "    if(match($0,/\"id\":\"[^\"]*\"/)) id=substr($0,RSTART+6,RLENGTH-7); "
+    + "    if(match($0,/\"node_type\":\"[^\"]*\"/)) nt=substr($0,RSTART+13,RLENGTH-14); "
+    + "    if(match($0,/\"domain\":\"[^\"]*\"/)) dm=substr($0,RSTART+10,RLENGTH-11); "
+    + "    dp=id; sub(/_.*/,\"\",dp); if(id!=\"\") NODE[id]=nt\"|\"dm\"|\"dp; "
+    + "  } else if(match($0,/\"type\":\"edge\"/)){ f=\"\"; t=\"\"; et=\"\"; "
+    + "    if(match($0,/\"from\":\"[^\"]*\"/)) f=substr($0,RSTART+8,RLENGTH-9); "
+    + "    if(match($0,/\"to\":\"[^\"]*\"/))   t=substr($0,RSTART+6,RLENGTH-7); "
+    + "    if(match($0,/\"edge_type\":\"[^\"]*\"/)) et=substr($0,RSTART+13,RLENGTH-14); "
+    + "    if(f!=\"\" && t!=\"\" && f!=t){ DEG[f]++; DEG[t]++; print f, t, et > \"" + EDG + "\" } "
+    + "  } } END{ for(k in NODE){ d=(k in DEG)?DEG[k]:0; print k, NODE[k], d > \"" + TAG + "\" } }' '" + ATLAS + "'"
+try { exec("rm -f '" + TAG + "' '" + EDG + "'") } catch e {} // @allow-silent-catch
+try { exec(awk_extract) } catch e { println("awk extract failed"); exit(1) } // @allow-silent-exit
+let _types  = exec("awk -F'\\t' '{split($2,a,\"|\"); print a[1]}' '" + TAG + "' | sort | uniq -c | awk '$2!=\"\" {print $2\"\\t\"$1}'").trim()
+let _doms   = exec("awk -F'\\t' '{split($2,a,\"|\"); print a[2]}' '" + TAG + "' | sort | uniq -c | awk '$2!=\"\" && $1>=200 {print $2\"\\t\"$1}'").trim()
+let _depths = exec("awk -F'\\t' '{split($2,a,\"|\"); print a[3]}' '" + TAG + "' | sort | uniq -c | awk '$2!=\"\" && $1>=200 {print $2\"\\t\"$1}'").trim()
+let _etypes = exec("awk -F'\\t' '$3!=\"\" {print $3}' '" + EDG + "' | sort | uniq -c | awk '$2!=\"\" && $1>=20 {print $2\"\\t\"$1}'").trim()
+println("  node_types:\n" + _types); println("  domains(>=200):\n" + _doms)
+println("  depth_pfx(>=200):\n" + _depths); println("  edge_types(>=20):\n" + _etypes)
+fn parse_lines(s: string) -> [string] { let r = s.trim(); if r == "" { return [] }; return r.split("\n") }
+fn run_subgraph(label: string, ids_path: string, epred: string, OUT_DIR: string, EDG: string, MINDEG: i64) -> [string] {
+    let pid = to_string(to_int(exec("echo $$").trim()))
+    let MEM = "/tmp/.sg_mem." + pid + ".tsv"
+    let RP  = "/tmp/.sg_rp."  + pid + ".txt"
+    let DG  = "/tmp/.sg_dg."  + pid + ".txt"
+    let CL  = "/tmp/.sg_cl."  + pid + ".txt"
+    try { exec("rm -f '" + MEM + "' '" + RP + "' '" + DG + "' '" + CL + "'") } catch e {} // @allow-silent-catch
+    try { exec("sort -u '" + ids_path + "' | awk 'NF>0 {print NR-1\"\\t\"$1}' > '" + MEM + "'") } catch e {} // @allow-silent-catch
+    let n = to_int(to_string(exec("wc -l < '" + MEM + "'")).trim())
+    if n < 20 { return [label, to_string(n), "0", "0.0", "skip_small"] }
+    let build = "awk -v NC=" + to_string(n) + " 'BEGIN{FS=\"\\t\"; while((getline l < \"" + MEM + "\")>0){split(l,a,\"\\t\"); MAP[a[2]]=a[1]}} "
+        + "{ " + epred + " if($1 in MAP && $2 in MAP){ ia=MAP[$1]+0; ib=MAP[$2]+0; if(ia!=ib){ "
+        + "  N[ia]=(ia in N ? N[ia]\" \"ib : ib); N[ib]=(ib in N ? N[ib]\" \"ia : ia); "
+        + "  D[ia]=(ia in D ? D[ia]+1 : 1); D[ib]=(ib in D ? D[ib]+1 : 1) } } } "
+        + "END{ acc=0; for(i=0;i<NC;i++){ deg=(i in D)?D[i]:0; "
+        + "  printf \"%d\\n\", acc >> \"" + RP + "\"; acc+=deg; "
+        + "  printf \"%d\\n\", deg >> \"" + DG + "\"; "
+        + "  if(deg>0){ nn=split(N[i],NB,\" \"); for(j=1;j<=nn;j++) printf \"%s\\n\", NB[j] >> \"" + CL + "\" } } "
+        + "  printf \"%d\\n\", acc >> \"" + RP + "\" }' '" + EDG + "'"
+    try { exec(build) } catch e {} // @allow-silent-catch
+    let row_ptr = load_int_lines(RP); let deg = load_int_lines(DG); let col_idx = load_int_lines(CL)
+    let edges = len(col_idx) / 2
+    let mut sd: i64 = 0; let mut id: i64 = 0
+    while id < len(deg) { sd = sd + deg[id]; id = id + 1 }
+    let md = to_float(sd) / to_float(n)
+    if md < to_float(MINDEG) { return [label, to_string(n), to_string(edges), "0.0", "skip_lowdeg"] }
+    let eig = lanczos_eigs(deg, row_ptr, col_idx, n, 50)
+    if len(eig) < 10 { return [label, to_string(n), to_string(edges), "0.0", "skip_lanczos_short"] }
+    let EP = OUT_DIR + "/" + label + ".eig.jsonl"
+    let mut buf = ""; let mut w: i64 = 0
+    while w < len(eig) { buf = buf + "{\"idx\":" + to_string(w) + ",\"lambda\":" + to_string(eig[w]) + "}\n"; w = w + 1 }
+    try { write_file(EP, buf) } catch e { return [label, to_string(n), to_string(edges), "0.0", "write_fail"] } // @allow-silent-catch
+    let _H = env("HOME"); let SP = _H + "/Dev/nexus/shared/bisociation/spectra"
+    let UNF = OUT_DIR + "/" + label + ".unf.jsonl"; let PCC = OUT_DIR + "/" + label + ".pc.jsonl"; let VRD = OUT_DIR + "/" + label + ".json"
+    try { exec("hexa '" + SP + "/unfold.hexa' '" + EP + "' '" + UNF + "' 2>/dev/null") } catch e {} // @allow-silent-catch
+    try { exec("hexa '" + SP + "/pair_corr.hexa' '" + UNF + "' '" + PCC + "' 2>/dev/null") } catch e {} // @allow-silent-catch
+    try { exec("hexa '" + SP + "/wigner_fit.hexa' '" + PCC + "' '" + VRD + "' 2>/dev/null") } catch e {} // @allow-silent-catch
+    let mut score = "0.0"; let mut verdict = "unknown"
+    if file_exists(VRD) {
+        let r = read_file(VRD).trim()
+        let kp = r.index_of("\"score\":")
+        if kp >= 0 { let af = r.substring(kp + 8, r.len()); let ct = af.index_of(","); let mut ep2 = af.len(); if ct >= 0 { ep2 = ct }; score = af.substring(0, ep2).trim() }
+        let kv = r.index_of("\"verdict\":\"")
+        if kv >= 0 { let af = r.substring(kv + 11, r.len()); let ct = af.index_of("\""); if ct >= 0 { verdict = af.substring(0, ct) } }
+    }
+    try { exec("rm -f '" + MEM + "' '" + RP + "' '" + DG + "' '" + CL + "'") } catch e {} // @allow-silent-catch
+    return [label, to_string(n), to_string(edges), score, verdict]
+}
+
+fn make_safe(s: string) -> string {
+    let mut o = ""; let mut i: i64 = 0
+    while i < s.len() { let c = s.substring(i, i + 1); if c == " " || c == "\"" || c == "'" || c == "/" { o = o + "_" } else { o = o + c }; i = i + 1 }
+    return o
+}
+
+// stage_ids: take a tag-class predicate, write 1-hop closure ids to /tmp/.sg_ids.{label}.{pid}.txt
+fn stage_ids_1hop(label: string, npred: string, TAG: string, EDG: string, pid: string) -> string {
+    let CORE = "/tmp/.sg_core." + label + "." + pid + ".txt"
+    let OUT  = "/tmp/.sg_ids."  + label + "." + pid + ".txt"
+    try { exec("awk -F'\\t' '" + npred + "' '" + TAG + "' | awk -F'\\t' '{print $1}' | sort -u > '" + CORE + "'") } catch e {} // @allow-silent-catch
+    // 1-hop closure: every edge endpoint touching CORE union CORE itself
+    try { exec("awk 'FNR==NR{C[$1]=1; next} { if($1 in C || $2 in C){print $1; print $2} }' '" + CORE + "' '" + EDG + "' | cat - '" + CORE + "' | sort -u > '" + OUT + "'") } catch e {} // @allow-silent-catch
+    return OUT
+}
+fn add_tag_jobs(jobs: [[string]], lines: string, prefix: string, col_idx: i64, TAG: string, EDG: string, pid: string, min_cnt: i64) -> [[string]] {
+    let mut out = jobs
+    let arr = parse_lines(lines)
+    let mut i: i64 = 0
+    while i < len(arr) {
+        let p = arr[i].split("\t")
+        if len(p) >= 2 && to_int(p[1]) >= min_cnt {
+            let lab = prefix + p[0]
+            let npred = "{split($2,a,\"|\"); if(a[" + to_string(col_idx) + "]==\"" + p[0] + "\") print}"
+            let ids = stage_ids_1hop(lab, npred, TAG, EDG, pid)
+            out = out.push([lab, ids, ""])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+let mut jobs: [[string]] = []
+jobs = add_tag_jobs(jobs, _types,  "nt_",  1, TAG, EDG, pid, 50)
+jobs = add_tag_jobs(jobs, _doms,   "dom_", 2, TAG, EDG, pid, 1)
+jobs = add_tag_jobs(jobs, _depths, "pfx_", 3, TAG, EDG, pid, 1)
+// edge-type jobs: nodes = endpoints of edges with that type
+let el = parse_lines(_etypes); let mut ei: i64 = 0
+while ei < len(el) {
+    let p = el[ei].split("\t")
+    if len(p) >= 2 {
+        let lab = "et_" + p[0]; let IDS = "/tmp/.sg_ids." + lab + "." + pid + ".txt"
+        try { exec("awk -F'\\t' '$3==\"" + p[0] + "\" {print $1; print $2}' '" + EDG + "' | sort -u > '" + IDS + "'") } catch e {} // @allow-silent-catch
+        jobs = jobs.push([lab, IDS, "if($3!=\"" + p[0] + "\") next; "])
+    }
+    ei = ei + 1
+}
+// hub-centric: top-N degree + 1-hop
+let hub_str = exec("awk -F'\\t' '$3+0>0 {print $3\"\\t\"$1}' '" + TAG + "' | sort -k1,1 -nr | head -" + to_string(HUB_TOP) + " | awk '{print $2}'").trim()
+if hub_str != "" {
+    let HF = "/tmp/.sg_hubs." + pid + ".txt"; try { write_file(HF, hub_str) } catch e {} // @allow-silent-catch
+    let lab = "hub_top" + to_string(HUB_TOP); let IDS = "/tmp/.sg_ids." + lab + "." + pid + ".txt"
+    try { exec("awk 'FNR==NR{H[$1]=1; next} { if($1 in H || $2 in H){print $1; print $2} }' '" + HF + "' '" + EDG + "' | cat - '" + HF + "' | sort -u > '" + IDS + "'") } catch e {} // @allow-silent-catch
+    jobs = jobs.push([lab, IDS, ""])
+}
+// leaf-only (deg<=2), no 1-hop
+let LIDS = "/tmp/.sg_ids.leaf_deg_le2." + pid + ".txt"
+try { exec("awk -F'\\t' '$3+0<=2 && $3+0>=1 {print $1}' '" + TAG + "' | sort -u > '" + LIDS + "'") } catch e {} // @allow-silent-catch
+jobs = jobs.push(["leaf_deg_le2", LIDS, ""])
+// relays: nodes that are both edge source AND edge target
+let RIDS = "/tmp/.sg_ids.relay_dual." + pid + ".txt"
+try { exec("awk -F'\\t' '{F[$1]=1; T[$2]=1} END{for(k in F) if(k in T) print k}' '" + EDG + "' > '" + RIDS + "'") } catch e {} // @allow-silent-catch
+jobs = jobs.push(["relay_dual", RIDS, ""])
+let RHIDS = "/tmp/.sg_ids.relay_1hop." + pid + ".txt"
+try { exec("awk 'FNR==NR{C[$1]=1; next} { if($1 in C || $2 in C){print $1; print $2} }' '" + RIDS + "' '" + EDG + "' | cat - '" + RIDS + "' | sort -u > '" + RHIDS + "'") } catch e {} // @allow-silent-catch
+jobs = jobs.push(["relay_1hop", RHIDS, ""])
+println("  jobs: " + to_string(len(jobs)))
+
+let mut summary = "{\"generated_at\":\"2026-04-14\",\"global_score\":0.224,\"global_verdict\":\"Poisson\",\"subnets\":[\n"
+let mut first_row = true
+let mut best_label = ""; let mut best_score = -1.0; let mut best_n: i64 = 0; let mut best_e: i64 = 0
+let mut ji: i64 = 0
+while ji < len(jobs) {
+    let job = jobs[ji]
+    let label = make_safe(job[0])
+    println("  -> " + label)
+    let row = run_subgraph(label, job[1], job[2], OUT_DIR, EDG, MINDEG)
+    let n_ = to_int(row[1]); let e_ = to_int(row[2]); let mut sc = 0.0; try { sc = to_float(row[3]) } catch x {} // @allow-silent-catch
+    let vd = row[4]
+    let entry = "{\"label\":\"" + label + "\",\"n\":" + row[1] + ",\"edges\":" + row[2] + ",\"score\":" + row[3] + ",\"verdict\":\"" + vd + "\"}"
+    if first_row { summary = summary + "  " + entry; first_row = false } else { summary = summary + ",\n  " + entry }
+    if sc > best_score && vd != "skip_small" && vd != "skip_lowdeg" && vd != "skip_lanczos_short" && vd != "write_fail" {
+        best_score = sc; best_label = label; best_n = n_; best_e = e_
+    }
+    ji = ji + 1
+}
+summary = summary + "\n],\n\"best\":{\"label\":\"" + best_label + "\",\"n\":" + to_string(best_n) + ",\"edges\":" + to_string(best_e) + ",\"score\":" + to_string(best_score) + "}}\n"
+try { write_file(SPDIR + "/subgraph_summary.json", summary) } catch e { println("summary write fail") }
+
+if best_score >= 0.7 {
+    let BR = _HOME + "/Dev/nexus/shared/bisociation/breakthroughs.jsonl"
+    let line = "{\"ts\":\"2026-04-14\",\"kind\":\"subgraph_gue\",\"subnet\":\"" + best_label + "\",\"score\":" + to_string(best_score) + ",\"n\":" + to_string(best_n) + ",\"edges\":" + to_string(best_e) + ",\"note\":\"sub-graph laplacian spectrum bunched toward GUE while global stays Poisson\"}\n"
+    let mut prev = ""; if file_exists(BR) { try { prev = read_file(BR) } catch e {} } // @allow-silent-catch
+    try { write_file(BR, prev + line) } catch e {} // @allow-silent-catch
+    println("  breakthroughs.jsonl appended for " + best_label)
+}
+
+try { exec("rm -f '" + TAG + "' '" + EDG + "' /tmp/.sg_hubs." + pid + ".txt /tmp/.sg_hubs." + pid + ".txt.all /tmp/.sg_hubmem." + pid + ".tsv") } catch e {} // @allow-silent-catch
+
+println("=== done ==="); println("  best: " + best_label + "  score=" + to_string(best_score)); println("  summary: " + SPDIR + "/subgraph_summary.json")
+exit(0)

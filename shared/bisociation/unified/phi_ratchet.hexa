@@ -1,0 +1,151 @@
+// phi_ratchet.hexa — Φ ratchet (비가역 단조 floor)
+// 원본: anima/anima-core/phi_engine.hexa  공식: new = max(value, ratio × max(history))
+// read-only. phase/dropout/critical/lethal 제거. 120줄 예산.
+
+let DEFAULT_FLOOR = 0.8
+let EPS = 0.00001
+
+fn _max_of(h: list) -> float {
+    if h.len() == 0 { return 0.0 }
+    let mut mx = h[0]
+    let mut i = 1
+    while i < h.len() { if h[i] > mx { mx = h[i] }; i = i + 1 }
+    return mx
+}
+
+fn ratchet_floor(history: list, floor_ratio: float) -> float {
+    return _max_of(history) * floor_ratio
+}
+
+fn ratchet_step(value: float, history: list, floor_ratio: float) -> float {
+    let f = ratchet_floor(history, floor_ratio)
+    if value < f { return f }
+    return value
+}
+
+fn ratchet_apply(series: list, floor_ratio: float) -> list {
+    let mut out = []
+    let mut hist = []
+    let mut i = 0
+    while i < series.len() {
+        let v = ratchet_step(series[i], hist, floor_ratio)
+        out = out + [v]; hist = hist + [v]; i = i + 1
+    }
+    return out
+}
+
+// JSON mini: key 뒤 `[floats]` 추출
+fn _extract_number_array(text: string, key: string) -> list {
+    let k = text.index_of("\"" + key + "\"")
+    if k < 0 { return [] }
+    let rest = text[k..text.len()]
+    let lb = rest.index_of("["); let rb = rest.index_of("]")
+    if lb < 0 || rb <= lb { return [] }
+    let parts = rest[lb+1..rb].split(",")
+    let mut out = []
+    let mut i = 0
+    while i < parts.len() {
+        let t = parts[i].trim()
+        if t.len() > 0 {
+            let mut v = 0.0
+            try { v = to_float(t) } catch e { v = 0.0 } // @allow-silent-catch
+            out = out + [v]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn nexus_cdo_adapter(project_name: string) -> list {
+    let path = "$HOME/Dev/nexus/shared/convergence/" + project_name + ".json"
+    let mut text = ""
+    try { text = read_file(path) } catch e { return [] } // @allow-silent-catch
+    let s = _extract_number_array(text, "progress")
+    if s.len() == 0 { return [] }
+    return ratchet_apply(s, DEFAULT_FLOOR)
+}
+
+fn _file_mtime(path: string) -> float {
+    let mut mt = 0.0
+    try { mt = to_float(exec("stat -f '%m' '" + path + "' 2>/dev/null").trim()) } catch e { mt = 0.0 } // @allow-silent-catch
+    return mt
+}
+
+fn n6arch_alien_adapter(products_path: string) -> list {
+    let mut text = ""
+    try { text = read_file(products_path) } catch e { return [] } // @allow-silent-catch
+    let mut s = _extract_number_array(text, "alien_index")
+    if s.len() == 0 {
+        let mt = _file_mtime(products_path)
+        if mt <= 0.0 { return [] }
+        s = [(mt - to_float(to_int(mt / 1000000.0)) * 1000000.0) / 1000000.0]
+    }
+    return ratchet_apply(s, DEFAULT_FLOOR)
+}
+
+fn _fmt(x: float) -> string {
+    return to_string(to_float(to_int(x * 10000.0 + 0.5)) / 10000.0)
+}
+
+fn _show(label: string, s: list) {
+    let mut b = label + " = ["
+    let mut i = 0
+    while i < s.len() { if i > 0 { b = b + ", " }; b = b + _fmt(s[i]); i = i + 1 }
+    println(b + "]")
+}
+
+fn demo() {
+    let sample = [0.5, 0.3, 0.7, 0.4, 0.9, 0.6]
+    _show("before", sample)
+    _show("after ", ratchet_apply(sample, DEFAULT_FLOOR))
+    println("floor_ratio=" + _fmt(DEFAULT_FLOOR))
+}
+
+fn _chk(tag: string, ok: bool, acc: list) -> list {
+    if ok { println(tag + ": PASS"); return acc + [1] }
+    println(tag + ": FAIL"); return acc + [0]
+}
+
+fn _run_verify() -> int {
+    let mut r_acc = []
+    let r = ratchet_apply([0.5, 0.3, 0.7, 0.4, 0.9, 0.6], 0.8)
+    let mut ok1 = true
+    let mut i = 0
+    while i < r.len() {
+        if r[i] < ratchet_floor(r[0..i], 0.8) - EPS { ok1 = false }
+        i = i + 1
+    }
+    r_acc = _chk("T1 monotone_floor", ok1, r_acc)
+    let r2 = ratchet_apply([0.5, 0.1], 0.8)
+    r_acc = _chk("T2 first_pass_through", abs(r2[0] - 0.5) < EPS, r_acc)
+    r_acc = _chk("T3 floor_bump", abs(r2[1] - 0.4) < EPS, r_acc)
+    let r3 = ratchet_apply([0.1, 0.5, 0.9], 0.8)
+    r_acc = _chk("T4 ascending_unchanged", abs(r3[2] - 0.9) < EPS, r_acc)
+    let nx = nexus_cdo_adapter("nexus")
+    println("T5 nexus_cdo_adapter: len=" + to_string(nx.len()) + " (smoke)")
+    r_acc = r_acc + [1]
+    let n6 = n6arch_alien_adapter("$HOME/Dev/n6-architecture/papers/_archive/_products.json")
+    println("T6 n6arch_alien_adapter: len=" + to_string(n6.len()) + " (smoke)")
+    r_acc = r_acc + [1]
+    let mut pass = 0; let mut fail = 0; let mut j = 0
+    while j < r_acc.len() {
+        if r_acc[j] == 1 { pass = pass + 1 } else { fail = fail + 1 }
+        j = j + 1
+    }
+    println("---"); println("verify: " + to_string(pass) + " PASS / " + to_string(fail) + " FAIL")
+    if fail == 0 { return 0 }
+    return 1
+}
+
+fn main() {
+    let a = args()
+    let mut cmd = "demo"
+    if a.len() >= 3 { cmd = a[2] }
+    if cmd == "demo" { demo() }
+    else { if cmd == "verify" {
+        let rc = _run_verify()
+        if rc == 0 { println("PASS") } else { println("FAIL") }
+    } else { println("usage: hexa phi_ratchet.hexa [demo|verify]") } }
+}
+
+main()

@@ -1,0 +1,246 @@
+// shared/bisociation/unified/ouroboros_unified.hexa — OUROBOROS 3종 통합 어댑터
+// L1 Bisociation Engine 인프라 — nexus/anima/n6arch 자기진화 루프 단일 인터페이스
+// 원본 3종 (L0 보호, 수정 금지):
+//   nexus:   shared/blowup/ouroboros/ouroboros.hexa           saturation (epsilon=0.001, meta fp=0.333)
+//   anima:   anima-core/runtime/anima_runtime.hexa            ratchet (phi_best * 0.8 floor, collapse=0.3)
+//   n6arch:  n6shared/discovery_graph.json                    closure (nodes+edges 누적, BT count)
+//
+// trait Ouroboros:
+//   cycle_tick(state) -> state'        한 사이클 진행
+//   get_fixed_point() -> value         수렴 목표값
+//   get_state() -> snapshot            현재 스냅샷
+//   should_converge() -> bool          수렴 조건 충족
+//   advance() -> bool                  사이클 전진 (수렴=false)
+
+// ─── 상수 ───
+
+comptime const NEXUS_FP        = 0.333333333    // meta_fixed_point (saturation delta)
+comptime const NEXUS_EPSILON   = 0.001          // absorber_epsilon
+comptime const ANIMA_FLOOR     = 0.8            // RATCHET_FLOOR
+comptime const ANIMA_COLLAPSE  = 0.3            // collapse_ratio
+comptime const N6ARCH_NODE_TARGET = 515         // closure graph size (v15)
+comptime const N6ARCH_EDGE_TARGET = 2087
+comptime const MAX_CYCLES      = 24
+
+// ─── 유틸 ───
+
+fn abs_f(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+fn max_f(a: float, b: float) -> float {
+    if a > b { return a }
+    return b
+}
+
+// ─── 통합 state 스냅샷 ───
+
+struct OuroState {
+    variant: string,
+    cycle: int,
+    value: float,         // 현재 진화값 (variant별 의미 상이)
+    peak: float,          // 최고값 (anima ratchet)
+    delta: float,         // 직전 사이클과의 차이
+    nodes: int,           // n6arch 누적 노드
+    edges: int,           // n6arch 누적 엣지
+    converged: bool,
+    history: str
+}
+
+fn new_state(variant: string) -> OuroState {
+    OuroState { variant: variant, cycle: 0, value: 0.0, peak: 0.0, delta: 1.0, nodes: 0, edges: 0, converged: false, history: [] }
+}
+
+// ─── nexus 어댑터 (saturation) ───
+//   value = 발견률 delta → NEXUS_EPSILON 미만이면 수렴 (absorber semantics)
+
+fn nexus_ouro_tick(st: OuroState) -> OuroState {
+    let c = st.cycle + 1
+    // 샘플 발견 곡선: 1/sqrt(c) decay + n6 boost (6,12,24 주기)
+    let n6_boost = if c % 6 == 0 { 0.5 } else { 0.0 }
+    let raw = 1.0 / to_float(c) + n6_boost
+    let new_delta = abs_f(raw - st.value)
+    let conv = c >= 3 && new_delta < NEXUS_EPSILON
+    OuroState { variant: st.variant, cycle: c, value: raw, peak: max_f(st.peak, raw), delta: new_delta, nodes: st.nodes, edges: st.edges, converged: conv, history: st.history + [raw] }
+}
+
+fn nexus_fp() -> float { return NEXUS_FP }
+fn nexus_converged(st: OuroState) -> bool { return st.cycle >= 3 && st.delta < NEXUS_EPSILON }
+
+// ─── anima 어댑터 (ratchet) ───
+//   phi_best 단조 비감소 + floor = peak * 0.8, collapse 시 복원
+//   수렴: phi가 peak에 정착 (delta < epsilon && phi >= floor)
+
+fn anima_phi_tick(st: OuroState) -> OuroState {
+    let c = st.cycle + 1
+    // 샘플 Φ 곡선: staircase 성장 + 가끔 collapse attempt
+    let target = to_float(c) * 0.1 + 1.0
+    let raw = if c % 5 == 0 { st.value * ANIMA_COLLAPSE } else { target }
+    let new_peak = max_f(st.peak, raw)
+    let floor = new_peak * ANIMA_FLOOR
+    let phi = if raw < floor { floor } else { raw }  // ratchet
+    let new_delta = abs_f(phi - st.value)
+    let conv = c >= 3 && new_delta < 0.01 && phi >= floor
+    OuroState { variant: st.variant, cycle: c, value: phi, peak: new_peak, delta: new_delta, nodes: st.nodes, edges: st.edges, converged: conv, history: st.history + [phi] }
+}
+
+fn anima_fp(st: OuroState) -> float { return st.peak * ANIMA_FLOOR }
+fn anima_converged(st: OuroState) -> bool { return st.cycle >= 3 && st.delta < 0.01 && st.value >= st.peak * ANIMA_FLOOR }
+
+// ─── n6arch 어댑터 (discovery graph closure) ───
+//   nodes+edges 누적 → target 도달 시 수렴 (graph closure)
+
+fn n6arch_ouro_tick(st: OuroState) -> OuroState {
+    let c = st.cycle + 1
+    // 샘플 발견 곡선: 사이클당 노드 ~30개 + 엣지 ~85개 (v14~v15 rate)
+    let new_nodes = st.nodes + 30
+    let new_edges = st.edges + 85
+    let ratio = (to_float(new_nodes) / to_float(N6ARCH_NODE_TARGET) + to_float(new_edges) / to_float(N6ARCH_EDGE_TARGET)) / 2.0
+    let conv = new_nodes >= N6ARCH_NODE_TARGET && new_edges >= N6ARCH_EDGE_TARGET
+    OuroState { variant: st.variant, cycle: c, value: ratio, peak: max_f(st.peak, ratio), delta: abs_f(ratio - st.value), nodes: new_nodes, edges: new_edges, converged: conv, history: st.history + [ratio] }
+}
+
+fn n6arch_fp() -> float { return 1.0 }  // 100% graph closure
+fn n6arch_converged(st: OuroState) -> bool { return st.nodes >= N6ARCH_NODE_TARGET && st.edges >= N6ARCH_EDGE_TARGET }
+
+// ─── 통합 디스패처 ───
+
+fn ouroboros_tick(variant: string, st: OuroState) -> OuroState {
+    if variant == "nexus"  { return nexus_ouro_tick(st) }
+    if variant == "anima"  { return anima_phi_tick(st) }
+    if variant == "n6arch" { return n6arch_ouro_tick(st) }
+    // unified: 3종 병렬 전진 → 투표 요약 (value=평균, converged=2/3 이상)
+    let sn = nexus_ouro_tick(st)
+    let sa = anima_phi_tick(st)
+    let s6 = n6arch_ouro_tick(st)
+    let votes = (if sn.converged { 1 } else { 0 }) + (if sa.converged { 1 } else { 0 }) + (if s6.converged { 1 } else { 0 })
+    let avg = (sn.value + sa.value + s6.value) / 3.0
+    OuroState { variant: "unified", cycle: st.cycle + 1, value: avg, peak: max_f(st.peak, avg), delta: abs_f(avg - st.value), nodes: s6.nodes, edges: s6.edges, converged: votes >= 2, history: st.history + [avg] }
+}
+
+fn get_fixed_point(variant: string, st: OuroState) -> float {
+    if variant == "nexus"  { return nexus_fp() }
+    if variant == "anima"  { return anima_fp(st) }
+    if variant == "n6arch" { return n6arch_fp() }
+    return (NEXUS_FP + st.peak * ANIMA_FLOOR + 1.0) / 3.0
+}
+
+fn should_converge(variant: string, st: OuroState) -> bool {
+    if variant == "nexus"  { return nexus_converged(st) }
+    if variant == "anima"  { return anima_converged(st) }
+    if variant == "n6arch" { return n6arch_converged(st) }
+    return st.converged
+}
+
+fn advance(variant: string, st: OuroState) -> OuroState {
+    if should_converge(variant, st) { return st }
+    ouroboros_tick(variant, st)
+}
+
+// ─── CLI ───
+
+fn cmd_inspect() {
+    println("=== OUROBOROS 3종 통합 비교 ===")
+    println("")
+    println("variant  | fixed_point            | source                                       | cycle semantics")
+    println("---------+------------------------+----------------------------------------------+------------------------")
+    println("nexus    | delta<" + to_string(NEXUS_EPSILON) + " (saturation)  | shared/blowup/ouroboros/ouroboros.hexa      | discovery rate saturated")
+    println("anima    | phi_best * " + to_string(ANIMA_FLOOR) + " (ratchet) | anima-core/runtime/anima_runtime.hexa       | Phi monotonic non-decrease")
+    println("n6arch   | nodes>=" + to_string(N6ARCH_NODE_TARGET) + "/edges>=" + to_string(N6ARCH_EDGE_TARGET) + "    | n6-architecture/n6shared/discovery_graph.json | graph closure accumulation")
+    println("unified  | vote 2/3               | ouroboros_unified.hexa (this file)          | majority convergence")
+    println("")
+    println("공통 인터페이스: cycle_tick / get_fixed_point / get_state / should_converge / advance")
+    println("투표 규칙: 3/3 = TRUE_CONVERGENCE, 2/3 = PARTIAL_CONVERGENCE, <2 = EVOLVING")
+}
+
+fn cmd_demo(variant: string, steps: int) {
+    println("=== demo: " + variant + " steps=" + to_string(steps) + " ===")
+    let mut st = new_state(variant)
+    let mut i = 0
+    let cap = if steps < MAX_CYCLES { steps } else { MAX_CYCLES }
+    while i < cap {
+        st = advance(variant, st)
+        let mut conv_tag = "····"
+        if st.converged { conv_tag = "CONV" }
+        let mut extra = ""
+        if variant == "n6arch" { extra = " nodes=" + to_string(st.nodes) + " edges=" + to_string(st.edges) }
+        if variant == "unified" { extra = " nodes=" + to_string(st.nodes) + " edges=" + to_string(st.edges) }
+        println("  cycle " + to_string(st.cycle) + " [" + conv_tag + "] value=" + to_string(st.value) + " peak=" + to_string(st.peak) + " delta=" + to_string(st.delta) + extra)
+        if st.converged { i = cap }
+        i = i + 1
+    }
+    println("  fixed_point=" + to_string(get_fixed_point(variant, st)) + " converged=" + to_string(st.converged))
+}
+
+// args()[0]=hexa bin, args()[1]=script, args()[2]=mode, args()[3..]=params
+let a = args()
+let a_len = a.len()
+let mode = if a_len >= 3 { a[2] } else { "help" }
+
+if mode == "inspect" { cmd_inspect() }
+
+if mode == "demo" {
+    let mut v = "unified"
+    let mut s = 12
+    if a_len >= 4 { v = a[3] }
+    if a_len >= 5 { s = to_int(a[4]) }
+    cmd_demo(v, s)
+}
+
+if mode == "help" {
+    println("=== ouroboros_unified.hexa — OUROBOROS 3종 통합 어댑터 ===")
+    println("")
+    println("사용법:")
+    println("  hexa ouroboros_unified.hexa inspect                  3종 원본/고정점 비교")
+    println("  hexa ouroboros_unified.hexa demo <variant> <steps>   샘플 실행")
+    println("    variant: nexus | anima | n6arch | unified")
+    println("")
+    println("trait Ouroboros:")
+    println("  cycle_tick(state)     한 사이클 진행")
+    println("  get_fixed_point()     수렴 목표값")
+    println("  should_converge()     수렴 조건 충족")
+    println("  advance()             전진 (수렴 시 유지)")
+    println("")
+    println("unified 투표: 3/3 TRUE_CONV / 2/3 PARTIAL / <2 EVOLVING")
+}
+
+// ─── 검증 ───
+
+assert abs_f(0.0 - 3.14) > 3.0
+assert max_f(3.0, 5.0) == 5.0
+
+let s0 = new_state("nexus")
+assert s0.cycle == 0
+assert s0.converged == false
+
+let s1 = nexus_ouro_tick(s0)
+assert s1.cycle == 1
+assert s1.value > 0.0
+
+let sa0 = new_state("anima")
+let sa1 = anima_phi_tick(sa0)
+assert sa1.peak >= sa1.value * ANIMA_FLOOR   // ratchet invariant
+let sa2 = anima_phi_tick(sa1)
+assert sa2.peak >= sa1.peak                   // monotonic non-decrease
+
+let sg0 = new_state("n6arch")
+let sg1 = n6arch_ouro_tick(sg0)
+assert sg1.nodes == 30
+assert sg1.edges == 85
+
+let su0 = new_state("unified")
+let su1 = ouroboros_tick("unified", su0)
+assert su1.cycle == 1
+
+assert nexus_fp() == NEXUS_FP
+assert n6arch_fp() == 1.0
+
+println("")
+println("=== ouroboros_unified verified ===")
+
+proof ouroboros_unified_invariants {
+    invariant anima_ratchet_monotonic()       // peak never decreases
+    invariant nexus_saturation_epsilon()      // delta bounded by epsilon
+    invariant n6arch_closure_accumulates()    // nodes+edges strictly increase
+    invariant unified_vote_majority()         // 2/3 threshold
+}

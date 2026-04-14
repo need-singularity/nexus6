@@ -1,0 +1,150 @@
+// wigner_fit.hexa — Wigner GUE vs Poisson χ² Fit (L2 Bisociation Engine — Spectra)
+// Role: Compare observed R₂(r) against GUE theory and Poisson; compute bisociation_score.
+// Math: R2_gue(r) = 1 − (sin(πr)/(πr))² ; R2_poi(r) = 1
+//       χ²_k = Σ (R2_obs − R2_k)² / |R2_k + ε|
+//       score = χ²_poi / (χ²_poi + χ²_gue)  → 1 favors GUE
+// CLI:  hexa wigner_fit.hexa <paircorr.jsonl> <output.json>
+
+comptime const PI = 3.14159265358979
+comptime const EPS = 0.01
+
+fn safe_float(s: string) -> f64 {
+    let mut v = 0.0
+    try { v = to_float(s) } catch e {} // @allow-silent-catch
+    return v
+}
+
+fn abs_f(x: f64) -> f64 {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// sin via range reduction to [-π/2, π/2] + 9th-order Taylor
+fn sin_taylor(x: f64) -> f64 {
+    let mut y = x
+    let two_pi = 2.0 * PI
+    while y > PI { y = y - two_pi }
+    while y < 0.0 - PI { y = y + two_pi }
+    if y > PI / 2.0 { y = PI - y }
+    if y < 0.0 - PI / 2.0 { y = 0.0 - PI - y }
+    let y2 = y * y
+    let y3 = y2 * y
+    let y5 = y3 * y2
+    let y7 = y5 * y2
+    let y9 = y7 * y2
+    return y - y3 / 6.0 + y5 / 120.0 - y7 / 5040.0 + y9 / 362880.0
+}
+
+fn _min_cut(s: string, from: i64) -> i64 {
+    let cands = [",", "}", " ", "\t", "\r", "]"]
+    let mut best: i64 = 0 - 1
+    let mut i: i64 = 0
+    while i < cands.len() {
+        let sub = s.substring(from, s.len())
+        let p = sub.index_of(cands[i])
+        if p >= 0 {
+            let abs_p = from + p
+            if best < 0 || abs_p < best { best = abs_p }
+        }
+        i = i + 1
+    }
+    return best
+}
+
+fn json_get_num(line: string, key: string) -> f64 {
+    let pat = "\"" + key + "\""
+    let kp = line.index_of(pat)
+    if kp < 0 { return 0.0 }
+    let after_key = kp + pat.len()
+    let colon_rel = line.substring(after_key, line.len()).index_of(":")
+    if colon_rel < 0 { return 0.0 }
+    let mut num_start = after_key + colon_rel + 1
+    while num_start < line.len() {
+        let ch = line.substring(num_start, num_start + 1)
+        if ch == " " || ch == "\t" { num_start = num_start + 1 } else { break }
+    }
+    let cut = _min_cut(line, num_start)
+    let mut end = line.len()
+    if cut >= 0 { end = cut }
+    return safe_float(line.substring(num_start, end).trim())
+}
+
+// GUE R₂(r); r=0 → 0 (lim (sin x/x)² = 1)
+fn r2_gue(r: f64) -> f64 {
+    if r < 0.000000001 { return 0.0 }
+    let pr = PI * r
+    let s = sin_taylor(pr)
+    let ratio = s / pr
+    return 1.0 - ratio * ratio
+}
+
+fn r2_poi(r: f64) -> f64 { return 1.0 }
+
+fn main() {
+    let argv = args()
+    if argv.len() < 4 {
+        eprintln("usage: hexa wigner_fit.hexa <paircorr.jsonl> <output.json>")
+        exit(2)
+    }
+    let inp = argv[2].trim()
+    let outp = argv[3].trim()
+
+    let mut raw = ""
+    try { raw = read_file(inp) } catch e { // @allow-silent-catch
+        eprintln("FAIL: read_file " + inp)
+        exit(1) // @allow-silent-exit
+    }
+
+    let mut rs: list = []
+    let mut r2s: list = []
+    for line in raw.split("\n") {
+        let l = line.trim()
+        if l.len() == 0 { continue }
+        if l.contains("\"r\"") == false { continue }
+        rs = rs + [json_get_num(l, "r")]
+        r2s = r2s + [json_get_num(l, "R2")]
+    }
+
+    let n = rs.len()
+    if n < 3 {
+        eprintln("FAIL: need >=3 bins, got " + to_string(n))
+        exit(1) // @allow-silent-exit
+    }
+
+    let mut chi2_gue = 0.0
+    let mut chi2_poi = 0.0
+    let mut i: i64 = 0
+    while i < n {
+        let r = rs[i]
+        let obs = r2s[i]
+        let g = r2_gue(r)
+        let p = r2_poi(r)
+        let dg = obs - g
+        let dp = obs - p
+        chi2_gue = chi2_gue + dg * dg / (abs_f(g) + EPS)
+        chi2_poi = chi2_poi + dp * dp / (abs_f(p) + EPS)
+        i = i + 1
+    }
+
+    let denom = chi2_poi + chi2_gue
+    let mut score = 0.5
+    if denom > 0.000000000001 { score = chi2_poi / denom }
+
+    let mut verdict = "mixed"
+    if score > 0.7 { verdict = "GUE" }
+    else if score < 0.3 { verdict = "Poisson" }
+
+    let out = "{\"gue_chi2\":" + to_string(chi2_gue) +
+              ",\"poi_chi2\":" + to_string(chi2_poi) +
+              ",\"score\":" + to_string(score) +
+              ",\"verdict\":\"" + verdict + "\"" +
+              ",\"n_bins\":" + to_string(n) + "}\n"
+
+    try { write_file(outp, out) } catch e { // @allow-silent-catch
+        eprintln("FAIL: write_file " + outp)
+        exit(1) // @allow-silent-exit
+    }
+    eprintln("wigner_fit: chi2_gue=" + to_string(chi2_gue) + " chi2_poi=" + to_string(chi2_poi) + " score=" + to_string(score) + " verdict=" + verdict)
+}
+
+main()
