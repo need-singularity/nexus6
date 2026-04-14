@@ -14,7 +14,9 @@ ssot:
 
 engine (.hexa):
   entry.hexa           dispatcher — prompt|pretool|post|guard|self_check 서브커맨드, sub-modules 호출
-  cmd_gate.hexa        smash/free seed 검증 (추상 단독 토큰 REJECT, 컨텍스트 결합 강제)
+  cmd_gate.hexa        smash/free seed 검증 + go/keep/pick 옵션 자동 선택 위임 (option_gate 통합, 2026-04-14)
+  option_gate.hexa     옵션 자동 선택 워커 — "go"/"keep"/알파벳/한국어 서수 트리거 시 직전 assistant JSONL 에서 옵션 블록 추출 → option_ranker.py 점수 1위 선택 (argv 모드, 훅 없음)
+  option_ranker.py     python 워커 — fence(A|B|C / 1|2|3|-) 블록 파싱 + GPT-식 휴리스틱(영향도/리스크/난이도) 스코어링
   prompt_scan.hexa     UserPromptSubmit 대응 — 사용자 발화 패턴 스캔
   pre_tool_guard.hexa  PreToolUse 대응 — Write/Edit/Bash/Agent 공통 guard
   post_bash.hexa       PostToolUse(Bash) — exit 코드 + stderr 수집
@@ -68,6 +70,8 @@ convention (2026-04-14~ 훅 시스템 대체):
   Agent 호출 전        entry.hexa guard <area> <prompt_hash>   → agent_id stdout (complete 시 사용)
   Agent 완료 후        entry.hexa guard complete <agent_id>
   smash|free 실행      shared/harness/exec_validated {mode} "{seed}" {engine} {args} (cmd_gate 적용, bin/ 심링크 가능)
+  go/keep 옵션 선택    cmd_gate 내부 자동 — 직전 assistant 옵션 블록 있으면 "OK:go:" 뒤에 SELECTED 주입 (훅 없음, option_gate 위임)
+  option_gate 직접     entry.hexa option_gate <prompt> [transcript_path]   → option_gate.hexa 위임 (테스트/디버그용)
   sync 실행            entry.hexa sync <list|diff|all|id> [flags]       → sync.hexa 위임
   errors 라우팅        entry.hexa errors <route|drain_check|...> ...    → errors.hexa 위임
   agent_ledger 직접    entry.hexa agent_ledger <register|complete|list|gc|dup_check> ...
