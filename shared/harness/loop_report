@@ -1,0 +1,146 @@
+#!/bin/bash
+# loop_report — SKILL (/loop) → HARNESS 강제 이관 모듈
+#
+# 역할: loop 실행 후 NEXT_AFTER 블록을 Claude 가 무시하지 못하게 강제.
+#       ~/.claude/skills/loop/SKILL.md 의 "step 7 보고 박스에 NEXT 포함" 규칙을
+#       하네스 코드로 집행 (H-LOOP-REPORT).
+#
+# 흐름:
+#   loop (bash) emit ===NEXT_AFTER_BEGIN===...=== ← post_bash.hexa 감지
+#   → loop_report check    → .loop_pending_next 플래그 생성 (TTL 600s)
+#   → 다음 prompt_scan 진입 시 loop_report verify → 직전 assistant 메시지에서
+#     NEXT_AFTER 반영 여부 확인. 미반영 시 stderr WARN + mistakes.jsonl append.
+#   → Claude 가 NEXT 보고하면 loop_report clear
+#
+# usage:
+#   loop_report check <stdout_text>     post_bash 에서 호출
+#   loop_report verify                  prompt_scan 에서 호출
+#   loop_report clear                   명시적 해제
+#   loop_report status                  현 플래그 상태 출력 (디버그)
+
+set -e
+
+NEXUS="${NEXUS:-$HOME/Dev/nexus}"
+HARNESS="${NEXUS}/shared/harness"
+FLAG="${HARNESS}/.loop_pending_next"
+MISTAKES="${HARNESS}/mistakes.jsonl"
+TTL_SECONDS=600    # 10 분 — 그 뒤 stale 로 자동 만료
+
+now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+now_ts()  { date -u +%s; }
+
+# ─── check: loop stdout 에 NEXT_AFTER 블록 있으면 플래그 생성 ───
+cmd_check() {
+    local stdout_text="$1"
+    [ -z "$stdout_text" ] && return 0
+
+    # 3 조건 모두 충족해야 플래그
+    echo "$stdout_text" | grep -q "===NEXT_AFTER_BEGIN===" || return 0
+    echo "$stdout_text" | grep -q "===NEXT_AFTER_END==="   || return 0
+    local next_line
+    next_line="$(echo "$stdout_text" | grep -E '^NEXT:' | head -1)"
+    [ -z "$next_line" ] && return 0
+
+    local exhausted
+    exhausted="$(echo "$stdout_text" | grep -E '^EXHAUSTED:' | head -1 | awk '{print $2}')"
+    local project
+    project="$(echo "$stdout_text" | grep -E '^===NEXT_AFTER_BEGIN===' | head -1 | sed 's/===NEXT_AFTER_BEGIN===//' | sed 's/===$//')"
+
+    # 플래그 파일 (JSON line, grep 친화)
+    cat > "$FLAG" <<EOF
+{"ts":"$(now_iso)","ts_unix":$(now_ts),"project":"${project:-unknown}","exhausted":${exhausted:-false},"next_line":"$(echo "$next_line" | sed 's/"/\\"/g')","ttl":${TTL_SECONDS}}
+EOF
+    # stderr 로 하네스 흐름 안내 (silent-success 원칙 — 파일 생성만, 성공 시 stdout 무출력)
+    return 0
+}
+
+# ─── verify: 플래그 있고 직전 assistant 메시지에 NEXT 없으면 WARN ───
+cmd_verify() {
+    [ -f "$FLAG" ] || return 0
+
+    local created_ts now
+    created_ts="$(grep -oE '"ts_unix":[0-9]+' "$FLAG" | cut -d: -f2)"
+    now="$(now_ts)"
+    [ -z "$created_ts" ] && { rm -f "$FLAG"; return 0; }
+
+    # TTL 초과 → 자동 clear
+    if [ "$((now - created_ts))" -gt "$TTL_SECONDS" ]; then
+        rm -f "$FLAG"
+        return 0
+    fi
+
+    local next_line project exhausted
+    next_line="$(grep -oE '"next_line":"[^"]*"' "$FLAG" | sed 's/"next_line":"//' | sed 's/"$//')"
+    project="$(grep -oE '"project":"[^"]*"'     "$FLAG" | sed 's/"project":"//'   | sed 's/"$//')"
+    exhausted="$(grep -oE '"exhausted":[a-z]+'  "$FLAG" | cut -d: -f2)"
+
+    # 세션 JSONL 에서 직전 assistant 메시지 추출 → NEXT 반영 여부 검사
+    # Claude Code 는 pwd 전체를 `/` → `-` 치환한 디렉토리를 사용 (예: /Users/ghost/Dev/nexus → -Users-ghost-Dev-nexus)
+    local claude_proj
+    claude_proj="$(pwd | sed 's/\//-/g')"
+    local jsonl
+    jsonl="$(ls -t "$HOME/.claude/projects/${claude_proj}/"*.jsonl 2>/dev/null | head -1)"
+
+    local assistant_has_next=0
+    if [ -n "$jsonl" ] && [ -f "$jsonl" ]; then
+        # 직전 10 assistant 메시지 text 추출
+        local recent
+        recent="$(tail -200 "$jsonl" 2>/dev/null | /usr/bin/jq -r 'select(.type=="assistant") | (.message.content // []) | map(select(.type=="text") | .text) | join("\n")' 2>/dev/null | tail -c 20000)"
+        if echo "$recent" | grep -qE "NEXT[:：]|다음 항목|다음 로드맵|===NEXT_AFTER|NEXT_AFTER"; then
+            assistant_has_next=1
+        fi
+    fi
+
+    if [ "$assistant_has_next" = "1" ]; then
+        # Claude 가 보고에 포함함 → 플래그 해제
+        rm -f "$FLAG"
+        return 0
+    fi
+
+    # 미반영 — stderr WARN + mistakes append + stdout 에 Claude 알림
+    local warn_msg="[H-LOOP-REPORT] NEXT_AFTER 미반영 — 직전 loop 사이클의 다음 로드맵 항목을 보고 박스에 포함해야 함. 플래그: ${FLAG}. ${next_line}"
+    echo "$warn_msg" >&2
+
+    # mistakes.jsonl append (silent-failure P1 로그)
+    local row
+    row="{\"ts\":\"$(now_iso)\",\"rule\":\"H-LOOP-REPORT\",\"severity\":\"warn\",\"project\":\"${project}\",\"exhausted\":${exhausted:-false},\"next\":\"$(echo "$next_line" | sed 's/"/\\"/g')\",\"detail\":\"Claude 가 loop 후 NEXT_AFTER 블록을 보고에 포함하지 않음\"}"
+    echo "$row" >> "$MISTAKES" 2>/dev/null || true
+
+    # Claude 가 prompt_scan stdout 에서 받을 강제 지시문
+    cat <<EOF
+[H-LOOP-REPORT] CLAUDE_MUST_INCLUDE: 직전 loop 사이클 결과 보고에 다음 항목 포함 필수
+  NEXT: ${next_line#NEXT: }
+  EXHAUSTED: ${exhausted:-false}
+  SSOT: ${FLAG}
+  (보고에 포함하면 자동 해제 — clear 수동 호출 불필요)
+EOF
+    return 0
+}
+
+cmd_clear() {
+    rm -f "$FLAG"
+    echo "loop_report: flag cleared" >&2
+}
+
+cmd_status() {
+    if [ -f "$FLAG" ]; then
+        echo "flag: present"
+        cat "$FLAG"
+    else
+        echo "flag: absent"
+    fi
+}
+
+main() {
+    local sub="${1:-status}"
+    shift || true
+    case "$sub" in
+        check)  cmd_check "$*" ;;
+        verify) cmd_verify ;;
+        clear)  cmd_clear ;;
+        status) cmd_status ;;
+        *)      echo "usage: loop_report <check|verify|clear|status>" >&2; exit 2 ;;
+    esac
+}
+
+main "$@"

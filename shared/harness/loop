@@ -29,6 +29,17 @@
 #   ROADMAP: <path>
 #   DRY: <bool>
 #   ===LOOP_END===
+#   ===NEXT_AFTER_BEGIN===<project>===     (자동 append — "이 사이클 완료 후 다음 항목")
+#   NEXT: <phase>/<track>/<id>  [<status>]  <task>
+#   PHASE_NAME: <현 phase 가 끝나면 진입할 phase name or current>
+#   EXHAUSTED: <true|false>    (true 면 extend 권장)
+#   ===NEXT_AFTER_END===
+#
+# NEXT_AFTER 규칙:
+#   - 현 phase in_progress 면: 같은 phase 첫 status!=done task 1개 (현 cycle 완료 후 잔여)
+#   - 현 phase 곧 done 이면: 다음 phase(planned) 첫 task
+#   - 전체 소진 시: EXHAUSTED=true 출력 (Claude 가 roadmap extend 권유)
+#   - Claude 는 loop 완료(commit+push) 후 보고 블록에 NEXT_AFTER 내용 포함
 
 set -e
 
@@ -109,6 +120,75 @@ plan_print() {
     echo "ROADMAP: ${roadmap}"
     echo "DRY: ${dry}"
     echo "===LOOP_END==="
+
+    # ─── NEXT_AFTER: 이 사이클 완료 후 다음 진행 항목 예측 ───
+    emit_next_after "$project" "$roadmap" "$phase_id"
+}
+
+# NEXT_AFTER 블록 — roadmap next 결과를 Claude 가 loop 완료 후 자동 표시
+# 우선순위:
+#   1. 현 phase 잔여 tasks (현 cycle 이 일부만 처리하는 경우)
+#   2. 다음 planned phase 첫 task (현 phase 가 모두 done 되면 진입)
+#   3. 없으면 EXHAUSTED=true (roadmap extend 권고)
+emit_next_after() {
+    local project="$1" roadmap="$2" current_pid="$3"
+    local next_json
+    next_json="$(jq -c --arg pid "$current_pid" '
+        # helper: phase → first undone task
+        def undone_in_phase(phase):
+            phase.parallel // []
+            | map(.tasks[]? | select(.status != "done"))
+            | .[0] // null;
+        # 1. 현 phase 잔여
+        (.phases[] | select(.id == $pid)) as $cur
+        | (undone_in_phase($cur)) as $in_cur
+        | if $in_cur then
+            {phase_id: $pid, phase_name: $cur.name, source: "current_phase_remaining",
+             track: ([$cur.parallel[] | select(.tasks[]?.id == $in_cur.id) | .track][0] // "?"),
+             task: $in_cur, exhausted: false}
+          else
+            # 2. 다음 phase (planned|in_progress)
+            [.phases[] | select((.status == "planned") or (.status == "in_progress" and .id != $pid))][0] as $next
+            | if $next then
+                (undone_in_phase($next)) as $in_next
+                | if $in_next then
+                    {phase_id: $next.id, phase_name: $next.name, source: "next_phase_first",
+                     track: ([$next.parallel[] | select(.tasks[]?.id == $in_next.id) | .track][0] // "?"),
+                     task: $in_next, exhausted: false}
+                  else
+                    {phase_id: $next.id, phase_name: $next.name, source: "next_phase_empty",
+                     track: "?", task: null, exhausted: false}
+                  end
+              else
+                {phase_id: null, phase_name: null, source: "roadmap_exhausted",
+                 track: null, task: null, exhausted: true}
+              end
+          end
+    ' "$roadmap" 2>/dev/null)"
+
+    local phase_id phase_name source track_name task_id task_desc task_status exhausted
+    phase_id="$(echo "$next_json"   | jq -r '.phase_id // "-"')"
+    phase_name="$(echo "$next_json" | jq -r '.phase_name // "-"')"
+    source="$(echo "$next_json"     | jq -r '.source // "-"')"
+    track_name="$(echo "$next_json" | jq -r '.track // "-"')"
+    task_id="$(echo "$next_json"    | jq -r '.task.id // "-"')"
+    task_desc="$(echo "$next_json"  | jq -r '.task.task // "-"')"
+    task_status="$(echo "$next_json" | jq -r '.task.status // "-"')"
+    exhausted="$(echo "$next_json"  | jq -r '.exhausted // false')"
+
+    echo "===NEXT_AFTER_BEGIN===${project}==="
+    if [ "$exhausted" = "true" ]; then
+        echo "EXHAUSTED: true"
+        echo "NEXT: roadmap 전체 소진 — roadmap extend 로 NEXUS 창발 연장 권장"
+        echo "HINT: hexa \$NEXUS/shared/harness/roadmap.hexa extend --project ${project}"
+    else
+        echo "NEXT: ${phase_id}/${track_name}/${task_id}  [${task_status}]  ${task_desc}"
+        echo "PHASE_NAME: ${phase_name}"
+        echo "SOURCE: ${source}"
+        echo "EXHAUSTED: false"
+        echo "HINT: 현 cycle 완료(commit/push) 후 'go' 재입력 또는 'roadmap next' 확인"
+    fi
+    echo "===NEXT_AFTER_END==="
 }
 
 list_tables() {
