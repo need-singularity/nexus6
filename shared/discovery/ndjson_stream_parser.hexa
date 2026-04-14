@@ -1,0 +1,261 @@
+// NDJSON streaming parser (fast-path pattern)
+// DISC-P1-1 — discovery_graph.json 실시간 append 스트림 파서
+//
+// goal: 12MB NDJSON 입력에서 RSS 스파이크 < 2MB 유지
+// strategy: shell sed/awk/grep 로 고정 윈도우 chunk 또는 tail-append 만 스트림.
+//           hexa 쪽은 chunk 경계마다 buf 자연 해제 (scalar agg 만 유지).
+//           hexa Stage1 pitfall: map["new_key"]=v 미작동 → 집계는 int 스칼라 + 도메인 TOP 은 awk 로.
+//
+// usage (env-driven):
+//   NDJSON_PATH=<path> NDJSON_CHUNK=5000 NDJSON_MODE=full  hexa run ...
+//   NDJSON_PATH=<path> NDJSON_MODE=tail NDJSON_SINCE=70000 hexa run ...
+//
+// emits JSON to stdout (AI-native SSOT)
+
+fn to_str(v) -> str { return to_string(v) }
+
+fn sh(cmd: str) -> str {
+    let mut r: str = ""
+    try { r = to_string(exec(cmd)).trim() } catch e { r = "" } // @allow-silent-catch
+    return r
+}
+
+fn sh_int(cmd: str) -> i64 {
+    let s = sh(cmd)
+    if s == "" { return 0 }
+    let mut v: i64 = 0
+    try { v = to_int(s) } catch e { v = 0 } // @allow-silent-catch
+    return v
+}
+
+fn rss_kb() -> i64 {
+    return sh_int("ps -o rss= -p $PPID 2>/dev/null")
+}
+
+fn epoch_ms() -> i64 {
+    return sh_int("python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s000")
+}
+
+fn rec_type(line: str) -> str {
+    if line.contains("\"type\":\"node\"") { return "node" }
+    if line.contains("\"type\": \"node\"") { return "node" }
+    if line.contains("\"type\":\"edge\"") { return "edge" }
+    if line.contains("\"type\": \"edge\"") { return "edge" }
+    return "other"
+}
+
+// Process a chunk of lines, return [nodes, edges, others, parsed, reject] as list
+fn parse_chunk(lines: list) -> list {
+    let mut nodes: i64 = 0
+    let mut edges: i64 = 0
+    let mut others: i64 = 0
+    let mut parsed: i64 = 0
+    let mut reject: i64 = 0
+
+    let n = len(lines)
+    let mut i: i64 = 0
+    while i < n {
+        let line = lines[i]
+        i = i + 1
+        if len(line) < 2 { continue }
+        if !line.starts_with("{") { reject = reject + 1 ; continue }
+        let t = rec_type(line)
+        if t == "node" { nodes = nodes + 1 }
+        else if t == "edge" { edges = edges + 1 }
+        else { others = others + 1 }
+        parsed = parsed + 1
+    }
+    return [nodes, edges, others, parsed, reject]
+}
+
+// Domain TOP via awk — single pass, ~O(file) on disk but O(k domains) RAM outside hexa
+fn domain_top_json(path: str, cap: i64) -> str {
+    let cmd = "grep -E '\"type\":\\s*\"node\"' '" + path + "' 2>/dev/null | " +
+              "sed -nE 's/.*\"domain\":\\s*\"([^\"]+)\".*/\\1/p' | " +
+              "sort | uniq -c | sort -rn | head -" + to_str(cap) + " | " +
+              "awk 'BEGIN{printf \"{\"} {if(NR>1)printf \",\"; printf \"\\\"\"$2\"\\\":\"$1} END{printf \"}\"}'"
+    let out = sh(cmd)
+    if out == "" { return "{}" }
+    return out
+}
+
+// --- stream full ---
+// HEXA STAGE1 MEMORY NOTE:
+//   interpreter 의 string/list 할당은 arena_reset() 으로도 해제되지 않음 (확인됨).
+//   → 라인 내용을 hexa 로 끌어오지 말고 shell awk 에서 count 만 반환 (scalar-only).
+//   hexa 는 chunk 경계마다 count 4개 (i64) 만 누산 → RSS stable at baseline.
+fn stream_full(path: str, chunk_lines: i64) -> str {
+    let total_lines = sh_int("wc -l < '" + path + "' 2>/dev/null || echo 0")
+    let size_bytes  = sh_int("wc -c < '" + path + "' 2>/dev/null || echo 0")
+
+    let t0 = epoch_ms()
+    let rss0 = rss_kb()
+    let mut rss_peak: i64 = rss0
+    let mut rss_floor: i64 = rss0
+    let mut rss_samples: i64 = 0
+    let mut rss_sum: i64 = rss0
+
+    let mut nodes: i64 = 0
+    let mut edges: i64 = 0
+    let mut others: i64 = 0
+    let mut parsed: i64 = 0
+    let mut reject: i64 = 0
+    let mut chunks: i64 = 0
+
+    let mut start: i64 = 1
+    while start <= total_lines {
+        let stop = start + chunk_lines - 1
+        // awk classifies within the chunk and emits 5 scalars "nodes edges others parsed reject"
+        // stdout payload = ~20 bytes, hexa heap footprint constant per chunk.
+        let cmd = "sed -n '" + to_str(start) + "," + to_str(stop) + "p' '" + path + "' | " +
+                  "awk '" +
+                  "BEGIN{n=0;e=0;o=0;p=0;r=0}" +
+                  "/^\\{/{" +
+                  "  p++;" +
+                  "  if (index($0,\"\\\"type\\\":\\\"node\\\"\")>0 || index($0,\"\\\"type\\\": \\\"node\\\"\")>0) n++;" +
+                  "  else if (index($0,\"\\\"type\\\":\\\"edge\\\"\")>0 || index($0,\"\\\"type\\\": \\\"edge\\\"\")>0) e++;" +
+                  "  else o++;" +
+                  "  next" +
+                  "}" +
+                  "{if(length($0)>1) r++}" +
+                  "END{print n\" \"e\" \"o\" \"p\" \"r}'"
+        let out = sh(cmd)
+        let parts = out.split(" ")
+        if len(parts) >= 5 {
+            let mut vn: i64 = 0
+            let mut ve: i64 = 0
+            let mut vo: i64 = 0
+            let mut vp: i64 = 0
+            let mut vr: i64 = 0
+            try { vn = to_int(parts[0]) } catch e { vn = 0 } // @allow-silent-catch
+            try { ve = to_int(parts[1]) } catch e { ve = 0 } // @allow-silent-catch
+            try { vo = to_int(parts[2]) } catch e { vo = 0 } // @allow-silent-catch
+            try { vp = to_int(parts[3]) } catch e { vp = 0 } // @allow-silent-catch
+            try { vr = to_int(parts[4]) } catch e { vr = 0 } // @allow-silent-catch
+            nodes  = nodes  + vn
+            edges  = edges  + ve
+            others = others + vo
+            parsed = parsed + vp
+            reject = reject + vr
+        }
+        chunks = chunks + 1
+        let cur_rss = rss_kb()
+        if cur_rss > rss_peak { rss_peak = cur_rss }
+        if cur_rss < rss_floor { rss_floor = cur_rss }
+        rss_sum = rss_sum + cur_rss
+        rss_samples = rss_samples + 1
+        start = stop + 1
+        try { arena_reset() } catch e {} // @allow-silent-catch
+    }
+
+    let t1 = epoch_ms()
+    let elapsed = t1 - t0
+    let spike = rss_peak - rss0
+    let mut rss_avg: i64 = 0
+    if rss_samples > 0 { rss_avg = rss_sum / rss_samples }
+
+    let dom = domain_top_json(path, 12)
+
+    let payload = "{\"parser\":\"ndjson_stream_parser.hexa\",\"schema\":1," +
+        "\"path\":\"" + path + "\"," +
+        "\"mode\":\"full\"," +
+        "\"chunk_lines\":" + to_str(chunk_lines) + "," +
+        "\"total_lines\":" + to_str(total_lines) + "," +
+        "\"size_bytes\":" + to_str(size_bytes) + "," +
+        "\"chunks\":" + to_str(chunks) + "," +
+        "\"nodes\":" + to_str(nodes) + "," +
+        "\"edges\":" + to_str(edges) + "," +
+        "\"others\":" + to_str(others) + "," +
+        "\"parsed\":" + to_str(parsed) + "," +
+        "\"reject\":" + to_str(reject) + "," +
+        "\"elapsed_ms\":" + to_str(elapsed) + "," +
+        "\"rss_start_kb\":" + to_str(rss0) + "," +
+        "\"rss_peak_kb\":" + to_str(rss_peak) + "," +
+        "\"rss_floor_kb\":" + to_str(rss_floor) + "," +
+        "\"rss_avg_kb\":" + to_str(rss_avg) + "," +
+        "\"rss_spike_kb\":" + to_str(spike) + "," +
+        "\"rss_samples\":" + to_str(rss_samples) + "," +
+        "\"domains_top\":" + dom +
+        "}"
+    return payload
+}
+
+// --- tail-once (append stream, zombie-safe single cycle) ---
+fn tail_once(path: str, since_line: i64) -> str {
+    let total_lines = sh_int("wc -l < '" + path + "' 2>/dev/null || echo 0")
+    let t0 = epoch_ms()
+    let rss0 = rss_kb()
+
+    let mut new_lines: i64 = 0
+    if total_lines > since_line { new_lines = total_lines - since_line }
+
+    let mut nodes: i64 = 0
+    let mut edges: i64 = 0
+    let mut others: i64 = 0
+    let mut parsed: i64 = 0
+    let mut reject: i64 = 0
+    let mut rss_peak: i64 = rss0
+
+    if new_lines > 0 {
+        let new_from = since_line + 1
+        let cmd = "tail -n +" + to_str(new_from) + " '" + path + "' | " +
+                  "awk '" +
+                  "BEGIN{n=0;e=0;o=0;p=0;r=0}" +
+                  "/^\\{/{" +
+                  "  p++;" +
+                  "  if (index($0,\"\\\"type\\\":\\\"node\\\"\")>0 || index($0,\"\\\"type\\\": \\\"node\\\"\")>0) n++;" +
+                  "  else if (index($0,\"\\\"type\\\":\\\"edge\\\"\")>0 || index($0,\"\\\"type\\\": \\\"edge\\\"\")>0) e++;" +
+                  "  else o++;" +
+                  "  next" +
+                  "}" +
+                  "{if(length($0)>1) r++}" +
+                  "END{print n\" \"e\" \"o\" \"p\" \"r}'"
+        let out = sh(cmd)
+        let parts = out.split(" ")
+        if len(parts) >= 5 {
+            try { nodes  = to_int(parts[0]) } catch e { nodes = 0 } // @allow-silent-catch
+            try { edges  = to_int(parts[1]) } catch e { edges = 0 } // @allow-silent-catch
+            try { others = to_int(parts[2]) } catch e { others = 0 } // @allow-silent-catch
+            try { parsed = to_int(parts[3]) } catch e { parsed = 0 } // @allow-silent-catch
+            try { reject = to_int(parts[4]) } catch e { reject = 0 } // @allow-silent-catch
+        }
+        let cur = rss_kb()
+        if cur > rss_peak { rss_peak = cur }
+    }
+
+    let t1 = epoch_ms()
+    let payload = "{\"parser\":\"ndjson_stream_parser.hexa\",\"schema\":1," +
+        "\"path\":\"" + path + "\"," +
+        "\"mode\":\"tail\"," +
+        "\"since_line\":" + to_str(since_line) + "," +
+        "\"tail_line\":" + to_str(total_lines) + "," +
+        "\"new_lines\":" + to_str(new_lines) + "," +
+        "\"nodes\":" + to_str(nodes) + "," +
+        "\"edges\":" + to_str(edges) + "," +
+        "\"others\":" + to_str(others) + "," +
+        "\"parsed\":" + to_str(parsed) + "," +
+        "\"reject\":" + to_str(reject) + "," +
+        "\"elapsed_ms\":" + to_str(t1 - t0) + "," +
+        "\"rss_start_kb\":" + to_str(rss0) + "," +
+        "\"rss_peak_kb\":" + to_str(rss_peak) + "," +
+        "\"rss_spike_kb\":" + to_str(rss_peak - rss0) +
+        "}"
+    return payload
+}
+
+// --- main ---
+let ENV_PATH  = sh("echo ${NDJSON_PATH:-${NEXUS:-$HOME/Dev/nexus}/shared/discovery/discovery_graph.json}")
+let ENV_CHUNK = sh("echo ${NDJSON_CHUNK:-5000}")
+let ENV_MODE  = sh("echo ${NDJSON_MODE:-full}")
+let ENV_SINCE = sh("echo ${NDJSON_SINCE:-0}")
+
+let mut chunk: i64 = 5000
+try { chunk = to_int(ENV_CHUNK) } catch e { chunk = 5000 } // @allow-silent-catch
+let mut since: i64 = 0
+try { since = to_int(ENV_SINCE) } catch e { since = 0 } // @allow-silent-catch
+
+if ENV_MODE == "tail" {
+    println(tail_once(ENV_PATH, since))
+} else {
+    println(stream_full(ENV_PATH, chunk))
+}
