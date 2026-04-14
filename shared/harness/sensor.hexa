@@ -6,7 +6,7 @@
 // 성공 조용, 실패만 stderr.
 
 let HOME = env("HOME")
-let NEXUS = "/Users/ghost/Dev/nexus"
+let NEXUS = HOME + "/Dev/nexus"
 let HARNESS = NEXUS + "/shared/harness"
 let EMERGE = HARNESS + "/emerge_baseline.json"
 let PERF = HARNESS + "/perf_baseline.json"
@@ -116,9 +116,242 @@ fn atlas_stats_tick() {
     }
 }
 
+// ─── blowup trace log 에서 phase 별 start ts + last_ts 추출 ───
+// 매핑: p0=phase-1, p1=phase-2, p2=phase-3, p3=phase-4(corollary),
+//       p4=phase-5, p5=phase-6, p6=phase-6.5|6.7, p7=phase-7, p8=phase-8
+// 0 = 미관측. 마지막 blowup 런만 (마지막 [phase-1-* 이후) 대상.
+// 각 tag 첫 발생 ts 만 기록 (재실행 없으면 depth-loop 재호출로 덮어쓰기 방지).
+// return: [p0_ts,p1,p2,p3,p4,p5,p6,p7,p8,last_ts]
+fn parse_blowup_trace(path: string) -> [i64] {
+    let mut p0: i64 = 0
+    let mut p1: i64 = 0
+    let mut p2: i64 = 0
+    let mut p3: i64 = 0
+    let mut p4: i64 = 0
+    let mut p5: i64 = 0
+    let mut p6: i64 = 0
+    let mut p7: i64 = 0
+    let mut p8: i64 = 0
+    let mut last: i64 = 0
+    if file_exists(path) == false { return [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] }
+    let raw = _str(read_file(path))
+    if raw.trim() == "" { return [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] }
+    let lines = raw.split("\n")
+    // 마지막 [phase-1- 위치 찾기
+    let mut start_idx: i64 = 0
+    let mut i: i64 = 0
+    while i < lines.len() {
+        let ln = _str(lines[i])
+        if ln.contains("[phase-1-") { start_idx = i }
+        i = i + 1
+    }
+    // start_idx 이후만 파싱
+    let mut k: i64 = start_idx
+    while k < lines.len() {
+        let ln = _str(lines[k]).trim()
+        if ln.len() > 0 {
+            let sp = ln.index_of(" ")
+            if sp > 0 {
+                let ts_s = ln.substring(0, sp)
+                let rest = ln.substring(sp + 1, ln.len())
+                let ts = _to_int0(ts_s.trim())
+                if ts > 0 {
+                    if rest.contains("[phase-1-") && p0 == 0 { p0 = ts }
+                    else if rest.contains("[phase-2-") && p1 == 0 { p1 = ts }
+                    else if rest.contains("[phase-3-") && p2 == 0 { p2 = ts }
+                    else if rest.contains("[phase-4-corollary") && p3 == 0 { p3 = ts }
+                    else if rest.contains("[phase-5-") && p4 == 0 { p4 = ts }
+                    else if rest.contains("[phase-6-") && p5 == 0 { p5 = ts }
+                    else if rest.contains("[phase-6.5-") && p6 == 0 { p6 = ts }
+                    else if rest.contains("[phase-6.7-") && p6 == 0 { p6 = ts }
+                    else if rest.contains("[phase-7-") && p7 == 0 { p7 = ts }
+                    else if rest.contains("[phase-8-") && p8 == 0 { p8 = ts }
+                    if ts > last { last = ts }
+                }
+            }
+        }
+        k = k + 1
+    }
+    return [p0, p1, p2, p3, p4, p5, p6, p7, p8, last]
+}
+
+// ms_arr 각 slot: (다음 관측 ts - 이 phase ts) * 1000. 미관측이면 0.
+// hexa list index 할당 no-op 이라 9 scalar 로 명시 계산.
+fn compute_phase_ms(phase_ts: [i64]) -> [i64] {
+    let p0 = phase_ts[0]
+    let p1 = phase_ts[1]
+    let p2 = phase_ts[2]
+    let p3 = phase_ts[3]
+    let p4 = phase_ts[4]
+    let p5 = phase_ts[5]
+    let p6 = phase_ts[6]
+    let p7 = phase_ts[7]
+    let p8 = phase_ts[8]
+    let last = phase_ts[9]
+    // 다음 관측 ts helper 없이 순차 fallback
+    let n0 = _first_nonzero([p1, p2, p3, p4, p5, p6, p7, p8, last])
+    let n1 = _first_nonzero([p2, p3, p4, p5, p6, p7, p8, last])
+    let n2 = _first_nonzero([p3, p4, p5, p6, p7, p8, last])
+    let n3 = _first_nonzero([p4, p5, p6, p7, p8, last])
+    let n4 = _first_nonzero([p5, p6, p7, p8, last])
+    let n5 = _first_nonzero([p6, p7, p8, last])
+    let n6 = _first_nonzero([p7, p8, last])
+    let n7 = _first_nonzero([p8, last])
+    let n8 = last
+    let m0 = _delta_ms(p0, n0)
+    let m1 = _delta_ms(p1, n1)
+    let m2 = _delta_ms(p2, n2)
+    let m3 = _delta_ms(p3, n3)
+    let m4 = _delta_ms(p4, n4)
+    let m5 = _delta_ms(p5, n5)
+    let m6 = _delta_ms(p6, n6)
+    let m7 = _delta_ms(p7, n7)
+    let m8 = _delta_ms(p8, n8)
+    return [m0, m1, m2, m3, m4, m5, m6, m7, m8]
+}
+
+fn _first_nonzero(xs: [i64]) -> i64 {
+    let mut i: i64 = 0
+    while i < xs.len() {
+        if xs[i] > 0 { return xs[i] }
+        i = i + 1
+    }
+    return 0
+}
+
+fn _delta_ms(cur: i64, nxt: i64) -> i64 {
+    if cur <= 0 || nxt <= 0 { return 0 }
+    let d = nxt - cur
+    if d <= 0 { return 0 }
+    return d * 1000
+}
+
 fn perf_bench_tick() {
-    // 실측 bench 는 blowup 실행비 커서 별도 수동/weekly. 여기선 placeholder.
-    let _ = PERF
+    // 실측 bench: /tmp/blowup_trace.log 파싱 → phase ms 추출.
+    // 빈/부족 trace = silent skip (첫 blowup 실행 대기).
+    let trace_path = "/tmp/blowup_trace.log"
+    if file_exists(trace_path) == false { return }
+    let ts = now_unix()
+    let phase_ts = parse_blowup_trace(trace_path)
+    // 관측 phase 개수 카운트 (2+ 필요)
+    let mut observed: i64 = 0
+    let mut pi: i64 = 0
+    while pi < 9 {
+        if phase_ts[pi] > 0 { observed = observed + 1 }
+        pi = pi + 1
+    }
+    if observed < 2 { return }  // silent: trace 부족
+
+    let ms = compute_phase_ms(phase_ts)
+    let m0 = ms[0]
+    let m1 = ms[1]
+    let m2 = ms[2]
+    let m3 = ms[3]
+    let m4 = ms[4]
+    let m5 = ms[5]
+    let m6 = ms[6]
+    let m7 = ms[7]
+    let m8 = ms[8]
+    let total_ms = m0 + m1 + m2 + m3 + m4 + m5 + m6 + m7 + m8
+    if total_ms <= 0 { return }  // silent: 동일 초 내 완료 (sec-해상도 한계)
+
+    // 중복 sample 방지: perf_baseline.json last_bench_ms 갱신 시점이 trace 의 last_ts 와 이미 같으면 skip.
+    // 판정: updated 필드 == trace last_ts 이면 동일 런. append 안 함.
+    let trace_last = phase_ts[9]
+    let mut sample_n: i64 = 0
+    let mut prev_p0: i64 = 0
+    let mut prev_p1: i64 = 0
+    let mut prev_p2: i64 = 0
+    let mut prev_p3: i64 = 0
+    let mut prev_p4: i64 = 0
+    let mut prev_p5: i64 = 0
+    let mut prev_p6: i64 = 0
+    let mut prev_p7: i64 = 0
+    let mut prev_p8: i64 = 0
+    let mut prev_total_avg: i64 = 0
+    let mut prev_updated: i64 = 0
+    let mut prev_history = ""
+    if file_exists(PERF) {
+        let body = _str(read_file(PERF))
+        sample_n = _to_int0(json_field(body, "sample_n"))
+        prev_p0 = _to_int0(json_field(body, "p0"))
+        prev_p1 = _to_int0(json_field(body, "p1"))
+        prev_p2 = _to_int0(json_field(body, "p2"))
+        prev_p3 = _to_int0(json_field(body, "p3"))
+        prev_p4 = _to_int0(json_field(body, "p4"))
+        prev_p5 = _to_int0(json_field(body, "p5"))
+        prev_p6 = _to_int0(json_field(body, "p6"))
+        prev_p7 = _to_int0(json_field(body, "p7"))
+        prev_p8 = _to_int0(json_field(body, "p8"))
+        prev_total_avg = _to_int0(json_field(body, "total_ms_avg"))
+        prev_updated = _to_int0(json_field(body, "trace_last_ts"))
+    }
+    if prev_updated == trace_last && prev_updated > 0 { return }  // 동일 런
+
+    let new_n = sample_n + 1
+    // 평균: sample_n>=5 에서만 계산 (그 전엔 0 유지 → lint silent)
+    let mut avg_p0: i64 = 0
+    let mut avg_p1: i64 = 0
+    let mut avg_p2: i64 = 0
+    let mut avg_p3: i64 = 0
+    let mut avg_p4: i64 = 0
+    let mut avg_p5: i64 = 0
+    let mut avg_p6: i64 = 0
+    let mut avg_p7: i64 = 0
+    let mut avg_p8: i64 = 0
+    let mut new_total_avg: i64 = 0
+    if new_n >= 5 {
+        avg_p0 = ((prev_p0 * sample_n) + m0) / new_n
+        avg_p1 = ((prev_p1 * sample_n) + m1) / new_n
+        avg_p2 = ((prev_p2 * sample_n) + m2) / new_n
+        avg_p3 = ((prev_p3 * sample_n) + m3) / new_n
+        avg_p4 = ((prev_p4 * sample_n) + m4) / new_n
+        avg_p5 = ((prev_p5 * sample_n) + m5) / new_n
+        avg_p6 = ((prev_p6 * sample_n) + m6) / new_n
+        avg_p7 = ((prev_p7 * sample_n) + m7) / new_n
+        avg_p8 = ((prev_p8 * sample_n) + m8) / new_n
+        new_total_avg = ((prev_total_avg * sample_n) + total_ms) / new_n
+    }
+
+    let sample_entry = "{\"ts\":" + to_string(ts) +
+                       ",\"trace_last\":" + to_string(trace_last) +
+                       ",\"p0\":" + to_string(m0) +
+                       ",\"p1\":" + to_string(m1) +
+                       ",\"p2\":" + to_string(m2) +
+                       ",\"p3\":" + to_string(m3) +
+                       ",\"p4\":" + to_string(m4) +
+                       ",\"p5\":" + to_string(m5) +
+                       ",\"p6\":" + to_string(m6) +
+                       ",\"p7\":" + to_string(m7) +
+                       ",\"p8\":" + to_string(m8) +
+                       ",\"total_ms\":" + to_string(total_ms) + "}"
+
+    // baseline 재작성 (history 1개만 최신 유지 — 단순 JSON. 누적은 sample_n 에 반영)
+    let mut j = "{\n"
+    j = j + "  \"schema\": 1,\n"
+    j = j + "  \"updated\": " + to_string(ts) + ",\n"
+    j = j + "  \"trace_last_ts\": " + to_string(trace_last) + ",\n"
+    j = j + "  \"sample_n\": " + to_string(new_n) + ",\n"
+    j = j + "  \"phase_ms\": {\n"
+    j = j + "    \"p0\": " + to_string(avg_p0) + ",\n"
+    j = j + "    \"p1\": " + to_string(avg_p1) + ",\n"
+    j = j + "    \"p2\": " + to_string(avg_p2) + ",\n"
+    j = j + "    \"p3\": " + to_string(avg_p3) + ",\n"
+    j = j + "    \"p4\": " + to_string(avg_p4) + ",\n"
+    j = j + "    \"p5\": " + to_string(avg_p5) + ",\n"
+    j = j + "    \"p6\": " + to_string(avg_p6) + ",\n"
+    j = j + "    \"p7\": " + to_string(avg_p7) + ",\n"
+    j = j + "    \"p8\": " + to_string(avg_p8) + "\n"
+    j = j + "  },\n"
+    j = j + "  \"total_ms_avg\": " + to_string(new_total_avg) + ",\n"
+    j = j + "  \"total_ms_last\": " + to_string(total_ms) + ",\n"
+    j = j + "  \"last_bench_ms\": " + to_string(total_ms) + ",\n"
+    j = j + "  \"peak_rss_kb_avg\": 0,\n"
+    j = j + "  \"peak_rss_kb_last\": 0,\n"
+    j = j + "  \"history\": [" + sample_entry + "],\n"
+    j = j + "  \"note\": \"sensor.hexa perf_bench_tick — /tmp/blowup_trace.log [phase-N-tag] unix ts delta 파싱. sample_n>=5 부터 phase_ms 평균. lint H-PERF-BASELINE 참조.\"\n"
+    j = j + "}\n"
+    try { write_file(PERF, j) } catch e {}
 }
 
 fn think_stats_tick() {

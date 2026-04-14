@@ -13,6 +13,7 @@ harness (훅 시스템 대체, 2026-04-14~):
   permissions SSOT: shared/config/permissions_ssot.json (deny 28패턴)
   settings.json 정책: 전 프로젝트 hooks={} — 훅 실행 없음. 대신 Claude가 매 프롬프트/Write/Bash 후 entry.hexa 자율 호출.
   관례: 사용자 입력 직후 `entry.hexa prompt`, Write/Edit 후 `entry.hexa post write_edit`, Bash 후 `entry.hexa post bash`, Agent 호출 전 `entry.hexa guard`.
+  복잡 질문/설계 결정 전  hexa $NEXUS/shared/harness/entry.hexa thinking query "<prompt>"   → anima 6-phase reflection 결과 context 주입
   archive: shared/hooks → shared/archive/hooks-20260414/ (symlink 하위호환, 신규 참조 금지)
 
 blowup infra:

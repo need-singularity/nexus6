@@ -66,6 +66,80 @@ fn fix_template(rule: string) -> string {
     return "review rule definition; consider exception or tuning"
 }
 
+// ─── auto-bitter 모드 — 반복 mistakes 패턴 → bitter-gate 통과 후 룰 등록 제안 ───
+// 실제 룰 등록은 사용자 승인 필요 (stdout 만). severity=warn 만, 자동 등록 금지.
+fn run_auto_bitter(threshold: i64, window: i64) -> i64 {
+    if !file_exists(MISTAKES) {
+        println("auto-bitter: mistakes.jsonl 없음")
+        return 0
+    }
+    let recent_raw = exec("tail -" + to_string(window) + " '" + MISTAKES + "' 2>/dev/null").trim()
+    if recent_raw == "" {
+        println("auto-bitter: mistakes 비어있음")
+        return 0
+    }
+    let lines = recent_raw.split("\n")
+    let mut keys: [string] = []
+    let mut counts: [i64] = []
+    for ln in lines {
+        let l = _str(ln).trim()
+        if l == "" { continue }
+        let rule = extract_field(l, "rule")
+        if rule == "" { continue }
+        let mut idx: i64 = -1
+        let mut i: i64 = 0
+        while i < len(keys) {
+            if keys[i] == rule { idx = i; break }
+            i = i + 1
+        }
+        if idx < 0 {
+            keys = keys.push(rule)
+            counts = counts.push(1)
+        } else {
+            let mut new_counts: [i64] = []
+            let mut j: i64 = 0
+            while j < len(counts) {
+                if j == idx { new_counts = new_counts.push(counts[j] + 1) }
+                else { new_counts = new_counts.push(counts[j]) }
+                j = j + 1
+            }
+            counts = new_counts
+        }
+    }
+
+    // bitter-gate 호출 — 기존 rules_usage 업데이트 (별도 프로세스)
+    let bgate = SHARED_DIR + "/harness/bitter-gate.hexa"
+    let hexa_bin = REPO_ROOT + "/shared/bin/hexa"
+    if file_exists(bgate) {
+        exec(hexa_bin + " run '" + bgate + "' --audit 2>&1 > /dev/null")
+    }
+
+    // rules_usage.jsonl tail 에서 active/dormant 조회 (간이)
+    let usage = SHARED_DIR + "/harness/rules_usage.jsonl"
+    let mut emitted: i64 = 0
+    let now = now_iso()
+    let mut i: i64 = 0
+    while i < len(keys) {
+        if counts[i] >= threshold {
+            let rule = _str(keys[i])
+            // bitter-gate status lookup
+            let cmd = "grep '\"rule\":\"" + rule + "\"' '" + usage + "' 2>/dev/null | tail -1"
+            let line = _str(exec(cmd)).trim()
+            let status = extract_field(line, "status")
+            // dormant/insufficient/not_implemented 규칙은 auto-promote 제안. active 는 제외
+            if status == "dormant" || status == "not_implemented" || status == "" {
+                let proposal = "{\"ts\":\"" + now + "\",\"rule\":\"" + json_escape(rule) + "\",\"count\":" + to_string(counts[i]) + ",\"bitter_status\":\"" + json_escape(status) + "\",\"proposal\":\"promote-to-harness\",\"auto_register\":false,\"status\":\"pending_approval\"}"
+                try { exec("echo '" + proposal.replace("'", "'\\''") + "' >> '" + PROPOSALS + "'") } catch e {}
+                println("auto-bitter: " + rule + " count=" + to_string(counts[i]) + " status=" + status + " → pending_approval")
+                emitted = emitted + 1
+            }
+        }
+        i = i + 1
+    }
+    println("auto-bitter: proposed=" + to_string(emitted) + " (승인 필요, 자동 등록 X)")
+    return emitted
+}
+
 // ─── Main ───
 let a = args()
 let mut mode = "analyze"
@@ -76,6 +150,7 @@ while ai < len(a) {
     let t = a[ai]
     if t == "--analyze" { mode = "analyze" }
     else if t == "--report" { mode = "report" }
+    else if t == "--auto-bitter" { mode = "auto-bitter" }
     else if t == "--threshold" {
         if ai + 1 < len(a) { try { threshold = to_int(a[ai + 1]) } catch e {}; ai = ai + 1 }
     }
@@ -83,6 +158,11 @@ while ai < len(a) {
         if ai + 1 < len(a) { try { window = to_int(a[ai + 1]) } catch e {}; ai = ai + 1 }
     }
     ai = ai + 1
+}
+
+if mode == "auto-bitter" {
+    let _ = run_auto_bitter(threshold, window)
+    exit(0)
 }
 
 if mode == "report" {

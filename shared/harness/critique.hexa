@@ -1,0 +1,258 @@
+// critique.hexa — P7 야간 발견: Critique (블로업 결과 anti-thesis 생성)
+// 역할: cross_feed.jsonl 의 direction="blowup→atlas" pending 최근 5건 대상
+//       anti-thesis 생성 ("NOT-" / "counter-" prefix) → log append + cross_feed contradiction append
+// SSOT: shared/harness/critique_log.jsonl (append-only)
+//
+// subcommands:
+//   antithesis            최근 pending 5건 → counter 생성 + log + cross_feed append
+//   status                최근 24h critique 수 + contradiction direction 수
+//   history [N=10]        critique_log.jsonl 마지막 N 줄
+//
+// 성공 조용 (H1). antithesis 만 최소 stdout.
+
+let HOME = env("HOME")
+let NEXUS = HOME + "/Dev/nexus"
+let HARNESS = NEXUS + "/shared/harness"
+
+let LOG = HARNESS + "/critique_log.jsonl"
+let CROSS_QUEUE = HARNESS + "/cross_feed.jsonl"
+let CROSS_FEED = HARNESS + "/cross_feed.hexa"
+let HEXA_BIN = NEXUS + "/shared/bin/hexa"
+
+// ─── void-safe coercion ───
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _to_int0(s: string) -> i64 {
+    if s == "" { return 0 }
+    let first = _str(s.split("\n")[0]).trim()
+    if first == "" { return 0 }
+    return to_int(first)
+}
+
+fn now_unix() -> i64 {
+    return _to_int0(_str(exec("date +%s")).trim())
+}
+
+fn json_escape(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", " ")
+    r = r.replace("\r", " ")
+    r = r.replace("\t", " ")
+    return r
+}
+
+fn json_field(line: string, key: string) -> string {
+    let tag = "\"" + key + "\""
+    if line.contains(tag) == false { return "" }
+    let after = line.split(tag)[1]
+    let parts = after.split(":")
+    if parts.len() < 2 { return "" }
+    let mut rest = parts[1]
+    let mut i = 2
+    while i < parts.len() {
+        rest = rest + ":" + parts[i]
+        i = i + 1
+    }
+    let s = rest.trim()
+    if s.len() == 0 { return "" }
+    if s.substring(0, 1) == "\"" {
+        let inner = s.substring(1, s.len())
+        let ep = inner.split("\"")
+        if ep.len() < 1 { return "" }
+        return ep[0]
+    }
+    let mut end = 0
+    while end < s.len() {
+        let c = s.substring(end, end + 1)
+        if c == "," || c == "}" || c == "\n" || c == " " { break }
+        end = end + 1
+    }
+    return s.substring(0, end).trim()
+}
+
+fn shell_quote(s: string) -> string {
+    let escaped = s.replace("'", "'\\''")
+    return "'" + escaped + "'"
+}
+
+fn append_line(path: string, line: string) {
+    let cmd = "printf '%s\\n' " + shell_quote(line) + " >> '" + path + "' 2>/dev/null"
+    let _r = exec(cmd)
+}
+
+fn _ensure_log() {
+    if file_exists(LOG) == false {
+        try { write_file(LOG, "") } catch e {}
+    }
+}
+
+// ─── cross_feed.jsonl 에서 direction=blowup→atlas pending 최근 5건 ───
+fn load_pending_blowup() -> [string] {
+    let mut rows: [string] = []
+    if file_exists(CROSS_QUEUE) == false { return rows }
+    // tail -500 으로 최근만 스캔 (성능)
+    let raw = _str(exec("tail -500 '" + CROSS_QUEUE + "' 2>/dev/null"))
+    if raw.trim() == "" { return rows }
+    let lines = raw.split("\n")
+    let mut i: i64 = lines.len() - 1
+    let mut picked: i64 = 0
+    while i >= 0 && picked < 5 {
+        let line = _str(lines[i]).trim()
+        if line.len() > 0 {
+            let dir = json_field(line, "direction")
+            let st = json_field(line, "status")
+            if dir == "blowup→atlas" && st == "pending" {
+                rows = rows.push(line)
+                picked = picked + 1
+            }
+        }
+        i = i - 1
+    }
+    return rows
+}
+
+// ─── antithesis 생성 ── ts mod 2 로 prefix 선택 ───
+fn make_counter(original: string, ts: i64, idx: i64) -> string {
+    if original.len() == 0 { return "" }
+    let mode = (ts + idx) % 2
+    if mode == 0 { return "NOT-" + original }
+    return "counter-" + original
+}
+
+// ─── antithesis ───
+fn cmd_antithesis(argv: [string]) {
+    _ensure_log()
+    let pend = load_pending_blowup()
+    if pend.len() == 0 {
+        // silent — 할 일 없음 (cron 대비)
+        return
+    }
+
+    let ts = now_unix()
+    let mut made: i64 = 0
+    let mut first_counter = ""
+    let mut i: i64 = 0
+    while i < pend.len() {
+        let row = pend[i]
+        let seed = json_field(row, "seed")
+        let result = json_field(row, "result")
+        let source = json_field(row, "source")
+
+        let base = result
+        // result 비어있으면 seed 로 fallback
+        let original = if base.len() > 0 { base } else { seed }
+        if original.len() == 0 { i = i + 1; continue }
+
+        let counter = make_counter(original, ts, i)
+        if first_counter.len() == 0 { first_counter = counter }
+
+        let strength: i64 = 1 + (i % 3)
+        let line_out = "{\"ts\":" + to_string(ts + i) +
+                       ",\"kind\":\"antithesis\"" +
+                       ",\"original\":\"" + json_escape(original) + "\"" +
+                       ",\"counter\":\"" + json_escape(counter) + "\"" +
+                       ",\"source\":\"" + json_escape(source) + "\"" +
+                       ",\"seed\":\"" + json_escape(seed) + "\"" +
+                       ",\"strength\":" + to_string(strength) + "}"
+        append_line(LOG, line_out)
+
+        // cross_feed append — contradiction payload
+        let cf_cmd = "'" + HEXA_BIN + "' run '" + CROSS_FEED + "' append_blowup critique " +
+                     shell_quote(counter) + " " + shell_quote("antithesis") +
+                     " >/dev/null 2>&1"
+        let _r = exec(cf_cmd)
+
+        made = made + 1
+        i = i + 1
+    }
+
+    println("antithesis: generated=" + to_string(made) + " first=" + first_counter)
+}
+
+// ─── status — 최근 24h critique 수 + contradiction direction 수 ───
+fn cmd_status(argv: [string]) {
+    let now = now_unix()
+    let cutoff = now - 86400
+
+    let mut crit_n: i64 = 0
+    let mut last_ts: i64 = 0
+    if file_exists(LOG) {
+        let raw = _str(read_file(LOG))
+        if raw.trim() != "" {
+            let lines = raw.split("\n")
+            let mut i = 0
+            while i < lines.len() {
+                let line = _str(lines[i]).trim()
+                if line.len() > 0 {
+                    let ts = _to_int0(json_field(line, "ts"))
+                    if ts >= cutoff {
+                        crit_n = crit_n + 1
+                        if ts > last_ts { last_ts = ts }
+                    }
+                }
+                i = i + 1
+            }
+        }
+    }
+
+    // cross_feed 에서 critique source 24h 누적 (direction=blowup→atlas source=critique)
+    let mut contra_n: i64 = 0
+    if file_exists(CROSS_QUEUE) {
+        let raw = _str(exec("tail -500 '" + CROSS_QUEUE + "' 2>/dev/null"))
+        if raw.trim() != "" {
+            let lines = raw.split("\n")
+            let mut i = 0
+            while i < lines.len() {
+                let line = _str(lines[i]).trim()
+                if line.len() > 0 {
+                    let ts = _to_int0(json_field(line, "ts"))
+                    let src = json_field(line, "source")
+                    if ts >= cutoff && src == "critique" {
+                        contra_n = contra_n + 1
+                    }
+                }
+                i = i + 1
+            }
+        }
+    }
+
+    println("critique critiques_24h=" + to_string(crit_n) +
+            " contradictions_24h=" + to_string(contra_n) +
+            " last_ts=" + to_string(last_ts))
+}
+
+fn cmd_history(argv: [string]) {
+    let mut n: i64 = 10
+    if argv.len() >= 4 {
+        let v = _to_int0(argv[3].trim())
+        if v > 0 { n = v }
+    }
+    if file_exists(LOG) == false { return }
+    let cmd = "tail -n " + to_string(n) + " '" + LOG + "' 2>/dev/null"
+    let out = _str(exec(cmd))
+    print(out)
+}
+
+fn main() {
+    let argv = args()
+    if argv.len() < 3 {
+        eprintln("usage: critique <antithesis|status|history> [args...]")
+        exit(2)
+    }
+    let mode = argv[2].trim()
+    if mode == "antithesis" { cmd_antithesis(argv) }
+    else if mode == "status" { cmd_status(argv) }
+    else if mode == "history" { cmd_history(argv) }
+    else {
+        eprintln("REJECT: unknown mode '" + mode + "' — modes: antithesis|status|history")
+        exit(2)
+    }
+}
+
+main()
