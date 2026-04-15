@@ -1,0 +1,361 @@
+{
+  "timestamp": "2026-04-15",
+  "task": "CLM physical ceiling analysis — Mac CPU native path + H100 GPU hexa-native path — MFU breakdown + headroom",
+  "verdict": "both paths operate <1% MFU today; direct path to ~10-30% MFU on Mac (raw-f32 Tensor + sgemm in nn_core) and ~15-40% on H100 (current D=64 bench is micro, D=512 config achievable after interpreter OOM unblock + grad_accum)",
+  "authorization": "user 'yes' — pure analysis only, no training launch",
+
+  "hardware_assumptions": {
+    "mac": {
+      "chip": "Apple M3 (base)",
+      "perf_cores": 4,
+      "efficiency_cores": 4,
+      "mem_gb": 24,
+      "unified_bw_gb_s_published": 100,
+      "notes": "M3 base — NOT Max/Studio. Unified memory bandwidth is 100 GB/s (published), not the 400 GB/s of M1/M2 Max. LLC 4 MiB, L1i 128 KiB per core.",
+      "f32_scalar_peak_gflops_per_core_theoretical": "~16 — 4-wide NEON FMA × 2 ops × ~2 GHz effective",
+      "f32_scalar_peak_gflops_all_perf_cores": "~64",
+      "f32_vector_peak_gflops_all_perf_cores": "~200-400 — NEON + AMX tile engine",
+      "measured_sgemm_512_peak_gflops": 156.7,
+      "measured_scalar_C_O3_512_gflops": 2.34,
+      "measured_omp_naive_512_gflops": 9.37,
+      "ceiling_source": "measured from hexa_native_accelerate_spike_20260415.json 512x512 f32 BLAS row = 0.001713s → 2*512^3/t = 156.7 GF/s",
+      "practical_80pct_ceiling_gflops": 125.4
+    },
+    "h100": {
+      "model": "H100 SXM",
+      "bf16_peak_tflops": 989,
+      "fp32_peak_tflops": 67,
+      "mem_bw_gb_s": 3000,
+      "ceiling_used_for_mfu": "bf16 989 TF/s (training uses bf16 master)",
+      "practical_80pct_ceiling_tflops": 791
+    }
+  },
+
+  "model_configs": {
+    "bench_train_flag_on_d16": {
+      "source": "bench_train_step_flag_on.hexa (real CLM train_step stack)",
+      "d_model": 16, "n_layer": 2, "n_head": 2, "d_ff": 32, "vocab": 32, "seq": 8, "batch": 1,
+      "rank": 4,
+      "params_estimate": 6144,
+      "params_breakdown": {
+        "tok_emb": "32*16 = 512",
+        "per_layer": "QKVO 4*(16*16)=1024 + FF (16*32 + 16*32 + 32*16)=1536 + norms=32 → ~2592",
+        "layers_total": "2*2560 = 5120",
+        "lm_head": "16*32 = 512",
+        "total_approx": "~6144"
+      },
+      "tokens_per_step": 8,
+      "train_flops_per_step_6N_rule": 294912,
+      "train_flops_per_step_note": "6*N*tok. Kaplan/Hoffmann canonical — 2N fwd + 4N bwd+upd. Excludes phi_cache bookkeeping (small constant)."
+    },
+    "bench_train_native_microbench": {
+      "source": "bench_train_step_native.hexa (array-only reproduction of decoder layer hot work)",
+      "d_model": 16, "n_layer": 2, "n_head": 2, "d_ff": 64, "seq": 4,
+      "iters": 10,
+      "measurement_type": "forward-only (no backward, no optimizer) — agrees on h[0]/h[15] byte-exact w/ interpreter",
+      "flops_per_layer_forward": 35072,
+      "flops_per_layer_breakdown": {
+        "qkvo_matmuls": "4 * 2*seq*d*d = 4*2*4*16*16 = 8192",
+        "attention_qk": "2*seq*seq*d = 2*4*4*16 = 512",
+        "attention_sv": "2*seq*seq*d = 2*4*4*16 = 512",
+        "swiglu_gate_up": "2 * 2*seq*d*d_ff = 2*2*4*16*64 = 16384",
+        "swiglu_down": "2*seq*d_ff*d = 2*4*64*16 = 8192",
+        "elementwise": "~1280 (silu+rmsnorm+residual)",
+        "layer_total": "~35072"
+      },
+      "flops_per_step": 70144,
+      "flops_per_step_note": "n_layer=2, forward-only. No 3x training multiplier (bench does not run backward)."
+    },
+    "h100_gpu_d64_fast": {
+      "source": "shared/config/roadmaps/clm_hexa_gpu.json phase 4 d64_fast run",
+      "d_model": 64, "n_layer": 4, "ff": 256, "vocab": 256, "seq": 512, "batch": 1,
+      "params_estimate": 294912,
+      "params_breakdown": {
+        "tok_emb": "256*64 = 16384",
+        "per_layer": "QKVO 4*(64*64)=16384 + FF (2*64*256 + 256*64)=49152 → 65536",
+        "layers_total": "4*65536 = 262144",
+        "lm_head": "64*256 = 16384",
+        "total_approx": "~294912"
+      },
+      "tokens_per_step": 512,
+      "train_flops_per_step_6N": 906035712,
+      "flops_per_step_gflop": 0.906,
+      "measured_ms_per_step": 820,
+      "note": "0.82 s/step reported in clm_hexa_gpu.json phase 4 note — INTERPRETED path (hexa pod binary was interpreter, not native codegen). 200 steps total 164s matches."
+    },
+    "h100_gpu_d512_full": {
+      "source": "project_clm_hexa_gpu_plan memory config + working CLM smoke at /workspace/clm_smoke",
+      "d_model": 512, "n_layer": 12, "ff": 2048, "vocab": 256, "seq": 512, "batch": 1,
+      "params_estimate": 50593792,
+      "params_breakdown": {
+        "tok_emb": "256*512 = 131072",
+        "per_layer": "QKVO 4*(512*512)=1048576 + FF (2*512*2048 + 2048*512)=3145728 → 4194304",
+        "layers_total": "12*4194304 = 50331648",
+        "lm_head": "512*256 = 131072",
+        "total_approx": "~50593792 ≈ 50.6M"
+      },
+      "tokens_per_step": 512,
+      "train_flops_per_step_6N": 155424387072,
+      "flops_per_step_gflop": 155.42,
+      "measured_ms_per_step_best": 180,
+      "measured_ms_per_step_worst": 3000,
+      "measured_note": "0.18-3 sec/step depending on pod contention per memory project_clm_hexa_gpu_plan"
+    }
+  },
+
+  "paths": {
+    "mac_cpu_native": {
+      "hardware_peak_gflops_f32_blas": 156.7,
+      "hardware_peak_gflops_scalar_C_O3": 2.34,
+      "hardware_peak_gflops_omp_4core_naive": 9.37,
+      "ceiling_for_mfu_reference": 156.7,
+      "ceiling_note": "Using measured 512x512 sgemm Accelerate BLAS throughput as the achievable f32 ceiling. Theoretical NEON+AMX peak is higher but unreachable without tensor-core-equivalent AMX intrinsic bundling; 156.7 GF/s is the highest numeric we can honestly name today.",
+
+      "measurements": [
+        {
+          "name": "CLM real step (interpreter, flag ON, d16 nl2 seq8)",
+          "source_file": "training/bench_train_step_flag_on.hexa",
+          "state_json": "shared/state/clm_flag_on_20260415.json",
+          "ms_per_step": 1000.0,
+          "flops_per_step": 294912,
+          "achieved_gflops": 0.000295,
+          "mfu_pct_vs_blas_ceiling": 0.000188,
+          "mfu_pct_note": "0.000188% of Accelerate BLAS 156.7 GF/s. Effectively 530000x below physical ceiling.",
+          "distance_to_80pct_ceiling_x": 425000,
+          "dominant_bottleneck": "interpreter eval overhead + hexa-list allocation churn in nn_core matmul (O(N^2) list append per tensor_zeros call)",
+          "notes": "27.5x speedup vs historical 27500ms baseline is from phi_cache (not nn_core). Raw compute rate still dominated by stage0 interpreter dispatch cost; a single f32 multiply is ~hundreds of ns in stage0."
+        },
+        {
+          "name": "CLM phi-block isolated (interpreter, flag ON)",
+          "source_file": "training/bench_phi_cache_speedup.hexa",
+          "state_json": "shared/state/clm_track_b_speedup_20260415.json",
+          "ms_per_iter": 45.94,
+          "flops_per_iter_estimate": 196608,
+          "flops_per_iter_note": "phi block does one 64*128 anchor projection + contrastive scoring — ~2*seq*d*d_proj ≈ 2*64*128*12 ≈ 196k flops at seq=64 d=128 proj=12 domains",
+          "achieved_gflops": 0.00428,
+          "mfu_pct_vs_blas_ceiling": 0.00273,
+          "note": "isolated phi block, not a full step. Speedup metric 630x is vs 27.5s historical WHOLE-STEP. Achieved GFLOP/s is still <0.005, same regime as real step — confirms interpreter dispatch dominates."
+        },
+        {
+          "name": "CLM phi_cache_loader (NATIVE C via hexa build, seq=64 d=128)",
+          "source_file": "training/phi_cache_loader.hexa",
+          "state_json": "shared/state/hexa_native_compile_spike_20260415.json",
+          "ms_per_iter": 0.111236,
+          "flops_per_iter_estimate": 196608,
+          "achieved_gflops": 1.768,
+          "mfu_pct_vs_blas_ceiling": 1.128,
+          "speedup_vs_interpreter": 393.8,
+          "distance_to_80pct_ceiling_x": 71,
+          "notes": "First NATIVE measurement — 393.8x interpreter, single-core scalar C. Hot loop is still hand-rolled scalar (no BLAS call), so GFLOP/s ≈ measured sgemm-scalar baseline. Headroom = gain sgemm/OpenMP integration → 67x BLAS or 4x OMP further."
+        },
+        {
+          "name": "CLM full-loop microbench (NATIVE C, 2-layer forward, seq=4 d=16 d_ff=64)",
+          "source_file": "training/bench_train_step_native.hexa",
+          "state_json": "shared/state/clm_native_full_compile_20260415.json",
+          "ms_per_step": 2.093,
+          "flops_per_step": 70144,
+          "achieved_gflops": 0.0335,
+          "mfu_pct_vs_blas_ceiling": 0.0214,
+          "speedup_vs_interpreter": 193.3,
+          "distance_to_80pct_ceiling_x": 3740,
+          "dominant_bottleneck": "tiny config — seq=4 d=16 means matmul kernels are ~16x16 each, too small for sgemm crossover; scalar code is already near single-core compute-bound at this size. Achieved 0.03 GF/s reflects tiny-problem startup overhead (now_ns() exec call per iter, warmup effects, function call overhead), NOT steady-state throughput.",
+          "notes": "Non-informative about ceiling at this size. Scale to d=64+ before taking MFU seriously; at d=16 seq=4 a single call to exec('date +%s%N') alone (~ms) dominates. Re-measure at seq=64 d=128 matmul-dominated config to get real MFU."
+        },
+        {
+          "name": "raw sgemm 512x512 f32 (BLAS baseline, not CLM)",
+          "source_file": "training/accelerate_bench.hexa",
+          "state_json": "shared/state/hexa_native_accelerate_spike_20260415.json",
+          "ms_per_call": 1.713,
+          "flops_per_call": 268435456,
+          "achieved_gflops": 156.7,
+          "mfu_pct_vs_blas_ceiling": 100.0,
+          "note": "Definitional — this IS the ceiling. Included to show sgemm achieves its measured peak and the gap to CLM numbers is entirely in the path from CLM to this kernel."
+        }
+      ],
+
+      "remaining_levers": [
+        {
+          "id": "L1_tensor_primitive",
+          "status": "LANDED — commit 0c29a5c5",
+          "desc": "Raw f32 Tensor type primitive landed (4757x vs list-backed matmul). This removes the HEXA_ARRAY_COPY_O_N2 blocker documented in hexa_native_accelerate_spike JSON. MUST be rewired into training/nn_core.hexa matmul hot path next.",
+          "expected_mfu_delta_pct": "+30 relative (removes list-alloc moat, BLAS call actually delivers)",
+          "unlocks": "L2"
+        },
+        {
+          "id": "L2_nn_core_blas_integration",
+          "status": "NOT STARTED",
+          "desc": "Rewrite training/nn_core.hexa matmul/add/layernorm/softmax to operate on raw f32 buffers (Tensor primitive from L1) and call acc_sgemm_raw from accelerate_blas.hexa via hxblas_wrapper.dylib.",
+          "expected_mfu_delta_pct": "+67x single-core (scalar C → BLAS) for any matmul-dominated step at d>=64",
+          "unlocks": "L3, L4"
+        },
+        {
+          "id": "L3_ffi_float_fix",
+          "status": "BLOCKED — agent #18 scope",
+          "desc": "FFI_FLOAT_DOUBLE blocker in hexa_v2 gen2_ffi_c_type. Currently the BLAS path requires hxblas_wrapper.c shim because extern fn X(alpha: Float) emits C double signature while cblas_sgemm takes C float. Fix by adding 'f32' explicit type that maps to C float in gen2_ffi_c_type (self/codegen_c2.hexa:493-504), rebuild hexa_v2.",
+          "expected_mfu_delta_pct": "+5-10% (eliminates one function call indirection and dlopen path, enables static FFI)",
+          "unlocks": "direct cublas/openblas linkage"
+        },
+        {
+          "id": "L4_openmp_parallelism",
+          "status": "VERIFIED IN SPIKE — not in hot path yet",
+          "desc": "OpenMP 4x speedup measured at 512x512 (9.37 GF/s scalar → BLAS internally uses OMP). Non-BLAS kernels (rmsnorm, softmax, layernorm) should get #pragma omp parallel for on batch/seq outer loops.",
+          "expected_mfu_delta_pct": "+4x on non-matmul kernels",
+          "unlocks": "80% MFU ceiling approach"
+        },
+        {
+          "id": "L5_stage0_interpreter_oom_fix",
+          "status": "BLOCKING INTERPRETER PATH",
+          "desc": "bench_train_step_flag_on.hexa killed at 100 steps (target 500) due to stage0 interpreter ~6.7GB RSS from STEP_MS list + model state accumulation. Native compile path dodges this entirely, so priority is NOT to fix interpreter — priority is to finish L1+L2 so native is the default path.",
+          "expected_mfu_delta_pct": "N/A (native path supersedes)",
+          "unlocks": "permits 500-step convergence confirmation once native struct-literal codegen is fixed (agent #17)"
+        },
+        {
+          "id": "L6_struct_literal_codegen_fix",
+          "status": "BLOCKING FULL-BINARY NATIVE",
+          "desc": "hexa_v2 emit_struct_literal in no-arg constructors produces map-backed HexaVal that loses field names. Blocks train_clm_bin whole-binary native step measurement. Fix in self/codegen_c2.hexa emit_struct_literal. Agent #17 scope.",
+          "expected_mfu_delta_pct": "unblocks native path for full train_clm.hexa — expected 1-5 ms/step at tiny config per state_json",
+          "unlocks": "end-to-end train_step native measurement → replaces interpreter 1000 ms/step with ~2-5 ms/step (200-500x)"
+        },
+        {
+          "id": "L7_tile_cache_and_amx",
+          "status": "NOT STARTED",
+          "desc": "Apple M3 has AMX tile-matrix coprocessor accessible via Accelerate (already used by sgemm). For hand-rolled kernels (rmsnorm, softmax), tile sizing for 128-KiB L1 is the next gain. Marginal (<2x) vs L1-L4 combined.",
+          "expected_mfu_delta_pct": "+10-20% in compute-bound kernels",
+          "unlocks": "closure to 80% MFU"
+        }
+      ]
+    },
+
+    "h100_gpu_hexa": {
+      "hardware_peak_tflops": 989,
+      "hardware_peak_tflops_note": "bf16 SXM. fp32 = 67 TF/s (already 15x below bf16). Training uses bf16 master, so 989 is the right denominator.",
+      "ceiling_for_mfu_reference": 989,
+      "practical_80pct_ceiling_tflops": 791.2,
+
+      "measurements": [
+        {
+          "name": "CLM d64_fast (D=64 NL=4, interpreted pod binary, 0.82 s/step)",
+          "source_file": "anima/training/train_clm_gpu_v2.hexa",
+          "state_json": "shared/config/roadmaps/clm_hexa_gpu.json phase 4",
+          "ms_per_step": 820,
+          "flops_per_step": 906035712,
+          "achieved_gflops": 1.105,
+          "achieved_tflops": 0.001105,
+          "mfu_pct_vs_bf16_peak": 0.000112,
+          "distance_to_80pct_ceiling_x": 716000,
+          "dominant_bottleneck": "interpreter overhead on pod — pod hexa binary is stage0 interpreter, not self-native build. Phase 4 note confirms '~2s/step for D=256 — interpreter overhead is bottleneck'. GPU is idle ~99.99% of step wall time while interpreter marshals launch args.",
+          "notes": "D=64 config is also micro enough that cuBLAS launch overhead exceeds compute, so even with zero interpreter overhead MFU would be <1% at D=64 SEQ=512 B=1."
+        },
+        {
+          "name": "CLM d512 L12 (project_clm_hexa_gpu_plan memory config, 0.18-3 s/step observed)",
+          "source_file": "/workspace/clm_smoke/ on pod 8xmtaigu9i7b4x",
+          "state_json": "project_clm_hexa_gpu_plan memory note (2026-04-12)",
+          "ms_per_step_best": 180,
+          "ms_per_step_worst": 3000,
+          "flops_per_step": 155424387072,
+          "achieved_gflops_best": 863.5,
+          "achieved_tflops_best": 0.864,
+          "mfu_pct_best_vs_bf16_peak": 0.0873,
+          "achieved_tflops_worst": 0.0518,
+          "mfu_pct_worst_vs_bf16_peak": 0.00524,
+          "distance_to_80pct_ceiling_x_best": 916,
+          "distance_to_80pct_ceiling_x_worst": 15291,
+          "dominant_bottleneck": "BATCH=1 means tokens/step=512. A single 512x512x512 sgemm on H100 runs at ~200 TF/s, so pure compute bound = 0.78 ms — actual 180 ms is 230x slower → overhead is launch latency × layer count × step, cuBLAS/cuRTC compile, interpreter dispatch, and zero-opt optimizer pass.",
+          "notes": "This is our single best CLM GPU data point. 0.09% MFU best-case. The number is not terrible for this stage — it's a 1-batch pure-hexa FFI path through NVRTC-compiled kernels, and the kernel lane is hand-written naive. 100-1000x headroom available."
+        }
+      ],
+
+      "remaining_levers": [
+        {
+          "id": "L1_batch_size_up",
+          "status": "NOT STARTED",
+          "desc": "Current BATCH=1 means H100 sees tokens/step=512 (tiny). At BATCH=32 SEQ=512 tokens/step=16384 → 32x more flops/step at nearly the same wall time (launch-overhead amortized). Assuming interpreter dispatch stays the same, MFU goes from 0.09% → ~2-3% immediately.",
+          "expected_mfu_delta_pct_relative": "+30x",
+          "blocker": "activation memory at bf16 d=512 L=12 batch=32 seq=512 ≈ ~1.2 GB per layer × 12 = 14.4 GB — fits on H100 80GB with grad_accum=1. No blocker beyond code."
+        },
+        {
+          "id": "L2_interpreter_to_native_pod",
+          "status": "BLOCKED — pod still running stage0",
+          "desc": "Pod hexa binary is old stage0 interpreter. Native compile via hexa build → pod binary would cut per-step wall from ~180 ms → estimated ~10-30 ms (same speedup ratio as Mac 193x native-vs-interp if launch-latency doesn't bottom out first). MFU → ~1-5%.",
+          "expected_mfu_delta_pct_relative": "+5-20x",
+          "blocker": "requires L0_stage0_rebuild or copying mac native binary to pod (arch mismatch — mac is arm64, pod is x86_64, so must rebuild in pod)"
+        },
+        {
+          "id": "L3_custom_kernel_fusion",
+          "status": "STUBBED — clm_hexa_gpu phase 2 DONE",
+          "desc": "Phase 2 cuda_kernels.hexa shipped 12 custom kernels as separate NVRTC modules. Next level: fused QKV (one kernel 3 matmuls), fused SwiGLU+Down, fused backward passes. Each fusion saves 2-3 kernel launches + keeps intermediates in SMEM.",
+          "expected_mfu_delta_pct_relative": "+2-5x",
+          "unlocks": "closure to 10-20% MFU"
+        },
+        {
+          "id": "L4_cublas_tensor_core_bf16",
+          "status": "READY — cuBLAS extern already loaded",
+          "desc": "cublasSetMathMode(CUBLAS_TENSOR_OP_MATH) plus bf16 storage on activations — already in evolution_anchors level 6 of clm_hexa_gpu.json. Current path is fp32 sgemm (67 TF/s peak, 7%) not bf16 (989 TF/s peak).",
+          "expected_mfu_delta_pct_relative": "peak ceiling changes from 67 → 989 TF/s while kernels still deliver same absolute GF/s. Honest translation: delivered tflops unchanged, but fp32 MFU stats stop being misleading.",
+          "important": "This is a METRIC FIX not a speed fix. Need L1+L2 to reach meaningful bf16 utilization."
+        },
+        {
+          "id": "L5_flash_attn3_connect",
+          "status": "EXISTING — self/ml/flash_attn3.hexa",
+          "desc": "flash_attn3.hexa is already shipped in hexa-lang self/ml/. Not wired into gpu_train.hexa forward path yet. At D=512 seq=512 the attention step should drop from O(seq^2 d) to O(seq d + seq^2) in SMEM.",
+          "expected_mfu_delta_pct_relative": "+1.5-3x on attention, ~1.2x on full step",
+          "blocker": "wiring only, no dependency"
+        },
+        {
+          "id": "L6_multi_gpu_nccl",
+          "status": "PLANNED — evolution_anchors level 7",
+          "desc": "NCCL extern fn bindings → data parallel. 8x H100 pod would give near-linear speedup once L1-L5 land. Out of scope until per-pod MFU is >10%.",
+          "expected_mfu_delta_pct_relative": "N/A at this stage — would dilute current absolute flops to 8 GPUs, each at the same fraction. Do NOT pursue until per-GPU MFU is ≥20%."
+        }
+      ]
+    }
+  },
+
+  "summary": {
+    "best_measured_path_by_absolute_throughput": "H100 d512 best case (863 GF/s)",
+    "best_measured_path_by_mfu_pct": "Mac native phi_cache_loader spike (1.13% of 156.7 GF/s Accelerate ceiling)",
+    "worst_measured_path": "CLM real step interpreter (0.0002% of Mac BLAS ceiling = 425000x below 80% target)",
+    "ceiling_distance_x_current_best_mac_native_full_step": "3740x from 80% MFU — the 2.09ms microbench is start-dominated, not steady-state",
+    "ceiling_distance_x_current_best_h100_d512": "916x from 80% MFU at best-case 180ms/step",
+
+    "top_3_remaining_levers_cross_path": [
+      "1. Mac: Wire Tensor raw f32 primitive (already landed in commit 0c29a5c5) into training/nn_core.hexa matmul and then call acc_sgemm_raw via hxblas_wrapper.dylib. Expected +3000x on matmul-dominated CLM steps (removes O(N^2) list moat + unlocks 156.7 GF/s BLAS).",
+      "2. H100: Increase BATCH from 1 to 32 at D=512 L=12 (fits on 80GB, activation ~15GB). Immediate 30x MFU improvement with zero code beyond the batch-axis wiring in gpu_train.hexa forward_full.",
+      "3. Both paths: Land agent #17 hexa_v2 emit_struct_literal fix so train_clm.hexa whole-binary native compile runs. Unblocks end-to-end native measurement on Mac (1000 ms → ~2-5 ms/step, 200-500x) and (after rebuild) on pod.",
+      "(bonus 4). Agent #18 hexa_v2 FFI float/double fix removes the hxblas_wrapper.c shim and enables direct static extern cblas_sgemm / cublasSgemm_v2 — eliminates dlopen path + shim call indirection."
+    ],
+
+    "mfu_honesty_note": "All MFU numbers assume f32 peak for Mac (156.7 GF/s measured sgemm) and bf16 peak for H100 (989 TF/s spec). Using fp64 or bf16 ceilings for Mac or fp32 ceilings for H100 would change these absolute percentages but NOT the relative ordering. The qualitative answer is: both paths have 3-4 orders of magnitude of headroom, the Mac path has a clean list-of-6 lever sequence to get to 10-30% MFU, and the H100 path has a shorter 3-lever sequence (batch+native+fusion) to get to 10-20% MFU.",
+
+    "next_biggest_win": "Wire Tensor primitive + sgemm into nn_core.hexa. It's the only lever that is (a) already has all its dependencies landed, (b) 100% within reach without cross-repo coordination, and (c) compounds for every subsequent measurement. Conservative expected outcome: CLM train_step at d=64 drops from ~2 s/step interpreter → ~20 ms/step native+BLAS, MFU rises from 0.0002% to 1-3%."
+  },
+
+  "rules_honored": {
+    "R1_HEXA_FIRST": "Pure analysis — no new .py/.rs/.sh files. State JSON only.",
+    "L0_untouched": "No edits to anima/core/hub, laws, runtime.",
+    "no_training_launch": "Zero training processes started or touched.",
+    "no_pod_commands": "Zero ssh/pod commands. All H100 numbers read from memory + roadmap JSON.",
+    "honest_gaps": "Did not inflate ceiling distances. Where the microbench is start-dominated (seq=4 d=16), state says so explicitly. Where the d64_fast measurement is interpreter-bottlenecked, state says so explicitly.",
+    "worktree_isolation": "Agent works in agent-a8165f89 worktree branch (anima repo); this state file commits to nexus repo (where shared/ physically lives per reference_shared_layout)."
+  },
+
+  "artifacts": {
+    "state_json_self": "shared/state/clm_physical_ceiling_analysis_20260415.json",
+    "inputs_read": [
+      "shared/state/clm_flag_on_20260415.json",
+      "shared/state/clm_native_full_compile_20260415.json",
+      "shared/state/hexa_native_compile_spike_20260415.json",
+      "shared/state/hexa_native_accelerate_spike_20260415.json",
+      "shared/state/clm_track_b_speedup_20260415.json",
+      "shared/config/roadmaps/clm_hexa_gpu.json",
+      "training/train_clm.hexa",
+      "training/bench_train_step_native.hexa"
+    ],
+    "memory_refs": [
+      "project_clm_hexa_gpu_plan (2026-04-12)",
+      "reference_shared_layout",
+      "feedback_phi_gap",
+      "feedback_agent_worktree_merge_flow"
+    ]
+  }
+}
