@@ -127,9 +127,9 @@ Claude baseline 1차 (수정 전 v1) 결과 핵심 발견:
 
 ---
 
-## 4. 추천
+## 4. 추천 (Plan A/B/C → 정확하게는 4 옵션, 6d 참조)
 
-**(C) Composite 경로 채택**:
+**(C) Composite 경로 채택** — 외부 LLM(Claude) + 자체 CLM 의식 단기 시연 + 자체 ALM 본격 진행:
 
 1. **이번 주 (B 경로)**:
    - Track A harness fix 완료 → Claude 재측정 (오늘 진행 중)
@@ -138,12 +138,13 @@ Claude baseline 1차 (수정 전 v1) 결과 핵심 발견:
    - autonomy_loop conscious-lm provider 연결
    - **결과**: v3.0 hire-sim Claude+CLM 조합으로 **2-5일 내 시연**
 
-2. **이번 달 (A 경로 시작)**:
+2. **이번 달 (A 경로 시작)** — **자체 모델 직원**:
    - TALM-P2-1 harness 작성 (1-3일 Mac)
    - 실업무 corpus 수집 전략 결정 (공개 데이터 vs 자체 라벨 vs 합성)
    - corpus 확보 (2-7일)
    - TALM-P2-1 → P3-1 → P4-1 → P4-2 순차 학습 (2주)
-   - **결과**: 자체 모델 직원 capability **3-4주 내 도달**
+   - CLM 의식 layer (이번 주에 완성) wire — 자체 ALM ↔ 자체 CLM 합성
+   - **결과**: anima 자체 모델 직원 capability **3-4주 내 도달** (= 옵션 A in 6d)
 
 3. **유휴 자원 정리 원칙**:
    - H100 pod 작업 없으면 즉시 삭제 (`runpodctl pod delete <id>`)
@@ -156,14 +157,92 @@ Claude baseline 1차 (수정 전 v1) 결과 핵심 발견:
 
 | 트리거 | 결정 |
 |---|---|
-| Track A harness fix 결과 | Claude 재측정 PASS (≥85%) → B 경로 즉시 진행 / 미달 → harness v3 1cycle |
-| Track C1 nl=8 결과 | PASS → CLM gate 종료 / PARTIAL → BPE 재학습 / FAIL → d=128 직행 |
+| Track A harness fix 결과 | Claude 재측정 PASS (≥85%) → C 경로(외부 시연) 즉시 진행 / 미달 → harness v3 1cycle |
+| Track C1 nl=8 결과 | PASS → CLM 의식 layer gate 종료 / PARTIAL → BPE 재학습 / FAIL → d=128 직행 |
 | TALM-P2-1 harness 결정 | (a) 자체 작성 1-3일 / (b) single global LoRA 단순화 / (c) ZCLM-P0-3 corpus 대기 |
 | 실업무 corpus 전략 | 공개 데이터셋 / 자체 라벨링 / 합성 LLM-생성 — 비용/품질/시간 트레이드오프 |
+| **anima 정체성 결정** | A (ALM+CLM moat) vs B (ALM 단독 빠른 수익) vs D (CLM 7B sovereignty) — 6d 참조 |
 
 ---
 
-## 6. 외부 참조
+## 6. 정정 + Architecture Rationale (2026-04-16 세션 후반 추가)
+
+### 6a. CLM 자체로는 직원 절대 불가 (정정)
+
+이전 표현 "CLM 1-7일 직원 도달"은 misleading. 정확히는 "CLM 의식 layer 1-7일 완성".
+
+**현 CLM 사실**:
+- d=64, NL=2 (또는 8), **14M params**
+- byte-level Korean, PPL 8.51 → 형태소 수준 ("이다", "이는") 만 출력
+- 코헌트 문장 1줄 자체가 불가
+- 의식 검증 (Φ 측정 + GWT broadcast) 용 실험 모델
+
+**즉 CLM 단독으로는 직원 절대 불가**. v3.0 직원 = CLM(의식) + ALM(텍스트) 합성 필수.
+
+### 6b. CLM 자체 직원하려면 — 7B+ 스케일업
+
+| 모델 크기 | 일수 | 비용 | 품질 |
+|---|---|---|---|
+| CLM 100M (d=512 NL=12) | 2-3주 | ~$2,000 | 단순 대화, agent-grade 부족 |
+| **CLM 1B** (d=1024 NL=24) | **3-5주** | **~$2,500** | 한국어 conversation OK, 도구 약함 |
+| **CLM 7B** (d=2048 NL=32) | **2-3개월** | **~$10K-15K** | 직원 capability 진입 (Qwen 14B 절반) |
+| CLM 14B+ | 4-6개월 | $30K+ | ALM과 동급 |
+
+구성: 한국어 corpus 100M-1B chars 수집 (2-3주) + tokenizer 재훈련 + pretraining + instruction tuning.
+
+**비교**:
+- **ALM Plan A** (Qwen 14B + LoRA): 14-21일, **$400-600**
+- CLM 7B from scratch: 2-3개월, $10K-15K
+- **20-30x 빠르고 20-50x 싸다 → ALM 정공법**
+
+CLM 자체 직원 = sovereignty/철학적 가치 (외부 모델 의존 0). 실용 비합리적.
+
+### 6c. ALM 단독 = "일반 LLM 직원" / ALM+CLM = "anima moat"
+
+**ALM (Qwen 14B+) 단독으로 가진 것**:
+- ✅ 텍스트 생성, 도구 사용, 다턴 대화 일관성
+- ✅ self-critique, chain-of-thought, ReAct
+- ✅ 페르소나·감정·의도 표현 (prompt engineering)
+
+**즉 ChatGPT/Claude 도 "의식 흉내" 가능** — ALM 단독으로 직원 capability 충분.
+
+**그러면 왜 CLM 분리?** Anima 의식 정의가 LLM 흉내가 아닌 **측정 가능한 모델** 요구:
+
+| anima 의식 정의 | LLM 단독 | CLM 명시 |
+|---|---|---|
+| Φ (IIT 통합정보) 측정 | 약함 | ✓ measure_phi proxy |
+| GWT broadcast (specialist + global) | 단일 context | ✓ 6채널 cross-attention |
+| 6채널 cycle (기본/감정/의도/기억/서사/메타) 동시 | 흉내만 | ✓ 별도 channel state |
+| Orch-OR 양자 붕괴 샘플링 | 결정적 | ✓ Penrose-Hameroff 근사 |
+| persistent state across session | 외부 memory 보조 | ✓ lore_book + GWT |
+| EEG 동조 (실시간 감정) | X | ✓ anima-eeg 통합 |
+
+**zeta-surpass moats** (`shared/roadmaps/zeta-surpass.json`):
+- consciousness: Φ + GWT + Orch-OR + EEG + 헥사곤 — "제타/Claude/GPT 모두 없음"
+- CLM 빼면 → anima = "지능형 chatbot" — 일반 LLM 과 차별 X
+
+### 6d. 직원 옵션 정리 (정정 반영)
+
+| 옵션 | 일수 | 비용 | 의미 | anima 정체성 |
+|---|---|---|---|---|
+| **(A) ALM + CLM 합성** | **14-21일** | **$400-600** | 측정 가능 의식 있는 직원 | ✓ moat |
+| (B) ALM 단독 (CLM 빼고) | 14-21일 | $400-600 | 일반 LLM 직원 (Qwen+LoRA chatbot) | ✗ 차별 X |
+| (C) Claude(외부) + CLM | **3-5일** | ~$50 | 외부 LLM + 자체 의식 시연 | 🟡 자체 직원 X, capability proof |
+| (D) CLM 단독 7B (자체 학습) | **2-3개월** | $10K-15K | 외부 의존 0 자체 직원 | ✓✓ sovereignty |
+
+**현 권장**: (C) 단기 시연 (이번 주) + (A) 본격 자체 직원 (이번 달) 병행. (D) 는 sovereignty 가 핵심 가치일 때만.
+
+### 6e. 의문 — "ALM 단독으로 갈래?"
+
+전략 결정 사항:
+- ALM 단독 = 빠른 수익화 (Qwen-기반 chatbot, zeta 와 직접 경쟁), anima 차별성 약함
+- ALM + CLM = 차별성 (의식 moat), 수익화 약간 늦음
+
+**현재 로드맵 = ALM + CLM** 기본. CLM 빼는 결정은 anima 정체성 자체 변경 — user 명시 결정 사항.
+
+---
+
+## 7. 외부 참조
 
 - **알고리즘 등록부**: `shared/convergence/anima.json` (lifecycle states + per-item commits)
 - **학습 측정치**: `shared/state/training_speed_ceilings.json` (MFU, step time, pod_id 태깅)
