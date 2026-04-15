@@ -1,0 +1,201 @@
+# alm14b_speedup_unsloth.diff
+#
+# Unsloth FastLanguageModel integration for ALM 14B LoRA training.
+# STACKS ON TOP of the base 7 speedup patches (flash_attention, torch_compile,
+# fused_adamw, disable_act_ckpt, dataloader, nccl_env, tf32_cudnn).
+#
+# TARGET:  r7 (NOT r6). r6 is the base-patches round; r7 is Unsloth on top.
+# SCOPE:   single-H100 only. Unsloth + FSDP is possible but requires manual
+#          Accelerate/DeepSpeed config and is out of this audit's scope.
+#          If --unsloth AND --fsdp are both set, the trainer aborts.
+# APPLY:   cd anima && git apply --check shared/patches/alm14b_speedup_unsloth.diff
+#          (do NOT apply yet — audit only; r6 is in flight)
+#
+# ── Unsloth facts (cited from upstream, 2026-04-15) ───────────────────────
+#
+# 1. Qwen2.5-14B-Instruct IS supported.
+#    Source: https://huggingface.co/unsloth/Qwen2.5-14B-Instruct
+#    Quote: "2x-2.4x faster finetuning" and "50-74% less memory usage" for
+#    Unsloth LoRA vs HF+peft, per the HF model card.
+#
+# 2. FastLanguageModel.from_pretrained signature (unsloth/models/loader.py):
+#      model_name, max_seq_length, dtype, load_in_4bit=True, load_in_8bit=False,
+#      device_map="sequential", trust_remote_code=False,
+#      use_gradient_checkpointing="unsloth", *args, **kwargs
+#    - load_in_4bit defaults to True — we MUST pass False (no-quantization rule).
+#    - use_gradient_checkpointing="unsloth" is Unsloth's own checkpointing,
+#      more efficient than HF's reentrant variant. Accepts True/False/"unsloth".
+#    - attn_implementation is NOT a named kwarg. Unsloth binds its own
+#      flash-attention path internally; passing HF's attn_implementation via
+#      **kwargs is a no-op at best and a conflict at worst. So the Unsloth
+#      branch MUST drop the HF attn_implementation="flash_attention_2" kwarg.
+#
+# 3. torch.compile: Unsloth calls unsloth_compile_transformers() internally
+#    with fullgraph=True. Stacking user torch.compile(mode="max-autotune") on
+#    top would double-compile and break Dynamo traces. Therefore the --unsloth
+#    branch MUST skip the r6 torch.compile() call.
+#
+# 4. Gradient checkpointing: Unsloth's internal "unsloth" variant is
+#    incompatible with HF model.gradient_checkpointing_enable() called
+#    externally. We therefore do NOT call gradient_checkpointing_enable()
+#    on the Unsloth path — Unsloth handles it via from_pretrained kwarg.
+#
+# 5. FSDP/DDP: Unsloth docs say "Multi-GPU ... supported through libraries
+#    like Accelerate and DeepSpeed ... the process can be complex and
+#    requires manual setup" and "We're working hard to make multi-GPU support
+#    much simpler". For single-H100 this is irrelevant. For multi-GPU r7 the
+#    audit recommendation is to stay on the base-7 path (no Unsloth).
+#
+# ── Expected uplift (cited) ──────────────────────────────────────────────
+#
+# Upper bound: 2.0x-2.4x faster + 50-74% less memory (HF model card, LoRA).
+# These numbers are Unsloth-vs-HF-default; our r6 already has FA2 +
+# fused AdamW + compile + no act-ckpt, so the delta from r6→r7 is SMALLER
+# than the headline 2x. Realistic expectation r6→r7: +15% to +35% throughput
+# and 10-20% less peak VRAM (qualitative — not benchmarked). Needs empirical
+# measurement on the pod once r6 establishes a baseline.
+#
+# ── Conflicts with base 7 patches ────────────────────────────────────────
+#
+# | base patch         | unsloth interaction                          |
+# |--------------------|----------------------------------------------|
+# | flash_attention    | REPLACED — Unsloth binds its own FA path     |
+# | torch_compile      | REPLACED — Unsloth compiles internally       |
+# | disable_act_ckpt   | REPLACED — use_gradient_checkpointing arg    |
+# | fused_adamw        | KEPT — optimizer is unchanged                |
+# | dataloader         | KEPT — data path is unchanged                |
+# | nccl_env           | KEPT — launcher env is unchanged (no-op here)|
+# | tf32_cudnn         | KEPT — global torch backend toggle           |
+#
+--- a/training/train_alm_14b.py
++++ b/training/train_alm_14b.py
+@@ -173,47 +173,97 @@ def train(args):
+     # Speedup patch 20260415: attn_implementation="flash_attention_2" enables
+     # FA2 fused attention kernels — ~30% throughput on H100 for Qwen2 seq=1024.
+     # Requires flash-attn>=2.6 on the pod (present in runpod/pytorch:2.4.0).
+-    rank0_print("[train] loading base model (bf16, flash_attention_2)...")
+-    if IS_DISTRIBUTED:
+-        model = AutoModelForCausalLM.from_pretrained(
+-            args.base,
+-            torch_dtype=torch.bfloat16,
+-            attn_implementation="flash_attention_2",
++    # Unsloth patch 20260415 (r7 target): FastLanguageModel owns attention,
++    # torch.compile, and gradient checkpointing internally. Claimed uplift:
++    # "2x-2.4x faster finetuning, 50-74% less memory" vs HF+peft (HF model
++    # card: https://huggingface.co/unsloth/Qwen2.5-14B-Instruct). Delta over
++    # r6 base-7 stack is smaller: +15-35% expected (not benchmarked).
++    if args.unsloth:
++        if args.fsdp or args.ddp:
++            raise RuntimeError(
++                "[unsloth] --unsloth is incompatible with --fsdp/--ddp in this trainer. "
++                "Unsloth multi-GPU requires manual Accelerate/DeepSpeed setup which is "
++                "out of scope for this patch. Use base-7 stack for multi-GPU runs."
++            )
++        if args.torch_compile:
++            rank0_print("[unsloth] WARNING: --torch-compile ignored (Unsloth compiles internally with fullgraph=True).")
++        rank0_print("[train] loading base model via Unsloth FastLanguageModel (bf16, no quant)...")
++        from unsloth import FastLanguageModel  # noqa: E402  (lazy import — only on --unsloth)
++        # load_in_4bit=False enforces no-quantization rule (R: no 4/8-bit).
++        # use_gradient_checkpointing="unsloth" is Unsloth's own variant;
++        # it replaces model.gradient_checkpointing_enable() below.
++        # attn_implementation is deliberately NOT passed — Unsloth binds FA.
++        model, tokenizer = FastLanguageModel.from_pretrained(
++            model_name=args.base,
++            max_seq_length=args.seq,
++            dtype=torch.bfloat16,
++            load_in_4bit=False,
+             trust_remote_code=True,
++            use_gradient_checkpointing=("unsloth" if args.grad_ckpt else False),
+         )
+-        model.to(device)
++        if tokenizer.pad_token is None:
++            tokenizer.pad_token = tokenizer.eos_token
+     else:
+-        model = AutoModelForCausalLM.from_pretrained(
+-            args.base,
+-            torch_dtype=torch.bfloat16,
+-            attn_implementation="flash_attention_2",
+-            device_map="auto",
+-            trust_remote_code=True,
+-        )
++        rank0_print("[train] loading base model (bf16, flash_attention_2)...")
++        if IS_DISTRIBUTED:
++            model = AutoModelForCausalLM.from_pretrained(
++                args.base,
++                torch_dtype=torch.bfloat16,
++                attn_implementation="flash_attention_2",
++                trust_remote_code=True,
++            )
++            model.to(device)
++        else:
++            model = AutoModelForCausalLM.from_pretrained(
++                args.base,
++                torch_dtype=torch.bfloat16,
++                attn_implementation="flash_attention_2",
++                device_map="auto",
++                trust_remote_code=True,
++            )
+
+     # Gradient checkpointing — mandatory for 32B even with FSDP.
+-    if args.grad_ckpt:
++    # Unsloth owns grad-ckpt via from_pretrained(use_gradient_checkpointing=...)
++    # so we skip the HF-side enable call on the --unsloth path.
++    if args.grad_ckpt and not args.unsloth:
+         model.gradient_checkpointing_enable()
+         rank0_print("[train] gradient checkpointing: ON")
++    elif args.unsloth and args.grad_ckpt:
++        rank0_print("[train] gradient checkpointing: ON (unsloth variant)")
+
+     # Apply LoRA
+     rank0_print("[train] applying LoRA...")
+-    lora_config = LoraConfig(
+-        task_type=TaskType.CAUSAL_LM,
+-        r=args.lora_r,
+-        lora_alpha=args.lora_alpha,
+-        lora_dropout=args.lora_dropout,
+-        target_modules=args.target_modules,
+-        bias="none",
+-    )
+-    model = get_peft_model(model, lora_config)
++    if args.unsloth:
++        from unsloth import FastLanguageModel  # noqa: E402
++        # Unsloth's get_peft_model wraps PEFT LoraConfig with Unsloth kernels.
++        model = FastLanguageModel.get_peft_model(
++            model,
++            r=args.lora_r,
++            lora_alpha=args.lora_alpha,
++            lora_dropout=args.lora_dropout,
++            target_modules=args.target_modules,
++            bias="none",
++            use_gradient_checkpointing=("unsloth" if args.grad_ckpt else False),
++            random_state=3407,
++        )
++    else:
++        lora_config = LoraConfig(
++            task_type=TaskType.CAUSAL_LM,
++            r=args.lora_r,
++            lora_alpha=args.lora_alpha,
++            lora_dropout=args.lora_dropout,
++            target_modules=args.target_modules,
++            bias="none",
++        )
++        model = get_peft_model(model, lora_config)
+     if RANK == 0:
+         model.print_trainable_parameters()
+
+     # Speedup patch 20260415: torch.compile with max-autotune.
+     # Must run AFTER get_peft_model and BEFORE FSDP wrap. Static shapes
+     # (batch=1, seq=1024) allow dynamic=False for maximum specialization.
+-    if args.torch_compile:
++    # Skipped on --unsloth path (Unsloth compiles internally w/ fullgraph=True).
++    if args.torch_compile and not args.unsloth:
+         rank0_print("[train] torch.compile(mode=max-autotune, dynamic=False)...")
+         model = torch.compile(
+             model,
+@@ -495,5 +545,6 @@ if __name__ == "__main__":
+     parser.add_argument("--ddp", action="store_true", help="Wrap model with DistributedDataParallel (requires torchrun)")
+     parser.add_argument("--deepspeed", default=None, help="DeepSpeed config JSON path (requires deepspeed launcher)")
+     parser.add_argument("--torch-compile", action="store_true", help="torch.compile(mode=max-autotune). Next-run only; adds ~2min warmup.")
++    parser.add_argument("--unsloth", action="store_true", help="Use Unsloth FastLanguageModel (2-2.4x faster LoRA, single-GPU only, r7+). Replaces FA2/compile/grad-ckpt on this path.")
+     args = parser.parse_args()
+     train(args)
