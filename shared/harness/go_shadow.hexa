@@ -1,0 +1,606 @@
+// go_shadow.hexa — rmengine shadow-mode comparator for `go`/loop
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// PURPOSE
+//   기존 loop 엔진 결과와 rmengine (roadmap_engine.hexa) 의 dispatch 결과를
+//   병렬 shadow 실행하고, 다음 실행 노드(next task) 가 일치하는지 비교.
+//   읽기 전용 — loop 동작 불변, 결과를 shadow_log.jsonl 에 append.
+//
+// 알고리즘
+//   1) project 판별 (argv[0] 또는 cwd)
+//   2) loop 엔진 dry 실행 → ===NEXT_AFTER_BEGIN=== 블록에서 NEXT task id 추출
+//   3) roadmap_schema_adapter (v2→v1 flat) → 임시파일
+//   4) roadmap_engine --dispatch → JSON {ready:[...], in_progress:[...], ...}
+//   5) rmengine_next = in_progress[0] if any else ready[0] if any else ""
+//   6) diff = compare(loop_next_id, rmengine_next)
+//   7) append JSONL to shadow_log.jsonl
+//
+// 출력
+//   stdout: human-readable 1-line summary (project loop_next rmengine_next match=Y/N)
+//   file:   shared/harness/shadow_log.jsonl  (append-only)
+//
+// CLI
+//   hexa go_shadow.hexa <project>              단발 shadow 비교
+//   hexa go_shadow.hexa --project anima        명시 프로젝트
+//   hexa go_shadow.hexa --selftest             self-check (mock loop output)
+//   hexa go_shadow.hexa --tail [N]             최근 N 라인 shadow_log tail (default 10)
+//
+// exit: 0 compared OK (match or mismatch both) / 2 usage / 3 loop fail /
+//       4 adapter fail / 5 engine fail
+// ═══════════════════════════════════════════════════════════════════════════
+
+let HOME = env("HOME")
+let NEXUS_BASE = HOME + "/Dev/nexus"
+let HARNESS_DIR = NEXUS_BASE + "/shared/harness"
+let ROADMAPS_DIR = NEXUS_BASE + "/shared/roadmaps"
+let LOG_PATH = HARNESS_DIR + "/shadow_log.jsonl"
+let LOOP_BIN = HARNESS_DIR + "/loop"
+let ADAPTER = HARNESS_DIR + "/roadmap_schema_adapter.hexa"
+let ENGINE = HARNESS_DIR + "/roadmap_engine.hexa"
+
+let WHITELIST = ["nexus", "anima", "n6-architecture", "hexa-lang", "airgenome", "papers", "void"]
+
+// ── void-safe coercion ───────────────────────────────────────────────────
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _to_int0(s: string) -> i64 {
+    if s == "" { return 0 }
+    let first = s.split("\n")[0].trim()
+    if first == "" { return 0 }
+    return to_int(first)
+}
+
+fn now_unix() -> i64 {
+    return _to_int0(_str(exec("date +%s")).trim())  // @allow-bare-exec
+}
+
+fn ts_iso() -> string {
+    return _str(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()  // @allow-bare-exec
+}
+
+fn json_escape(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", " ")
+    r = r.replace("\r", " ")
+    r = r.replace("\t", " ")
+    return r
+}
+
+fn shq(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _contains_str(xs: [string], v: string) -> bool {
+    let mut i: i64 = 0
+    while i < xs.len() {
+        if _str(xs[i]) == v { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ── project detection ────────────────────────────────────────────────────
+fn detect_project() -> string {
+    let cwd = _str(exec("pwd")).trim()  // @allow-bare-exec
+    let parts = cwd.split("/")
+    let mut i: i64 = parts.len() - 1
+    while i >= 0 {
+        let p = _str(parts[i])
+        if _contains_str(WHITELIST, p) { return p }
+        i = i - 1
+    }
+    // git toplevel fallback
+    let top = _str(exec("git -C " + shq(cwd) + " rev-parse --show-toplevel 2>/dev/null")).trim()  // @allow-bare-exec
+    if top != "" {
+        let tparts = top.split("/")
+        if tparts.len() > 0 {
+            let bn = _str(tparts[tparts.len() - 1])
+            if _contains_str(WHITELIST, bn) { return bn }
+        }
+    }
+    return ""
+}
+
+// ── run loop dry and extract NEXT task id ────────────────────────────────
+struct LoopResult {
+    ok: bool,
+    project: string,
+    phase_id: string,
+    next_task_id: string,
+    next_track: string,
+    next_phase_id: string,
+    exhausted: bool,
+    raw_tail: string
+}
+
+fn _line_starts_with(line: string, prefix: string) -> bool {
+    let lt = line.trim()
+    if lt.len() < prefix.len() { return false }
+    return lt.substring(0, prefix.len()) == prefix
+}
+
+fn parse_loop_output(stdout: string) -> LoopResult {
+    let mut r = LoopResult {
+        ok: false, project: "", phase_id: "", next_task_id: "",
+        next_track: "", next_phase_id: "", exhausted: false, raw_tail: ""
+    }
+    if stdout.len() == 0 { return r }
+    let lines = stdout.split("\n")
+    let mut in_loop_block: bool = false
+    let mut in_next_block: bool = false
+    let mut i: i64 = 0
+    while i < lines.len() {
+        let line = _str(lines[i])
+        let lt = line.trim()
+        // Loop block markers
+        if lt.starts_with("===LOOP_BEGIN===") { in_loop_block = true; i = i + 1; continue }
+        if lt.starts_with("===LOOP_END===") { in_loop_block = false; i = i + 1; continue }
+        if lt.starts_with("===NEXT_AFTER_BEGIN===") { in_next_block = true; i = i + 1; continue }
+        if lt.starts_with("===NEXT_AFTER_END===") { in_next_block = false; i = i + 1; continue }
+        // LOOP BEGIN content
+        if in_loop_block {
+            if _line_starts_with(line, "PROJECT:") {
+                r.project = lt.substring(8, lt.len()).trim()
+            }
+            if _line_starts_with(line, "PHASE:") {
+                // "PHASE: P4 ..." — extract P-id
+                let body = lt.substring(6, lt.len()).trim()
+                let toks = body.split(" ")
+                if toks.len() > 0 { r.phase_id = _str(toks[0]) }
+            }
+        }
+        // NEXT AFTER block
+        if in_next_block {
+            if _line_starts_with(line, "EXHAUSTED:") {
+                let v = lt.substring(10, lt.len()).trim()
+                if v == "true" { r.exhausted = true }
+            }
+            if _line_starts_with(line, "NEXT:") {
+                // "NEXT: P4/ALM/ALM-P4-4  [in_progress]  32B 스케일..."
+                // skip if contains 'roadmap 전체 소진' — exhausted text.
+                let body = lt.substring(5, lt.len()).trim()
+                if body.index_of("전체 소진") >= 0 || r.exhausted {
+                    r.next_task_id = ""
+                } else {
+                    // split by space, first token = "P4/ALM/ALM-P4-4"
+                    let first_tok_end = body.index_of(" ")
+                    let ident = if first_tok_end < 0 { body } else { body.substring(0, first_tok_end) }
+                    let id_parts = ident.split("/")
+                    if id_parts.len() >= 3 {
+                        r.next_phase_id = _str(id_parts[0])
+                        r.next_track = _str(id_parts[1])
+                        r.next_task_id = _str(id_parts[2])
+                    } else {
+                        // best-effort: last '/'-segment
+                        r.next_task_id = _str(id_parts[id_parts.len() - 1])
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    // raw_tail: last 500 chars (debug)
+    if stdout.len() > 500 {
+        r.raw_tail = stdout.substring(stdout.len() - 500, stdout.len())
+    } else {
+        r.raw_tail = stdout
+    }
+    r.ok = (r.project != "") || (r.next_task_id != "") || r.exhausted
+    return r
+}
+
+fn run_loop_dry(project: string) -> LoopResult {
+    // $HOME/Dev/<project> 로 cd 후 loop dry
+    let proj_dir = HOME + "/Dev/" + project
+    if dir_exists(proj_dir) == false {
+        let mut r = LoopResult {
+            ok: false, project: project, phase_id: "", next_task_id: "",
+            next_track: "", next_phase_id: "", exhausted: false, raw_tail: "dir missing: " + proj_dir
+        }
+        return r
+    }
+    let cmd = "cd " + shq(proj_dir) + " && " + shq(LOOP_BIN) + " dry 2>&1"
+    let out = _str(exec(cmd))  // @allow-bare-exec
+    return parse_loop_output(out)
+}
+
+// ── run rmengine (adapter + engine) ──────────────────────────────────────
+struct EngineResult {
+    ok: bool,
+    project: string,
+    roadmap_path: string,
+    flat_path: string,
+    dispatch_json: string,
+    ready: [string],
+    in_progress: [string],
+    next_task_id: string,
+    nodes_total: i64,
+    error: string
+}
+
+// --- parse dispatch JSON for "ready" and "in_progress" string arrays ---
+// (continue fall-through 회피 — pitfall P4)
+fn _find_key_arr(body: string, key: string) -> [string] {
+    let k = "\"" + key + "\""
+    let mut out: [string] = []
+    let ki = body.index_of(k)
+    if ki < 0 { return out }
+    let mut i: i64 = ki + k.len()
+    // skip ws + ':' + ws
+    let mut scanning: bool = true
+    while scanning && i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == ":" { i = i + 1 }
+        else { scanning = false }
+    }
+    if i >= body.len() { return out }
+    if body.substring(i, i + 1) != "[" { return out }
+    i = i + 1
+    let mut done: bool = false
+    while done == false && i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == "]" {
+            done = true
+        } else if c == "\"" {
+            let start = i + 1
+            let mut j = start
+            let mut jdone: bool = false
+            while jdone == false && j < body.len() {
+                let cj = body.substring(j, j + 1)
+                if cj == "\\" { j = j + 2 }
+                else if cj == "\"" { jdone = true }
+                else { j = j + 1 }
+            }
+            if j < body.len() {
+                out = out.push(body.substring(start, j))
+                i = j + 1
+            } else {
+                done = true
+            }
+        } else {
+            i = i + 1
+        }
+    }
+    return out
+}
+
+fn run_rmengine(project: string) -> EngineResult {
+    let mut r = EngineResult {
+        ok: false, project: project, roadmap_path: "", flat_path: "",
+        dispatch_json: "", ready: [], in_progress: [], next_task_id: "",
+        nodes_total: 0, error: ""
+    }
+    let rm_path = ROADMAPS_DIR + "/" + project + ".json"
+    if file_exists(rm_path) == false {
+        r.error = "roadmap missing: " + rm_path
+        return r
+    }
+    r.roadmap_path = rm_path
+    // 임시 flat 파일
+    let ts = to_string(now_unix())
+    let pid = _str(exec("echo $$")).trim()  // @allow-bare-exec
+    let flat_path = "/tmp/rmshadow_" + project + "_" + ts + "_" + pid + ".json"
+    r.flat_path = flat_path
+    // adapter 호출
+    let adapter_cmd = "hexa " + shq(ADAPTER) + " to-flat " + shq(rm_path) + " --out=" + shq(flat_path) + " 2>&1"
+    let adapter_out = _str(exec(adapter_cmd))  // @allow-bare-exec
+    if file_exists(flat_path) == false {
+        r.error = "adapter fail: " + adapter_out.substring(0, if adapter_out.len() > 200 { 200 } else { adapter_out.len() })
+        return r
+    }
+    // 노드 수 = 간단히 grep count (정확치 않지만 추정). dispatch 에서 정확 수치 오면 덮어씀.
+    let nc_out = _str(exec("grep -c '\"id\"' " + shq(flat_path) + " 2>/dev/null")).trim()  // @allow-bare-exec
+    r.nodes_total = _to_int0(nc_out)
+    // 엔진 호출
+    let engine_cmd = "hexa " + shq(ENGINE) + " " + shq(flat_path) + " --dispatch 2>/dev/null"
+    let engine_out = _str(exec(engine_cmd)).trim()  // @allow-bare-exec
+    if engine_out.len() == 0 || engine_out.index_of("{") < 0 {
+        r.error = "engine fail: empty dispatch"
+        // cleanup
+        exec("rm -f " + shq(flat_path))  // @allow-bare-exec
+        return r
+    }
+    r.dispatch_json = engine_out
+    // dispatch JSON 에서 "ready" / "in_progress" 배열 추출
+    r.ready = _find_key_arr(engine_out, "ready")
+    r.in_progress = _find_key_arr(engine_out, "in_progress")
+    // next = in_progress[0] || ready[0]
+    if r.in_progress.len() > 0 {
+        r.next_task_id = _str(r.in_progress[0])
+    } else if r.ready.len() > 0 {
+        r.next_task_id = _str(r.ready[0])
+    } else {
+        r.next_task_id = ""
+    }
+    r.ok = true
+    // flat 파일 정리
+    exec("rm -f " + shq(flat_path))  // @allow-bare-exec
+    return r
+}
+
+// ── compare results ──────────────────────────────────────────────────────
+struct Diff {
+    is_match: bool,
+    reason: string,          // "exact" | "both_empty" | "loop_only" | "engine_only" | "different_id" | "loop_exhausted"
+    loop_next: string,
+    engine_next: string
+}
+
+fn compare_results(lr: LoopResult, er: EngineResult) -> Diff {
+    let ln = lr.next_task_id
+    let en = er.next_task_id
+    let mut d = Diff { is_match: false, reason: "unknown", loop_next: ln, engine_next: en }
+    if lr.exhausted && en == "" {
+        d.is_match = true
+        d.reason = "both_exhausted"
+        return d
+    }
+    if lr.exhausted {
+        d.reason = "loop_exhausted"
+        return d
+    }
+    if ln == "" && en == "" {
+        d.is_match = true
+        d.reason = "both_empty"
+        return d
+    }
+    if ln == "" {
+        d.reason = "engine_only"
+        return d
+    }
+    if en == "" {
+        d.reason = "loop_only"
+        return d
+    }
+    if ln == en {
+        d.is_match = true
+        d.reason = "exact"
+        return d
+    }
+    d.reason = "different_id"
+    return d
+}
+
+// ── append JSONL row ─────────────────────────────────────────────────────
+fn log_shadow(project: string, lr: LoopResult, er: EngineResult, d: Diff) -> bool {
+    let row = "{\"ts\":\"" + ts_iso() + "\","
+            + "\"ts_unix\":" + to_string(now_unix()) + ","
+            + "\"project\":\"" + json_escape(project) + "\","
+            + "\"loop_ok\":" + to_string(lr.ok) + ","
+            + "\"loop_phase\":\"" + json_escape(lr.phase_id) + "\","
+            + "\"loop_next\":\"" + json_escape(lr.next_task_id) + "\","
+            + "\"loop_next_track\":\"" + json_escape(lr.next_track) + "\","
+            + "\"loop_exhausted\":" + to_string(lr.exhausted) + ","
+            + "\"engine_ok\":" + to_string(er.ok) + ","
+            + "\"engine_next\":\"" + json_escape(er.next_task_id) + "\","
+            + "\"engine_ready_n\":" + to_string(er.ready.len()) + ","
+            + "\"engine_in_progress_n\":" + to_string(er.in_progress.len()) + ","
+            + "\"engine_nodes\":" + to_string(er.nodes_total) + ","
+            + "\"engine_error\":\"" + json_escape(er.error) + "\","
+            + "\"match\":" + to_string(d.is_match) + ","
+            + "\"divergence_reason\":\"" + json_escape(d.reason) + "\"}"
+    try {
+        append_file(LOG_PATH, row + "\n")
+        return true
+    } catch e {
+        eprintln("WARN: append_file failed: " + LOG_PATH)
+        return false
+    }
+}
+
+// ── selftest ─────────────────────────────────────────────────────────────
+fn _selftest_loop_stdout() -> string {
+    let mut s: string = ""
+    s = s + "===LOOP_BEGIN===anima:dry===\n"
+    s = s + "PROJECT: anima\n"
+    s = s + "PHASE: P4 some phase status=in_progress\n"
+    s = s + "TRACKS: ALM,CLM,PHYSICS\n"
+    s = s + "ROADMAP: /tmp/mock.json\n"
+    s = s + "DRY: true\n"
+    s = s + "===LOOP_END===\n"
+    s = s + "===NEXT_AFTER_BEGIN===anima===\n"
+    s = s + "NEXT: P4/ALM/ALM-P4-4  [in_progress]  32B some task\n"
+    s = s + "PHASE_NAME: v5 실증 통합\n"
+    s = s + "SOURCE: current_phase_remaining\n"
+    s = s + "EXHAUSTED: false\n"
+    s = s + "===NEXT_AFTER_END===\n"
+    return s
+}
+
+fn _selftest_exhausted_stdout() -> string {
+    let mut s: string = ""
+    s = s + "===LOOP_BEGIN===dummy:dry===\n"
+    s = s + "PROJECT: dummy\n"
+    s = s + "PHASE: P99 end status=done\n"
+    s = s + "===LOOP_END===\n"
+    s = s + "===NEXT_AFTER_BEGIN===dummy===\n"
+    s = s + "EXHAUSTED: true\n"
+    s = s + "NEXT: roadmap 전체 소진 — roadmap extend 로 NEXUS 창발 연장 권장\n"
+    s = s + "===NEXT_AFTER_END===\n"
+    return s
+}
+
+fn cmd_selftest() -> i64 {
+    let mut fails: i64 = 0
+    println("[selftest] go_shadow")
+    // 1. parse loop output (anima mock)
+    let lr1 = parse_loop_output(_selftest_loop_stdout())
+    if lr1.project != "anima" {
+        eprintln("FAIL: parse project expected=anima got=" + lr1.project)
+        fails = fails + 1
+    } else { println("  parse project=anima OK") }
+    if lr1.next_task_id != "ALM-P4-4" {
+        eprintln("FAIL: parse next_task_id expected=ALM-P4-4 got=" + lr1.next_task_id)
+        fails = fails + 1
+    } else { println("  parse next_task_id=ALM-P4-4 OK") }
+    if lr1.next_track != "ALM" {
+        eprintln("FAIL: parse next_track expected=ALM got=" + lr1.next_track)
+        fails = fails + 1
+    } else { println("  parse next_track=ALM OK") }
+    if lr1.phase_id != "P4" {
+        eprintln("FAIL: parse phase_id expected=P4 got=" + lr1.phase_id)
+        fails = fails + 1
+    } else { println("  parse phase_id=P4 OK") }
+
+    // 2. exhausted
+    let lr2 = parse_loop_output(_selftest_exhausted_stdout())
+    if lr2.exhausted == false {
+        eprintln("FAIL: exhausted parse expected=true got=false")
+        fails = fails + 1
+    } else { println("  parse exhausted=true OK") }
+    if lr2.next_task_id != "" {
+        eprintln("FAIL: exhausted next_task_id expected='' got=" + lr2.next_task_id)
+        fails = fails + 1
+    } else { println("  parse exhausted next='' OK") }
+
+    // 3. _find_key_arr
+    let mock_json = "{\"roadmap\":\"x\",\"ready\":[\"A\",\"B\"],\"in_progress\":[\"Z\"],\"other\":[]}"
+    let r_arr = _find_key_arr(mock_json, "ready")
+    if r_arr.len() != 2 {
+        eprintln("FAIL: _find_key_arr ready len expected=2 got=" + to_string(r_arr.len()))
+        fails = fails + 1
+    } else { println("  _find_key_arr ready=2 OK") }
+    let ip_arr = _find_key_arr(mock_json, "in_progress")
+    if ip_arr.len() != 1 {
+        eprintln("FAIL: _find_key_arr in_progress len expected=1 got=" + to_string(ip_arr.len()))
+        fails = fails + 1
+    } else { println("  _find_key_arr in_progress=1 OK") }
+
+    // 4. compare
+    let mut lr3 = LoopResult {
+        ok: true, project: "p", phase_id: "P1", next_task_id: "T1",
+        next_track: "A", next_phase_id: "P1", exhausted: false, raw_tail: ""
+    }
+    let mut er3 = EngineResult {
+        ok: true, project: "p", roadmap_path: "", flat_path: "",
+        dispatch_json: "", ready: [], in_progress: ["T1"], next_task_id: "T1",
+        nodes_total: 5, error: ""
+    }
+    let d_exact = compare_results(lr3, er3)
+    if d_exact.is_match == false || d_exact.reason != "exact" {
+        eprintln("FAIL: compare exact match missing (match=" + to_string(d_exact.is_match) + " reason=" + d_exact.reason + ")")
+        fails = fails + 1
+    } else { println("  compare exact match OK") }
+
+    er3.next_task_id = "T2"
+    let d_diff = compare_results(lr3, er3)
+    if d_diff.is_match || d_diff.reason != "different_id" {
+        eprintln("FAIL: compare different_id missing")
+        fails = fails + 1
+    } else { println("  compare different_id OK") }
+
+    lr3.exhausted = true
+    lr3.next_task_id = ""
+    er3.next_task_id = ""
+    let d_ex = compare_results(lr3, er3)
+    if d_ex.is_match == false || d_ex.reason != "both_exhausted" {
+        eprintln("FAIL: compare both_exhausted missing (reason=" + d_ex.reason + ")")
+        fails = fails + 1
+    } else { println("  compare both_exhausted OK") }
+
+    if fails == 0 { println("[selftest] PASS — 0 failures"); return 0 }
+    println("[selftest] FAIL — " + to_string(fails) + " failure(s)")
+    return 6
+}
+
+// ── tail shadow log ──────────────────────────────────────────────────────
+fn cmd_tail(n: i64) -> i64 {
+    if file_exists(LOG_PATH) == false {
+        println("(shadow_log.jsonl 없음 — 최초 실행 전)")
+        return 0
+    }
+    let nn = if n <= 0 { 10 } else { n }
+    let out = _str(exec("tail -n " + to_string(nn) + " " + shq(LOG_PATH)))  // @allow-bare-exec
+    print(out)
+    return 0
+}
+
+// ── CLI ──────────────────────────────────────────────────────────────────
+fn usage() {
+    eprintln("usage:")
+    eprintln("  hexa go_shadow.hexa <project>")
+    eprintln("  hexa go_shadow.hexa --project <name>")
+    eprintln("  hexa go_shadow.hexa --selftest")
+    eprintln("  hexa go_shadow.hexa --tail [N=10]")
+    exit(2)
+}
+
+fn cmd_shadow(project_arg: string) -> i64 {
+    let mut project = project_arg
+    if project == "" { project = detect_project() }
+    if project == "" {
+        eprintln("REJECT: project not detected (cwd 기반 자동감지 실패). --project=<name> 명시 필요.")
+        return 2
+    }
+    if _contains_str(WHITELIST, project) == false {
+        eprintln("REJECT: unknown project '" + project + "' (whitelist: nexus|anima|n6-architecture|hexa-lang|airgenome|papers|void)")
+        return 2
+    }
+
+    let lr = run_loop_dry(project)
+    if lr.ok == false && lr.raw_tail.index_of("dir missing") >= 0 {
+        eprintln("SKIP: " + lr.raw_tail)
+        return 3
+    }
+    let er = run_rmengine(project)
+    let d = compare_results(lr, er)
+    log_shadow(project, lr, er, d)
+
+    let match_str = if d.is_match { "Y" } else { "N" }
+    // human-readable 1-liner
+    println("[shadow] project=" + project
+        + "  loop_next=" + (if lr.next_task_id == "" { "(empty)" } else { lr.next_task_id })
+        + "  engine_next=" + (if er.next_task_id == "" { "(empty)" } else { er.next_task_id })
+        + "  match=" + match_str
+        + "  reason=" + d.reason)
+    if er.ok == false {
+        eprintln("[shadow] engine error: " + er.error)
+    }
+    return 0
+}
+
+fn main() {
+    let argv = args()
+    let mut a: [string] = []
+    let mut ai: i64 = 2
+    while ai < argv.len() {
+        a = a.push(_str(argv[ai]))
+        ai = ai + 1
+    }
+
+    if a.len() == 0 {
+        // no-arg: detect project + shadow
+        let rc = cmd_shadow("")
+        exit(rc)
+    }
+    let first = _str(a[0])
+    if first == "--selftest" || first == "selftest" {
+        exit(cmd_selftest())
+    }
+    if first == "--help" || first == "-h" || first == "help" { usage() }
+    if first == "--tail" {
+        let n = if a.len() >= 2 { _to_int0(_str(a[1])) } else { 10 }
+        exit(cmd_tail(n))
+    }
+    if first == "--project" {
+        if a.len() < 2 { usage() }
+        exit(cmd_shadow(_str(a[1])))
+    }
+    if first.starts_with("--") {
+        eprintln("WARN: unknown flag: " + first)
+        usage()
+    }
+    // positional project arg
+    exit(cmd_shadow(first))
+}
+
+main()
