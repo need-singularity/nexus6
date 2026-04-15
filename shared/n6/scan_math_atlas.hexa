@@ -1,600 +1,1153 @@
 // scan_math_atlas.hexa — 수학 아틀라스 — 가설 마크다운 파서
-// 목적: TECS-L, anima, SEDI 리포의 가설 마크다운 파일을 파싱하고
+// 목적: TECS-L (nexus 흡수), SEDI, anima 리포의 가설 마크다운 파일을 파싱하고
 //       구조화된 메타데이터를 추출 (id, title, grade, refs 등)
 // R1 HEXA-FIRST | R14 shared/ 단일진실
-// 실행: hexa shared/n6/scan_math_atlas.hexa [--json|--summary|--save|--query FIELD=VALUE|--repo NAME]
+// 실행: hexa run shared/n6/scan_math_atlas.hexa [--json|--summary|--save|--query FIELD=VALUE|--repo NAME]
+// ─── 2026-04-15 stage1 rewrite: 21개 missing API 제거, 병렬 list 패턴 적용 ───
 
-// ── 등급 이모지 (탐지 순서 중요) ──
-comptime const GRADE_EMOJIS = ["⭐", "🟩", "🟧", "🟦", "🟨", "🟥", "🟪", "⚪", "⬛", "★", "⚡", "✅"]
+let HOME = env("HOME")
+let NEXUS = HOME + "/Dev/nexus"
+let DEV = HOME + "/Dev"
+let OUT_DIR = NEXUS + "/shared/n6"
 
-// ── 리포 색상 ──
-comptime const REPO_COLORS = {
-    "TECS-L": "#4A90D9", "SEDI": "#E67E22", "anima": "#2ECC71",
-    "golden-moe": "#F1C40F", "conscious-lm": "#9B59B6",
-    "energy-efficiency": "#1ABC9C"
+// ═══ 등급 이모지 (탐지 순서 중요) ═══
+// parallel list (hashmap iterate stage1 pitfall 회피)
+let GRADE_EMOJIS = ["⭐", "🟩", "🟧", "🟦", "🟨", "🟥", "🟪", "⚪", "⬛", "★", "⚡", "✅"]
+
+// repo colors — parallel keys/vals
+let REPO_NAMES = ["TECS-L", "SEDI", "anima", "golden-moe", "conscious-lm", "energy-efficiency"]
+let REPO_COLORS = ["#4A90D9", "#E67E22", "#2ECC71", "#F1C40F", "#9B59B6", "#1ABC9C"]
+
+// ═══ void-safe / helper ═══
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
 }
 
-// ── 리포 스캔 설정 ──
-comptime const BASE = file_dir().parent().parent()  // TECS-L 루트
-comptime const DEV = BASE.parent()                   // ~/Dev
+fn _to_int0(s: string) -> i64 {
+    if s == "" { return 0 }
+    let first = _str(s.split("\n")[0]).trim()
+    if first == "" { return 0 }
+    return to_int(first)
+}
 
-comptime const REPO_SCANS = [
-    {
-        "name": "TECS-L", "root": BASE,
-        "hypothesis_dirs": ["docs/hypotheses", "math/docs/hypotheses"],
-        "constant_dirs": [".", "calc", "math"]
-    },
-    {
-        "name": "SEDI", "root": DEV + "/SEDI",
-        "hypothesis_dirs": ["docs/hypotheses"],
-        "constant_dirs": ["sedi", "sedi/sources"]
-    },
-    {
-        "name": "anima", "root": DEV + "/anima",
-        "hypothesis_dirs": [
-            "docs/hypotheses", "docs/hypotheses/cx", "docs/hypotheses/ce",
-            "docs/hypotheses/dd", "docs/hypotheses/dasein", "docs/hypotheses/evo",
-            "docs/hypotheses/genesis", "docs/hypotheses/hw", "docs/hypotheses/inf",
-            "docs/hypotheses/omega", "docs/hypotheses/onto", "docs/hypotheses/phil",
-            "docs/hypotheses/phys", "docs/hypotheses/se", "docs/hypotheses/sing",
-            "docs/hypotheses/sl", "docs/hypotheses/three", "docs/hypotheses/topo",
-            "docs/hypotheses/tp"
-        ],
-        "python_sources": ["hypothesis_recommender.py"],
-        "constant_dirs": ["."]
-    },
-    { "name": "golden-moe", "root": DEV + "/golden-moe", "hypothesis_dirs": [], "constant_dirs": ["."] },
-    { "name": "conscious-lm", "root": DEV + "/conscious-lm", "hypothesis_dirs": [], "constant_dirs": ["."] },
-    { "name": "energy-efficiency", "root": DEV + "/energy-efficiency", "hypothesis_dirs": [], "constant_dirs": [".", "techniques", "experiments"] }
-]
+fn _rfind(s: string, ch: string) -> i64 {
+    let n = len(s)
+    let mut i: i64 = n - 1
+    while i >= 0 {
+        if s.substring(i, i + 1) == ch { return i }
+        i = i - 1
+    }
+    return -1
+}
 
-// ═════════════════════════════════════════════════════════════
-// YAML 프론트매터 파싱
-// ═════════════════════════════════════════════════════════════
+fn _basename(path: string) -> string {
+    let slash = _rfind(path, "/")
+    if slash < 0 { return path }
+    return path.substring(slash + 1, len(path))
+}
 
-fn parse_yaml_frontmatter(text) {
-    let m = regex_match(r"^---\n(.*?)\n---", text, "s")
-    if m == nil { return {} }
-    let result = {}
-    for line in m[1].split("\n") {
-        let km = regex_match(r'^(\w[\w-]*):\s*"?([^"]*)"?\s*$', line.trim())
-        if km != nil { result[km[1]] = km[2].trim() }
+fn _stem(path: string) -> string {
+    let b = _basename(path)
+    let dot = _rfind(b, ".")
+    if dot < 0 { return b }
+    return b.substring(0, dot)
+}
+
+fn _color_for(repo: string) -> string {
+    let mut i: i64 = 0
+    while i < len(REPO_NAMES) {
+        if REPO_NAMES[i] == repo { return REPO_COLORS[i] }
+        i = i + 1
+    }
+    return "#999999"
+}
+
+// parallel list map get/set (hashmap iterate 우회용 보조, 단순 조회는 map[k] 유효)
+fn _idx_of(xs: [string], v: string) -> i64 {
+    let mut i: i64 = 0
+    while i < len(xs) {
+        if xs[i] == v { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn _now_iso() -> string {
+    return _str(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()
+}
+
+// json escape (strings)
+fn _jesc(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", "\\n")
+    r = r.replace("\r", "\\r")
+    r = r.replace("\t", "\\t")
+    return r
+}
+
+// sql single-quote escape
+fn _sql_esc(s: string) -> string {
+    return s.replace("'", "''")
+}
+
+// safe substring (clamps out-of-range)
+fn _sub(s: string, a: i64, b: i64) -> string {
+    let n = len(s)
+    let mut lo = a
+    let mut hi = b
+    if lo < 0 { lo = 0 }
+    if hi > n { hi = n }
+    if lo >= hi { return "" }
+    return s.substring(lo, hi)
+}
+
+// pad right with spaces
+fn _padr(s: string, w: i64) -> string {
+    let mut r = s
+    while len(r) < w { r = r + " " }
+    return r
+}
+
+fn _padl(s: string, w: i64) -> string {
+    let mut r = s
+    while len(r) < w { r = r + " " }
+    return r
+}
+
+// ═══ YAML 프론트매터 파싱 ═══
+// 포맷: 첫 3글자 "---" 그다음 줄 시작, 다음 "---" 줄 사이. key: value / key: "value"
+fn parse_yaml_frontmatter(text: string) -> [string] {
+    // return parallel [key1, val1, key2, val2, ...]
+    let mut out: [string] = []
+    if len(text) < 4 { return out }
+    if !text.starts_with("---") { return out }
+    // find next "---" starting from position 3
+    let rest = text.substring(3, len(text))
+    let end_idx = rest.index_of("\n---")
+    if end_idx < 0 { return out }
+    let block = rest.substring(0, end_idx)
+    let lines = block.split("\n")
+    let mut i: i64 = 0
+    while i < len(lines) {
+        let ln = _str(lines[i]).trim()
+        if len(ln) > 0 {
+            let colon = ln.index_of(":")
+            if colon > 0 {
+                let k = _str(ln.substring(0, colon)).trim()
+                let v_raw = _str(ln.substring(colon + 1, len(ln))).trim()
+                let mut v = v_raw
+                if len(v) >= 2 && v.starts_with("\"") && v.ends_with("\"") {
+                    v = v.substring(1, len(v) - 1)
+                }
+                out = out + [k, v]
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn yaml_get(yaml: [string], key: string) -> string {
+    let mut i: i64 = 0
+    while i + 1 < len(yaml) {
+        if yaml[i] == key { return yaml[i + 1] }
+        i = i + 2
+    }
+    return ""
+}
+
+// ═══ 등급 추출 ═══
+fn extract_emoji_run(text: string) -> string {
+    let mut result = ""
+    let mut i: i64 = 0
+    let mut started = false
+    let n = len(text)
+    while i < n {
+        let mut matched = false
+        let rest = text.substring(i, n)
+        let mut gi: i64 = 0
+        while gi < len(GRADE_EMOJIS) {
+            let emoji = GRADE_EMOJIS[gi]
+            if rest.starts_with(emoji) {
+                result = result + emoji
+                i = i + len(emoji)
+                matched = true
+                started = true
+                gi = 999
+            }
+            gi = gi + 1
+        }
+        if !matched {
+            if started { i = n }
+            else { i = i + 1 }
+        }
     }
     return result
 }
 
-// ═════════════════════════════════════════════════════════════
-// 등급 추출
-// ═════════════════════════════════════════════════════════════
-
-fn extract_emoji_run(text) {
-    // 텍스트에서 연속된 등급 이모지 추출
-    let result = []
-    let i = 0
-    let started = false
-    while i < text.len() {
-        let matched = false
-        for emoji in GRADE_EMOJIS {
-            if text.substring(i, text.len()).starts_with(emoji) {
-                result.push(emoji)
-                i = i + emoji.len()
-                matched = true
-                started = true
-                break
-            }
-        }
-        if not matched {
-            if started { break }
-            i = i + 1
-        }
+fn extract_grade(text: string, yaml: [string], title_line: string) -> string {
+    let yg = yaml_get(yaml, "grade")
+    if yg != "" { return yg }
+    // ## Grade: xxx
+    let idx = text.index_of("\n## Grade:")
+    if idx >= 0 {
+        let after = text.substring(idx + 10, len(text))
+        let nl = after.index_of("\n")
+        let mut line = after
+        if nl >= 0 { line = after.substring(0, nl) }
+        line = line.trim()
+        let e = extract_emoji_run(line)
+        if e != "" { return e }
+        if line != "" { return line }
     }
-    return if result.len() > 0 { result.join("") } else { nil }
-}
-
-fn extract_grade(text, yaml, title_line) {
-    // 등급 추출 (우선순위: YAML > ## Grade > **Grade:** > 제목 이모지)
-    if yaml.get("grade") != nil { return yaml["grade"] }
-
-    let m = regex_match(r"^##\s*Grade:\s*(.+)", text, "m")
-    if m != nil {
-        let emojis = extract_emoji_run(m[1].trim())
-        if emojis != nil { return emojis }
-        return m[1].trim()
+    // first line "## Grade:"
+    if text.starts_with("## Grade:") {
+        let nl = text.index_of("\n")
+        let mut line = text
+        if nl >= 0 { line = text.substring(0, nl) }
+        let v = _str(line.substring(9, len(line))).trim()
+        let e = extract_emoji_run(v)
+        if e != "" { return e }
+        if v != "" { return v }
     }
-
-    let m2 = regex_match(r'\*\*(?:Grade|Status):\s*(.+?)(?:\*\*|$)', text, "m")
-    if m2 != nil {
-        let emojis = extract_emoji_run(m2[1].trim())
-        if emojis != nil { return emojis }
-        return m2[1].trim()
+    // **Grade: ...** / **Status: ...**
+    let m_g = text.index_of("**Grade:")
+    if m_g >= 0 {
+        let after = text.substring(m_g + 8, len(text))
+        let end = after.index_of("**")
+        let mut inner = after
+        if end >= 0 { inner = after.substring(0, end) }
+        let v = inner.trim()
+        let e = extract_emoji_run(v)
+        if e != "" { return e }
+        if v != "" { return v }
     }
-
-    if title_line != nil {
-        let emojis = extract_emoji_run(title_line)
-        if emojis != nil { return emojis }
+    if title_line != "" {
+        let e = extract_emoji_run(title_line)
+        if e != "" { return e }
         if title_line.contains("✅") { return "✅" }
     }
-
-    return nil
+    return ""
 }
 
-// ═════════════════════════════════════════════════════════════
-// 참조 추출
-// ═════════════════════════════════════════════════════════════
-
-fn extract_refs(text) {
-    // 교차 참조 추출: 관련 가설 번호와 H-XX-NNN 패턴
-    let refs = []
-    let m = regex_match(r"[Rr]elated\s+hypothes[ei]s?:\s*(.+)", text)
-    if m != nil {
-        for num_match in regex_find_all(r"(\d{2,4})\s*\(", m[1]) {
-            refs.push(num_match[1])
+// ═══ refs 추출 ═══
+// H-XX-NNN 및 "Related hypothesis: 123 (title)" 숫자 리스트
+fn extract_refs(text: string) -> [string] {
+    let mut refs: [string] = []
+    // H-XX-NNN 패턴: 수동 스캔
+    let n = len(text)
+    let mut i: i64 = 0
+    while i < n - 3 {
+        if text.substring(i, i + 2) == "H-" {
+            // 2nd char uppercase letter (A-Z)
+            let mut j = i + 2
+            // letters
+            while j < n {
+                let c = text.substring(j, j + 1)
+                if c >= "A" && c <= "Z" { j = j + 1 }
+                else { j = 999999; }
+            }
+            if j >= 999999 {
+                // restore j via rescanning
+                j = i + 2
+                while j < n {
+                    let c = text.substring(j, j + 1)
+                    if c >= "A" && c <= "Z" { j = j + 1 }
+                    else { j = j; break }
+                }
+            }
+            if j < n && j > i + 2 && text.substring(j, j + 1) == "-" {
+                let mut k = j + 1
+                while k < n {
+                    let c = text.substring(k, k + 1)
+                    if c >= "0" && c <= "9" { k = k + 1 }
+                    else { k = k; break }
+                }
+                if k > j + 1 {
+                    let rid = text.substring(i, k)
+                    if _idx_of(refs, rid) < 0 { refs = refs + [rid] }
+                    i = k
+                    continue
+                }
+            }
         }
-    }
-    for m2 in regex_find_all(r"\(H-([A-Z]+)-(\d+)\)", text) {
-        refs.push("H-" + m2[1] + "-" + m2[2])
+        i = i + 1
     }
     return refs
 }
 
-fn extract_gz_dependency(text) {
-    // 황금지대 의존성 플래그 추출
-    let m = regex_match(r"\*\*Golden Zone dependency:\*\*\s*(.+)", text)
-    if m == nil { return nil }
-    let value = m[1].trim().upper()
-    if value.starts_with("NONE") or value.starts_with("NO") { return false }
-    if value.starts_with("YES") { return true }
-    return nil
+// ═══ 제목/ID 추출 (H-XX-NNN, Hypothesis NNN, Frontier NNN, YAML id) ═══
+fn parse_title_line(text: string) -> string {
+    // first "# " line
+    if text.starts_with("# ") {
+        let nl = text.index_of("\n")
+        if nl >= 0 { return _str(text.substring(2, nl)).trim() }
+        return _str(text.substring(2, len(text))).trim()
+    }
+    let idx = text.index_of("\n# ")
+    if idx >= 0 {
+        let after = text.substring(idx + 3, len(text))
+        let nl = after.index_of("\n")
+        if nl >= 0 { return _str(after.substring(0, nl)).trim() }
+        return _str(after).trim()
+    }
+    return ""
 }
 
-fn extract_domain(hid) {
-    // H-XX-NNN 스타일 ID에서 도메인 추출
-    let m = regex_match(r"H-([A-Z]+)-", hid)
-    if m != nil { return m[1] }
-    return nil
+fn extract_domain(hid: string) -> string {
+    // H-XX-... → XX
+    if !hid.starts_with("H-") { return "" }
+    let rest = hid.substring(2, len(hid))
+    let dash = rest.index_of("-")
+    if dash <= 0 { return "" }
+    return rest.substring(0, dash)
 }
 
-// ═════════════════════════════════════════════════════════════
-// 가설 마크다운 파싱
-// ═════════════════════════════════════════════════════════════
+fn _is_digit(c: string) -> bool {
+    return c >= "0" && c <= "9"
+}
 
-fn parse_hypothesis_md(text, repo, filepath) {
-    // 가설 마크다운 파일을 파싱하여 구조화된 메타데이터 반환
+// Best-effort H-XX-NNN extract from a title line (e.g. "# H-CX-042: ...")
+fn find_h_code(line: string) -> string {
+    let n = len(line)
+    let mut i: i64 = 0
+    while i + 4 < n {
+        if line.substring(i, i + 2) == "H-" {
+            let mut j = i + 2
+            while j < n {
+                let c = line.substring(j, j + 1)
+                if (c >= "A" && c <= "Z") { j = j + 1 }
+                else { j = j; break }
+            }
+            if j > i + 2 && j < n && line.substring(j, j + 1) == "-" {
+                let mut k = j + 1
+                while k < n && _is_digit(line.substring(k, k + 1)) { k = k + 1 }
+                if k > j + 1 { return line.substring(i, k) }
+            }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// "Hypothesis NNN:" or "Hypothesis Review NNN:" or "Frontier NNN:"
+fn find_numeric_hypo(line: string) -> [string] {
+    // return [id, title]
+    let mut out: [string] = []
+    let keys = ["Hypothesis Review ", "Hypothesis ", "Frontier "]
+    let prefixes = ["", "", "F-"]
+    let mut ki: i64 = 0
+    while ki < len(keys) {
+        let key = keys[ki]
+        let idx = line.index_of(key)
+        if idx >= 0 {
+            let after = line.substring(idx + len(key), len(line))
+            // read digits
+            let mut j: i64 = 0
+            while j < len(after) && _is_digit(after.substring(j, j + 1)) { j = j + 1 }
+            if j > 0 {
+                let num = after.substring(0, j)
+                let rest = after.substring(j, len(after))
+                let mut title = rest
+                if rest.starts_with(":") { title = _str(rest.substring(1, len(rest))).trim() }
+                out = out + [prefixes[ki] + num, title]
+                return out
+            }
+        }
+        ki = ki + 1
+    }
+    return out
+}
+
+// ═══ 가설 마크다운 파일 파싱 (반환 = [id, title, grade, domain, refs_csv, file]) ═══
+fn parse_hypothesis_md(text: string, repo: string, filepath: string) -> [string] {
     let yaml = parse_yaml_frontmatter(text)
-    let stem = path_stem(filepath)
+    let stem = _stem(filepath)
+    let title_line = parse_title_line(text)
 
-    let title_match = regex_match(r"^#\s+(.+)", text, "m")
-    let title_line = if title_match != nil { title_match[1].trim() } else { "" }
+    let mut hid = ""
+    let mut title = ""
+    let mut domain = ""
 
-    let hid = nil
-    let title = nil
-    let domain = nil
-
-    // 패턴 A: "Hypothesis Review NNN: Title"
-    let m = regex_match(r"Hypothesis\s+Review\s+(\d+):\s*(.*)", title_line)
-    if m != nil { hid = m[1]; title = m[2].trim() }
-
-    // 패턴 B: "Hypothesis NNN: Title"
-    if hid == nil {
-        let m2 = regex_match(r"Hypothesis\s+(\d+):\s*(.*)", title_line)
-        if m2 != nil { hid = m2[1]; title = m2[2].trim() }
-    }
-
-    // 패턴 C: "H-XX-NNN: Title"
-    if hid == nil {
-        let m3 = regex_match(r"(H-[A-Z]+-\d+):\s*(.*)", title_line)
-        if m3 != nil { hid = m3[1]; title = m3[2].trim(); domain = extract_domain(hid) }
-    }
-
-    // 패턴 E: "Frontier NNN: Title"
-    if hid == nil {
-        let m4 = regex_match(r"Frontier\s+(\d+):\s*(.*)", title_line)
-        if m4 != nil { hid = "F-" + m4[1]; title = m4[2].trim() }
-    }
-
-    // 패턴 D: YAML id 필드 (최우선)
-    if yaml.get("id") != nil {
-        hid = yaml["id"]
+    // YAML id 최우선
+    let y_id = yaml_get(yaml, "id")
+    if y_id != "" {
+        hid = y_id
         domain = extract_domain(hid)
-        if yaml.get("title") != nil { title = yaml["title"] }
+        let y_t = yaml_get(yaml, "title")
+        if y_t != "" { title = y_t }
     }
 
-    // 폴백
-    if hid == nil { hid = stem; title = if title_line.len() > 0 { title_line } else { stem } }
-    if title == nil { title = title_line }
+    // Hypothesis/Frontier 패턴
+    if hid == "" {
+        let h = find_numeric_hypo(title_line)
+        if len(h) >= 2 {
+            hid = h[0]
+            title = h[1]
+        }
+    }
+
+    // H-XX-NNN 패턴
+    if hid == "" {
+        let hc = find_h_code(title_line)
+        if hc != "" {
+            hid = hc
+            domain = extract_domain(hid)
+            // title: after "H-XX-NNN:" if present
+            let ci = title_line.index_of(hc)
+            let after = title_line.substring(ci + len(hc), len(title_line))
+            let mut t = after
+            if t.starts_with(":") { t = _str(t.substring(1, len(t))).trim() }
+            if t != "" { title = t }
+        }
+    }
+
+    // fallback
+    if hid == "" { hid = stem }
+    if title == "" {
+        if title_line != "" { title = title_line }
+        else { title = stem }
+    }
 
     let full_id = repo + ":" + hid
     let grade = extract_grade(text, yaml, title_line)
     let refs = extract_refs(text)
-    let gz_dependent = extract_gz_dependency(text)
-
-    return {
-        "id": full_id, "title": title, "repo": repo,
-        "domain": domain, "grade": grade, "refs": refs,
-        "gz_dependent": gz_dependent, "file": filepath
-    }
+    let refs_csv = refs.join(",")
+    return [full_id, title, grade, domain, refs_csv, filepath]
 }
 
-fn parse_anima_recommender(source) {
-    // anima의 HYPOTHESIS_DB 파이썬 소스에서 가설 항목 추출
-    let results = []
-    for m in regex_find_all(r"Hypothesis\(\s*(.*?)\s*\)", source, "s") {
-        let block = m[1]
-        let entry = {}
-        for field in ["code", "name", "category", "description"] {
-            let fm = regex_match(field + r'\s*=\s*"([^"]*)"', block)
-            if fm != nil { entry[field] = fm[1] }
-        }
-        let code = entry.get("code", "???")
-        results.push({
-            "id": "anima:" + code,
-            "title": entry.get("name", ""),
-            "code": code,
-            "category": entry.get("category"),
-            "description": entry.get("description"),
-            "grade": nil
-        })
-    }
-    return results
-}
-
-// ═════════════════════════════════════════════════════════════
-// 상수 분류
-// ═════════════════════════════════════════════════════════════
-
-fn categorize_constant(name, file_path) {
-    let upper = name.upper()
-    let fpath = file_path.lower()
-    if ["PSI", "CONSCIOUSNESS", "PHI_", "MIND", "WILL"].any(fn(k) { upper.contains(k) }) { return "consciousness" }
-    if ["consciousness", "anima_alive", "conscious"].any(fn(k) { fpath.contains(k) }) { return "consciousness" }
-    if ["ENGINE", "ARCH", "DECODER", "MODEL", "TOPOLOG"].any(fn(k) { upper.contains(k) }) { return "architecture" }
-    if upper.contains("TARGET") { return "targets" }
-    if ["PHYSICS", "PARTICLE", "MASS", "ZETA", "GAUGE", "STRING", "QUANTUM"].any(fn(k) { upper.contains(k) }) { return "physics" }
-    if ["CONSTANT", "POOL", "PERFECT_NUMBER", "FIBONACCI", "KISSING"].any(fn(k) { upper.contains(k) }) { return "constants" }
-    if upper.contains("DOMAIN") or upper.contains("CATEGOR") { return "domains" }
-    if upper.contains("MAGIC") or upper.contains("NUCLEAR") { return "nuclear" }
-    if ["EXPRESSION", "FORMULA", "IDENTITY"].any(fn(k) { upper.contains(k) }) { return "expressions" }
-    if ["OBSERVED", "EMPIRICAL", "BENCHMARK"].any(fn(k) { upper.contains(k) }) { return "observed" }
-    if ["PROFILE", "BRAIN", "EEG", "EMOTION", "GROWTH"].any(fn(k) { upper.contains(k) }) { return "neuroscience" }
-    if ["CLAIM", "VERIFY", "TEST", "SCAN", "GRADE"].any(fn(k) { upper.contains(k) }) { return "verification" }
-    if ["PRESET", "CONFIG", "PARAM", "SWEEP"].any(fn(k) { upper.contains(k) }) { return "config" }
-    return "other"
-}
-
-// ═════════════════════════════════════════════════════════════
-// 디렉토리 스캔
-// ═════════════════════════════════════════════════════════════
-
-fn scan_md_dir(repo_name, repo_root, rel_dir) {
-    // 디렉토리에서 *.md 파일을 스캔하고 각각을 가설로 파싱
-    let results = []
+// ═══ 디렉토리 스캔 — exec("ls") 경유 ═══
+// 반환: parallel list [id, title, grade, domain, refs_csv, file, repo] × N  (7-tuple)
+// 병렬 리스트는 이후 stride=7 인덱싱으로 처리
+fn scan_md_dir(repo: string, repo_root: string, rel_dir: string) -> [string] {
+    let mut out: [string] = []
     let dirpath = repo_root + "/" + rel_dir
-    if not dir_exists(dirpath) { return results }
-    for mdfile in glob(dirpath + "/*.md").sort() {
-        let name = path_basename(mdfile)
-        if name.starts_with(".") or name == "README.md" { continue }
-        let text = read_file(mdfile)
-        if text == nil { continue }
-        let filepath = mdfile.replace(repo_root + "/", "")
-        let h = parse_hypothesis_md(text, repo_name, filepath)
-        results.push(h)
+    if !dir_exists(dirpath) { return out }
+    // list *.md files (skip README, hidden, CLAUDE.md)
+    let raw = _str(exec("ls -1 '" + dirpath + "'/*.md 2>/dev/null"))
+    let lines = raw.split("\n")
+    let mut i: i64 = 0
+    while i < len(lines) {
+        let path = _str(lines[i]).trim()
+        i = i + 1
+        if path == "" { continue }
+        let name = _basename(path)
+        if name.starts_with(".") { continue }
+        if name == "README.md" || name == "CLAUDE.md" { continue }
+        // skip if file doesn't exist (defensive)
+        if !file_exists(path) { continue }
+        let text = _str(read_file(path))
+        if text == "" { continue }
+        // relative path: strip repo_root + "/"
+        let mut rel = path
+        let prefix = repo_root + "/"
+        if path.starts_with(prefix) { rel = path.substring(len(prefix), len(path)) }
+        let rec = parse_hypothesis_md(text, repo, rel)
+        // rec = [id, title, grade, domain, refs_csv, file]; append repo
+        out = out + rec + [repo]
     }
-    return results
+    return out
 }
 
-fn scan_anima_python(repo_root, source_file) {
-    // anima 파이썬 소스 파일 읽기 및 파싱
-    let fpath = repo_root + "/" + source_file
-    if not file_exists(fpath) { return [] }
-    let text = read_file(fpath)
-    if text == nil { return [] }
-    let entries = parse_anima_recommender(text)
-    let results = []
-    for e in entries {
-        results.push({
-            "id": e["id"], "title": e["title"], "repo": "anima",
-            "domain": e.get("category"), "grade": e.get("grade"),
-            "refs": [], "gz_dependent": nil, "file": source_file
-        })
-    }
-    return results
-}
+// ═══ 전체 repo 빌드 ═══
+// atlas 표현: parallel 7열 flat list + stats parallel (repo_names, counts) + generated ts
+fn build_atlas() -> [string] {
+    // records: flat stride 7 list (id, title, grade, domain, refs_csv, file, repo)
+    let mut records: [string] = []
 
-// ═════════════════════════════════════════════════════════════
-// 아틀라스 빌드
-// ═════════════════════════════════════════════════════════════
-
-fn build_atlas() {
-    // 모든 리포를 스캔하고 통합 아틀라스 구축
-    let all_hypotheses = []
-    let stats = {}
-
-    for repo_cfg in REPO_SCANS {
-        let name = repo_cfg["name"]
-        let root = repo_cfg["root"]
-        let repo_count = 0
-
-        // 마크다운 가설 디렉토리 스캔
-        for rel_dir in repo_cfg.get("hypothesis_dirs", []) {
-            let entries = scan_md_dir(name, root, rel_dir)
-            all_hypotheses = all_hypotheses + entries
-            repo_count = repo_count + entries.len()
-        }
-
-        // 파이썬 소스 스캔 (anima)
-        for src in repo_cfg.get("python_sources", []) {
-            let entries = scan_anima_python(root, src)
-            all_hypotheses = all_hypotheses + entries
-            repo_count = repo_count + entries.len()
-        }
-
-        stats[name] = repo_count
+    // ── TECS-L (nexus 흡수) ──
+    let tecs_root = NEXUS
+    let tecs_dirs = ["docs/hypotheses", "math/docs/hypotheses"]
+    let mut tecs_count: i64 = 0
+    let mut ti: i64 = 0
+    while ti < len(tecs_dirs) {
+        let rec = scan_md_dir("TECS-L", tecs_root, tecs_dirs[ti])
+        records = records + rec
+        tecs_count = tecs_count + len(rec) / 7
+        ti = ti + 1
     }
 
-    // ID 기준 중복 제거
-    let seen = set()
-    let unique = []
-    for h in all_hypotheses {
-        if not seen.contains(h["id"]) {
-            seen.add(h["id"])
-            unique.push(h)
-        }
+    // ── SEDI ──
+    let sedi_root = DEV + "/SEDI"
+    let mut sedi_count: i64 = 0
+    if dir_exists(sedi_root) {
+        let rec = scan_md_dir("SEDI", sedi_root, "docs/hypotheses")
+        records = records + rec
+        sedi_count = len(rec) / 7
     }
 
-    return {
-        "version": "1.1",
-        "generated": now_format("%Y-%m-%dT%H:%M:%S"),
-        "stats": stats,
-        "total": unique.len(),
-        "hypotheses": unique,
-        "constant_maps": [],
-        "constant_stats": {}
-    }
-}
-
-// ═════════════════════════════════════════════════════════════
-// 출력 함수 (SQLite, DOT, Markdown, HTML)
-// ═════════════════════════════════════════════════════════════
-
-fn write_sqlite(atlas, dbpath) {
-    // 아틀라스 데이터를 SQLite 데이터베이스에 쓰기
-    let sql_cmds = [
-        "DROP TABLE IF EXISTS hypotheses",
-        "DROP TABLE IF EXISTS edges",
-        "CREATE TABLE hypotheses (id TEXT PRIMARY KEY, repo TEXT, file TEXT, title TEXT, grade TEXT, domain TEXT, gz_dependent INTEGER, refs TEXT)",
-        "CREATE TABLE edges (source_id TEXT, target_id TEXT, relation TEXT)",
-        "CREATE INDEX idx_repo ON hypotheses(repo)",
-        "CREATE INDEX idx_grade ON hypotheses(grade)",
-        "CREATE INDEX idx_domain ON hypotheses(domain)"
+    // ── anima ──
+    let anima_root = DEV + "/anima"
+    let anima_dirs = [
+        "docs/hypotheses",
+        "docs/hypotheses/cx", "docs/hypotheses/ce", "docs/hypotheses/dd",
+        "docs/hypotheses/dasein", "docs/hypotheses/evo", "docs/hypotheses/genesis",
+        "docs/hypotheses/hw", "docs/hypotheses/inf", "docs/hypotheses/omega",
+        "docs/hypotheses/onto", "docs/hypotheses/phil", "docs/hypotheses/phys",
+        "docs/hypotheses/se", "docs/hypotheses/sing", "docs/hypotheses/sl",
+        "docs/hypotheses/three", "docs/hypotheses/topo", "docs/hypotheses/tp",
+        "docs/hypotheses/accel", "docs/hypotheses/h"
     ]
-    exec("sqlite3 " + dbpath + " '" + sql_cmds.join("; ") + "'")
-
-    // 가설 삽입
-    for h in atlas["hypotheses"] {
-        let gz = if h["gz_dependent"] == true { "1" } else if h["gz_dependent"] == false { "0" } else { "NULL" }
-        let refs_json = to_json(h["refs"])
-        let sql = "INSERT INTO hypotheses VALUES ('" + h["id"].replace("'", "''") + "', '" + h["repo"] + "', '" + (h["file"] or "").replace("'", "''") + "', '" + (h["title"] or "").replace("'", "''") + "', '" + (h["grade"] or "").replace("'", "''") + "', '" + (h["domain"] or "").replace("'", "''") + "', " + gz + ", '" + refs_json.replace("'", "''") + "')"
-        exec("sqlite3 " + dbpath + " \"" + sql + "\"")
+    let mut anima_count: i64 = 0
+    if dir_exists(anima_root) {
+        let mut ai: i64 = 0
+        while ai < len(anima_dirs) {
+            let rec = scan_md_dir("anima", anima_root, anima_dirs[ai])
+            records = records + rec
+            anima_count = anima_count + len(rec) / 7
+            ai = ai + 1
+        }
     }
 
-    // 엣지 빌드
-    let id_lookup = {}
-    for h in atlas["hypotheses"] {
-        let full_id = h["id"]
-        let short = if full_id.contains(":") { full_id.split(":")[1] } else { full_id }
-        if not id_lookup.has(short) { id_lookup[short] = full_id }
+    // ── de-dup by id (first wins) ──
+    let mut seen_ids: [string] = []
+    let mut uniq: [string] = []
+    let mut idx: i64 = 0
+    while idx + 6 < len(records) {
+        let id = records[idx]
+        if _idx_of(seen_ids, id) < 0 {
+            seen_ids = seen_ids + [id]
+            uniq = uniq + [records[idx], records[idx + 1], records[idx + 2],
+                           records[idx + 3], records[idx + 4], records[idx + 5],
+                           records[idx + 6]]
+        }
+        idx = idx + 7
     }
-    for h in atlas["hypotheses"] {
-        let source = h["id"]
-        for ref in h.get("refs", []) {
-            let target = id_lookup.get(ref)
-            if target != nil and target != source {
-                exec("sqlite3 " + dbpath + " \"INSERT INTO edges VALUES ('" + source.replace("'", "''") + "', '" + target.replace("'", "''") + "', 'ref')\"")
+
+    // stats encoded as flat list: [repo, count, repo, count, ...]
+    let mut stats: [string] = []
+    stats = stats + ["TECS-L", to_string(tecs_count)]
+    stats = stats + ["SEDI", to_string(sedi_count)]
+    stats = stats + ["anima", to_string(anima_count)]
+
+    // atlas = [generated, total, stats.len, <stats...>, records.len, <records...>]
+    // instead of nested — we return a flat encoding the callers know
+    let total = len(uniq) / 7
+    let mut out: [string] = []
+    out = out + [_now_iso(), to_string(total), to_string(len(stats))]
+    out = out + stats
+    out = out + [to_string(len(uniq))]
+    out = out + uniq
+    return out
+}
+
+// decode helpers over atlas flat list
+fn atlas_generated(atlas: [string]) -> string { return atlas[0] }
+fn atlas_total(atlas: [string]) -> i64 { return to_int(atlas[1]) }
+fn atlas_stats_count(atlas: [string]) -> i64 { return to_int(atlas[2]) }
+
+// returns stats as parallel [name, count, ...] starting at atlas[3]
+fn atlas_stats_slice(atlas: [string]) -> [string] {
+    let sc = atlas_stats_count(atlas)
+    let mut out: [string] = []
+    let mut i: i64 = 0
+    while i < sc {
+        out = out + [atlas[3 + i]]
+        i = i + 1
+    }
+    return out
+}
+
+fn atlas_records_offset(atlas: [string]) -> i64 {
+    return 3 + atlas_stats_count(atlas) + 1
+}
+
+fn atlas_records_len(atlas: [string]) -> i64 {
+    let off = 3 + atlas_stats_count(atlas)
+    return to_int(atlas[off])
+}
+
+// record accessors: record index k → field f (0..6)
+// 0=id, 1=title, 2=grade, 3=domain, 4=refs_csv, 5=file, 6=repo
+fn rec_field(atlas: [string], k: i64, f: i64) -> string {
+    let off = atlas_records_offset(atlas)
+    return atlas[off + k * 7 + f]
+}
+
+fn stats_get(atlas: [string], repo: string) -> i64 {
+    let sc = atlas_stats_count(atlas)
+    let mut i: i64 = 0
+    while i + 1 < sc {
+        if atlas[3 + i] == repo { return to_int(atlas[3 + i + 1]) }
+        i = i + 2
+    }
+    return 0
+}
+
+// ═══ 출력: SQLite ═══
+fn write_sqlite(atlas: [string], dbpath: string) {
+    exec("rm -f '" + dbpath + "'")
+    let schema_sql = "CREATE TABLE hypotheses (id TEXT PRIMARY KEY, repo TEXT, file TEXT, title TEXT, grade TEXT, domain TEXT, refs TEXT); CREATE TABLE edges (source_id TEXT, target_id TEXT, relation TEXT); CREATE INDEX idx_repo ON hypotheses(repo); CREATE INDEX idx_grade ON hypotheses(grade); CREATE INDEX idx_domain ON hypotheses(domain);"
+    exec("sqlite3 '" + dbpath + "' '" + schema_sql + "'")
+
+    let total = atlas_total(atlas)
+    // batch insert via temp .sql file
+    let sql_file = dbpath + ".load.sql"
+    let mut body = "BEGIN;\n"
+    let mut k: i64 = 0
+    while k < total {
+        let id = rec_field(atlas, k, 0)
+        let title = rec_field(atlas, k, 1)
+        let grade = rec_field(atlas, k, 2)
+        let domain = rec_field(atlas, k, 3)
+        let refs_csv = rec_field(atlas, k, 4)
+        let file = rec_field(atlas, k, 5)
+        let repo = rec_field(atlas, k, 6)
+        // refs JSON array
+        let mut refs_json = "[]"
+        if refs_csv != "" {
+            let parts = refs_csv.split(",")
+            let mut rj = "["
+            let mut ri: i64 = 0
+            while ri < len(parts) {
+                if ri > 0 { rj = rj + "," }
+                rj = rj + "\"" + _jesc(parts[ri]) + "\""
+                ri = ri + 1
+            }
+            rj = rj + "]"
+            refs_json = rj
+        }
+        body = body + "INSERT INTO hypotheses VALUES ('" + _sql_esc(id) + "','" + _sql_esc(repo) + "','" + _sql_esc(file) + "','" + _sql_esc(title) + "','" + _sql_esc(grade) + "','" + _sql_esc(domain) + "','" + _sql_esc(refs_json) + "');\n"
+        k = k + 1
+    }
+
+    // edges: for each record, each ref, resolve target
+    // id_lookup: parallel list (short_id → full_id)
+    let mut lk_short: [string] = []
+    let mut lk_full: [string] = []
+    let mut k2: i64 = 0
+    while k2 < total {
+        let full = rec_field(atlas, k2, 0)
+        let colon = full.index_of(":")
+        let mut short = full
+        if colon >= 0 { short = full.substring(colon + 1, len(full)) }
+        if _idx_of(lk_short, short) < 0 {
+            lk_short = lk_short + [short]
+            lk_full = lk_full + [full]
+        }
+        k2 = k2 + 1
+    }
+
+    let mut k3: i64 = 0
+    while k3 < total {
+        let src = rec_field(atlas, k3, 0)
+        let refs_csv = rec_field(atlas, k3, 4)
+        if refs_csv != "" {
+            let parts = refs_csv.split(",")
+            let mut ri: i64 = 0
+            while ri < len(parts) {
+                let r = parts[ri]
+                let ti = _idx_of(lk_short, r)
+                if ti >= 0 {
+                    let tgt = lk_full[ti]
+                    if tgt != src {
+                        body = body + "INSERT INTO edges VALUES ('" + _sql_esc(src) + "','" + _sql_esc(tgt) + "','ref');\n"
+                    }
+                }
+                ri = ri + 1
             }
         }
+        k3 = k3 + 1
     }
+    body = body + "COMMIT;\n"
+    write_file(sql_file, body)
+    exec("sqlite3 '" + dbpath + "' < '" + sql_file + "'")
+    exec("rm -f '" + sql_file + "'")
 }
 
-fn write_dot(atlas, dotpath) {
-    // 아틀라스 그래프를 Graphviz DOT 파일로 쓰기
-    let id_lookup = {}
-    let hyp_by_id = {}
-    for h in atlas["hypotheses"] {
-        let full_id = h["id"]
-        let short = if full_id.contains(":") { full_id.split(":")[1] } else { full_id }
-        if not id_lookup.has(short) { id_lookup[short] = full_id }
-        hyp_by_id[full_id] = h
+// ═══ 출력: DOT ═══
+fn write_dot(atlas: [string], dotpath: string) {
+    let total = atlas_total(atlas)
+    // build lookup short→full
+    let mut lk_short: [string] = []
+    let mut lk_full: [string] = []
+    let mut k: i64 = 0
+    while k < total {
+        let full = rec_field(atlas, k, 0)
+        let colon = full.index_of(":")
+        let mut short = full
+        if colon >= 0 { short = full.substring(colon + 1, len(full)) }
+        if _idx_of(lk_short, short) < 0 {
+            lk_short = lk_short + [short]
+            lk_full = lk_full + [full]
+        }
+        k = k + 1
     }
 
-    let edges = []
-    let connected = set()
-    for h in atlas["hypotheses"] {
-        let source = h["id"]
-        for ref in h.get("refs", []) {
-            let target = id_lookup.get(ref)
-            if target != nil and target != source {
-                edges.push((source, target))
-                connected.add(source)
-                connected.add(target)
+    // edges (parallel list)
+    let mut esrc: [string] = []
+    let mut etgt: [string] = []
+    let mut connected: [string] = []
+    let mut k2: i64 = 0
+    while k2 < total {
+        let src = rec_field(atlas, k2, 0)
+        let refs_csv = rec_field(atlas, k2, 4)
+        if refs_csv != "" {
+            let parts = refs_csv.split(",")
+            let mut ri: i64 = 0
+            while ri < len(parts) {
+                let r = parts[ri]
+                let ti = _idx_of(lk_short, r)
+                if ti >= 0 {
+                    let tgt = lk_full[ti]
+                    if tgt != src {
+                        esrc = esrc + [src]
+                        etgt = etgt + [tgt]
+                        if _idx_of(connected, src) < 0 { connected = connected + [src] }
+                        if _idx_of(connected, tgt) < 0 { connected = connected + [tgt] }
+                    }
+                }
+                ri = ri + 1
             }
         }
+        k2 = k2 + 1
     }
 
-    let lines = ["digraph math_atlas {", "  rankdir=LR;", "  node [style=filled];", ""]
-
-    for nid in connected.to_list().sort() {
-        let h = hyp_by_id.get(nid)
-        if h == nil { continue }
-        let safe = nid.replace(":", "_").replace("-", "_")
-        let color = REPO_COLORS.get(h["repo"], "#999999")
-        let label = if h["title"] != nil { h["title"].substring(0, 40).replace("\"", "\\\"") } else { nid }
-        lines.push("  " + safe + " [label=\"" + label + "\" fillcolor=\"" + color + "\"];")
-    }
-    lines.push("")
-
-    for (src, tgt) in edges {
-        let s_safe = src.replace(":", "_").replace("-", "_")
-        let t_safe = tgt.replace(":", "_").replace("-", "_")
-        lines.push("  " + s_safe + " -> " + t_safe + ";")
-    }
-    lines.push("}")
-
-    write_file(dotpath, lines.join("\n") + "\n")
-}
-
-fn write_markdown(atlas, mdpath) {
-    // 아틀라스를 읽기 쉬운 마크다운 문서로 쓰기
-    let lines = []
-    let total = atlas["total"]
-    let cm_count = atlas.get("constant_maps", []).len()
-    lines.push("# 수학 아틀라스")
-    lines.push("")
-    lines.push("> 자동 생성: " + atlas["generated"] + " | " + str(total) + " 가설 | " + str(cm_count) + " 상수 맵")
-    lines.push("")
-
-    // 요약 테이블
-    lines.push("## 요약")
-    lines.push("")
-    lines.push("| 리포 | 가설 | 상수 맵 |")
-    lines.push("|------|------|---------|")
-    for repo in ["TECS-L", "SEDI", "anima"] {
-        let h_count = atlas["stats"].get(repo, 0)
-        let c_count = atlas.get("constant_stats", {}).get(repo, 0)
-        lines.push("| " + repo + " | " + str(h_count) + " | " + str(c_count) + " |")
-    }
-    lines.push("")
-
-    // 리포별 가설
-    lines.push("## 가설")
-    lines.push("")
-    for repo in ["TECS-L", "SEDI", "anima"] {
-        let hyps = atlas["hypotheses"].filter(fn(h) { h["repo"] == repo })
-        lines.push("### " + repo + " (" + str(hyps.len()) + ")")
-        lines.push("")
-        lines.push("| # | ID | 제목 | 등급 | 도메인 |")
-        lines.push("|---|-----|------|------|--------|")
-        for i, h in hyps.enumerate() {
-            let hid = if h["id"].contains(":") { h["id"].split(":")[1] } else { h["id"] }
-            let title = (h.get("title") or "").substring(0, 60)
-            let grade = h.get("grade") or "-"
-            let domain = h.get("domain") or "-"
-            lines.push("| " + str(i + 1) + " | " + hid + " | " + title + " | " + grade + " | " + domain + " |")
+    let mut out = "digraph math_atlas {\n  rankdir=LR;\n  node [style=filled];\n\n"
+    // node decls for connected only
+    let mut ci: i64 = 0
+    while ci < len(connected) {
+        let nid = connected[ci]
+        // find record for label
+        let mut mk: i64 = 0
+        let mut title = nid
+        let mut repo = ""
+        while mk < total {
+            if rec_field(atlas, mk, 0) == nid {
+                title = rec_field(atlas, mk, 1)
+                repo = rec_field(atlas, mk, 6)
+                mk = total
+            }
+            mk = mk + 1
         }
-        lines.push("")
+        let safe = nid.replace(":", "_").replace("-", "_").replace(".", "_")
+        let color = _color_for(repo)
+        let mut label = title
+        if len(label) > 40 { label = label.substring(0, 40) }
+        label = label.replace("\"", "\\\"")
+        out = out + "  " + safe + " [label=\"" + label + "\" fillcolor=\"" + color + "\"];\n"
+        ci = ci + 1
     }
-
-    write_file(mdpath, lines.join("\n") + "\n")
+    out = out + "\n"
+    let mut ei: i64 = 0
+    while ei < len(esrc) {
+        let s_safe = esrc[ei].replace(":", "_").replace("-", "_").replace(".", "_")
+        let t_safe = etgt[ei].replace(":", "_").replace("-", "_").replace(".", "_")
+        out = out + "  " + s_safe + " -> " + t_safe + ";\n"
+        ei = ei + 1
+    }
+    out = out + "}\n"
+    write_file(dotpath, out)
 }
 
-// ═════════════════════════════════════════════════════════════
-// CLI 진입점
-// ═════════════════════════════════════════════════════════════
+// ═══ 출력: Markdown ═══
+fn write_markdown(atlas: [string], mdpath: string) {
+    let total = atlas_total(atlas)
+    let mut out = "# 수학 아틀라스\n\n"
+    out = out + "> 자동 생성: " + atlas_generated(atlas) + " | " + to_string(total) + " 가설\n\n"
+    out = out + "## 요약\n\n| 리포 | 가설 |\n|------|------|\n"
+    let repos = ["TECS-L", "SEDI", "anima"]
+    let mut ri: i64 = 0
+    while ri < len(repos) {
+        out = out + "| " + repos[ri] + " | " + to_string(stats_get(atlas, repos[ri])) + " |\n"
+        ri = ri + 1
+    }
+    out = out + "\n## 가설\n\n"
 
+    let mut ri2: i64 = 0
+    while ri2 < len(repos) {
+        let repo = repos[ri2]
+        // collect indices
+        let mut count: i64 = 0
+        let mut k: i64 = 0
+        while k < total {
+            if rec_field(atlas, k, 6) == repo { count = count + 1 }
+            k = k + 1
+        }
+        out = out + "### " + repo + " (" + to_string(count) + ")\n\n"
+        out = out + "| # | ID | 제목 | 등급 | 도메인 |\n|---|-----|------|------|--------|\n"
+        let mut n: i64 = 0
+        let mut k2: i64 = 0
+        while k2 < total {
+            if rec_field(atlas, k2, 6) == repo {
+                n = n + 1
+                let id = rec_field(atlas, k2, 0)
+                let colon = id.index_of(":")
+                let mut short = id
+                if colon >= 0 { short = id.substring(colon + 1, len(id)) }
+                let title = rec_field(atlas, k2, 1)
+                let mut tshort = title
+                if len(tshort) > 60 { tshort = tshort.substring(0, 60) }
+                tshort = tshort.replace("|", "\\|")
+                let grade = rec_field(atlas, k2, 2)
+                let domain = rec_field(atlas, k2, 3)
+                let g_cell = if grade == "" { "-" } else { grade }
+                let d_cell = if domain == "" { "-" } else { domain }
+                out = out + "| " + to_string(n) + " | " + short + " | " + tshort + " | " + g_cell + " | " + d_cell + " |\n"
+            }
+            k2 = k2 + 1
+        }
+        out = out + "\n"
+    }
+    write_file(mdpath, out)
+}
+
+// ═══ 출력: HTML ═══
+fn write_html(atlas: [string], htmlpath: string) {
+    let total = atlas_total(atlas)
+    let gen = atlas_generated(atlas)
+    let mut out = "<!DOCTYPE html>\n<html lang=\"ko\"><head>\n<meta charset=\"utf-8\">\n<title>Math Atlas</title>\n"
+    out = out + "<style>\n"
+    out = out + "body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;margin:2em;max-width:1400px;}\n"
+    out = out + "h1{border-bottom:2px solid #333;}\n"
+    out = out + "h2{margin-top:2em;border-bottom:1px solid #ccc;padding-bottom:4px;}\n"
+    out = out + "table{border-collapse:collapse;width:100%;margin-bottom:2em;}\n"
+    out = out + "th,td{border:1px solid #ddd;padding:6px 10px;text-align:left;vertical-align:top;}\n"
+    out = out + "th{background:#f4f4f4;}\n"
+    out = out + "tr:nth-child(even){background:#fafafa;}\n"
+    out = out + ".repo-TECS-L{color:#4A90D9;font-weight:600;}\n"
+    out = out + ".repo-SEDI{color:#E67E22;font-weight:600;}\n"
+    out = out + ".repo-anima{color:#2ECC71;font-weight:600;}\n"
+    out = out + ".grade{font-size:1.1em;}\n"
+    out = out + ".meta{color:#666;font-size:0.9em;}\n"
+    out = out + "code{background:#f0f0f0;padding:1px 4px;border-radius:3px;}\n"
+    out = out + "</style>\n</head>\n<body>\n"
+    out = out + "<h1>수학 아틀라스 (Math Atlas)</h1>\n"
+    out = out + "<p class=\"meta\">자동 생성: " + gen + " | 총 " + to_string(total) + " 가설 | 출처: TECS-L, SEDI, anima</p>\n"
+
+    // summary
+    out = out + "<h2>요약</h2>\n<table>\n<tr><th>리포</th><th>가설</th></tr>\n"
+    let repos = ["TECS-L", "SEDI", "anima"]
+    let mut ri: i64 = 0
+    while ri < len(repos) {
+        out = out + "<tr><td class=\"repo-" + repos[ri] + "\">" + repos[ri] + "</td><td>" + to_string(stats_get(atlas, repos[ri])) + "</td></tr>\n"
+        ri = ri + 1
+    }
+    out = out + "</table>\n"
+
+    // per-repo tables
+    let mut ri2: i64 = 0
+    while ri2 < len(repos) {
+        let repo = repos[ri2]
+        let mut count: i64 = 0
+        let mut kc: i64 = 0
+        while kc < total {
+            if rec_field(atlas, kc, 6) == repo { count = count + 1 }
+            kc = kc + 1
+        }
+        out = out + "<h2>" + repo + " <span class=\"meta\">(" + to_string(count) + ")</span></h2>\n"
+        out = out + "<table>\n<tr><th>#</th><th>ID</th><th>제목</th><th>등급</th><th>도메인</th><th>참조</th></tr>\n"
+        let mut n: i64 = 0
+        let mut k: i64 = 0
+        while k < total {
+            if rec_field(atlas, k, 6) == repo {
+                n = n + 1
+                let id = rec_field(atlas, k, 0)
+                let colon = id.index_of(":")
+                let mut short = id
+                if colon >= 0 { short = id.substring(colon + 1, len(id)) }
+                let title = rec_field(atlas, k, 1)
+                let grade = rec_field(atlas, k, 2)
+                let domain = rec_field(atlas, k, 3)
+                let refs_csv = rec_field(atlas, k, 4)
+                let file = rec_field(atlas, k, 5)
+                let g_cell = if grade == "" { "-" } else { grade }
+                let d_cell = if domain == "" { "-" } else { domain }
+                let r_cell = if refs_csv == "" { "-" } else { refs_csv }
+                out = out + "<tr>"
+                out = out + "<td>" + to_string(n) + "</td>"
+                out = out + "<td><code>" + short + "</code></td>"
+                out = out + "<td>" + title + "<br><span class=\"meta\">" + file + "</span></td>"
+                out = out + "<td class=\"grade\">" + g_cell + "</td>"
+                out = out + "<td>" + d_cell + "</td>"
+                out = out + "<td>" + r_cell + "</td>"
+                out = out + "</tr>\n"
+            }
+            k = k + 1
+        }
+        out = out + "</table>\n"
+        ri2 = ri2 + 1
+    }
+    out = out + "</body></html>\n"
+    write_file(htmlpath, out)
+}
+
+// ═══ 출력: JSON (--json 모드 + 저장 용도) ═══
+fn atlas_to_json(atlas: [string]) -> string {
+    let total = atlas_total(atlas)
+    let mut out = "{\n"
+    out = out + "  \"version\": \"1.2\",\n"
+    out = out + "  \"generated\": \"" + atlas_generated(atlas) + "\",\n"
+    out = out + "  \"total\": " + to_string(total) + ",\n"
+    out = out + "  \"stats\": {\n"
+    let repos = ["TECS-L", "SEDI", "anima"]
+    let mut ri: i64 = 0
+    while ri < len(repos) {
+        out = out + "    \"" + repos[ri] + "\": " + to_string(stats_get(atlas, repos[ri]))
+        if ri + 1 < len(repos) { out = out + "," }
+        out = out + "\n"
+        ri = ri + 1
+    }
+    out = out + "  },\n  \"hypotheses\": [\n"
+    let mut k: i64 = 0
+    while k < total {
+        let refs_csv = rec_field(atlas, k, 4)
+        let mut refs_json = "[]"
+        if refs_csv != "" {
+            let parts = refs_csv.split(",")
+            let mut rj = "["
+            let mut ri2: i64 = 0
+            while ri2 < len(parts) {
+                if ri2 > 0 { rj = rj + "," }
+                rj = rj + "\"" + _jesc(parts[ri2]) + "\""
+                ri2 = ri2 + 1
+            }
+            rj = rj + "]"
+            refs_json = rj
+        }
+        out = out + "    {"
+        out = out + "\"id\":\"" + _jesc(rec_field(atlas, k, 0)) + "\","
+        out = out + "\"repo\":\"" + _jesc(rec_field(atlas, k, 6)) + "\","
+        out = out + "\"file\":\"" + _jesc(rec_field(atlas, k, 5)) + "\","
+        out = out + "\"title\":\"" + _jesc(rec_field(atlas, k, 1)) + "\","
+        out = out + "\"grade\":\"" + _jesc(rec_field(atlas, k, 2)) + "\","
+        out = out + "\"domain\":\"" + _jesc(rec_field(atlas, k, 3)) + "\","
+        out = out + "\"refs\":" + refs_json
+        out = out + "}"
+        if k + 1 < total { out = out + "," }
+        out = out + "\n"
+        k = k + 1
+    }
+    out = out + "  ]\n}\n"
+    return out
+}
+
+// ═══ CLI 파싱 + main ═══
 fn main() {
-    let args = get_args()
-    let do_json = args.contains("--json")
-    let do_summary = args.contains("--summary")
-    let do_save = args.contains("--save")
-    let do_readme = args.contains("--readme-summary")
-    let repo_filter = nil
-    let query = nil
-
-    for i, arg in args.enumerate() {
-        if arg == "--repo" and i + 1 < args.len() { repo_filter = args[i + 1] }
-        if arg == "--query" and i + 1 < args.len() { query = args[i + 1] }
+    let a = args()
+    let n = len(a)
+    let mut do_json = false
+    let mut do_summary = false
+    let mut do_save = false
+    let mut repo_filter = ""
+    let mut query = ""
+    let mut i: i64 = 2
+    while i < n {
+        let tok = a[i]
+        if tok == "--json" { do_json = true }
+        else if tok == "--summary" { do_summary = true }
+        else if tok == "--save" { do_save = true }
+        else if tok == "--repo" && i + 1 < n { i = i + 1; repo_filter = a[i] }
+        else if tok == "--query" && i + 1 < n { i = i + 1; query = a[i] }
+        else if tok == "--help" || tok == "-h" {
+            println("usage: hexa run scan_math_atlas.hexa [--json|--summary|--save|--query FIELD=VALUE|--repo NAME]")
+            return
+        }
+        i = i + 1
     }
-
-    // 기본: --save --summary
-    if not do_json and not do_summary and not do_save and query == nil and not do_readme {
+    // default: --save --summary
+    if !do_json && !do_summary && !do_save && query == "" {
         do_save = true
         do_summary = true
     }
 
     let atlas = build_atlas()
+    let total = atlas_total(atlas)
 
-    // --repo 필터
-    if repo_filter != nil {
-        atlas["hypotheses"] = atlas["hypotheses"].filter(fn(h) { h["repo"] == repo_filter })
-        atlas["total"] = atlas["hypotheses"].len()
+    // --repo filter : 필터링된 레코드로 재구축
+    let mut eff_atlas = atlas
+    if repo_filter != "" {
+        let mut filtered: [string] = []
+        let mut k: i64 = 0
+        while k < total {
+            if rec_field(atlas, k, 6) == repo_filter {
+                let mut f: i64 = 0
+                while f < 7 {
+                    filtered = filtered + [rec_field(atlas, k, f)]
+                    f = f + 1
+                }
+            }
+            k = k + 1
+        }
+        let new_total = len(filtered) / 7
+        // rebuild atlas (keep stats block unchanged for summary display)
+        let mut rebuilt: [string] = [atlas[0], to_string(new_total), atlas[2]]
+        let sc = atlas_stats_count(atlas)
+        let mut si: i64 = 0
+        while si < sc { rebuilt = rebuilt + [atlas[3 + si]]; si = si + 1 }
+        rebuilt = rebuilt + [to_string(len(filtered))]
+        rebuilt = rebuilt + filtered
+        eff_atlas = rebuilt
     }
 
     // --json
     if do_json {
-        println(to_json(atlas, 2))
-        return
+        println(atlas_to_json(eff_atlas))
     }
 
     // --save
     if do_save {
-        let out_dir = file_dir()
-        let json_path = out_dir + "/math_atlas.json"
-        let db_path = out_dir + "/math_atlas.db"
-        let dot_path = out_dir + "/math_atlas.dot"
-        let md_path = out_dir + "/MATH_ATLAS.md"
+        let json_path = OUT_DIR + "/math_atlas.json"
+        let db_path = OUT_DIR + "/math_atlas.db"
+        let dot_path = OUT_DIR + "/math_atlas.dot"
+        let md_path = OUT_DIR + "/math_atlas.md"
+        let html_path = OUT_DIR + "/math_atlas.html"
 
-        write_json(json_path, atlas)
+        write_file(json_path, atlas_to_json(eff_atlas))
         println("  JSON: " + json_path)
 
-        write_sqlite(atlas, db_path)
+        write_sqlite(eff_atlas, db_path)
         println("  SQLite: " + db_path)
 
-        write_dot(atlas, dot_path)
+        write_dot(eff_atlas, dot_path)
         println("  DOT: " + dot_path)
 
-        write_markdown(atlas, md_path)
+        write_markdown(eff_atlas, md_path)
         println("  Markdown: " + md_path)
+
+        write_html(eff_atlas, html_path)
+        println("  HTML: " + html_path)
     }
 
     // --summary
     if do_summary {
-        println("\n=== 수학 아틀라스 요약 ===")
-        println("  총 가설: " + str(atlas["total"]))
-        println("  생성 시각: " + atlas.get("generated", "N/A"))
-        println()
+        println("")
+        println("=== 수학 아틀라스 요약 ===")
+        println("  총 가설: " + to_string(atlas_total(eff_atlas)))
+        println("  생성 시각: " + atlas_generated(eff_atlas))
+        println("")
         println("  리포별:")
-        for repo, count in atlas.get("stats", {}) {
-            println("    " + repo.pad_right(10) + " " + str(count).pad_left(5))
+        let sc = atlas_stats_count(eff_atlas)
+        let mut si: i64 = 0
+        while si + 1 < sc {
+            let rn = eff_atlas[3 + si]
+            let rc = eff_atlas[3 + si + 1]
+            println("    " + _padr(rn, 10) + " " + _padl(rc, 5))
+            si = si + 2
         }
-        println()
+        println("")
 
-        // 등급 분포
-        let grade_dist = {}
-        for h in atlas["hypotheses"] {
-            let g = h.get("grade") or "(none)"
-            let key = "(none)"
-            for emoji in GRADE_EMOJIS {
-                if g.contains(emoji) { key = emoji; break }
+        // 등급 분포 — parallel list
+        let mut g_keys: [string] = []
+        let mut g_vals: [i64] = []
+        let ntot = atlas_total(eff_atlas)
+        let mut k: i64 = 0
+        while k < ntot {
+            let g_raw = rec_field(eff_atlas, k, 2)
+            let mut key = "(none)"
+            if g_raw != "" {
+                // try to normalize to single grade emoji
+                let mut gi: i64 = 0
+                while gi < len(GRADE_EMOJIS) {
+                    if g_raw.contains(GRADE_EMOJIS[gi]) { key = GRADE_EMOJIS[gi]; gi = 999 }
+                    gi = gi + 1
+                }
+                if key == "(none)" {
+                    key = g_raw
+                    if len(key) > 6 { key = key.substring(0, 6) }
+                }
             }
-            if key == "(none)" and g != "(none)" { key = g.substring(0, 6) }
-            grade_dist[key] = grade_dist.get(key, 0) + 1
+            let idx = _idx_of(g_keys, key)
+            if idx < 0 {
+                g_keys = g_keys + [key]
+                g_vals = g_vals + [1]
+            } else {
+                // list index assignment is no-op — rebuild
+                let mut new_vals: [i64] = []
+                let mut j: i64 = 0
+                while j < len(g_vals) {
+                    if j == idx { new_vals = new_vals + [g_vals[j] + 1] }
+                    else { new_vals = new_vals + [g_vals[j]] }
+                    j = j + 1
+                }
+                g_vals = new_vals
+            }
+            k = k + 1
         }
-        println("  등급 분포 (상위 10):")
-        let sorted_grades = grade_dist.entries().sort_by(fn(a, b) { b.1 - a.1 }).slice(0, 10)
-        for (grade, count) in sorted_grades {
-            let bar = "#" * min(count / 5, 40)
-            println("    " + grade.pad_right(6) + " " + str(count).pad_left(5) + "  " + bar)
+        println("  등급 분포:")
+        // Selection sort for top 10 (desc by count) — simple, N small
+        let mut sorted_keys: [string] = []
+        let mut sorted_vals: [i64] = []
+        let mut used: [i64] = []
+        let mut round: i64 = 0
+        let top = if len(g_keys) < 10 { len(g_keys) } else { 10 }
+        while round < top {
+            let mut best: i64 = -1
+            let mut best_val: i64 = -1
+            let mut j: i64 = 0
+            while j < len(g_keys) {
+                if _idx_of(used, j) < 0 && g_vals[j] > best_val {
+                    best = j
+                    best_val = g_vals[j]
+                }
+                j = j + 1
+            }
+            if best < 0 { round = top }
+            else {
+                sorted_keys = sorted_keys + [g_keys[best]]
+                sorted_vals = sorted_vals + [g_vals[best]]
+                used = used + [best]
+                round = round + 1
+            }
+        }
+        let mut sk: i64 = 0
+        while sk < len(sorted_keys) {
+            let bar_w = if sorted_vals[sk] / 5 > 40 { 40 } else { sorted_vals[sk] / 5 }
+            let mut bar = ""
+            let mut bi: i64 = 0
+            while bi < bar_w { bar = bar + "#"; bi = bi + 1 }
+            println("    " + _padr(sorted_keys[sk], 8) + " " + _padl(to_string(sorted_vals[sk]), 5) + "  " + bar)
+            sk = sk + 1
         }
     }
 
     // --query FIELD=VALUE
-    if query != nil {
-        if not query.contains("=") {
+    if query != "" {
+        let eq = query.index_of("=")
+        if eq <= 0 {
             println("오류: --query는 FIELD=VALUE 형식이어야 합니다 (예: domain=CX)")
             return
         }
-        let (field, value) = query.split("=", 1)
-        let matches = atlas["hypotheses"].filter(fn(h) {
-            str(h.get(field, "")).lower().contains(value.lower())
-        })
-        println("\n  질의: " + field + "=" + value + " (" + str(matches.len()) + " 결과)")
-        for h in matches.slice(0, 30) {
-            let g = h.get("grade") or "-"
-            println("    " + g.pad_right(4) + " " + h["id"].pad_right(30) + " " + (h.get("title") or "").substring(0, 50))
+        let field = query.substring(0, eq).trim()
+        let value = query.substring(eq + 1, len(query)).trim().to_lower()
+        // field → column index
+        let cols = ["id", "title", "grade", "domain", "refs", "file", "repo"]
+        let col_idx = _idx_of(cols, field)
+        if col_idx < 0 {
+            println("오류: 알 수 없는 필드 '" + field + "' (id|title|grade|domain|refs|file|repo)")
+            return
         }
-        if matches.len() > 30 {
-            println("    ... 외 " + str(matches.len() - 30) + "건")
+        let mut matches_idx: [i64] = []
+        let ntot = atlas_total(eff_atlas)
+        let mut k: i64 = 0
+        while k < ntot {
+            let v = rec_field(eff_atlas, k, col_idx).to_lower()
+            if v.contains(value) { matches_idx = matches_idx + [k] }
+            k = k + 1
+        }
+        println("")
+        println("  질의: " + field + "=" + value + " (" + to_string(len(matches_idx)) + " 결과)")
+        let cap = if len(matches_idx) > 30 { 30 } else { len(matches_idx) }
+        let mut mi: i64 = 0
+        while mi < cap {
+            let k2 = matches_idx[mi]
+            let grade = rec_field(eff_atlas, k2, 2)
+            let g_cell = if grade == "" { "-" } else { grade }
+            let id = rec_field(eff_atlas, k2, 0)
+            let title = rec_field(eff_atlas, k2, 1)
+            let mut tshort = title
+            if len(tshort) > 50 { tshort = tshort.substring(0, 50) }
+            println("    " + _padr(g_cell, 4) + " " + _padr(id, 30) + " " + tshort)
+            mi = mi + 1
+        }
+        if len(matches_idx) > 30 {
+            println("    ... 외 " + to_string(len(matches_idx) - 30) + "건")
         }
     }
 }
 
-main()
+// stage1 자동으로 main() 호출 (explicit call 중복 실행 회피)
