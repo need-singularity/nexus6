@@ -1,0 +1,88 @@
+{
+  "timestamp": "2026-04-15",
+  "task": "Spike BLAS/OpenMP parallelization in hexa native C codegen path to accelerate CLM training matmul hot loops",
+  "verdict": "GO — wrapper shim path working; direct extern path blocked behind hexa_v2 FFI ABI fix",
+  "option_tried": "B (hybrid) — C wrapper stub exposing Hexa-FFI-shaped entry points, Hexa extern fn @link() calls into it",
+  "blas_feasible": true,
+  "blas_speedup_matmul": {
+    "128x128_f32": {"scalar_sec": 0.00122, "blas_sec": 0.000079, "speedup_vs_C_scalar_x": 15.2},
+    "256x256_f32": {"scalar_sec": 0.01227, "blas_sec": 0.000208, "speedup_vs_C_scalar_x": 59.0},
+    "512x512_f32": {"scalar_sec": 0.11487, "blas_sec": 0.001713, "speedup_vs_C_scalar_x": 67.1},
+    "vs_hexa_list_scalar_256x256": "~1457x (hexa array matmul was 0.358s vs BLAS 0.000246s — hexa lists add another 25x penalty over C-scalar from linked-list alloc churn)",
+    "baseline_type": "C-compiled -O3 triple-nested loop over raw f32 buffers (matches training/nn_core.hexa matmul math, minus hexa's list storage)"
+  },
+  "openmp_feasible": true,
+  "openmp_speedup_matmul": {
+    "128x128_f32": {"scalar_sec": 0.00122, "omp_sec": 0.000362, "speedup_vs_C_scalar_x": 3.3},
+    "256x256_f32": {"scalar_sec": 0.01227, "omp_sec": 0.003148, "speedup_vs_C_scalar_x": 3.9},
+    "512x512_f32": {"scalar_sec": 0.11487, "omp_sec": 0.028632, "speedup_vs_C_scalar_x": 4.0},
+    "impl_notes": "naive #pragma omp parallel for over outer loop, no cache tiling, no SIMD intrinsics — so plateau is bound by memory bandwidth, not compute. OpenBLAS is already multithreaded (already benefits from OMP internally) so the separate OMP kernel here is mainly a measurement control."
+  },
+  "integration_effort": {
+    "shim_c_file": "training/hxblas_wrapper.c (142 lines)",
+    "hexa_module": "training/accelerate_blas.hexa (120 lines — extern decls + array↔raw helpers)",
+    "hexa_bench": "training/accelerate_bench.hexa (100 lines — 3-way scalar/omp/blas comparison)",
+    "build_dylib_cmd": "clang -O3 -Xpreprocessor -fopenmp -I/opt/homebrew/opt/openblas/include -I/opt/homebrew/opt/libomp/include -L/opt/homebrew/opt/openblas/lib -L/opt/homebrew/opt/libomp/lib -dynamiclib training/hxblas_wrapper.c -o training/build/libhxblas.dylib -lopenblas -lomp",
+    "dylib_path": "training/build/libhxblas.dylib",
+    "dylib_links": "libopenblas.0.dylib, libomp.dylib, libSystem.B.dylib",
+    "total_loc_added": 362
+  },
+  "blockers_found": [
+    {
+      "id": "FFI_FLOAT_DOUBLE",
+      "severity": "medium",
+      "description": "Live hexa_v2 binary FFI emitter in self/codegen_c2.hexa gen2_ffi_c_type maps both Float and float to C 'double'. Direct @link extern fn cblas_sgemm(... alpha: Float ...) produces a typedef that hits cblas_sgemm with double alpha/beta in d0/d1, but the real signature takes C float in s0/s1 — silent ABI mismatch on ARM64. Confirmed: direct extern cblas_sdot returned 0, direct extern cblas_sgemm returned C[0]=0.",
+      "workaround": "C wrapper stub (hxblas_wrapper.c) presents ABI-compatible signatures (int64_t for ints/pointers, double for floats) and narrows to C float before calling real cblas_sgemm. Adds one function-call level of indirection, dwarfed by BLAS kernel time.",
+      "proper_fix_location": "self/codegen_c2.hexa lines 493-504 gen2_ffi_c_type / gen2_ffi_c_ret_type. Add explicit 'f32' type that maps to C 'float' separate from 'Float' which maps to double. Then rebuild hexa_v2 via stage0 → hexa_cc.hexa → self/native/hexa_v2. Out-of-scope for this spike (agent #18 owns hexa_v2 rebuild).",
+      "blocker_for": "direct zero-copy extern cblas_sgemm (no shim)"
+    },
+    {
+      "id": "PTR_OFFSET_IS_BYTE_NOT_ELEMENT",
+      "severity": "documentation",
+      "description": "hexa runtime hexa_ptr_write_f32(ptr, offset, val) uses offset as a BYTE offset, not element index. self/test_accelerate_ffi.hexa uses it as an element index (line 104: write_f32(buf, i, arr[i])) — that test would write 4-byte-wide values at byte offsets 0/1/2/3 and corrupt all but the first element. The test reports '(guarded)' for BLAS rows which effectively skips them on a fresh macOS host.",
+      "workaround": "accelerate_blas.hexa helpers multiply by 4 explicitly — write_f32(buf, i * 4, arr[i]).",
+      "proper_fix_location": "either rename runtime fn to ptr_write_f32_bytes, or add ptr_write_f32_elem(buf, i, val) that computes i*4 internally. Or fix test_accelerate_ffi.hexa to use byte offsets. Documented in training/accelerate_blas.hexa header."
+    },
+    {
+      "id": "HEXA_ARRAY_COPY_O_N2",
+      "severity": "major_architectural",
+      "description": "Hexa array (list) type is immutable linked-list-like. Appending via 'a = a + [x]' is O(N) per op, building an N-element list is O(N²). In nn_core.hexa matmul, every call allocates tensor_zeros(M*N) via this path — the scalar matmul spends >95%% of wall time in list construction, not FLOPs. At 128² a BLAS matmul takes 0.08ms but converting A/B hexa lists to raw f32 buffers and back takes 1000+ms — 12000× worse.",
+      "workaround": "Operate on raw f32 buffers end-to-end (alloc_raw / write_f32 / deref_f32). Never round-trip through hexa arrays in the inner loop.",
+      "proper_fix_location": "refactor training/nn_core.hexa so Tensor is a raw f32 buffer (opaque integer handle) rather than a hexa array. Matmul, add, layernorm, softmax, attention all rewritten to use raw buffer ops. High-impact architectural change — should be its own task. Not strictly blocking, but without it BLAS acceleration is hidden behind an O(N²) list-copy moat."
+    }
+  ],
+  "dynamic_vs_static_ffi": {
+    "current_path": "dynamic — hexa_v2 emits hexa_ffi_dlopen(@link_path) + hexa_ffi_dlsym at main entry, builds function-pointer typedef, calls through it. Works.",
+    "static_path_exists_but_unused": "self/codegen_c2.hexa gen2_static_ffi_block (lines 650-660) emits proper 'extern ret_type name(params);' declarations — but is NOT wired into the main codegen_c2() entry at line 32. Dead code only called from test_ffi_codegen.hexa. Wiring it would need compiler changes + rebuild.",
+    "static_path_upside": "eliminates dlopen/dlsym path at startup, enables link-time symbol resolution, lets clang inline small calls, and avoids the float→double typedef bug (since gen2_static_c_type at line 548 correctly maps f32→float).",
+    "verdict": "static FFI fix is the right long-term fix — both faster and correct. Dynamic shim is the short-term workaround."
+  },
+  "deliverables": {
+    "c_wrapper_shim": "training/hxblas_wrapper.c",
+    "hexa_module": "training/accelerate_blas.hexa",
+    "hexa_bench": "training/accelerate_bench.hexa",
+    "compiled_dylib_artifact": "training/build/libhxblas.dylib (34 KiB, rebuild on every host)",
+    "state_json": "shared/state/hexa_native_accelerate_spike_20260415.json"
+  },
+  "toolchain": {
+    "hexa_binary": "/Users/ghost/.hx/bin/hexa → /Users/ghost/Dev/hexa-lang/hexa.real",
+    "hexa_v2_compiler": "/Users/ghost/Dev/hexa-lang/self/native/hexa_v2 (2026-04-15 21:35 build, do not rebuild here — agent #18 scope)",
+    "openblas": "/opt/homebrew/opt/openblas (0.3.31) — already installed via Homebrew",
+    "libomp": "/opt/homebrew/opt/libomp (21.1.8 / 22.1.1) — already installed, pulled in by openblas",
+    "clang": "Apple clang 17.0.0, arm64-apple-darwin24.6.0 — requires -Xpreprocessor -fopenmp syntax, not -fopenmp"
+  },
+  "next_action": [
+    "Primary: Land this spike (commit wrapper + bench) so CLM hot paths have an immediate escape hatch. Rewrite training/nn_core.hexa matmul to check if a _USE_BLAS flag is set and delegate to acc_sgemm_raw for raw-buffer tensors. Gate behind a hexa constant so non-BLAS hosts still work via the existing scalar path.",
+    "Secondary: Track FFI_FLOAT_DOUBLE blocker in agent #18's hexa_v2 rebuild scope. Once the static FFI path is wired, migrate from @link('libhxblas.dylib') → @link('openblas') and drop the wrapper stub entirely. Expected time-to-resolve: one compile cycle after #18.",
+    "Major: Address HEXA_ARRAY_COPY_O_N2 — refactor nn_core.hexa Tensor type to raw f32 buffers. This is where the order-of-magnitude gains actually land. Without this step BLAS speedup stays hidden behind list-copy overhead on anything that talks to existing hexa-array code."
+  ],
+  "rules_honored": {
+    "R1_HEXA_FIRST": "all new hexa files .hexa; only wrapper is .c (intentional FFI bridge, not a tool)",
+    "L0_untouched": "anima/core/hub, laws, runtime/anima_runtime unchanged",
+    "no_hexa_v2_rebuild": "did not modify self/codegen_c2.hexa or rebuild hexa_v2 — agent #18 scope",
+    "no_training_disruption": "spike runs in isolated worktree agent-a0d9cb44, no training processes touched",
+    "no_new_system_packages": "used pre-existing openblas + libomp from Homebrew",
+    "worktree_isolation": "all work in .claude/worktrees/agent-a0d9cb44, no main branch leak",
+    "R7_no_py_rs_sh": "only .hexa + .c files written (hook compliance)"
+  }
+}

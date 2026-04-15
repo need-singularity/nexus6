@@ -1,0 +1,94 @@
+// autocorr_analyzer.hexa — lag autocorrelation of byte stream
+//
+// Given a JSONL log with {byte: int} entries, compute normalised
+// autocorrelation at lags 1..L (default L=32 for short streams, 1024 for
+// long). Output numeric table + ASCII heatmap.
+//
+// Null hypothesis: bytes are i.i.d. uniform(0..255) → autocorr ~ 0 + N(0,
+// 1/sqrt(N)). Any |ρ(k)| > 3/sqrt(N) at a lag k is suspicious.
+//
+// Usage:  hexa autocorr_analyzer.hexa <log_path> [max_lag] [out_json]
+
+let _args = args()
+if _args.len() < 3 {
+    println("usage: autocorr_analyzer.hexa <log_path> [max_lag] [out_json]")
+    exit(1)
+}
+
+let log_path = _args[2]
+let mut max_lag: i64 = 32
+if _args.len() >= 4 { try { max_lag = to_int(_args[3]) } catch e { max_lag = 32 } }
+let mut out_json: string = ""
+if _args.len() >= 5 { out_json = _args[4] }
+
+if max_lag < 1 { max_lag = 1 }
+
+// Delegate numeric heavy lifting to python one-liner
+let py = "/usr/bin/python3 -c \"\nimport json, math, sys\np='" + log_path + "'\nL=" + to_string(max_lag) + "\nxs=[]\nfor l in open(p):\n    l=l.strip()\n    if not l or not l.startswith('{'): continue\n    try:\n        r=json.loads(l)\n    except:\n        continue\n    b=r.get('byte',None)\n    if b is None or b<0 or b>255: continue\n    xs.append(int(b))\nn=len(xs)\nif n < 5:\n    print(json.dumps({'error':'too_few','n':n})); raise SystemExit\nL=min(L, n-1)\nmu=sum(xs)/n\nvar=sum((x-mu)**2 for x in xs)/n\nif var == 0:\n    print(json.dumps({'error':'zero_var','n':n})); raise SystemExit\ndef ac(k):\n    s=0.0\n    for i in range(n-k):\n        s += (xs[i]-mu)*(xs[i+k]-mu)\n    return (s/(n-k))/var\nrows=[]\nfor k in range(1, L+1):\n    r=ac(k)\n    rows.append((k, round(r,5)))\nsigma = 1.0/math.sqrt(max(n,2))\nsig3 = 3*sigma\nflagged=[k for k,r in rows if abs(r) > sig3]\nmax_abs=max(rows, key=lambda x: abs(x[1])) if rows else (0,0)\n# simple distribution check: byte mean vs 127.5, std vs sqrt((256**2-1)/12)=~73.9\nstd_emp=math.sqrt(var)\nrep={'n':n,'max_lag':L,'mean':round(mu,2),'std':round(std_emp,2),\n     'sigma_3_bound':round(sig3,5),\n     'rows':[list(r) for r in rows],\n     'flagged_lags':flagged,\n     'max_abs_lag':max_abs[0],'max_abs_rho':max_abs[1],\n     'verdict_iid': (len(flagged)==0)}\nprint(json.dumps(rep))\n\"\n"
+
+let mut raw = ""
+try { raw = to_string(exec(py)) } catch e { raw = "{\"error\":\"py_fail\"}" }
+raw = raw.trim()
+
+// Persist JSON if requested
+if out_json.len() > 0 {
+    try { write_file(out_json, raw + "\n") } catch e {}
+}
+
+// ASCII heatmap — parse rows via simple split
+// parse [[k,r],[k,r],...] (numeric)
+println("=== autocorr report ===")
+println(raw)
+println("")
+
+// Extract rows segment heuristically for ASCII plot
+// python's json.dumps uses ', ' and ': ' → match both
+let mut rpos1 = raw.split("\"rows\": [[")
+if rpos1.len() < 2 { rpos1 = raw.split("\"rows\":[[") }
+if rpos1.len() < 2 {
+    println("[plot] no rows parseable")
+    exit(0)
+}
+let after = rpos1[1]
+let mut rpos2 = after.split("]], \"flagged_lags\"")
+if rpos2.len() < 1 { rpos2 = after.split("]],\"flagged_lags\"") }
+if rpos2.len() < 1 {
+    println("[plot] malformed rows")
+    exit(0)
+}
+let inside = rpos2[0]  // "k, r], [k, r], ..., [k, r"
+let mut pairs = inside.split("], [")
+if pairs.len() < 2 { pairs = inside.split("],[") }
+
+println("== ASCII |rho| heatmap (each # = 0.01, cap 40) ==")
+let mut j: i64 = 0
+while j < pairs.len() {
+    let p = pairs[j]
+    // python dumps "[k, r]" with a space, split by ", " first
+    let mut kv = p.split(", ")
+    if kv.len() < 2 { kv = p.split(",") }
+    if kv.len() >= 2 {
+        let mut k = 0
+        let mut rho_str = ""
+        try { k = to_int(kv[0].trim()) } catch e { k = 0 }
+        rho_str = kv[1].trim()
+        // absolute value handling — remove leading '-'
+        let mut mag_str = rho_str
+        if mag_str.len() > 0 && mag_str.substring(0, 1) == "-" {
+            mag_str = mag_str.substring(1, mag_str.len())
+        }
+        // parse float via python roundtrip (hexa-lang no native float parse from decimal)
+        let mag_cmd = "/usr/bin/python3 -c \"print(round(abs(float('" + rho_str + "'))*100))\" 2>/dev/null"
+        let mut mag_r = ""
+        try { mag_r = to_string(exec(mag_cmd)).trim() } catch e { mag_r = "0" }
+        let mut mag_n: i64 = 0
+        try { mag_n = to_int(mag_r) } catch e { mag_n = 0 }
+        if mag_n > 40 { mag_n = 40 }
+        let mut bar = ""
+        let mut b = 0
+        while b < mag_n { bar = bar + "#"; b = b + 1 }
+        // sign marker (rho_str already carries sign)
+        println("lag " + to_string(k) + "\t" + rho_str + "\t|" + bar)
+    }
+    j = j + 1
+}

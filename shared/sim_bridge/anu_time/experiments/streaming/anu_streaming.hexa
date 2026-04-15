@@ -1,0 +1,122 @@
+// anu_streaming.hexa — bsz=1 ANU streaming experiment
+//
+// Hypothesis: buffer-size = 1 (one ANU request per byte) eliminates the
+// "refresh-at-k*bufsize" artifact entirely. Every byte IS a refresh. If
+// 64-tick signature was artifact, we should see uniform dt distribution
+// (no periodicity). If something remains periodic, it's an ANU/network
+// signature.
+//
+// Rate-limit discipline:
+//   - ANU official: 1 req / min
+//   - We pace: 60s minimum gap between requests
+//   - default: 30 requests (30 min run), ask 1 byte per request.
+//   - cache is NOT used (bsz=1 mode bypasses 60s TTL window)
+//
+// Usage: hexa anu_streaming.hexa <n_bytes> <run_dir> [pace_s]
+//   n_bytes: default 30
+//   pace_s:  default 60 (seconds between fetches)
+
+let _args = args()
+let mut n_bytes: i64 = 30
+let mut run_dir: string = ""
+let mut pace_s: i64 = 60
+
+if _args.len() >= 3 { try { n_bytes = to_int(_args[2]) } catch e { n_bytes = 30 } }
+if _args.len() >= 4 { run_dir = _args[3] }
+if _args.len() >= 5 { try { pace_s = to_int(_args[4]) } catch e { pace_s = 60 } }
+
+if n_bytes < 1 { n_bytes = 1 }
+if n_bytes > 60 { n_bytes = 60 }
+if pace_s < 60 { pace_s = 60 }
+
+if run_dir.len() == 0 {
+    let mut home = ""
+    try { home = to_string(exec("printenv HOME")).trim() } catch e { home = "" }
+    run_dir = home + "/Dev/nexus/shared/sim_bridge/anu_time/experiments/streaming/_run_default"
+}
+try { let _m = exec("mkdir -p '" + run_dir + "'") } catch e {}
+
+// ─── timing helpers ───
+fn now_ns() -> i64 {
+    let mut r = ""
+    try { r = to_string(exec("/usr/bin/python3 -c 'import time; print(time.time_ns())' 2>/dev/null")).trim() } catch e { r = "" }
+    if r.len() == 0 {
+        try { r = to_string(exec("date +%s%N 2>/dev/null")).trim() } catch e { r = "0" }
+    }
+    let mut v: i64 = 0
+    try { v = to_int(r) } catch e { v = 0 }
+    return v
+}
+
+fn now_epoch() -> i64 {
+    let mut r = ""
+    try { r = to_string(exec("date +%s")).trim() } catch e { r = "0" }
+    let mut v: i64 = 0
+    try { v = to_int(r) } catch e { v = 0 }
+    return v
+}
+
+// ─── one-byte fetch from ANU (length=1) ───
+fn fetch_one_anu() -> i64 {
+    let tmp = "/tmp/anu_stream." + to_string(now_epoch()) + ".json"
+    let cmd = "curl -s --max-time 8 'https://qrng.anu.edu.au/API/jsonI.php?length=1&type=uint8' 2>/dev/null | /usr/bin/python3 -c \"import sys,json;d=json.load(sys.stdin);print(d.get('data',[-1])[0] if d.get('success') else -1)\" > " + tmp + " 2>/dev/null; cat " + tmp + " 2>/dev/null; rm -f " + tmp
+    let mut r = ""
+    try { r = to_string(exec(cmd)).trim() } catch e { r = "" }
+    if r.len() == 0 { return 0 - 1 }
+    let mut v: i64 = 0
+    try { v = to_int(r) } catch e { v = 0 - 1 }
+    if v < 0 || v > 255 { return 0 - 1 }
+    return v
+}
+
+// ─── MAIN ───
+let log_path = run_dir + "/log.jsonl"
+let meta_path = run_dir + "/meta.json"
+
+let start_epoch = now_epoch()
+let start_ns = now_ns()
+
+let meta_json = "{\"mode\":\"bsz1_streaming\",\"n_bytes\":" + to_string(n_bytes) + ",\"pace_s\":" + to_string(pace_s) + ",\"start_epoch\":" + to_string(start_epoch) + "}\n"
+try { write_file(meta_path, meta_json) } catch e {}
+try { write_file(log_path, "") } catch e {}
+
+println("[stream] n_bytes=" + to_string(n_bytes) + " pace_s=" + to_string(pace_s) + " run=" + run_dir)
+
+let mut i: i64 = 0
+let mut prev_fetch_ns: i64 = 0
+let mut fail: i64 = 0
+
+while i < n_bytes {
+    // rate-limit pacing
+    if i > 0 {
+        let elapsed_ns = now_ns() - prev_fetch_ns
+        let need_ns = pace_s * 1000000000
+        if elapsed_ns < need_ns {
+            let sleep_s = (need_ns - elapsed_ns) / 1000000000 + 1
+            let mut ss = sleep_s
+            if ss < 1 { ss = 1 }
+            if ss > pace_s + 2 { ss = pace_s + 2 }
+            try { let _z = exec("sleep " + to_string(ss)) } catch e {}
+        }
+    }
+    let t0 = now_ns()
+    let b = fetch_one_anu()
+    let t1 = now_ns()
+    prev_fetch_ns = t1
+    let ok = if b >= 0 { 1 } else { 0 }
+    if ok == 0 { fail = fail + 1 }
+    let line = "{\"i\":" + to_string(i) + ",\"t_ns\":" + to_string(t1) + ",\"fetch_dt_ns\":" + to_string(t1 - t0) + ",\"byte\":" + to_string(b) + ",\"ok\":" + to_string(ok) + "}\n"
+    try { append_file(log_path, line) } catch e {}
+    println("[i=" + to_string(i) + "] byte=" + to_string(b) + " dt_ms=" + to_string((t1 - t0) / 1000000) + " ok=" + to_string(ok))
+    if fail >= 5 {
+        println("[stream] ABORT 5 consecutive failures")
+        break
+    }
+    if ok == 1 { fail = 0 }
+    i = i + 1
+}
+
+let end_ns = now_ns()
+let fmeta = "{\"mode\":\"bsz1_streaming\",\"n_bytes\":" + to_string(n_bytes) + ",\"actual\":" + to_string(i) + ",\"pace_s\":" + to_string(pace_s) + ",\"start_ns\":" + to_string(start_ns) + ",\"end_ns\":" + to_string(end_ns) + ",\"total_wall_ns\":" + to_string(end_ns - start_ns) + ",\"fail_final\":" + to_string(fail) + "}\n"
+try { write_file(meta_path, fmeta) } catch e {}
+println("[stream] done i=" + to_string(i) + " wall_s=" + to_string((end_ns - start_ns) / 1000000000))

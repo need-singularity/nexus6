@@ -1,0 +1,269 @@
+// scale_bootstrap.hexa — 1000-iter Gödel-Q bootstrap with expanded 7-op space.
+// Uses scale1k/expanded_ops.hexa + expanded_picker.hexa.
+// RNG mode selectable: "anu" (default, curl + urandom fallback) or "urandom".
+//
+// Usage: hexa scale_bootstrap.hexa <max_iters> <run_id> [mode]
+//   max_iters default 200, cap 1500.
+//   run_id default = timestamp.
+//   mode: anu | urandom  (default anu)
+
+fn ts_id() -> string {
+    let mut r = ""
+    try { r = to_string(exec("date +%Y%m%d-%H%M%S")).trim() } catch e { r = "0" }
+    return r
+}
+
+let _args = args()
+let mut max_iters = 200
+if _args.len() >= 3 {
+    try { max_iters = to_int(_args[2]) } catch e { max_iters = 200 }
+}
+if max_iters > 1500 { max_iters = 1500 }
+if max_iters < 1 { max_iters = 1 }
+
+let mut run_id = ts_id()
+if _args.len() >= 4 { run_id = _args[3] }
+
+let mut mode = "anu"
+if _args.len() >= 5 { mode = _args[4] }
+
+let home = env_var("HOME")
+let base = home + "/Dev/nexus/shared/sim_bridge/godel_q"
+let scale_dir = base + "/scale1k"
+let src = base + "/mutation_target.hexa"
+let run_dir = scale_dir + "/runs/" + run_id
+try { exec("mkdir -p " + run_dir) } catch e {}
+let log_path = run_dir + "/mutations.jsonl"
+let sandbox = run_dir + "/candidate.hexa"
+
+let hx = home + "/Dev/nexus/shared/bin/hexa"
+let picker = scale_dir + "/expanded_picker.hexa"
+let mutator = scale_dir + "/expanded_ops.hexa"
+let gate = base + "/verify_gate.hexa"
+let anu_mod = base + "/anu_source.hexa"
+
+// baseline
+let base_cmd = "HEXA_LOCAL=1 HEXA_NO_LAUNCHD=1 " + hx + " run " + gate + " " + src + " 0 2>/dev/null"
+let base_out = to_string(exec(base_cmd)).trim()
+let mut baseline_metric = 0
+let mut baseline_hash = ""
+let bparts = base_out.split("\t")
+let mut bi = 0
+while bi < bparts.len() {
+    let p = bparts[bi]
+    let eq = p.index_of("=")
+    if eq > 0 {
+        let k = p.substring(0, eq).trim()
+        let v = p.substring(eq + 1, p.len()).trim()
+        if k == "metric" {
+            try { baseline_metric = to_int(v) } catch e { baseline_metric = 0 }
+        }
+        if k == "hash" { baseline_hash = v }
+    }
+    bi = bi + 1
+}
+
+println("[scale] run_id=" + run_id + " max_iters=" + to_string(max_iters) + " mode=" + mode)
+println("[scale] baseline metric=" + to_string(baseline_metric) + " hash=" + baseline_hash)
+println("[scale] log=" + log_path)
+
+let hdr = "{\"event\":\"start\",\"run_id\":\"" + run_id + "\",\"max_iters\":" + to_string(max_iters) + ",\"mode\":\"" + mode + "\",\"baseline_metric\":" + to_string(baseline_metric) + ",\"baseline_hash\":\"" + baseline_hash + "\"}"
+try { write_file(log_path, hdr + "\n") } catch e {}
+
+// counters
+let mut n_try = 0
+let mut n_applied = 0
+let mut n_parse_ok = 0
+let mut n_metric_up = 0
+let mut n_accept = 0
+let mut anu_bytes = 0
+let mut max_delta = 0
+let mut max_delta_iter = 0
+
+// hash history for fixed-point heuristic
+let mut last_hash = ""
+let mut same_hash_run = 0
+let mut best_same_run = 0
+let mut fp_iter = 0
+let mut fp_run = 0
+
+// per-op counters
+let mut op_names = ["tweak_const", "swap_op", "rename_var", "swap_lines", "inline_const", "extract_var", "loop_unroll"]
+let mut op_try = [0, 0, 0, 0, 0, 0, 0]
+let mut op_applied = [0, 0, 0, 0, 0, 0, 0]
+let mut op_accept = [0, 0, 0, 0, 0, 0, 0]
+
+// running blob + position
+let mut blob = ""
+let mut pos = 0
+let anu_cmd = "HEXA_LOCAL=1 HEXA_NO_LAUNCHD=1 " + hx + " run " + anu_mod + " 2>/dev/null"
+let ur_cmd = "head -c 64 /dev/urandom | od -An -vtx1 | tr -d ' \\n'"
+
+let mut iter = 1
+while iter <= max_iters {
+    if blob.len() < pos + 8 {
+        let mut b = ""
+        if mode == "urandom" {
+            try { b = to_string(exec(ur_cmd)).trim() } catch e { b = "" }
+        } else {
+            try { b = to_string(exec(anu_cmd)).trim() } catch e { b = "" }
+        }
+        if b.len() < 128 {
+            // fallback to urandom
+            try { b = to_string(exec(ur_cmd)).trim() } catch e { b = "" }
+        }
+        if b.len() < 128 {
+            println("[iter " + to_string(iter) + "] RNG fail; skip")
+            iter = iter + 1
+            continue
+        }
+        blob = b
+        pos = 0
+    }
+    let bytes_hex = blob.substring(pos, pos + 8)
+    pos = pos + 8
+    anu_bytes = anu_bytes + 4
+
+    let pick_cmd = "HEXA_LOCAL=1 HEXA_NO_LAUNCHD=1 " + hx + " run " + picker + " " + bytes_hex + " 2>/dev/null"
+    let pick_out = to_string(exec(pick_cmd)).trim()
+    let pparts = pick_out.split("\t")
+    if pparts.len() < 3 {
+        iter = iter + 1
+        continue
+    }
+    let line = pparts[0]
+    let op = pparts[1]
+    let mag = pparts[2]
+
+    // op index
+    let mut op_i = -1
+    let mut oi = 0
+    while oi < op_names.len() {
+        if to_string(op_names[oi]) == op { op_i = oi ; break }
+        oi = oi + 1
+    }
+
+    let mut_cmd = "HEXA_LOCAL=1 HEXA_NO_LAUNCHD=1 " + hx + " run " + mutator + " " + src + " " + sandbox + " " + line + " " + op + " " + mag + " 2>/dev/null"
+    let mut_out = to_string(exec(mut_cmd)).trim()
+    n_try = n_try + 1
+    if op_i >= 0 { op_try[op_i] = op_try[op_i] + 1 }
+
+    let mut applied = 0
+    let mparts = mut_out.split("\t")
+    let mut old_src = ""
+    let mut new_src = ""
+    let mut mi = 0
+    while mi < mparts.len() {
+        let p = mparts[mi]
+        let eq = p.index_of("=")
+        if eq > 0 {
+            let k = p.substring(0, eq)
+            let v = p.substring(eq + 1, p.len())
+            if k == "applied" {
+                try { applied = to_int(v.trim()) } catch e { applied = 0 }
+            }
+            if k == "old" { old_src = v }
+            if k == "new" { new_src = v }
+        }
+        mi = mi + 1
+    }
+    if applied == 1 {
+        n_applied = n_applied + 1
+        if op_i >= 0 { op_applied[op_i] = op_applied[op_i] + 1 }
+    }
+
+    let gate_cmd = "HEXA_LOCAL=1 HEXA_NO_LAUNCHD=1 " + hx + " run " + gate + " " + sandbox + " " + to_string(baseline_metric) + " 2>/dev/null"
+    let gate_out = to_string(exec(gate_cmd)).trim()
+    let gparts = gate_out.split("\t")
+    let mut parse_ok = 0
+    let mut out_ok = 0
+    let mut metric = 0
+    let mut out_hash = ""
+    let mut accept = 0
+    let mut gi = 0
+    while gi < gparts.len() {
+        let p = gparts[gi]
+        let eq = p.index_of("=")
+        if eq > 0 {
+            let k = p.substring(0, eq).trim()
+            let v = p.substring(eq + 1, p.len()).trim()
+            if k == "parse_ok" {
+                try { parse_ok = to_int(v) } catch e { parse_ok = 0 }
+            }
+            if k == "out_ok" {
+                try { out_ok = to_int(v) } catch e { out_ok = 0 }
+            }
+            if k == "metric" {
+                try { metric = to_int(v) } catch e { metric = 0 }
+            }
+            if k == "hash" { out_hash = v }
+            if k == "accept" {
+                try { accept = to_int(v) } catch e { accept = 0 }
+            }
+        }
+        gi = gi + 1
+    }
+    if parse_ok == 1 { n_parse_ok = n_parse_ok + 1 }
+    let delta = metric - baseline_metric
+    if delta > 0 && out_ok == 1 && applied == 1 { n_metric_up = n_metric_up + 1 }
+    let mut eff_accept = 0
+    if applied == 1 && out_ok == 1 && accept == 1 { eff_accept = 1 }
+    if eff_accept == 1 {
+        n_accept = n_accept + 1
+        if op_i >= 0 { op_accept[op_i] = op_accept[op_i] + 1 }
+    }
+
+    // hash-run tracking for fixed-point heuristic
+    if eff_accept == 1 {
+        if out_hash == last_hash && last_hash.len() > 0 {
+            same_hash_run = same_hash_run + 1
+        } else {
+            same_hash_run = 1
+            last_hash = out_hash
+        }
+        if same_hash_run > best_same_run { best_same_run = same_hash_run }
+        if fp_iter == 0 && same_hash_run >= 10 {
+            fp_iter = iter
+            fp_run = same_hash_run
+        }
+    }
+
+    // max delta tracking
+    if eff_accept == 1 && delta > max_delta {
+        max_delta = delta
+        max_delta_iter = iter
+    }
+
+    let old_esc = old_src.replace("\\", "\\\\").replace("\"", "\\\"")
+    let new_esc = new_src.replace("\\", "\\\\").replace("\"", "\\\"")
+
+    let entry = "{\"iter\":" + to_string(iter) + ",\"anu_hex\":\"" + bytes_hex + "\",\"line\":" + line + ",\"op\":\"" + op + "\",\"mag\":\"" + mag + "\",\"applied\":" + to_string(applied) + ",\"parse_ok\":" + to_string(parse_ok) + ",\"out_ok\":" + to_string(out_ok) + ",\"metric\":" + to_string(metric) + ",\"delta\":" + to_string(delta) + ",\"hash\":\"" + out_hash + "\",\"accept\":" + to_string(eff_accept) + ",\"same_hash_run\":" + to_string(same_hash_run) + ",\"old\":\"" + old_esc + "\",\"new\":\"" + new_esc + "\"}"
+    try { append_file(log_path, entry + "\n") } catch e {}
+
+    // progress print every 50
+    let step = iter / 50
+    if iter == 1 || iter == max_iters || (iter - step * 50) == 0 {
+        println("[iter " + to_string(iter) + "/" + to_string(max_iters) + "] op=" + op + " applied=" + to_string(applied) + " metric=" + to_string(metric) + " Δ=" + to_string(delta) + " hash_run=" + to_string(same_hash_run) + " max_Δ=" + to_string(max_delta))
+    }
+
+    iter = iter + 1
+}
+
+// summary
+let mut op_summary = ""
+let mut si = 0
+while si < op_names.len() {
+    if si > 0 { op_summary = op_summary + "," }
+    op_summary = op_summary + "\"" + to_string(op_names[si]) + "\":{\"try\":" + to_string(op_try[si]) + ",\"applied\":" + to_string(op_applied[si]) + ",\"accept\":" + to_string(op_accept[si]) + "}"
+    si = si + 1
+}
+
+let summ = "{\"event\":\"end\",\"run_id\":\"" + run_id + "\",\"mode\":\"" + mode + "\",\"n_try\":" + to_string(n_try) + ",\"n_applied\":" + to_string(n_applied) + ",\"n_parse_ok\":" + to_string(n_parse_ok) + ",\"n_metric_up\":" + to_string(n_metric_up) + ",\"n_accept\":" + to_string(n_accept) + ",\"anu_bytes\":" + to_string(anu_bytes) + ",\"max_delta\":" + to_string(max_delta) + ",\"max_delta_iter\":" + to_string(max_delta_iter) + ",\"best_same_hash_run\":" + to_string(best_same_run) + ",\"fixed_point_iter\":" + to_string(fp_iter) + ",\"fixed_point_run\":" + to_string(fp_run) + ",\"ops\":{" + op_summary + "}}"
+try { append_file(log_path, summ + "\n") } catch e {}
+
+println("")
+println("=== scale summary run_id=" + run_id + " ===")
+println("try=" + to_string(n_try) + " applied=" + to_string(n_applied) + " parse_ok=" + to_string(n_parse_ok) + " metric_up=" + to_string(n_metric_up) + " accept=" + to_string(n_accept))
+println("anu_bytes=" + to_string(anu_bytes) + " max_Δ=" + to_string(max_delta) + "@iter" + to_string(max_delta_iter) + " best_hash_run=" + to_string(best_same_run))
+println("fixed_point: iter=" + to_string(fp_iter) + " run=" + to_string(fp_run))
+println("log: " + log_path)
