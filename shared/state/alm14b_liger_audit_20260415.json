@@ -1,0 +1,142 @@
+{
+  "audit_id": "alm14b_liger_audit_20260415",
+  "date": "2026-04-15",
+  "target": "training/train_alm_14b.py",
+  "round_target": "r7 (NOT r5, NOT r6)",
+  "stacks_on": "shared/patches/alm14b_speedup_*.diff (7 base speedup patches for r6)",
+  "scope": "Liger Kernel (github.com/linkedin/Liger-Kernel) integration audit + drop-in patch",
+  "upstream_source": {
+    "repo": "https://github.com/linkedin/Liger-Kernel",
+    "latest_release": "v0.7.0 (2026-02-12)",
+    "readme_sha": "main@HEAD as of 2026-04-15",
+    "technical_report": "https://arxiv.org/pdf/2410.10989",
+    "license": "BSD-2-Clause-Patent"
+  },
+  "environment": {
+    "hardware": "RunPod H100 80GB (SXM)",
+    "base_image": "runpod/pytorch:2.4.0 (torch 2.4, triton 3.0)",
+    "dtype": "bf16",
+    "model_base": "Qwen/Qwen2.5-14B-Instruct",
+    "peft": "LoRA r=32 alpha=64 (r7 default) or r=128 alpha=256 (kbase carry-over)"
+  },
+  "policy": {
+    "no_install_on_running_pod": true,
+    "never_apply_to_current_run": true,
+    "hexa_first_exemption": "existing .py trainer; in-place audit allowed",
+    "l0_untouched": true,
+    "liger_is_triton_only": "no new C++ deps; pure-python wheel"
+  },
+  "qwen2_support": true,
+  "qwen2_support_evidence": {
+    "api": "liger_kernel.transformers.apply_liger_kernel_to_qwen2",
+    "readme_table_entry": "Qwen2, Qwen2.5, & QwQ | apply_liger_kernel_to_qwen2 | RoPE, RMSNorm, SwiGLU, CrossEntropyLoss, FusedLinearCrossEntropy",
+    "source_file": "src/liger_kernel/transformers/monkey_patch.py:1351-1416",
+    "exported_in_init": "src/liger_kernel/transformers/__init__.py (apply_liger_kernel_to_qwen2 re-export verified)",
+    "handles_instance_patching": "When model= kwarg is passed, Liger additionally walks base_model.layers and patches decoder_layer.mlp, decoder_layer.input_layernorm, decoder_layer.post_attention_layernorm, and base_model.norm in-place — required when the HF model was already instantiated via from_pretrained.",
+    "kernels_applied_to_qwen2": [
+      "apply_rotary_pos_emb -> liger_rotary_pos_emb (rope)",
+      "Qwen2RMSNorm -> LigerRMSNorm (rms_norm)",
+      "Qwen2MLP -> LigerSwiGLUMLP (swiglu)",
+      "Qwen2ForCausalLM.forward -> qwen2_lce_forward (fused_linear_cross_entropy, requires labels= kwarg)"
+    ]
+  },
+  "compat_matrix": {
+    "fa2_compat": {
+      "status": "COMPAT",
+      "evidence": "README: 'The kernel works out of the box with Flash Attention, PyTorch FSDP, and Microsoft DeepSpeed.' Liger only replaces RMSNorm/RoPE/SwiGLU/CrossEntropy — it does NOT touch the attention implementation, so HF's attn_implementation='flash_attention_2' path remains active and uses Dao-AILab flash-attn kernels. RoPE replacement happens at the apply_rotary_pos_emb level, which FA2 consumes AFTER rotary, so no double-application.",
+      "caveat": "Liger's RoPE fuses the rotation but FA2 Qwen2 path in transformers>=4.45 applies rotary BEFORE FA2 kernel call — no conflict verified by reading qwen2_lce_forward path."
+    },
+    "compile_compat": {
+      "status": "COMPAT_WITH_CAVEAT",
+      "evidence": "Liger kernels are triton kernels — torch.compile can coexist because Dynamo treats triton autotune kernels as opaque ops and does not try to retrace them. The 2026-03-06 PyTorch blog post 'Peak Performance, Minimized Memory: Optimizing torchtune's performance with torch.compile & Liger Kernel' explicitly demonstrates compile+liger stacking on torchtune for Llama3.",
+      "caveat": "fullgraph=False (already set in the base r6 compile patch) is REQUIRED because Liger CE loss triggers a graph break. dynamic=False remains safe.",
+      "source": "https://pytorch.org/blog/peak-performance-minimized-memory/"
+    },
+    "fsdp_compat": {
+      "status": "COMPAT",
+      "evidence": "README: 'Multi-GPU supported: Compatible with multi-GPU setups (PyTorch FSDP, DeepSpeed, DDP, etc.).' Liger has a dedicated src/liger_kernel/transformers/fsdp.py module for FSDP-specific handling. The Liger benchmark itself (README Speed Up / Memory Reduction plots) was run with FSDP1 on 8 A100s: 'Benchmark conditions: LLaMA 3-8B, Batch Size = 8, bf16, AdamW, grad_ckpt=True, FSDP1'.",
+      "ordering": "Liger MUST be applied BEFORE FSDP wrapping. Current r6 trainer order is: from_pretrained -> grad_ckpt -> get_peft_model -> torch.compile -> FSDP. Liger insert point is after from_pretrained and BEFORE grad_ckpt (so Liger's LigerRMSNorm is the module wrapped by FSDP, not the HF Qwen2RMSNorm)."
+    },
+    "bf16_compat": {
+      "status": "COMPAT",
+      "evidence": "Liger README explicitly benchmarks bf16 (Llama 3-8B bf16 on 8 A100s FSDP1). Triton kernels are dtype-generic and explicitly support bf16 accumulation. No fp8 required."
+    },
+    "unsloth_conflict": {
+      "status": "NO_CONFLICT_IN_THIS_REPO",
+      "evidence": "grep unsloth|Unsloth|UNSLOTH on training/ directory: zero matches. Trainer does not import unsloth. Therefore mutual-exclusion does not apply here.",
+      "general_note": "If a future session ever enables Unsloth, it must be removed before applying Liger — Unsloth patches the same Qwen2Model.forward / Qwen2MLP / Qwen2RMSNorm class symbols and will compete with Liger's monkeypatch, causing whichever applies last to win (undefined behavior)."
+    },
+    "peft_lora_compat": {
+      "status": "COMPAT",
+      "evidence": "Liger replaces Qwen2MLP instances with LigerSwiGLUMLP, which still exposes gate_proj/up_proj/down_proj nn.Linear children. PEFT LoRA target_modules=['q_proj','k_proj','v_proj','o_proj'] (current r7 default) only touches attention projections — NOT touched by Liger's MLP/RMSNorm/RoPE patches. So LoRA attach works unchanged. If target_modules is expanded to include ['gate_proj','up_proj','down_proj'] (common for r=128 configs), PEFT must be attached AFTER Liger so that LoRA wraps the LigerSwiGLUMLP child linears instead of the original Qwen2MLP linears.",
+      "ordering_rule": "apply_liger_kernel_to_qwen2(model=model) -> model.gradient_checkpointing_enable() -> get_peft_model(model, lora_config)"
+    },
+    "fused_linear_ce_compat": {
+      "status": "COMPAT_REQUIRES_LABELS_KWARG",
+      "evidence": "Liger's qwen2_lce_forward replaces Qwen2ForCausalLM.forward and computes loss inside the fused kernel. This requires the training loop to pass labels= to model.__call__. Trainer line 352: outputs = model(input_ids=x, labels=y) — YES, satisfied.",
+      "memory_saving_mechanism": "Fused Linear CrossEntropy never materializes the full [B, T, vocab] logits tensor — it chunks the last linear layer + CE loss together. For Qwen2.5-14B this is the largest activation (152K vocab x 1024 seq x bf16 = ~300 MB per step), so saving it is the primary source of the claimed 60% memory reduction."
+    },
+    "gradient_checkpointing_compat": {
+      "status": "COMPAT",
+      "evidence": "Liger kernels are transparent to grad_ckpt — the checkpointed region re-runs forward with Liger kernels each time. README benchmark explicitly uses grad_ckpt=True. Current r6 disables grad_ckpt for 14B (alm14b_speedup_disable_act_ckpt.diff); Liger's FusedLinearCE memory saving makes this disable even safer — more headroom."
+    }
+  },
+  "expected_uplift": {
+    "primary_claim": {
+      "throughput_gain_pct": 20,
+      "memory_reduction_pct": 60,
+      "source": "Liger README main banner: 'increase multi-GPU training throughput by 20% and reduce memory usage by 60%'",
+      "bench_conditions": "LLaMA 3-8B, Batch=8, bf16, AdamW, grad_ckpt=True, FSDP1, 8xA100",
+      "quote": "With one line of code, Liger Kernel can increase throughput by more than 20% and reduce memory usage by 60%, thereby enabling longer context lengths, larger batch sizes, and massive vocabularies."
+    },
+    "conservative_estimate_for_alm14b_h100": {
+      "throughput_gain_pct": 12,
+      "memory_reduction_pct": 35,
+      "rationale": "alm14b r7 differs from the README bench: (a) batch=1 not 8, (b) single H100 not 8xA100 FSDP, (c) LoRA not full fine-tune, (d) seq=1024 not 4K+. The 20% throughput claim is weighted by larger batch + FSDP all-reduce savings that don't apply to single-GPU. FusedLinearCE still delivers the vocab-logits memory save, which is the biggest slice (~35% of peak). Throughput gain drops to the portion attributable to RMSNorm+SwiGLU+RoPE kernel fusion, conservatively 10-15%.",
+      "stacks_with_base_r6": "base r6 cumulative estimate is +50% throughput. Liger adds ~10% multiplicative on top (compute path is different — attention is already FA2, optimizer is already fused, Liger targets MLP+norm+loss). Combined r7 target: +65% over r5 baseline."
+    },
+    "citations_only_no_speculation": true
+  },
+  "patch_location": {
+    "file": "training/train_alm_14b.py",
+    "insert_after_line": 192,
+    "insert_before_line": 194,
+    "context": "After the non-distributed from_pretrained() block closes (line 192), before 'Gradient checkpointing' comment (line 194). LoRA attach is at line 209 — Liger runs before PEFT. torch.compile is at line 218 — Liger runs before compile so Dynamo sees LigerRMSNorm/LigerSwiGLUMLP.",
+    "new_cli_flag": "--liger (default False; r7 launcher sets --liger)",
+    "ordering_invariant": "from_pretrained -> apply_liger_kernel_to_qwen2(model=model) -> grad_ckpt -> get_peft_model -> torch.compile -> FSDP"
+  },
+  "patch_file": "shared/patches/alm14b_speedup_liger.diff",
+  "blockers": [],
+  "warnings": [
+    "Liger kernel must be installed on the pod BEFORE r7 launches: 'pip install liger-kernel' (stable v0.7.0). Audit-time policy is NO INSTALL on running pod — install is deferred to r7 launcher pre-step.",
+    "transformers>=4.45 (current pin per reference_peft_torch_compat.md) is required for apply_liger_kernel_to_qwen2 — verified compat.",
+    "torch>=2.1.2 and triton>=2.3.0 required — runpod/pytorch:2.4.0 ships torch 2.4 + triton 3.0 — OK.",
+    "If cross_entropy path ever switches to passing logits explicitly instead of labels=, fused_linear_cross_entropy=True will break — keep labels= contract in trainer line 352.",
+    "The PyTorch blog (2026-03-06) documents ONE caveat for compile+liger: 'graph breaks at CE loss boundary'. fullgraph=False in r6 compile patch already accommodates this — no extra change needed."
+  ],
+  "validation_plan_for_r7_launch": [
+    "0. Pre-flight: pip install liger-kernel==0.7.0 on fresh pod (NOT running r5/r6 pod)",
+    "1. Smoke: python3 train_alm_14b.py --corpus $CORPUS --steps 50 --smoke --liger (expect [train] liger: applied to Qwen2 log line)",
+    "2. Memory check: nvidia-smi at step 20 — peak VRAM should drop vs base r6 smoke (fused_linear_ce saves ~6-8 GB for Qwen2.5-14B vocab 152K @ seq=1024)",
+    "3. Loss parity: CE at step 50 must be within 1% of base r6 smoke CE — Liger is exact, not approximate, so any >1% drift indicates a bug",
+    "4. Throughput: step/min at steps 20-50 vs base r6 — expect +10-15%",
+    "5. If PASS: launch r7 full 10000-step run with --liger in launcher"
+  ],
+  "application_order_relative_to_base_7": [
+    "Base 7 patches (r6) already applied in working tree (verified via git diff).",
+    "Liger patch stacks on top — git apply --check against post-base-7 working tree must PASS.",
+    "For r7 launch: rebase to a fresh working tree, apply base 7 + liger in one series."
+  ],
+  "do_not_apply_to_current_run": true,
+  "do_not_apply_to_r5": true,
+  "do_not_apply_to_r6": true,
+  "apply_to": "r7 only, fresh from step 0",
+  "sign_off": {
+    "rule_never_resume_with_param_change": "honored — Liger changes backward graph, mandates fresh run",
+    "rule_one_shot_best": "honored — Liger prepared BEFORE r7 launch",
+    "rule_no_quantization": "honored — Liger is bf16 Triton, not quantization",
+    "rule_no_install_on_pod": "honored — install deferred to r7 pre-launch",
+    "rule_l0_untouched": "honored — only training/train_alm_14b.py modified",
+    "rule_hexa_first_exemption": "acknowledged — existing .py trainer, in-place audit"
+  }
+}

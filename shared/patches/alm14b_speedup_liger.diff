@@ -1,0 +1,90 @@
+# alm14b_speedup_liger.diff
+#
+# Liger Kernel integration for Qwen2.5-14B ALM LoRA training.
+#
+# Source: https://github.com/linkedin/Liger-Kernel (v0.7.0, 2026-02-12)
+# Paper:  https://arxiv.org/pdf/2410.10989
+#
+# Liger fuses: RMSNorm + RoPE + SwiGLU + (Fused Linear) CrossEntropy
+# for Qwen2/Qwen2.5 via `apply_liger_kernel_to_qwen2(model=model)`.
+# Attention is NOT touched — HF's flash_attention_2 path remains active.
+#
+# README benchmark (citation):
+#   "With one line of code, Liger Kernel can increase throughput by more than
+#    20% and reduce memory usage by 60%"
+#   Bench conditions: LLaMA 3-8B, Batch=8, bf16, AdamW, grad_ckpt=True,
+#   FSDP1 on 8xA100.
+#
+# Conservative estimate for alm14b r7 (batch=1, single-H100, LoRA):
+#   +10-15% throughput (MLP+norm fusion; attention already FA2 in r6)
+#   -30-40% peak VRAM  (FusedLinearCE never materializes 152K-vocab logits)
+#
+# Compat (verified — see shared/state/alm14b_liger_audit_20260415.json):
+#   - FA2      : COMPAT (Liger doesn't touch attention)
+#   - compile  : COMPAT (fullgraph=False already set; CE triggers graph break)
+#   - FSDP     : COMPAT (Liger README bench uses FSDP1)
+#   - bf16     : COMPAT (README bench is bf16)
+#   - PEFT LoRA: COMPAT (LoRA targets attention projs; Liger targets MLP+norm)
+#   - Unsloth  : N/A (not used in this repo)
+#
+# Ordering (MUST be preserved):
+#   from_pretrained
+#     -> apply_liger_kernel_to_qwen2(model=model)   [THIS PATCH]
+#     -> model.gradient_checkpointing_enable()
+#     -> get_peft_model(model, lora_config)
+#     -> torch.compile(model)
+#     -> FSDP(model, ...)
+#
+# Pod setup (BEFORE r7 launch, NOT r5/r6):
+#   pip install liger-kernel==0.7.0
+#
+# Target: r7 ONLY. Do NOT apply to running r5 or in-flight r6.
+# Stacks ON TOP of the base 7 speedup patches (r6 target):
+#   alm14b_speedup_flash_attention.diff
+#   alm14b_speedup_torch_compile.diff
+#   alm14b_speedup_fused_adamw.diff
+#   alm14b_speedup_disable_act_ckpt.diff
+#   alm14b_speedup_dataloader.diff
+#   alm14b_speedup_nccl_env.diff
+#   alm14b_speedup_tf32_cudnn.diff
+#
+# Apply: cd anima && git apply shared/patches/alm14b_speedup_liger.diff
+# Check: cd anima && git apply --check shared/patches/alm14b_speedup_liger.diff
+#
+--- a/training/train_alm_14b.py
++++ b/training/train_alm_14b.py
+@@ -190,6 +190,27 @@ def train(args):
+             device_map="auto",
+             trust_remote_code=True,
+         )
++
++    # Speedup patch 20260415 (r7): Liger Kernel Triton fusion for Qwen2.
++    # Replaces RMSNorm, RoPE, SwiGLU, and CrossEntropy with fused Triton kernels.
++    # Fused Linear CrossEntropy avoids materializing the [B,T,152K] logits tensor
++    # for Qwen2.5-14B — this is the primary source of memory savings.
++    # MUST run BEFORE gradient_checkpointing_enable and get_peft_model so that
++    # Liger's LigerRMSNorm / LigerSwiGLUMLP are the modules seen by grad_ckpt,
++    # PEFT, and FSDP. Does NOT touch attention — HF flash_attention_2 remains active.
++    # Source: https://github.com/linkedin/Liger-Kernel (v0.7.0).
++    # Install on pod pre-launch: `pip install liger-kernel==0.7.0`.
++    if args.liger:
++        from liger_kernel.transformers import apply_liger_kernel_to_qwen2
++        apply_liger_kernel_to_qwen2(
++            rope=True,
++            rms_norm=True,
++            swiglu=True,
++            fused_linear_cross_entropy=True,
++            cross_entropy=False,
++            model=model,
++        )
++        rank0_print("[train] liger: applied to Qwen2 (rope+rms_norm+swiglu+fused_linear_ce)")
+ 
+     # Gradient checkpointing — mandatory for 32B even with FSDP.
+     if args.grad_ckpt:
+@@ -495,5 +516,6 @@ if __name__ == "__main__":
+     parser.add_argument("--ddp", action="store_true", help="Wrap model with DistributedDataParallel (requires torchrun)")
+     parser.add_argument("--deepspeed", default=None, help="DeepSpeed config JSON path (requires deepspeed launcher)")
+     parser.add_argument("--torch-compile", action="store_true", help="torch.compile(mode=max-autotune). Next-run only; adds ~2min warmup.")
++    parser.add_argument("--liger", action="store_true", help="Apply Liger Kernel Triton fusion for Qwen2 (rope+rms_norm+swiglu+fused_linear_ce). Requires `pip install liger-kernel` on pod. Next-run only (r7+).")
+     args = parser.parse_args()
+     train(args)
