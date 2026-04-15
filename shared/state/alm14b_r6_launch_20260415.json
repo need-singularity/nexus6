@@ -1,0 +1,162 @@
+{
+  "launch_id": "alm14b_r6_launch_20260415",
+  "date": "2026-04-15",
+  "run_id": "r6",
+  "pod_id": "xhq9b2c8fljdyo",
+  "pod_name": "anima-p4-alm-holo",
+  "pod_gpu": "1x H100 SXM 80GB",
+  "pod_image": "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
+  "decision": "reuse_same_pod_no_parallel",
+  "decision_reason": "r5 was already DONE (4000 steps complete, step_4000 saved to R2 before this task started). Pod GPU was idle (0% util, 0 MiB). Launching on 2nd pod would have doubled cost with zero benefit since r5 wasn't running. No r5 interrupt was needed because r5 had already exited cleanly.",
+  "r5_state_at_start": {
+    "status": "DONE (training exited before task began)",
+    "final_step": 4000,
+    "final_loss": 0.1848,
+    "final_phi_holo": 1501.94,
+    "elapsed_min": 112.8,
+    "r2_checkpoints": ["step_500", "step_1000", "step_1500", "step_2000", "step_2500", "step_3000", "step_3500", "step_4000"]
+  },
+  "r4_production_safe": {
+    "confirmed": true,
+    "r2_checkpoints_present": ["step_1000", "step_1500", "step_2000", "step_4000", "step_6000", "step_8000", "step_10000"],
+    "source": "rclone lsd r2:anima-models/alm14b/r4/"
+  },
+  "config": {
+    "base": "Qwen/Qwen2.5-14B-Instruct",
+    "trainer": "train_alm_14b_p4.py (P4 holo variant with phi_holo gate metric)",
+    "steps": 4000,
+    "lr": 5e-6,
+    "batch": 1,
+    "grad_accum": 8,
+    "seq": 1024,
+    "warmup": 200,
+    "lora_r": 32,
+    "lora_alpha": 64,
+    "lora_dropout": 0.05,
+    "ckpt_dir": "/workspace/ckpt_alm_14b_r6",
+    "save_every": 500,
+    "eval_every": 100,
+    "round": 6,
+    "model_tag": "alm14b"
+  },
+  "patches_applied_to_anima_repo": {
+    "training/train_alm_14b.py": [
+      "alm14b_speedup_fused_adamw.diff",
+      "alm14b_speedup_tf32_cudnn.diff",
+      "alm14b_speedup_dataloader.diff (applied manually after fused_adamw shifted context)",
+      "alm14b_speedup_flash_attention.diff",
+      "alm14b_speedup_torch_compile.diff"
+    ],
+    "training/launch_alm_14b_r5.sh": [
+      "alm14b_speedup_disable_act_ckpt.diff",
+      "alm14b_speedup_nccl_env.diff"
+    ]
+  },
+  "patches_applied_to_pod_trainer": {
+    "target": "/workspace/train_alm_14b_p4.py (pod-specific P4 holo trainer, NOT the repo trainer)",
+    "note": "Pod runs a forked variant with HoloMapHead + phi_holo metric; patches ported manually.",
+    "applied": [
+      "flash_attention_2 (env-gated via ALM_ATTN_IMPL; default SDPA after measurement)",
+      "fused=True AdamW",
+      "async dataloader (env-gated via ALM_DL_WORKERS; default 0 after measurement)",
+      "tf32 + cudnn.benchmark",
+      "torch.compile (env-gated via ALM_NO_COMPILE; disabled after 9+ min warmup with no step)"
+    ],
+    "skipped_noop": [
+      "disable_act_ckpt — P4 trainer never enabled gradient_checkpointing (already off)",
+      "nccl_env — applied in launcher but single-GPU, no effect"
+    ]
+  },
+  "baseline_r5": {
+    "speed_step_per_min": 35.6,
+    "speed_source": "train_p4_r5.log step=50-4000 steady state",
+    "tok_per_s": 4861,
+    "tflop_per_s": 432,
+    "mfu_pct": 43.7
+  },
+  "new_r6": {
+    "speed_step_per_min": 36.7,
+    "speed_source": "train_alm_14b_r6.log step=50-160 steady state",
+    "tok_per_s": 5011,
+    "tflop_per_s": 445,
+    "mfu_pct": 45.0,
+    "gpu_util_pct": 98,
+    "gpu_memory_mib": 46607
+  },
+  "gain": {
+    "abs_step_per_min": 1.1,
+    "pct_relative": 3.1,
+    "mfu_delta_points": 1.3,
+    "target_mfu_pct": 72,
+    "target_gap_pct": 27
+  },
+  "empirical_findings": [
+    {
+      "finding": "Audit assumed Qwen2 defaults to 'eager' attention; actually defaults to SDPA",
+      "impact": "FA2 +30% estimate was vs wrong baseline. On H100 seq=1024 bf16, SDPA ≈ FA2 ± noise. FA2 actually measured 1-2% SLOWER than SDPA due to kernel launch overhead on short seqs.",
+      "evidence": "pod Qwen2.5-14B-Instruct loaded without attn_implementation kwarg → config._attn_implementation='sdpa', attn class=Qwen2SdpaAttention"
+    },
+    {
+      "finding": "Audit predicted disable_act_ckpt +25%; P4 trainer never enabled it",
+      "impact": "Zero gain — baseline already had act_ckpt off.",
+      "evidence": "grep -n gradient_checkpointing /workspace/train_alm_14b_p4.py → no matches"
+    },
+    {
+      "finding": "Audit predicted dataloader async +1%; measured -2% to -4%",
+      "impact": "num_workers=2 with pin_memory on in-memory dataset added subprocess IPC overhead exceeding savings. Reverted to num_workers=0+pin_memory.",
+      "evidence": "r6 iter 1 (num_workers=2, FA2): 34.1 step/min vs r5 35.6 = -4.2%"
+    },
+    {
+      "finding": "torch.compile(max-autotune) exceeded 7 min warmup without producing step 1",
+      "impact": "Killed iter 1. reduce-overhead tried in iter 2, also >5 min without step 1. Killed iter 2. Disabled compile entirely for iter 3. torch.compile with output_hidden_states=True on Qwen2+LoRA appears to hit many dynamo graph breaks that make compile non-viable for this trainer.",
+      "evidence": "tmux capture-pane showed autotune cycling through 100+ triton_mm_N kernels; symbolic_shapes.py warnings"
+    },
+    {
+      "finding": "fused AdamW + tf32 + cudnn.benchmark + pin_memory (async H2D) collectively net ~+3%",
+      "impact": "Aligned with audit's conservative sum for these 3 items (~5%); actual realized gain smaller because LoRA param count (50M) makes optimizer cost small baseline",
+      "evidence": "r6 iter 3 (SDPA + fused + tf32 + cudnn + num_workers=0): 36.7 step/min vs r5 35.6 = +3.1%"
+    }
+  ],
+  "revised_cumulative_estimate_vs_audit": {
+    "audit_cumulative_estimate_pct": 50,
+    "measured_actual_pct": 3.1,
+    "reason_for_shortfall": "Audit baseline was assumed eager attention + act_ckpt ON; both were wrong. Real baseline was already SDPA + act_ckpt OFF, leaving only fused_adamw/tf32/pin_memory (~+3%) and torch.compile (unmeasurable). FA2 and act_ckpt toggle together accounted for ~47 of the 50 predicted pct but both were moot."
+  },
+  "launch_evidence": {
+    "pod_main_python_pid": 11930,
+    "tmux_session": "alm-r6",
+    "launch_script": "/workspace/launch_alm_14b_speedup.sh (generic ALM_RUN_ID-aware)",
+    "launch_env": "ALM_RUN_ID=r6 ALM_NO_COMPILE=1 ALM_ATTN_IMPL=sdpa",
+    "log_file": "/workspace/train_alm_14b_r6.log",
+    "first_step_log": "[train] step=1/4000 loss=15.5701 ... speed=25.4step/min (warmup)",
+    "stable_step_log": "[train] step=150/4000 loss=13.1302 main=12.7417 holo=0.344739 lr=3.76e-06 speed=36.7step/min ETA=105min",
+    "eval_step_100": "[eval] step=100 eval_loss=15.0722 best=15.0072 phi_holo=1931.69"
+  },
+  "r2_prefix": "r2:anima-models/alm14b/r6/step_{step}/",
+  "iteration_history": [
+    "iter 1: max-autotune compile — hung >7 min, killed",
+    "iter 2: reduce-overhead compile — hung >5 min (dynamo tracing output_hidden_states), killed",
+    "iter 3: NO_COMPILE + FA2 + num_workers=2 — 34.1 step/min (-4.2% vs baseline)",
+    "iter 4: NO_COMPILE + FA2 + num_workers=0 — 34.9 step/min (-2.0% vs baseline)",
+    "iter 5 (FINAL): NO_COMPILE + SDPA + num_workers=0 + fused AdamW + tf32 + cudnn — 36.7 step/min (+3.1% vs baseline)"
+  ],
+  "next_actions": [
+    "Let r6 run to completion (4000 steps, ETA ~105 min from step 150)",
+    "Audit the audit: shared/state/alm14b_pt_speedup_audit_20260415.json should be annotated with empirical findings (baseline was SDPA not eager, act_ckpt was already off)",
+    "For +20% more MFU: explore seq packing (concat samples to seq=4096 instead of batch=1 seq=1024), multi-GPU FSDP, bf16 fused matmul paths, or Hopper-specific TMA/WGMMA — not in current audit scope",
+    "torch.compile investigation: output_hidden_states=True is the dynamo blocker. Alternatives: hook last hidden with forward hook instead of kwarg, or compute phi_holo on a separate detached pass every N steps"
+  ],
+  "files_touched": {
+    "local_repo_anima": [
+      "/Users/ghost/Dev/anima/training/train_alm_14b.py",
+      "/Users/ghost/Dev/anima/training/launch_alm_14b_r5.sh"
+    ],
+    "pod": [
+      "/workspace/train_alm_14b_p4.py (patched in place)",
+      "/workspace/launch_alm_14b_speedup.sh (new; generic ALM_RUN_ID-aware; NOT versioned)"
+    ],
+    "nexus_state": [
+      "/Users/ghost/Dev/nexus/shared/state/alm14b_r6_launch_20260415.json"
+    ]
+  }
+}
