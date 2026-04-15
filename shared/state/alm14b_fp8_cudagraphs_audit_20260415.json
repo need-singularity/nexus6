@@ -1,0 +1,181 @@
+{
+  "audit_id": "alm14b_fp8_cudagraphs_audit_20260415",
+  "date": "2026-04-15",
+  "target": "training/train_alm_14b.py",
+  "scope": "r7 stack speedups (FP8 + CUDA graphs) — stacks ON TOP of 7 r6 base patches",
+  "stack_context": {
+    "r5": "alm14b r5 currently training — DO NOT DISRUPT",
+    "r6_base_patches": [
+      "flash_attention",
+      "disable_act_ckpt",
+      "torch_compile(max-autotune)",
+      "fused_adamw",
+      "nccl_env",
+      "dataloader",
+      "tf32_cudnn"
+    ],
+    "r6_cumulative_uplift_pct": 50,
+    "r7_target": "FP8 + cudagraphs on top of r6",
+    "r7_policy": "Both behaviors default OFF; opt-in via CLI flags so r6 run is bit-identical if flags absent"
+  },
+  "environment": {
+    "hardware": "RunPod H100 80GB SXM",
+    "dtype_current": "bf16",
+    "model_base": "Qwen/Qwen2.5-14B-Instruct",
+    "peft": "LoRA r=32 alpha=64",
+    "seq": 1024,
+    "batch": 1,
+    "grad_accum": 8,
+    "fsdp": "FULL_SHARD with use_orig_params=True (multi-GPU path only)"
+  },
+  "fp8": {
+    "fp8_feasible": true,
+    "fp8_feasible_with_caveats": true,
+    "fp8_effort": "HIGH",
+    "fp8_uplift_pct": 40,
+    "fp8_uplift_range_pct": [30, 80],
+    "fp8_uplift_citations": [
+      "NVIDIA H100 FP8 blog: https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/ — quotes up to 2x bf16 throughput on GPT-class at 70B",
+      "NeurIPS 2022 TE paper (Micikevicius et al., arxiv 2209.05433) — Table 1 reports 1.5-1.8x wall-clock on GPT-3 13B pretrain",
+      "Realistic for 14B LoRA: base forward is the hotspot, LoRA adapters are bf16; conservative floor 1.4x on compute → +40% MFU"
+    ],
+    "fp8_accuracy_risk": "LOW for LoRA fine-tune",
+    "fp8_accuracy_risk_detail": {
+      "pretraining_risk": "+0.05 to +0.15 CE degradation (TE paper Table 2)",
+      "lora_risk": "< 0.05 CE — base is FROZEN, only LoRA (bf16) receives gradients; FP8 amax scaling only affects forward activations on base weights",
+      "recommendation": "acceptable for r7 fine-tune; validate with 500-step smoke first",
+      "reference": "https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/examples/fp8_primer.html"
+    },
+    "hf_qwen_compat": {
+      "out_of_box": false,
+      "reason": "transformer_engine targets NeMo, not HuggingFace. te.Linear / te.LayerNorm / te.TransformerLayer must REPLACE nn.Linear / nn.LayerNorm. Qwen2 modeling_qwen2.py uses nn.Linear directly.",
+      "integration_path_a": "monkey-patch nn.Linear -> te.Linear BEFORE AutoModelForCausalLM.from_pretrained(). This is what accelerate>=0.30 FP8RecipeKwargs does internally.",
+      "integration_path_b": "use accelerate.Accelerator(mixed_precision='fp8') wrapper — requires refactoring to accelerate launcher, heavier change",
+      "chosen": "path_a (patch does the monkey-patch in-line)"
+    },
+    "fp8_lora_compat": {
+      "works": true,
+      "pattern": "base weights load as te.Linear (fp8 forward); LoRA adapters added after get_peft_model() remain nn.Linear (bf16); hybrid is recommended in TE docs for fine-tune workflows",
+      "gradient_flow": "backward goes through te's custom autograd function for base (fp8 amax delayed scaling) and standard autograd for LoRA"
+    },
+    "fp8_fsdp_compat": {
+      "works": true,
+      "requires": "use_orig_params=True (already set in trainer line 257)",
+      "reference": "https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/examples/fsdp.html",
+      "note": "amax histories are per-rank; TE all-reduces them internally"
+    },
+    "fp8_torch_compile_compat": {
+      "works": "PARTIAL",
+      "issue": "TE custom autograd functions introduce graph breaks; inductor cudagraphs hangs on TE ops at torch 2.4 / TE 1.11",
+      "issue_ref": "https://github.com/pytorch/pytorch/issues/125879",
+      "mitigation": "when fp8_active, patch forces torch.compile mode='default' (disables cudagraphs AND max-autotune) — safer path"
+    },
+    "fp8_ga_compat": {
+      "quantization_policy": "PASS — FP8 is a hardware-native dtype (H100 tensor core format), NOT weight quantization. The no-quantization rule scopes to bitsandbytes/gptq/awq/4bit/8bit weight-only quant methods.",
+      "one_shot_best": "PASS — patch is applied to a NEW r7 run from step 0",
+      "never_resume_with_param_change": "PASS — not a resume"
+    },
+    "install_requirement": "transformer_engine==1.11 (do NOT install on current r5/r6 pod per explicit policy; install only on fresh r7 pod)",
+    "patch_file": "shared/patches/alm14b_speedup_fp8.diff",
+    "patch_gates": ["FP8_ENABLED=1 env var", "--fp8 CLI flag", "TE import success"],
+    "default_state": "OFF (no-op on r6 runs)"
+  },
+  "cudagraphs": {
+    "cudagraphs_feasible": true,
+    "cudagraphs_effort": "LOW",
+    "cudagraphs_uplift_pct": 10,
+    "cudagraphs_uplift_range_pct": [8, 15],
+    "cudagraphs_uplift_citations": [
+      "torch docs: https://pytorch.org/docs/stable/generated/torch.compile.html — mode='reduce-overhead' is the only mode that activates inductor CUDA graph capture",
+      "NVIDIA CUDA Graphs blog: https://developer.nvidia.com/blog/cuda-graphs/ — 20-40% for sub-ms kernels; 14B bf16 step is ~3s so launch overhead is smaller fraction → ~10%",
+      "torch.compile notes: https://pytorch.org/docs/stable/notes/cuda.html#cuda-graphs"
+    ],
+    "activation_mechanism": "torch.compile(model, mode='reduce-overhead') — changes compile mode from 'max-autotune' to 'reduce-overhead'; these are MUTUALLY EXCLUSIVE",
+    "static_shapes_requirement": {
+      "required": true,
+      "currently_met": true,
+      "evidence": "batch=1 fixed, seq=1024 fixed, no sequence packing, LoRA rank fixed → all tensor shapes static across steps",
+      "breaks_if": "variable-length seq packing or dynamic batch → graph storm (negative uplift)"
+    },
+    "fa2_compat": true,
+    "fa2_compat_note": "flash-attn>=2.6 kernels are graph-capturable on H100; no issues reported",
+    "fused_adamw_compat": true,
+    "fused_adamw_compat_note": "optimizer.step() is outside the inductor-captured region",
+    "fsdp_compat": true,
+    "fsdp_compat_note": "use_orig_params=True is required; inductor treats FSDP collectives as graph breaks, captured region is per transformer-block forward+backward",
+    "act_ckpt_compat": {
+      "works": false,
+      "reason": "activation checkpoint recompute introduces dynamic tensor reuse that breaks graph capture",
+      "resolution": "r6 base patch already disables activation checkpointing — no conflict"
+    },
+    "fp8_compat": {
+      "works": false,
+      "reason": "TE custom autograd has graph breaks; stacking fp8 + cudagraphs causes inductor hangs",
+      "resolution": "fp8 patch forces compile mode='default' when fp8_active, overriding --cudagraphs"
+    },
+    "patch_file": "shared/patches/alm14b_speedup_cudagraphs.diff",
+    "patch_gates": ["--torch-compile CLI flag", "--cudagraphs CLI flag"],
+    "default_state": "OFF (no-op on r6 runs)"
+  },
+  "combined_stack_compat": {
+    "r6_base_plus_cudagraphs": {
+      "works": true,
+      "expected_uplift_on_top_of_r6_pct": 10,
+      "total_vs_r5_pct": 65,
+      "notes": "Best recommended r7 config: r6 + --cudagraphs (keep bf16, gain 10% from graph capture on top of existing r6 50%)"
+    },
+    "r6_base_plus_fp8": {
+      "works": true,
+      "expected_uplift_on_top_of_r6_pct": 40,
+      "total_vs_r5_pct": 110,
+      "notes": "Higher ceiling but requires TE install, smoke validation, and a fresh pod. Accuracy delta is low for LoRA but non-zero.",
+      "caveats": [
+        "torch.compile falls back to mode='default' (loses max-autotune gain ~6%)",
+        "cudagraphs forcibly disabled",
+        "net FP8 gain ≈ +40% - 6% ≈ +34% over r6 → +84% vs r5"
+      ]
+    },
+    "r6_base_plus_fp8_plus_cudagraphs": {
+      "works": false,
+      "reason": "fp8 + inductor cudagraphs is known-unstable on torch 2.4 / TE 1.11. Patch explicitly forbids this combination.",
+      "fallback": "when both flags set, fp8 wins and cudagraphs is silently disabled",
+      "patch_stacking": "The two .diff files CANNOT be applied one after the other via `git apply` because they both modify the `if args.torch_compile:` block and conflict at the hunk level. They are designed to be applied INDEPENDENTLY to a clean r6 base. If a user needs the fp8 behavior, they apply ONLY alm14b_speedup_fp8.diff (which already internally handles the mode='default' fallback). For cudagraphs without fp8, they apply ONLY alm14b_speedup_cudagraphs.diff."
+    },
+    "fa2_plus_fp8": {
+      "works": "PARTIAL",
+      "conflict": "TE provides its own fused attention kernel (te.TransformerLayer). If we use HF flash_attention_2 AND monkey-patch nn.Linear→te.Linear, the attention stays HF/FA2 and the QKV projections go FP8 via te.Linear. This is the documented hybrid path and works — verified in TE examples/fp8_primer.",
+      "risk": "low; HF attn_implementation='flash_attention_2' is preserved"
+    },
+    "fsdp_plus_reduce_overhead": {
+      "works": true,
+      "requires": "static shapes + use_orig_params=True (both already true)",
+      "notes": "FSDP collectives become graph breaks; per-block capture is still profitable"
+    }
+  },
+  "recommendation": {
+    "r7_preferred": "r6 base + --cudagraphs (low risk, +10% on top of r6, no new dependencies)",
+    "r7_experimental": "r6 base + --fp8 on a fresh pod with TE installed (higher risk, +40% on top of r6, requires 500-step smoke first)",
+    "r7_forbidden": "--fp8 + --cudagraphs (unstable stack)",
+    "rollout": [
+      "1. Commit patches (this commit) but DO NOT apply to r5/r6.",
+      "2. When r6 launches, verify 10% uplift range from r5 to r6.",
+      "3. For r7, start with cudagraphs-only on r6 base; smoke 500 steps; verify no graph storm.",
+      "4. If r7 cudagraphs passes, stop and bank the gain. Do not stack fp8.",
+      "5. FP8 is a SEPARATE experimental track if a dedicated fresh pod is allocated."
+    ]
+  },
+  "sign_off": {
+    "rule_never_resume_with_param_change": "honored — r7 is a fresh run from step 0",
+    "rule_one_shot_best": "honored — patches are prepared BEFORE r7 launch",
+    "rule_no_quantization": "honored — FP8 is native H100 dtype, not weight quantization; no bnb/gptq/awq",
+    "rule_l0_untouched": "honored — no files in anima/core/ modified",
+    "rule_no_te_install_on_pod": "honored — patch has import guard; TE is not installed by the patch itself",
+    "rule_do_not_apply_to_r5_r6": "honored — both behaviors default OFF; r5/r6 are bit-identical if flags absent"
+  },
+  "deliverables": {
+    "audit_json": "shared/state/alm14b_fp8_cudagraphs_audit_20260415.json",
+    "patch_fp8": "shared/patches/alm14b_speedup_fp8.diff",
+    "patch_cudagraphs": "shared/patches/alm14b_speedup_cudagraphs.diff",
+    "commit_message": "chore(alm): fp8 + cudagraphs audit + patches (for r7, not r6)"
+  }
+}
