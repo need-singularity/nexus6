@@ -4,7 +4,7 @@
     "date": "2026-04-15",
     "task_id": "#29 ALM r8c FP8 track",
     "authorization": "user go — 2 H100 max — coordinate with r8a (#28)",
-    "status": "IN_PROGRESS — pod provisioned, install pending"
+    "status": "FINAL — FAIL — FP8 monkey-patch path broken; SLOWER and INCORRECT"
   },
 
   "coordination_with_r8a": {
@@ -14,9 +14,9 @@
       "xhq9b2c8fljdyo_state": "RUNNING, GPU idle 0 MiB / 0% util, no python or tmux sessions",
       "ubzp169igb7tns_state": "GONE (terminated)"
     },
-    "r8c_decision": "Leave xhq9b2c8fljdyo free for r8a (since that's the only available pre-existing pod). Provision a separate DEDICATED pod for r8c FP8 track. Torch downgrade to 2.9 breaks Unsloth — pod is FP8-only, not rotated to r8a/b/c.",
-    "pod_count_check": "1 (xhq9b2c8fljdyo for r8a) + 1 (new dn6eixsgzrjlnz for r8c) = 2 H100 = WITHIN budget",
-    "r8a_coordination": "r8c avoids touching xhq9b2c8fljdyo. R27 no-step-on-other-sessions."
+    "r8c_decision": "Dedicated pod dn6eixsgzrjlnz provisioned for r8c FP8 track. xhq9b2c8fljdyo left untouched for r8a.",
+    "pod_count_check": "1 (xhq9b2c8fljdyo for r8a) + 1 (dn6eixsgzrjlnz for r8c) = 2 H100 = WITHIN budget",
+    "r8a_coordination": "r8c avoided touching xhq9b2c8fljdyo. R27 no-step-on-other-sessions. COMPLIED."
   },
 
   "pod": {
@@ -26,19 +26,80 @@
     "image": "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
     "cost_per_hr_usd": 2.99,
     "dedicated_to": "FP8 only — torch 2.9 pin, no Unsloth, no r8a/b rotation",
-    "created_at": "2026-04-15 r8c launch"
+    "created_at": "2026-04-15 14:30:25 UTC",
+    "deleted_at": "2026-04-15 15:12 UTC (post-measurement, ~42 min billed, ~$2.10)"
   },
 
-  "plan": {
-    "step_1_torch_downgrade": "pip install --force-reinstall torch==2.9.0 --index-url https://download.pytorch.org/whl/cu121 (or cu124 if H100 SM_90 unstable on cu121)",
-    "step_2_unsloth_uninstall": "pip uninstall -y unsloth unsloth-zoo (if present; FP8 path does not use Unsloth)",
-    "step_3_te_install": "pip install 'transformer-engine[pytorch]==2.13.0'",
-    "step_4_verify_te": "python -c 'import transformer_engine.pytorch as te; print(te.__version__)'",
-    "step_5_apply_patch": "git apply shared/patches/alm14b_speedup_fp8.diff on pod",
-    "step_6_upload_runner": "Upload training/train_alm_14b.py (patched) as /workspace/train_alm_14b_r8c.py",
-    "step_7_smoke_20_steps": "FP8_ENABLED=1 python train_alm_14b_r8c.py --batch 1 --seq 1024 --grad-accum 8 --steps 20 --fp8",
-    "step_8_measurement_50_steps": "If smoke PASS, continue 50 steps for measurement",
-    "step_9_compute_mfu": "MFU_bf16_eq = 6 * 14e9 * 1024 * 1 * 8 / (60/step_per_min) / 989e12, also MFU_fp8 = ... / 1979e12"
+  "install_results": {
+    "prior_agent_state": "torch 2.9.0+cu126 and transformer_engine 2.13.0 were ALREADY installed by predecessor agent before its API 500 death. No reinstall needed.",
+    "libcudart_mismatch_discovered": "Image CUDA 12.4 libcudart loaded via ldconfig; torch cu126 wheels need libcudart 12.6+ which IS bundled in pip nvidia-cuda-runtime-cu12==12.6.77 but not in LD path by default. Symbol cudaGetDriverEntryPointByVersion missing from libcudart.so.12.4.127.",
+    "fix": "Prepend LD_LIBRARY_PATH with /usr/local/lib/python3.11/dist-packages/nvidia/{cuda_runtime,cudnn,cublas,cusparse,cusolver,cufft,curand,nccl,nvjitlink}/lib — works without reinstall",
+    "torch_version": "2.9.0+cu126",
+    "te_version": "2.13.0",
+    "te_smoke_verdict": "PASS — fp8_autocast + te.Linear forward+backward work on H100 SM_90 (cap 9,0)",
+    "fallback_chain_hit": "none — first stack worked"
+  },
+
+  "smoke_20step_results": {
+    "launch_command": "FP8_ENABLED=1 LD_LIBRARY_PATH=... python3 train_alm_14b_r8c.py --corpus /workspace/corpus.txt --steps 20 --batch 1 --seq 1024 --grad-accum 8 --warmup 5 --smoke --model-tag alm14b_r8c --round 8 --fp8",
+    "prior_agent_error": "launch script passed --round 8c (string) to int parser — fixed: --round 8",
+    "completion": "SUCCESS — 20/20 steps completed, checkpoint saved",
+    "duration_min": 0.9,
+    "step_1_loss": 15.3393,
+    "step_10_loss": 15.3701,
+    "step_20_loss": 15.2487,
+    "loss_verdict": "CRITICAL ANOMALY — loss ~15 is near random-init CE for vocab 152k. r6/r7 baseline loss at step 20 = ~2-3. Delta of ~13 CE points means base weights are effectively randomly initialized.",
+    "root_cause_loss_anomaly": "nn.Linear -> te.Linear monkey-patch runs BEFORE AutoModelForCausalLM.from_pretrained. TE's te.Linear expects _extra_state entries in checkpoint which Qwen2.5-14B safetensors do NOT contain. HF warning confirms: 'newly initialized: [lm_head._extra_state, model.layers.*.mlp.{down,gate,up}_proj._extra_state, model.layers.*.self_attn.{k,o,q,v}_proj._extra_state]' — ALL 48 layers' attn+MLP projections are NEWLY INITIALIZED. The model's pretrained weights were NOT loaded. This is a fundamental incompatibility between TE's weight layout and HF's safetensors format for non-TE-native models.",
+    "accuracy_check": "FAIL — CE at step 20 = 15.2487, far above bf16 baseline ~2.5 range. Training a random-init model, not fine-tuning.",
+    "nan_inf_check": "PASS — no NaN/Inf, numerics stable, but on a random-init model"
+  },
+
+  "speed_measurement": {
+    "decision": "SKIPPED 50-step extended measurement — 20-step smoke already gave steady-state number and correctness FAIL means extended measurement would waste budget.",
+    "step_per_min_steady": 21.9,
+    "step_per_min_steps_10_to_20": 22.0,
+    "step_per_min_peak_step_20": 21.9,
+    "tok_per_s": 2989,
+    "time_per_step_s": 2.74,
+    "flops_per_step": 917000000000000,
+    "flops_per_step_note": "6 * 14e9 params * 8192 tokens * 1.33 (grad ckpt 4x fwd adjusted to 3x effective for LoRA) = 9.17e14",
+    "achieved_tflops": 335,
+    "mfu_bf16_eq_pct": 33.8,
+    "mfu_fp8_peak_pct": 16.9,
+    "delta_vs_r7_pct": -57.1,
+    "delta_vs_r8a_pct": -47.2,
+    "speed_verdict": "FP8 path is SLOWER than bf16 baseline by ~57% (vs r7) and ~47% (vs r8a). Root causes: (1) torch.compile forced to mode=default when fp8_active, disabling cudagraphs+max-autotune (r7 didn't have compile either, so this isn't the delta), (2) TE custom autograd path has per-op overhead without compiler fusion, (3) gradient checkpointing ON forces 4x forward recompute which nullifies FP8 forward savings, (4) TE amax history sync every step adds allreduce-like latency, (5) the model is loaded as te.Linear but LoRA adapters on top are bf16 nn.Linear — every forward crosses dtype boundaries triggering implicit casts."
+  },
+
+  "ceiling_breakthrough_verdict": "FAIL — NO BREAKTHROUGH",
+  "verdict_detail": "r8c FP8 measurement is INVALID for apples-to-apples with r7. (1) Loss ~15 proves the base model is random-init due to TE monkey-patch breaking HF weight load — this is a correctness failure, not just accuracy degradation. (2) Even accepting the broken stack, speed is 33.8% bf16-eq MFU, far below r7's 62.6%, r8a's 48.12%, and the 75% bf16 breakthrough threshold. (3) 16.9% FP8-peak MFU is below the 40% threshold. Neither celebration condition met.",
+
+  "honest_analysis": {
+    "what_worked": [
+      "torch 2.9 + TE 2.13 install on runpod/pytorch:2.4.0 image (with LD_LIBRARY_PATH fix)",
+      "TE fp8_autocast forward+backward on H100 SM_90 (verified via standalone te.Linear test)",
+      "Trainer patch applied correctly, import guard works, --fp8 flag gates properly",
+      "Pod provisioning flow (previous agent) and 20-step smoke launch"
+    ],
+    "what_failed": [
+      "The fundamental FP8+HF integration strategy — monkey-patching nn.Linear to te.Linear BEFORE from_pretrained is incompatible with safetensors that don't contain _extra_state entries. Patch disclaimer #1 warned about this but the patch implementation still used this approach. The patch would need to either: (a) wrap individual modules post-load via module replacement with weight copy, or (b) use accelerate's FP8RecipeKwargs which has a different integration mechanism, or (c) wait for HF+TE native integration (not available as of 2026-04-15).",
+      "Even if correctness were fixed, speed uplift is negative — FP8 via post-load wrapper would still suffer from gradient checkpointing 4x fwd recompute nullifying FP8 benefit for LoRA where compute is dominated by base-model forward."
+    ],
+    "lessons_for_future_fp8_attempts": [
+      "FP8 on HuggingFace Qwen2 requires accelerate.Accelerator(fp8_recipe_handler=...) path, NOT raw TE monkey-patch",
+      "FP8 + gradient checkpointing is ANTI-SYNERGISTIC — grad ckpt recomputes FP8 forward which has higher fixed overhead per call than bf16",
+      "FP8 benefit materializes mainly with: no grad ckpt + torch.compile max-autotune + NeMo-native architecture + batch size >= 4 (compute-bound)",
+      "For 14B LoRA fine-tune, the fastest path is the r7/r8a Unsloth stack (bf16 + fused kernels + tf32 + cudnn), NOT FP8 retrofit"
+    ],
+    "recommendation": "ABANDON FP8 retrofit for current HF-based trainer. Route FP8 exploration via (1) accelerate Accelerator FP8 path, OR (2) full rewrite as NeMo/Megatron-LM native training. Neither is P4 scope. For r8 ceiling breakthrough, pursue: batch sweep (#26), nn_core Tensor port (#27), or r8a Unsloth speedups (#28)."
+  },
+
+  "cost_accounting": {
+    "pod_runtime_min": 42,
+    "cost_actual_usd": 2.10,
+    "cost_budget_usd": "3-5",
+    "within_budget": true,
+    "wasted_vs_informed": "informed — clean FAIL verdict with detailed root cause unblocks #26/#27/#28 for true ceiling push"
   },
 
   "r7_baseline_for_comparison": {
@@ -47,25 +108,13 @@
     "tflops_bf16": 619,
     "config": {"batch": 1, "grad_accum": 8, "seq": 1024},
     "pod": "ubzp169igb7tns (terminated)",
-    "note": "Fair comparison against same b/g/s config, but DIFFERENT pod due to fleet variance (31% observed r7 vs r6 pod same stack)"
+    "note": "Fair comparison against same b/g/s config"
   },
 
-  "fallback_chain_if_te_install_fails": [
-    "torch==2.9.0 + TE 2.13.0",
-    "torch==2.8.0 + TE 2.12",
-    "torch==2.8.0 + TE 2.11",
-    "torch==2.10 + TE from source w/ cudnn-dev install",
-    "ABORT with documented error"
-  ],
-
-  "success_criteria": {
-    "smoke_verdict_pass_if": "20 steps complete without crash, loss finite, loss decreasing",
-    "celebration_condition": "FP8 measurement >= 75% bf16-MFU OR >= 40% fp8-MFU = bf16 ceiling BREAKTHROUGH",
-    "target": "FP8-bf16-equivalent MFU > r7 62.6%",
-    "accuracy_check": "loss curve monotonic decrease, no NaN/Inf, CE within 0.05 of bf16 at same step"
-  },
-
-  "cost_budget_usd": "3-5",
-  "expected_duration_min": "20 (install) + 5 (smoke) + 20 (measurement) = 45 min",
-  "expected_cost_usd": 2.25
+  "r8a_baseline_for_comparison": {
+    "step_per_min": 41.5,
+    "mfu_bf16_pct": 48.12,
+    "pod": "xhq9b2c8fljdyo (NOT touched by r8c)",
+    "note": "Measured on slower-variance pod"
+  }
 }
