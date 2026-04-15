@@ -16,6 +16,11 @@ let NEXUS_HARNESS = HOME + "/Dev/nexus/shared/harness"
 let LINT_LOG = NEXUS_HARNESS + "/lint_log.jsonl"
 let MISTAKES_LOG = NEXUS_HARNESS + "/mistakes.jsonl"
 
+// ─── Lint marker budget (HARN-P8-1) ───
+// --all 모드에서 총 addressable violation 수가 이 값을 초과하면 warn.
+// 로드맵 이력: P6 200 → P7 100 → P8 50
+let LINT_MARKER_BUDGET: i64 = 50
+
 fn now_ts() {
     return exec("date +%s").trim()
 }
@@ -2663,9 +2668,26 @@ fn _is_harness_log(path: string) -> bool {
     return false
 }
 
+// HARN-P8-1 FP filter: HEAD commit 에 harness 승인 마커가 있으면 HARNESS-LOCK 재발화 안 함.
+// commit.hexa/cmd_gate/agent_ledger exit() 미전파 이슈로 stdout sentinel 패턴 도입된 상태 (memory: f-hexa-exit-sentinel).
+// 이미 harness-approved 된 작업의 --all 스캔은 false positive.
+fn _head_commit_harness_ok() -> bool {
+    let subj = _str(exec("git log -1 --format='%s' 2>/dev/null")).trim()
+    if subj == "" { return false }
+    if subj.index_of("(harness)") >= 0 { return true }
+    if subj.index_of("harness-approved") >= 0 { return true }
+    let body = _str(exec("git log -1 --format='%b' 2>/dev/null")).trim()
+    if body.index_of("harness-approved") >= 0 { return true }
+    let trailers = _str(exec("git log -1 --format='%B' 2>/dev/null")).trim()
+    if trailers.index_of("harness-approved") >= 0 { return true }
+    return false
+}
+
 fn check_harness_modification(path: string) -> string {
     if !path.starts_with("shared/harness/") { return "" }
     if _is_harness_log(path) { return "" }
+    // HARN-P8-1 FP filter: HEAD 에 harness 승인 이미 있으면 noise — skip.
+    if _head_commit_harness_ok() { return "" }
     // msg_check 는 commit.hexa msg_check (commit-msg 훅) 최종 검증
     // pre-commit 단계 COMMIT_EDITMSG 는 N-1 메시지라 구조적 오탐 원인 — warn-only 로 완화
     return "HARNESS-LOCK|warn|staged shared/harness/ — commit msg '(harness):' prefix 또는 'harness-approved' 필요 (commit-msg 단계 최종 검증)"
@@ -3222,11 +3244,14 @@ fn check_think_cross(path: string) -> string {
     if e != ".hexa" { return "" }
     let tl = NEXUS_HARNESS + "/thinking_log.jsonl"
     if !file_exists(tl) { return "" }
-    let zero_touch = exec("tail -n 50 '" + tl + "' 2>/dev/null | grep -c '\"atlas_touches\":0' ").trim()
+    // HARN-P8-1 scaffold filter: BT-5xx/BT-M* 브레이크스루 탐사 쿼리는 atlas 미등록이 expected scaffold.
+    // bt_metacog prefetch 가 생성한 thinking_engine 세션이라 cross-miss 원인 아님.
+    // prompt 시작이 "BT-" 이거나 "atlas_expected: scaffold" 마커 포함 시 제외.
+    let zero_touch = exec("tail -n 50 '" + tl + "' 2>/dev/null | grep '\"atlas_touches\":0' | grep -v '\"prompt\":\"BT-' | grep -v '\"atlas_expected\":\"scaffold\"' | wc -l").trim()
     if zero_touch == "" { return "" }
     let n = _to_int0(zero_touch)
     if n >= 10 {
-        return "H-THINK-CROSS|block|H-THINK-CROSS: 최근 50 세션 중 atlas_touches=0 " + to_string(n) + "건 (atlas 미등록)"
+        return "H-THINK-CROSS|block|H-THINK-CROSS: 최근 50 세션 중 atlas_touches=0 " + to_string(n) + "건 (atlas 미등록, BT-scaffold 제외)"
     }
     return ""
 }
@@ -3611,6 +3636,27 @@ let files = files_raw.split("\n")
 let mut violations: [string] = []
 let mut checked: i64 = 0
 
+// ─── HARN-P8-1: 글로벌 상태 룰 fire-once 플래그 ───
+// --all 모드에서 check_*() 가 매 .hexa 파일마다 동일 메시지 푸시 → total 마커 인플레이트.
+// 파일 단위 수정 불가한 global-state 룰은 최대 1회만 발화.
+// filter 반영 대상: H-THINK-*, L0 (warn-level, commit-msg 최종 검증), HARNESS-LOCK (FP),
+//                   H-EMERGE-COMMIT, H-EVOLVE-CRON, H-RES-OOM, H-PERF-BASELINE,
+//                   H-CROSS-NEXUS-N6, H-CROSS-N6-ANIMA, H-NOREGRESS.
+let mut _once_think_shallow = false
+let mut _once_think_loop = false
+let mut _once_think_cross = false
+let mut _once_think_evolve = false
+let mut _once_think_diverge = false
+let mut _once_emerge_commit = false
+let mut _once_evolve_cron = false
+let mut _once_res_oom = false
+let mut _once_perf_baseline = false
+let mut _once_cross_nexus_n6 = false
+let mut _once_cross_n6_anima = false
+let mut _once_no_regress = false
+let mut _once_harness_lock = false
+let mut _once_l0_lockdown = false
+
 // ─── H9 one-shot gate: hook stdin round-trip 회귀 감지 ───
 // hooks/*.hexa 가 스코프에 있으면 1회만 실행. 없으면 조용히 스킵.
 // gate 실패 시 lint 의 후속 check 에서 runtime 에러가 나도 확실히 차단하도록
@@ -3675,9 +3721,13 @@ for f in files {
     }
 
     // check_l0_lockdown: only shared/ files
-    if under_shared {
+    // HARN-P8-1: warn-level 이고 commit-msg 단계 최종 검증. --all 에서 fire-once.
+    if under_shared && !_once_l0_lockdown {
         let v3 = check_l0_lockdown(path)
-        if v3 != "" { violations = violations.push(path + "|" + v3) }
+        if v3 != "" {
+            violations = violations.push(path + "|" + v3)
+            if mode == "all" { _once_l0_lockdown = true }
+        }
     }
 
     // check_pitfalls: only .hexa files
@@ -3729,8 +3779,14 @@ for f in files {
     if v8b != "" { violations = violations.push(path + "|" + v8b) }
 
     // check_harness_modification: shared/harness/ 수정 시 승인 마커 필요
-    let v9 = check_harness_modification(path)
-    if v9 != "" { violations = violations.push(path + "|" + v9) }
+    // HARN-P8-1: global commit-state 룰, --all 모드에서 fire-once.
+    if !_once_harness_lock {
+        let v9 = check_harness_modification(path)
+        if v9 != "" {
+            violations = violations.push(path + "|" + v9)
+            if mode == "all" { _once_harness_lock = true }
+        }
+    }
 
     // check_silent_exit (R19): .hexa/.sh/.py/.ts/.js 대상
     if e == ".hexa" || e == ".sh" || e == ".py" || e == ".ts" || e == ".js" {
@@ -3942,45 +3998,108 @@ for f in files {
     let v_nh = check_h_nohook(path)
     if v_nh != "" { violations = violations.push(path + "|" + v_nh) }
 
+    // HARN-P8-1: global-state 룰 (atlas/baseline/cross_feed/mistakes/growth-tick 글로벌 체크)
+    // 매 .hexa 파일마다 동일 결과 → fire-once in --all mode.
+
     // check_emerge_commit (H-EMERGE-COMMIT): atlas 3 commit 연속 무성장 감지
-    let v_ec = check_emerge_commit(path)
-    if v_ec != "" { violations = violations.push(path + "|" + v_ec) }
+    if !_once_emerge_commit {
+        let v_ec = check_emerge_commit(path)
+        if v_ec != "" {
+            violations = violations.push(path + "|" + v_ec)
+            if mode == "all" { _once_emerge_commit = true }
+        }
+    }
 
     // check_no_regress (H-NOREGRESS): atlas nodes/edges 역행 차단 (NEXUS_GC_OK=1 우회)
-    let v_nr = check_no_regress(path)
-    if v_nr != "" { violations = violations.push(path + "|" + v_nr) }
+    if !_once_no_regress {
+        let v_nr = check_no_regress(path)
+        if v_nr != "" {
+            violations = violations.push(path + "|" + v_nr)
+            if mode == "all" { _once_no_regress = true }
+        }
+    }
 
     // check_perf_baseline (H-PERF-BASELINE): blowup 성능 1.2x 회귀 감지
-    let v_pb = check_perf_baseline(path)
-    if v_pb != "" { violations = violations.push(path + "|" + v_pb) }
+    if !_once_perf_baseline {
+        let v_pb = check_perf_baseline(path)
+        if v_pb != "" {
+            violations = violations.push(path + "|" + v_pb)
+            if mode == "all" { _once_perf_baseline = true }
+        }
+    }
 
     // check_cross_nexus_n6 (H-CROSS-NEXUS-N6): blowup→atlas pending 5+ 감지
-    let v_cx1 = check_cross_nexus_n6(path)
-    if v_cx1 != "" { violations = violations.push(path + "|" + v_cx1) }
+    if !_once_cross_nexus_n6 {
+        let v_cx1 = check_cross_nexus_n6(path)
+        if v_cx1 != "" {
+            violations = violations.push(path + "|" + v_cx1)
+            if mode == "all" { _once_cross_nexus_n6 = true }
+        }
+    }
 
     // check_cross_n6_anima (H-CROSS-N6-ANIMA): atlas→anima pending 3+ 감지
-    let v_cx2 = check_cross_n6_anima(path)
-    if v_cx2 != "" { violations = violations.push(path + "|" + v_cx2) }
+    if !_once_cross_n6_anima {
+        let v_cx2 = check_cross_n6_anima(path)
+        if v_cx2 != "" {
+            violations = violations.push(path + "|" + v_cx2)
+            if mode == "all" { _once_cross_n6_anima = true }
+        }
+    }
 
     // check_res_oom (H-RES-OOM): 최근 mistakes.jsonl OOM 기록 글로벌 게이트
-    let v_oom = check_res_oom(path)
-    if v_oom != "" { violations = violations.push(path + "|" + v_oom) }
+    if !_once_res_oom {
+        let v_oom = check_res_oom(path)
+        if v_oom != "" {
+            violations = violations.push(path + "|" + v_oom)
+            if mode == "all" { _once_res_oom = true }
+        }
+    }
 
     // check_evolve_cron (H-EVOLVE-CRON): growth-tick 6h stale 감지
-    let v_ev = check_evolve_cron(path)
-    if v_ev != "" { violations = violations.push(path + "|" + v_ev) }
+    if !_once_evolve_cron {
+        let v_ev = check_evolve_cron(path)
+        if v_ev != "" {
+            violations = violations.push(path + "|" + v_ev)
+            if mode == "all" { _once_evolve_cron = true }
+        }
+    }
 
-    // ─── P5 Thinking 엔진 가드 (H-THINK-*) ───
-    let v_ts = check_think_shallow(path)
-    if v_ts != "" { violations = violations.push(path + "|" + v_ts) }
-    let v_tl = check_think_loop(path)
-    if v_tl != "" { violations = violations.push(path + "|" + v_tl) }
-    let v_tc = check_think_cross(path)
-    if v_tc != "" { violations = violations.push(path + "|" + v_tc) }
-    let v_te = check_think_evolve(path)
-    if v_te != "" { violations = violations.push(path + "|" + v_te) }
-    let v_td = check_think_diverge(path)
-    if v_td != "" { violations = violations.push(path + "|" + v_td) }
+    // ─── P5 Thinking 엔진 가드 (H-THINK-*) — global thinking_log 상태, fire-once ───
+    if !_once_think_shallow {
+        let v_ts = check_think_shallow(path)
+        if v_ts != "" {
+            violations = violations.push(path + "|" + v_ts)
+            if mode == "all" { _once_think_shallow = true }
+        }
+    }
+    if !_once_think_loop {
+        let v_tl = check_think_loop(path)
+        if v_tl != "" {
+            violations = violations.push(path + "|" + v_tl)
+            if mode == "all" { _once_think_loop = true }
+        }
+    }
+    if !_once_think_cross {
+        let v_tc = check_think_cross(path)
+        if v_tc != "" {
+            violations = violations.push(path + "|" + v_tc)
+            if mode == "all" { _once_think_cross = true }
+        }
+    }
+    if !_once_think_evolve {
+        let v_te = check_think_evolve(path)
+        if v_te != "" {
+            violations = violations.push(path + "|" + v_te)
+            if mode == "all" { _once_think_evolve = true }
+        }
+    }
+    if !_once_think_diverge {
+        let v_td = check_think_diverge(path)
+        if v_td != "" {
+            violations = violations.push(path + "|" + v_td)
+            if mode == "all" { _once_think_diverge = true }
+        }
+    }
 
     // check_hexa_exit (공통, H-HEXA-EXIT): hexa child exit() 비전파 — stdout 마커 검사 권장 (.hexa)
     if e == ".hexa" {
@@ -4057,7 +4176,13 @@ for v in violations {
     let vfile = _str(parts[0])
     let vrule = _str(parts[1])
     let vsev = _str(parts[2])
-    let vhint = _str(parts[3])
+    // hint 에 | 포함 가능 (H-GRC 등) — parts[3:] 를 | 로 rejoin
+    let mut vhint = _str(parts[3])
+    let mut _pi: i64 = 4
+    while _pi < len(parts) {
+        vhint = vhint + "|" + _str(parts[_pi])
+        _pi = _pi + 1
+    }
     if vsev == "error" { has_error = true }
     if vi > 0 { viol_json = viol_json + "," }
     viol_json = viol_json + "{\"file\":\"" + json_escape(vfile) + "\",\"rule\":\"" + vrule + "\",\"severity\":\"" + vsev + "\",\"fix_hint\":\"" + json_escape(vhint) + "\"}"
@@ -4081,13 +4206,51 @@ for v in violations {
     let vfile = _str(parts[0])
     let vrule = _str(parts[1])
     let vsev = _str(parts[2])
-    let vhint = _str(parts[3])
+    // hint 에 | 포함 가능 — parts[3:] rejoin
+    let mut vhint = _str(parts[3])
+    let mut _pi: i64 = 4
+    while _pi < len(parts) {
+        vhint = vhint + "|" + _str(parts[_pi])
+        _pi = _pi + 1
+    }
     let line = "{\"file\":\"" + json_escape(vfile) + "\",\"rule\":\"" + vrule + "\",\"severity\":\"" + vsev + "\",\"fix_hint\":\"" + json_escape(vhint) + "\"}"
     // stderr 로
     try { exec("echo '" + line.replace("'", "'\\''") + "' >&2") } catch e {}
     // mistakes.jsonl 누적
     let m = "{\"ts\":\"" + now_iso() + "\",\"kind\":\"lint_fail\",\"file\":\"" + json_escape(vfile) + "\",\"rule\":\"" + vrule + "\",\"fix\":\"" + json_escape(vhint) + "\"}"
     try { exec("echo '" + m.replace("'", "'\\''") + "' >> '" + MISTAKES_LOG + "'") } catch e {}
+}
+
+// ─── Lint marker budget gate (--all 모드 전용) ───
+// addressable violation 총수가 LINT_MARKER_BUDGET 초과 시 warn 출력.
+// 글로벌 상태 트리거 (H-THINK-CROSS, HARNESS-LOCK 등) 는 제외 — 파일 단위 수정 불가.
+// HARN-P8-1: L0/H-CROSS-*/H-NOREGRESS 추가. 이제 fire-once 라 count 가중치 영향은 적음.
+if mode == "all" {
+    let mut addressable: i64 = 0
+    for v in violations {
+        let vs = _str(v)
+        if vs == "" { continue }
+        // 글로벌 상태 트리거 제외 (파일 단위 수정 불가 — commit-msg/env/cron/baseline 상태)
+        if vs.index_of("H-THINK-CROSS") >= 0 { continue }
+        if vs.index_of("H-THINK-DIVERGE") >= 0 { continue }
+        if vs.index_of("H-THINK-SHALLOW") >= 0 { continue }
+        if vs.index_of("H-THINK-LOOP") >= 0 { continue }
+        if vs.index_of("H-THINK-EVOLVE") >= 0 { continue }
+        if vs.index_of("HARNESS-LOCK") >= 0 { continue }
+        if vs.index_of("L0|warn") >= 0 { continue }
+        if vs.index_of("H-EMERGE-COMMIT") >= 0 { continue }
+        if vs.index_of("H-EVOLVE-CRON") >= 0 { continue }
+        if vs.index_of("H-RES-OOM") >= 0 { continue }
+        if vs.index_of("H-PERF-BASELINE") >= 0 { continue }
+        if vs.index_of("H-CROSS-NEXUS-N6") >= 0 { continue }
+        if vs.index_of("H-CROSS-N6-ANIMA") >= 0 { continue }
+        if vs.index_of("H-NOREGRESS") >= 0 { continue }
+        addressable = addressable + 1
+    }
+    if addressable > LINT_MARKER_BUDGET {
+        let budget_msg = "LINT-MARKER-BUDGET|warn|addressable violations " + to_string(addressable) + " > budget " + to_string(LINT_MARKER_BUDGET) + " — @allow marker 또는 코드 수정 필요"
+        try { exec("echo '{\"file\":\"\",\"rule\":\"LINT-MARKER-BUDGET\",\"severity\":\"warn\",\"fix_hint\":\"addressable " + to_string(addressable) + " > " + to_string(LINT_MARKER_BUDGET) + "\"}' >&2") } catch e {}
+    }
 }
 
 // error 가 있으면 차단, warn/info 만이면 통과
