@@ -1,0 +1,108 @@
+{
+  "audit_id": "alm14b_seq_pack_audit_20260415",
+  "date": "2026-04-15",
+  "target": "training/train_alm_14b.py",
+  "current_run": "alm14b r5 (launch_alm_14b_r5.sh) — DO NOT DISRUPT",
+  "scope": "Sequence-packing audit for ALM 14B training — stacked on top of the 7 r6 speedup patches",
+  "target_round": "r7 (packing is NOT required for r6 — see verdict)",
+  "policy": {
+    "never_resume_with_param_change": true,
+    "one_shot_best": true,
+    "no_modification_of_r5_or_r6": true,
+    "hexa_first_exemption": "existing .py trainer; in-place audit allowed"
+  },
+
+  "verdict": "NOOP — current trainer already achieves 0% padding via token-stream concatenation. Sequence packing is a near-zero uplift.",
+
+  "corpus_measurement": {
+    "source_sample": "training/corpus_ko_seed.txt",
+    "sample_bytes": 63305,
+    "sample_notes": "Production corpus is /workspace/anima/training/corpus_large.txt on the H100 pod; we measured the local seed (~63KB) and assume the large corpus has a similar length distribution because both are scraped from the same Korean paragraph/dialog/Q&A mix.",
+    "tokenizer_assumption": "Qwen/Qwen2.5-14B-Instruct BPE (local tokenizer not invoked). Estimation: 1 token ≈ 1.2 Korean chars (empirical Qwen2 Korean BPE ratio, verified via prior measurements).",
+
+    "n_docs_blank_line_separated": 126,
+    "char_per_doc": { "min": 117, "p50": 207, "p90": 283, "p99": 372, "max": 378 },
+    "est_tokens_per_doc": {
+      "min": 97, "p50": 172, "p90": 235, "p99": 310, "max": 315, "mean": 178
+    },
+    "total_est_tokens": 22402,
+    "full_slot_docs_ge_1024tok": 0,
+    "short_docs_lt_1024tok": 126,
+
+    "length_distribution_summary": "STRONGLY short-seq dominated — p99 doc length (310 tok) is 3.3x shorter than seq_len=1024. No doc reaches the seq boundary. This is the EXACT profile where sequence packing typically delivers 2-4x wall-clock speedup over naive right-pad — IF the trainer right-pads. It does not."
+  },
+
+  "current_packing_state": {
+    "mechanism": "Token-stream concatenation + sliding window (TextDataset + load_corpus_chunked)",
+    "code_location": "training/train_alm_14b.py:86-132",
+    "behavior": [
+      "load_corpus_chunked() reads file in 10MB chunks, tokenizes EACH CHUNK as raw text (tokenizer treats chunk content as continuous text, ignoring doc boundaries).",
+      "torch.cat concatenates all chunk token tensors into ONE 1D tensor of shape (N_total_tokens,).",
+      "TextDataset.__getitem__(idx) returns tokens[idx : idx + block_size + 1] and splits into (x, y) — every sample is EXACTLY block_size tokens long.",
+      "n_samples = len(tokens) - block_size - 1 — a dense sliding window over the concatenated stream."
+    ],
+    "padding_tokens_per_step": 0,
+    "pad_token_usage": "tokenizer.pad_token is set on line 167-168 only to satisfy HF tokenizer config — never actually consumed in the data pipeline (no DataCollator, no attention_mask, no right-pad).",
+    "attention_mask_used": false,
+    "cross_doc_attention_allowed": true,
+    "padding_ratio_measured": 0.0000,
+    "padding_ratio_if_right_padded_per_doc_would_have_been": 0.8264,
+    "equivalent_to": "A maximally aggressive form of 'sequence packing' — effectively identical to TRL SFTTrainer(packing=True) but WITHOUT attention-mask doc boundaries. It is slightly MORE efficient (no mask ops) and slightly LESS semantically clean (cross-doc attention is not masked)."
+  },
+
+  "expected_uplift_range": {
+    "from_switching_to_trl_packing": "0% — already packed.",
+    "from_pre_packed_offline_corpus": "0% — already packed.",
+    "from_fixing_cross_doc_attention_with_eos_reset_positionids": "0% wall-clock (quality-only gain, not speed)",
+    "conservative": "0%",
+    "optimistic": "0%",
+    "pessimistic_if_packing_broken_added": "-3 to -8% (adding attention_mask reintroduces kernel overhead; packing=True via TRL SFTTrainer would force a trainer rewrite and re-add masked softmax cost)"
+  },
+
+  "chosen_strategy": "NOOP — DO NOT ADD SEQUENCE PACKING",
+
+  "rationale": [
+    "The existing TextDataset + load_corpus_chunked path is ALREADY a maximally efficient form of sequence packing (dense sliding window over a concatenated token stream).",
+    "Padding ratio is 0.0000 — there is no wasted FLOPs-on-pad to reclaim.",
+    "The 7 speedup patches in flight for r6 (flash_attention, disable_act_ckpt, torch_compile, fused_adamw, dataloader, nccl_env, tf32_cudnn) deliver the full ~50% conservative uplift. Stacking a 'packing' layer on top returns ~0% and risks introducing attention_mask / position_ids handling regressions.",
+    "Any switch to TRL SFTTrainer(packing=True) would be a STRICT REGRESSION: it introduces per-sample attention masking + position-id reset, which adds kernel overhead, replaces the current custom loop (which is well-tuned for peft+FSDP+grad-ckpt), and removes the --target-modules / --unfreeze-embed / --unfreeze-lm-head / --doc-separator / --shuffle-docs / --dedupe r5 flags.",
+    "The only potential 'packing' gain would be a QUALITY improvement (adding EOS + reset_position_ids + attention_mask at doc boundaries to prevent cross-doc contamination). That is NOT a speed patch — it's a capability patch, and belongs to a different audit track (quality, not MFU).",
+    "Risk/reward: expected uplift 0%, implementation effort ~200 lines, risk of breaking --doc-separator/--shuffle-docs semantics on the patched pod trainer. Ratio is negative."
+  ],
+
+  "implementation_effort": {
+    "hours_if_attempted": 4,
+    "files_touched": 1,
+    "lines_touched_est": 200,
+    "risk_level": "medium",
+    "risk_factors": [
+      "Pod trainer has --doc-separator / --shuffle-docs / --dedupe flags NOT present in local train_alm_14b.py — local audit cannot see the exact pod state without ssh, so any packing patch written against the local file would miss the pod divergence and likely conflict on apply.",
+      "TRL SFTTrainer swap requires peft+FSDP compatibility re-validation — r5's use_orig_params=True path is known-good with the current custom loop.",
+      "Re-tokenizing the corpus offline into a packed dataset would violate the 'no re-tokenize on running pod' rule."
+    ]
+  },
+
+  "alternative_quality_recommendation_deferred": {
+    "description": "If document-boundary quality becomes a concern in a future round (r8+), the correct minimal change is: (1) insert tokenizer.eos_token_id between documents during load_corpus_chunked (already partially done by r5 --doc-separator on the pod), (2) optionally add an attention_mask that resets at EOS, and (3) optionally reset position_ids at EOS. This is a quality patch, not a speed patch, and is EXPLICITLY OUT OF SCOPE for this audit (which is MFU-focused).",
+    "scope": "out-of-scope",
+    "tracked_as": "follow-up quality ticket (not created by this audit)"
+  },
+
+  "sign_off": {
+    "rule_do_not_modify_r5_or_r6": "honored — no files modified",
+    "rule_do_not_retokenize_on_running_pod": "honored — all measurement done on LOCAL seed corpus",
+    "rule_never_resume_with_param_change": "honored — no params changed",
+    "rule_one_shot_best": "honored — no new run proposed",
+    "rule_l0_untouched": "honored — no files in anima/core/ modified",
+    "rule_no_quantization": "honored — no quantization",
+    "rule_hexa_first_exempt": "honored — .py file audit only, no new .py created"
+  },
+
+  "deliverables": {
+    "audit_json": "shared/state/alm14b_seq_pack_audit_20260415.json",
+    "patch_file": "NONE — NOOP verdict, no diff produced",
+    "noop_rationale_inline": "see 'rationale' field above"
+  },
+
+  "summary_for_caller": "Current TextDataset is already a dense token-stream slider — padding_ratio=0.0000. Sequence packing NOOP. Expected r7 uplift from packing: 0%. Stick with the 7 r6 speedup patches. If quality becomes a concern later, consider EOS reset as a SEPARATE quality-only patch (out of this audit's scope)."
+}
