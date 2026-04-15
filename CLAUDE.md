@@ -14,6 +14,8 @@ harness (훅 시스템 대체, 2026-04-14~):
   settings.json 정책: 전 프로젝트 hooks={} — 훅 실행 없음. 대신 Claude가 매 프롬프트/Write/Bash 후 entry.hexa 자율 호출.
   관례: 사용자 입력 직후 `entry.hexa prompt`, Write/Edit 후 `entry.hexa post write_edit`, Bash 후 `entry.hexa post bash`, Agent 호출 전 `entry.hexa guard`.
   복잡 질문/설계 결정 전  hexa $NEXUS/shared/harness/entry.hexa thinking query "<prompt>"   → anima 6-phase reflection 결과 context 주입
+  dod_gate: hexa shared/harness/dod_gate.hexa <check|verify|explain> <track> — DoD artifact 검증, roadmap 승격 게이트 (H-DOD)
+  verifier: shared/harness/verifier.hexa — dod_gate 내부 순수 검증기 (H-VERIFIER)
   archive: shared/hooks → shared/archive/hooks-20260414/ (symlink 하위호환, 신규 참조 금지)
 
 blowup infra:
@@ -53,6 +55,9 @@ L0 보호 (평시 자유 수정, 유저 명시 요청 시만 승인 절차):
   shared/harness/cmd_gate.hexa — seed 검증 gate
   shared/harness/{prompt_scan,pre_tool_guard,post_bash,post_edit}.hexa — sub-modules
   shared/harness/exec_validated — gate 적용 실행 래퍼 (bin/ 심링크 유지)
+  shared/harness/dod_gate.hexa — DoD 검증 게이트 (H-DOD/H-CLAIM-LEX)
+  shared/harness/verifier.hexa — dod_gate 내부 순수 검증기 (H-VERIFIER)
+  shared/roadmaps/voice_dod.json — voice 트랙 DoD 스펙
   shared/config/permissions_ssot.json — deny 패턴 SSOT
   shared/blowup/core/blowup.hexa — 9-phase 파이프라인
   shared/blowup/modules/*.hexa — 6종 변종
@@ -92,4 +97,6 @@ ref:
   cli_spec  shared/engine/nexus_cli_spec.json    nexus-cli 외부 진입점 스펙 (hive 등)
   lenses    shared/config/lens_registry.json     400종
   grammar   shared/config/hexa_grammar.jsonl     hexa-lang+pitfalls P1~P5
+  dod       shared/harness/dod_gate.hexa          H-DOD/H-CLAIM-LEX
+  voice_dod shared/roadmaps/voice_dod.json        voice 트랙 DoD 스펙
   api       shared/CLAUDE.md
