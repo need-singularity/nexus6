@@ -8,6 +8,24 @@ let HEXA = HOME + "/Dev/nexus/shared/bin/hexa"
 let HARNESS = HOME + "/Dev/nexus/shared/harness"
 let CMDS_JSON = HOME + "/Dev/nexus/shared/config/commands.json"
 
+// ─── freshness 캐시 — idempotent 하위 check 반복 skip ──────────────
+// 각 sub-module 호출 전에 fresh 확인 → TTL 내면 skip.
+// 무효화는 각 모듈 자체의 내부 상태 변경 시 자연 만료 (파일 삭제 or TTL 경과).
+// 매 prompt 당 ~1-2초 절감 (7개 중 3개가 200-400ms hexa startup).
+fn is_fresh(tag: str, ttl_sec: i64) -> bool {
+    let path = "/tmp/prompt_scan_fresh_" + tag
+    let age = to_string(exec("[ -f " + path + " ] && echo $(( $(date +%s) - $(stat -f%m " + path + " 2>/dev/null || echo 0) )) || echo -1")).trim()
+    if age == "-1" || age == "" { return false }
+    let age_i = to_int(age)
+    if age_i < ttl_sec { return true }
+    return false
+}
+
+fn mark_fresh(tag: str) {
+    let path = "/tmp/prompt_scan_fresh_" + tag
+    let _ = exec("touch " + path)
+}
+
 // commands.json SSOT 동적 로드 — 공용 + project_specific[git basename] 머지.
 // 하드코딩 미러 금지 (R36 후보, drift 0).
 fn load_cmds_from_ssot() {
@@ -122,35 +140,51 @@ fn main() {
     if lower.len() == 0 { return }
 
     // H-ERR-DRAIN — errors.jsonl open 카운트 임계치 초과 시 drain 경고
-    if env("NEXUS_DRAIN_OK") != "1" {
+    // 30s TTL: drain 상태는 Claude 가 실제 fix 작업 해야 변함 → 30s 내 동일 결과.
+    if env("NEXUS_DRAIN_OK") != "1" && is_fresh("drain", 30) == false {
         let drain_cmd = HEXA + " run " + HARNESS + "/errors.hexa drain_check 10 2>&1"
         let drain_out = to_string(exec(drain_cmd)).trim()
         if drain_out.len() > 0 { println(drain_out) }
+        mark_fresh("drain")
     }
 
     // H-GIT-FRESH — 30분 stale 시 fetch + origin drift alert (세션 간 commit 중복 방지)
-    let gf_cmd = HEXA + " run " + HARNESS + "/git_fresh.hexa check 2>&1"
-    let gf_out = to_string(exec(gf_cmd)).trim()
-    if gf_out.len() > 0 { println(gf_out) }
+    // 60s TTL: 내부적으로 이미 30분 stale throttle 있음 → hexa startup 만 절감.
+    if is_fresh("git_fresh", 60) == false {
+        let gf_cmd = HEXA + " run " + HARNESS + "/git_fresh.hexa check 2>&1"
+        let gf_out = to_string(exec(gf_cmd)).trim()
+        if gf_out.len() > 0 { println(gf_out) }
+        mark_fresh("git_fresh")
+    }
 
     // H-LOOP-REPORT — SKILL (/loop) → HARNESS 강제 집행.
     //   직전 loop 사이클이 NEXT_AFTER 를 emit 했는데 Claude 보고에 미반영 시 stderr WARN + stdout 강제 지시.
+    //   bash 스크립트라 hexa startup 없음 → 캐시 생략, 원본 유지.
     let lr_cmd = "bash " + HARNESS + "/loop_report verify 2>&1"
     let lr_out = to_string(exec(lr_cmd)).trim()
     if lr_out.len() > 0 { println(lr_out) }
 
     // H-SESSION-REGISTRY — 세션 manifest 갱신 + 다른 활성 세션 노출
-    exec(HEXA + " run " + HARNESS + "/session_registry.hexa register nexus harness prompt_in >/dev/null 2>&1")
-    let peers_cmd = HEXA + " run " + HARNESS + "/session_registry.hexa peers 2>&1 1>/dev/null"
-    let peers_out = to_string(exec(peers_cmd)).trim()
-    if peers_out.len() > 0 { println(peers_out) }
+    // 30s TTL: 세션 heartbeat 은 30s 이내 중복해도 무의미, peers 목록도 30s 안정.
+    if is_fresh("session_reg", 30) == false {
+        exec(HEXA + " run " + HARNESS + "/session_registry.hexa register nexus harness prompt_in >/dev/null 2>&1")
+        let peers_cmd = HEXA + " run " + HARNESS + "/session_registry.hexa peers 2>&1 1>/dev/null"
+        let peers_out = to_string(exec(peers_cmd)).trim()
+        if peers_out.len() > 0 { println(peers_out) }
+        mark_fresh("session_reg")
+    }
 
     // H-BROADCAST — 최근 5분 shared/ 변경 tail (cross-project 가시화)
-    let bc_cmd = HEXA + " run " + HARNESS + "/broadcast.hexa tail 300 2>&1"
-    let bc_out = to_string(exec(bc_cmd)).trim()
-    if bc_out.len() > 0 { println(bc_out) }
+    // 20s TTL: 5분 윈도 tail 이라 20s 겹침 허용해도 놓칠 이벤트 거의 없음.
+    if is_fresh("broadcast", 20) == false {
+        let bc_cmd = HEXA + " run " + HARNESS + "/broadcast.hexa tail 300 2>&1"
+        let bc_out = to_string(exec(bc_cmd)).trim()
+        if bc_out.len() > 0 { println(bc_out) }
+        mark_fresh("broadcast")
+    }
 
     // H-SECURITY — passive secret/path 스캔 (실패 무시, 본체 영향 X)
+    // 캐시 생략: 매 prompt 내용이 다르므로 idempotent 아님.
     let sec_text = user_text.replace("\"", "\\\"")
     exec(HEXA + " run " + HARNESS + "/security_scan.hexa prompt \"" + sec_text + "\" 2>/dev/null")
 
