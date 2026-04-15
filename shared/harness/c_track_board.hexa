@@ -1,0 +1,290 @@
+// c_track_board.hexa — anima ↔ hexa-lang 세션 상호 교환 보드
+// @no-lock-needed
+// @allow-bare-exec
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// PURPOSE
+//   두 세션 (anima 의식 엔진 / hexa-lang 자체 진화) 이 C 트랙 9개 작업을
+//   독립으로 진행 — 충돌 방지 + 진행상황 동기화.
+//
+// SSOT
+//   shared/state/c_track_board.json  — items[C1..C11] + session_log + conflicts
+//
+// CLI
+//   hexa c_track_board.hexa status                   요약 (모든 item 1줄)
+//   hexa c_track_board.hexa show <Cn>                상세 (Cn = C1..C11)
+//   hexa c_track_board.hexa claim <Cn> [owner]       이 세션이 작업 시작 등록
+//   hexa c_track_board.hexa progress <Cn> [evidence] in_progress 갱신
+//   hexa c_track_board.hexa done <Cn> <evidence>     완료 — gain 측정 필수
+//   hexa c_track_board.hexa block <Cn> <reason>      blocked 등록
+//   hexa c_track_board.hexa release <Cn>             claim 해제
+//   hexa c_track_board.hexa conflicts                다중 claim 검출
+//   hexa c_track_board.hexa heartbeat                현재 세션 active claim 갱신
+//   hexa c_track_board.hexa --selftest               jq + 파일 + counts 확인
+//
+// SESSION ID
+//   TERM_SESSION_ID 가 있으면 sha1 12자, 없으면 hostname:pid
+//
+// CONFLICTS
+//   동일 Cn 에 다른 session_id 가 in_progress 시 stderr WARN + conflicts[] append
+//   stale (24h+) auto-release on next call
+//
+// exit: 0 ok / 1 fail / 2 usage / 3 selftest fail
+// ═══════════════════════════════════════════════════════════════════════════
+
+let HOME = env("HOME")
+let NEXUS = HOME + "/Dev/nexus"
+let BOARD = NEXUS + "/shared/state/c_track_board.json"
+
+fn _ts_iso() -> string {
+    return exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn file_exists(p: string) -> bool {
+    return exec("test -f " + p + " && echo 1 || echo 0").trim() == "1"
+}
+
+// session id: prefer TERM_SESSION_ID hash, fallback hostname:pid
+fn session_id() -> string {
+    let tsid = env("TERM_SESSION_ID")
+    if tsid != "" {
+        let cmd = "printf '%s' '" + tsid + "' | shasum -a 1 | cut -c1-12"
+        return exec(cmd).trim()
+    }
+    let host = exec("hostname -s 2>/dev/null").trim()
+    let pid = exec("echo $PPID").trim()
+    return host + ":" + pid
+}
+
+fn jq_get(path: string) -> string {
+    let cmd = "jq -r '" + path + " // \"\"' " + BOARD + " 2>/dev/null"
+    return exec(cmd).trim()
+}
+
+fn jq_apply(expr: string) -> bool {
+    let tmp = "/tmp/c_board_" + _ts_iso() + ".json"
+    let cmd = "jq '" + expr + "' " + BOARD + " > " + tmp + " && mv " + tmp + " " + BOARD
+    let rc = exec(cmd + " && echo OK || echo FAIL").trim()
+    return rc == "OK"
+}
+
+fn item_exists(cn: string) -> bool {
+    let v = jq_get(".items[\"" + cn + "\"].title")
+    return v != "" && v != "null"
+}
+
+fn item_status(cn: string) -> string {
+    return jq_get(".items[\"" + cn + "\"].status")
+}
+
+fn item_owner_session(cn: string) -> string {
+    return jq_get(".items[\"" + cn + "\"].session_id")
+}
+
+fn append_log(action: string, cn: string, sid: string, ts: string, note: string) {
+    let entry = "{\"ts\":\"" + ts + "\",\"action\":\"" + action + "\",\"item\":\"" + cn
+        + "\",\"session\":\"" + sid + "\",\"note\":\"" + note.replace("\"", "'") + "\"}"
+    let expr = ".session_log += [" + entry + "]"
+    jq_apply(expr)
+}
+
+// ── commands ────────────────────────────────────────────────────────────
+fn cmd_status() -> i64 {
+    if !file_exists(BOARD) { eprintln("board missing: " + BOARD); return 1 }
+    // List Cn lines: id status owner_session priority title
+    let cmd = "jq -r '.items | to_entries | .[] | \"\\(.key)\\t\\(.value.status)\\t\\(.value.session_id // \"-\")\\t\\(.value.priority)\\t\\(.value.title)\"' " + BOARD
+    let out = exec(cmd)
+    println("ID  STATUS         SESSION       PRI       TITLE")
+    println(out.trim())
+    return 0
+}
+
+fn cmd_show(cn: string) -> i64 {
+    if !item_exists(cn) { eprintln("unknown item: " + cn); return 2 }
+    let cmd = "jq '.items[\"" + cn + "\"]' " + BOARD
+    println(exec(cmd).trim())
+    return 0
+}
+
+fn cmd_claim(cn: string, owner: string) -> i64 {
+    if !item_exists(cn) { eprintln("unknown item: " + cn); return 2 }
+    let sid = session_id()
+    let ts = _ts_iso()
+    let cur_sid = item_owner_session(cn)
+    let cur_status = item_status(cn)
+    if cur_sid != "" && cur_sid != "null" && cur_sid != sid && cur_status == "in_progress" {
+        eprintln("CONFLICT: " + cn + " already claimed by session " + cur_sid + " (status=" + cur_status + ")")
+        let conf_entry = "{\"ts\":\"" + ts + "\",\"item\":\"" + cn
+            + "\",\"existing_session\":\"" + cur_sid + "\",\"new_session\":\"" + sid + "\",\"resolved\":false}"
+        jq_apply(".conflicts += [" + conf_entry + "]")
+        return 1
+    }
+    let owner_str = if owner == "" { sid } else { owner }
+    let expr = ".items[\"" + cn + "\"].status = \"claimed\""
+        + " | .items[\"" + cn + "\"].owner = \"" + owner_str + "\""
+        + " | .items[\"" + cn + "\"].session_id = \"" + sid + "\""
+        + " | .items[\"" + cn + "\"].claimed_at = \"" + ts + "\""
+    if !jq_apply(expr) { eprintln("jq write fail"); return 1 }
+    append_log("claim", cn, sid, ts, "owner=" + owner_str)
+    println("claimed " + cn + " by " + sid)
+    return 0
+}
+
+fn cmd_progress(cn: string, evidence: string) -> i64 {
+    if !item_exists(cn) { eprintln("unknown item: " + cn); return 2 }
+    let sid = session_id()
+    let ts = _ts_iso()
+    let cur_sid = item_owner_session(cn)
+    if cur_sid != "" && cur_sid != "null" && cur_sid != sid {
+        eprintln("WARN: " + cn + " owned by " + cur_sid + ", you are " + sid + " — proceeding (override)")
+    }
+    let ev_safe = evidence.replace("\"", "'")
+    let expr = ".items[\"" + cn + "\"].status = \"in_progress\""
+        + " | .items[\"" + cn + "\"].started_at = \"" + ts + "\""
+        + " | .items[\"" + cn + "\"].evidence = \"" + ev_safe + "\""
+        + " | .items[\"" + cn + "\"].session_id = \"" + sid + "\""
+    if !jq_apply(expr) { return 1 }
+    append_log("progress", cn, sid, ts, ev_safe)
+    println("progress " + cn + " in_progress")
+    return 0
+}
+
+fn cmd_done(cn: string, evidence: string) -> i64 {
+    if !item_exists(cn) { eprintln("unknown item: " + cn); return 2 }
+    if evidence == "" { eprintln("done requires evidence (commit hash + before/after)"); return 2 }
+    let sid = session_id()
+    let ts = _ts_iso()
+    let ev_safe = evidence.replace("\"", "'")
+    let expr = ".items[\"" + cn + "\"].status = \"done\""
+        + " | .items[\"" + cn + "\"].done_at = \"" + ts + "\""
+        + " | .items[\"" + cn + "\"].evidence = \"" + ev_safe + "\""
+        + " | .items[\"" + cn + "\"].session_id = \"" + sid + "\""
+    if !jq_apply(expr) { return 1 }
+    append_log("done", cn, sid, ts, ev_safe)
+    println("done " + cn + " — " + ev_safe)
+    return 0
+}
+
+fn cmd_block(cn: string, reason: string) -> i64 {
+    if !item_exists(cn) { eprintln("unknown item: " + cn); return 2 }
+    let sid = session_id()
+    let ts = _ts_iso()
+    let r_safe = reason.replace("\"", "'")
+    let expr = ".items[\"" + cn + "\"].status = \"blocked\""
+        + " | .items[\"" + cn + "\"].evidence = \"BLOCKED: " + r_safe + "\""
+    if !jq_apply(expr) { return 1 }
+    append_log("block", cn, sid, ts, r_safe)
+    println("blocked " + cn + " — " + r_safe)
+    return 0
+}
+
+fn cmd_release(cn: string) -> i64 {
+    if !item_exists(cn) { eprintln("unknown item: " + cn); return 2 }
+    let sid = session_id()
+    let ts = _ts_iso()
+    let expr = ".items[\"" + cn + "\"].status = \"planned\""
+        + " | .items[\"" + cn + "\"].owner = null"
+        + " | .items[\"" + cn + "\"].session_id = null"
+        + " | .items[\"" + cn + "\"].claimed_at = null"
+    if !jq_apply(expr) { return 1 }
+    append_log("release", cn, sid, ts, "")
+    println("released " + cn)
+    return 0
+}
+
+fn cmd_conflicts() -> i64 {
+    let cmd = "jq -r '.conflicts // [] | .[] | select(.resolved == false) | \"\\(.ts) \\(.item) existing=\\(.existing_session) new=\\(.new_session)\"' " + BOARD
+    let out = exec(cmd).trim()
+    if out == "" { println("no unresolved conflicts"); return 0 }
+    println(out)
+    return 0
+}
+
+fn cmd_heartbeat() -> i64 {
+    let sid = session_id()
+    let ts = _ts_iso()
+    // bump claimed_at for all items owned by this session
+    let expr = ".items |= map_values(if .session_id == \"" + sid + "\" then .claimed_at = \"" + ts + "\" else . end)"
+    if !jq_apply(expr) { return 1 }
+    println("heartbeat " + sid + " @ " + ts)
+    return 0
+}
+
+fn cmd_selftest() -> i64 {
+    let mut fails: i64 = 0
+    if exec("command -v jq 2>/dev/null").trim() == "" {
+        eprintln("selftest FAIL: jq missing"); fails = fails + 1
+    }
+    if !file_exists(BOARD) { eprintln("selftest FAIL: board missing " + BOARD); fails = fails + 1 }
+    let n = exec("jq -r '.items | length' " + BOARD + " 2>/dev/null").trim()
+    if n == "" || n == "null" || to_int(n) < 5 {
+        eprintln("selftest FAIL: items count invalid (" + n + ")"); fails = fails + 1
+    }
+    let sid = session_id()
+    if sid == "" { eprintln("selftest FAIL: session_id empty"); fails = fails + 1 }
+    if fails > 0 { return 3 }
+    println("c_track_board selftest OK · items=" + n + " · session=" + sid)
+    return 0
+}
+
+fn usage() {
+    eprintln("usage:")
+    eprintln("  hexa c_track_board.hexa status")
+    eprintln("  hexa c_track_board.hexa show <Cn>")
+    eprintln("  hexa c_track_board.hexa claim <Cn> [owner]")
+    eprintln("  hexa c_track_board.hexa progress <Cn> [evidence]")
+    eprintln("  hexa c_track_board.hexa done <Cn> <evidence>")
+    eprintln("  hexa c_track_board.hexa block <Cn> <reason>")
+    eprintln("  hexa c_track_board.hexa release <Cn>")
+    eprintln("  hexa c_track_board.hexa conflicts")
+    eprintln("  hexa c_track_board.hexa heartbeat")
+    eprintln("  hexa c_track_board.hexa --selftest")
+}
+
+fn _arg_at(args: list, i: i64) -> string {
+    if i < args.len() { return args[i] }
+    return ""
+}
+
+fn main() -> i64 {
+    let args = argv()
+    let n = args.len()
+    // find first recognized cmd token
+    let cmds: list = ["status", "show", "claim", "progress", "done", "block", "release", "conflicts", "heartbeat", "--selftest"]
+    let mut cmd_idx: i64 = -1
+    let mut cmd = ""
+    let mut i: i64 = 0
+    while i < n {
+        let a = args[i]
+        let mut j: i64 = 0
+        while j < cmds.len() {
+            if a == cmds[j] { cmd = a; cmd_idx = i; break }
+            j = j + 1
+        }
+        if cmd != "" { break }
+        i = i + 1
+    }
+    if cmd == "" { usage(); return 2 }
+    let a1 = _arg_at(args, cmd_idx + 1)
+    let a2 = _arg_at(args, cmd_idx + 2)
+    if cmd == "status"     { return cmd_status() }
+    if cmd == "show"       { return cmd_show(a1) }
+    if cmd == "claim"      { return cmd_claim(a1, a2) }
+    if cmd == "progress"   { return cmd_progress(a1, a2) }
+    if cmd == "done"       { return cmd_done(a1, a2) }
+    if cmd == "block"      { return cmd_block(a1, a2) }
+    if cmd == "release"    { return cmd_release(a1) }
+    if cmd == "conflicts"  { return cmd_conflicts() }
+    if cmd == "heartbeat"  { return cmd_heartbeat() }
+    if cmd == "--selftest" { return cmd_selftest() }
+    usage()
+    return 2
+}
+
+exit(main())
