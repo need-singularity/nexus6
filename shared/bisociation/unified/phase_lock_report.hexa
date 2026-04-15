@@ -1,0 +1,385 @@
+// shared/bisociation/unified/phase_lock_report.hexa — L5 slot 5/5
+// BISOC-P8-1: L1~L5 전체 health dashboard + structured JSON report
+// 목적: bisociation engine 모든 레이어의 진행 상태를 수집하여
+//        structured JSON report 생성 + phase_lock_log.jsonl 기록
+//
+// 설계:
+//   convergence.json → layer 별 progress/status/modules_done/modules_total
+//   state.json → phase, composite scores, paper_trigger status
+//   output: JSON report to stdout
+//   side-effect: append summary line to phase_lock_log.jsonl
+
+comptime const PAPER_TRIGGER_THRESHOLD = 0.9
+
+// ─── 유틸 ───
+
+fn abs_f(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn resolve_nexus() -> string {
+    let nx = env("NEXUS")
+    if nx != "" { return nx }
+    return env("HOME") + "/Dev/nexus"
+}
+
+// ─── Layer health 집계 ───
+
+struct LayerHealth {
+    name: string,
+    status: string,
+    progress: float,
+    modules_done: int,
+    modules_total: int
+}
+
+struct Report {
+    timestamp: int,
+    phase: string,
+    overall_status: string,
+    overall_completion: float,
+    total_modules_done: int,
+    total_modules_total: int,
+    layers: str,           // list of LayerHealth
+    composite_best: float,
+    composite_best_pair: string,
+    paper_trigger: bool,
+    paper_trigger_gap: float,
+    phase_lock_status: string,
+    next_actions: str      // list of string
+}
+
+fn extract_layer(conv: str, layer_key: string) -> LayerHealth {
+    let stages = conv["stages"]
+    if stages[layer_key] == nil {
+        return LayerHealth {
+            name: layer_key, status: "unknown", progress: 0.0,
+            modules_done: 0, modules_total: 0
+        }
+    }
+    let layer = stages[layer_key]
+    let status = if layer["status"] != nil { layer["status"] } else { "unknown" }
+    let progress = if layer["progress"] != nil { to_float(layer["progress"]) } else { 0.0 }
+    let done = if layer["modules_done"] != nil { to_int(layer["modules_done"]) } else { 0 }
+    let total = if layer["modules_total"] != nil { to_int(layer["modules_total"]) } else { 0 }
+    LayerHealth {
+        name: layer_key, status: status, progress: progress,
+        modules_done: done, modules_total: total
+    }
+}
+
+fn compute_report(conv: str, state: str) -> Report {
+    // extract all layers
+    let layer_keys = ["L1_unified", "L2_spectra", "L3_cross", "L3_ext_field", "L3_codata17_priority", "L4_spectral_feedback", "L5_phase_lock", "L_meta"]
+    let mut layers = []
+    let mut total_done = 0
+    let mut total_total = 0
+    let mut i = 0
+    while i < layer_keys.len() {
+        let lh = extract_layer(conv, layer_keys[i])
+        layers = layers + [lh]
+        total_done = total_done + lh.modules_done
+        total_total = total_total + lh.modules_total
+        i = i + 1
+    }
+
+    // overall completion
+    let completion = if total_total > 0 { to_float(total_done) / to_float(total_total) } else { 0.0 }
+
+    // composite best from state.json
+    let mut composite_best = 0.0
+    let mut composite_pair = "none"
+    let mut paper_trigger = false
+
+    // check L3_aligned_rerun
+    if state["L3_aligned_rerun"] != nil {
+        let rerun = state["L3_aligned_rerun"]
+        if rerun["results"] != nil {
+            let results = rerun["results"]
+            let rkeys = results.keys()
+            let mut k = 0
+            while k < rkeys.len() {
+                let entry = results[rkeys[k]]
+                if entry["after"] != nil {
+                    let comp = to_float(entry["after"]["composite"])
+                    if comp > composite_best {
+                        composite_best = comp
+                        composite_pair = rkeys[k]
+                    }
+                }
+                k = k + 1
+            }
+        }
+        if rerun["paper_trigger"] != nil {
+            paper_trigger = rerun["paper_trigger"]
+        }
+    }
+
+    // check L3_codata17_priority
+    if state["L3_codata17_priority"] != nil {
+        let codata = state["L3_codata17_priority"]
+        if codata["results"] != nil {
+            let res = codata["results"]
+            if res["composite_aligned"] != nil {
+                let comp = to_float(res["composite_aligned"])
+                if comp > composite_best {
+                    composite_best = comp
+                    composite_pair = "constants_x_physics_codata17"
+                }
+            }
+        }
+    }
+
+    // check priority_target in convergence.json
+    if conv["priority_target"] != nil {
+        let pt = conv["priority_target"]
+        if pt["current_field_best"] != nil {
+            let cfb = pt["current_field_best"]
+            if cfb["composite"] != nil {
+                let comp = to_float(cfb["composite"])
+                if comp > composite_best {
+                    composite_best = comp
+                    composite_pair = if cfb["pair"] != nil { cfb["pair"] } else { "unknown" }
+                }
+            }
+        }
+    }
+
+    let paper_gap = PAPER_TRIGGER_THRESHOLD - composite_best
+    let paper_gap_clamped = if paper_gap < 0.0 { 0.0 } else { paper_gap }
+    if composite_best >= PAPER_TRIGGER_THRESHOLD { paper_trigger = true }
+
+    // phase lock status from L5
+    let l5 = extract_layer(conv, "L5_phase_lock")
+    let phase_lock_status = if l5.progress >= 1.0 { "LOCKED" } else if l5.progress >= 0.6 { "CONVERGING" } else { "OPEN" }
+
+    // current phase from state
+    let phase = if state["phase"] != nil { state["phase"] } else { "unknown" }
+
+    // overall status
+    let overall_status = if completion >= 1.0 { "ALL_COMPLETE" } else if completion >= 0.8 { "NEAR_COMPLETE" } else if completion >= 0.5 { "IN_PROGRESS" } else { "EARLY" }
+
+    // next actions
+    let mut next_actions = []
+    // check incomplete layers
+    let mut j = 0
+    while j < layers.len() {
+        let lh = layers[j]
+        if lh.progress < 1.0 {
+            next_actions = next_actions + ["complete " + lh.name + " (" + to_string(lh.modules_done) + "/" + to_string(lh.modules_total) + ")"]
+        }
+        j = j + 1
+    }
+    if paper_gap_clamped > 0.0 {
+        next_actions = next_actions + ["close paper_trigger gap " + to_string(paper_gap_clamped) + " (best=" + to_string(composite_best) + ", target=" + to_string(PAPER_TRIGGER_THRESHOLD) + ")"]
+    }
+    if phase_lock_status != "LOCKED" {
+        next_actions = next_actions + ["achieve phase lock (L5 " + to_string(l5.modules_done) + "/" + to_string(l5.modules_total) + ")"]
+    }
+
+    Report {
+        timestamp: time_now(),
+        phase: phase,
+        overall_status: overall_status,
+        overall_completion: completion,
+        total_modules_done: total_done,
+        total_modules_total: total_total,
+        layers: layers,
+        composite_best: composite_best,
+        composite_best_pair: composite_pair,
+        paper_trigger: paper_trigger,
+        paper_trigger_gap: paper_gap_clamped,
+        phase_lock_status: phase_lock_status,
+        next_actions: next_actions
+    }
+}
+
+// ─── JSON output ───
+
+fn layer_to_json(lh: LayerHealth) -> string {
+    let s = "{\"name\":\"" + lh.name + "\","
+    let s = s + "\"status\":\"" + lh.status + "\","
+    let s = s + "\"progress\":" + to_string(lh.progress) + ","
+    let s = s + "\"modules_done\":" + to_string(lh.modules_done) + ","
+    let s = s + "\"modules_total\":" + to_string(lh.modules_total) + "}"
+    return s
+}
+
+fn report_to_json(r: Report) -> string {
+    let mut layers_json = "["
+    let mut i = 0
+    while i < r.layers.len() {
+        if i > 0 { layers_json = layers_json + "," }
+        layers_json = layers_json + layer_to_json(r.layers[i])
+        i = i + 1
+    }
+    layers_json = layers_json + "]"
+
+    let mut actions_json = "["
+    let mut j = 0
+    while j < r.next_actions.len() {
+        if j > 0 { actions_json = actions_json + "," }
+        actions_json = actions_json + "\"" + r.next_actions[j] + "\""
+        j = j + 1
+    }
+    actions_json = actions_json + "]"
+
+    let mut out = "{\n"
+    out = out + "  \"timestamp\": " + to_string(r.timestamp) + ",\n"
+    out = out + "  \"phase\": \"" + r.phase + "\",\n"
+    out = out + "  \"overall_status\": \"" + r.overall_status + "\",\n"
+    out = out + "  \"overall_completion\": " + to_string(r.overall_completion) + ",\n"
+    out = out + "  \"total_modules_done\": " + to_string(r.total_modules_done) + ",\n"
+    out = out + "  \"total_modules_total\": " + to_string(r.total_modules_total) + ",\n"
+    out = out + "  \"layer_health\": " + layers_json + ",\n"
+    out = out + "  \"composite_best\": " + to_string(r.composite_best) + ",\n"
+    out = out + "  \"composite_best_pair\": \"" + r.composite_best_pair + "\",\n"
+    out = out + "  \"paper_trigger\": " + to_string(r.paper_trigger) + ",\n"
+    out = out + "  \"paper_trigger_gap\": " + to_string(r.paper_trigger_gap) + ",\n"
+    out = out + "  \"phase_lock_status\": \"" + r.phase_lock_status + "\",\n"
+    out = out + "  \"next_actions\": " + actions_json + "\n"
+    out = out + "}"
+    return out
+}
+
+fn summary_line(r: Report) -> string {
+    let s = "{\"ts\":" + to_string(r.timestamp)
+    let s = s + ",\"phase\":\"" + r.phase + "\""
+    let s = s + ",\"completion\":" + to_string(r.overall_completion)
+    let s = s + ",\"modules\":\"" + to_string(r.total_modules_done) + "/" + to_string(r.total_modules_total) + "\""
+    let s = s + ",\"composite_best\":" + to_string(r.composite_best)
+    let s = s + ",\"pair\":\"" + r.composite_best_pair + "\""
+    let s = s + ",\"paper_trigger\":" + to_string(r.paper_trigger)
+    let s = s + ",\"gap\":" + to_string(r.paper_trigger_gap)
+    let s = s + ",\"phase_lock\":\"" + r.phase_lock_status + "\""
+    let s = s + ",\"status\":\"" + r.overall_status + "\"}"
+    return s
+}
+
+// ─── CLI ───
+
+let a = args()
+let a_len = a.len()
+let mode = if a_len >= 3 { a[2] } else { "help" }
+
+if mode == "report" || mode == "status" {
+    let root = resolve_nexus()
+    let conv_path = root + "/shared/bisociation/convergence.json"
+    let state_path = root + "/shared/bisociation/state.json"
+    let log_path = root + "/shared/bisociation/unified/phase_lock_log.jsonl"
+
+    let conv_raw = read_file(conv_path)
+    let state_raw = read_file(state_path)
+
+    if conv_raw == "" || state_raw == "" {
+        eprint("ERROR: cannot read convergence.json or state.json")
+        println("__PHASE_LOCK_REPORT__ FAIL")
+    } else {
+        let conv = json_decode(conv_raw)
+        let state = json_decode(state_raw)
+        let r = compute_report(conv, state)
+
+        if mode == "report" {
+            // full JSON report
+            println(report_to_json(r))
+        } else {
+            // compact status
+            println("=== Phase Lock Report (L5 slot 5) ===")
+            println("")
+            println("phase          : " + r.phase)
+            println("overall_status : " + r.overall_status)
+            println("completion     : " + to_string(r.total_modules_done) + "/" + to_string(r.total_modules_total) + " (" + to_string(r.overall_completion) + ")")
+            println("composite_best : " + to_string(r.composite_best) + " (" + r.composite_best_pair + ")")
+            println("paper_trigger  : " + to_string(r.paper_trigger) + " (gap=" + to_string(r.paper_trigger_gap) + ")")
+            println("phase_lock     : " + r.phase_lock_status)
+            println("")
+            println("layer health:")
+            let mut i = 0
+            while i < r.layers.len() {
+                let lh = r.layers[i]
+                println("  " + lh.name + " : " + lh.status + " " + to_string(lh.modules_done) + "/" + to_string(lh.modules_total) + " (" + to_string(lh.progress) + ")")
+                i = i + 1
+            }
+            if r.next_actions.len() > 0 {
+                println("")
+                println("next actions:")
+                let mut j = 0
+                while j < r.next_actions.len() {
+                    println("  - " + r.next_actions[j])
+                    j = j + 1
+                }
+            }
+        }
+
+        // append to log
+        let line = summary_line(r)
+        let existing = read_file(log_path)
+        let new_content = if existing != "" { existing + "\n" + line } else { line }
+        write_file(log_path, new_content)
+        eprint("logged to " + log_path)
+    }
+}
+
+if mode == "help" {
+    println("=== phase_lock_report.hexa — L5 slot 5/5 ===")
+    println("")
+    println("L1~L5 전체 health dashboard + structured JSON report.")
+    println("")
+    println("사용법:")
+    println("  hexa phase_lock_report.hexa report   JSON report to stdout")
+    println("  hexa phase_lock_report.hexa status   compact human-readable status")
+    println("")
+    println("입력:")
+    println("  shared/bisociation/convergence.json — layer progress")
+    println("  shared/bisociation/state.json — phase, composites, paper_trigger")
+    println("")
+    println("출력:")
+    println("  stdout: JSON or text report")
+    println("  side-effect: append to shared/bisociation/unified/phase_lock_log.jsonl")
+}
+
+// ─── 검증 ───
+
+// test layer extraction with mock data
+let mock_conv = json_decode("{\"stages\":{\"L1_unified\":{\"progress\":1.0,\"modules_done\":4,\"modules_total\":4,\"status\":\"completed\"},\"L5_phase_lock\":{\"progress\":0.6,\"modules_done\":3,\"modules_total\":5,\"status\":\"in_progress\"}}}")
+let lh1 = extract_layer(mock_conv, "L1_unified")
+assert lh1.name == "L1_unified"
+assert lh1.status == "completed"
+assert lh1.modules_done == 4
+assert lh1.modules_total == 4
+
+let lh5 = extract_layer(mock_conv, "L5_phase_lock")
+assert lh5.progress == 0.6
+assert lh5.modules_done == 3
+
+// test missing layer
+let lh_missing = extract_layer(mock_conv, "L99_nonexistent")
+assert lh_missing.status == "unknown"
+assert lh_missing.modules_done == 0
+
+// test report computation with mock state
+let mock_state = json_decode("{\"phase\":\"L5\",\"L3_aligned_rerun\":{\"paper_trigger\":false,\"results\":{\"atlas_x_laws_aligned\":{\"after\":{\"composite\":0.83379}},\"constants_x_hypo_aligned\":{\"after\":{\"composite\":0.808852}}}}}")
+let r = compute_report(mock_conv, mock_state)
+assert r.phase == "L5"
+assert r.composite_best > 0.83
+assert r.composite_best_pair == "atlas_x_laws_aligned"
+assert r.paper_trigger == false
+assert r.paper_trigger_gap > 0.0
+assert r.total_modules_done == 7   // 4 + 3
+assert r.total_modules_total == 9  // 4 + 5
+
+// test JSON output contains expected fields
+let json_out = report_to_json(r)
+assert str_contains(json_out, "\"phase\": \"L5\"")
+assert str_contains(json_out, "\"composite_best\":")
+assert str_contains(json_out, "\"paper_trigger_gap\":")
+assert str_contains(json_out, "\"next_actions\":")
+
+// test summary line
+let sl = summary_line(r)
+assert str_contains(sl, "\"phase\":\"L5\"")
+assert str_contains(sl, "\"composite_best\":")
+
+println("")
+println("=== phase_lock_report verified ===")

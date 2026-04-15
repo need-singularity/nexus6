@@ -1,0 +1,265 @@
+// shared/bisociation/unified/phase_lock_gate.hexa — L5 slot 4/5
+// BISOC-P8-1: CI threshold gate — blowup pipeline hold/pass
+// 목적: convergence index (CI) 가 임계값 미달 시 blowup 파이프라인을 HOLD 하여
+//        수렴 미달 상태에서의 무의미한 sweep 방지
+//
+// 설계:
+//   CI >= GATE_THRESHOLD → PASS (blowup 진행)
+//   CI <  GATE_THRESHOLD → HOLD (blowup 보류)
+//   bridge alignment_score 가 ALIGNMENT_MIN 미만이면 추가 경고
+//   결정 로그: phase_lock_log.jsonl (append)
+//
+// stdout sentinel: __PHASE_LOCK__ PASS | HOLD
+//   (exit() 미전파 우회 — 호출측이 stdout 마지막 라인 파싱)
+
+comptime const GATE_THRESHOLD = 0.3
+comptime const ALIGNMENT_MIN = 0.2
+comptime const PAPER_TRIGGER = 0.9
+
+// ─── 유틸 ───
+
+fn abs_f(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn clamp_01(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    if x > 1.0 { return 1.0 }
+    return x
+}
+
+fn nexus_root() -> string {
+    let root = env("NEXUS")
+    if root != "" { return root }
+    return env("HOME") + "/Dev/nexus"
+}
+
+// ─── Gate 구조 ───
+
+struct GateInput {
+    ci_unified: float,
+    alignment_score: float,
+    phase_locked: bool,
+    health: string,
+    source: string
+}
+
+struct GateDecision {
+    verdict: string,        // PASS | HOLD
+    ci_unified: float,
+    threshold: float,
+    alignment_score: float,
+    alignment_ok: bool,
+    phase_locked: bool,
+    health: string,
+    reason: string,
+    paper_distance: float
+}
+
+fn evaluate_gate(input: GateInput) -> GateDecision {
+    let ci = clamp_01(input.ci_unified)
+    let align = clamp_01(input.alignment_score)
+    let align_ok = align >= ALIGNMENT_MIN
+    let paper_dist = PAPER_TRIGGER - align
+    let paper_dist_clamped = if paper_dist < 0.0 { 0.0 } else { paper_dist }
+
+    let mut verdict = "PASS"
+    let mut reason = "CI >= threshold"
+
+    if ci < GATE_THRESHOLD {
+        verdict = "HOLD"
+        reason = "CI " + to_string(ci) + " < threshold " + to_string(GATE_THRESHOLD)
+    }
+
+    // alignment sub-check (advisory, does not override PASS→HOLD alone)
+    if verdict == "PASS" && !align_ok {
+        reason = reason + " (WARNING: alignment " + to_string(align) + " < " + to_string(ALIGNMENT_MIN) + ")"
+    }
+
+    // health degradation escalates HOLD reason
+    if verdict == "HOLD" && input.health != "OK" {
+        reason = reason + " + health=" + input.health
+    }
+
+    GateDecision {
+        verdict: verdict,
+        ci_unified: ci,
+        threshold: GATE_THRESHOLD,
+        alignment_score: align,
+        alignment_ok: align_ok,
+        phase_locked: input.phase_locked,
+        health: input.health,
+        reason: reason,
+        paper_distance: paper_dist_clamped
+    }
+}
+
+fn print_gate(d: GateDecision) {
+    println("=== Phase Lock Gate (L5 slot 4) ===")
+    println("")
+    println("verdict          : " + d.verdict)
+    println("ci_unified       : " + to_string(d.ci_unified))
+    println("threshold        : " + to_string(d.threshold))
+    println("alignment_score  : " + to_string(d.alignment_score))
+    println("alignment_ok     : " + to_string(d.alignment_ok))
+    println("phase_locked     : " + to_string(d.phase_locked))
+    println("health           : " + d.health)
+    println("paper_distance   : " + to_string(d.paper_distance))
+    println("reason           : " + d.reason)
+}
+
+// ─── 로그 ───
+
+fn log_decision(d: GateDecision, source: string) {
+    let root = nexus_root()
+    let log_path = root + "/shared/bisociation/unified/phase_lock_log.jsonl"
+    let ts = to_string(time_now())
+    let entry = "{\"ts\":" + ts + ",\"verdict\":\"" + d.verdict + "\",\"ci\":" + to_string(d.ci_unified) + ",\"threshold\":" + to_string(d.threshold) + ",\"alignment\":" + to_string(d.alignment_score) + ",\"phase_locked\":" + to_string(d.phase_locked) + ",\"health\":\"" + d.health + "\",\"reason\":\"" + d.reason + "\",\"source\":\"" + source + "\"}"
+
+    // append via read+write
+    let mut existing = ""
+    let content = read_file(log_path)
+    if content != "" {
+        existing = content
+    }
+    let new_content = existing + entry + "\n"
+    write_file(log_path, new_content)
+}
+
+// ─── sentinel 출력 ───
+
+fn emit_sentinel(d: GateDecision) {
+    println("__PHASE_LOCK__ " + d.verdict)
+}
+
+// ─── CLI ───
+
+let a = args()
+let a_len = a.len()
+let mode = if a_len >= 3 { a[2] } else { "help" }
+
+if mode == "check" {
+    // hexa phase_lock_gate.hexa check <ci_unified> [<alignment_score> [<health>]]
+    if a_len >= 4 {
+        let ci = to_float(a[3])
+        let align = if a_len >= 5 { to_float(a[4]) } else { 0.5 }
+        let health = if a_len >= 6 { a[5] } else { "OK" }
+        let input = GateInput {
+            ci_unified: ci,
+            alignment_score: align,
+            phase_locked: true,
+            health: health,
+            source: "cli"
+        }
+        let decision = evaluate_gate(input)
+        print_gate(decision)
+        log_decision(decision, "cli")
+        println("")
+        emit_sentinel(decision)
+    } else {
+        println("usage: hexa phase_lock_gate.hexa check <ci> [<alignment> [<health>]]")
+    }
+}
+
+if mode == "demo" {
+    println("=== phase_lock_gate demo ===")
+    println("")
+
+    // case 1: CI above threshold — PASS
+    let input1 = GateInput { ci_unified: 0.65, alignment_score: 0.5, phase_locked: true, health: "OK", source: "demo" }
+    let d1 = evaluate_gate(input1)
+    println("case 1 (CI=0.65, align=0.5, OK): " + d1.verdict + " — " + d1.reason)
+
+    // case 2: CI below threshold — HOLD
+    let input2 = GateInput { ci_unified: 0.15, alignment_score: 0.3, phase_locked: false, health: "DRIFT", source: "demo" }
+    let d2 = evaluate_gate(input2)
+    println("case 2 (CI=0.15, align=0.3, DRIFT): " + d2.verdict + " — " + d2.reason)
+
+    // case 3: CI at threshold boundary — PASS
+    let input3 = GateInput { ci_unified: 0.3, alignment_score: 0.4, phase_locked: true, health: "OK", source: "demo" }
+    let d3 = evaluate_gate(input3)
+    println("case 3 (CI=0.3, align=0.4, OK): " + d3.verdict + " — " + d3.reason)
+
+    // case 4: CI above but alignment low — PASS with warning
+    let input4 = GateInput { ci_unified: 0.5, alignment_score: 0.1, phase_locked: false, health: "OK", source: "demo" }
+    let d4 = evaluate_gate(input4)
+    println("case 4 (CI=0.5, align=0.1, OK): " + d4.verdict + " — " + d4.reason)
+
+    // case 5: CI zero — HOLD
+    let input5 = GateInput { ci_unified: 0.0, alignment_score: 0.0, phase_locked: false, health: "STALL", source: "demo" }
+    let d5 = evaluate_gate(input5)
+    println("case 5 (CI=0.0, align=0.0, STALL): " + d5.verdict + " — " + d5.reason)
+
+    println("")
+    println("sentinel output sample:")
+    emit_sentinel(d1)
+}
+
+if mode == "help" {
+    println("=== phase_lock_gate.hexa — L5 slot 4/5 ===")
+    println("")
+    println("CI threshold gate for blowup pipeline hold/pass decision.")
+    println("")
+    println("사용법:")
+    println("  hexa phase_lock_gate.hexa check <ci> [<alignment> [<health>]]   게이트 판정")
+    println("  hexa phase_lock_gate.hexa demo                                  시뮬레이션 데모")
+    println("")
+    println("thresholds:")
+    println("  GATE_THRESHOLD  = " + to_string(GATE_THRESHOLD) + " (CI minimum for PASS)")
+    println("  ALIGNMENT_MIN   = " + to_string(ALIGNMENT_MIN) + " (advisory alignment floor)")
+    println("  PAPER_TRIGGER   = " + to_string(PAPER_TRIGGER) + " (paper readiness target)")
+    println("")
+    println("sentinel:")
+    println("  __PHASE_LOCK__ PASS   blowup pipeline 진행")
+    println("  __PHASE_LOCK__ HOLD   blowup pipeline 보류")
+    println("")
+    println("log: shared/bisociation/unified/phase_lock_log.jsonl")
+}
+
+// ─── 검증 ───
+
+// PASS: CI at threshold
+let t1_input = GateInput { ci_unified: 0.3, alignment_score: 0.5, phase_locked: true, health: "OK", source: "test" }
+let t1 = evaluate_gate(t1_input)
+assert t1.verdict == "PASS"
+assert t1.alignment_ok == true
+
+// HOLD: CI below threshold
+let t2_input = GateInput { ci_unified: 0.29, alignment_score: 0.5, phase_locked: true, health: "OK", source: "test" }
+let t2 = evaluate_gate(t2_input)
+assert t2.verdict == "HOLD"
+
+// PASS with alignment warning
+let t3_input = GateInput { ci_unified: 0.5, alignment_score: 0.1, phase_locked: false, health: "OK", source: "test" }
+let t3 = evaluate_gate(t3_input)
+assert t3.verdict == "PASS"
+assert t3.alignment_ok == false
+
+// HOLD: CI zero
+let t4_input = GateInput { ci_unified: 0.0, alignment_score: 0.0, phase_locked: false, health: "STALL", source: "test" }
+let t4 = evaluate_gate(t4_input)
+assert t4.verdict == "HOLD"
+assert t4.ci_unified == 0.0
+
+// PASS: CI high, paper distance correct
+let t5_input = GateInput { ci_unified: 0.8, alignment_score: 0.85, phase_locked: true, health: "OK", source: "test" }
+let t5 = evaluate_gate(t5_input)
+assert t5.verdict == "PASS"
+assert t5.paper_distance > 0.0
+assert t5.paper_distance < 0.1
+
+// clamp: CI > 1.0 clamped
+let t6_input = GateInput { ci_unified: 1.5, alignment_score: 0.5, phase_locked: true, health: "OK", source: "test" }
+let t6 = evaluate_gate(t6_input)
+assert t6.verdict == "PASS"
+assert t6.ci_unified == 1.0
+
+// clamp: CI negative clamped to 0
+let t7_input = GateInput { ci_unified: -0.5, alignment_score: 0.5, phase_locked: true, health: "OK", source: "test" }
+let t7 = evaluate_gate(t7_input)
+assert t7.verdict == "HOLD"
+assert t7.ci_unified == 0.0
+
+println("")
+println("=== phase_lock_gate verified ===")

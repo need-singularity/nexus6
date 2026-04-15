@@ -1,0 +1,297 @@
+// analyze_curve.hexa — parse sweep log, emit per-σ stats + ASCII plot +
+// phase-transition detection.
+//
+// Input: log file where each line is either a MODE= per-gen trace or a FINAL
+// summary line.  We only parse FINAL lines.
+//
+// CLI:
+//   hexa analyze_curve.hexa run <log_path> <out_json_path> <out_md_path>
+
+fn abs_f(x: float) -> float { if x < 0.0 { 0.0 - x } else { x } }
+fn sqrt_f(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    let mut i = 0
+    while i < 20 { g = (g + x / g) / 2.0; i = i + 1 }
+    g
+}
+
+// --- very small string utilities (hexa-native) ---
+// pick value after "KEY=" token in a single line, whitespace-delimited
+fn field_after(line: string, key: string) -> string {
+    let kidx = line.find(key)
+    if kidx < 0 { return "" }
+    let start = kidx + key.len()
+    if start >= line.len() { return "" }
+    // read until next space
+    let mut i = start
+    let L = line.len()
+    while i < L {
+        let ch = line.substring(i, i + 1)
+        if ch == " " { return line.substring(start, i) }
+        i = i + 1
+    }
+    line.substring(start, L)
+}
+
+fn parse_float_safe(s: string) -> float {
+    let mut v = 0.0
+    try { v = to_float(s) } catch e { v = 0.0 }
+    v
+}
+fn parse_int_safe(s: string) -> int {
+    let mut v = 0
+    try { v = to_int(s) } catch e { v = 0 }
+    v
+}
+
+// ─── main ───
+let _a = args()
+let mode = if _a.len() >= 3 { _a[2] } else { "help" }
+
+if mode == "help" {
+    println("analyze_curve.hexa run <log_path> <out_json> <out_md>")
+}
+
+if mode == "run" {
+    let log_path = if _a.len() >= 4 { _a[3] } else { "" }
+    let json_path = if _a.len() >= 5 { _a[4] } else { "" }
+    let md_path = if _a.len() >= 6 { _a[5] } else { "" }
+
+    if log_path.len() == 0 {
+        println("ERROR: need log path")
+    } else {
+        let mut raw = ""
+        try { raw = read_file(log_path) } catch e { raw = "" }
+        if raw.len() == 0 {
+            println("ERROR: log empty: " + log_path)
+        } else {
+            // split by lines
+            let lines = raw.split("\n")
+            // accumulate per-sigma aggregates
+            // We use parallel lists keyed by sigma string to preserve order.
+            let mut sigmas = []
+            let mut n_trials = []
+            let mut n_conv = []
+            let mut sum_cycle = []
+            let mut cnt_cycle = []
+            let mut sum_comp = []
+            let mut sum_comp2 = []
+            let mut sum_yield = []
+
+            for ln in lines {
+                if ln.find("FINAL") < 0 { continue }
+                let sig_s = field_after(ln, "SIGMA=")
+                let conv_s = field_after(ln, "CONV=")
+                let comp_s = field_after(ln, "BEST_COMP=")
+                let yield_s = field_after(ln, "BEST_YIELD=")
+                let cyc_s = field_after(ln, "CYCLE_CONV=")
+
+                if sig_s.len() == 0 { continue }
+                // locate sigma in our list
+                let mut idx = -1
+                let mut k = 0
+                while k < sigmas.len() {
+                    if sigmas[k] == sig_s { idx = k; k = sigmas.len() }
+                    k = k + 1
+                }
+                if idx < 0 {
+                    sigmas = sigmas + [sig_s]
+                    n_trials = n_trials + [0]
+                    n_conv = n_conv + [0]
+                    sum_cycle = sum_cycle + [0.0]
+                    cnt_cycle = cnt_cycle + [0]
+                    sum_comp = sum_comp + [0.0]
+                    sum_comp2 = sum_comp2 + [0.0]
+                    sum_yield = sum_yield + [0]
+                    idx = sigmas.len() - 1
+                }
+
+                n_trials[idx] = n_trials[idx] + 1
+                let comp_v = parse_float_safe(comp_s)
+                sum_comp[idx] = sum_comp[idx] + comp_v
+                sum_comp2[idx] = sum_comp2[idx] + comp_v * comp_v
+                sum_yield[idx] = sum_yield[idx] + parse_int_safe(yield_s)
+
+                if conv_s == "true" {
+                    n_conv[idx] = n_conv[idx] + 1
+                    let cyc_v = parse_int_safe(cyc_s)
+                    if cyc_v >= 0 {
+                        sum_cycle[idx] = sum_cycle[idx] + to_float(cyc_v)
+                        cnt_cycle[idx] = cnt_cycle[idx] + 1
+                    }
+                }
+            }
+
+            // ─── per-σ rows (numeric sort by sigma) ───
+            // Parse sigma floats for sorting
+            let mut sig_f = []
+            let mut si = 0
+            while si < sigmas.len() {
+                sig_f = sig_f + [parse_float_safe(sigmas[si])]
+                si = si + 1
+            }
+
+            // simple bubble sort of indices
+            let mut order = []
+            let mut oi = 0
+            while oi < sigmas.len() { order = order + [oi]; oi = oi + 1 }
+            let mut a = 0
+            while a < order.len() {
+                let mut b = 0
+                while b < order.len() - 1 - a {
+                    if sig_f[order[b]] > sig_f[order[b + 1]] {
+                        let tmp = order[b]
+                        order[b] = order[b + 1]
+                        order[b + 1] = tmp
+                    }
+                    b = b + 1
+                }
+                a = a + 1
+            }
+
+            // compute per-σ stats arrays in sorted order
+            let mut rows_md = ""
+            let mut rows_json = ""
+            let mut conv_rates = []  // float per σ, sorted
+            let mut sig_sorted = []
+            let mut mean_cycle_arr = []
+            let mut mean_comp_arr = []
+            let mut std_comp_arr = []
+
+            let mut si2 = 0
+            while si2 < order.len() {
+                let i = order[si2]
+                let nt = n_trials[i]
+                let nc = n_conv[i]
+                let conv_rate = if nt > 0 { to_float(nc) / to_float(nt) } else { 0.0 }
+                let mean_cycle = if cnt_cycle[i] > 0 { sum_cycle[i] / to_float(cnt_cycle[i]) } else { -1.0 }
+                let mean_comp = if nt > 0 { sum_comp[i] / to_float(nt) } else { 0.0 }
+                let var_comp = if nt > 1 {
+                    sum_comp2[i] / to_float(nt) - mean_comp * mean_comp
+                } else { 0.0 }
+                let std_comp = sqrt_f(abs_f(var_comp))
+                let mean_yield = if nt > 0 { to_float(sum_yield[i]) / to_float(nt) } else { 0.0 }
+
+                sig_sorted = sig_sorted + [sig_f[i]]
+                conv_rates = conv_rates + [conv_rate]
+                mean_cycle_arr = mean_cycle_arr + [mean_cycle]
+                mean_comp_arr = mean_comp_arr + [mean_comp]
+                std_comp_arr = std_comp_arr + [std_comp]
+
+                rows_md = rows_md + "| " + sigmas[i] + " | " + to_string(nt) + " | " + to_string(nc) + " | " + to_string(conv_rate) + " | " + to_string(mean_cycle) + " | " + to_string(mean_comp) + " | " + to_string(std_comp) + " | " + to_string(mean_yield) + " |\n"
+                if rows_json.len() > 0 { rows_json = rows_json + "," }
+                rows_json = rows_json + "{\"sigma\":" + sigmas[i] + ",\"n\":" + to_string(nt) + ",\"conv\":" + to_string(nc) + ",\"conv_rate\":" + to_string(conv_rate) + ",\"mean_cycle\":" + to_string(mean_cycle) + ",\"mean_comp\":" + to_string(mean_comp) + ",\"std_comp\":" + to_string(std_comp) + ",\"mean_yield\":" + to_string(mean_yield) + "}"
+                si2 = si2 + 1
+            }
+
+            // ─── phase-transition detection ───
+            // compute |dPr(conv)/dσ|  between adjacent σ
+            let mut max_grad = 0.0
+            let mut max_grad_sigma = 0.0
+            let mut grad_str = ""
+            let mut gi = 0
+            while gi + 1 < sig_sorted.len() {
+                let ds = sig_sorted[gi + 1] - sig_sorted[gi]
+                let dr = conv_rates[gi + 1] - conv_rates[gi]
+                let grad = if ds > 0.0 { abs_f(dr) / ds } else { 0.0 }
+                if grad > max_grad { max_grad = grad; max_grad_sigma = sig_sorted[gi] }
+                if grad_str.len() > 0 { grad_str = grad_str + ", " }
+                grad_str = grad_str + "(" + to_string(sig_sorted[gi]) + "→" + to_string(sig_sorted[gi + 1]) + "):" + to_string(grad)
+                gi = gi + 1
+            }
+
+            // verdict
+            // - monotonic_decrease: every dr <= 0 + max_grad small
+            // - phase_transition: one big jump
+            // - stochastic_resonance: non-monotonic with late recovery (later rate > earlier)
+            let mut all_down = true
+            let mut first = conv_rates[0]
+            let mut last = conv_rates[conv_rates.len() - 1]
+            let mut mid_min = first
+            let mut gj = 1
+            while gj < conv_rates.len() {
+                if conv_rates[gj] > conv_rates[gj - 1] + 0.05 { all_down = false }
+                if conv_rates[gj] < mid_min { mid_min = conv_rates[gj] }
+                gj = gj + 1
+            }
+
+            let mut verdict = "UNCLEAR"
+            if all_down && max_grad < 5.0 {
+                verdict = "MONOTONIC_DECREASE"
+            } else if max_grad >= 10.0 {
+                verdict = "PHASE_TRANSITION@sigma=" + to_string(max_grad_sigma)
+            } else if last > mid_min + 0.10 {
+                verdict = "STOCHASTIC_RESONANCE"
+            } else if !all_down {
+                verdict = "NON_MONOTONIC"
+            }
+
+            // ─── ASCII plot ───
+            // conv_rate 0..1 on 40-wide bars
+            let mut plot = "sigma     | conv_rate (0 ─────────────── 1)\n"
+            plot = plot + "----------+----------------------------------------\n"
+            let mut pi = 0
+            while pi < sig_sorted.len() {
+                let r = conv_rates[pi]
+                let bars = to_int(r * 40.0)
+                let mut bar = ""
+                let mut bi = 0
+                while bi < bars { bar = bar + "█"; bi = bi + 1 }
+                let sig_str = to_string(sig_sorted[pi])
+                let mut pad = sig_str
+                while pad.len() < 9 { pad = pad + " " }
+                plot = plot + pad + " | " + bar + " " + to_string(r) + "\n"
+                pi = pi + 1
+            }
+
+            // ─── mean_cycle ASCII plot ───
+            let mut cycle_plot = "sigma     | mean_cycle (0 ─────── 20, -1=no conv)\n"
+            cycle_plot = cycle_plot + "----------+------------------------------------\n"
+            let mut ci = 0
+            while ci < sig_sorted.len() {
+                let mc = mean_cycle_arr[ci]
+                let sig_str = to_string(sig_sorted[ci])
+                let mut pad = sig_str
+                while pad.len() < 9 { pad = pad + " " }
+                if mc < 0.0 {
+                    cycle_plot = cycle_plot + pad + " | (no conv)\n"
+                } else {
+                    let bars = to_int(mc * 2.0)
+                    let mut bar = ""
+                    let mut bi = 0
+                    while bi < bars { bar = bar + "▌"; bi = bi + 1 }
+                    cycle_plot = cycle_plot + pad + " | " + bar + " " + to_string(mc) + "\n"
+                }
+                ci = ci + 1
+            }
+
+            // ─── write JSON ───
+            if json_path.len() > 0 {
+                let json = "{\n  \"rows\": [" + rows_json + "],\n  \"max_gradient\": " + to_string(max_grad) + ",\n  \"max_gradient_sigma\": " + to_string(max_grad_sigma) + ",\n  \"verdict\": \"" + verdict + "\",\n  \"gradients\": \"" + grad_str + "\"\n}\n"
+                try { write_file(json_path, json) } catch ew { println("WRITE_ERR json=" + json_path) }
+            }
+            if md_path.len() > 0 {
+                let md = "# Variance Sweep — σ vs Convergence\n\n" +
+                         "## 표\n\n" +
+                         "| σ | n | conv | conv_rate | mean_cycle | mean_comp | std_comp | mean_yield |\n" +
+                         "|---|---|---|---|---|---|---|---|\n" +
+                         rows_md + "\n" +
+                         "## ASCII Plot — Convergence Rate\n\n```\n" + plot + "```\n\n" +
+                         "## ASCII Plot — Mean Convergence Cycle\n\n```\n" + cycle_plot + "```\n\n" +
+                         "## Phase Transition\n\n" +
+                         "- max |dPr/dσ| = " + to_string(max_grad) + " at σ=" + to_string(max_grad_sigma) + "\n" +
+                         "- gradients: " + grad_str + "\n\n" +
+                         "## Verdict\n\n**" + verdict + "**\n"
+                try { write_file(md_path, md) } catch ew2 { println("WRITE_ERR md=" + md_path) }
+            }
+
+            // stdout summary
+            println("=== Variance Sweep Summary ===")
+            println(plot)
+            println(cycle_plot)
+            println("max_gradient=" + to_string(max_grad) + " at sigma=" + to_string(max_grad_sigma))
+            println("verdict=" + verdict)
+        }
+    }
+}

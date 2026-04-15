@@ -1,0 +1,159 @@
+// tunable_noise.hexa — deterministic PRNG with tunable additive Gaussian-like noise
+//
+// RNG source: base = pseudo_rand (verbatim from ouroboros_meta.hexa) ∈ [0,1)
+// Perturbation: u' = clamp(u + σ * Z, 0.0001, 0.9999)
+// where Z is a zero-mean symmetric noise synthesised by Box-Muller-lite from
+// two independent LCG draws (a second LCG with different modulus/seed so it
+// stays statistically independent from the base PRNG).
+//
+// σ = 0    → pure determinism (bit-identical to ouroboros_meta baseline)
+// σ small  → small perturbation
+// σ large  → near-uniform (noise dominates)
+//
+// CLI:
+//   hexa tunable_noise.hexa gen <trial_id> <sigma> <generations> <out_path>
+//     trial_id  : 0..N-1 (seeds distinct trajectories)
+//     sigma     : float ∈ [0, 2.0]
+//     generations : int (usually 6)
+//     out_path  : file to write 30*N_gen floats (one per line, scaled 0..1)
+//
+// The produced file is consumed by a lightweight harness that feeds the same
+// 5-float draws into shadow-style meta-mutation offline, OR (simpler) we use
+// this file to seed sweep_runner.hexa which reimplements the ouroboros pipeline
+// with a σ-tunable next_5_rands.  We keep noise generation factored out here
+// for reproducibility & inspection.
+
+fn abs_f(x: float) -> float { if x < 0.0 { 0.0 - x } else { x } }
+fn clamp_f(x: float, lo: float, hi: float) -> float {
+    if x < lo { lo } else { if x > hi { hi } else { x } }
+}
+
+// base PRNG — identical to ouroboros_meta.pseudo_rand
+fn pseudo_rand(seed: int) -> float {
+    let x = ((seed * 1103515245 + 12345) % 2147483647)
+    let pos = if x < 0 { 0 - x } else { x }
+    to_float(pos % 10000) / 10000.0
+}
+
+// auxiliary PRNG — different constants so it is statistically independent
+fn aux_rand(seed: int) -> float {
+    let x = ((seed * 1664525 + 1013904223) % 2147483647)
+    let pos = if x < 0 { 0 - x } else { x }
+    to_float(pos % 10000) / 10000.0
+}
+
+// sqrt (Newton), copied from shadow
+fn sqrt_f(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut guess = x / 2.0
+    let mut i = 0
+    while i < 20 { guess = (guess + x / guess) / 2.0; i = i + 1 }
+    guess
+}
+
+// natural-log approx via series — adequate for noise gen (we only need rough Z)
+fn ln_approx(x: float) -> float {
+    // for x∈(0,1], use ln(x) = -sum_{k>=1} (1-x)^k / k, truncated
+    if x <= 0.0001 { return 0.0 - 9.0 }  // clip
+    let y = 1.0 - x
+    let mut acc = 0.0
+    let mut k = 1
+    let mut yk = y
+    while k <= 12 {
+        acc = acc + yk / to_float(k)
+        yk = yk * y
+        k = k + 1
+    }
+    0.0 - acc
+}
+
+// Box-Muller-lite: two uniforms → one standard normal (approx)
+fn box_muller_z(u1: float, u2: float) -> float {
+    // clip u1 to avoid ln(0)
+    let u1c = if u1 < 0.0001 { 0.0001 } else { if u1 > 0.9999 { 0.9999 } else { u1 } }
+    // Z = sqrt(-2 ln u1) * cos(2π u2)
+    // cos approximated by cheap polynomial: cos(θ) ≈ 1 - θ²/2 + θ⁴/24 for θ∈[-π,π]
+    let two_pi_u2 = 6.2831853 * u2
+    // fold to [-π, π]
+    let mut theta = two_pi_u2
+    while theta > 3.1415927 { theta = theta - 6.2831853 }
+    while theta < 0.0 - 3.1415927 { theta = theta + 6.2831853 }
+    let t2 = theta * theta
+    let cos_approx = 1.0 - t2 / 2.0 + (t2 * t2) / 24.0 - (t2 * t2 * t2) / 720.0
+    let r = sqrt_f(0.0 - 2.0 * ln_approx(u1c))
+    r * cos_approx
+}
+
+// tunable draw: u' = clamp(base + σ * Z, 0, 1)
+fn noisy_draw(seed_base: int, trial: int, k: int, sigma: float) -> float {
+    let seed1 = seed_base + trial * 9973 + k
+    let base = pseudo_rand(seed1)
+    if sigma <= 0.00001 { return base }
+    // independent auxiliary uniforms for Z
+    let u1 = aux_rand(seed1 * 7 + 11)
+    let u2 = aux_rand(seed1 * 13 + 29)
+    let z = box_muller_z(u1, u2)
+    let perturbed = base + sigma * z
+    clamp_f(perturbed, 0.0001, 0.9999)
+}
+
+// CLI: write a file of noisy draws for inspection & downstream consumption
+let _a = args()
+let mode_arg = if _a.len() >= 3 { _a[2] } else { "help" }
+
+if mode_arg == "gen" {
+    let mut trial = 0
+    let mut sigma = 0.0
+    let mut gens = 6
+    let mut out_path = ""
+    if _a.len() >= 4 { try { trial = to_int(_a[3]) } catch e1 {} }
+    if _a.len() >= 5 { try { sigma = to_float(_a[4]) } catch e2 {} }
+    if _a.len() >= 6 { try { gens = to_int(_a[5]) } catch e3 {} }
+    if _a.len() >= 7 { out_path = _a[6] }
+
+    // each generation draws 5 floats for each of 3 lower-half slots (indices 3,4,5)
+    // → 15 floats/gen; we produce gens * 5 * pool_size = gens * 30 to be safe.
+    let total = gens * 30
+    let mut buf = ""
+    let mut i = 0
+    while i < total {
+        let u = noisy_draw(i * 100, trial, i, sigma)
+        buf = buf + to_string(u) + "\n"
+        i = i + 1
+    }
+    if out_path.len() > 0 {
+        try { write_file(out_path, buf) } catch ew {
+            println("WRITE_ERR path=" + out_path)
+        }
+        println("OK trial=" + to_string(trial) + " sigma=" + to_string(sigma) + " gens=" + to_string(gens) + " floats=" + to_string(total) + " path=" + out_path)
+    } else {
+        // stdout fallback
+        println(buf)
+    }
+}
+
+if mode_arg == "stats" {
+    // optional: compute mean/std of noisy draws for a given sigma, 10000 samples
+    let mut sigma = 0.0
+    if _a.len() >= 4 { try { sigma = to_float(_a[3]) } catch e {} }
+    let n = 10000
+    let mut sum = 0.0
+    let mut sum2 = 0.0
+    let mut i = 0
+    while i < n {
+        let u = noisy_draw(i * 77, 0, i, sigma)
+        sum = sum + u
+        sum2 = sum2 + u * u
+        i = i + 1
+    }
+    let mean = sum / to_float(n)
+    let var = sum2 / to_float(n) - mean * mean
+    let sd = sqrt_f(abs_f(var))
+    println("STATS sigma=" + to_string(sigma) + " n=" + to_string(n) + " mean=" + to_string(mean) + " sd=" + to_string(sd))
+}
+
+if mode_arg == "help" {
+    println("tunable_noise.hexa — σ-tunable perturbation of deterministic PRNG")
+    println("  gen <trial> <sigma> <gens> <out_path>")
+    println("  stats <sigma>")
+}

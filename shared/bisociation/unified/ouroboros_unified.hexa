@@ -137,6 +137,98 @@ fn advance(variant: string, st: OuroState) -> OuroState {
     ouroboros_tick(variant, st)
 }
 
+// ═══════════════════════════════════════════
+// EVO-P8-1: 통합 수렴 지수 (Convergence Index)
+// ═══════════════════════════════════════════
+// 3-variant 각각의 수렴 거리를 [0,1] 정규화 후 가중 합산
+//   nexus:  CI_n = 1 - clamp(delta / NEXUS_EPSILON_SCALE, 0, 1)   [saturation proximity]
+//   anima:  CI_a = clamp(value / (peak * ANIMA_FLOOR), 0, 1)      [ratchet floor proximity]
+//   n6arch: CI_g = clamp((nodes/target + edges/target) / 2, 0, 1) [graph closure ratio]
+//   unified CI = (CI_n + CI_a + CI_g) / 3.0
+// 수렴 시 해당 variant CI = 1.0, 미수렴 시 0.0~1.0 연속
+
+comptime const NEXUS_EPSILON_SCALE = 0.1   // delta 가 0.1 이상이면 CI=0
+
+fn clamp_01(x: float) -> float {
+    if x < 0.0 { return 0.0 }
+    if x > 1.0 { return 1.0 }
+    return x
+}
+
+fn convergence_index_nexus(st: OuroState) -> float {
+    if st.cycle == 0 { return 0.0 }
+    if nexus_converged(st) { return 1.0 }
+    clamp_01(1.0 - st.delta / NEXUS_EPSILON_SCALE)
+}
+
+fn convergence_index_anima(st: OuroState) -> float {
+    if st.cycle == 0 { return 0.0 }
+    if anima_converged(st) { return 1.0 }
+    let floor = st.peak * ANIMA_FLOOR
+    if floor <= 0.0 { return 0.0 }
+    clamp_01(st.value / floor)
+}
+
+fn convergence_index_n6arch(st: OuroState) -> float {
+    if st.cycle == 0 { return 0.0 }
+    if n6arch_converged(st) { return 1.0 }
+    let nr = clamp_01(to_float(st.nodes) / to_float(N6ARCH_NODE_TARGET))
+    let er = clamp_01(to_float(st.edges) / to_float(N6ARCH_EDGE_TARGET))
+    (nr + er) / 2.0
+}
+
+// 통합 수렴 지수: 3-variant 평균 [0.0 .. 1.0]
+fn convergence_index(sn: OuroState, sa: OuroState, sg: OuroState) -> float {
+    let ci_n = convergence_index_nexus(sn)
+    let ci_a = convergence_index_anima(sa)
+    let ci_g = convergence_index_n6arch(sg)
+    (ci_n + ci_a + ci_g) / 3.0
+}
+
+// 통합 수렴 지수 + 분해 리포트
+struct ConvergenceReport {
+    ci_nexus: float,
+    ci_anima: float,
+    ci_n6arch: float,
+    ci_unified: float,
+    vote_nexus: bool,
+    vote_anima: bool,
+    vote_n6arch: bool,
+    votes: int,
+    verdict: string
+}
+
+fn convergence_report(sn: OuroState, sa: OuroState, sg: OuroState) -> ConvergenceReport {
+    let ci_n = convergence_index_nexus(sn)
+    let ci_a = convergence_index_anima(sa)
+    let ci_g = convergence_index_n6arch(sg)
+    let ci_u = (ci_n + ci_a + ci_g) / 3.0
+    let vn = nexus_converged(sn)
+    let va = anima_converged(sa)
+    let vg = n6arch_converged(sg)
+    let v = (if vn { 1 } else { 0 }) + (if va { 1 } else { 0 }) + (if vg { 1 } else { 0 })
+    let verdict = if v == 3 { "TRUE_CONVERGENCE" } else if v >= 2 { "PARTIAL_CONVERGENCE" } else if ci_u >= 0.7 { "APPROACHING" } else { "EVOLVING" }
+    ConvergenceReport { ci_nexus: ci_n, ci_anima: ci_a, ci_n6arch: ci_g, ci_unified: ci_u, vote_nexus: vn, vote_anima: va, vote_n6arch: vg, votes: v, verdict: verdict }
+}
+
+fn print_convergence_report(r: ConvergenceReport) {
+    println("=== OUROBOROS 통합 수렴 지수 (Convergence Index) ===")
+    println("")
+    println("variant  | CI       | converged | semantics")
+    println("---------+----------+-----------+----------------------------")
+    println("nexus    | " + to_string(r.ci_nexus)  + " | " + to_string(r.vote_nexus)  + "     | saturation delta → epsilon")
+    println("anima    | " + to_string(r.ci_anima)  + " | " + to_string(r.vote_anima)  + "     | phi ratchet → floor")
+    println("n6arch   | " + to_string(r.ci_n6arch) + " | " + to_string(r.vote_n6arch) + "     | graph closure → target")
+    println("---------+----------+-----------+----------------------------")
+    println("unified  | " + to_string(r.ci_unified) + " | " + to_string(r.votes) + "/3       | mean(CI_n, CI_a, CI_g)")
+    println("")
+    println("verdict: " + r.verdict)
+    println("  TRUE_CONVERGENCE   = 3/3 converged")
+    println("  PARTIAL_CONVERGENCE = 2/3 converged")
+    println("  APPROACHING         = CI >= 0.7 but votes < 2")
+    println("  EVOLVING            = CI < 0.7")
+}
+
 // ─── CLI ───
 
 fn cmd_inspect() {
@@ -179,6 +271,27 @@ let mode = if a_len >= 3 { a[2] } else { "help" }
 
 if mode == "inspect" { cmd_inspect() }
 
+if mode == "ci" {
+    // 통합 수렴 지수 (EVO-P8-1)
+    let steps = if a_len >= 4 { to_int(a[3]) } else { 12 }
+    let cap = if steps < MAX_CYCLES { steps } else { MAX_CYCLES }
+    let mut sn = new_state("nexus")
+    let mut sa = new_state("anima")
+    let mut sg = new_state("n6arch")
+    let mut i = 0
+    while i < cap {
+        sn = advance("nexus", sn)
+        sa = advance("anima", sa)
+        sg = advance("n6arch", sg)
+        let r = convergence_report(sn, sa, sg)
+        println("cycle " + to_string(i + 1) + " | CI=" + to_string(r.ci_unified) + " | n=" + to_string(r.ci_nexus) + " a=" + to_string(r.ci_anima) + " g=" + to_string(r.ci_n6arch) + " | " + r.verdict)
+        i = i + 1
+    }
+    println("")
+    let final_r = convergence_report(sn, sa, sg)
+    print_convergence_report(final_r)
+}
+
 if mode == "demo" {
     let mut v = "unified"
     let mut s = 12
@@ -192,6 +305,7 @@ if mode == "help" {
     println("")
     println("사용법:")
     println("  hexa ouroboros_unified.hexa inspect                  3종 원본/고정점 비교")
+    println("  hexa ouroboros_unified.hexa ci [steps]               통합 수렴 지수 (EVO-P8-1)")
     println("  hexa ouroboros_unified.hexa demo <variant> <steps>   샘플 실행")
     println("    variant: nexus | anima | n6arch | unified")
     println("")
@@ -235,8 +349,38 @@ assert su1.cycle == 1
 assert nexus_fp() == NEXUS_FP
 assert n6arch_fp() == 1.0
 
+// EVO-P8-1: convergence index 검증
+let ci0_n = convergence_index_nexus(s0)
+assert ci0_n == 0.0   // cycle 0 → CI=0
+let ci1_n = convergence_index_nexus(s1)
+assert ci1_n >= 0.0
+assert ci1_n <= 1.0
+
+let ci0_a = convergence_index_anima(sa0)
+assert ci0_a == 0.0
+let ci1_a = convergence_index_anima(sa1)
+assert ci1_a >= 0.0
+assert ci1_a <= 1.0
+
+let ci0_g = convergence_index_n6arch(sg0)
+assert ci0_g == 0.0
+let ci1_g = convergence_index_n6arch(sg1)
+assert ci1_g >= 0.0
+assert ci1_g <= 1.0
+
+let ci_unified_0 = convergence_index(s0, sa0, sg0)
+assert ci_unified_0 == 0.0
+
+let ci_unified_1 = convergence_index(s1, sa1, sg1)
+assert ci_unified_1 >= 0.0
+assert ci_unified_1 <= 1.0
+
+let report_1 = convergence_report(s1, sa1, sg1)
+assert report_1.votes >= 0
+assert report_1.votes <= 3
+
 println("")
-println("=== ouroboros_unified verified ===")
+println("=== ouroboros_unified verified (+ EVO-P8-1 convergence index) ===")
 
 proof ouroboros_unified_invariants {
     invariant anima_ratchet_monotonic()       // peak never decreases

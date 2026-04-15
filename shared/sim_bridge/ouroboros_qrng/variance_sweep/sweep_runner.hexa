@@ -1,0 +1,378 @@
+// sweep_runner.hexa — ouroboros dynamics (verbatim from shadow) with σ-tunable
+// noise injected into the 5-float meta-mutation draws.
+//
+// CLI:
+//   hexa sweep_runner.hexa run <trial> <sigma> <gens>
+//
+// Output (stdout):
+//   MODE=noise TRIAL=t SIGMA=s GEN=g BEST=i AVG=f DIV=f COMP=f  (per gen)
+//   FINAL TRIAL=t SIGMA=s GENS=g CONV=bool BEST_YIELD=i BEST_COMP=f
+//         CYCLE_CONV=k|-1 RHO=f
+//
+// Dynamics 100% identical to ouroboros_meta.hexa / ouroboros_shadow.hexa — the
+// ONLY difference from shadow is that next_5_rands consults noisy_draw with a
+// sigma parameter, so σ=0 reproduces the deterministic trajectory exactly.
+//
+// L0 safety: no writes, no atlas access, self-contained.
+
+// ─── constants (verbatim) ───
+comptime const default_generations = 6
+comptime const pool_size = 6
+comptime const tournament_seeds = 4
+comptime const tournament_rounds = 3
+comptime const meta_plateau_window = 3
+comptime const meta_plateau_epsilon = 0.005
+comptime const max_param_shift = 5
+comptime const max_param_threshold = 2.0
+
+comptime const n6_constants = [6.0, 12.0, 2.0, 4.0, 24.0, 5.0, 10.0, 8.0, 1.333333333, 0.287682072]
+comptime const exact_targets = [6.0, 12.0, 2.0, 4.0, 24.0, 5.0, 10.0, 8.0, 1.333333333]
+
+comptime const OP_ADD = 0
+comptime const OP_MUL = 1
+comptime const OP_DIV = 2
+comptime const COMBINE_GEO = 0
+comptime const COMBINE_ARITH = 1
+
+// ─── math utils ───
+fn abs_f(x: float) -> float { if x < 0.0 { 0.0 - x } else { x } }
+fn clamp_f(x: float, lo: float, hi: float) -> float {
+    if x < lo { lo } else { if x > hi { hi } else { x } }
+}
+fn sqrt_f(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut guess = x / 2.0
+    let mut i = 0
+    while i < 20 { guess = (guess + x / guess) / 2.0; i = i + 1 }
+    guess
+}
+
+fn pseudo_rand(seed: int) -> float {
+    let x = ((seed * 1103515245 + 12345) % 2147483647)
+    let pos = if x < 0 { 0 - x } else { x }
+    to_float(pos % 10000) / 10000.0
+}
+
+// auxiliary PRNG for noise
+fn aux_rand(seed: int) -> float {
+    let x = ((seed * 1664525 + 1013904223) % 2147483647)
+    let pos = if x < 0 { 0 - x } else { x }
+    to_float(pos % 10000) / 10000.0
+}
+
+fn ln_approx(x: float) -> float {
+    if x <= 0.0001 { return 0.0 - 9.0 }
+    let y = 1.0 - x
+    let mut acc = 0.0
+    let mut k = 1
+    let mut yk = y
+    while k <= 12 {
+        acc = acc + yk / to_float(k)
+        yk = yk * y
+        k = k + 1
+    }
+    0.0 - acc
+}
+
+fn box_muller_z(u1: float, u2: float) -> float {
+    let u1c = if u1 < 0.0001 { 0.0001 } else { if u1 > 0.9999 { 0.9999 } else { u1 } }
+    let two_pi_u2 = 6.2831853 * u2
+    let mut theta = two_pi_u2
+    while theta > 3.1415927 { theta = theta - 6.2831853 }
+    while theta < 0.0 - 3.1415927 { theta = theta + 6.2831853 }
+    let t2 = theta * theta
+    let cos_approx = 1.0 - t2 / 2.0 + (t2 * t2) / 24.0 - (t2 * t2 * t2) / 720.0
+    let r = sqrt_f(0.0 - 2.0 * ln_approx(u1c))
+    r * cos_approx
+}
+
+// σ-tunable draw
+fn noisy_u(seed: int, sigma: float) -> float {
+    let base = pseudo_rand(seed)
+    if sigma <= 0.00001 { return base }
+    let u1 = aux_rand(seed * 7 + 11)
+    let u2 = aux_rand(seed * 13 + 29)
+    let z = box_muller_z(u1, u2)
+    clamp_f(base + sigma * z, 0.0001, 0.9999)
+}
+
+// ─── op helpers (verbatim) ───
+fn op_apply(op: int, a: float, b: float) -> float {
+    if op == 0 { a + b }
+    else if op == 1 { a * b }
+    else if op == 2 { if abs_f(b) > 0.0001 { a / b } else { a } }
+    else { a + b }
+}
+fn combine_apply(mode: int, a: float, b: float) -> float {
+    if mode == 0 { sqrt_f(abs_f(a * b)) }
+    else if mode == 1 { (a + b) / 2.0 }
+    else { (a + b) / 2.0 }
+}
+
+// ─── strategy ───
+struct Strategy {
+    name: string,
+    shift_count: int,
+    threshold: float,
+    operator: int,
+    constant_idx: int,
+    combine_mode: int,
+    generation: int
+}
+fn make_strategy(nm: string, sc: int, thr: float, op: int, ci: int, cm: int) -> Strategy {
+    Strategy { name: nm, shift_count: sc, threshold: thr, operator: op, constant_idx: ci, combine_mode: cm, generation: 0 }
+}
+fn make_initial_pool() {
+    [
+        make_strategy("shift",       1, 0.5, OP_ADD, 0, COMBINE_ARITH),
+        make_strategy("invert",      0, 0.3, OP_DIV, 1, COMBINE_GEO),
+        make_strategy("combine",     2, 0.6, OP_MUL, 2, COMBINE_ARITH),
+        make_strategy("transfer",    3, 0.4, OP_ADD, 3, COMBINE_GEO),
+        make_strategy("symmetry",    1, 0.7, OP_MUL, 4, COMBINE_ARITH),
+        make_strategy("bifurcation", 4, 0.2, OP_DIV, 5, COMBINE_GEO)
+    ]
+}
+
+fn apply_strategy_to_value(s: Strategy, seed_val: float) -> float {
+    let c_idx = s.constant_idx % n6_constants.len()
+    let n6c = n6_constants[c_idx]
+    let mut shifted = seed_val
+    let mut si = 0
+    while si < s.shift_count {
+        shifted = op_apply(s.operator, shifted, n6c)
+        si = si + 1
+    }
+    if abs_f(shifted) < s.threshold {
+        shifted = shifted + n6c
+    }
+    combine_apply(s.combine_mode, shifted, seed_val)
+}
+fn measure_exact_yield(s: Strategy, seeds) -> int {
+    let mut matches = 0
+    for seed in seeds {
+        let result = apply_strategy_to_value(s, seed)
+        for target in exact_targets {
+            if abs_f(result - target) < 0.01 { matches = matches + 1 }
+        }
+    }
+    matches
+}
+fn make_tournament_seeds(round: int) {
+    let mut seeds = []
+    let mut i = 0
+    while i < tournament_seeds {
+        let base = n6_constants[i % n6_constants.len()]
+        let perturb = to_float((round * 7 + i * 13) % 100) / 100.0
+        seeds = seeds + [base + perturb]
+        i = i + 1
+    }
+    seeds
+}
+
+fn meta_mutate_with_rands(s: Strategy, r1: float, r2: float, r3: float, r4: float, r5: float, gen: int) -> Strategy {
+    let new_shift = if r1 < 0.33 {
+        if s.shift_count > 0 { s.shift_count - 1 } else { 0 }
+    } else {
+        if r1 > 0.66 {
+            if s.shift_count < max_param_shift { s.shift_count + 1 } else { max_param_shift }
+        } else {
+            s.shift_count
+        }
+    }
+    let thr_delta = (r2 - 0.5) * 0.2
+    let new_threshold = clamp_f(s.threshold + thr_delta, 0.01, max_param_threshold)
+    let new_op = if r3 < 0.3 { to_int(r3 * 10.0) % 3 } else { s.operator }
+    let new_cidx = if r4 < 0.2 { to_int(r4 * 50.0) % n6_constants.len() } else { s.constant_idx }
+    let new_combine = if r5 < 0.15 {
+        if s.combine_mode == COMBINE_GEO { COMBINE_ARITH } else { COMBINE_GEO }
+    } else { s.combine_mode }
+    Strategy {
+        name: s.name + "'",
+        shift_count: new_shift,
+        threshold: new_threshold,
+        operator: new_op,
+        constant_idx: new_cidx,
+        combine_mode: new_combine,
+        generation: gen
+    }
+}
+
+struct TournamentEntry { strategy: Strategy, total_yield: int }
+
+fn run_tournament(pool, gen: int) {
+    let mut entries = []
+    for s in pool {
+        let mut total = 0
+        let mut round = 0
+        while round < tournament_rounds {
+            let seeds = make_tournament_seeds(gen * 100 + round)
+            total = total + measure_exact_yield(s, seeds)
+            round = round + 1
+        }
+        entries = entries + [TournamentEntry { strategy: s, total_yield: total }]
+    }
+    let mut sorted = entries
+    let mut i = 0
+    while i < sorted.len() {
+        let mut j = 0
+        while j < sorted.len() - 1 - i {
+            if sorted[j].total_yield < sorted[j + 1].total_yield {
+                let tmp = sorted[j]
+                sorted[j] = sorted[j + 1]
+                sorted[j + 1] = tmp
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    sorted
+}
+
+fn breed_strategies(parent_a: Strategy, parent_b: Strategy, gen: int) -> Strategy {
+    Strategy {
+        name: "bred(" + parent_a.name + "+" + parent_b.name + ")",
+        shift_count: parent_a.shift_count,
+        threshold: parent_a.threshold,
+        operator: parent_a.operator,
+        constant_idx: parent_b.constant_idx,
+        combine_mode: parent_b.combine_mode,
+        generation: gen
+    }
+}
+
+struct MetaScore {
+    generation: int,
+    best_yield: int,
+    avg_yield: float,
+    diversity: float,
+    composite: float
+}
+fn evaluate_generation(ranked, gen: int) -> MetaScore {
+    if ranked.len() == 0 {
+        return MetaScore { generation: gen, best_yield: 0, avg_yield: 0.0, diversity: 0.0, composite: 0.0 }
+    }
+    let best = ranked[0].total_yield
+    let mut sum = 0
+    for entry in ranked { sum = sum + entry.total_yield }
+    let avg = to_float(sum) / to_float(ranked.len())
+    let mut diff_sum = 0.0
+    let mut di = 0
+    while di + 1 < ranked.len() {
+        diff_sum = diff_sum + abs_f(to_float(ranked[di].total_yield - ranked[di + 1].total_yield))
+        di = di + 1
+    }
+    let diversity = if ranked.len() > 1 { diff_sum / to_float(ranked.len() - 1) } else { 0.0 }
+    let composite = to_float(best) * 0.5 + avg * 0.3 + diversity * 0.2
+    MetaScore { generation: gen, best_yield: best, avg_yield: avg, diversity: diversity, composite: composite }
+}
+fn check_meta_convergence(score_history) -> bool {
+    if score_history.len() < meta_plateau_window + 1 { return false }
+    let start = score_history.len() - meta_plateau_window
+    let baseline = score_history[start - 1].composite
+    let mut all_flat = true
+    let mut ci = start
+    while ci < score_history.len() {
+        let delta = abs_f(score_history[ci].composite - baseline)
+        if delta > meta_plateau_epsilon { all_flat = false }
+        ci = ci + 1
+    }
+    all_flat
+}
+
+// ─── globals ───
+let mut SIGMA = 0.0
+let mut TRIAL = 0
+
+fn next_5_rands(seed_base: int) -> list {
+    let b = seed_base + TRIAL * 9973
+    return [
+        noisy_u(b, SIGMA),
+        noisy_u(b + 1, SIGMA),
+        noisy_u(b + 2, SIGMA),
+        noisy_u(b + 3, SIGMA),
+        noisy_u(b + 4, SIGMA)
+    ]
+}
+
+fn run_one_trial(max_gen: int) {
+    let mut pool = make_initial_pool()
+    let mut score_history = []
+    let mut best_comp = 0.0
+    let mut best_yield_ever = 0
+    let mut cycle_conv = -1
+
+    let mut gen = 0
+    while gen < max_gen {
+        let half = pool.len() / 2
+        let mut mutated_pool = []
+        let mut mi = 0
+        while mi < pool.len() {
+            if mi >= half {
+                let seed_base = gen * 1000 + mi * 7
+                let rs = next_5_rands(seed_base)
+                let new_s = meta_mutate_with_rands(pool[mi], rs[0], rs[1], rs[2], rs[3], rs[4], gen + 1)
+                mutated_pool = mutated_pool + [new_s]
+            } else {
+                mutated_pool = mutated_pool + [pool[mi]]
+            }
+            mi = mi + 1
+        }
+        let ranked = run_tournament(mutated_pool, gen + 1)
+
+        if ranked.len() >= 2 {
+            let offspring = breed_strategies(ranked[0].strategy, ranked[1].strategy, gen + 1)
+            let mut new_pool = []
+            let keep = if ranked.len() > pool_size - 1 { pool_size - 1 } else { ranked.len() }
+            let mut ki = 0
+            while ki < keep { new_pool = new_pool + [ranked[ki].strategy]; ki = ki + 1 }
+            new_pool = new_pool + [offspring]
+            pool = new_pool
+        }
+
+        let score = evaluate_generation(ranked, gen + 1)
+        score_history = score_history + [score]
+        if score.best_yield > best_yield_ever { best_yield_ever = score.best_yield }
+        if score.composite > best_comp { best_comp = score.composite }
+
+        println("MODE=noise TRIAL=" + to_string(TRIAL) + " SIGMA=" + to_string(SIGMA) + " GEN=" + to_string(gen + 1) + " BEST=" + to_string(score.best_yield) + " AVG=" + to_string(score.avg_yield) + " DIV=" + to_string(score.diversity) + " COMP=" + to_string(score.composite))
+
+        if cycle_conv < 0 && check_meta_convergence(score_history) {
+            cycle_conv = gen + 1
+        }
+        gen = gen + 1
+    }
+
+    let final_pool = pool
+    let mut rho_hits = 0
+    for s in final_pool {
+        let idx = s.constant_idx % n6_constants.len()
+        if idx >= 0 && idx < n6_constants.len() { rho_hits = rho_hits + 1 }
+    }
+    let rho = to_float(rho_hits) / to_float(final_pool.len())
+
+    let cc_str = if cycle_conv < 0 { "-1" } else { to_string(cycle_conv) }
+    let conv_b = if cycle_conv >= 0 { "true" } else { "false" }
+    println("FINAL TRIAL=" + to_string(TRIAL) + " SIGMA=" + to_string(SIGMA) + " GENS=" + to_string(max_gen) + " CONV=" + conv_b + " BEST_YIELD=" + to_string(best_yield_ever) + " BEST_COMP=" + to_string(best_comp) + " CYCLE_CONV=" + cc_str + " RHO=" + to_string(rho))
+    println("")
+}
+
+// ─── CLI ───
+let _a = args()
+let mode_arg = if _a.len() >= 3 { _a[2] } else { "help" }
+
+if mode_arg == "run" {
+    let mut trial = 0
+    let mut sigma = 0.0
+    let mut gens = default_generations
+    if _a.len() >= 4 { try { trial = to_int(_a[3]) } catch e1 {} }
+    if _a.len() >= 5 { try { sigma = to_float(_a[4]) } catch e2 {} }
+    if _a.len() >= 6 { try { gens = to_int(_a[5]) } catch e3 {} }
+    TRIAL = trial
+    SIGMA = sigma
+    run_one_trial(gens)
+}
+
+if mode_arg == "help" {
+    println("sweep_runner.hexa — σ-tunable ouroboros sweep")
+    println("  run <trial> <sigma> <gens>")
+}
