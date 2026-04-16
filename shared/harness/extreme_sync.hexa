@@ -62,6 +62,7 @@ fn file_exists(p: string) -> bool {
 // Count options by state using jq — robust, no hexa JSON parser needed.
 // returns 0 on jq failure.
 // "chosen" also counts state=="done" (ossified options).
+// "done" is a distinct raw count (used for wall_progress_pct denominator math).
 fn count_state(path: string, state: string) -> i64 {
     if !file_exists(path) { return 0 }
     let mut cmd = ""
@@ -70,6 +71,16 @@ fn count_state(path: string, state: string) -> i64 {
     } else {
         cmd = "jq -r '[.tracks[].options[]? | select(.state==\"" + state + "\")] | length' " + path + " 2>/dev/null"
     }
+    let out = exec(cmd).trim()
+    if out == "" || out == "null" { return 0 }
+    return to_int(out)
+}
+
+// Count raw state=="done" only (no chosen merge). Used to compute
+// wall_progress_pct as a monotone fraction independent of chosen flapping.
+fn count_done_raw(path: string) -> i64 {
+    if !file_exists(path) { return 0 }
+    let cmd = "jq -r '[.tracks[].options[]? | select(.state==\"done\")] | length' " + path + " 2>/dev/null"
     let out = exec(cmd).trim()
     if out == "" || out == "null" { return 0 }
     return to_int(out)
@@ -161,7 +172,8 @@ struct AggCounts {
     chosen: i64,
     alternative: i64,
     rejected: i64,
-    provisional: i64
+    provisional: i64,
+    done: i64
 }
 
 // options_chosen can legitimately DECREASE when items are re-classified provisional.
@@ -174,6 +186,7 @@ fn sum_counts(paths: list) -> AggCounts {
     let mut alt: i64 = 0
     let mut rej: i64 = 0
     let mut prov: i64 = 0
+    let mut dn: i64 = 0
     let mut i: i64 = 0
     while i < paths.len() {
         let p = paths[i]
@@ -182,11 +195,12 @@ fn sum_counts(paths: list) -> AggCounts {
         alt = alt + count_state(p, "alternative")
         rej = rej + count_state(p, "rejected")
         prov = prov + count_state(p, "provisional")
+        dn = dn + count_done_raw(p)
         i = i + 1
     }
     return AggCounts {
         total: total, chosen: chosen, alternative: alt,
-        rejected: rej, provisional: prov
+        rejected: rej, provisional: prov, done: dn
     }
 }
 
@@ -199,20 +213,26 @@ fn status_of(counts: AggCounts) -> string {
     return "provisional"
 }
 
-// wall_progress_pct heuristic:
-//   0-20: spec only
-//   20-40: ALM Day 0 in progress (hire_sim log exists)
-//   40-60: ALM Day 1-2 (checkpoint exists)
-//   60-80: ALM Day 3+ (serving wire done)
-//   80-100: gate passed
-fn compute_progress(evid_hs: string, pbv_count: i64, stage0_ok: bool) -> i64 {
+// wall_progress_pct:
+//   Count-based denominator from sub-roadmap option states (non-abandoned).
+//   Formula: done / (done + chosen + provisional)
+//     - numerator   = raw done options (ossified, monotone up modulo re-open)
+//     - denominator = still-live options (done + chosen + provisional)
+//     - excludes alternative/rejected (abandoned — not part of progress denom)
+//   Evidence bonus: +5pp if hire_sim gate metric present (completion_rate|avg_score)
+//     (small nudge only; never dominates the ratio)
+//   Floor 5, ceiling 100. Guard div-by-zero.
+fn compute_progress(counts: AggCounts, evid_hs: string) -> i64 {
+    let denom = counts.done + counts.chosen + counts.provisional
     let mut p: i64 = 5
-    if stage0_ok { p = p + 5 }
-    if pbv_count >= 7 { p = p + 5 }  // C3 isolation in progress
-    if evid_hs != "no_log" { p = p + 15 }
-    if evid_hs.index_of("completion_rate") >= 0 || evid_hs.index_of("avg_score") >= 0 {
-        p = p + 20
+    if denom > 0 {
+        p = (counts.done * 100) / denom
     }
+    if evid_hs.index_of("completion_rate") >= 0 || evid_hs.index_of("avg_score") >= 0 {
+        p = p + 5
+    }
+    if p < 5 { p = 5 }
+    if p > 100 { p = 100 }
     return p
 }
 
@@ -367,26 +387,89 @@ fn update_destinations(ts: string, hs_evidence: string, dry: bool) -> bool {
 }
 
 // ── Phase status sync — phases[].status 자동 갱신 ──────────────────────
+// Rollup rule (task-driven — preferred):
+//   all non-null tasks in phases[i].parallel[*].tasks[*].status == "done" → "done"
+//   any task.status == "in_progress"                                      → "in_progress"
+//   else (any planned, or mix of planned+done)                            → "planned"
+//   if phase has no tasks (tasks==null or empty) → fall back to evidence heuristic
+//
+// Evidence fallback (only when no tasks):
+//   ALM-TRAIN: hire_sim log present → in_progress; gate metric present → done
+//   CLM-*:     clm_phase_remaining ladder
+//   ALM-CONSCIOUS / ALM-RC / CLM-7B: cascade from prior phase
+//
+// Rolls up each phase independently — never overrides task-declared state.
+fn rollup_phase_from_tasks(phase_idx: i64) -> string {
+    // jq: count tasks by status across all .parallel[*].tasks[*]
+    let base = "jq -r '.phases[" + to_string(phase_idx) + "].parallel[]?.tasks[]?.status' " + PATH_XT + " 2>/dev/null"
+    let out = exec(base).trim()
+    if out == "" { return "" }   // no tasks — caller will fall back
+    let mut total: i64 = 0
+    let mut done: i64 = 0
+    let mut ip: i64 = 0
+    let lines = out.split("\n")
+    let mut i: i64 = 0
+    while i < lines.len() {
+        let s = lines[i].trim()
+        if s != "" && s != "null" {
+            total = total + 1
+            if s == "done" { done = done + 1 }
+            if s == "in_progress" { ip = ip + 1 }
+        }
+        i = i + 1
+    }
+    if total == 0 { return "" }
+    if ip > 0 { return "in_progress" }
+    if done == total { return "done" }
+    if done > 0 { return "in_progress" }  // partial: some done, rest planned
+    return "planned"
+}
+
 fn update_phase_statuses(ts: string, hs_evidence: string, dry: bool) -> bool {
     if !file_exists(PATH_XT) { return false }
     let alm_training = hs_evidence != "no_log"
     let alm_gate = hs_evidence.index_of("completion_rate") >= 0 || hs_evidence.index_of("avg_score") >= 0
 
-    let prep_s = "done"
-    let launch_s = "done"
-    let mut alm_train_s = "planned"
-    if alm_training { alm_train_s = "in_progress" }
-    if alm_gate { alm_train_s = "done" }
-    let mut clm_curr_s = "planned"
+    // Evidence-derived fallback statuses (used only when a phase has no tasks).
+    let prep_fb = "done"
+    let launch_fb = "done"
+    let mut alm_train_fb = "planned"
+    if alm_training { alm_train_fb = "in_progress" }
+    if alm_gate { alm_train_fb = "done" }
+    let mut clm_curr_fb = "planned"
     let clm_rem = clm_phase_remaining()
-    if clm_rem < 28 { clm_curr_s = "in_progress" }
-    if clm_rem <= 3 { clm_curr_s = "done" }
-    let mut alm_con_s = "planned"
-    if alm_train_s == "done" { alm_con_s = "in_progress" }
-    let mut alm_rc_s = "planned"
-    if alm_gate { alm_con_s = "done"; alm_rc_s = "in_progress" }
-    let mut clm_7b_s = "planned"
-    if clm_curr_s == "done" { clm_7b_s = "in_progress" }
+    if clm_rem < 28 { clm_curr_fb = "in_progress" }
+    if clm_rem <= 3 { clm_curr_fb = "done" }
+    let mut alm_con_fb = "planned"
+    if alm_train_fb == "done" { alm_con_fb = "in_progress" }
+    let mut alm_rc_fb = "planned"
+    if alm_gate { alm_con_fb = "done"; alm_rc_fb = "in_progress" }
+    let mut clm_7b_fb = "planned"
+    if clm_curr_fb == "done" { clm_7b_fb = "in_progress" }
+
+    // Task-driven rollup (preferred). Empty string = no tasks → use fallback.
+    let r0 = rollup_phase_from_tasks(0)
+    let r1 = rollup_phase_from_tasks(1)
+    let r2 = rollup_phase_from_tasks(2)
+    let r3 = rollup_phase_from_tasks(3)
+    let r4 = rollup_phase_from_tasks(4)
+    let r5 = rollup_phase_from_tasks(5)
+    let r6 = rollup_phase_from_tasks(6)
+
+    let mut prep_s = r0
+    if prep_s == "" { prep_s = prep_fb }
+    let mut launch_s = r1
+    if launch_s == "" { launch_s = launch_fb }
+    let mut alm_train_s = r2
+    if alm_train_s == "" { alm_train_s = alm_train_fb }
+    let mut clm_curr_s = r3
+    if clm_curr_s == "" { clm_curr_s = clm_curr_fb }
+    let mut alm_con_s = r4
+    if alm_con_s == "" { alm_con_s = alm_con_fb }
+    let mut alm_rc_s = r5
+    if alm_rc_s == "" { alm_rc_s = alm_rc_fb }
+    let mut clm_7b_s = r6
+    if clm_7b_s == "" { clm_7b_s = clm_7b_fb }
 
     let jq_expr = "(.phases[0].status) = \"" + prep_s + "\""
         + " | (.phases[1].status) = \"" + launch_s + "\""
@@ -476,7 +559,7 @@ fn cmd_sync(dry: bool) -> i64 {
     let hs = latest_hire_sim_pass()
     let pbv = pbv_experiment_count()
     let st0 = stage0_recent()
-    let progress = compute_progress(hs, pbv, st0)
+    let progress = compute_progress(counts, hs)
     if dry {
         println("extreme_sync DRY " + ts)
         println("  options: total=" + to_string(counts.total)
