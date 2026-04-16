@@ -14,6 +14,7 @@
 //   check_bare_interpreter_cmd    bare python3/ruby/node 차단          (R22)
 //   check_no_archive_cmd          mkdir backup / cp .bak / tar.gz      (H-NOARCHIVE)
 //   check_no_hook_cmd             git config core.hooksPath / claude   (H-NOHOOK)
+//   check_git_destruction_cmd     git reset --hard / clean -f / stash  (H-NO-GIT-DESTRUCT)
 //   check_hexa_budget             hexa 프로세스 예산 게이트            (H-NOZOMBIE)
 // ═══════════════════════════════════════════════════════════
 
@@ -213,6 +214,99 @@ fn check_no_hook_cmd(tool: str, arg: str) -> str {
     if arg.contains("claude hooks add") || arg.contains("claude config hooks") {
         return "REJECT: claude hooks add 금지 (H-NOHOOK) — settings.json hooks={} SSOT. harness/entry.hexa 자율 호출로 대체. 우회: NEXUS_HOOK_OK=1"
     }
+    return ""
+}
+
+// H-NO-GIT-DESTRUCT: 비가역 git 명령 차단 (2026-04-17 audit-agent 사건 후 도입).
+// Why: read-only audit 에이전트가 `git stash + reset` 으로 untracked .hexa 8개 영구 소실.
+//      stash 는 --include-untracked 없으면 untracked 보존 안 함 → reset 시 통째로 사라짐.
+//      git fsck dangling blob 으로 7개 복구했으나 1개 영구 소실, 동일 사고 재발 방지 필수.
+// 차단:
+//   1. git reset --hard            (worktree+index 무조건 파괴)
+//   2. git clean -f / -fd / -fdx   (untracked 파일 무조건 파괴)
+//   3. git checkout . / -- .       (worktree 변경 무조건 파괴)
+//   4. git checkout --force        (worktree 변경 + branch 강제 전환)
+//   5. git restore . / --worktree . (worktree 변경 무조건 파괴)
+//   6. git switch -f / --discard-changes (worktree 변경 파괴)
+//   7. git branch -D <name>        (unmerged branch 강제 삭제)
+//   8. git stash drop / clear      (stash 무조건 파괴)
+//   9. git stash (push) without -u WHEN untracked files exist  ← 본 사건 원인
+//  10. git update-ref -d           (ref 무조건 삭제)
+// 우회: NEXUS_GIT_OK=1 prefix 또는 cmd 내 @allow-git-destruct 토큰.
+fn check_git_destruction_cmd(tool: str, arg: str) -> str {
+    if tool != "Bash" { return "" }
+    if arg.len() == 0 { return "" }
+    if arg.contains("NEXUS_GIT_OK=1") { return "" }
+    if arg.contains("@allow-git-destruct") { return "" }
+    if arg.contains("git ") == false { return "" }
+
+    // 1. reset --hard
+    if arg.contains("git reset --hard") || arg.contains("git reset -h ") {
+        return "REJECT: git reset --hard 차단 (H-NO-GIT-DESTRUCT) — worktree+index 무조건 파괴. 안전대안: git reset --soft / --mixed (기본) / git revert. 우회: NEXUS_GIT_OK=1 prefix"
+    }
+
+    // 2. clean -f / -fd / -fdx / -fx (실제 삭제는 -f 필수)
+    if arg.contains("git clean -f") || arg.contains("git clean --force") || arg.contains("git clean -df") || arg.contains("git clean -dfx") {
+        return "REJECT: git clean -f 차단 (H-NO-GIT-DESTRUCT) — untracked 파일 무조건 삭제 (본 사건 원인 클래스). 안전대안: git clean -n (dry-run 먼저). 우회: NEXUS_GIT_OK=1 prefix"
+    }
+
+    // 3-4. checkout 파괴 패턴 — git checkout . / git checkout -- . / git checkout --force / -f
+    if arg.contains("git checkout .") || arg.contains("git checkout -- .") {
+        return "REJECT: git checkout . 차단 (H-NO-GIT-DESTRUCT) — worktree 변경 무조건 파괴. 안전대안: git stash --include-untracked 후 작업, git restore --source=HEAD <file>. 우회: NEXUS_GIT_OK=1 prefix"
+    }
+    if arg.contains("git checkout --force") || arg.contains("git checkout -f ") {
+        return "REJECT: git checkout --force/-f 차단 (H-NO-GIT-DESTRUCT) — worktree 강제 폐기 + branch 전환. 우회: NEXUS_GIT_OK=1 prefix"
+    }
+
+    // 5. restore . / restore --worktree .
+    if arg.contains("git restore .") || arg.contains("git restore --worktree .") || arg.contains("git restore --staged --worktree .") {
+        return "REJECT: git restore . 차단 (H-NO-GIT-DESTRUCT) — worktree 변경 무조건 파괴. 안전대안: 파일별 git restore <file>. 우회: NEXUS_GIT_OK=1 prefix"
+    }
+
+    // 6. switch -f / --discard-changes
+    if arg.contains("git switch -f ") || arg.contains("git switch --force ") || arg.contains("git switch --discard-changes") {
+        return "REJECT: git switch --force/-f 차단 (H-NO-GIT-DESTRUCT) — worktree 변경 파괴. 안전대안: git stash --include-untracked 선행. 우회: NEXUS_GIT_OK=1 prefix"
+    }
+
+    // 7. branch -D (대문자만 차단, -d 는 merged 만 삭제하므로 안전)
+    if arg.contains("git branch -D ") || arg.contains("git branch --delete --force") || arg.contains("git branch -Df ") || arg.contains("git branch -fD ") {
+        return "REJECT: git branch -D 차단 (H-NO-GIT-DESTRUCT) — unmerged branch 강제 삭제 (커밋 영구 손실 가능). 안전대안: git branch -d (merged 만), git branch -m <new> 로 rename. 우회: NEXUS_GIT_OK=1 prefix"
+    }
+
+    // 8. stash drop / clear
+    if arg.contains("git stash drop") || arg.contains("git stash clear") {
+        return "REJECT: git stash drop/clear 차단 (H-NO-GIT-DESTRUCT) — stash 무조건 폐기. 안전대안: git stash branch <name> 로 별도 브랜치 보존. 우회: NEXUS_GIT_OK=1 prefix"
+    }
+
+    // 10. update-ref -d
+    if arg.contains("git update-ref -d ") || arg.contains("git update-ref --no-deref -d") {
+        return "REJECT: git update-ref -d 차단 (H-NO-GIT-DESTRUCT) — ref 무조건 삭제. 우회: NEXUS_GIT_OK=1 prefix"
+    }
+
+    // 9. stash (push) 본 사건 원인 — untracked 가 존재할 때만 차단.
+    //    매칭: `git stash` 단독 / `git stash save ...` / `git stash push ...`
+    //    면제: `-u`, `--include-untracked`, `-a`, `--all`, pop/apply/list/show/drop/clear/branch/create/store
+    let stash_idx = arg.index_of("git stash")
+    if stash_idx >= 0 {
+        // tail = "git stash" 이후 부분
+        let tail = arg.substring(stash_idx + 9, arg.len())
+        let is_subcmd = tail.starts_with(" pop") || tail.starts_with(" apply") || tail.starts_with(" list") ||
+                        tail.starts_with(" show") || tail.starts_with(" drop") || tail.starts_with(" clear") ||
+                        tail.starts_with(" branch") || tail.starts_with(" create") || tail.starts_with(" store")
+        if is_subcmd == false {
+            // push variant — -u/-a/--include-untracked 면제
+            let has_u = tail.contains(" -u") || tail.contains(" --include-untracked") ||
+                        tail.contains(" -a") || tail.contains(" --all")
+            if has_u == false {
+                // untracked 실제 존재 검사 (없으면 통과 — 무해한 stash)
+                let untracked_count = to_string(exec("git status --porcelain 2>/dev/null | grep -c '^??' || echo 0")).trim()  // @allow-bare-exec
+                if untracked_count != "0" && untracked_count != "" {
+                    return "REJECT: git stash without -u 차단 (H-NO-GIT-DESTRUCT, 2026-04-17 사건) — untracked " + untracked_count + "개 존재 시 stash 보존 안 됨, 후속 reset/checkout 으로 영구 소실 위험. 안전대안: git stash --include-untracked 또는 git add 선행. 우회: NEXUS_GIT_OK=1 prefix"
+                }
+            }
+        }
+    }
+
     return ""
 }
 
