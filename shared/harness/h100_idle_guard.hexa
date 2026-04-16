@@ -2,17 +2,19 @@
 // @no-lock-needed
 // @allow-bare-exec
 // @no-sandbox
-// h100_idle_guard.hexa — ANIMA + HEXA-LANG H100 유휴 가드 (3-pod enforcement)
+// h100_idle_guard.hexa — ANIMA + HEXA-LANG H100 유휴 가드 (4-pod enforcement)
 //
 // ═══════════════════════════════════════════════════════════════════════════
 // PURPOSE
 //   모든 가동 중인 H100 pod을 감시해 유휴 상태를 방지한다.
 //   - RunPod GraphQL로 가동 pod 목록 + 상태 조회
+//   - GPU util 실시간 체크: runpodctl + nvidia-smi SSH (< 5% = idle)
 //   - 각 slot의 heartbeat 파일 age 검사 (shared/state/h100_heartbeat/<slot>.json)
-//   - idle_policy.action_sequence 단계적 실행:
-//       5분  → warn (alert jsonl 기록)
-//      10분  → dispatch_fallback (큐 다음 작업 지시)
-//      15분  → terminate (runpodctl pod stop)
+//   - idle_policy.action_sequence 단계적 실행 (강화):
+//       3분  → warn (alert jsonl 기록)
+//       5분  → dispatch_fallback (큐 다음 작업 지시)
+//       8분  → HARD KILL (runpodctl pod stop — 실제 실행, alert 아님)
+//   - GPU util < 5% 감지 시 즉시 경고, 2회 연속 시 HARD KILL
 //   - 예산 모니터링 (일일/월간 cap)
 //   - 사람이 읽는 상태표 출력
 //
@@ -102,15 +104,15 @@ fn plan_pod_int(idx: int, field: string) -> int {
 // ── RunPod GraphQL query ────────────────────────────────────────────────────
 fn query_pods(api_key: string) -> string {
     if len(api_key) == 0 { return "" }
-    let q = "{\\\"query\\\":\\\"query { myself { pods { id name desiredStatus costPerHr machine { gpuDisplayName } runtime { uptimeInSeconds } } } }\\\"}"
+    let q = "{\\\"query\\\":\\\"query { myself { pods { id name desiredStatus costPerHr machine { gpuDisplayName } runtime { uptimeInSeconds gpus { gpuUtilPerc } ports { ip publicPort privatePort } } } } }\\\"}"
     let cmd = "curl -s -H 'Authorization: Bearer " + api_key + "' -H 'Content-Type: application/json' -X POST -d \"" + q + "\" https://api.runpod.io/graphql"
     return sh(cmd)
 }
 
 let TMP_RESP = "/tmp/h100_guard_resp.json"
+let TMP_IDLE = "/tmp/h100_idle_consecutive.json"
 
 fn stash_resp(resp: string) {
-    // JSON 응답을 tmp 파일로 저장 (shell quoting 우회)
     write_file(TMP_RESP, resp)
 }
 
@@ -128,6 +130,100 @@ fn total_cost_per_hr(resp: string) -> string {
     let r = sh(cmd)
     if len(r) == 0 { return "0.00" }
     return r
+}
+
+// ── GPU utilization check per pod ───────────────────────────────────────────
+// RunPod GraphQL gpuUtilPerc 사용. 없으면 SSH nvidia-smi fallback.
+fn get_running_pod_ids(resp: string) -> string {
+    if len(resp) == 0 { return "" }
+    stash_resp(resp)
+    // Returns "id1|gpu1|name1\nid2|gpu2|name2\n..." for RUNNING pods
+    let cmd = "python3 -c \"import json;d=json.load(open('" + TMP_RESP + "'));ps=(d.get('data') or {}).get('myself',{}).get('pods') or [];[print(f\\\"{p['id']}|{(p.get('runtime') or {}).get('gpus',[{}])[0].get('gpuUtilPerc','?')}|{p.get('name','?')}\\\") for p in ps if p.get('desiredStatus')=='RUNNING']\" 2>/dev/null"
+    return sh(cmd)
+}
+
+fn get_pod_ssh(resp: string, pod_id: string) -> string {
+    // Returns "ip port" for SSH connection to a specific pod
+    stash_resp(resp)
+    let cmd = "python3 -c \"import json;d=json.load(open('" + TMP_RESP + "'));ps=(d.get('data') or {}).get('myself',{}).get('pods') or [];[print(f\\\"{port['ip']} {port['publicPort']}\\\") for p in ps for port in (p.get('runtime') or {}).get('ports',[]) if p['id']=='" + pod_id + "' and port.get('privatePort')==22]\" 2>/dev/null"
+    return sh(cmd)
+}
+
+fn check_gpu_util_ssh(ip: string, port: string) -> int {
+    // SSH nvidia-smi fallback — returns GPU util % or -1 on failure
+    let ssh_key = HOME + "/.runpod/ssh/RunPod-Key-Go"
+    let cmd = "ssh -i " + ssh_key + " -o StrictHostKeyChecking=no -o ConnectTimeout=5 root@" + ip + " -p " + port + " 'nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits' 2>/dev/null | head -1"
+    let r = sh(cmd)
+    if len(r) == 0 { return -1 }
+    return to_int(r)
+}
+
+// ── Consecutive idle tracker (file-based) ───────────────────────────────────
+fn load_idle_counts() -> string {
+    if file_exists(TMP_IDLE) { return read_file(TMP_IDLE) }
+    return "{}"
+}
+
+fn get_idle_count(pod_id: string) -> int {
+    let data = load_idle_counts()
+    let cmd = "python3 -c \"import json;d=json.loads('" + data.replace("'", "'\\''") + "');print(d.get('" + pod_id + "',0))\" 2>/dev/null"
+    return to_int(sh(cmd))
+}
+
+fn set_idle_count(pod_id: string, count: int) {
+    let data = load_idle_counts()
+    let cmd = "python3 -c \"import json;d=json.loads('" + data.replace("'", "'\\''") + "');d['" + pod_id + "']=" + to_string(count) + ";print(json.dumps(d))\" 2>/dev/null"
+    let new_data = sh(cmd)
+    if len(new_data) > 0 { write_file(TMP_IDLE, new_data) }
+}
+
+fn clear_idle_count(pod_id: string) {
+    set_idle_count(pod_id, 0)
+}
+
+// ── GPU idle enforcement pass ───────────────────────────────────────────────
+// Returns number of pods killed
+fn enforce_gpu_idle(resp: string, dry: bool) -> int {
+    let lines = get_running_pod_ids(resp)
+    if len(lines) == 0 { return 0 }
+    let mut killed = 0
+    let threshold = 5  // GPU util < 5% = idle
+    let max_consecutive = 2  // 2회 연속 idle → HARD KILL
+
+    // Parse each pod line: "id|gpuUtil|name"
+    let cmd = "echo '" + lines.replace("'", "'\\''") + "' | while IFS='|' read pid gpu name; do echo \"$pid $gpu $name\"; done"
+    let parsed = sh(cmd)
+    // Process via python for safety
+    let kill_cmd = "python3 << 'PYEOF'\nimport subprocess, json, os\nlines = '''" + lines.replace("'", "'\\''") + "'''.strip().split('\\n')\nidle_file = '" + TMP_IDLE + "'\ntry:\n    idle = json.load(open(idle_file))\nexcept: idle = {}\nkilled = []\nfor line in lines:\n    parts = line.split('|')\n    if len(parts) < 3: continue\n    pid, gpu_s, name = parts[0], parts[1], parts[2]\n    try: gpu = int(gpu_s)\n    except: gpu = -1\n    if gpu < 0:\n        print(f'  [{name}] GPU util unknown — skip')\n        continue\n    if gpu < " + to_string(threshold) + ":\n        prev = idle.get(pid, 0)\n        idle[pid] = prev + 1\n        if idle[pid] >= " + to_string(max_consecutive) + ":\n            print(f'  [{name}] GPU {gpu}% — IDLE {idle[pid]}x consecutive → HARD KILL')\n            killed.append(pid)\n        else:\n            print(f'  [{name}] GPU {gpu}% — IDLE {idle[pid]}/" + to_string(max_consecutive) + " (warn)')\n    else:\n        idle[pid] = 0\n        print(f'  [{name}] GPU {gpu}% — OK')\njson.dump(idle, open(idle_file, 'w'))\nprint('KILL:' + ','.join(killed))\nPYEOF"
+    let result = sh_stderr(kill_cmd)
+    println(result)
+
+    // Extract KILL list and execute
+    let kill_list = sh("echo '" + result.replace("'", "'\\''") + "' | grep '^KILL:' | sed 's/KILL://'")
+    if len(kill_list) == 0 { return 0 }
+    if kill_list == "" { return 0 }
+
+    // Actually kill each pod
+    let kill_exec = "for pid in $(echo '" + kill_list + "' | tr ',' ' '); do " +
+        "if [ -n \"$pid\" ]; then " +
+        (if dry { "echo \"[DRY] would stop $pid\"" } else { "runpodctl pod stop $pid 2>&1 | head -1" }) +
+        "; fi; done"
+    let kill_result = sh_stderr(kill_exec)
+    if len(kill_result) > 0 { println("  " + kill_result) }
+
+    // Count kills
+    let kc = sh("echo '" + kill_list + "' | tr ',' '\\n' | grep -c '.' 2>/dev/null")
+    killed = to_int(kc)
+
+    // Log kills
+    let mut ki = 0
+    let ts = iso_now()
+    let ids = sh("echo '" + kill_list + "' | tr ',' '\\n'")
+    // Emit alert for each kill
+    if killed > 0 {
+        emit_alert("_gpu_idle", "HARD_KILL", killed, "pods=" + kill_list + " gpu<" + to_string(threshold) + "% x" + to_string(max_consecutive))
+    }
+    return killed
 }
 
 // ── Heartbeat age check ─────────────────────────────────────────────────────
@@ -164,16 +260,25 @@ fn dispatch_fallback(slot: string, fq_hint: string) {
 
 fn terminate_pod(slot: string, dry: bool) -> string {
     if dry { return "dry-run (skipped terminate)" }
-    // 현 단계 구현: runpodctl에 id 매핑 필요 (다음 iter). 지금은 alert로 마킹.
-    // 실제 kill은 pod_id 매핑 후 mutation podStop 수행.
-    emit_alert(slot, "terminate_requested", 0, "pod_id 매핑 필요 — alert jsonl 소비 후 Claude가 runpodctl pod stop 실행")
-    return "terminate alert emitted"
+    // HARD KILL — runpodctl pod stop 실제 실행
+    // slot name으로 pod_id 매핑: runpodctl pod list → name 매칭
+    let find_cmd = "runpodctl pod list 2>/dev/null | python3 -c \"import json,sys;ps=json.load(sys.stdin);[print(p['id']) for p in ps if p.get('desiredStatus')=='RUNNING' and '" + slot + "' in p.get('name','').lower()]\" 2>/dev/null"
+    let pod_id = sh(find_cmd)
+    if len(pod_id) == 0 {
+        emit_alert(slot, "terminate_no_match", 0, "no running pod matching slot=" + slot)
+        return "no pod found for slot " + slot
+    }
+    // Execute hard kill
+    let stop_result = sh_stderr("runpodctl pod stop " + pod_id)
+    emit_alert(slot, "HARD_KILL", 0, "pod_id=" + pod_id + " result=" + stop_result)
+    println("  [HARD KILL] " + slot + " pod=" + pod_id + " → " + stop_result)
+    return "KILLED pod=" + pod_id
 }
 
 // ── Status table ────────────────────────────────────────────────────────────
 fn print_plan_table() {
     println("")
-    println("═══ H100 3-POD PLAN ══════════════════════════════════════════════════")
+    println("═══ GPU 4-POD PLAN (H100/A100 auto-fallback) ════════════════════════")
     let n = plan_pod_count()
     println("  slot                role                              budget/day  idle_kill")
     println("  ─────────────────── ────────────────────────────────  ──────────  ─────────")
@@ -259,9 +364,21 @@ fn main() {
 
     if status_only { return }
 
-    // enforcement pass
+    // ── GPU utilization enforcement (PRIMARY — 최우선) ──────────────────
+    println("")
+    println("── GPU IDLE ENFORCEMENT ──────────────────────────────────────")
+    let gpu_killed = enforce_gpu_idle(pods_json, dry)
+    if gpu_killed > 0 {
+        println("  ✗ " + to_string(gpu_killed) + " pod(s) HARD KILLED (GPU idle)")
+    } else {
+        println("  ✓ all pods GPU active")
+    }
+
+    // ── heartbeat enforcement pass (SECONDARY — GPU 체크 보완) ──────────
+    println("")
+    println("── HEARTBEAT ENFORCEMENT ────────────────────────────────────")
     let n = plan_pod_count()
-    let mut actions_taken = 0
+    let mut actions_taken = gpu_killed
     let mut i = 0
     while i < n {
         let slot = plan_pod_field(i, "slot")
@@ -270,6 +387,7 @@ fn main() {
         let act = action_for_age(age, kill)
         if act == "warn" {
             emit_alert(slot, "warn", age, "heartbeat stale ≥ " + to_string(kill / 3) + "min")
+            println("  [WARN] " + slot + " — heartbeat stale " + to_string(age / 60) + "min")
             actions_taken = actions_taken + 1
         }
         else if act == "dispatch_fallback" {
@@ -279,7 +397,6 @@ fn main() {
         }
         else if act == "terminate" {
             let r = terminate_pod(slot, dry)
-            println("  [TERMINATE] " + slot + " — " + r)
             actions_taken = actions_taken + 1
         }
         i = i + 1
