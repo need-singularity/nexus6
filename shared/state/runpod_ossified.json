@@ -435,6 +435,66 @@
       "related": ["runpod_checkpoint_corruption_zero_byte", "runpod_volumeless_ephemeral_wipe"],
       "incident_date": "2026-04-16",
       "severity": "HIGH — silent data corruption is worse than visible failure"
+    },
+    "RUNPOD_OPERATOR_HF_TOKEN_GATE": {
+      "id": "RUNPOD_OPERATOR_HF_TOKEN_GATE",
+      "symptom": "Launcher preflight passes static + local dry-run, but pod-side training silently aborts on huggingface.from_pretrained 401 Unauthorized.",
+      "cause": "Local preflight may SKIP on HF_TOKEN (Mac dev has no token), but the pod-side runner must re-gate. Without a pod-side fail-closed check, training launches against empty token and hits HF Hub 401 mid-download — no meaningful error surface, tmux log shows only traceback fragments.",
+      "evidence": "shared/state/alm_a1_launch_ready_20260416.json#preflight_dry_run_result.checks.4_hf_token → 'FAIL: HF_TOKEN unset' on local dev; runner emitted for pod re-checks via bash '[[ -z \"${HF_TOKEN:-}\" ]] && exit 1'.",
+      "fix": "Two-stage gate: (1) local preflight reports FAIL non-blocking (dev doesn't need token); (2) emitted bash runner re-checks HF_TOKEN as FIRST gate after nvidia-smi, refuses launch with exit 1 when unset. Never treat local SKIP as pass.",
+      "affected": "Any ALM LoRA launcher fetching HF base weights (Qwen/Llama/Mistral).",
+      "severity": "HIGH — silent data loss: operator thinks training started but nothing happens.",
+      "applied_to_fn": "training/launch_alm_a1.hexa::main (emits runner with HF_TOKEN gate); training/alm_a1_preflight.hexa::check_4_hf_token",
+      "incident_date": "2026-04-16",
+      "ossified_at": "2026-04-16"
+    },
+    "RUNPOD_POD_TERMINATED_WITHOUT_R2_UPLOAD": {
+      "id": "RUNPOD_POD_TERMINATED_WITHOUT_R2_UPLOAD",
+      "symptom": "Pod terminates (stockout, preemption, manual stop) before end-of-training rclone block runs → 0 artifacts on R2 despite step_N reached.",
+      "cause": "Deferring ALL rclone to post-training single-batch upload (per mfs_quota rule) means pod death between last in-memory ckpt and the rclone block leaves R2 empty. A 48-hour run can accumulate 10+ intermediate ckpts that never leave MooseFS.",
+      "evidence": "Pod tubq10zkct0t8f (ALM-P4-4 32B 2-GPU) terminated before writing step_3000 to R2 → shared/state/anima_train.json closed P4-4 as 'superseded_by_14b' per shared/state/extreme_100pct_gate_audit_20260416.json (commit 039cea64). Cost: $100-300 sunk + zero salvageable artifact.",
+      "fix": "Background rclone copy every ≤500 steps via post-save hook (not end-of-training only). scripts/ckpt_backup_hook.hexa inspects label=production on every save_every boundary and triggers rclone WITHIN the MFS quota budget (save_every≥500 spacing + bounded rclone bandwidth ≠ synchronous in-training rclone+torch.save). Contrast with forbidden pattern: sync rclone co-located with torch.save in same step.",
+      "affected": "All long-running (>4h) ALM/CLM training, especially 2-GPU 32B+ with 48h+ wall time.",
+      "severity": "CRITICAL — silent data loss + roadmap closure as 'superseded' to hide the gap.",
+      "applied_to_fn": "training/train_alm_14b.hexa::main (python runner save-every branch invokes invoke_ckpt_backup_hook); scripts/ckpt_backup_hook.hexa::main + build_rclone_cmd",
+      "incident_date": "2026-04-16",
+      "ossified_at": "2026-04-16"
+    },
+    "RUNPOD_SUPERSEDED_POD_INFLATES_ROADMAP": {
+      "id": "RUNPOD_SUPERSEDED_POD_INFLATES_ROADMAP",
+      "symptom": "Roadmap JSON wall_progress_pct shows 92% but auto_sync recomputes 50% — discrepancy traces to a pod-gated task marked 'in_progress (per roadmap)' while the pod itself is already terminated.",
+      "cause": "Roadmap tasks tied to pod artifacts (ALM-P4-4 32B step_3000) assume pod still running. When pod terminates without completing, the task status doesn't automatically flip to 'superseded' or 'aborted' — it stays 'in_progress', inflating wall_progress.",
+      "evidence": "shared/state/extreme_100pct_gate_audit_20260416.json line 250: '92% value in aggregate_state.wall_progress_pct was MANUALLY set or set by a different code path than auto_sync (which consistently computes 50%)'. Pod tubq10zkct0t8f terminated but ALM-P4-4 stayed marked as in-progress until explicit 2026-04-16T14:00Z closure.",
+      "fix": "Before claiming any pod-gated status as active, run `runpodctl pod list` freshness check. If pod not in live list, task must be auto-flipped to status='superseded' or 'aborted' with pod_id in the rationale. Roadmap sync loop should cross-check pod IDs against live inventory.",
+      "affected": "Roadmap sync + extreme_sync.hexa + any gate audit consuming roadmap JSON.",
+      "severity": "HIGH — misleads goal-tracking, hides abandonment as progress.",
+      "applied_to_fn": null,
+      "reason": "no ALM-owned enforcement point — see sibling agent roadmap domain (harness / extreme_sync). Left as inventory-only cross-reference.",
+      "incident_date": "2026-04-16",
+      "ossified_at": "2026-04-16"
+    },
+    "RUNPOD_CKPT_LABEL_VS_R2_POLICY": {
+      "id": "RUNPOD_CKPT_LABEL_VS_R2_POLICY",
+      "symptom": "Silent R2 bloat (experiment ckpts land in production prefix) OR silent data loss (production ckpts skipped as experiment).",
+      "cause": "ckpt_label is a string field in config + sidecar. Per shared/config/ckpt_policy.json, 'production' → R2 retain, 'experiment' → R2 discard, 'archive' → R2 retain under archive/ prefix. Without strict string-match gating, a typo or missing label defaults to unintended routing.",
+      "fix": "Hard-coded mirror of ckpt_policy labels in scripts/ckpt_backup_hook.hexa::label_uploads (avoids jq dependency on pod): production/archive → true, experiment → false, unknown label → warn + false (fail closed). Trainer writes sidecar ckpt_meta.json with 'label' field; launcher validates cfg_label == 'production' before proceeding. Linter scripts/ckpt_name_lint.hexa cross-checks basename against naming_convention.{alm,clm}.regex.",
+      "affected": "scripts/ckpt_backup_hook.hexa; training/train_alm_14b.hexa (invoke_ckpt_backup_hook + --ckpt-label); training/launch_alm_a1.hexa (ckpt_label production invariant); scripts/ckpt_name_lint.hexa (naming convention cross-check).",
+      "severity": "HIGH — cost/correctness: bloated R2 costs money, missing R2 ckpt loses training.",
+      "applied_to_fn": "training/launch_alm_a1.hexa::main (cfg_label production guard); training/train_alm_14b.hexa::main (python runner --ckpt-label threaded to hook); scripts/ckpt_backup_hook.hexa::label_uploads + r2_prefix_for; scripts/ckpt_name_lint.hexa::lint_basename",
+      "incident_date": "2026-04-16",
+      "ossified_at": "2026-04-16"
+    },
+    "RUNPOD_SMOKE_PASS_VS_LAUNCH_READY_GAP": {
+      "id": "RUNPOD_SMOKE_PASS_VS_LAUNCH_READY_GAP",
+      "symptom": "Local smoke test reports 33/33 PASS, operator assumes pod will launch, but pod-side runner refuses due to HF_TOKEN unset / compute_cap < 8.0 / disk < 100GB.",
+      "cause": "Smoke test and launch readiness are distinct gates. Smoke covers static config parse + dry-run emission + JSON shape (33 asserts on Mac dev). Pod-side gates (HF_TOKEN, GPU bf16 cap, disk) are re-checked by the emitted bash runner at launch time and CANNOT be satisfied from local dev.",
+      "evidence": "shared/state/alm_a1_launch_ready_20260416.json separates smoke_test_result (33/33 on Mac) from preflight_dry_run_result (HF_TOKEN FAIL on Mac, expected) from operator_responsibilities_on_pod (4 explicit pod-side checks). ready_for_launch=true despite HF_TOKEN local-FAIL because that blocker is pod-operator-owned, not a code defect.",
+      "fix": "Two-tier reporting: smoke test asserts code invariants (dry-run emission, JSON shape); preflight separately reports pod-specific gates (HF_TOKEN, GPU, disk, R2 prefix) with explicit LOCAL/POD label. operator_responsibilities_on_pod list is part of launch_ready artifact. Never claim 'ready_for_launch' purely from smoke pass.",
+      "affected": "Any ALM/CLM launcher with remote pod target; roadmap gates predicated on 'smoke PASS' alone.",
+      "severity": "MEDIUM — operator-facing gap causes failed launches + time waste.",
+      "applied_to_fn": "training/launch_alm_a1.hexa::main (emits runner with all pod-side re-checks); training/alm_a1_preflight.hexa::main (returns all_ok + issues list distinguishing LOCAL SKIP from POD FAIL)",
+      "incident_date": "2026-04-16",
+      "ossified_at": "2026-04-16"
     }
   },
 
