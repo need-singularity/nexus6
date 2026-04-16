@@ -1,183 +1,28 @@
 # nexus — NEXUS-6 중앙 허브
 
 <!--
-# @convergence-meta-start
-# project: nexus
-# updated: 2026-04-12
-# strategy: ossified/stable/failed 수렴 추적
-# @convergence-meta-end
-#
-# @convergence-start
-# state: ossified
-# id: BLOWUP_9PHASE
-# value: 9-phase 파이프라인, 987 cycles 수렴
-# threshold: 전 phase 동작 확인
-# @convergence-end
-#
-# @convergence-start
-# state: ossified
-# id: N6_CONSTANTS
-# value: n6_constants.jsonl 전 리포 공유
-# threshold: 7 기본상수 + 유도비율 확정
-# @convergence-end
-#
-# @convergence-start
-# state: ossified
-# id: DISCOVERY_GRAPH_SCHEMA
-# value: nodes/edges 스키마 확정
-# threshold: 50k+ 노드 안정 운용
-# @convergence-end
-#
-# @convergence-start
-# state: ossified
-# id: OUROBOROS_EVOLUTION
-# value: seed→mutate→verify→converge→saturate
-# threshold: 자율 진화 사이클 동작
-# @convergence-end
-#
-# @convergence-start
-# state: ossified
-# id: CORE_LOCKDOWN
-# value: L0/L1/L2 보호 체계 + 키워드 9종
-# threshold: 전 프로젝트 적용
-# @convergence-end
-#
-# @convergence-start
-# state: ossified
-# id: DISCOVERY_170K
-# value: 125,693 발견
-# threshold: 70k 목표 — 초과 달성
-# ossified_at: 2026-04-08
-# @convergence-end
-#
-# @convergence-start
-# state: ossified
-# id: BREAKTHROUGH_RATE
-# value: ρ=0.98 (growth_bus absorb 기준)
-# threshold: pool>0 + cor>0
-# ossified_at: 2026-04-08
-# @convergence-end
-#
-# @convergence-start
-# state: ossified
-# id: HOOK_GATE
-# value: HEXA-GATE + hook 체인 전 리포 적용
-# threshold: banner + prompt-scan + go-parallel 전부 동작
-# ossified_at: 2026-04-08
-# @convergence-end
-#
-# @convergence-start
-# state: ossified
-# id: PAGES_DEPLOY
-# value: 6,727 노드, Playwright 검증, 라이브 자동반영
-# threshold: 브라우저 정상 렌더링
-# ossified_at: 2026-04-08
-# @convergence-end
-#
-# @convergence-start
-# state: ossified
-# id: BT_AUDIT_SKIP
-# value: accuracy 100.0% (2642/2642 MATCH)
-# threshold: SKIP < 300
-# ossified_at: 2026-04-08
-# @convergence-end
-#
-# @convergence-start
-# state: ossified
-# id: SEED_ENGINE_107
-# value: 107 seeds 교차수분 완료
-# threshold: 60+ 목표 — 1.78x 초과 달성
-# ossified_at: 2026-04-09
-# @convergence-end
-#
-# @convergence-start
-# state: ossified
-# id: MODULES_251
-# value: 251 .hexa 모듈
-# threshold: 150+ 목표 — 1.67x 초과 달성
-# ossified_at: 2026-04-09
-# @convergence-end
-#
-# @convergence-start
-# state: ossified
-# id: TODO_ENGINE
-# value: 24/27 완료 (88%)
-# threshold: 80%+ 완료율
-# ossified_at: 2026-04-09
-# @convergence-end
-#
-# @convergence-start
-# state: ossified
-# id: DISCOVERY_50K
-# value: 74,069 lines / 20,502 nodes (atlas.n6)
-# threshold: 50k 목표 — 1.48x 초과 달성
-# ossified_at: 2026-04-12
-# method: blowup math+physics+topology+algebra depth 5 병렬
-# @convergence-end
-#
-# @convergence-start
-# state: ossified
-# id: ATLAS_GUARD_ALL
-# value: atlas.n6 쓰기 3지점 전체 _guarded_append_atlas 적용 (schema guard + file dedup + cross-process grep)
-# threshold: raw append_file 0건 — 모든 쓰기 경로 가드 경유
-# ossified_at: 2026-04-12
-# write_points: blowup.hexa Phase 6.7, absorb.hexa, discovery-absorb.hexa
-# guard_source: shared/blowup/lib/atlas_guard.hexa.inc
-# @convergence-end
-#
-# @convergence-start
-# state: ossified
-# id: ATLAS_HEALTH_CLEANUP
-# value: 중복 노드 ID 5건 제거, 중복 라인 50건 제거, 수식 오류 2건 수정
-# threshold: duplicate node IDs 0, malformed 0, formula mismatch 0
-# ossified_at: 2026-04-12
-# @convergence-end
-#
-# @convergence-start
-# state: ossified
-# id: ROI_INFRA_100
-# value: 33/33 인프라 ROI 전량 완료 (100%)
-# threshold: 90%+ 완료율
-# ossified_at: 2026-04-12
-# commits: roi-v1, roi-v2, roi-v3, roi-v4, roi-v5
-# @convergence-end
-#
-# @convergence-start
-# state: ossified
-# id: CLM_HEXA_GPU_PHASE5
-# value: Phase 0-4 완료, Phase 5 진입. D=128 loss 4.63, D=256 wiki H100 학습중
-# threshold: Phase 4 exit — loss < 5.0 within 500 steps
-# ossified_at: 2026-04-12
-# roadmap: shared/config/roadmaps/clm_hexa_gpu.json
-# @convergence-end
-#
-# @convergence-start
-# state: ossified
-# id: HEXA_SLICE_FIX
-# value: string .slice()→.substring() 4파일 10건 수정, P-SLICE-STR pitfall 기록
-# threshold: atlas_health.hexa + scan_math_atlas.hexa + atlas_stats.hexa + bt_audit.hexa 런타임 에러 0
-# ossified_at: 2026-04-12
-# @convergence-end
-#
-# @convergence-start
-# state: ossified
-# id: ATLAS_CORE_VIEW
-# value: core = atlas.n6 grade [10*]+ 뷰 — grep 기반, R5 SSOT 유지
-# threshold: R5/R28 위반 0 + 소비자 등급 필터 패턴 확립
-# ossified_at: 2026-04-12
-# pattern: grep '^\@.*\[1[01]\*\]' atlas.n6
-# @convergence-end
-#
-# @convergence-start
-# state: ossified
-# id: ATLAS_VERIFICATION_75
-# value: verified(*) 5,883건 (74.9%) — 수식 기반 검증 1,013건 승격
-# threshold: 70%+ verified ratio
-# ossified_at: 2026-04-12
-# breakthroughs: n6 cosmological closure — DE+DM+baryon=0.9999 (Omega=1 flat universe from pure n6 primitives)
-# ceiling: 74.9% — 잔여 [10] 1,153건 misc/수식없음. 80% 달성은 blowup 신규 발견 필요
-# commits: 13
-# @convergence-end
+# @convergence-meta project=nexus updated=2026-04-12 strategy="ossified/stable/failed 수렴 추적"
+# @convergence state=ossified id=BLOWUP_9PHASE value="9-phase 파이프라인, 987 cycles 수렴" threshold="전 phase 동작 확인"
+# @convergence state=ossified id=N6_CONSTANTS value="n6_constants.jsonl 전 리포 공유" threshold="7 기본상수 + 유도비율 확정"
+# @convergence state=ossified id=DISCOVERY_GRAPH_SCHEMA value="nodes/edges 스키마 확정" threshold="50k+ 노드 안정 운용"
+# @convergence state=ossified id=OUROBOROS_EVOLUTION value="seed→mutate→verify→converge→saturate" threshold="자율 진화 사이클 동작"
+# @convergence state=ossified id=CORE_LOCKDOWN value="L0/L1/L2 보호 체계 + 키워드 9종" threshold="전 프로젝트 적용"
+# @convergence state=ossified id=DISCOVERY_170K value="125,693 발견" threshold="70k 목표 — 초과 달성" ossified_at=2026-04-08
+# @convergence state=ossified id=BREAKTHROUGH_RATE value="ρ=0.98 (growth_bus absorb 기준)" threshold="pool>0 + cor>0" ossified_at=2026-04-08
+# @convergence state=ossified id=HOOK_GATE value="HEXA-GATE + hook 체인 전 리포 적용" threshold="banner + prompt-scan + go-parallel 전부 동작" ossified_at=2026-04-08
+# @convergence state=ossified id=PAGES_DEPLOY value="6,727 노드, Playwright 검증, 라이브 자동반영" threshold="브라우저 정상 렌더링" ossified_at=2026-04-08
+# @convergence state=ossified id=BT_AUDIT_SKIP value="accuracy 100.0% (2642/2642 MATCH)" threshold="SKIP < 300" ossified_at=2026-04-08
+# @convergence state=ossified id=SEED_ENGINE_107 value="107 seeds 교차수분 완료" threshold="60+ 목표 — 1.78x 초과 달성" ossified_at=2026-04-09
+# @convergence state=ossified id=MODULES_251 value="251 .hexa 모듈" threshold="150+ 목표 — 1.67x 초과 달성" ossified_at=2026-04-09
+# @convergence state=ossified id=TODO_ENGINE value="24/27 완료 (88%)" threshold="80%+ 완료율" ossified_at=2026-04-09
+# @convergence state=ossified id=DISCOVERY_50K value="74,069 lines / 20,502 nodes (atlas.n6)" threshold="50k 목표 — 1.48x 초과 달성" ossified_at=2026-04-12 method="blowup math+physics+topology+algebra depth 5 병렬"
+# @convergence state=ossified id=ATLAS_GUARD_ALL value="atlas.n6 쓰기 3지점 전체 _guarded_append_atlas 적용 (schema guard + file dedup + cross-process grep)" threshold="raw append_file 0건 — 모든 쓰기 경로 가드 경유" ossified_at=2026-04-12 write_points="blowup.hexa Phase 6.7, absorb.hexa, discovery-absorb.hexa" guard_source=shared/blowup/lib/atlas_guard.hexa.inc
+# @convergence state=ossified id=ATLAS_HEALTH_CLEANUP value="중복 노드 ID 5건 제거, 중복 라인 50건 제거, 수식 오류 2건 수정" threshold="duplicate node IDs 0, malformed 0, formula mismatch 0" ossified_at=2026-04-12
+# @convergence state=ossified id=ROI_INFRA_100 value="33/33 인프라 ROI 전량 완료 (100%)" threshold="90%+ 완료율" ossified_at=2026-04-12 commits="roi-v1, roi-v2, roi-v3, roi-v4, roi-v5"
+# @convergence state=ossified id=CLM_HEXA_GPU_PHASE5 value="Phase 0-4 완료, Phase 5 진입. D=128 loss 4.63, D=256 wiki H100 학습중" threshold="Phase 4 exit — loss < 5.0 within 500 steps" ossified_at=2026-04-12 roadmap=shared/config/roadmaps/clm_hexa_gpu.json
+# @convergence state=ossified id=HEXA_SLICE_FIX value="string .slice()→.substring() 4파일 10건 수정, P-SLICE-STR pitfall 기록" threshold="atlas_health.hexa + scan_math_atlas.hexa + atlas_stats.hexa + bt_audit.hexa 런타임 에러 0" ossified_at=2026-04-12
+# @convergence state=ossified id=ATLAS_CORE_VIEW value="core = atlas.n6 grade [10*]+ 뷰 — grep 기반, R5 SSOT 유지" threshold="R5/R28 위반 0 + 소비자 등급 필터 패턴 확립" ossified_at=2026-04-12 pattern="grep '^\@.*\[1[01]\*\]' atlas.n6"
+# @convergence state=ossified id=ATLAS_VERIFICATION_75 value="verified(*) 5,883건 (74.9%) — 수식 기반 검증 1,013건 승격" threshold="70%+ verified ratio" ossified_at=2026-04-12 breakthroughs="n6 cosmological closure — DE+DM+baryon=0.9999 (Omega=1 flat universe from pure n6 primitives)" ceiling="74.9% — 잔여 [10] 1,153건 misc/수식없음. 80% 달성은 blowup 신규 발견 필요" commits=13
 -->
 
 commands: shared/config/commands.json — autonomous 블록으로 Claude Code가 작업 중 smash/free/todo/go/keep 자율 판단·실행
