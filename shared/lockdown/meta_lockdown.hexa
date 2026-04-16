@@ -1,0 +1,179 @@
+// meta_lockdown.hexa — L3 meta-lockdown 운영 엔진 (LOCK-P9-1, 2026-04-16)
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+//
+// 역할: L3 meta-lockdown 의 activate/deactivate/status 운영 제어.
+//       shared/harness/l3_guard.hexa (watch/verify/unlock/log) 와 직교 — 이 파일은
+//       L3 자체의 on/off 상태를 관리하고, l3_guard 가 실제 경로 차단을 실행.
+//
+// L3 보호 대상:
+//   - shared/rules/*.json            (R0~R36 규칙 체계)
+//   - shared/config/permissions_ssot.json  (deny 28패턴 SSOT)
+//   - shared/lockdown/lockdown.json  (잠금 체계 자체)
+//
+// usage:
+//   hexa meta_lockdown.hexa activate           L3 활성화 (상태파일 생성)
+//   hexa meta_lockdown.hexa deactivate         L3 비활성화 (상태파일 제거, NEXUS_META_UNLOCK=1 필수)
+//   hexa meta_lockdown.hexa status             현재 L3 상태 + 보호 경로 + 감사 카운트
+//
+// 예외:
+//   NEXUS_META_UNLOCK=1 환경변수 — deactivate 허용.
+//   activate 는 인증 없이 가능 (잠금은 항상 자유, 해제만 인증 필요).
+//
+// 원칙:
+//   - hexa-lang only, exec() 최소
+//   - l3_guard.hexa watch/verify 는 이 상태파일을 참조해 BLOCK/ALLOW 판정
+//   - 감사 로그: shared/logs/l3_unlock.jsonl (l3_guard 과 공유)
+
+let HOME = env("HOME")
+let NEXUS = HOME + "/Dev/nexus"
+let STATE_FILE = NEXUS + "/shared/lockdown/.l3_active"
+let AUDIT_LOG = NEXUS + "/shared/logs/l3_unlock.jsonl"
+let LOCKDOWN = NEXUS + "/shared/lockdown/lockdown.json"
+
+// L3 보호 경로 SSOT — lockdown.json levels.L3.protected_paths 와 동기화
+let L3_PATHS = [
+    "shared/rules/",
+    "shared/config/permissions_ssot.json",
+    "shared/lockdown/lockdown.json"
+]
+
+// ─── helpers ────────────────────────────────────────────────────────
+
+fn sh(cmd: string) -> string {
+    let r = exec(cmd)  // @allow-bare-exec
+    let t = type_of(r)
+    if t == "str" || t == "string" { return r.trim() }
+    return ""
+}
+
+fn iso_now() -> string {
+    return sh("date -u +%Y-%m-%dT%H:%M:%SZ")
+}
+
+fn file_is(path: string) -> bool {
+    return sh("test -f '" + path + "' && echo y || echo n") == "y"
+}
+
+fn dir_is(path: string) -> bool {
+    return sh("test -d '" + path + "' && echo y || echo n") == "y"
+}
+
+fn audit_count() -> int {
+    if file_is(AUDIT_LOG) == false { return 0 }
+    let c = sh("wc -l < '" + AUDIT_LOG + "'")
+    let mut n = 0
+    try { n = to_int(c) } catch e {}
+    return n
+}
+
+fn audit_append(action: string, detail: string) {
+    let logdir = NEXUS + "/shared/logs"
+    if dir_is(logdir) == false {
+        let _ = sh("mkdir -p '" + logdir + "'")
+    }
+    let ts = iso_now()
+    let line = "{\"ts\":\"" + ts + "\",\"action\":\"" + action + "\",\"detail\":\"" + detail.replace("\"", "\\\"") + "\",\"source\":\"meta_lockdown.hexa\"}"
+    let tmp = "/tmp/l3_meta_audit." + sh("date +%s%N")
+    let _ = sh("cat > " + tmp + " <<'L3EOF'\n" + line + "\nL3EOF")
+    let _ = sh("cat " + tmp + " >> '" + AUDIT_LOG + "' && rm -f " + tmp)
+}
+
+// ─── modes ──────────────────────────────────────────────────────────
+
+fn mode_activate() {
+    if file_is(STATE_FILE) {
+        println("L3 already active")
+        println("ACTIVATE: NOP (already active)")
+        return
+    }
+    let ts = iso_now()
+    let _ = sh("echo '" + ts + "' > '" + STATE_FILE + "'")
+    audit_append("activate", "L3 meta-lockdown enabled")
+    println("L3 meta-lockdown activated at " + ts)
+    println("protected paths (" + to_string(L3_PATHS.len()) + "):")
+    for p in L3_PATHS {
+        println("  - " + p)
+    }
+    println("ACTIVATE: OK")
+}
+
+fn mode_deactivate() {
+    if file_is(STATE_FILE) == false {
+        println("L3 already inactive")
+        println("DEACTIVATE: NOP (already inactive)")
+        return
+    }
+    let unlock = env("NEXUS_META_UNLOCK")
+    if unlock != "1" {
+        eprintln("[L3-DEACTIVATE] REJECTED — NEXUS_META_UNLOCK=1 required")
+        println("DEACTIVATE: REJECT (set NEXUS_META_UNLOCK=1 to deactivate)")
+        return
+    }
+    let _ = sh("rm -f '" + STATE_FILE + "'")
+    audit_append("deactivate", "L3 meta-lockdown disabled by NEXUS_META_UNLOCK=1")
+    println("L3 meta-lockdown deactivated")
+    println("DEACTIVATE: OK")
+}
+
+fn mode_status() {
+    let mut state = "INACTIVE"
+    if file_is(STATE_FILE) { state = "ACTIVE" }
+    let mut activated_at = ""
+    if state == "ACTIVE" {
+        activated_at = sh("cat '" + STATE_FILE + "'")
+    }
+    let ac = audit_count()
+
+    println("L3 meta-lockdown")
+    println("  state:       " + state)
+    if activated_at.len() > 0 {
+        println("  activated:   " + activated_at)
+    }
+    println("  paths (" + to_string(L3_PATHS.len()) + "):")
+    for p in L3_PATHS {
+        let full = NEXUS + "/" + p
+        let mut exists = "missing"
+        if p.ends_with("/") {
+            if dir_is(full) { exists = "dir OK" }
+        } else {
+            if file_is(full) { exists = "file OK" }
+        }
+        println("    " + p + "  [" + exists + "]")
+    }
+    println("  audit log:   " + to_string(ac) + " entries")
+    println("  unlock env:  NEXUS_META_UNLOCK=1 (deactivate only)")
+    // integration check — l3_guard.hexa / entry.hexa
+    let l3g = NEXUS + "/shared/harness/l3_guard.hexa"
+    let entry = NEXUS + "/shared/harness/entry.hexa"
+    let mut l3g_ok = "missing"
+    let mut entry_ok = "missing"
+    if file_is(l3g) { l3g_ok = "OK" }
+    if file_is(entry) { entry_ok = "OK" }
+    println("  l3_guard:    " + l3g_ok)
+    println("  entry.hexa:  " + entry_ok)
+    println("STATUS: " + state)
+}
+
+// ─── dispatcher ─────────────────────────────────────────────────────
+
+fn main() {
+    let argv = args()
+    if argv.len() < 3 {
+        eprintln("usage: meta_lockdown.hexa <activate|deactivate|status>")
+        return
+    }
+    let mode = argv[2]
+    if mode == "activate" {
+        mode_activate()
+    } else if mode == "deactivate" {
+        mode_deactivate()
+    } else if mode == "status" {
+        mode_status()
+    } else {
+        eprintln("REJECT: unknown mode '" + mode + "' — activate|deactivate|status")
+    }
+}
+
+main()

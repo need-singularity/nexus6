@@ -1,0 +1,586 @@
+// bt_progress_panel.hexa — INFRA-P9-1 BT 실시간 진척 모니터링 패널
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+// task: INFRA-P9-1 (A13_INFRASTRUCTURE P9)
+// 역할: BT-541..547 7대 미해결 난제 공격 진척 집계 + 테이블/JSON 출력
+//
+// SSOT inputs (read-only):
+//   shared/bt/attacks/*.hexa           — 공격 모듈 파일
+//   shared/bt/attacks/*.jsonl          — 공격 결과 JSONL
+//   shared/bt/BT-5XX_*.json           — 라운드 결과 JSON
+//   shared/bt/metacog_BT-5XX.json     — 메타인지 prefetch
+//   shared/bt/bt_attacks.jsonl        — 공격 레지스트리
+//   shared/logs/bt_promotion.jsonl    — 승격 게이트 로그
+//   shared/logs/bt_consistency.jsonl  — 정합성 검증 로그
+//
+// SSOT output:
+//   shared/state/bt_progress.json     — JSON 기계판독 스냅샷
+//
+// modes:
+//   panel                   터미널 진척 테이블 (default)
+//   json                    bt_progress.json 갱신 + stdout JSON
+//   detail <BT-5XX>         개별 BT 상세 출력
+//   --selftest              smoke test
+//
+// ref: bt_metacog.hexa (BT 테이블), consensus_bt_gate.hexa (정합성)
+
+let HOME = env("HOME")
+let NEXUS_ENV = env("NEXUS")
+let NEXUS = if NEXUS_ENV != "" { NEXUS_ENV } else { HOME + "/Dev/nexus" } // @allow-devpath
+let SHARED = NEXUS + "/shared"
+let BT_DIR = SHARED + "/bt"
+let ATTACKS_DIR = BT_DIR + "/attacks"
+let STATE_DIR = SHARED + "/state"
+let LOGS_DIR = SHARED + "/logs"
+let OUT_JSON = STATE_DIR + "/bt_progress.json"
+
+// ─── BT-541..547 정의 테이블 ───
+let BT_IDS: [string] = ["BT-541", "BT-542", "BT-543", "BT-544", "BT-545", "BT-546", "BT-547"]
+let BT_NAMES: [string] = [
+    "Riemann Hypothesis",
+    "P vs NP",
+    "Yang-Mills Mass Gap",
+    "Navier-Stokes",
+    "Hodge Conjecture",
+    "BSD Conjecture",
+    "Poincare Conjecture"
+]
+let BT_DOMAINS: [string] = [
+    "analytic_NT",
+    "complexity",
+    "particle_QCD",
+    "fluid_dynamics",
+    "algebraic_geom",
+    "number_theory",
+    "topology"
+]
+
+// ─── helpers ───
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _to_int0(s: string) -> int {
+    let trimmed = s.trim()
+    if trimmed == "" { return 0 }
+    let lines = trimmed.split("\n")
+    let first = lines[0].trim()
+    if first == "" { return 0 }
+    let mut r = 0
+    try { r = to_int(first) } catch e {}
+    return r
+}
+
+fn now_ts() -> string {
+    let mut ts = ""
+    try { ts = _str(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim() } catch e {} // @allow-bare-exec
+    return ts
+}
+
+fn json_esc(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", " ")
+    r = r.replace("\r", " ")
+    r = r.replace("\t", " ")
+    return r
+}
+
+fn is(x: int) -> string { return to_string(x) }
+
+fn pad_right(s: string, width: int) -> string {
+    let mut r = s
+    while r.len() < width { r = r + " " }
+    return r
+}
+
+fn pad_left(s: string, width: int) -> string {
+    let mut r = s
+    while r.len() < width { r = " " + r }
+    return r
+}
+
+// ─── data collectors ───
+
+// attack hexa files in shared/bt/attacks/ matching bt5XX
+fn count_attack_files(bt_num: string) -> int {
+    // bt_num = "541" etc
+    let cmd = "ls '" + ATTACKS_DIR + "/' 2>/dev/null | grep -i 'bt" + bt_num + "' | grep '\\.hexa$' | wc -l"
+    return _to_int0(_str(exec(cmd))) // @allow-bare-exec
+}
+
+// attack hexa files in shared/bt/ (non-attacks dir) matching BT-5XX
+fn count_bt_root_files(bt_id: string) -> int {
+    // bt_id = "BT-541" etc, also check lowercase bt5xx
+    let bt_num = bt_id.replace("BT-", "")
+    let cmd = "ls '" + BT_DIR + "/' 2>/dev/null | grep -iE '(BT-" + bt_num + "|bt" + bt_num + ")' | grep -v metacog | wc -l"
+    return _to_int0(_str(exec(cmd))) // @allow-bare-exec
+}
+
+// result JSONL line count in attacks dir
+fn count_result_lines(bt_num: string) -> int {
+    let cmd = "cat '" + ATTACKS_DIR + "/'bt" + bt_num + "_*.jsonl 2>/dev/null | wc -l"
+    return _to_int0(_str(exec(cmd))) // @allow-bare-exec
+}
+
+// count EXACT/NEAR/MISS in result JSONL
+fn count_grade(bt_num: string, grade: string) -> int {
+    let cmd = "cat '" + ATTACKS_DIR + "/'bt" + bt_num + "_*.jsonl 2>/dev/null | grep -c '\"" + grade + "\"' 2>/dev/null"
+    return _to_int0(_str(exec(cmd))) // @allow-bare-exec
+}
+
+// check bt_attacks.jsonl for status
+fn attack_registry_status(bt_id: string) -> string {
+    let cmd = "grep '\"" + bt_id + "\"' '" + BT_DIR + "/bt_attacks.jsonl' 2>/dev/null | head -1"
+    let line = _str(exec(cmd)).trim() // @allow-bare-exec
+    if line == "" { return "-" }
+    // extract status field
+    if line.contains("\"status\"") == false { return "-" }
+    let parts = line.split("\"status\"")
+    if parts.len() < 2 { return "-" }
+    let after = parts[1]
+    let qparts = after.split("\"")
+    if qparts.len() >= 3 { return qparts[1] }
+    return "-"
+}
+
+// check resolution from attack registry or round json
+fn attack_resolution(bt_id: string) -> string {
+    let cmd = "grep '\"" + bt_id + "\"' '" + BT_DIR + "/bt_attacks.jsonl' 2>/dev/null | head -1"
+    let line = _str(exec(cmd)).trim() // @allow-bare-exec
+    if line != "" && line.contains("\"resolution\"") {
+        let parts = line.split("\"resolution\"")
+        if parts.len() >= 2 {
+            let qp = parts[1].split("\"")
+            if qp.len() >= 3 { return qp[1] }
+        }
+    }
+    return "-"
+}
+
+// metacog exists?
+fn has_metacog(bt_id: string) -> bool {
+    let path = BT_DIR + "/metacog_" + bt_id + ".json"
+    return file_exists(path)
+}
+
+// round JSON count
+fn count_rounds(bt_id: string) -> int {
+    let bt_num = bt_id.replace("BT-", "")
+    let cmd = "ls '" + BT_DIR + "/' 2>/dev/null | grep -iE 'BT-" + bt_num + "_' | grep '\\.json$' | grep -iv metacog | wc -l"
+    return _to_int0(_str(exec(cmd))) // @allow-bare-exec
+}
+
+// consensus gate: check bt_consistency.jsonl for this BT
+fn consensus_result(bt_id: string) -> string {
+    let log_path = LOGS_DIR + "/bt_consistency.jsonl"
+    let cmd = "grep '\"" + bt_id + "\"' '" + log_path + "' 2>/dev/null | tail -1"
+    let line = _str(exec(cmd)).trim() // @allow-bare-exec
+    if line == "" { return "N/A" }
+    if line.contains("PASS") { return "PASS" }
+    if line.contains("BLOCK") { return "BLOCK" }
+    if line.contains("WARN") { return "WARN" }
+    return "RUN"
+}
+
+// most recent attack mtime
+fn latest_mtime(bt_id: string) -> string {
+    let bt_num = bt_id.replace("BT-", "")
+    // check attacks dir + bt root for most recent file
+    let cmd = "ls -lt '" + ATTACKS_DIR + "/'bt" + bt_num + "_* '" + BT_DIR + "/'BT-" + bt_num + "_* '" + BT_DIR + "/'bt" + bt_num + "_* 2>/dev/null | head -1 | awk '{print $6,$7,$8}'"
+    let raw = _str(exec(cmd)).trim() // @allow-bare-exec
+    if raw == "" { return "-" }
+    return raw
+}
+
+// exact hits from bt_attacks.jsonl
+fn count_exact_from_registry(bt_id: string) -> int {
+    let cmd = "grep '\"" + bt_id + "\"' '" + BT_DIR + "/bt_attacks.jsonl' 2>/dev/null | head -1"
+    let line = _str(exec(cmd)).trim() // @allow-bare-exec
+    if line == "" { return 0 }
+    if line.contains("\"exact_hits\"") == false { return 0 }
+    let parts = line.split("\"exact_hits\"")
+    if parts.len() < 2 { return 0 }
+    let after = parts[1]
+    // count commas in array + 1 (rough)
+    if after.contains("[") == false { return 0 }
+    let arr_start = after.split("[")
+    if arr_start.len() < 2 { return 0 }
+    let arr_body = arr_start[1].split("]")[0]
+    if arr_body.trim() == "" { return 0 }
+    let items = arr_body.split(",")
+    return items.len()
+}
+
+// near hits from bt_attacks.jsonl
+fn count_near_from_registry(bt_id: string) -> int {
+    let cmd = "grep '\"" + bt_id + "\"' '" + BT_DIR + "/bt_attacks.jsonl' 2>/dev/null | head -1"
+    let line = _str(exec(cmd)).trim() // @allow-bare-exec
+    if line == "" { return 0 }
+    if line.contains("\"near_hits\"") == false { return 0 }
+    let parts = line.split("\"near_hits\"")
+    if parts.len() < 2 { return 0 }
+    let arr_start = parts[1].split("[")
+    if arr_start.len() < 2 { return 0 }
+    let arr_body = arr_start[1].split("]")[0]
+    if arr_body.trim() == "" { return 0 }
+    let items = arr_body.split(",")
+    return items.len()
+}
+
+// ─── panel: terminal table ───
+fn cmd_panel() {
+    println("=== BT PROGRESS PANEL (" + now_ts() + ") ===")
+    println("")
+
+    // header
+    let h_id = pad_right("BT-ID", 8)
+    let h_name = pad_right("Problem", 22)
+    let h_atk = pad_left("Atk", 4)
+    let h_rnd = pad_left("Rnd", 4)
+    let h_res = pad_left("Res", 6)
+    let h_exact = pad_left("EXACT", 6)
+    let h_near = pad_left("NEAR", 5)
+    let h_meta = pad_left("Meta", 5)
+    let h_gate = pad_right("Gate", 6)
+    let h_status = pad_right("Status", 8)
+    let h_last = pad_right("Last", 16)
+    println(h_id + " " + h_name + " " + h_atk + " " + h_rnd + " " + h_res + " " + h_exact + " " + h_near + " " + h_meta + " " + h_gate + " " + h_status + " " + h_last)
+    println("-------- ---------------------- ---- ---- ------ ------ ----- ----- ------ -------- ----------------")
+
+    let mut total_atk = 0
+    let mut total_rnd = 0
+    let mut total_exact = 0
+    let mut total_near = 0
+    let mut total_meta = 0
+
+    let mut i = 0
+    while i < BT_IDS.len() {
+        let bt_id = BT_IDS[i]
+        let bt_num = bt_id.replace("BT-", "")
+        let name = BT_NAMES[i]
+
+        // count attack files
+        let atk_files = count_attack_files(bt_num) + count_bt_root_files(bt_id)
+        total_atk = total_atk + atk_files
+
+        // round JSONs
+        let rounds = count_rounds(bt_id)
+        total_rnd = total_rnd + rounds
+
+        // resolution
+        let res = attack_resolution(bt_id)
+
+        // EXACT/NEAR from results JSONL
+        let mut exact = count_exact_from_registry(bt_id)
+        let mut near = count_near_from_registry(bt_id)
+
+        // also count from JSONL files in attacks dir
+        let jl_exact = count_grade(bt_num, "EXACT")
+        let jl_near = count_grade(bt_num, "NEAR")
+        if jl_exact > exact { exact = jl_exact }
+        if jl_near > near { near = jl_near }
+
+        total_exact = total_exact + exact
+        total_near = total_near + near
+
+        // metacog
+        let meta = if has_metacog(bt_id) { "Y" } else { "-" }
+        if has_metacog(bt_id) { total_meta = total_meta + 1 }
+
+        // consensus gate
+        let gate = consensus_result(bt_id)
+
+        // registry status
+        let mut status = attack_registry_status(bt_id)
+        if status == "-" {
+            // infer from existence
+            if atk_files > 0 { status = "ACTIVE" }
+            else if rounds > 0 { status = "DONE_R" }
+            else if has_metacog(bt_id) { status = "PREFETCH" }
+            else { status = "PLANNED" }
+        }
+
+        // last modified
+        let last = latest_mtime(bt_id)
+
+        // format row
+        let c_id = pad_right(bt_id, 8)
+        let c_name = pad_right(name, 22)
+        let c_atk = pad_left(is(atk_files), 4)
+        let c_rnd = pad_left(is(rounds), 4)
+        let c_res = pad_left(res, 6)
+        let c_exact = pad_left(is(exact), 6)
+        let c_near = pad_left(is(near), 5)
+        let c_meta = pad_left(meta, 5)
+        let c_gate = pad_right(gate, 6)
+        let c_status = pad_right(status, 8)
+        let c_last = pad_right(last, 16)
+        println(c_id + " " + c_name + " " + c_atk + " " + c_rnd + " " + c_res + " " + c_exact + " " + c_near + " " + c_meta + " " + c_gate + " " + c_status + " " + c_last)
+
+        i = i + 1
+    }
+
+    println("-------- ---------------------- ---- ---- ------ ------ ----- ----- ------ -------- ----------------")
+    println(pad_right("TOTAL", 8) + " " + pad_right("7 problems", 22) + " " +
+        pad_left(is(total_atk), 4) + " " + pad_left(is(total_rnd), 4) +
+        "      " + pad_left(is(total_exact), 6) + " " + pad_left(is(total_near), 5) +
+        " " + pad_left(is(total_meta) + "/7", 5))
+    println("")
+    println("Legend: Atk=attack files, Rnd=round JSONs, Res=resolution, Gate=consensus")
+    println("        EXACT/NEAR=hit counts, Meta=metacog prefetch, Status=current phase")
+    println("All BT-541..547: resolution 0/1 MISS (no proof claims)")
+}
+
+// ─── json: machine-readable output ───
+fn cmd_json() {
+    let ts = now_ts()
+    let mut entries: [string] = []
+
+    let mut i = 0
+    while i < BT_IDS.len() {
+        let bt_id = BT_IDS[i]
+        let bt_num = bt_id.replace("BT-", "")
+        let name = BT_NAMES[i]
+        let domain = BT_DOMAINS[i]
+
+        let atk = count_attack_files(bt_num) + count_bt_root_files(bt_id)
+        let rounds = count_rounds(bt_id)
+        let res = attack_resolution(bt_id)
+        let mut exact = count_exact_from_registry(bt_id)
+        let mut near = count_near_from_registry(bt_id)
+        let jl_exact = count_grade(bt_num, "EXACT")
+        let jl_near = count_grade(bt_num, "NEAR")
+        if jl_exact > exact { exact = jl_exact }
+        if jl_near > near { near = jl_near }
+        let result_lines = count_result_lines(bt_num)
+        let meta = has_metacog(bt_id)
+        let gate = consensus_result(bt_id)
+        let mut status = attack_registry_status(bt_id)
+        if status == "-" {
+            if atk > 0 { status = "ACTIVE" }
+            else if rounds > 0 { status = "DONE_R" }
+            else if meta { status = "PREFETCH" }
+            else { status = "PLANNED" }
+        }
+        let last = latest_mtime(bt_id)
+
+        let entry = "    {\"bt_id\":\"" + bt_id + "\",\"name\":\"" + json_esc(name) +
+            "\",\"domain\":\"" + json_esc(domain) +
+            "\",\"attack_files\":" + is(atk) +
+            ",\"rounds\":" + is(rounds) +
+            ",\"resolution\":\"" + json_esc(res) +
+            "\",\"exact\":" + is(exact) +
+            ",\"near\":" + is(near) +
+            ",\"result_lines\":" + is(result_lines) +
+            ",\"metacog\":" + to_string(meta) +
+            ",\"consensus_gate\":\"" + json_esc(gate) +
+            "\",\"status\":\"" + json_esc(status) +
+            "\",\"last_modified\":\"" + json_esc(last) + "\"}"
+        entries = entries + [entry]
+
+        i = i + 1
+    }
+
+    let body = "{\n  \"ts\":\"" + ts + "\",\n  \"panel\":\"bt_progress\",\n  \"version\":1,\n  \"bts\":[\n" +
+        entries.join(",\n") + "\n  ]\n}"
+
+    // write to file
+    let esc_body = body.replace("'", "'\\''")
+    try { exec("printf '%s\\n' '" + esc_body + "' > '" + OUT_JSON + "'") } catch e {} // @allow-bare-exec
+
+    println(body)
+}
+
+// ─── detail: single BT deep view ───
+fn cmd_detail(bt_id: string) {
+    // validate
+    let mut found = false
+    let mut idx = 0
+    let mut bi = 0
+    while bi < BT_IDS.len() {
+        if BT_IDS[bi] == bt_id {
+            found = true
+            idx = bi
+        }
+        bi = bi + 1
+    }
+    if found == false {
+        println("ERROR: unknown bt_id '" + bt_id + "'. Valid: BT-541..BT-547")
+        return
+    }
+
+    let bt_num = bt_id.replace("BT-", "")
+    let name = BT_NAMES[idx]
+    let domain = BT_DOMAINS[idx]
+
+    println("=== " + bt_id + " DETAIL (" + now_ts() + ") ===")
+    println("Problem:  " + name)
+    println("Domain:   " + domain)
+    println("")
+
+    // attack files
+    println("[Attack Files]")
+    let cmd_atk = "ls -la '" + ATTACKS_DIR + "/'bt" + bt_num + "_* 2>/dev/null"
+    let atk_out = _str(exec(cmd_atk)).trim() // @allow-bare-exec
+    if atk_out != "" { println(atk_out) }
+    else { println("  (none in attacks/)") }
+
+    let cmd_bt = "ls -la '" + BT_DIR + "/'BT-" + bt_num + "_* '" + BT_DIR + "/'bt" + bt_num + "_* 2>/dev/null"
+    let bt_out = _str(exec(cmd_bt)).trim() // @allow-bare-exec
+    if bt_out != "" { println(bt_out) }
+    println("")
+
+    // metacog
+    println("[Metacog]")
+    let metacog_path = BT_DIR + "/metacog_" + bt_id + ".json"
+    if file_exists(metacog_path) {
+        let mc = _str(exec("cat '" + metacog_path + "' 2>/dev/null")).trim() // @allow-bare-exec
+        println(mc)
+    } else {
+        println("  (not prefetched)")
+    }
+    println("")
+
+    // result JSONL
+    println("[Results JSONL]")
+    let cmd_jl = "cat '" + ATTACKS_DIR + "/'bt" + bt_num + "_*.jsonl 2>/dev/null | wc -l"
+    let jl_count = _to_int0(_str(exec(cmd_jl))) // @allow-bare-exec
+    println("  Lines: " + is(jl_count))
+    if jl_count > 0 {
+        println("  Last 5 entries:")
+        let tail = _str(exec("cat '" + ATTACKS_DIR + "/'bt" + bt_num + "_*.jsonl 2>/dev/null | tail -5")) // @allow-bare-exec
+        println(tail)
+    }
+    println("")
+
+    // registry entry
+    println("[Attack Registry]")
+    let reg = _str(exec("grep '\"" + bt_id + "\"' '" + BT_DIR + "/bt_attacks.jsonl' 2>/dev/null")).trim() // @allow-bare-exec
+    if reg != "" { println(reg) }
+    else { println("  (no registry entry)") }
+    println("")
+
+    // consensus gate
+    println("[Consensus Gate]")
+    let cons_path = LOGS_DIR + "/bt_consistency.jsonl"
+    let cons = _str(exec("grep '\"" + bt_id + "\"' '" + cons_path + "' 2>/dev/null | tail -3")).trim() // @allow-bare-exec
+    if cons != "" { println(cons) }
+    else { println("  (no consistency check yet)") }
+    println("")
+
+    // promotion log
+    println("[Promotion Gate]")
+    let promo_path = LOGS_DIR + "/bt_promotion.jsonl"
+    let promo = _str(exec("grep '\"" + bt_id + "\"' '" + promo_path + "' 2>/dev/null | tail -3")).trim() // @allow-bare-exec
+    if promo != "" { println(promo) }
+    else { println("  (no promotion events)") }
+    println("")
+
+    // round JSONs
+    println("[Round JSONs]")
+    let rnds = _str(exec("ls -la '" + BT_DIR + "/'BT-" + bt_num + "_*.json 2>/dev/null | grep -v metacog")).trim() // @allow-bare-exec
+    if rnds != "" { println(rnds) }
+    else { println("  (no round JSONs)") }
+
+    println("")
+    println("Resolution: 0/1 MISS (no proof claims)")
+}
+
+// ─── selftest ───
+fn cmd_selftest() {
+    println("=== BT PROGRESS PANEL SELFTEST ===")
+    let mut pass = 0
+    let mut fail = 0
+
+    // test 1: BT table size
+    if BT_IDS.len() == 7 { pass = pass + 1; println("  [PASS] BT_IDS len = 7") }
+    else { fail = fail + 1; println("  [FAIL] BT_IDS len = " + is(BT_IDS.len())) }
+
+    // test 2: names match
+    if BT_NAMES.len() == 7 { pass = pass + 1; println("  [PASS] BT_NAMES len = 7") }
+    else { fail = fail + 1; println("  [FAIL] BT_NAMES len") }
+
+    // test 3: domains match
+    if BT_DOMAINS.len() == 7 { pass = pass + 1; println("  [PASS] BT_DOMAINS len = 7") }
+    else { fail = fail + 1; println("  [FAIL] BT_DOMAINS len") }
+
+    // test 4: attacks dir exists
+    let dir_ok = _str(exec("test -d '" + ATTACKS_DIR + "' && echo y || echo n")).trim() // @allow-bare-exec
+    if dir_ok == "y" { pass = pass + 1; println("  [PASS] attacks/ dir exists") }
+    else { fail = fail + 1; println("  [FAIL] attacks/ dir missing") }
+
+    // test 5: state dir exists
+    let state_ok = _str(exec("test -d '" + STATE_DIR + "' && echo y || echo n")).trim() // @allow-bare-exec
+    if state_ok == "y" { pass = pass + 1; println("  [PASS] state/ dir exists") }
+    else { fail = fail + 1; println("  [FAIL] state/ dir missing") }
+
+    // test 6: metacog files exist (should be 7)
+    let mut mc_count = 0
+    let mut mi = 0
+    while mi < BT_IDS.len() {
+        if has_metacog(BT_IDS[mi]) { mc_count = mc_count + 1 }
+        mi = mi + 1
+    }
+    if mc_count == 7 { pass = pass + 1; println("  [PASS] metacog 7/7") }
+    else { fail = fail + 1; println("  [WARN] metacog " + is(mc_count) + "/7") }
+
+    // test 7: pad helpers
+    let p = pad_right("AB", 5)
+    if p.len() == 5 { pass = pass + 1; println("  [PASS] pad_right") }
+    else { fail = fail + 1; println("  [FAIL] pad_right") }
+
+    println("")
+    println("selftest: " + is(pass) + " pass, " + is(fail) + " fail")
+    if fail == 0 { println("__HARNESS_SELFTEST__ PASS") }
+    else { println("__HARNESS_SELFTEST__ WARN") }
+}
+
+// ─── main ───
+fn find_mode(argv: [string]) -> string {
+    // scan all argv for known modes / flags (handles hexa <file> <mode> and direct <mode>)
+    let mut ai = 1
+    while ai < argv.len() {
+        let a = _str(argv[ai]).trim()
+        if a == "panel" || a == "json" || a == "detail" || a == "--selftest" { return a }
+        ai = ai + 1
+    }
+    return "panel"
+}
+
+fn find_bt_arg(argv: [string]) -> string {
+    // scan all argv for BT-5XX pattern
+    let mut ai = 1
+    while ai < argv.len() {
+        let a = _str(argv[ai]).trim()
+        if a.contains("BT-5") { return a }
+        ai = ai + 1
+    }
+    return "BT-541"
+}
+
+fn main() {
+    let argv = args()
+    let mode = find_mode(argv)
+
+    if mode == "panel" { cmd_panel() }
+    else if mode == "json" { cmd_json() }
+    else if mode == "detail" {
+        let bt_id = find_bt_arg(argv)
+        cmd_detail(bt_id)
+    }
+    else if mode == "--selftest" { cmd_selftest() }
+    else {
+        println("usage: hexa bt_progress_panel.hexa <panel|json|detail <BT-5XX>|--selftest>")
+        println("  panel              terminal progress table (default)")
+        println("  json               write bt_progress.json + stdout")
+        println("  detail <BT-5XX>    detailed view for single BT")
+        println("  --selftest         smoke test")
+    }
+}
+
+main()

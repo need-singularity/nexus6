@@ -1,0 +1,324 @@
+// shared/bisociation/l5_completion.hexa — BISOC-P9-1
+// L5 5/5 completion verifier + unified L1~L5 convergence index
+// CLI: hexa l5_completion.hexa <status|complete|index|n6|help>
+// index = sum(w_k * progress_k) / sum(w_k), w=[L1:1,L2:2,L3:3,L4:4,L5:5,Lm:3]
+// n=6 Montgomery-Dyson: R2(r)=1-(sin(pi*r)/(pi*r))^2, sigma(6)*phi(6)==24
+// reads: convergence.json + state.json  writes: l5_convergence.jsonl
+// see also: convergence_index.hexa (standalone index calculator)
+
+comptime const LAYER_COUNT = 6
+comptime const PAPER_TRIGGER = 0.9
+comptime const N6_SIGMA = 12
+comptime const N6_PHI = 2
+comptime const N6_TAU = 4
+comptime const N6_J2 = 24
+
+fn layer_keys() -> list { return ["L1_unified", "L2_spectra", "L3_cross", "L4_spectral_feedback", "L5_phase_lock", "L_meta"] }
+fn layer_weights() -> list { return [1.0, 2.0, 3.0, 4.0, 5.0, 3.0] }
+fn layer_labels() -> list { return ["L1 unified", "L2 spectra", "L3 cross", "L4 feedback", "L5 phase-lock", "L_meta"] }
+
+fn abs_f(x: float) -> float { if x < 0.0 { return 0.0 - x } ; return x }
+fn clamp_01(x: float) -> float { if x < 0.0 { return 0.0 } ; if x > 1.0 { return 1.0 } ; return x }
+fn resolve_nexus() -> string { let nx = env("NEXUS") ; if nx != "" { return nx } ; return env("HOME") + "/Dev/nexus" }
+
+// ─── Layer 데이터 ───
+
+struct LayerInfo { key: string, label: string, weight: float, progress: float, modules_done: int, modules_total: int, status: string }
+
+fn extract_layer(conv: str, key: string, label: string, weight: float) -> LayerInfo {
+    let stages = conv["stages"]
+    if stages == nil { return LayerInfo { key: key, label: label, weight: weight, progress: 0.0, modules_done: 0, modules_total: 0, status: "missing" } }
+    let layer = stages[key]
+    if layer == nil { return LayerInfo { key: key, label: label, weight: weight, progress: 0.0, modules_done: 0, modules_total: 0, status: "missing" } }
+    let prog = if layer["progress"] != nil { to_float(layer["progress"]) } else { 0.0 }
+    let done = if layer["modules_done"] != nil { to_int(layer["modules_done"]) } else { 0 }
+    let total = if layer["modules_total"] != nil { to_int(layer["modules_total"]) } else { 0 }
+    let st = if layer["status"] != nil { to_string(layer["status"]) } else { "unknown" }
+    LayerInfo { key: key, label: label, weight: weight, progress: prog, modules_done: done, modules_total: total, status: st }
+}
+
+// ─── Convergence Index ───
+
+struct ConvergenceResult { index: float, weighted_sum: float, weight_total: float, layers: list, composite_best: float, composite_pair: string, paper_trigger: bool, paper_gap: float, all_complete: bool }
+
+fn compute_convergence(conv: str, state: str) -> ConvergenceResult {
+    let keys = layer_keys()
+    let weights = layer_weights()
+    let labels = layer_labels()
+    let mut layers = []
+    let mut w_sum = 0.0
+    let mut w_total = 0.0
+    let mut all_done = true
+    let mut i = 0
+    while i < LAYER_COUNT {
+        let li = extract_layer(conv, keys[i], labels[i], to_float(weights[i]))
+        layers = layers + [li]
+        w_sum = w_sum + li.weight * clamp_01(li.progress)
+        w_total = w_total + li.weight
+        if li.progress < 1.0 { all_done = false }
+        i = i + 1
+    }
+    let idx = if w_total > 0.0 { w_sum / w_total } else { 0.0 }
+    // composite best from state
+    let mut comp_best = 0.0
+    let mut comp_pair = "none"
+    if state["L3_aligned_rerun"] != nil {
+        let rerun = state["L3_aligned_rerun"]
+        if rerun["results"] != nil {
+            let results = rerun["results"]
+            let rkeys = results.keys()
+            let mut k = 0
+            while k < rkeys.len() {
+                let entry = results[rkeys[k]]
+                if entry["after"] != nil {
+                    let c = to_float(entry["after"]["composite"])
+                    if c > comp_best { comp_best = c ; comp_pair = rkeys[k] }
+                }
+                k = k + 1
+            }
+        }
+    }
+    if state["L3_codata17_priority"] != nil {
+        let codata = state["L3_codata17_priority"]
+        if codata["results"] != nil {
+            let res = codata["results"]
+            if res["composite_aligned"] != nil {
+                let c = to_float(res["composite_aligned"])
+                if c > comp_best { comp_best = c ; comp_pair = "constants_x_physics_codata17" }
+            }
+        }
+    }
+    let paper = comp_best >= PAPER_TRIGGER
+    let gap = if paper { 0.0 } else { PAPER_TRIGGER - comp_best }
+    ConvergenceResult { index: idx, weighted_sum: w_sum, weight_total: w_total, layers: layers, composite_best: comp_best, composite_pair: comp_pair, paper_trigger: paper, paper_gap: gap, all_complete: all_done }
+}
+
+// ─── L5 검증 ───
+
+struct L5Verification { all_slots_done: bool, slots_done: int, slots_total: int, missing: list, phase: string }
+
+fn verify_l5(state: str) -> L5Verification {
+    let l5 = state["layers"]
+    if l5 == nil { return L5Verification { all_slots_done: false, slots_done: 0, slots_total: 5, missing: ["layers_missing"], phase: "unknown" } }
+    let pl = l5["L5_phase_lock"]
+    if pl == nil { return L5Verification { all_slots_done: false, slots_done: 0, slots_total: 5, missing: ["L5_phase_lock_missing"], phase: "unknown" } }
+    let slots = pl["slots"]
+    if slots == nil { return L5Verification { all_slots_done: false, slots_done: 0, slots_total: 5, missing: ["slots_missing"], phase: "unknown" } }
+    let slot_keys = ["1_protocol", "2_bridge", "3_monitor", "4_gate", "5_report"]
+    let mut done = 0
+    let mut missing = []
+    let mut j = 0
+    while j < 5 {
+        let sk = slot_keys[j]
+        let slot = slots[sk]
+        if slot != nil && to_string(slot["status"]) == "done" { done = done + 1 } else { missing = missing + [sk] }
+        j = j + 1
+    }
+    let phase = if state["phase"] != nil { to_string(state["phase"]) } else { "unknown" }
+    L5Verification { all_slots_done: done == 5, slots_done: done, slots_total: 5, missing: missing, phase: phase }
+}
+
+// ─── JSON 출력 ───
+
+fn result_to_json(cr: ConvergenceResult, v: L5Verification) -> string {
+    let mut lj = "["
+    let mut i = 0
+    while i < cr.layers.len() {
+        if i > 0 { lj = lj + "," }
+        let li = cr.layers[i]
+        lj = lj + "{\"key\":\"" + li.key + "\",\"w\":" + to_string(li.weight) + ",\"progress\":" + to_string(li.progress) + ",\"done\":" + to_string(li.modules_done) + ",\"total\":" + to_string(li.modules_total) + ",\"status\":\"" + li.status + "\"}"
+        i = i + 1
+    }
+    lj = lj + "]"
+    let mut o = "{\"ts\":" + to_string(time_now())
+    o = o + ",\"convergence_index\":" + to_string(cr.index)
+    o = o + ",\"weighted_sum\":" + to_string(cr.weighted_sum)
+    o = o + ",\"weight_total\":" + to_string(cr.weight_total)
+    o = o + ",\"composite_best\":" + to_string(cr.composite_best)
+    o = o + ",\"composite_pair\":\"" + cr.composite_pair + "\""
+    o = o + ",\"paper_trigger\":" + to_string(cr.paper_trigger)
+    o = o + ",\"paper_gap\":" + to_string(cr.paper_gap)
+    o = o + ",\"all_complete\":" + to_string(cr.all_complete)
+    o = o + ",\"l5_slots\":\"" + to_string(v.slots_done) + "/" + to_string(v.slots_total) + "\""
+    o = o + ",\"layers\":" + lj + "}"
+    return o
+}
+
+fn append_log(cr: ConvergenceResult, v: L5Verification) {
+    let root = resolve_nexus()
+    let log_path = root + "/shared/bisociation/l5_convergence.jsonl"
+    let entry = result_to_json(cr, v)
+    let existing = read_file(log_path)
+    let new_content = if existing != "" { existing + entry + "\n" } else { entry + "\n" }
+    write_file(log_path, new_content)
+    eprint("logged to " + log_path)
+}
+
+// ─── CLI ───
+
+let a = args()
+let a_len = a.len()
+let mode = if a_len >= 3 { a[2] } else { "help" }
+
+if mode == "status" || mode == "complete" || mode == "index" || mode == "n6" {
+    let root = resolve_nexus()
+    let conv_raw = read_file(root + "/shared/bisociation/convergence.json")
+    let state_raw = read_file(root + "/shared/bisociation/state.json")
+    if conv_raw == "" || state_raw == "" {
+        eprint("ERROR: cannot read convergence.json or state.json")
+        println("__L5_CONVERGENCE__ FAIL")
+    } else {
+        let conv = json_decode(conv_raw)
+        let state = json_decode(state_raw)
+        let cr = compute_convergence(conv, state)
+        let v = verify_l5(state)
+        if mode == "status" {
+            println("=== L1~L5 Bisociation Status ===")
+            println("")
+            let mut i = 0
+            while i < cr.layers.len() {
+                let li = cr.layers[i]
+                let bar = if li.progress >= 1.0 { "[DONE]" } else { "[" + to_string(li.modules_done) + "/" + to_string(li.modules_total) + "]" }
+                println("  " + li.label + "  w=" + to_string(li.weight) + "  " + bar + "  " + to_string(li.progress))
+                i = i + 1
+            }
+            println("")
+            println("L5 slots      : " + to_string(v.slots_done) + "/" + to_string(v.slots_total))
+            println("conv index    : " + to_string(cr.index))
+            println("composite best: " + to_string(cr.composite_best) + " (" + cr.composite_pair + ")")
+            println("paper trigger : " + to_string(cr.paper_trigger) + " (gap=" + to_string(cr.paper_gap) + ")")
+            println("all complete  : " + to_string(cr.all_complete))
+        }
+        if mode == "complete" {
+            println("=== L5 Completion Verification ===")
+            println("")
+            if v.all_slots_done {
+                println("L5 phase-lock: ALL 5/5 SLOTS DONE")
+                println("  1_protocol  2_bridge  3_monitor  4_gate  5_report")
+            } else {
+                println("L5 phase-lock: " + to_string(v.slots_done) + "/5 INCOMPLETE")
+                let mut m = 0
+                while m < v.missing.len() { println("  MISSING: " + v.missing[m]) ; m = m + 1 }
+            }
+            println("")
+            println("convergence index: " + to_string(cr.index))
+            let sentinel = if v.all_slots_done && cr.all_complete { "COMPLETE" } else { "INCOMPLETE" }
+            println("__L5_CONVERGENCE__ " + sentinel)
+        }
+        if mode == "index" {
+            println("=== Unified L1~L5 Convergence Index ===")
+            println("formula: sum(w_k * progress_k) / sum(w_k)")
+            println("  w = [L1:1, L2:2, L3:3, L4:4, L5:5, Lm:3]")
+            println("")
+            let mut i = 0
+            while i < cr.layers.len() {
+                let li = cr.layers[i]
+                let c = li.weight * clamp_01(li.progress)
+                println("  " + li.label + "  " + to_string(li.weight) + " * " + to_string(li.progress) + " = " + to_string(c))
+                i = i + 1
+            }
+            println("")
+            println("weighted sum : " + to_string(cr.weighted_sum))
+            println("weight total : " + to_string(cr.weight_total))
+            println("INDEX        : " + to_string(cr.index))
+            println("composite    : " + to_string(cr.composite_best) + " (" + cr.composite_pair + ")")
+            println("paper_trigger: " + to_string(cr.paper_trigger) + " (gap=" + to_string(cr.paper_gap) + ")")
+            println("")
+            println(result_to_json(cr, v))
+            append_log(cr, v)
+        }
+        if mode == "n6" {
+            // n=6 Montgomery-Dyson specialization report
+            println("=== n=6 Montgomery-Dyson Specialization ===")
+            println("")
+            println("R2(r) pair correlation (GUE two-point cluster function):")
+            println("  R2_GUE(r) = (sin(pi*r)/(pi*r))^2")
+            println("  n=6 invariants: sigma(6)=" + to_string(N6_SIGMA) + " phi(6)=" + to_string(N6_PHI) + " tau(6)=" + to_string(N6_TAU) + " j2=" + to_string(N6_J2))
+            println("  identity: sigma(6)*phi(6) == 6*tau(6) == " + to_string(N6_J2))
+            println("")
+            // compute R2 at key r values showing GUE kernel structure
+            let pi = 3.14159265358979
+            let r_samples = [0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0]
+            println("  r       R2_GUE(r)   n=6_correction")
+            let mut si = 0
+            while si < r_samples.len() {
+                let r_val = r_samples[si]
+                let x = pi * r_val
+                // sin via Taylor
+                let mut sin_val = 0.0
+                let mut term = x
+                let mut tk = 1
+                while tk <= 15 {
+                    sin_val = sin_val + term
+                    term = 0.0 - term * x * x / to_float((2 * tk) * (2 * tk + 1))
+                    tk = tk + 1
+                }
+                let sinc = if x > 0.001 { sin_val / x } else { 1.0 }
+                let r2_val = sinc * sinc
+                let n6_corr = r2_val * (1.0 - 1.0 / to_float(N6_J2))
+                println("  " + to_string(r_val) + "     " + to_string(r2_val) + "   " + to_string(n6_corr))
+                si = si + 1
+            }
+            println("")
+            println("n=6 correction factor: R2 * (1 - 1/j2) = R2 * 23/24")
+            println("  encodes 24-fold degeneracy from sigma*phi divisor symmetry")
+            println("  at r=1 (nearest-neighbor): GUE repulsion strongest")
+            println("  at r>>1: R2->0, correction->0 (Poisson uncorrelated)")
+            println("")
+            println("current convergence index: " + to_string(cr.index))
+            let n6_r = cr.index * to_float(N6_TAU)
+            println("n=6 evaluation point: r = index * tau(6) = " + to_string(n6_r))
+        }
+    }
+}
+
+if mode == "help" {
+    println("=== l5_completion.hexa — BISOC-P9-1 ===")
+    println("L5 completion verifier + unified L1~L5 convergence index.")
+    println("")
+    println("CLI:")
+    println("  hexa l5_completion.hexa status    L1~L5 overview")
+    println("  hexa l5_completion.hexa complete  verify L5 5/5 slots")
+    println("  hexa l5_completion.hexa index     compute convergence index + log")
+    println("  hexa l5_completion.hexa n6        n=6 Montgomery-Dyson specialization")
+    println("")
+    println("index = sum(w_k * progress_k) / sum(w_k)")
+    println("  w = [L1:1, L2:2, L3:3, L4:4, L5:5, Lm:3], range [0,1]")
+    println("  n=6 correction: GUE R2(r) at r=index*tau(6)")
+    println("log: shared/bisociation/l5_convergence.jsonl")
+    println("see: shared/bisociation/convergence_index.hexa (standalone)")
+}
+
+// ─── 검증 ───
+
+let mc = json_decode("{\"stages\":{\"L1_unified\":{\"progress\":1.0,\"modules_done\":4,\"modules_total\":4,\"status\":\"completed\"},\"L2_spectra\":{\"progress\":1.0,\"modules_done\":4,\"modules_total\":4,\"status\":\"completed\"},\"L3_cross\":{\"progress\":0.8,\"modules_done\":4,\"modules_total\":5,\"status\":\"in_progress\"},\"L4_spectral_feedback\":{\"progress\":1.0,\"modules_done\":1,\"modules_total\":1,\"status\":\"completed\"},\"L5_phase_lock\":{\"progress\":1.0,\"modules_done\":5,\"modules_total\":5,\"status\":\"completed\"},\"L_meta\":{\"progress\":1.0,\"modules_done\":4,\"modules_total\":4,\"status\":\"completed\"}}}")
+let ms = json_decode("{\"phase\":\"L5\",\"L3_aligned_rerun\":{\"results\":{\"atlas_x_laws_aligned\":{\"after\":{\"composite\":0.83379}}}}}")
+let tcr = compute_convergence(mc, ms)
+// (1*1 + 2*1 + 3*0.8 + 4*1 + 5*1 + 3*1) / 18 = 17.4/18 = 0.9666
+assert tcr.index > 0.96
+assert tcr.index < 0.97
+assert tcr.composite_best > 0.83
+assert tcr.paper_trigger == false
+assert tcr.all_complete == false
+
+let mc2 = json_decode("{\"stages\":{\"L1_unified\":{\"progress\":1.0,\"modules_done\":4,\"modules_total\":4,\"status\":\"completed\"},\"L2_spectra\":{\"progress\":1.0,\"modules_done\":4,\"modules_total\":4,\"status\":\"completed\"},\"L3_cross\":{\"progress\":1.0,\"modules_done\":5,\"modules_total\":5,\"status\":\"completed\"},\"L4_spectral_feedback\":{\"progress\":1.0,\"modules_done\":1,\"modules_total\":1,\"status\":\"completed\"},\"L5_phase_lock\":{\"progress\":1.0,\"modules_done\":5,\"modules_total\":5,\"status\":\"completed\"},\"L_meta\":{\"progress\":1.0,\"modules_done\":4,\"modules_total\":4,\"status\":\"completed\"}}}")
+let tcr2 = compute_convergence(mc2, ms)
+assert tcr2.index == 1.0
+assert tcr2.all_complete == true
+
+let mv = json_decode("{\"phase\":\"L5\",\"layers\":{\"L5_phase_lock\":{\"slots\":{\"1_protocol\":{\"status\":\"done\"},\"2_bridge\":{\"status\":\"done\"},\"3_monitor\":{\"status\":\"done\"},\"4_gate\":{\"status\":\"done\"},\"5_report\":{\"status\":\"done\"}}}}}")
+let tv = verify_l5(mv)
+assert tv.all_slots_done == true
+assert tv.slots_done == 5
+
+let mv2 = json_decode("{\"phase\":\"L5\",\"layers\":{\"L5_phase_lock\":{\"slots\":{\"1_protocol\":{\"status\":\"done\"},\"2_bridge\":{\"status\":\"done\"},\"3_monitor\":{\"status\":\"done\"},\"4_gate\":{\"status\":\"wip\"},\"5_report\":{\"status\":\"wip\"}}}}}")
+let tv2 = verify_l5(mv2)
+assert tv2.all_slots_done == false
+assert tv2.slots_done == 3
+
+assert clamp_01(-0.5) == 0.0
+assert clamp_01(1.5) == 1.0
+assert clamp_01(0.5) == 0.5
+
+println("")
+println("=== l5_completion verified ===")

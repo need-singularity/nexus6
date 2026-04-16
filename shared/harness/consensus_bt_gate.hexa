@@ -1,0 +1,806 @@
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+// consensus_bt_gate.hexa — CONSN-P8-1 (A17_CONSENSUS P8)
+// BT promotion consistency verification cycle.
+// Validates that promoted BT claims have:
+//   (a) supporting evidence in discovery_log
+//   (b) multi-pass verification agreement
+//   (c) consistency with existing BT state (bt_audit_result, bt_labels)
+//
+// SSOT inputs (read-only):
+//   shared/logs/bt_promotion.jsonl        — promotion gate audit log (CONSN-P7-1 output)
+//   shared/bt/bt_audit_result.json        — EXACT audit results
+//   shared/bt/bt_labels.json              — BT label registry
+//   shared/bt/bt_domains.jsonl            — domain registry
+//   shared/bt/bt_keywords.jsonl           — keyword registry
+//   shared/discovery_log.jsonl            — consensus candidates (source)
+//
+// SSOT output (append-only):
+//   shared/logs/bt_consistency.jsonl       — verification cycle results
+//
+// modes:
+//   verify                 full consistency cycle (all promoted candidates)
+//   verify --id <id>       single candidate consistency check
+//   drift                  detect drift between promotion log and BT state
+//   status [N=20]          recent N consistency events
+//   --selftest             smoke test
+//
+// sentinel (stdout last line):
+//   __HARNESS_CONSISTENCY_RESULT__ PASS
+//   __HARNESS_CONSISTENCY_RESULT__ BLOCK <reason>
+//
+// refs: shared/engine/bt_promotion_gate_spec.json (CONSN-P7-1 parent spec)
+
+// ─── safe_exec inc copy-paste (stage1 native include) ───
+let _SE_HOME = env("HOME")
+let _SE_WRAPPER = _SE_HOME + "/Dev/nexus/shared/harness/perl_timeout.sh" // @allow-devpath
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _shq(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _wrapper_ok() -> bool {
+    let r = _str(exec("test -x '" + _SE_WRAPPER + "' && echo y || echo n")).trim()
+    return r == "y"
+}
+
+fn _wrap(cmd: string, timeout_sec: i64) -> string {
+    if !_wrapper_ok() { return cmd }
+    return "'" + _SE_WRAPPER + "' " + to_string(timeout_sec) + " bash -c " + _shq(cmd)
+}
+
+fn safe_exec(cmd: string, timeout_sec: i64) -> string {
+    let wrapped = _wrap(cmd, timeout_sec)
+    return _str(exec(wrapped + " 2>&1"))  // @allow-bare-exec — wrapped
+}
+
+// ─── paths ───
+let HOME = env("HOME")
+let NEXUS_ENV = env("NEXUS")
+let NEXUS = if NEXUS_ENV != "" { NEXUS_ENV } else { HOME + "/Dev/nexus" } // @allow-devpath
+let SHARED = NEXUS + "/shared"
+let HARNESS = SHARED + "/harness"
+let HEXA_BIN = SHARED + "/bin/hexa"
+
+// inputs (read-only)
+let PROMO_LOG = SHARED + "/logs/bt_promotion.jsonl"
+let BT_AUDIT = SHARED + "/bt/bt_audit_result.json"
+let BT_LABELS = SHARED + "/bt/bt_labels.json"
+let BT_DOMAINS = SHARED + "/bt/bt_domains.jsonl"
+let BT_KEYWORDS = SHARED + "/bt/bt_keywords.jsonl"
+let DISC_LOG = SHARED + "/discovery_log.jsonl"
+
+// output (append-only)
+let CONSISTENCY_LOG = SHARED + "/logs/bt_consistency.jsonl"
+
+// bt_promotion_gate for cross-invocation
+let BT_GATE = HARNESS + "/bt_promotion_gate.hexa"
+
+// ─── thresholds (mirror CONSN-P7-1 spec, inline for independence) ───
+let TH_MIN_SCORE = 0.70
+let TH_MIN_CROSS = 3
+let TH_MIN_TIER = "STRONG"
+// consistency-specific thresholds
+let TH_REVERIFY_AGREE_MIN: i64 = 2        // min agreement passes out of 3
+let TH_MAX_DRIFT_RATIO = 0.20             // max allowed drift (promoted but missing from source)
+let TH_EVIDENCE_MIN_LINES: i64 = 1        // min discovery_log lines backing a promoted candidate
+
+// ─── helpers ───
+fn now_iso() -> string {
+    return safe_exec("date -u +%Y-%m-%dT%H:%M:%SZ", 5).trim()
+}
+
+fn json_escape(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", " ")
+    r = r.replace("\r", " ")
+    r = r.replace("\t", " ")
+    return r
+}
+
+fn json_str(line: string, field: string) -> string {
+    let m1 = "\"" + field + "\":\""
+    let m2 = "\"" + field + "\": \""
+    let mut parts = line.split(m1)
+    if parts.len() < 2 { parts = line.split(m2) }
+    if parts.len() < 2 { return "" }
+    let end = _str(parts[1]).split("\"")
+    if end.len() < 1 { return "" }
+    return _str(end[0])
+}
+
+fn json_num(line: string, field: string) -> f64 {
+    let marker = "\"" + field + "\":"
+    let parts = line.split(marker)
+    if parts.len() < 2 { return 0.0 }
+    let rest = _str(parts[1])
+    let mut buf = ""
+    let n = len(rest)
+    let mut i: i64 = 0
+    while i < n {
+        let ch = rest.substring(i, i + 1)
+        if ch == " " { i = i + 1; continue }
+        if ch == "," || ch == "}" || ch == "\n" { break }
+        buf = buf + ch
+        i = i + 1
+    }
+    buf = buf.trim()
+    if buf == "" { return 0.0 }
+    let mut v = 0.0
+    try { v = to_float(buf) } catch e { v = 0.0 }
+    return v
+}
+
+fn json_int(line: string, field: string) -> i64 {
+    let v = json_num(line, field)
+    let s = to_string(v)
+    let dot = s.index_of(".")
+    let body = if dot >= 0 { s.substring(0, dot) } else { s }
+    if body == "" || body == "-" { return 0 }
+    return to_int(body)
+}
+
+fn load_lines(path: string) -> [string] {
+    let mut out: [string] = []
+    if !file_exists(path) { return out }
+    let lines = _str(read_file(path)).split("\n")
+    let n = len(lines)
+    let mut i: i64 = 0
+    while i < n {
+        let ln = _str(lines[i]).trim()
+        if len(ln) > 0 { out = out.push(ln) }
+        i = i + 1
+    }
+    return out
+}
+
+fn list_contains(xs: [string], y: string) -> bool {
+    let n = len(xs)
+    let mut i: i64 = 0
+    while i < n {
+        if _str(xs[i]) == y { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn abs_f(x: f64) -> f64 {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// seed_quality (mirror of consensus_loop.hexa, bt_promotion_gate.hexa)
+fn seed_quality(v: f64) -> f64 {
+    let consts = [6.0, 12.0, 2.0, 4.0, 5.0, 24.0, 7.0, 28.0, 120.0, 720.0]
+    let mut best = 1.0
+    let mut i: i64 = 0
+    while i < 10 {
+        let c = consts[i]
+        let d = if c > 1.0 { abs_f(v - c) / c } else { abs_f(v - c) }
+        if d < best { best = d }
+        i = i + 1
+    }
+    if best > 1.0 { return 0.0 }
+    return 1.0 - best
+}
+
+fn tier_of(score: f64) -> string {
+    if score >= 0.95 { return "EXACT" }
+    if score >= 0.80 { return "STRONG" }
+    if score >= 0.60 { return "WEAK" }
+    return "NONE"
+}
+
+fn tier_rank(tier: string) -> i64 {
+    if tier == "EXACT"  { return 3 }
+    if tier == "STRONG" { return 2 }
+    if tier == "WEAK"   { return 1 }
+    return 0
+}
+
+fn tier_ok(tier: string, min_tier: string) -> bool {
+    return tier_rank(tier) >= tier_rank(min_tier)
+}
+
+// ─── promoted event record ───
+struct PromoEvent {
+    candidate_id: string,
+    domain: string,
+    name: string,
+    value: f64,
+    score: f64,
+    cross_confirms: i64,
+    distinct_seeds: i64,
+    tier: string,
+    verdict: string,
+    ts: string
+}
+
+fn load_promoted_events() -> [PromoEvent] {
+    let mut out: [PromoEvent] = []
+    let lines = load_lines(PROMO_LOG)
+    let n = len(lines)
+    let mut i: i64 = 0
+    while i < n {
+        let line = _str(lines[i])
+        i = i + 1
+        let kind = json_str(line, "kind")
+        if kind != "bt_promotion_event" { continue }
+        let verdict = json_str(line, "verdict")
+        if verdict != "PROMOTE" { continue }
+        let ev = PromoEvent{
+            candidate_id: json_str(line, "candidate_id"),
+            domain: json_str(line, "domain"),
+            name: json_str(line, "name"),
+            value: json_num(line, "value"),
+            score: json_num(line, "score"),
+            cross_confirms: json_int(line, "cross_confirms"),
+            distinct_seeds: json_int(line, "distinct_seeds"),
+            tier: json_str(line, "tier"),
+            verdict: verdict,
+            ts: json_str(line, "ts")
+        }
+        if ev.candidate_id != "" { out = out.push(ev) }
+    }
+    return out
+}
+
+// dedup promoted events by candidate_id (keep latest)
+fn dedup_promoted(events: [PromoEvent]) -> [PromoEvent] {
+    let mut seen_ids: [string] = []
+    let mut out: [PromoEvent] = []
+    // reverse iterate to keep latest per id
+    let n = len(events)
+    let mut i = n - 1
+    while i >= 0 {
+        let ev = events[i]
+        if !list_contains(seen_ids, ev.candidate_id) {
+            seen_ids = seen_ids.push(ev.candidate_id)
+            out = out.push(ev)
+        }
+        i = i - 1
+    }
+    return out
+}
+
+// ─── verification pass 1: evidence check ───
+// Verify each promoted candidate has backing evidence in discovery_log
+fn verify_evidence(ev: PromoEvent) -> [string] {
+    let mut issues: [string] = []
+    if !file_exists(DISC_LOG) {
+        issues = issues.push("discovery_log_missing")
+        return issues
+    }
+    // count lines matching this domain+name in discovery_log
+    let needle_d = "\"domain\":\"" + json_escape(ev.domain) + "\""
+    let needle_n = "\"name\":\"" + json_escape(ev.name) + "\""
+    let cmd = "grep -c " + _shq(needle_d) + " " + _shq(DISC_LOG) + " 2>/dev/null || echo 0"
+    let domain_count = json_int(safe_exec(cmd, 15), "")
+    // also check name co-occurrence (grep both)
+    let cmd2 = "grep " + _shq(needle_d) + " " + _shq(DISC_LOG)
+        + " 2>/dev/null | grep -c " + _shq(needle_n) + " 2>/dev/null || echo 0"
+    let count_str = safe_exec(cmd2, 15).trim()
+    let mut match_count: i64 = 0
+    try { match_count = to_int(count_str) } catch e { match_count = 0 }
+    if match_count < TH_EVIDENCE_MIN_LINES {
+        issues = issues.push("no_source_evidence")
+    }
+    return issues
+}
+
+// ─── verification pass 2: score re-verification ───
+// Independently re-compute seed_quality and tier, compare with recorded values
+fn verify_score(ev: PromoEvent) -> [string] {
+    let mut issues: [string] = []
+    let recomputed = seed_quality(ev.value)
+    let recomputed_tier = tier_of(recomputed)
+    // allow small floating-point difference
+    let diff = abs_f(recomputed - ev.score)
+    if diff > 0.01 {
+        issues = issues.push("score_mismatch(recorded=" + to_string(ev.score)
+            + " recomputed=" + to_string(recomputed) + ")")
+    }
+    if recomputed_tier != ev.tier {
+        issues = issues.push("tier_mismatch(recorded=" + ev.tier
+            + " recomputed=" + recomputed_tier + ")")
+    }
+    if !tier_ok(recomputed_tier, TH_MIN_TIER) {
+        issues = issues.push("tier_below_threshold(recomputed=" + recomputed_tier
+            + " min=" + TH_MIN_TIER + ")")
+    }
+    if recomputed < TH_MIN_SCORE {
+        issues = issues.push("score_below_threshold(recomputed=" + to_string(recomputed)
+            + " min=" + to_string(TH_MIN_SCORE) + ")")
+    }
+    return issues
+}
+
+// ─── verification pass 3: BT state consistency ───
+// Check promoted candidate doesn't conflict with existing BT labels/audit
+fn verify_bt_consistency(ev: PromoEvent) -> [string] {
+    let mut issues: [string] = []
+    // (a) domain must be in bt_domains.jsonl
+    let domain_lines = load_lines(BT_DOMAINS)
+    let mut domain_found = false
+    let dn = len(domain_lines)
+    let mut di: i64 = 0
+    while di < dn {
+        let d = json_str(_str(domain_lines[di]), "domain")
+        if d == ev.domain { domain_found = true; break }
+        di = di + 1
+    }
+    if !domain_found {
+        issues = issues.push("domain_not_registered")
+    }
+    // (b) check for duplicate in bt_labels (existing BT with same name substring)
+    if file_exists(BT_LABELS) {
+        let labels_body = _str(read_file(BT_LABELS))
+        let name_lower = ev.name.to_lower()
+        // search for name in labels values (approximate: substring in entire labels file)
+        if labels_body.to_lower().contains(name_lower) {
+            // could be coincidental substring match, mark as warning not hard fail
+            issues = issues.push("potential_bt_label_overlap(name=" + ev.name + ")")
+        }
+    }
+    // (c) cross_confirms threshold re-check
+    if ev.cross_confirms < TH_MIN_CROSS {
+        issues = issues.push("cross_below_threshold(recorded=" + to_string(ev.cross_confirms)
+            + " min=" + to_string(TH_MIN_CROSS) + ")")
+    }
+    return issues
+}
+
+// ─── multi-pass aggregation ───
+struct VerifyResult {
+    candidate_id: string,
+    domain: string,
+    name: string,
+    value: f64,
+    passes_run: i64,
+    passes_ok: i64,
+    status: string,      // CONSISTENT | INCONSISTENT | WARN
+    issues: [string]
+}
+
+fn run_verify(ev: PromoEvent) -> VerifyResult {
+    let mut all_issues: [string] = []
+    let mut passes_ok: i64 = 0
+    let passes_run: i64 = 3
+    // pass 1: evidence
+    let p1 = verify_evidence(ev)
+    if len(p1) == 0 { passes_ok = passes_ok + 1 }
+    let mut pi: i64 = 0
+    while pi < len(p1) {
+        all_issues = all_issues.push("P1:" + _str(p1[pi]))
+        pi = pi + 1
+    }
+    // pass 2: score re-verification
+    let p2 = verify_score(ev)
+    if len(p2) == 0 { passes_ok = passes_ok + 1 }
+    let mut qi: i64 = 0
+    while qi < len(p2) {
+        all_issues = all_issues.push("P2:" + _str(p2[qi]))
+        qi = qi + 1
+    }
+    // pass 3: BT state consistency
+    let p3 = verify_bt_consistency(ev)
+    // separate hard issues from soft warnings
+    let mut p3_hard: i64 = 0
+    let mut ri: i64 = 0
+    while ri < len(p3) {
+        let issue = _str(p3[ri])
+        all_issues = all_issues.push("P3:" + issue)
+        // potential_bt_label_overlap is soft warning, not a hard fail
+        if !issue.contains("potential_bt_label_overlap") {
+            p3_hard = p3_hard + 1
+        }
+        ri = ri + 1
+    }
+    if p3_hard == 0 { passes_ok = passes_ok + 1 }
+    // determine overall status
+    let mut status = "CONSISTENT"
+    if passes_ok < TH_REVERIFY_AGREE_MIN {
+        status = "INCONSISTENT"
+    } else if len(all_issues) > 0 {
+        status = "WARN"
+    }
+    return VerifyResult{
+        candidate_id: ev.candidate_id,
+        domain: ev.domain,
+        name: ev.name,
+        value: ev.value,
+        passes_run: passes_run,
+        passes_ok: passes_ok,
+        status: status,
+        issues: all_issues
+    }
+}
+
+// ─── drift detection ───
+// Check promoted candidates that no longer have source evidence
+struct DriftReport {
+    total_promoted: i64,
+    still_backed: i64,
+    drifted: i64,
+    drift_ratio: f64,
+    drift_ids: [string],
+    status: string       // OK | DRIFT
+}
+
+fn detect_drift(events: [PromoEvent]) -> DriftReport {
+    let n = len(events)
+    let mut backed: i64 = 0
+    let mut drifted: i64 = 0
+    let mut drift_ids: [string] = []
+    let mut i: i64 = 0
+    while i < n {
+        let ev = events[i]
+        let p1 = verify_evidence(ev)
+        if len(p1) == 0 {
+            backed = backed + 1
+        } else {
+            drifted = drifted + 1
+            drift_ids = drift_ids.push(ev.candidate_id)
+        }
+        i = i + 1
+    }
+    let ratio = if n > 0 { to_float(to_string(drifted)) / to_float(to_string(n)) } else { 0.0 }
+    let status = if ratio > TH_MAX_DRIFT_RATIO { "DRIFT" } else { "OK" }
+    return DriftReport{
+        total_promoted: n,
+        still_backed: backed,
+        drifted: drifted,
+        drift_ratio: ratio,
+        drift_ids: drift_ids,
+        status: status
+    }
+}
+
+// ─── logging ───
+fn issues_json(issues: [string]) -> string {
+    let n = len(issues)
+    if n == 0 { return "[]" }
+    let mut out = "["
+    let mut i: i64 = 0
+    while i < n {
+        if i > 0 { out = out + "," }
+        out = out + "\"" + json_escape(_str(issues[i])) + "\""
+        i = i + 1
+    }
+    out = out + "]"
+    return out
+}
+
+fn log_verify_event(r: VerifyResult, ts: string) {
+    let line = "{\"ts\":\"" + ts + "\""
+        + ",\"kind\":\"bt_consistency_verify\""
+        + ",\"candidate_id\":\"" + r.candidate_id + "\""
+        + ",\"domain\":\"" + json_escape(r.domain) + "\""
+        + ",\"name\":\"" + json_escape(r.name) + "\""
+        + ",\"value\":" + to_string(r.value)
+        + ",\"passes_run\":" + to_string(r.passes_run)
+        + ",\"passes_ok\":" + to_string(r.passes_ok)
+        + ",\"status\":\"" + r.status + "\""
+        + ",\"issues\":" + issues_json(r.issues)
+        + "}"
+    append_log(line)
+}
+
+fn log_drift_event(d: DriftReport, ts: string) {
+    let line = "{\"ts\":\"" + ts + "\""
+        + ",\"kind\":\"bt_consistency_drift\""
+        + ",\"total_promoted\":" + to_string(d.total_promoted)
+        + ",\"still_backed\":" + to_string(d.still_backed)
+        + ",\"drifted\":" + to_string(d.drifted)
+        + ",\"drift_ratio\":" + to_string(d.drift_ratio)
+        + ",\"drift_ids\":" + issues_json(d.drift_ids)
+        + ",\"status\":\"" + d.status + "\""
+        + "}"
+    append_log(line)
+}
+
+fn log_cycle_summary(total: i64, consistent: i64, warn: i64, inconsistent: i64, ts: string) {
+    let line = "{\"ts\":\"" + ts + "\""
+        + ",\"kind\":\"bt_consistency_cycle\""
+        + ",\"total\":" + to_string(total)
+        + ",\"consistent\":" + to_string(consistent)
+        + ",\"warn\":" + to_string(warn)
+        + ",\"inconsistent\":" + to_string(inconsistent)
+        + "}"
+    append_log(line)
+}
+
+fn append_log(line: string) {
+    let logdir = SHARED + "/logs"
+    let _ = safe_exec("mkdir -p " + _shq(logdir), 5)
+    if !file_exists(CONSISTENCY_LOG) {
+        try { write_file(CONSISTENCY_LOG, "") } catch e {}
+    }
+    try { append_file(CONSISTENCY_LOG, line + "\n") } catch e {
+        eprintln("FAIL: append_log " + CONSISTENCY_LOG)
+    }
+}
+
+// ─── sentinel (stdout last line, f-hexa-exit-sentinel) ───
+fn emit_sentinel(status: string, reason: string) {
+    println("")
+    println("__HARNESS_CONSISTENCY_RESULT__ " + status + " " + reason)
+}
+
+// ─── commands ───
+
+fn cmd_verify(target_id: string) {
+    if !file_exists(PROMO_LOG) {
+        println("[consensus_bt_gate] promotion log absent — " + PROMO_LOG)
+        emit_sentinel("PASS", "no_promotions_to_verify")
+        return
+    }
+    let all_events = load_promoted_events()
+    let events = dedup_promoted(all_events)
+    let n = len(events)
+    if n == 0 {
+        println("[consensus_bt_gate] no PROMOTE verdicts in promotion log")
+        emit_sentinel("PASS", "no_promotions_to_verify")
+        return
+    }
+    let ts = now_iso()
+    let mut total: i64 = 0
+    let mut cnt_consistent: i64 = 0
+    let mut cnt_warn: i64 = 0
+    let mut cnt_inconsistent: i64 = 0
+    let single_mode = target_id != ""
+    let mut i: i64 = 0
+    while i < n {
+        let ev = events[i]
+        i = i + 1
+        if single_mode && ev.candidate_id != target_id { continue }
+        let r = run_verify(ev)
+        total = total + 1
+        if r.status == "CONSISTENT" { cnt_consistent = cnt_consistent + 1 }
+        else if r.status == "WARN" { cnt_warn = cnt_warn + 1 }
+        else { cnt_inconsistent = cnt_inconsistent + 1 }
+        // stdout per-candidate
+        let issues_str = if len(r.issues) > 0 { issues_json(r.issues) } else { "[]" }
+        println(r.candidate_id + " " + r.status
+            + " passes=" + to_string(r.passes_ok) + "/" + to_string(r.passes_run)
+            + " domain=" + r.domain
+            + " name=" + r.name
+            + " issues=" + issues_str)
+        log_verify_event(r, ts)
+        if single_mode { break }
+    }
+    if single_mode && total == 0 {
+        eprintln("REJECT: candidate_id " + target_id + " not found in promoted events")
+        emit_sentinel("BLOCK", "candidate_not_found")
+        return
+    }
+    log_cycle_summary(total, cnt_consistent, cnt_warn, cnt_inconsistent, ts)
+    println("")
+    println("[consensus_bt_gate] verified=" + to_string(total)
+        + " consistent=" + to_string(cnt_consistent)
+        + " warn=" + to_string(cnt_warn)
+        + " inconsistent=" + to_string(cnt_inconsistent))
+    if cnt_inconsistent > 0 {
+        emit_sentinel("BLOCK", "inconsistent=" + to_string(cnt_inconsistent))
+    } else if cnt_warn > 0 {
+        emit_sentinel("PASS", "warn=" + to_string(cnt_warn))
+    } else {
+        emit_sentinel("PASS", "all_consistent")
+    }
+}
+
+fn cmd_drift() {
+    if !file_exists(PROMO_LOG) {
+        println("[consensus_bt_gate] promotion log absent — no drift to detect")
+        emit_sentinel("PASS", "no_promotions")
+        return
+    }
+    let events = dedup_promoted(load_promoted_events())
+    let n = len(events)
+    if n == 0 {
+        println("[consensus_bt_gate] no PROMOTE verdicts — drift N/A")
+        emit_sentinel("PASS", "no_promotions")
+        return
+    }
+    let ts = now_iso()
+    let d = detect_drift(events)
+    log_drift_event(d, ts)
+    println("[consensus_bt_gate] drift report")
+    println("  total_promoted: " + to_string(d.total_promoted))
+    println("  still_backed:   " + to_string(d.still_backed))
+    println("  drifted:        " + to_string(d.drifted))
+    println("  drift_ratio:    " + to_string(d.drift_ratio))
+    if len(d.drift_ids) > 0 {
+        let mut di: i64 = 0
+        while di < len(d.drift_ids) {
+            println("    drift: " + _str(d.drift_ids[di]))
+            di = di + 1
+        }
+    }
+    println("  status:         " + d.status)
+    if d.status == "DRIFT" {
+        emit_sentinel("BLOCK", "drift_ratio=" + to_string(d.drift_ratio))
+    } else {
+        emit_sentinel("PASS", "drift_ratio=" + to_string(d.drift_ratio))
+    }
+}
+
+fn cmd_status(n_last: i64) {
+    if !file_exists(CONSISTENCY_LOG) {
+        println("[consensus_bt_gate] consistency log absent — " + CONSISTENCY_LOG)
+        return
+    }
+    let out = _str(exec("tail -n " + to_string(n_last) + " " + _shq(CONSISTENCY_LOG) + " 2>&1"))  // @allow-bare-exec
+    print(out)
+    if !out.ends_with("\n") { println("") }
+}
+
+// ─── selftest ───
+fn selftest() -> i64 {
+    println("[consensus_bt_gate selftest]")
+    // test seed_quality
+    let sq6 = seed_quality(6.0)
+    if sq6 < 0.99 {
+        eprintln("FAIL: seed_quality(6.0) = " + to_string(sq6) + " expected ~1.0")
+        return 1
+    }
+    println("  seed_quality(6.0) = " + to_string(sq6) + " OK")
+    let sq100 = seed_quality(100.0)
+    if sq100 > 0.9 {
+        eprintln("FAIL: seed_quality(100.0) should be low, got " + to_string(sq100))
+        return 1
+    }
+    println("  seed_quality(100.0) = " + to_string(sq100) + " OK (low)")
+    // test tier_of
+    if tier_of(0.96) != "EXACT" { eprintln("FAIL: tier_of(0.96)"); return 1 }
+    if tier_of(0.85) != "STRONG" { eprintln("FAIL: tier_of(0.85)"); return 1 }
+    if tier_of(0.65) != "WEAK" { eprintln("FAIL: tier_of(0.65)"); return 1 }
+    if tier_of(0.3) != "NONE" { eprintln("FAIL: tier_of(0.3)"); return 1 }
+    println("  tier_of: all 4 tiers OK")
+    // test tier_ok
+    if !tier_ok("EXACT", "STRONG") { eprintln("FAIL: tier_ok EXACT>=STRONG"); return 1 }
+    if tier_ok("WEAK", "STRONG") { eprintln("FAIL: tier_ok WEAK<STRONG"); return 1 }
+    println("  tier_ok: pass")
+    // test list_contains
+    let xs = ["a", "b", "c"]
+    if !list_contains(xs, "b") { eprintln("FAIL: list_contains b"); return 1 }
+    if list_contains(xs, "d") { eprintln("FAIL: list_contains d"); return 1 }
+    println("  list_contains: pass")
+    // test json_str / json_num
+    let sample = "{\"domain\":\"math\",\"score\":0.85,\"name\":\"test\"}"
+    if json_str(sample, "domain") != "math" { eprintln("FAIL: json_str domain"); return 1 }
+    if json_str(sample, "name") != "test" { eprintln("FAIL: json_str name"); return 1 }
+    let sc = json_num(sample, "score")
+    if abs_f(sc - 0.85) > 0.001 { eprintln("FAIL: json_num score=" + to_string(sc)); return 1 }
+    println("  json_str/json_num: pass")
+    // test verify_score with a mock event
+    let mock_ev = PromoEvent{
+        candidate_id: "test123",
+        domain: "math",
+        name: "test_const",
+        value: 6.0,
+        score: 1.0,
+        cross_confirms: 5,
+        distinct_seeds: 5,
+        tier: "EXACT",
+        verdict: "PROMOTE",
+        ts: "2026-01-01T00:00:00Z"
+    }
+    let p2 = verify_score(mock_ev)
+    if len(p2) > 0 {
+        eprintln("FAIL: verify_score on value=6.0 score=1.0 EXACT should pass, got issues:")
+        let mut ei: i64 = 0
+        while ei < len(p2) { eprintln("  " + _str(p2[ei])); ei = ei + 1 }
+        return 1
+    }
+    println("  verify_score(6.0, EXACT, 1.0): pass")
+    // test verify_score mismatch detection
+    let bad_ev = PromoEvent{
+        candidate_id: "test456",
+        domain: "math",
+        name: "bad_const",
+        value: 6.0,
+        score: 0.5,
+        cross_confirms: 5,
+        distinct_seeds: 5,
+        tier: "WEAK",
+        verdict: "PROMOTE",
+        ts: "2026-01-01T00:00:00Z"
+    }
+    let p2b = verify_score(bad_ev)
+    if len(p2b) == 0 {
+        eprintln("FAIL: verify_score should detect mismatch for value=6.0 score=0.5")
+        return 1
+    }
+    println("  verify_score mismatch detection: pass (found " + to_string(len(p2b)) + " issues)")
+    println("[consensus_bt_gate selftest] ALL PASS")
+    return 0
+}
+
+// ─── CLI ───
+fn print_usage() {
+    println("consensus_bt_gate — CONSN-P8-1 BT promotion consistency verification")
+    println("")
+    println("  verify                          full consistency cycle (all promoted)")
+    println("  verify --id <candidate_id>      single candidate consistency check")
+    println("  drift                           detect promotion <-> source drift")
+    println("  status [N=20]                   recent N consistency events")
+    println("  --selftest                      smoke test")
+    println("")
+    println("input:  " + PROMO_LOG)
+    println("output: " + CONSISTENCY_LOG)
+    println("")
+    println("sentinel (stdout last line):")
+    println("  __HARNESS_CONSISTENCY_RESULT__ PASS|BLOCK <reason>")
+}
+
+fn main() {
+    let argv = args()
+    let mut a: [string] = []
+    let mut ai: i64 = 2
+    while ai < len(argv) {
+        a = a.push(_str(argv[ai]))
+        ai = ai + 1
+    }
+    let argc = len(a)
+    if argc == 0 {
+        print_usage()
+        exit(0)
+    }
+    let mode = _str(a[0])
+    if mode == "--help" || mode == "-h" || mode == "help" {
+        print_usage()
+        exit(0)
+    }
+    if mode == "--selftest" || mode == "selftest" {
+        let rc = selftest()
+        if rc == 0 { emit_sentinel("PASS", "selftest") }
+        else { emit_sentinel("BLOCK", "selftest_fail") }
+        exit(rc)
+    }
+    if mode == "verify" {
+        let mut target_id = ""
+        let mut i: i64 = 1
+        while i < argc {
+            let t = _str(a[i])
+            if t == "--id" && i + 1 < argc {
+                target_id = _str(a[i + 1])
+                i = i + 2
+                continue
+            }
+            i = i + 1
+        }
+        cmd_verify(target_id)
+        exit(0)
+    }
+    if mode == "drift" {
+        cmd_drift()
+        exit(0)
+    }
+    if mode == "status" {
+        let mut n_last: i64 = 20
+        if argc >= 2 {
+            let s = _str(a[1]).trim()
+            if s != "" {
+                try { n_last = to_int(s) } catch e { n_last = 20 }
+            }
+        }
+        cmd_status(n_last)
+        exit(0)
+    }
+    eprintln("REJECT: unknown mode '" + mode + "' — modes: verify|drift|status|--selftest")
+    print_usage()
+    emit_sentinel("BLOCK", "unknown_mode=" + mode)
+    exit(2)
+}
+
+main()

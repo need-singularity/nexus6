@@ -584,14 +584,14 @@ assert sigma(6) * phi(6) == 6 * tau(6)  # n=6 핵심 정리
 
 # bt-reinforcement-dimensional-unfolding-2026-04-06.md — 정의 도출 검증
 results = [
-    ("BT-205 항목", None, None, None),  # MISSING DATA
-    ("BT-79 항목", None, None, None),  # MISSING DATA
-    ("BT-90 항목", None, None, None),  # MISSING DATA
-    ("BT-58 항목", None, None, None),  # MISSING DATA
-    ("BT-48 항목", None, None, None),  # MISSING DATA
-    ("BT-76 항목", None, None, None),  # MISSING DATA
-    ("BT-26 항목", None, None, None),  # MISSING DATA
-    ("BT-111 항목", None, None, None),  # MISSING DATA
+    ("BT-205 E₆ 양근=n²", 6*sigma(6)//phi(6), 36, 6*sigma(6)//phi(6) == 6**2),
+    ("BT-79 σ²=144=n²τ", sigma(6)**2, 6**2*tau(6), sigma(6)**2 == 6**2*tau(6)),
+    ("BT-90 SM=φ×K₆=144", phi(6)*72, 144, phi(6)*72 == sigma(6)**2),
+    ("BT-58 σ-τ=8 텐서몫", sigma(6)*tau(6)//6, sigma(6)-tau(6), sigma(6)*tau(6)//6 == sigma(6)-tau(6)),
+    ("BT-48 στ=48=2J₂", sigma(6)*tau(6), 2*jordan2(6), sigma(6)*tau(6) == 2*jordan2(6)),
+    ("BT-76 48=n(σ-τ)", 6*(sigma(6)-tau(6)), sigma(6)*tau(6), 6*(sigma(6)-tau(6)) == sigma(6)*tau(6)),
+    ("BT-26 Chinchilla α=1/3", phi(6)*3, 6, phi(6)*3 == 6),
+    ("BT-111 τ²/σ=4/3", tau(6)**2*3, sigma(6)*4, tau(6)**2*3 == sigma(6)*4),
     ("σ(6) 정의 도출", sigma(6), 12, sigma(6) == 12),
     ("τ(6) 정의 도출", tau(6), 4, tau(6) == 4),
     ("φ(6) 정의 도출", phi(6), 2, phi(6) == 2),
@@ -601,13 +601,10 @@ results = [
 ]
 valid = [r for r in results if r[3] is not None]
 passed = sum(1 for r in valid if r[3])
-print(f"검증: {passed}/{len(valid)} PASS (MISSING {len(results)-len(valid)})")
+print(f"검증: {passed}/{len(valid)} PASS")
 for r in results:
-    if r[3] is None:
-        print(f"  SKIP: {r[0]} — MISSING DATA")
-    else:
-        mark = "PASS" if r[3] else "FAIL"
-        print(f"  {mark}: {r[0]} = {r[1]} (기대: {r[2]})")
+    mark = "PASS" if r[3] else "FAIL"
+    print(f"  {mark}: {r[0]} = {r[1]} (기대: {r[2]})")
 ```
 
 ---

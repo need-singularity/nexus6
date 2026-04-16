@@ -1,0 +1,693 @@
+// bt_atlas_pipe.hexa — REM-P9-1: BT compute results -> atlas auto-promotion pipe
+// @no-lock-needed  @allow-bare-exec  @enforce-sandbox
+// Pipeline: bt_promotion.jsonl -> consensus_bt_gate verify -> atlas.n6 auto-append
+//
+// SSOT inputs (read-only):
+//   shared/logs/bt_promotion.jsonl        — promotion gate events (CONSN-P7-1)
+//   shared/logs/bt_consistency.jsonl      — consensus gate verify results (CONSN-P8-1)
+//   shared/bt/bt_audit_result.json        — existing BT EXACT audit
+//
+// SSOT outputs (append-only):
+//   shared/harness/bt_atlas_promotions.jsonl — promotion/staging log
+//   shared/n6/atlas.n6                       — auto-append via _guarded_append_atlas()
+//
+// CLI:
+//   promote [--dry-run]       EXACT hits -> atlas.n6 auto-promote (consensus gate required)
+//   stage [--dry-run]         NEAR hits -> staging log (manual review pending)
+//   status [N=20]             recent N promotion/staging events
+//   --selftest                smoke test
+//
+// sentinel (stdout last line):
+//   __HARNESS_ATLAS_PIPE__ PASS|BLOCK <reason>
+
+// ─── atlas_guard.hexa.inc (copy-paste, infra-only) ───
+fn _valid_atlas_line(line: string) -> bool {
+    let t = line.trim()
+    if len(t) == 0 { return true }
+    let allowed = "#{@\"<>!-"
+    return allowed.contains(t[0..1])
+}
+
+fn _guarded_append_atlas(path: string, content: string) -> i64 {
+    if len(content) == 0 { return 0 }
+    let is_atlas = path.contains("atlas.n6")
+    let lines = content.split("\n")
+    let mut rejected: i64 = 0
+    let mut deduped: i64 = 0
+    let mut valid_lines = []
+    let mut valid_trimmed = []
+    let mut needs_dedup = []
+    let mut i: i64 = 0
+    while i < len(lines) {
+        let line = lines[i]
+        if !_valid_atlas_line(line) {
+            rejected = rejected + 1
+            i = i + 1
+            continue
+        }
+        let t = line.trim()
+        let do_dedup = is_atlas && len(t) > 0 && !t.starts_with("#")
+        valid_lines = valid_lines.push(line)
+        valid_trimmed = valid_trimmed.push(t)
+        needs_dedup = needs_dedup.push(do_dedup)
+        i = i + 1
+    }
+    let mut dup_set = #{}
+    let dedup_count: i64 = len(valid_lines)
+    let mut has_any_dedup = false
+    i = 0
+    while i < dedup_count {
+        if needs_dedup[i] { has_any_dedup = true }
+        i = i + 1
+    }
+    if has_any_dedup {
+        let _tmp = "/tmp/.atlas_pipe_dedup." + to_string(exec("echo $$").trim())
+        let mut patterns = []
+        i = 0
+        while i < dedup_count {
+            if needs_dedup[i] { patterns = patterns.push(valid_trimmed[i]) }
+            i = i + 1
+        }
+        try {
+            write_file(_tmp, "\n".join(patterns))
+            let found_raw = exec("grep -Fxf '" + _tmp + "' '" + path + "' 2>/dev/null || true")
+            let found_lines = found_raw.split("\n")
+            for fl in found_lines {
+                let ft = fl.trim()
+                if len(ft) > 0 { dup_set[ft] = true }
+            }
+        } catch e {}
+        try { exec("rm -f '" + _tmp + "' 2>/dev/null") } catch e {}
+    }
+    let mut clean_parts = []
+    i = 0
+    while i < dedup_count {
+        if needs_dedup[i] {
+            let t = valid_trimmed[i]
+            let mut is_dup = false
+            try { is_dup = dup_set[t] == true } catch e {}
+            if is_dup { deduped = deduped + 1; i = i + 1; continue }
+        }
+        clean_parts = clean_parts.push(valid_lines[i])
+        i = i + 1
+    }
+    if rejected > 0 { println("  [schema guard] rejected " + to_string(rejected) + " invalid lines -> " + path) }
+    if deduped > 0 { println("  [dedup guard] skipped " + to_string(deduped) + " duplicate lines -> " + path) }
+    if len(clean_parts) > 0 {
+        let mut clean = "\n".join(clean_parts)
+        if !clean.ends_with("\n") { clean = clean + "\n" }
+        try { append_file(path, clean) } catch e {}
+    }
+    return rejected
+}
+
+// ─── helpers ───
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _shq(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _to_int0(s: string) -> i64 {
+    if s == "" { return 0 }
+    let first = _str(s.split("\n")[0]).trim()
+    if first == "" { return 0 }
+    let mut v: i64 = 0
+    try { v = to_int(first) } catch e {}
+    return v
+}
+
+fn now_iso() -> string {
+    let mut ts = ""
+    try { ts = _str(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim() } catch e {} // @allow-bare-exec
+    return ts
+}
+
+fn json_escape(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", " ").replace("\r", " ").replace("\t", " ")
+}
+
+fn json_str(line: string, field: string) -> string {
+    let m1 = "\"" + field + "\":\""
+    let m2 = "\"" + field + "\": \""
+    let mut parts = line.split(m1)
+    if parts.len() < 2 { parts = line.split(m2) }
+    if parts.len() < 2 { return "" }
+    let end = _str(parts[1]).split("\"")
+    if end.len() < 1 { return "" }
+    return _str(end[0])
+}
+
+fn json_num(line: string, field: string) -> f64 {
+    let marker = "\"" + field + "\":"
+    let parts = line.split(marker)
+    if parts.len() < 2 { return 0.0 }
+    let rest = _str(parts[1])
+    let mut buf = ""
+    let n = len(rest)
+    let mut i: i64 = 0
+    while i < n {
+        let ch = rest.substring(i, i + 1)
+        if ch == " " { i = i + 1; continue }
+        if ch == "," || ch == "}" || ch == "\n" { break }
+        buf = buf + ch
+        i = i + 1
+    }
+    buf = buf.trim()
+    if buf == "" { return 0.0 }
+    let mut v = 0.0
+    try { v = to_float(buf) } catch e {}
+    return v
+}
+
+fn json_int(line: string, field: string) -> i64 {
+    let v = json_num(line, field)
+    let s = to_string(v)
+    let dot = s.index_of(".")
+    let body = if dot >= 0 { s.substring(0, dot) } else { s }
+    if body == "" || body == "-" { return 0 }
+    let mut r: i64 = 0
+    try { r = to_int(body) } catch e {}
+    return r
+}
+
+// ─── paths ───
+let HOME = env("HOME")
+let NEXUS_ENV = env("NEXUS")
+let NEXUS = if NEXUS_ENV != "" { NEXUS_ENV } else { HOME + "/Dev/nexus" } // @allow-devpath
+let SHARED = NEXUS + "/shared"
+let HARNESS = SHARED + "/harness"
+let ATLAS_PATH = SHARED + "/n6/atlas.n6"
+let PROMO_LOG = SHARED + "/logs/bt_promotion.jsonl"
+let CONSISTENCY_LOG = SHARED + "/logs/bt_consistency.jsonl"
+let BT_AUDIT = SHARED + "/bt/bt_audit_result.json"
+let PIPE_LOG = HARNESS + "/bt_atlas_promotions.jsonl"
+
+// ─── thresholds (mirror consensus_bt_gate / bt_promotion_gate_spec) ───
+let TH_MIN_SCORE = 0.70
+let TH_EXACT_SCORE = 0.95
+let TH_STRONG_SCORE = 0.80
+let TH_NEAR_SCORE = 0.60
+let TH_MIN_CROSS: i64 = 3
+
+// ─── tier classification ───
+fn tier_of(score: f64) -> string {
+    if score >= TH_EXACT_SCORE { return "EXACT" }
+    if score >= TH_STRONG_SCORE { return "STRONG" }
+    if score >= TH_NEAR_SCORE { return "WEAK" }
+    return "NONE"
+}
+
+// ─── promotion candidate struct ───
+struct BtCandidate {
+    candidate_id: string,
+    domain: string,
+    name: string,
+    value: f64,
+    score: f64,
+    cross_confirms: i64,
+    tier: string,
+    verdict: string,
+    ts: string
+}
+
+// ─── load promoted events from bt_promotion.jsonl (PROMOTE verdict only) ───
+fn load_promote_events() -> [BtCandidate] {
+    let mut out: [BtCandidate] = []
+    if !file_exists(PROMO_LOG) { return out }
+    let raw = _str(exec("grep '\"PROMOTE\"' " + _shq(PROMO_LOG) + " 2>/dev/null || true")).trim() // @allow-bare-exec
+    if raw == "" { return out }
+    let lines = raw.split("\n")
+    let mut i: i64 = 0
+    while i < len(lines) {
+        let line = _str(lines[i]).trim()
+        i = i + 1
+        if line == "" { continue }
+        let kind = json_str(line, "kind")
+        if kind != "bt_promotion_event" { continue }
+        let verdict = json_str(line, "verdict")
+        if verdict != "PROMOTE" { continue }
+        let ev = BtCandidate{
+            candidate_id: json_str(line, "candidate_id"),
+            domain: json_str(line, "domain"),
+            name: json_str(line, "name"),
+            value: json_num(line, "value"),
+            score: json_num(line, "score"),
+            cross_confirms: json_int(line, "cross_confirms"),
+            tier: json_str(line, "tier"),
+            verdict: verdict,
+            ts: json_str(line, "ts")
+        }
+        if ev.candidate_id != "" { out = out.push(ev) }
+    }
+    return out
+}
+
+// ─── load ALL promotion events (for staging: EXACT/STRONG tier, DENY but tier ok) ───
+fn load_all_events() -> [BtCandidate] {
+    let mut out: [BtCandidate] = []
+    if !file_exists(PROMO_LOG) { return out }
+    let raw = _str(read_file(PROMO_LOG))
+    let lines = raw.split("\n")
+    let mut i: i64 = 0
+    while i < len(lines) {
+        let line = _str(lines[i]).trim()
+        i = i + 1
+        if line == "" { continue }
+        let kind = json_str(line, "kind")
+        if kind != "bt_promotion_event" { continue }
+        let ev = BtCandidate{
+            candidate_id: json_str(line, "candidate_id"),
+            domain: json_str(line, "domain"),
+            name: json_str(line, "name"),
+            value: json_num(line, "value"),
+            score: json_num(line, "score"),
+            cross_confirms: json_int(line, "cross_confirms"),
+            tier: json_str(line, "tier"),
+            verdict: json_str(line, "verdict"),
+            ts: json_str(line, "ts")
+        }
+        if ev.candidate_id != "" { out = out.push(ev) }
+    }
+    return out
+}
+
+// ─── dedup by candidate_id (keep latest) ───
+fn dedup_by_id(events: [BtCandidate]) -> [BtCandidate] {
+    let mut seen: [string] = []
+    let mut out: [BtCandidate] = []
+    let n = len(events)
+    let mut i = n - 1
+    while i >= 0 {
+        let ev = events[i]
+        let mut found = false
+        let mut j: i64 = 0
+        while j < len(seen) {
+            if _str(seen[j]) == ev.candidate_id { found = true; break }
+            j = j + 1
+        }
+        if !found {
+            seen = seen.push(ev.candidate_id)
+            out = out.push(ev)
+        }
+        i = i - 1
+    }
+    return out
+}
+
+// ─── check consensus gate status for a candidate ───
+fn check_consensus(candidate_id: string) -> string {
+    // returns: "CONSISTENT" / "WARN" / "INCONSISTENT" / "UNKNOWN"
+    if !file_exists(CONSISTENCY_LOG) { return "UNKNOWN" }
+    // tail search: latest entry for this candidate
+    let raw = _str(exec("grep '\"" + json_escape(candidate_id) + "\"' " + _shq(CONSISTENCY_LOG) + " 2>/dev/null | tail -1")).trim() // @allow-bare-exec
+    if raw == "" { return "UNKNOWN" }
+    let status = json_str(raw, "status")
+    if status == "CONSISTENT" || status == "WARN" || status == "INCONSISTENT" { return status }
+    return "UNKNOWN"
+}
+
+// ─── check if already promoted in pipe log ───
+fn already_promoted(candidate_id: string) -> bool {
+    if !file_exists(PIPE_LOG) { return false }
+    let raw = _str(exec("grep '\"" + json_escape(candidate_id) + "\"' " + _shq(PIPE_LOG) + " 2>/dev/null | grep '\"promoted\"' | tail -1")).trim() // @allow-bare-exec
+    return raw != ""
+}
+
+// ─── already staged in pipe log ───
+fn already_staged(candidate_id: string) -> bool {
+    if !file_exists(PIPE_LOG) { return false }
+    let raw = _str(exec("grep '\"" + json_escape(candidate_id) + "\"' " + _shq(PIPE_LOG) + " 2>/dev/null | grep '\"staged\"' | tail -1")).trim() // @allow-bare-exec
+    return raw != ""
+}
+
+// ─── build atlas.n6 line from BT candidate ───
+fn build_atlas_line(ev: BtCandidate) -> string {
+    // JSON format matching existing atlas.n6 entries
+    let line = "{\"constant\":\"bt-" + json_escape(ev.domain) + "-" + json_escape(ev.name)
+        + "\",\"value\":\"" + to_string(ev.value)
+        + "\",\"source\":\"bt-promotion-pipe\",\"timestamp\":\""
+        + now_iso() + "\",\"grade\":\"" + ev.tier
+        + "\",\"processed\":true,\"bt\":{\"candidate_id\":\""
+        + json_escape(ev.candidate_id) + "\",\"domain\":\""
+        + json_escape(ev.domain) + "\",\"cross_confirms\":"
+        + to_string(ev.cross_confirms) + ",\"score\":"
+        + to_string(ev.score) + "},\"phase\":\"REM-P9-1-auto\"}"
+    return line
+}
+
+// ─── append pipe log entry ───
+fn log_pipe_event(candidate_id: string, domain: string, name: string, value: f64,
+                  score: f64, tier: string, action: string, reason: string) {
+    let ts = now_iso()
+    let line = "{\"ts\":\"" + ts
+        + "\",\"kind\":\"bt_atlas_pipe\",\"candidate_id\":\"" + json_escape(candidate_id)
+        + "\",\"domain\":\"" + json_escape(domain)
+        + "\",\"name\":\"" + json_escape(name)
+        + "\",\"value\":" + to_string(value)
+        + ",\"score\":" + to_string(score)
+        + ",\"tier\":\"" + tier
+        + "\",\"action\":\"" + json_escape(action)
+        + "\",\"reason\":\"" + json_escape(reason) + "\"}"
+    try { append_file(PIPE_LOG, line + "\n") } catch e {
+        eprintln("FAIL: append " + PIPE_LOG)
+    }
+}
+
+// ─── sentinel ───
+fn emit_sentinel(status: string, reason: string) {
+    println("")
+    println("__HARNESS_ATLAS_PIPE__ " + status + " " + reason)
+}
+
+// ═══════════════════════════════════════════════════════════
+// CMD: promote — EXACT hits -> atlas.n6 auto-append
+// ═══════════════════════════════════════════════════════════
+fn cmd_promote(dry_run: bool) {
+    println("[bt_atlas_pipe] promote" + (if dry_run { " (dry-run)" } else { "" }))
+
+    // Step 1: load promoted candidates from bt_promotion.jsonl
+    let all_promoted = load_promote_events()
+    let events = dedup_by_id(all_promoted)
+    let n = len(events)
+    if n == 0 {
+        println("  no PROMOTE verdicts in " + PROMO_LOG)
+        // also check for EXACT tier among all events (they may be DENY but tier=EXACT)
+        let all_ev = load_all_events()
+        let deduped = dedup_by_id(all_ev)
+        let mut exact_deny: i64 = 0
+        let mut i: i64 = 0
+        while i < len(deduped) {
+            let ev = deduped[i]
+            if ev.tier == "EXACT" && ev.verdict == "DENY" { exact_deny = exact_deny + 1 }
+            i = i + 1
+        }
+        if exact_deny > 0 {
+            println("  note: " + to_string(exact_deny) + " EXACT-tier candidates with DENY verdict (cross/domain checks failed)")
+        }
+        emit_sentinel("PASS", "no_promotable_candidates")
+        return
+    }
+
+    // Step 2: filter EXACT tier + consensus gate + novelty
+    let mut promoted: i64 = 0
+    let mut skipped: i64 = 0
+    let mut i: i64 = 0
+    while i < n {
+        let ev = events[i]
+        i = i + 1
+
+        // only EXACT tier auto-promotes
+        if ev.tier != "EXACT" {
+            println("  SKIP " + ev.candidate_id + " tier=" + ev.tier + " (need EXACT)")
+            skipped = skipped + 1
+            continue
+        }
+
+        // already promoted?
+        if already_promoted(ev.candidate_id) {
+            println("  SKIP " + ev.candidate_id + " already promoted")
+            skipped = skipped + 1
+            continue
+        }
+
+        // consensus gate check
+        let consensus = check_consensus(ev.candidate_id)
+        if consensus == "INCONSISTENT" {
+            println("  BLOCK " + ev.candidate_id + " consensus=INCONSISTENT")
+            if !dry_run {
+                log_pipe_event(ev.candidate_id, ev.domain, ev.name, ev.value,
+                    ev.score, ev.tier, "blocked", "consensus_inconsistent")
+            }
+            skipped = skipped + 1
+            continue
+        }
+
+        // build atlas line + append
+        let atlas_line = build_atlas_line(ev)
+        println("  PROMOTE " + ev.candidate_id + " " + ev.domain + "/" + ev.name
+            + " val=" + to_string(ev.value) + " score=" + to_string(ev.score)
+            + " consensus=" + consensus)
+
+        if !dry_run {
+            let rej = _guarded_append_atlas(ATLAS_PATH, atlas_line)
+            if rej > 0 {
+                println("    WARN: schema guard rejected " + to_string(rej) + " lines")
+                log_pipe_event(ev.candidate_id, ev.domain, ev.name, ev.value,
+                    ev.score, ev.tier, "rejected", "schema_guard")
+                skipped = skipped + 1
+                continue
+            }
+            log_pipe_event(ev.candidate_id, ev.domain, ev.name, ev.value,
+                ev.score, ev.tier, "promoted", "auto_exact_consensus=" + consensus)
+        }
+        promoted = promoted + 1
+    }
+
+    println("")
+    println("[bt_atlas_pipe] promoted=" + to_string(promoted) + " skipped=" + to_string(skipped))
+    if promoted > 0 {
+        emit_sentinel("PASS", "promoted=" + to_string(promoted))
+    } else {
+        emit_sentinel("PASS", "no_new_promotions")
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// CMD: stage — NEAR (STRONG/WEAK) hits -> staging log
+// ═══════════════════════════════════════════════════════════
+fn cmd_stage(dry_run: bool) {
+    println("[bt_atlas_pipe] stage" + (if dry_run { " (dry-run)" } else { "" }))
+
+    let all_ev = load_all_events()
+    let events = dedup_by_id(all_ev)
+    let n = len(events)
+    if n == 0 {
+        println("  no events in " + PROMO_LOG)
+        emit_sentinel("PASS", "no_candidates")
+        return
+    }
+
+    let mut staged: i64 = 0
+    let mut skipped: i64 = 0
+    let mut i: i64 = 0
+    while i < n {
+        let ev = events[i]
+        i = i + 1
+
+        // NEAR = STRONG or WEAK tier (not EXACT, not NONE)
+        let is_near = ev.tier == "STRONG" || ev.tier == "WEAK"
+        if !is_near { continue }
+
+        // score must meet minimum
+        if ev.score < TH_MIN_SCORE {
+            skipped = skipped + 1
+            continue
+        }
+
+        // already staged or promoted?
+        if already_staged(ev.candidate_id) || already_promoted(ev.candidate_id) {
+            skipped = skipped + 1
+            continue
+        }
+
+        println("  STAGE " + ev.candidate_id + " " + ev.domain + "/" + ev.name
+            + " val=" + to_string(ev.value) + " tier=" + ev.tier
+            + " score=" + to_string(ev.score) + " verdict=" + ev.verdict)
+
+        if !dry_run {
+            log_pipe_event(ev.candidate_id, ev.domain, ev.name, ev.value,
+                ev.score, ev.tier, "staged", "near_manual_review")
+        }
+        staged = staged + 1
+    }
+
+    println("")
+    println("[bt_atlas_pipe] staged=" + to_string(staged) + " skipped=" + to_string(skipped))
+    if staged > 0 {
+        emit_sentinel("PASS", "staged=" + to_string(staged))
+    } else {
+        emit_sentinel("PASS", "no_new_staging")
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// CMD: status — recent promotion/staging events
+// ═══════════════════════════════════════════════════════════
+fn cmd_status(n_last: i64) {
+    println("[bt_atlas_pipe] status (last " + to_string(n_last) + ")")
+
+    if !file_exists(PIPE_LOG) {
+        println("  pipe log absent — " + PIPE_LOG)
+        println("  promotion source: " + PROMO_LOG)
+        // summarize source events
+        if file_exists(PROMO_LOG) {
+            let total = _to_int0(_str(exec("wc -l < " + _shq(PROMO_LOG) + " 2>/dev/null")).trim()) // @allow-bare-exec
+            let promote_cnt = _to_int0(_str(exec("grep -c '\"PROMOTE\"' " + _shq(PROMO_LOG) + " 2>/dev/null || echo 0")).trim()) // @allow-bare-exec
+            let deny_cnt = _to_int0(_str(exec("grep -c '\"DENY\"' " + _shq(PROMO_LOG) + " 2>/dev/null || echo 0")).trim()) // @allow-bare-exec
+            let exact_cnt = _to_int0(_str(exec("grep -c '\"EXACT\"' " + _shq(PROMO_LOG) + " 2>/dev/null || echo 0")).trim()) // @allow-bare-exec
+            println("  source: total=" + to_string(total) + " promote=" + to_string(promote_cnt)
+                + " deny=" + to_string(deny_cnt) + " exact_tier=" + to_string(exact_cnt))
+        }
+        // check consistency gate
+        if file_exists(CONSISTENCY_LOG) {
+            let con_cnt = _to_int0(_str(exec("wc -l < " + _shq(CONSISTENCY_LOG) + " 2>/dev/null")).trim()) // @allow-bare-exec
+            println("  consistency_log: " + to_string(con_cnt) + " entries")
+        }
+        emit_sentinel("PASS", "pipe_log_empty")
+        return
+    }
+
+    // show recent pipe log entries
+    let out = _str(exec("tail -n " + to_string(n_last) + " " + _shq(PIPE_LOG) + " 2>&1")) // @allow-bare-exec
+    print(out)
+    if !out.ends_with("\n") { println("") }
+
+    // summary counts
+    let total = _to_int0(_str(exec("wc -l < " + _shq(PIPE_LOG) + " 2>/dev/null")).trim()) // @allow-bare-exec
+    let promoted_cnt = _to_int0(_str(exec("grep -c '\"promoted\"' " + _shq(PIPE_LOG) + " 2>/dev/null || echo 0")).trim()) // @allow-bare-exec
+    let staged_cnt = _to_int0(_str(exec("grep -c '\"staged\"' " + _shq(PIPE_LOG) + " 2>/dev/null || echo 0")).trim()) // @allow-bare-exec
+    let blocked_cnt = _to_int0(_str(exec("grep -c '\"blocked\"' " + _shq(PIPE_LOG) + " 2>/dev/null || echo 0")).trim()) // @allow-bare-exec
+    let rejected_cnt = _to_int0(_str(exec("grep -c '\"rejected\"' " + _shq(PIPE_LOG) + " 2>/dev/null || echo 0")).trim()) // @allow-bare-exec
+    println("")
+    println("[bt_atlas_pipe] total=" + to_string(total) + " promoted=" + to_string(promoted_cnt)
+        + " staged=" + to_string(staged_cnt) + " blocked=" + to_string(blocked_cnt)
+        + " rejected=" + to_string(rejected_cnt))
+}
+
+// ═══════════════════════════════════════════════════════════
+// selftest
+// ═══════════════════════════════════════════════════════════
+fn selftest() -> i64 {
+    println("[bt_atlas_pipe selftest]")
+
+    // test tier_of
+    if tier_of(0.96) != "EXACT" { eprintln("FAIL: tier_of(0.96)"); return 1 }
+    if tier_of(0.85) != "STRONG" { eprintln("FAIL: tier_of(0.85)"); return 1 }
+    if tier_of(0.65) != "WEAK" { eprintln("FAIL: tier_of(0.65)"); return 1 }
+    if tier_of(0.3) != "NONE" { eprintln("FAIL: tier_of(0.3)"); return 1 }
+    println("  tier_of: all 4 tiers OK")
+
+    // test json_str
+    let sample = "{\"domain\":\"math\",\"name\":\"test\",\"score\":0.95,\"tier\":\"EXACT\"}"
+    if json_str(sample, "domain") != "math" { eprintln("FAIL: json_str domain"); return 1 }
+    if json_str(sample, "tier") != "EXACT" { eprintln("FAIL: json_str tier"); return 1 }
+    println("  json_str: pass")
+
+    // test json_num
+    let sc = json_num(sample, "score")
+    if sc < 0.94 || sc > 0.96 { eprintln("FAIL: json_num score=" + to_string(sc)); return 1 }
+    println("  json_num: pass (score=" + to_string(sc) + ")")
+
+    // test build_atlas_line format
+    let mock = BtCandidate{
+        candidate_id: "test123", domain: "math", name: "pi_approx",
+        value: 6.0, score: 1.0, cross_confirms: 5, tier: "EXACT",
+        verdict: "PROMOTE", ts: "2026-01-01T00:00:00Z"
+    }
+    let atlas_line = build_atlas_line(mock)
+    if !atlas_line.contains("\"constant\":\"bt-math-pi_approx\"") {
+        eprintln("FAIL: build_atlas_line constant"); return 1
+    }
+    if !atlas_line.contains("\"grade\":\"EXACT\"") {
+        eprintln("FAIL: build_atlas_line grade"); return 1
+    }
+    if !atlas_line.contains("\"phase\":\"REM-P9-1-auto\"") {
+        eprintln("FAIL: build_atlas_line phase"); return 1
+    }
+    println("  build_atlas_line: pass")
+
+    // test _valid_atlas_line
+    if !_valid_atlas_line("{\"constant\":\"test\"}") { eprintln("FAIL: valid_atlas_line json"); return 1 }
+    if !_valid_atlas_line("# comment") { eprintln("FAIL: valid_atlas_line comment"); return 1 }
+    if !_valid_atlas_line("") { eprintln("FAIL: valid_atlas_line empty"); return 1 }
+    if _valid_atlas_line("INVALID_LINE_NO_PREFIX") { eprintln("FAIL: valid_atlas_line invalid"); return 1 }
+    println("  _valid_atlas_line: pass")
+
+    println("[bt_atlas_pipe selftest] ALL PASS")
+    return 0
+}
+
+// ═══════════════════════════════════════════════════════════
+// CLI
+// ═══════════════════════════════════════════════════════════
+fn print_usage() {
+    println("bt_atlas_pipe — REM-P9-1: BT compute results -> atlas auto-promotion")
+    println("")
+    println("  promote [--dry-run]     EXACT hits -> atlas.n6 auto-append (consensus gate required)")
+    println("  stage [--dry-run]       NEAR (STRONG/WEAK) -> staging log (manual review)")
+    println("  status [N=20]           recent N pipe events")
+    println("  --selftest              smoke test")
+    println("")
+    println("input:  " + PROMO_LOG)
+    println("output: " + PIPE_LOG)
+    println("atlas:  " + ATLAS_PATH)
+    println("")
+    println("sentinel: __HARNESS_ATLAS_PIPE__ PASS|BLOCK <reason>")
+}
+
+fn main() {
+    let argv = args()
+    let mut a: [string] = []
+    let mut ai: i64 = 2
+    while ai < len(argv) {
+        a = a.push(_str(argv[ai]))
+        ai = ai + 1
+    }
+    let argc = len(a)
+    if argc == 0 {
+        print_usage()
+        exit(0)
+    }
+    let mode = _str(a[0]).trim()
+    if mode == "--help" || mode == "-h" || mode == "help" {
+        print_usage()
+        exit(0)
+    }
+    if mode == "--selftest" || mode == "selftest" {
+        let rc = selftest()
+        if rc == 0 { emit_sentinel("PASS", "selftest") }
+        else { emit_sentinel("BLOCK", "selftest_fail") }
+        exit(rc)
+    }
+
+    // check --dry-run flag
+    let mut dry_run = false
+    let mut fi: i64 = 1
+    while fi < argc {
+        let flag = _str(a[fi]).trim()
+        if flag == "--dry-run" { dry_run = true }
+        fi = fi + 1
+    }
+
+    if mode == "promote" {
+        cmd_promote(dry_run)
+        exit(0)
+    }
+    if mode == "stage" {
+        cmd_stage(dry_run)
+        exit(0)
+    }
+    if mode == "status" {
+        let mut n_last: i64 = 20
+        if argc >= 2 {
+            let s = _str(a[1]).trim()
+            if s != "" && s != "--dry-run" {
+                try { n_last = to_int(s) } catch e { n_last = 20 }
+            }
+        }
+        cmd_status(n_last)
+        exit(0)
+    }
+
+    eprintln("REJECT: unknown mode '" + mode + "' -- modes: promote|stage|status|--selftest")
+    print_usage()
+    emit_sentinel("BLOCK", "unknown_mode=" + mode)
+    exit(2)
+}
+
+main()

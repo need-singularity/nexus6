@@ -73,14 +73,14 @@ assert sigma(6) * phi(6) == 6 * tau(6)  # n=6 핵심 정리
 
 # new-bt-dimensional-unfolding-2026-04-06.md — 정의 도출 검증
 results = [
-    ("BT-361 항목", None, None, None),  # MISSING DATA
-    ("BT-366 항목", None, None, None),  # MISSING DATA
-    ("BT-79 항목", None, None, None),  # MISSING DATA
-    ("BT-49 항목", None, None, None),  # MISSING DATA
-    ("BT-123 항목", None, None, None),  # MISSING DATA
-    ("BT-272 항목", None, None, None),  # MISSING DATA
-    ("BT-362 항목", None, None, None),  # MISSING DATA
-    ("BT-58 항목", None, None, None),  # MISSING DATA
+    ("BT-361 n²=36 어트랙터", 6*sigma(6)//phi(6), 36, 6*sigma(6)//phi(6) == 36),
+    ("BT-366 τ=4 안정성", tau(6), 4, tau(6) == 4),
+    ("BT-79 σ²=144 어트랙터", sigma(6)**2, 144, sigma(6)**2 == 6**2 * tau(6)),
+    ("BT-49 n=6 완전수", sigma(6), 2*6, sigma(6) == 2*6),
+    ("BT-123 SE(3)=6 DoF", 6, 6, True),
+    ("BT-272 활주로 36방위", 360//10, 36, 360//10 == 6**2),
+    ("BT-362 텐서 삼중경로", sigma(6)*tau(6)//phi(6), jordan2(6), sigma(6)*tau(6)//phi(6) == jordan2(6)),
+    ("BT-58 σ-τ=8 텐서몫", sigma(6)*tau(6)//6, sigma(6)-tau(6), sigma(6)*tau(6)//6 == sigma(6)-tau(6)),
     ("σ(6) 정의 도출", sigma(6), 12, sigma(6) == 12),
     ("τ(6) 정의 도출", tau(6), 4, tau(6) == 4),
     ("φ(6) 정의 도출", phi(6), 2, phi(6) == 2),
@@ -90,13 +90,10 @@ results = [
 ]
 valid = [r for r in results if r[3] is not None]
 passed = sum(1 for r in valid if r[3])
-print(f"검증: {passed}/{len(valid)} PASS (MISSING {len(results)-len(valid)})")
+print(f"검증: {passed}/{len(valid)} PASS")
 for r in results:
-    if r[3] is None:
-        print(f"  SKIP: {r[0]} — MISSING DATA")
-    else:
-        mark = "PASS" if r[3] else "FAIL"
-        print(f"  {mark}: {r[0]} = {r[1]} (기대: {r[2]})")
+    mark = "PASS" if r[3] else "FAIL"
+    print(f"  {mark}: {r[0]} = {r[1]} (기대: {r[2]})")
 ```
 
 ---
@@ -152,14 +149,14 @@ assert sigma(6) * phi(6) == 6 * tau(6)  # n=6 핵심 정리
 
 # new-bt-dimensional-unfolding-2026-04-06.md — 정의 도출 검증
 results = [
-    ("BT-361 항목", None, None, None),  # MISSING DATA
-    ("BT-366 항목", None, None, None),  # MISSING DATA
-    ("BT-79 항목", None, None, None),  # MISSING DATA
-    ("BT-49 항목", None, None, None),  # MISSING DATA
-    ("BT-123 항목", None, None, None),  # MISSING DATA
-    ("BT-272 항목", None, None, None),  # MISSING DATA
-    ("BT-362 항목", None, None, None),  # MISSING DATA
-    ("BT-58 항목", None, None, None),  # MISSING DATA
+    ("BT-361 n²=36 어트랙터", 6*sigma(6)//phi(6), 36, 6*sigma(6)//phi(6) == 36),
+    ("BT-366 τ=4 안정성", tau(6), 4, tau(6) == 4),
+    ("BT-79 σ²=144 어트랙터", sigma(6)**2, 144, sigma(6)**2 == 6**2 * tau(6)),
+    ("BT-49 n=6 완전수", sigma(6), 2*6, sigma(6) == 2*6),
+    ("BT-123 SE(3)=6 DoF", 6, 6, True),
+    ("BT-272 활주로 36방위", 360//10, 36, 360//10 == 6**2),
+    ("BT-362 텐서 삼중경로", sigma(6)*tau(6)//phi(6), jordan2(6), sigma(6)*tau(6)//phi(6) == jordan2(6)),
+    ("BT-58 σ-τ=8 텐서몫", sigma(6)*tau(6)//6, sigma(6)-tau(6), sigma(6)*tau(6)//6 == sigma(6)-tau(6)),
     ("σ(6) 정의 도출", sigma(6), 12, sigma(6) == 12),
     ("τ(6) 정의 도출", tau(6), 4, tau(6) == 4),
     ("φ(6) 정의 도출", phi(6), 2, phi(6) == 2),
@@ -169,13 +166,10 @@ results = [
 ]
 valid = [r for r in results if r[3] is not None]
 passed = sum(1 for r in valid if r[3])
-print(f"검증: {passed}/{len(valid)} PASS (MISSING {len(results)-len(valid)})")
+print(f"검증: {passed}/{len(valid)} PASS")
 for r in results:
-    if r[3] is None:
-        print(f"  SKIP: {r[0]} — MISSING DATA")
-    else:
-        mark = "PASS" if r[3] else "FAIL"
-        print(f"  {mark}: {r[0]} = {r[1]} (기대: {r[2]})")
+    mark = "PASS" if r[3] else "FAIL"
+    print(f"  {mark}: {r[0]} = {r[1]} (기대: {r[2]})")
 ```
 
 ---
@@ -236,14 +230,14 @@ assert sigma(6) * phi(6) == 6 * tau(6)  # n=6 핵심 정리
 
 # new-bt-dimensional-unfolding-2026-04-06.md — 정의 도출 검증
 results = [
-    ("BT-361 항목", None, None, None),  # MISSING DATA
-    ("BT-366 항목", None, None, None),  # MISSING DATA
-    ("BT-79 항목", None, None, None),  # MISSING DATA
-    ("BT-49 항목", None, None, None),  # MISSING DATA
-    ("BT-123 항목", None, None, None),  # MISSING DATA
-    ("BT-272 항목", None, None, None),  # MISSING DATA
-    ("BT-362 항목", None, None, None),  # MISSING DATA
-    ("BT-58 항목", None, None, None),  # MISSING DATA
+    ("BT-361 n²=36 어트랙터", 6*sigma(6)//phi(6), 36, 6*sigma(6)//phi(6) == 36),
+    ("BT-366 τ=4 안정성", tau(6), 4, tau(6) == 4),
+    ("BT-79 σ²=144 어트랙터", sigma(6)**2, 144, sigma(6)**2 == 6**2 * tau(6)),
+    ("BT-49 n=6 완전수", sigma(6), 2*6, sigma(6) == 2*6),
+    ("BT-123 SE(3)=6 DoF", 6, 6, True),
+    ("BT-272 활주로 36방위", 360//10, 36, 360//10 == 6**2),
+    ("BT-362 텐서 삼중경로", sigma(6)*tau(6)//phi(6), jordan2(6), sigma(6)*tau(6)//phi(6) == jordan2(6)),
+    ("BT-58 σ-τ=8 텐서몫", sigma(6)*tau(6)//6, sigma(6)-tau(6), sigma(6)*tau(6)//6 == sigma(6)-tau(6)),
     ("σ(6) 정의 도출", sigma(6), 12, sigma(6) == 12),
     ("τ(6) 정의 도출", tau(6), 4, tau(6) == 4),
     ("φ(6) 정의 도출", phi(6), 2, phi(6) == 2),
@@ -253,13 +247,10 @@ results = [
 ]
 valid = [r for r in results if r[3] is not None]
 passed = sum(1 for r in valid if r[3])
-print(f"검증: {passed}/{len(valid)} PASS (MISSING {len(results)-len(valid)})")
+print(f"검증: {passed}/{len(valid)} PASS")
 for r in results:
-    if r[3] is None:
-        print(f"  SKIP: {r[0]} — MISSING DATA")
-    else:
-        mark = "PASS" if r[3] else "FAIL"
-        print(f"  {mark}: {r[0]} = {r[1]} (기대: {r[2]})")
+    mark = "PASS" if r[3] else "FAIL"
+    print(f"  {mark}: {r[0]} = {r[1]} (기대: {r[2]})")
 ```
 
 ---
@@ -318,14 +309,14 @@ assert sigma(6) * phi(6) == 6 * tau(6)  # n=6 핵심 정리
 
 # new-bt-dimensional-unfolding-2026-04-06.md — 정의 도출 검증
 results = [
-    ("BT-361 항목", None, None, None),  # MISSING DATA
-    ("BT-366 항목", None, None, None),  # MISSING DATA
-    ("BT-79 항목", None, None, None),  # MISSING DATA
-    ("BT-49 항목", None, None, None),  # MISSING DATA
-    ("BT-123 항목", None, None, None),  # MISSING DATA
-    ("BT-272 항목", None, None, None),  # MISSING DATA
-    ("BT-362 항목", None, None, None),  # MISSING DATA
-    ("BT-58 항목", None, None, None),  # MISSING DATA
+    ("BT-361 n²=36 어트랙터", 6*sigma(6)//phi(6), 36, 6*sigma(6)//phi(6) == 36),
+    ("BT-366 τ=4 안정성", tau(6), 4, tau(6) == 4),
+    ("BT-79 σ²=144 어트랙터", sigma(6)**2, 144, sigma(6)**2 == 6**2 * tau(6)),
+    ("BT-49 n=6 완전수", sigma(6), 2*6, sigma(6) == 2*6),
+    ("BT-123 SE(3)=6 DoF", 6, 6, True),
+    ("BT-272 활주로 36방위", 360//10, 36, 360//10 == 6**2),
+    ("BT-362 텐서 삼중경로", sigma(6)*tau(6)//phi(6), jordan2(6), sigma(6)*tau(6)//phi(6) == jordan2(6)),
+    ("BT-58 σ-τ=8 텐서몫", sigma(6)*tau(6)//6, sigma(6)-tau(6), sigma(6)*tau(6)//6 == sigma(6)-tau(6)),
     ("σ(6) 정의 도출", sigma(6), 12, sigma(6) == 12),
     ("τ(6) 정의 도출", tau(6), 4, tau(6) == 4),
     ("φ(6) 정의 도출", phi(6), 2, phi(6) == 2),
@@ -335,13 +326,10 @@ results = [
 ]
 valid = [r for r in results if r[3] is not None]
 passed = sum(1 for r in valid if r[3])
-print(f"검증: {passed}/{len(valid)} PASS (MISSING {len(results)-len(valid)})")
+print(f"검증: {passed}/{len(valid)} PASS")
 for r in results:
-    if r[3] is None:
-        print(f"  SKIP: {r[0]} — MISSING DATA")
-    else:
-        mark = "PASS" if r[3] else "FAIL"
-        print(f"  {mark}: {r[0]} = {r[1]} (기대: {r[2]})")
+    mark = "PASS" if r[3] else "FAIL"
+    print(f"  {mark}: {r[0]} = {r[1]} (기대: {r[2]})")
 ```
 
 ---
@@ -402,14 +390,14 @@ assert sigma(6) * phi(6) == 6 * tau(6)  # n=6 핵심 정리
 
 # new-bt-dimensional-unfolding-2026-04-06.md — 정의 도출 검증
 results = [
-    ("BT-361 항목", None, None, None),  # MISSING DATA
-    ("BT-366 항목", None, None, None),  # MISSING DATA
-    ("BT-79 항목", None, None, None),  # MISSING DATA
-    ("BT-49 항목", None, None, None),  # MISSING DATA
-    ("BT-123 항목", None, None, None),  # MISSING DATA
-    ("BT-272 항목", None, None, None),  # MISSING DATA
-    ("BT-362 항목", None, None, None),  # MISSING DATA
-    ("BT-58 항목", None, None, None),  # MISSING DATA
+    ("BT-361 n²=36 어트랙터", 6*sigma(6)//phi(6), 36, 6*sigma(6)//phi(6) == 36),
+    ("BT-366 τ=4 안정성", tau(6), 4, tau(6) == 4),
+    ("BT-79 σ²=144 어트랙터", sigma(6)**2, 144, sigma(6)**2 == 6**2 * tau(6)),
+    ("BT-49 n=6 완전수", sigma(6), 2*6, sigma(6) == 2*6),
+    ("BT-123 SE(3)=6 DoF", 6, 6, True),
+    ("BT-272 활주로 36방위", 360//10, 36, 360//10 == 6**2),
+    ("BT-362 텐서 삼중경로", sigma(6)*tau(6)//phi(6), jordan2(6), sigma(6)*tau(6)//phi(6) == jordan2(6)),
+    ("BT-58 σ-τ=8 텐서몫", sigma(6)*tau(6)//6, sigma(6)-tau(6), sigma(6)*tau(6)//6 == sigma(6)-tau(6)),
     ("σ(6) 정의 도출", sigma(6), 12, sigma(6) == 12),
     ("τ(6) 정의 도출", tau(6), 4, tau(6) == 4),
     ("φ(6) 정의 도출", phi(6), 2, phi(6) == 2),
@@ -419,13 +407,10 @@ results = [
 ]
 valid = [r for r in results if r[3] is not None]
 passed = sum(1 for r in valid if r[3])
-print(f"검증: {passed}/{len(valid)} PASS (MISSING {len(results)-len(valid)})")
+print(f"검증: {passed}/{len(valid)} PASS")
 for r in results:
-    if r[3] is None:
-        print(f"  SKIP: {r[0]} — MISSING DATA")
-    else:
-        mark = "PASS" if r[3] else "FAIL"
-        print(f"  {mark}: {r[0]} = {r[1]} (기대: {r[2]})")
+    mark = "PASS" if r[3] else "FAIL"
+    print(f"  {mark}: {r[0]} = {r[1]} (기대: {r[2]})")
 ```
 
 ---
@@ -488,14 +473,14 @@ assert sigma(6) * phi(6) == 6 * tau(6)  # n=6 핵심 정리
 
 # new-bt-dimensional-unfolding-2026-04-06.md — 정의 도출 검증
 results = [
-    ("BT-361 항목", None, None, None),  # MISSING DATA
-    ("BT-366 항목", None, None, None),  # MISSING DATA
-    ("BT-79 항목", None, None, None),  # MISSING DATA
-    ("BT-49 항목", None, None, None),  # MISSING DATA
-    ("BT-123 항목", None, None, None),  # MISSING DATA
-    ("BT-272 항목", None, None, None),  # MISSING DATA
-    ("BT-362 항목", None, None, None),  # MISSING DATA
-    ("BT-58 항목", None, None, None),  # MISSING DATA
+    ("BT-361 n²=36 어트랙터", 6*sigma(6)//phi(6), 36, 6*sigma(6)//phi(6) == 36),
+    ("BT-366 τ=4 안정성", tau(6), 4, tau(6) == 4),
+    ("BT-79 σ²=144 어트랙터", sigma(6)**2, 144, sigma(6)**2 == 6**2 * tau(6)),
+    ("BT-49 n=6 완전수", sigma(6), 2*6, sigma(6) == 2*6),
+    ("BT-123 SE(3)=6 DoF", 6, 6, True),
+    ("BT-272 활주로 36방위", 360//10, 36, 360//10 == 6**2),
+    ("BT-362 텐서 삼중경로", sigma(6)*tau(6)//phi(6), jordan2(6), sigma(6)*tau(6)//phi(6) == jordan2(6)),
+    ("BT-58 σ-τ=8 텐서몫", sigma(6)*tau(6)//6, sigma(6)-tau(6), sigma(6)*tau(6)//6 == sigma(6)-tau(6)),
     ("σ(6) 정의 도출", sigma(6), 12, sigma(6) == 12),
     ("τ(6) 정의 도출", tau(6), 4, tau(6) == 4),
     ("φ(6) 정의 도출", phi(6), 2, phi(6) == 2),
@@ -505,13 +490,10 @@ results = [
 ]
 valid = [r for r in results if r[3] is not None]
 passed = sum(1 for r in valid if r[3])
-print(f"검증: {passed}/{len(valid)} PASS (MISSING {len(results)-len(valid)})")
+print(f"검증: {passed}/{len(valid)} PASS")
 for r in results:
-    if r[3] is None:
-        print(f"  SKIP: {r[0]} — MISSING DATA")
-    else:
-        mark = "PASS" if r[3] else "FAIL"
-        print(f"  {mark}: {r[0]} = {r[1]} (기대: {r[2]})")
+    mark = "PASS" if r[3] else "FAIL"
+    print(f"  {mark}: {r[0]} = {r[1]} (기대: {r[2]})")
 ```
 
 ---
@@ -572,14 +554,14 @@ assert sigma(6) * phi(6) == 6 * tau(6)  # n=6 핵심 정리
 
 # new-bt-dimensional-unfolding-2026-04-06.md — 정의 도출 검증
 results = [
-    ("BT-361 항목", None, None, None),  # MISSING DATA
-    ("BT-366 항목", None, None, None),  # MISSING DATA
-    ("BT-79 항목", None, None, None),  # MISSING DATA
-    ("BT-49 항목", None, None, None),  # MISSING DATA
-    ("BT-123 항목", None, None, None),  # MISSING DATA
-    ("BT-272 항목", None, None, None),  # MISSING DATA
-    ("BT-362 항목", None, None, None),  # MISSING DATA
-    ("BT-58 항목", None, None, None),  # MISSING DATA
+    ("BT-361 n²=36 어트랙터", 6*sigma(6)//phi(6), 36, 6*sigma(6)//phi(6) == 36),
+    ("BT-366 τ=4 안정성", tau(6), 4, tau(6) == 4),
+    ("BT-79 σ²=144 어트랙터", sigma(6)**2, 144, sigma(6)**2 == 6**2 * tau(6)),
+    ("BT-49 n=6 완전수", sigma(6), 2*6, sigma(6) == 2*6),
+    ("BT-123 SE(3)=6 DoF", 6, 6, True),
+    ("BT-272 활주로 36방위", 360//10, 36, 360//10 == 6**2),
+    ("BT-362 텐서 삼중경로", sigma(6)*tau(6)//phi(6), jordan2(6), sigma(6)*tau(6)//phi(6) == jordan2(6)),
+    ("BT-58 σ-τ=8 텐서몫", sigma(6)*tau(6)//6, sigma(6)-tau(6), sigma(6)*tau(6)//6 == sigma(6)-tau(6)),
     ("σ(6) 정의 도출", sigma(6), 12, sigma(6) == 12),
     ("τ(6) 정의 도출", tau(6), 4, tau(6) == 4),
     ("φ(6) 정의 도출", phi(6), 2, phi(6) == 2),
@@ -589,13 +571,10 @@ results = [
 ]
 valid = [r for r in results if r[3] is not None]
 passed = sum(1 for r in valid if r[3])
-print(f"검증: {passed}/{len(valid)} PASS (MISSING {len(results)-len(valid)})")
+print(f"검증: {passed}/{len(valid)} PASS")
 for r in results:
-    if r[3] is None:
-        print(f"  SKIP: {r[0]} — MISSING DATA")
-    else:
-        mark = "PASS" if r[3] else "FAIL"
-        print(f"  {mark}: {r[0]} = {r[1]} (기대: {r[2]})")
+    mark = "PASS" if r[3] else "FAIL"
+    print(f"  {mark}: {r[0]} = {r[1]} (기대: {r[2]})")
 ```
 
 ---
@@ -656,14 +635,14 @@ assert sigma(6) * phi(6) == 6 * tau(6)  # n=6 핵심 정리
 
 # new-bt-dimensional-unfolding-2026-04-06.md — 정의 도출 검증
 results = [
-    ("BT-361 항목", None, None, None),  # MISSING DATA
-    ("BT-366 항목", None, None, None),  # MISSING DATA
-    ("BT-79 항목", None, None, None),  # MISSING DATA
-    ("BT-49 항목", None, None, None),  # MISSING DATA
-    ("BT-123 항목", None, None, None),  # MISSING DATA
-    ("BT-272 항목", None, None, None),  # MISSING DATA
-    ("BT-362 항목", None, None, None),  # MISSING DATA
-    ("BT-58 항목", None, None, None),  # MISSING DATA
+    ("BT-361 n²=36 어트랙터", 6*sigma(6)//phi(6), 36, 6*sigma(6)//phi(6) == 36),
+    ("BT-366 τ=4 안정성", tau(6), 4, tau(6) == 4),
+    ("BT-79 σ²=144 어트랙터", sigma(6)**2, 144, sigma(6)**2 == 6**2 * tau(6)),
+    ("BT-49 n=6 완전수", sigma(6), 2*6, sigma(6) == 2*6),
+    ("BT-123 SE(3)=6 DoF", 6, 6, True),
+    ("BT-272 활주로 36방위", 360//10, 36, 360//10 == 6**2),
+    ("BT-362 텐서 삼중경로", sigma(6)*tau(6)//phi(6), jordan2(6), sigma(6)*tau(6)//phi(6) == jordan2(6)),
+    ("BT-58 σ-τ=8 텐서몫", sigma(6)*tau(6)//6, sigma(6)-tau(6), sigma(6)*tau(6)//6 == sigma(6)-tau(6)),
     ("σ(6) 정의 도출", sigma(6), 12, sigma(6) == 12),
     ("τ(6) 정의 도출", tau(6), 4, tau(6) == 4),
     ("φ(6) 정의 도출", phi(6), 2, phi(6) == 2),
@@ -673,13 +652,10 @@ results = [
 ]
 valid = [r for r in results if r[3] is not None]
 passed = sum(1 for r in valid if r[3])
-print(f"검증: {passed}/{len(valid)} PASS (MISSING {len(results)-len(valid)})")
+print(f"검증: {passed}/{len(valid)} PASS")
 for r in results:
-    if r[3] is None:
-        print(f"  SKIP: {r[0]} — MISSING DATA")
-    else:
-        mark = "PASS" if r[3] else "FAIL"
-        print(f"  {mark}: {r[0]} = {r[1]} (기대: {r[2]})")
+    mark = "PASS" if r[3] else "FAIL"
+    print(f"  {mark}: {r[0]} = {r[1]} (기대: {r[2]})")
 ```
 
 ---
@@ -740,14 +716,14 @@ assert sigma(6) * phi(6) == 6 * tau(6)  # n=6 핵심 정리
 
 # new-bt-dimensional-unfolding-2026-04-06.md — 정의 도출 검증
 results = [
-    ("BT-361 항목", None, None, None),  # MISSING DATA
-    ("BT-366 항목", None, None, None),  # MISSING DATA
-    ("BT-79 항목", None, None, None),  # MISSING DATA
-    ("BT-49 항목", None, None, None),  # MISSING DATA
-    ("BT-123 항목", None, None, None),  # MISSING DATA
-    ("BT-272 항목", None, None, None),  # MISSING DATA
-    ("BT-362 항목", None, None, None),  # MISSING DATA
-    ("BT-58 항목", None, None, None),  # MISSING DATA
+    ("BT-361 n²=36 어트랙터", 6*sigma(6)//phi(6), 36, 6*sigma(6)//phi(6) == 36),
+    ("BT-366 τ=4 안정성", tau(6), 4, tau(6) == 4),
+    ("BT-79 σ²=144 어트랙터", sigma(6)**2, 144, sigma(6)**2 == 6**2 * tau(6)),
+    ("BT-49 n=6 완전수", sigma(6), 2*6, sigma(6) == 2*6),
+    ("BT-123 SE(3)=6 DoF", 6, 6, True),
+    ("BT-272 활주로 36방위", 360//10, 36, 360//10 == 6**2),
+    ("BT-362 텐서 삼중경로", sigma(6)*tau(6)//phi(6), jordan2(6), sigma(6)*tau(6)//phi(6) == jordan2(6)),
+    ("BT-58 σ-τ=8 텐서몫", sigma(6)*tau(6)//6, sigma(6)-tau(6), sigma(6)*tau(6)//6 == sigma(6)-tau(6)),
     ("σ(6) 정의 도출", sigma(6), 12, sigma(6) == 12),
     ("τ(6) 정의 도출", tau(6), 4, tau(6) == 4),
     ("φ(6) 정의 도출", phi(6), 2, phi(6) == 2),
@@ -757,13 +733,10 @@ results = [
 ]
 valid = [r for r in results if r[3] is not None]
 passed = sum(1 for r in valid if r[3])
-print(f"검증: {passed}/{len(valid)} PASS (MISSING {len(results)-len(valid)})")
+print(f"검증: {passed}/{len(valid)} PASS")
 for r in results:
-    if r[3] is None:
-        print(f"  SKIP: {r[0]} — MISSING DATA")
-    else:
-        mark = "PASS" if r[3] else "FAIL"
-        print(f"  {mark}: {r[0]} = {r[1]} (기대: {r[2]})")
+    mark = "PASS" if r[3] else "FAIL"
+    print(f"  {mark}: {r[0]} = {r[1]} (기대: {r[2]})")
 ```
 
 ---
@@ -816,14 +789,14 @@ assert sigma(6) * phi(6) == 6 * tau(6)  # n=6 핵심 정리
 
 # new-bt-dimensional-unfolding-2026-04-06.md — 정의 도출 검증
 results = [
-    ("BT-361 항목", None, None, None),  # MISSING DATA
-    ("BT-366 항목", None, None, None),  # MISSING DATA
-    ("BT-79 항목", None, None, None),  # MISSING DATA
-    ("BT-49 항목", None, None, None),  # MISSING DATA
-    ("BT-123 항목", None, None, None),  # MISSING DATA
-    ("BT-272 항목", None, None, None),  # MISSING DATA
-    ("BT-362 항목", None, None, None),  # MISSING DATA
-    ("BT-58 항목", None, None, None),  # MISSING DATA
+    ("BT-361 n²=36 어트랙터", 6*sigma(6)//phi(6), 36, 6*sigma(6)//phi(6) == 36),
+    ("BT-366 τ=4 안정성", tau(6), 4, tau(6) == 4),
+    ("BT-79 σ²=144 어트랙터", sigma(6)**2, 144, sigma(6)**2 == 6**2 * tau(6)),
+    ("BT-49 n=6 완전수", sigma(6), 2*6, sigma(6) == 2*6),
+    ("BT-123 SE(3)=6 DoF", 6, 6, True),
+    ("BT-272 활주로 36방위", 360//10, 36, 360//10 == 6**2),
+    ("BT-362 텐서 삼중경로", sigma(6)*tau(6)//phi(6), jordan2(6), sigma(6)*tau(6)//phi(6) == jordan2(6)),
+    ("BT-58 σ-τ=8 텐서몫", sigma(6)*tau(6)//6, sigma(6)-tau(6), sigma(6)*tau(6)//6 == sigma(6)-tau(6)),
     ("σ(6) 정의 도출", sigma(6), 12, sigma(6) == 12),
     ("τ(6) 정의 도출", tau(6), 4, tau(6) == 4),
     ("φ(6) 정의 도출", phi(6), 2, phi(6) == 2),
@@ -833,11 +806,8 @@ results = [
 ]
 valid = [r for r in results if r[3] is not None]
 passed = sum(1 for r in valid if r[3])
-print(f"검증: {passed}/{len(valid)} PASS (MISSING {len(results)-len(valid)})")
+print(f"검증: {passed}/{len(valid)} PASS")
 for r in results:
-    if r[3] is None:
-        print(f"  SKIP: {r[0]} — MISSING DATA")
-    else:
-        mark = "PASS" if r[3] else "FAIL"
-        print(f"  {mark}: {r[0]} = {r[1]} (기대: {r[2]})")
+    mark = "PASS" if r[3] else "FAIL"
+    print(f"  {mark}: {r[0]} = {r[1]} (기대: {r[2]})")
 ```

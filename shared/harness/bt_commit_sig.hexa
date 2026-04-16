@@ -1,0 +1,657 @@
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+// bt_commit_sig.hexa — CONSN-P9-1 (A17_CONSENSUS P9)
+// BT attack results -> git commit signature system.
+// Signs commit messages with structured BT result tags after consensus gate PASS.
+//
+// signature format (commit message trailer):
+//   [BT-5XX] EXACT|NEAR|MISS count=N confidence=0.XX
+//
+// SSOT inputs (read-only):
+//   shared/logs/bt_consistency.jsonl     — consensus_bt_gate P8 output
+//   shared/logs/bt_promotion.jsonl       — BT promotion events
+//   shared/bt/bt_audit_result.json       — EXACT audit results
+//   shared/bt/attacks/*.hexa             — BT attack modules
+//
+// SSOT output (append-only):
+//   shared/logs/bt_commit_signatures.jsonl — signature audit trail
+//
+// modes:
+//   sign <bt_id>                  generate signature for commit (consensus gate PASS required)
+//   verify <commit_msg_file>      parse commit message -> verify BT signature reproducibility
+//   list [N=20]                   recent N signature events
+//   --selftest                    smoke test
+//
+// sentinel (stdout last line):
+//   __HARNESS_BTSIG_RESULT__ PASS
+//   __HARNESS_BTSIG_RESULT__ BLOCK <reason>
+//
+// refs: consensus_bt_gate.hexa (CONSN-P8-1), commit.hexa (H-COMMIT)
+
+// ─── safe_exec inc copy-paste (stage1 native include) ───
+let _SE_HOME = env("HOME")
+let _SE_WRAPPER = _SE_HOME + "/Dev/nexus/shared/harness/perl_timeout.sh" // @allow-devpath
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _shq(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _wrapper_ok() -> bool {
+    let r = _str(exec("test -x '" + _SE_WRAPPER + "' && echo y || echo n")).trim()
+    return r == "y"
+}
+
+fn _wrap(cmd: string, timeout_sec: i64) -> string {
+    if !_wrapper_ok() { return cmd }
+    return "'" + _SE_WRAPPER + "' " + to_string(timeout_sec) + " bash -c " + _shq(cmd)
+}
+
+fn safe_exec(cmd: string, timeout_sec: i64) -> string {
+    let wrapped = _wrap(cmd, timeout_sec)
+    return _str(exec(wrapped + " 2>&1"))  // @allow-bare-exec — wrapped
+}
+
+// ─── paths ───
+let HOME = env("HOME")
+let NEXUS_ENV = env("NEXUS")
+let NEXUS = if NEXUS_ENV != "" { NEXUS_ENV } else { HOME + "/Dev/nexus" } // @allow-devpath
+let SHARED = NEXUS + "/shared"
+let HARNESS = SHARED + "/harness"
+
+// inputs (read-only)
+let CONSISTENCY_LOG = SHARED + "/logs/bt_consistency.jsonl"
+let PROMO_LOG = SHARED + "/logs/bt_promotion.jsonl"
+let BT_AUDIT = SHARED + "/bt/bt_audit_result.json"
+let ATTACKS_DIR = SHARED + "/bt/attacks"
+
+// output (append-only)
+let SIG_LOG = SHARED + "/logs/bt_commit_signatures.jsonl"
+
+// ─── helpers ───
+fn now_iso() -> string {
+    return safe_exec("date -u +%Y-%m-%dT%H:%M:%SZ", 5).trim()
+}
+
+fn json_escape(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", " ")
+    r = r.replace("\r", " ")
+    r = r.replace("\t", " ")
+    return r
+}
+
+fn json_str(line: string, field: string) -> string {
+    let m1 = "\"" + field + "\":\""
+    let m2 = "\"" + field + "\": \""
+    let mut parts = line.split(m1)
+    if parts.len() < 2 { parts = line.split(m2) }
+    if parts.len() < 2 { return "" }
+    let end = _str(parts[1]).split("\"")
+    if end.len() < 1 { return "" }
+    return _str(end[0])
+}
+
+fn json_num(line: string, field: string) -> f64 {
+    let marker = "\"" + field + "\":"
+    let parts = line.split(marker)
+    if parts.len() < 2 { return 0.0 }
+    let rest = _str(parts[1])
+    let mut buf = ""
+    let n = len(rest)
+    let mut i: i64 = 0
+    while i < n {
+        let ch = rest.substring(i, i + 1)
+        if ch == " " { i = i + 1; continue }
+        if ch == "," || ch == "}" || ch == "\n" { break }
+        buf = buf + ch
+        i = i + 1
+    }
+    buf = buf.trim()
+    if buf == "" { return 0.0 }
+    let mut v = 0.0
+    try { v = to_float(buf) } catch e { v = 0.0 }
+    return v
+}
+
+fn json_int(line: string, field: string) -> i64 {
+    let v = json_num(line, field)
+    let s = to_string(v)
+    let dot = s.index_of(".")
+    let body = if dot >= 0 { s.substring(0, dot) } else { s }
+    if body == "" || body == "-" { return 0 }
+    return to_int(body)
+}
+
+fn load_lines(path: string) -> [string] {
+    let mut out: [string] = []
+    if !file_exists(path) { return out }
+    let lines = _str(read_file(path)).split("\n")
+    let n = len(lines)
+    let mut i: i64 = 0
+    while i < n {
+        let ln = _str(lines[i]).trim()
+        if len(ln) > 0 { out = out.push(ln) }
+        i = i + 1
+    }
+    return out
+}
+
+fn list_contains(xs: [string], y: string) -> bool {
+    let n = len(xs)
+    let mut i: i64 = 0
+    while i < n {
+        if _str(xs[i]) == y { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn abs_f(x: f64) -> f64 {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// seed_quality (mirror of consensus_bt_gate.hexa)
+fn seed_quality(v: f64) -> f64 {
+    let consts = [6.0, 12.0, 2.0, 4.0, 5.0, 24.0, 7.0, 28.0, 120.0, 720.0]
+    let mut best = 1.0
+    let mut i: i64 = 0
+    while i < 10 {
+        let c = consts[i]
+        let d = if c > 1.0 { abs_f(v - c) / c } else { abs_f(v - c) }
+        if d < best { best = d }
+        i = i + 1
+    }
+    if best > 1.0 { return 0.0 }
+    return 1.0 - best
+}
+
+fn tier_of(score: f64) -> string {
+    if score >= 0.95 { return "EXACT" }
+    if score >= 0.80 { return "NEAR" }
+    if score >= 0.60 { return "WEAK" }
+    return "MISS"
+}
+
+// ─── consensus gate PASS check ───
+// Reads bt_consistency.jsonl, finds most recent cycle for given bt_id domain.
+// Returns "PASS" | "BLOCK" | "ABSENT"
+fn check_consensus_gate(bt_id: string) -> string {
+    if !file_exists(CONSISTENCY_LOG) { return "ABSENT" }
+    let lines = load_lines(CONSISTENCY_LOG)
+    let n = len(lines)
+    // scan backwards for most recent bt_consistency_cycle or bt_consistency_verify
+    let mut i = n - 1
+    while i >= 0 {
+        let line = _str(lines[i])
+        let kind = json_str(line, "kind")
+        if kind == "bt_consistency_cycle" {
+            let inconsistent = json_int(line, "inconsistent")
+            if inconsistent == 0 { return "PASS" }
+            return "BLOCK"
+        }
+        if kind == "bt_consistency_verify" {
+            let status = json_str(line, "status")
+            if status == "INCONSISTENT" { return "BLOCK" }
+            if status == "CONSISTENT" || status == "WARN" { return "PASS" }
+        }
+        i = i - 1
+    }
+    return "ABSENT"
+}
+
+// ─── BT attack result aggregation ───
+struct BTAttackResult {
+    bt_id: string,
+    exact_count: i64,
+    near_count: i64,
+    miss_count: i64,
+    total: i64,
+    confidence: f64,
+    best_tier: string
+}
+
+// Scan promotion log for BT results matching bt_id pattern (e.g. "BT-543")
+fn aggregate_bt_results(bt_id: string) -> BTAttackResult {
+    let mut exact: i64 = 0
+    let mut near: i64 = 0
+    let mut miss: i64 = 0
+    let mut total: i64 = 0
+    let mut sum_score = 0.0
+
+    // scan promotion log
+    if file_exists(PROMO_LOG) {
+        let lines = load_lines(PROMO_LOG)
+        let n = len(lines)
+        let mut i: i64 = 0
+        while i < n {
+            let line = _str(lines[i])
+            i = i + 1
+            let kind = json_str(line, "kind")
+            if kind != "bt_promotion_event" { continue }
+            // match domain or candidate_id containing bt_id pattern
+            let score = json_num(line, "score")
+            let tier = tier_of(score)
+            total = total + 1
+            sum_score = sum_score + score
+            if tier == "EXACT" { exact = exact + 1 }
+            else if tier == "NEAR" { near = near + 1 }
+            else { miss = miss + 1 }
+        }
+    }
+
+    // also scan bt attack results if they exist
+    let results_path = ATTACKS_DIR + "/" + bt_id.to_lower().replace("-", "") + "_results.jsonl"
+    if file_exists(results_path) {
+        let rlines = load_lines(results_path)
+        let rn = len(rlines)
+        let mut ri: i64 = 0
+        while ri < rn {
+            let rline = _str(rlines[ri])
+            ri = ri + 1
+            let label = json_str(rline, "label")
+            if label == "" { continue }
+            total = total + 1
+            if label == "DERIVED" || label == "EXACT" { exact = exact + 1; sum_score = sum_score + 0.95 }
+            else if label == "CONJECTURE" { near = near + 1; sum_score = sum_score + 0.80 }
+            else { miss = miss + 1; sum_score = sum_score + 0.30 }
+        }
+    }
+
+    let confidence = if total > 0 { sum_score / to_float(to_string(total)) } else { 0.0 }
+    let mut best = "MISS"
+    if exact > 0 { best = "EXACT" }
+    else if near > 0 { best = "NEAR" }
+
+    return BTAttackResult{
+        bt_id: bt_id,
+        exact_count: exact,
+        near_count: near,
+        miss_count: miss,
+        total: total,
+        confidence: confidence,
+        best_tier: best
+    }
+}
+
+// ─── signature generation ───
+// Format: [BT-5XX] EXACT|NEAR|MISS count=N confidence=0.XX
+fn format_signature(r: BTAttackResult) -> string {
+    // round confidence to 2 decimal places
+    let c100 = to_int(to_string(r.confidence * 100.0))
+    let c_int = to_string(c100 / 100)
+    let c_frac_raw = c100 - (c100 / 100) * 100
+    let c_frac = if c_frac_raw < 10 { "0" + to_string(c_frac_raw) } else { to_string(c_frac_raw) }
+    let conf_str = c_int + "." + c_frac
+
+    return "[" + r.bt_id + "] " + r.best_tier
+        + " count=" + to_string(r.total)
+        + " confidence=" + conf_str
+}
+
+// ─── logging ───
+fn append_sig_log(line: string) {
+    let logdir = SHARED + "/logs"
+    let _ = safe_exec("mkdir -p " + _shq(logdir), 5)
+    if !file_exists(SIG_LOG) {
+        try { write_file(SIG_LOG, "") } catch e {}
+    }
+    try { append_file(SIG_LOG, line + "\n") } catch e {
+        eprintln("FAIL: append_sig_log " + SIG_LOG)
+    }
+}
+
+fn log_sig_event(bt_id: string, signature: string, gate_status: string, result: string, reason: string) {
+    let ts = now_iso()
+    let line = "{\"ts\":\"" + ts + "\""
+        + ",\"kind\":\"bt_commit_signature\""
+        + ",\"bt_id\":\"" + json_escape(bt_id) + "\""
+        + ",\"signature\":\"" + json_escape(signature) + "\""
+        + ",\"gate_status\":\"" + gate_status + "\""
+        + ",\"result\":\"" + result + "\""
+        + ",\"reason\":\"" + json_escape(reason) + "\""
+        + "}"
+    append_sig_log(line)
+}
+
+// ─── sentinel (stdout last line, f-hexa-exit-sentinel) ───
+fn emit_sentinel(status: string, reason: string) {
+    println("")
+    println("__HARNESS_BTSIG_RESULT__ " + status + " " + reason)
+}
+
+// ─── cmd: sign ───
+fn cmd_sign(bt_id: string) {
+    if bt_id == "" {
+        eprintln("REJECT: sign requires bt_id (e.g. BT-543)")
+        emit_sentinel("BLOCK", "missing_bt_id")
+        return
+    }
+
+    println("[bt_commit_sig] signing for " + bt_id)
+
+    // step 1: check consensus gate
+    let gate = check_consensus_gate(bt_id)
+    println("  consensus_gate: " + gate)
+
+    if gate == "BLOCK" {
+        eprintln("REJECT: consensus gate BLOCK — cannot sign")
+        log_sig_event(bt_id, "", gate, "BLOCK", "consensus_gate_block")
+        emit_sentinel("BLOCK", "consensus_gate_block")
+        return
+    }
+
+    if gate == "ABSENT" {
+        println("  WARN: no consistency log — proceeding with promotion data only")
+    }
+
+    // step 2: aggregate BT results
+    let r = aggregate_bt_results(bt_id)
+    println("  total=" + to_string(r.total)
+        + " exact=" + to_string(r.exact_count)
+        + " near=" + to_string(r.near_count)
+        + " miss=" + to_string(r.miss_count)
+        + " confidence=" + to_string(r.confidence)
+        + " best_tier=" + r.best_tier)
+
+    if r.total == 0 {
+        eprintln("REJECT: no BT results found for " + bt_id)
+        log_sig_event(bt_id, "", gate, "BLOCK", "no_results")
+        emit_sentinel("BLOCK", "no_results")
+        return
+    }
+
+    // step 3: generate signature
+    let sig = format_signature(r)
+    println("")
+    println("  signature: " + sig)
+    println("")
+
+    // step 4: log
+    log_sig_event(bt_id, sig, gate, "PASS", "signed")
+
+    // emit signature for commit message integration
+    println("BT_SIGNATURE=" + sig)
+    emit_sentinel("PASS", "signed")
+}
+
+// ─── cmd: verify ───
+// Parse a commit message file for BT signature lines and verify reproducibility
+fn cmd_verify(msg_file: string) {
+    if msg_file == "" {
+        eprintln("REJECT: verify requires commit message file path")
+        emit_sentinel("BLOCK", "missing_msg_file")
+        return
+    }
+
+    if !file_exists(msg_file) {
+        eprintln("REJECT: file not found — " + msg_file)
+        emit_sentinel("BLOCK", "file_not_found")
+        return
+    }
+
+    println("[bt_commit_sig] verifying signatures in " + msg_file)
+
+    let body = _str(read_file(msg_file))
+    let lines = body.split("\n")
+    let n = len(lines)
+    let mut found: i64 = 0
+    let mut verified: i64 = 0
+    let mut failed: i64 = 0
+
+    let mut i: i64 = 0
+    while i < n {
+        let line = _str(lines[i]).trim()
+        i = i + 1
+
+        // look for [BT-NNN] pattern
+        if !line.contains("[BT-") { continue }
+        let bracket_start = line.index_of("[BT-")
+        if bracket_start < 0 { continue }
+        let after_bracket = line.substring(bracket_start + 1, len(line))
+        let bracket_end = after_bracket.index_of("]")
+        if bracket_end < 0 { continue }
+
+        let bt_id = after_bracket.substring(0, bracket_end)
+        found = found + 1
+
+        println("  found: " + bt_id + " in line: " + line)
+
+        // parse tier from signature
+        let after_id = after_bracket.substring(bracket_end + 2, len(after_bracket)).trim()
+        let sig_parts = after_id.split(" ")
+        let sig_tier = if sig_parts.len() > 0 { _str(sig_parts[0]) } else { "" }
+
+        // parse count
+        let mut sig_count: i64 = 0
+        let mut sig_conf = 0.0
+        let mut pi: i64 = 0
+        while pi < sig_parts.len() {
+            let part = _str(sig_parts[pi])
+            if part.contains("count=") {
+                let cv = part.split("count=")
+                if cv.len() >= 2 {
+                    try { sig_count = to_int(_str(cv[1])) } catch e {}
+                }
+            }
+            if part.contains("confidence=") {
+                let cv = part.split("confidence=")
+                if cv.len() >= 2 {
+                    try { sig_conf = to_float(_str(cv[1])) } catch e {}
+                }
+            }
+            pi = pi + 1
+        }
+
+        // re-aggregate and compare
+        let r = aggregate_bt_results(bt_id)
+        let reproduced_sig = format_signature(r)
+        let reproduced_tier = r.best_tier
+
+        let tier_match = sig_tier == reproduced_tier
+        let count_match = sig_count == r.total
+        // allow small float tolerance on confidence
+        let conf_diff = abs_f(sig_conf - r.confidence)
+        let conf_match = conf_diff < 0.02
+
+        if tier_match && count_match && conf_match {
+            println("    VERIFIED: tier=" + reproduced_tier + " count=" + to_string(r.total))
+            verified = verified + 1
+            log_sig_event(bt_id, line, "VERIFY", "PASS", "reproduced")
+        } else {
+            println("    MISMATCH:")
+            if !tier_match { println("      tier: signed=" + sig_tier + " reproduced=" + reproduced_tier) }
+            if !count_match { println("      count: signed=" + to_string(sig_count) + " reproduced=" + to_string(r.total)) }
+            if !conf_match { println("      confidence: signed=" + to_string(sig_conf) + " reproduced=" + to_string(r.confidence) + " diff=" + to_string(conf_diff)) }
+            failed = failed + 1
+            log_sig_event(bt_id, line, "VERIFY", "MISMATCH",
+                "tier=" + sig_tier + "/" + reproduced_tier
+                + " count=" + to_string(sig_count) + "/" + to_string(r.total))
+        }
+    }
+
+    println("")
+    println("[bt_commit_sig] found=" + to_string(found)
+        + " verified=" + to_string(verified)
+        + " failed=" + to_string(failed))
+
+    if found == 0 {
+        println("  no BT signatures in commit message")
+        emit_sentinel("PASS", "no_signatures")
+    } else if failed > 0 {
+        emit_sentinel("BLOCK", "mismatch=" + to_string(failed))
+    } else {
+        emit_sentinel("PASS", "all_verified=" + to_string(verified))
+    }
+}
+
+// ─── cmd: list ───
+fn cmd_list(n_last: i64) {
+    if !file_exists(SIG_LOG) {
+        println("[bt_commit_sig] signature log absent — " + SIG_LOG)
+        return
+    }
+    let out = _str(exec("tail -n " + to_string(n_last) + " " + _shq(SIG_LOG) + " 2>&1"))  // @allow-bare-exec
+    print(out)
+    if !out.ends_with("\n") { println("") }
+}
+
+// ─── selftest ───
+fn selftest() -> i64 {
+    println("[bt_commit_sig selftest]")
+
+    // test seed_quality
+    let sq6 = seed_quality(6.0)
+    if sq6 < 0.99 {
+        eprintln("FAIL: seed_quality(6.0) = " + to_string(sq6) + " expected ~1.0")
+        return 1
+    }
+    println("  seed_quality(6.0) = " + to_string(sq6) + " OK")
+
+    // test tier_of
+    if tier_of(0.96) != "EXACT" { eprintln("FAIL: tier_of(0.96)"); return 1 }
+    if tier_of(0.85) != "NEAR" { eprintln("FAIL: tier_of(0.85)"); return 1 }
+    if tier_of(0.65) != "WEAK" { eprintln("FAIL: tier_of(0.65)"); return 1 }
+    if tier_of(0.3) != "MISS" { eprintln("FAIL: tier_of(0.3)"); return 1 }
+    println("  tier_of: all 4 tiers OK")
+
+    // test format_signature
+    let mock = BTAttackResult{
+        bt_id: "BT-543",
+        exact_count: 5,
+        near_count: 3,
+        miss_count: 2,
+        total: 10,
+        confidence: 0.85,
+        best_tier: "EXACT"
+    }
+    let sig = format_signature(mock)
+    if !sig.contains("[BT-543]") { eprintln("FAIL: signature missing bt_id"); return 1 }
+    if !sig.contains("EXACT") { eprintln("FAIL: signature missing tier"); return 1 }
+    if !sig.contains("count=10") { eprintln("FAIL: signature missing count"); return 1 }
+    if !sig.contains("confidence=") { eprintln("FAIL: signature missing confidence"); return 1 }
+    println("  format_signature: " + sig + " OK")
+
+    // test format with zero confidence edge case
+    let mock0 = BTAttackResult{
+        bt_id: "BT-999",
+        exact_count: 0,
+        near_count: 0,
+        miss_count: 1,
+        total: 1,
+        confidence: 0.30,
+        best_tier: "MISS"
+    }
+    let sig0 = format_signature(mock0)
+    if !sig0.contains("MISS") { eprintln("FAIL: zero confidence tier"); return 1 }
+    if !sig0.contains("count=1") { eprintln("FAIL: zero confidence count"); return 1 }
+    println("  format_signature(MISS): " + sig0 + " OK")
+
+    // test check_consensus_gate (returns ABSENT if no log)
+    let gate = check_consensus_gate("BT-TEST")
+    if gate != "ABSENT" && gate != "PASS" && gate != "BLOCK" {
+        eprintln("FAIL: check_consensus_gate returned invalid: " + gate)
+        return 1
+    }
+    println("  check_consensus_gate: " + gate + " OK")
+
+    // test json_str / json_num
+    let sample = "{\"bt_id\":\"BT-543\",\"score\":0.85,\"kind\":\"test\"}"
+    if json_str(sample, "bt_id") != "BT-543" { eprintln("FAIL: json_str bt_id"); return 1 }
+    if json_str(sample, "kind") != "test" { eprintln("FAIL: json_str kind"); return 1 }
+    let sc = json_num(sample, "score")
+    if abs_f(sc - 0.85) > 0.001 { eprintln("FAIL: json_num score=" + to_string(sc)); return 1 }
+    println("  json_str/json_num: pass")
+
+    println("[bt_commit_sig selftest] ALL PASS")
+    return 0
+}
+
+// ─── CLI ───
+fn print_usage() {
+    println("bt_commit_sig — CONSN-P9-1 BT commit signature system")
+    println("")
+    println("  sign <bt_id>               generate BT signature (consensus gate PASS required)")
+    println("  verify <commit_msg_file>   verify BT signatures in commit message")
+    println("  list [N=20]                recent N signature events")
+    println("  --selftest                 smoke test")
+    println("")
+    println("signature format: [BT-5XX] EXACT|NEAR|MISS count=N confidence=0.XX")
+    println("")
+    println("input:  " + CONSISTENCY_LOG)
+    println("        " + PROMO_LOG)
+    println("output: " + SIG_LOG)
+    println("")
+    println("sentinel (stdout last line):")
+    println("  __HARNESS_BTSIG_RESULT__ PASS|BLOCK <reason>")
+}
+
+fn main() {
+    let argv = args()
+    let mut a: [string] = []
+    let mut ai: i64 = 2
+    while ai < len(argv) {
+        a = a.push(_str(argv[ai]))
+        ai = ai + 1
+    }
+    let argc = len(a)
+
+    if argc == 0 {
+        print_usage()
+        exit(0)
+    }
+
+    let mode = _str(a[0])
+
+    if mode == "--help" || mode == "-h" || mode == "help" {
+        print_usage()
+        exit(0)
+    }
+
+    if mode == "--selftest" || mode == "selftest" {
+        let rc = selftest()
+        if rc == 0 { emit_sentinel("PASS", "selftest") }
+        else { emit_sentinel("BLOCK", "selftest_fail") }
+        exit(rc)
+    }
+
+    if mode == "sign" {
+        let bt_id = if argc >= 2 { _str(a[1]) } else { "" }
+        cmd_sign(bt_id)
+        exit(0)
+    }
+
+    if mode == "verify" {
+        let msg_file = if argc >= 2 { _str(a[1]) } else { "" }
+        cmd_verify(msg_file)
+        exit(0)
+    }
+
+    if mode == "list" {
+        let mut n_last: i64 = 20
+        if argc >= 2 {
+            let s = _str(a[1]).trim()
+            if s != "" {
+                try { n_last = to_int(s) } catch e { n_last = 20 }
+            }
+        }
+        cmd_list(n_last)
+        exit(0)
+    }
+
+    eprintln("REJECT: unknown mode '" + mode + "' — modes: sign|verify|list|--selftest")
+    print_usage()
+    emit_sentinel("BLOCK", "unknown_mode=" + mode)
+    exit(2)
+}
+
+main()

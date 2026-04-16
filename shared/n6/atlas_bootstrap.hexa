@@ -1,0 +1,893 @@
+// ═══════════════════════════════════════════════════════════
+// atlas_bootstrap.hexa — ATLAS-P9-1 Mk.III self-bootstrap engine
+// Goal: atlas topology self-analysis → sparse region detection →
+//       candidate generation → _guarded_append validation → stats update
+// Usage: hexa atlas_bootstrap.hexa <scan|bootstrap|hubs|status|growth-points|recommend> [--dry-run] [--verbose] [--top N] [--min-deg N]
+// Guard: all writes via _guarded_append_atlas() (schema+dedup)
+// Sidecar: atlas.n6.stats (Mk.III marker tracking), atlas.n6.deg (degree TSV)
+// ═══════════════════════════════════════════════════════════
+
+// ─── HOME + paths ───
+let mut _HOME = ""
+try { _HOME = env("HOME") } catch e {}  // @allow-silent-catch
+if _HOME == "" {
+    try { _HOME = to_string(exec("printenv HOME")).trim() } catch e {}  // @allow-silent-catch
+}
+let _NEXUS = _HOME + "/Dev/nexus"
+let _ATLAS = _NEXUS + "/shared/n6/atlas.n6"
+let _DEG = _ATLAS + ".deg"
+let _STATS = _ATLAS + ".stats"
+
+// ─── CLI ───
+let _a = args()
+let mut _cmd = ""
+let mut _dry_run = false
+let mut _verbose = false
+let mut _top_n: i64 = 30
+let mut _min_deg: i64 = 5
+let mut _ai: i64 = 2
+while _ai < len(_a) {
+    let tok = _a[_ai]
+    if tok == "--dry-run" { _dry_run = true }
+    else if tok == "--verbose" || tok == "-v" { _verbose = true }
+    else if tok == "--top" && _ai + 1 < len(_a) {
+        _ai = _ai + 1
+        try { _top_n = to_int(_a[_ai]) } catch e {}  // @allow-silent-catch
+    }
+    else if tok == "--min-deg" && _ai + 1 < len(_a) {
+        _ai = _ai + 1
+        try { _min_deg = to_int(_a[_ai]) } catch e {}  // @allow-silent-catch
+    }
+    else if tok == "--help" || tok == "-h" {
+        println("usage: hexa atlas_bootstrap.hexa <mode> [--dry-run] [--verbose] [--top N] [--min-deg N]")
+        println("  scan          find growth points (sparse regions, near-hubs)")
+        println("  bootstrap     ext-sync merge + generate candidates to fill gaps")
+        println("  hubs          hub analysis (top hubs, potential new hubs)")
+        println("  status        Mk.III evolution status from atlas.n6.stats")
+        println("  growth-points degree centrality hub classification + growth candidates")
+        println("  recommend     suggest new edges for leaf/isolated nodes")
+        exit(0)  // @allow-silent-exit
+    }
+    else if _cmd == "" && !tok.starts_with("-") { _cmd = tok }
+    _ai = _ai + 1
+}
+if _cmd == "" { _cmd = "status" }
+
+// ═══════════════════════════════════════════════════════════
+// ─── common helpers (hexa no import — copy-paste pattern) ───
+// ═══════════════════════════════════════════════════════════
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _to_int0(s: string) -> i64 {
+    if s == "" { return 0 }
+    let first = _str(s.split("\n")[0]).trim()
+    if first == "" { return 0 }
+    let mut v: i64 = 0
+    try { v = to_int(first) } catch e {}  // @allow-silent-catch
+    return v
+}
+
+fn _exec_int(cmd: string) -> i64 {
+    let mut r: i64 = 0
+    try { r = to_int(to_string(exec(cmd)).trim()) } catch e {}  // @allow-silent-catch
+    return r
+}
+
+fn _exec_str(cmd: string) -> string {
+    let mut r = ""
+    try { r = to_string(exec(cmd)).trim() } catch e {}  // @allow-silent-catch
+    return r
+}
+
+fn _jesc(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", "\\n")
+    r = r.replace("\t", "\\t")
+    return r
+}
+
+fn _now_iso() -> string {
+    return _str(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()
+}
+
+fn _json_val(raw: string, key: string) -> string {
+    let needle = "\"" + key + "\":"
+    let idx = raw.index_of(needle)
+    if idx < 0 { return "" }
+    let after = raw.substring(idx + len(needle), len(raw)).trim()
+    if after.starts_with("\"") {
+        let rest = after.substring(1, len(after))
+        let q2 = rest.index_of("\"")
+        if q2 >= 0 { return rest.substring(0, q2) }
+        return ""
+    }
+    let mut buf = ""
+    let mut ci: i64 = 0
+    while ci < len(after) {
+        let c = after[ci..ci + 1]
+        if c == "," || c == "}" || c == " " || c == "\n" { ci = len(after) }
+        else { buf = buf + c }
+        ci = ci + 1
+    }
+    return buf
+}
+
+fn _json_int(raw: string, key: string) -> i64 {
+    return _to_int0(_json_val(raw, key))
+}
+
+// ─── atlas guard (atlas_guard.hexa.inc pattern) ───
+fn _valid_atlas_line(line: string) -> bool {
+    let t = line.trim()
+    if len(t) == 0 { return true }
+    let allowed = "#{@\"<>!-"
+    return allowed.contains(t[0..1])
+}
+
+fn _guarded_append_atlas(path: string, content: string) -> i64 {
+    if len(content) == 0 { return 0 }
+    let is_atlas = path.contains("atlas.n6")
+    let lines = content.split("\n")
+    let mut rejected: i64 = 0
+    let mut deduped: i64 = 0
+    let mut valid_lines: [string] = []
+    let mut valid_trimmed: [string] = []
+    let mut needs_dedup: [bool] = []
+    let mut i: i64 = 0
+    while i < len(lines) {
+        let line = lines[i]
+        if !_valid_atlas_line(line) {
+            rejected = rejected + 1
+            i = i + 1
+            continue
+        }
+        let t = line.trim()
+        let do_dedup = is_atlas && len(t) > 0 && !t.starts_with("#")
+        valid_lines = valid_lines + [line]
+        valid_trimmed = valid_trimmed + [t]
+        needs_dedup = needs_dedup + [do_dedup]
+        i = i + 1
+    }
+    // batch dedup via grep -Fxf (1 exec)
+    let mut dup_set = #{}
+    let mut has_any = false
+    i = 0
+    while i < len(valid_lines) {
+        if needs_dedup[i] { has_any = true }
+        i = i + 1
+    }
+    if has_any {
+        let _tmp = "/tmp/.atlas_bootstrap_dedup." + to_string(exec("echo $$").trim())
+        let mut patterns: [string] = []
+        i = 0
+        while i < len(valid_lines) {
+            if needs_dedup[i] { patterns = patterns + [valid_trimmed[i]] }
+            i = i + 1
+        }
+        try {
+            write_file(_tmp, "\n".join(patterns))
+            let found_raw = to_string(exec("grep -Fxf '" + _tmp + "' '" + path + "' 2>/dev/null || true"))
+            let found_lines = found_raw.split("\n")
+            for fl in found_lines {
+                let ft = fl.trim()
+                if len(ft) > 0 { dup_set[ft] = true }
+            }
+        } catch e {}  // @allow-silent-catch
+        try { exec("rm -f '" + _tmp + "' 2>/dev/null") } catch e {}  // @allow-silent-catch
+    }
+    let mut clean_parts: [string] = []
+    i = 0
+    while i < len(valid_lines) {
+        if needs_dedup[i] {
+            let t = valid_trimmed[i]
+            let mut is_dup = false
+            try { is_dup = dup_set[t] == true } catch e {}  // @allow-silent-catch
+            if is_dup { deduped = deduped + 1; i = i + 1; continue }
+        }
+        clean_parts = clean_parts + [valid_lines[i]]
+        i = i + 1
+    }
+    if rejected > 0 { println("  [schema guard] rejected " + to_string(rejected) + " invalid lines") }
+    if deduped > 0 { println("  [dedup guard] skipped " + to_string(deduped) + " duplicate lines") }
+    if len(clean_parts) > 0 {
+        let mut clean = "\n".join(clean_parts)
+        if !clean.ends_with("\n") { clean = clean + "\n" }
+        try { append_file(path, clean) } catch e {}  // @allow-silent-catch
+    }
+    return rejected
+}
+
+// ─── JSON node/edge generators ───
+fn _mk_node(id: string, ntype: string, domain: string, summary: string, conf: f64) -> string {
+    return "{\"type\":\"node\",\"id\":\"" + _jesc(id) + "\",\"node_type\":\"" + _jesc(ntype) + "\",\"domain\":\"" + _jesc(domain) + "\",\"summary\":\"" + _jesc(summary) + "\",\"confidence\":" + to_string(conf) + ",\"depth\":0,\"source\":\"bootstrap-mk3\"}"
+}
+
+fn _mk_edge(from_id: string, to_id: string, etype: string, strength: f64) -> string {
+    return "{\"type\":\"edge\",\"from\":\"" + _jesc(from_id) + "\",\"to\":\"" + _jesc(to_id) + "\",\"edge_type\":\"" + _jesc(etype) + "\",\"strength\":" + to_string(strength) + ",\"bidirectional\":false,\"source\":\"bootstrap-mk3\"}"
+}
+
+// ─── file checks ───
+if !file_exists(_ATLAS) {
+    println("error: atlas not found: " + _ATLAS)
+    exit(1)  // @allow-silent-exit
+}
+
+// ═══════════════════════════════════════════════════════════
+// CMD: status — Mk.III evolution tracking
+// ═══════════════════════════════════════════════════════════
+
+fn cmd_status() {
+    println("=== atlas Mk.III bootstrap status ===")
+    println("  atlas: " + _ATLAS)
+    println("  ts:    " + _now_iso())
+    println("")
+    // load stats sidecar
+    let mut stats_raw = ""
+    if file_exists(_STATS) {
+        try { stats_raw = read_file(_STATS).trim() } catch e {}  // @allow-silent-catch
+    }
+    let nodes = _json_int(stats_raw, "nodes")
+    let edges = _json_int(stats_raw, "edges")
+    let hubs = _json_int(stats_raw, "hubs")
+    let lines = _json_int(stats_raw, "line_count")
+    let size = _json_int(stats_raw, "size")
+    println("  nodes:    " + to_string(nodes))
+    println("  edges:    " + to_string(edges))
+    println("  hubs:     " + to_string(hubs))
+    println("  lines:    " + to_string(lines))
+    println("  size:     " + to_string(size) + " bytes")
+    println("")
+    // Mk.III markers: bootstrap-sourced entries
+    let mk3_nodes = _exec_int("grep -c 'bootstrap-mk3' '" + _ATLAS + "' 2>/dev/null")
+    println("  Mk.III bootstrapped entries: " + to_string(mk3_nodes))
+    // degree sidecar age
+    if file_exists(_DEG) {
+        let deg_lines = _exec_int("wc -l < '" + _DEG + "' 2>/dev/null")
+        println("  degree sidecar:  " + to_string(deg_lines) + " entries")
+    } else {
+        println("  degree sidecar:  MISSING (run blowup to regenerate)")
+    }
+    // evolution level
+    let mut level = "Mk.II"
+    if mk3_nodes >= 100 { level = "Mk.III (bootstrapping)" }
+    if mk3_nodes >= 500 { level = "Mk.III (active)" }
+    if mk3_nodes >= 1000 { level = "Mk.III (mature)" }
+    println("")
+    println("  evolution: " + level)
+    // ratio health
+    if nodes > 0 {
+        let ratio_x10 = edges * 10 / nodes
+        let ri = ratio_x10 / 10
+        let rf = ratio_x10 - ri * 10
+        println("  edge/node: " + to_string(ri) + "." + to_string(rf))
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// CMD: scan — growth point detection
+// ═══════════════════════════════════════════════════════════
+
+fn cmd_scan() {
+    println("=== atlas Mk.III growth point scan ===")
+    println("  ts: " + _now_iso())
+    println("")
+    if !file_exists(_DEG) {
+        println("error: degree sidecar not found: " + _DEG)
+        println("hint: run blowup or atlas_health to regenerate")
+        exit(1)  // @allow-silent-exit
+    }
+    // 1. degree distribution summary
+    let total = _exec_int("wc -l < '" + _DEG + "' 2>/dev/null")
+    let deg0 = _exec_int("awk -F'\\t' '$NF==0' '" + _DEG + "' | wc -l")
+    let deg1 = _exec_int("awk -F'\\t' '$NF==1' '" + _DEG + "' | wc -l")
+    let deg2 = _exec_int("awk -F'\\t' '$NF==2' '" + _DEG + "' | wc -l")
+    let deg3p = total - deg0 - deg1 - deg2
+    println("-- degree distribution --")
+    println("  total nodes:  " + to_string(total))
+    println("  isolated (0): " + to_string(deg0))
+    println("  leaf (1):     " + to_string(deg1))
+    println("  near-hub (2): " + to_string(deg2))
+    println("  hub (3+):     " + to_string(deg3p))
+    println("")
+    // 2. sparse domains — domains with highest % of degree<=1 nodes
+    println("-- sparsest domains (growth targets) --")
+    let sparse_raw = _exec_str("awk -F'\\t' '{ split($1,a,\"-\"); pfx=a[1]; tot[pfx]++; if($NF<=1) sp[pfx]++ } END { for(p in tot) { s=0; if(p in sp) s=sp[p]; if(tot[p]>=5) printf \"%d\\t%d\\t%s\\n\", s, tot[p], p } }' '" + _DEG + "' | sort -t$'\\t' -k1 -rn | head -" + to_string(_top_n))
+    let slines = sparse_raw.split("\n")
+    let mut si: i64 = 0
+    while si < len(slines) {
+        let sl = _str(slines[si]).trim()
+        si = si + 1
+        if sl == "" { continue }
+        let parts = sl.split("\t")
+        if len(parts) >= 3 {
+            let sp_count = _to_int0(parts[0])
+            let sp_total = _to_int0(parts[1])
+            let sp_name = parts[2]
+            let mut pct_x10: i64 = 0
+            if sp_total > 0 { pct_x10 = sp_count * 1000 / sp_total }
+            let pi = pct_x10 / 10
+            let pf = pct_x10 - pi * 10
+            let mut pad = sp_name
+            while len(pad) < 18 { pad = pad + " " }
+            println("  " + pad + to_string(sp_count) + "/" + to_string(sp_total) + " sparse  (" + to_string(pi) + "." + to_string(pf) + "%)")
+        }
+    }
+    println("")
+    // 3. near-hub candidates (degree=2 — one edge away from hub status)
+    println("-- near-hub candidates (degree=2, top " + to_string(_top_n) + ") --")
+    let nearhub_raw = _exec_str("awk -F'\\t' '$NF==2 { print $1 }' '" + _DEG + "' | head -" + to_string(_top_n))
+    let nh_lines = nearhub_raw.split("\n")
+    let mut ni: i64 = 0
+    let mut nh_count: i64 = 0
+    while ni < len(nh_lines) {
+        let nid = _str(nh_lines[ni]).trim()
+        ni = ni + 1
+        if nid == "" { continue }
+        if _verbose { println("    " + nid) }
+        nh_count = nh_count + 1
+    }
+    println("  near-hub pool: " + to_string(deg2) + " nodes (showed " + to_string(nh_count) + ")")
+    println("")
+    // 4. isolated node sample
+    if deg0 > 0 {
+        println("-- isolated nodes (degree=0, sample) --")
+        let iso_raw = _exec_str("awk -F'\\t' '$NF==0 { print $1 }' '" + _DEG + "' | head -20")
+        let iso_lines = iso_raw.split("\n")
+        for il in iso_lines {
+            let iid = _str(il).trim()
+            if iid != "" { println("    " + iid) }
+        }
+        println("")
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// CMD: hubs — hub analysis
+// ═══════════════════════════════════════════════════════════
+
+fn cmd_hubs() {
+    println("=== atlas Mk.III hub analysis ===")
+    println("  ts: " + _now_iso())
+    println("")
+    if !file_exists(_DEG) {
+        println("error: degree sidecar not found")
+        exit(1)  // @allow-silent-exit
+    }
+    // top hubs by degree
+    println("-- top " + to_string(_top_n) + " hubs (by degree) --")
+    let top_raw = _exec_str("sort -t$'\\t' -k2 -rn '" + _DEG + "' | head -" + to_string(_top_n))
+    let tlines = top_raw.split("\n")
+    let mut ti: i64 = 0
+    println("  rank  degree  id")
+    println("  ────  ──────  ──────────────────────────────")
+    while ti < len(tlines) {
+        let tl = _str(tlines[ti]).trim()
+        ti = ti + 1
+        if tl == "" { continue }
+        let tp = tl.split("\t")
+        if len(tp) >= 2 {
+            let mut rank_str = to_string(ti)
+            while len(rank_str) < 4 { rank_str = rank_str + " " }
+            let mut deg_str = tp[1]
+            while len(deg_str) < 6 { deg_str = deg_str + " " }
+            println("  " + rank_str + "  " + deg_str + "  " + tp[0])
+        }
+    }
+    println("")
+    // hub domain distribution
+    println("-- hub distribution by domain prefix --")
+    let hub_dom_raw = _exec_str("awk -F'\\t' '$NF>=3 { split($1,a,\"-\"); tot[a[1]]++ } END { for(p in tot) printf \"%d\\t%s\\n\", tot[p], p }' '" + _DEG + "' | sort -rn | head -15")
+    let hd_lines = hub_dom_raw.split("\n")
+    for hdl in hd_lines {
+        let hl = _str(hdl).trim()
+        if hl != "" { println("    " + hl) }
+    }
+    println("")
+    // potential new hubs (degree=2 nodes connected to existing hubs)
+    println("-- potential new hubs (near-hub + hub-adjacent) --")
+    let potential_count = _exec_int("awk -F'\\t' '$NF==2' '" + _DEG + "' | wc -l")
+    println("  degree-2 pool size: " + to_string(potential_count))
+    println("  (each needs 1 more connection to become hub)")
+    // domain breakdown of near-hubs
+    let nh_dom_raw = _exec_str("awk -F'\\t' '$NF==2 { split($1,a,\"-\"); tot[a[1]]++ } END { for(p in tot) printf \"%d\\t%s\\n\", tot[p], p }' '" + _DEG + "' | sort -rn | head -10")
+    let nd_lines = nh_dom_raw.split("\n")
+    println("  near-hub domains:")
+    for ndl in nd_lines {
+        let nl = _str(ndl).trim()
+        if nl != "" { println("    " + nl) }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// CMD: bootstrap — generate + validate candidates
+// ═══════════════════════════════════════════════════════════
+
+fn cmd_bootstrap() {
+    println("=== atlas Mk.III bootstrap: ext-sync + gap fill ===")
+    println("  mode: " + if _dry_run { "DRY-RUN" } else { "LIVE" })
+    println("  ts:   " + _now_iso())
+    println("")
+
+    // PHASE 0: run scan_ext_atlas to merge external project entries (581+)
+    let _HEXA_BIN = _NEXUS + "/shared/bin/hexa"
+    let scan_script = _NEXUS + "/shared/n6/scan_ext_atlas.hexa"
+    if file_exists(scan_script) && file_exists(_HEXA_BIN) {
+        println("  [Phase 0] running scan_ext_atlas...")
+        let scan_flags = if _dry_run { "--dry-run" } else { "" }
+        let vflag = if _verbose { "--verbose" } else { "" }
+        let mut scan_out = ""
+        try {
+            scan_out = _str(exec(_HEXA_BIN + " " + scan_script + " " + scan_flags + " " + vflag + " 2>&1"))
+        } catch e {
+            println("  warning: scan_ext_atlas failed: " + to_string(e))
+        }
+        let mut ext_total: i64 = 0
+        let out_lines = scan_out.split("\n")
+        for ol in out_lines {
+            let ot = _str(ol).trim()
+            if ot.starts_with("total new entries:") {
+                let oparts = ot.split(":")
+                if len(oparts) >= 2 { ext_total = _to_int0(_str(oparts[1]).trim()) }
+            }
+            if _verbose && ot != "" { println("    | " + ot) }
+        }
+        println("  ext-sync entries: " + to_string(ext_total))
+        println("")
+    }
+
+    // PHASE 0b: bridge atlas.signals.n6 -> atlas.n6
+    let signals_path = _NEXUS + "/shared/n6/atlas.signals.n6"
+    let mut sig_count: i64 = 0
+    if file_exists(signals_path) {
+        println("  [Phase 0b] bridging atlas.signals.n6...")
+        let mut sig_raw = ""
+        try { sig_raw = _str(exec("grep -oE '^@S SIG-[A-Z0-9_-]+' '" + signals_path + "' 2>/dev/null")) } catch e {}  // @allow-silent-catch
+        if sig_raw != "" {
+            let sig_lines = sig_raw.split("\n")
+            let mut sig_content = "# ── bootstrap-mk3: signals bridge (" + _now_iso() + ") ──\n"
+            let mut si: i64 = 0
+            while si < len(sig_lines) {
+                let sline = _str(sig_lines[si]).trim()
+                si = si + 1
+                if sline == "" { continue }
+                let sp = sline.split(" ")
+                if len(sp) < 2 { continue }
+                let sig_id = _str(sp[1]).trim()
+                if sig_id == "" { continue }
+                let node_id = "sig-" + sig_id
+                let mut domain = "signal"
+                if sig_id.contains("SR") { domain = "stochastic-resonance" }
+                else if sig_id.contains("OURO") { domain = "ouroboros" }
+                else if sig_id.contains("DD") { domain = "consciousness" }
+                sig_content = sig_content + _mk_node(node_id, "Signal", domain, sig_id, 0.8) + "\n"
+                sig_content = sig_content + _mk_edge("n", node_id, "Derives", 0.6) + "\n"
+                sig_count = sig_count + 1
+                if _verbose { println("    + " + node_id) }
+            }
+            if sig_count > 0 && !_dry_run {
+                _guarded_append_atlas(_ATLAS, sig_content)
+            }
+        }
+        println("  signal bridge nodes: " + to_string(sig_count))
+        println("")
+    }
+
+    if !file_exists(_DEG) {
+        println("  regenerating degree sidecar...")
+        _regen_deg()
+    }
+    // PHASE 1: identify isolated + leaf nodes
+    let iso_raw = _exec_str("awk -F'\\t' '$NF==0 { print $1 }' '" + _DEG + "' | head -50")
+    let leaf_raw = _exec_str("awk -F'\\t' '$NF==1 { print $1 }' '" + _DEG + "' | head -50")
+    // PHASE 2: identify top hubs (connect targets)
+    let hub_raw = _exec_str("sort -t$'\\t' -k2 -rn '" + _DEG + "' | head -10 | awk -F'\\t' '{print $1}'")
+    let hub_ids = hub_raw.split("\n")
+    let mut hubs: [string] = []
+    for h in hub_ids {
+        let hid = _str(h).trim()
+        if hid != "" { hubs = hubs + [hid] }
+    }
+    if len(hubs) == 0 {
+        println("error: no hubs found in degree sidecar")
+        exit(1)  // @allow-silent-exit
+    }
+    // PHASE 3: generate bridge edges (isolated/leaf -> nearest hub)
+    let mut entries: [string] = []
+    let mut gen_count: i64 = 0
+    // 3a: connect isolated nodes to domain-matched hub or top hub
+    let iso_ids = iso_raw.split("\n")
+    let mut ii: i64 = 0
+    while ii < len(iso_ids) {
+        let iid = _str(iso_ids[ii]).trim()
+        ii = ii + 1
+        if iid == "" { continue }
+        // pick hub: try domain match first, fallback to top hub
+        let iparts = iid.split("-")
+        let ipfx = if len(iparts) > 0 { iparts[0] } else { "" }
+        let mut target_hub = hubs[0]
+        let mut hi: i64 = 0
+        while hi < len(hubs) {
+            if hubs[hi].starts_with(ipfx + "-") { target_hub = hubs[hi]; hi = len(hubs) }
+            hi = hi + 1
+        }
+        entries = entries + [_mk_edge(iid, target_hub, "bootstrap-bridge", 0.3)]
+        gen_count = gen_count + 1
+        if _verbose { println("    bridge: " + iid + " -> " + target_hub) }
+    }
+    // 3b: connect leaf nodes that share domain prefix (intra-domain edges)
+    let leaf_ids = leaf_raw.split("\n")
+    let mut domain_buckets = #{}
+    let mut li: i64 = 0
+    while li < len(leaf_ids) {
+        let lid = _str(leaf_ids[li]).trim()
+        li = li + 1
+        if lid == "" { continue }
+        let lparts = lid.split("-")
+        let lpfx = if len(lparts) > 0 { lparts[0] } else { "unknown" }
+        let mut existing = ""
+        try { existing = _str(domain_buckets[lpfx]) } catch e {}  // @allow-silent-catch
+        if existing == "" {
+            domain_buckets[lpfx] = lid
+        } else {
+            // connect this leaf to previous leaf in same domain
+            entries = entries + [_mk_edge(existing, lid, "bootstrap-cluster", 0.4)]
+            gen_count = gen_count + 1
+            domain_buckets[lpfx] = lid
+            if _verbose { println("    cluster: " + existing + " -> " + lid) }
+        }
+    }
+    // 3c: near-hub promotion — connect degree-2 nodes to a second hub
+    let nearhub_raw = _exec_str("awk -F'\\t' '$NF==2 { print $1 }' '" + _DEG + "' | head -30")
+    let nh_ids = nearhub_raw.split("\n")
+    let mut ni: i64 = 0
+    while ni < len(nh_ids) {
+        let nid = _str(nh_ids[ni]).trim()
+        ni = ni + 1
+        if nid == "" { continue }
+        // pick a hub this near-hub is NOT already connected to
+        let hub_idx = ni % len(hubs)
+        let target = hubs[hub_idx]
+        entries = entries + [_mk_edge(nid, target, "bootstrap-promote", 0.35)]
+        gen_count = gen_count + 1
+        if _verbose { println("    promote: " + nid + " -> " + target) }
+    }
+    println("  candidates generated: " + to_string(gen_count))
+    println("    isolated->hub bridges: " + to_string(len(iso_ids)))
+    println("    leaf cluster edges:    intra-domain pairing")
+    println("    near-hub promotions:   " + to_string(len(nh_ids)))
+    println("")
+    // PHASE 4: write via _guarded_append_atlas
+    if !_dry_run && len(entries) > 0 {
+        let mut content = "# ── bootstrap-mk3: self-expansion (" + _now_iso() + ") ──\n"
+        let mut ei: i64 = 0
+        while ei < len(entries) {
+            content = content + entries[ei] + "\n"
+            ei = ei + 1
+        }
+        let rej = _guarded_append_atlas(_ATLAS, content)
+        let accepted = gen_count - rej
+        println("  written: " + to_string(accepted) + " entries (rejected: " + to_string(rej) + ")")
+        // PHASE 5: regenerate sidecars
+        println("")
+        println("  [Phase 5] regenerating sidecars...")
+        _regen_deg()
+        let deg_lines = _exec_int("wc -l < '" + _DEG + "' 2>/dev/null")
+        println("  degree entries: " + to_string(deg_lines))
+        _update_stats_full()
+        // update mk3 tracking
+        _update_stats_mk3(accepted)
+    } else if _dry_run {
+        println("  (dry-run: no changes written)")
+        if _verbose {
+            println("  sample entries:")
+            let mut si: i64 = 0
+            while si < len(entries) && si < 5 {
+                println("    " + entries[si])
+                si = si + 1
+            }
+        }
+    }
+}
+
+// ─── degree sidecar regeneration (awk 1-pass) ───
+fn _regen_deg() {
+    try {
+        exec("bash", ["-c", "awk -F'\"' '/\"type\":\"edge\"/ { for(i=1;i<=NF;i++) { if($i==\"from\") f=$(i+2); if($i==\"to\") t=$(i+2) } if(f) d[f]++; if(t) d[t]++ } END { for(k in d) print k\"\\t\"d[k] }' '" + _ATLAS + "' | sort -t'\t' -k2 -rn > '" + _DEG + "'"])
+    } catch e { println("  error: deg regen failed") }
+}
+
+// ─── full stats sidecar update ───
+fn _update_stats_full() {
+    let mut mtime = ""
+    try { mtime = to_string(exec("stat -f '%m' '" + _ATLAS + "' 2>/dev/null")).trim() } catch e {}  // @allow-silent-catch
+    let size = _exec_int("stat -f '%z' '" + _ATLAS + "' 2>/dev/null")
+    let lines = _exec_int("wc -l < '" + _ATLAS + "' 2>/dev/null")
+    let nodes = _exec_int("grep -c '\"type\":\"node\"' '" + _ATLAS + "' 2>/dev/null")
+    let edges = _exec_int("grep -c '\"type\":\"edge\"' '" + _ATLAS + "' 2>/dev/null")
+    let mut head_hash = ""
+    try { head_hash = to_string(exec("head -c 256 '" + _ATLAS + "' | md5 -q 2>/dev/null")).trim() } catch e {}  // @allow-silent-catch
+    let hubs = _exec_int("awk -F'\"id\":\"' '/\"type\":\"(node|absorb)\"/{split($2,a,\"\\\"\");print a[1]}' '" + _ATLAS + "' | sort -u | wc -l")
+    let json = "{\"schema\":2,\"mtime\":" + mtime + ",\"size\":" + to_string(size) + ",\"line_count\":" + to_string(lines) + ",\"head_hash\":\"" + head_hash + "\",\"nodes\":" + to_string(nodes) + ",\"edges\":" + to_string(edges) + ",\"hubs\":" + to_string(hubs) + "}"
+    try { write_file(_STATS, json + "\n") } catch e {}  // @allow-silent-catch
+    println("  stats: nodes=" + to_string(nodes) + " edges=" + to_string(edges) + " hubs=" + to_string(hubs))
+}
+
+fn _update_stats_mk3(new_count: i64) {
+    // read current stats, add mk3 tracking fields
+    let mut raw = ""
+    if file_exists(_STATS) {
+        try { raw = read_file(_STATS).trim() } catch e {}  // @allow-silent-catch
+    }
+    if raw == "" { return }
+    // inject mk3 fields before closing brace
+    let close = raw.index_of("}")
+    if close < 0 { return }
+    let prefix = raw.substring(0, close)
+    let existing_mk3 = _json_int(raw, "mk3_entries")
+    let total_mk3 = existing_mk3 + new_count
+    let ts = _now_iso()
+    let suffix = ",\"mk3_entries\":" + to_string(total_mk3) + ",\"mk3_last_bootstrap\":\"" + ts + "\"}"
+    try { write_file(_STATS, prefix + suffix + "\n") } catch e {}  // @allow-silent-catch
+    println("  stats updated: mk3_entries=" + to_string(total_mk3))
+}
+
+// ═══════════════════════════════════════════════════════════
+// CMD: growth-points — degree centrality hub classification + growth candidates
+// hub = degree >= _min_deg, 분류: mega(1000+), major(100+), rising(min_deg+)
+// ═══════════════════════════════════════════════════════════
+
+fn cmd_growth_points() {
+    println("=== atlas Mk.III growth-points ===")
+    println("  atlas:    " + _ATLAS)
+    println("  min-deg:  " + to_string(_min_deg))
+    println("  top-n:    " + to_string(_top_n))
+    println("  ts:       " + _now_iso())
+    println("")
+
+    if !file_exists(_DEG) {
+        println("  degree sidecar missing, regenerating...")
+        _regen_deg()
+    }
+
+    // load degree sidecar into parallel lists
+    let deg_raw = _exec_str("cat '" + _DEG + "' 2>/dev/null")
+    let deg_lines = deg_raw.split("\n")
+    let mut d_ids: [string] = []
+    let mut d_vals: [i64] = []
+    let mut di: i64 = 0
+    while di < len(deg_lines) {
+        let dl = _str(deg_lines[di]).trim()
+        di = di + 1
+        if dl == "" { continue }
+        let dp = dl.split("\t")
+        if len(dp) < 2 { continue }
+        let did = _str(dp[0]).trim()
+        let dv = _to_int0(_str(dp[1]).trim())
+        if did != "" && dv > 0 {
+            d_ids = d_ids + [did]
+            d_vals = d_vals + [dv]
+        }
+    }
+    let total = len(d_ids)
+    println("  total nodes: " + to_string(total))
+
+    // classify: mega / major / rising / leaf
+    let mut mega_ids: [string] = []
+    let mut mega_degs: [i64] = []
+    let mut major_ids: [string] = []
+    let mut major_degs: [i64] = []
+    let mut rising_ids: [string] = []
+    let mut rising_degs: [i64] = []
+    let mut leaf_count: i64 = 0
+
+    let mut i: i64 = 0
+    while i < total {
+        let d = d_vals[i]
+        if d >= 1000 {
+            mega_ids = mega_ids + [d_ids[i]]
+            mega_degs = mega_degs + [d]
+        } else if d >= 100 {
+            major_ids = major_ids + [d_ids[i]]
+            major_degs = major_degs + [d]
+        } else if d >= _min_deg {
+            rising_ids = rising_ids + [d_ids[i]]
+            rising_degs = rising_degs + [d]
+        } else {
+            leaf_count = leaf_count + 1
+        }
+        i = i + 1
+    }
+
+    // output
+    println("")
+    println("  --- MEGA hubs (degree >= 1000) : " + to_string(len(mega_ids)) + " ---")
+    i = 0
+    while i < len(mega_ids) {
+        println("    " + mega_ids[i] + "\t" + to_string(mega_degs[i]))
+        i = i + 1
+    }
+
+    println("")
+    println("  --- MAJOR hubs (degree 100-999) : " + to_string(len(major_ids)) + " ---")
+    i = 0
+    let major_limit = if len(major_ids) < _top_n { len(major_ids) } else { _top_n }
+    while i < major_limit {
+        println("    " + major_ids[i] + "\t" + to_string(major_degs[i]))
+        i = i + 1
+    }
+
+    println("")
+    println("  --- RISING hubs (degree " + to_string(_min_deg) + "-99) : " + to_string(len(rising_ids)) + " ---")
+    i = 0
+    let rising_limit = if len(rising_ids) < _top_n { len(rising_ids) } else { _top_n }
+    while i < rising_limit {
+        println("    " + rising_ids[i] + "\t" + to_string(rising_degs[i]))
+        i = i + 1
+    }
+
+    println("")
+    println("  --- LEAF nodes (degree < " + to_string(_min_deg) + ") : " + to_string(leaf_count) + " ---")
+
+    // growth metric
+    let hub_total = len(mega_ids) + len(major_ids) + len(rising_ids)
+    let hub_pct = if total > 0 { (hub_total * 100) / total } else { 0 }
+    println("")
+    println("=== growth summary ===")
+    println("  total:    " + to_string(total))
+    println("  hubs:     " + to_string(hub_total) + " (" + to_string(hub_pct) + "%)")
+    println("  mega:     " + to_string(len(mega_ids)))
+    println("  major:    " + to_string(len(major_ids)))
+    println("  rising:   " + to_string(len(rising_ids)))
+    println("  leaves:   " + to_string(leaf_count))
+
+    // growth points = rising hubs with low cross-domain connectivity
+    println("")
+    println("  --- GROWTH POINTS (rising hubs, expansion candidates) ---")
+    let mut gp_count: i64 = 0
+    i = 0
+    while i < len(rising_ids) && gp_count < _top_n {
+        let rid = rising_ids[i]
+        let rd = rising_degs[i]
+        i = i + 1
+        // count cross-domain edges for this node
+        let mut cross: i64 = 0
+        try {
+            let cr = _exec_str("grep -c 'CrossDomain.*\"" + rid + "\"\\|\"" + rid + "\".*CrossDomain' '" + _ATLAS + "' 2>/dev/null")
+            cross = _to_int0(cr)
+        } catch e {}  // @allow-silent-catch
+        // growth point if no cross-domain edges or very few
+        if cross <= 1 {
+            println("    [GP] " + rid + "  deg=" + to_string(rd) + "  cross=" + to_string(cross))
+            gp_count = gp_count + 1
+        }
+    }
+    if gp_count == 0 { println("    (all rising hubs have cross-domain edges)") }
+}
+
+// ═══════════════════════════════════════════════════════════
+// CMD: recommend — suggest new edges for leaf/isolated nodes
+// domain-prefix matching to connect orphans to nearest hub
+// ═══════════════════════════════════════════════════════════
+
+fn cmd_recommend() {
+    println("=== atlas Mk.III edge recommendations ===")
+    println("  atlas:  " + _ATLAS)
+    println("  top-n:  " + to_string(_top_n))
+    println("  mode:   " + if _dry_run { "DRY-RUN" } else { "LIVE" })
+    println("  ts:     " + _now_iso())
+    println("")
+
+    if !file_exists(_DEG) {
+        println("  degree sidecar missing, regenerating...")
+        _regen_deg()
+    }
+
+    // load hub list (degree >= 50)
+    let hub_raw = _exec_str("awk -F'\\t' '$2>=50 { print $1\"\\t\"$2 }' '" + _DEG + "' | sort -t$'\\t' -k2 -rn")
+    let hub_lines = hub_raw.split("\n")
+    let mut hub_ids: [string] = []
+    let mut hi: i64 = 0
+    while hi < len(hub_lines) {
+        let hl = _str(hub_lines[hi]).trim()
+        hi = hi + 1
+        if hl == "" { continue }
+        let hp = hl.split("\t")
+        if len(hp) >= 1 { hub_ids = hub_ids + [_str(hp[0]).trim()] }
+    }
+    println("  hubs (deg>=50): " + to_string(len(hub_ids)))
+
+    // load leaf nodes (degree <= 2 = appears in only 1 edge, sample 200)
+    let leaf_raw = _exec_str("awk -F'\\t' '$2<=2 { print $1 }' '" + _DEG + "' | head -200")
+    let leaf_lines = leaf_raw.split("\n")
+    let mut leaf_ids: [string] = []
+    let mut li: i64 = 0
+    while li < len(leaf_lines) {
+        let ll = _str(leaf_lines[li]).trim()
+        li = li + 1
+        if ll != "" { leaf_ids = leaf_ids + [ll] }
+    }
+    println("  leaf sample: " + to_string(len(leaf_ids)))
+    println("")
+
+    // domain prefix -> recommended hub mapping
+    let dom_pfx = ["blowup-d0", "blowup-d1", "blowup-d2", "blowup-d3", "n6-", "n6arch-", "anima-", "airgenome-", "papers-", "sig-"]
+    let dom_hub = ["n", "sigma", "phi", "tau", "n6-sigma", "n", "n", "n", "n", "n"]
+
+    let mut rec_count: i64 = 0
+    let mut rec_content = "# ── bootstrap-mk3: recommended edges (" + _now_iso() + ") ──\n"
+
+    println("  --- RECOMMENDATIONS ---")
+    let mut ri: i64 = 0
+    while ri < len(leaf_ids) && rec_count < _top_n {
+        let leaf = leaf_ids[ri]
+        ri = ri + 1
+
+        // find matching domain prefix
+        let mut matched_hub = ""
+        let mut pi: i64 = 0
+        while pi < len(dom_pfx) {
+            if leaf.starts_with(dom_pfx[pi]) {
+                matched_hub = dom_hub[pi]
+                pi = len(dom_pfx)
+            }
+            pi = pi + 1
+        }
+        if matched_hub == "" { continue }
+
+        // check if edge already exists (from->to or to->from)
+        let mut exists = false
+        try {
+            let check1 = _exec_int("grep -c '\"from\":\"" + matched_hub + "\".*\"to\":\"" + leaf + "\"' '" + _ATLAS + "' 2>/dev/null")
+            if check1 > 0 { exists = true }
+        } catch e {}  // @allow-silent-catch
+        if !exists {
+            try {
+                let check2 = _exec_int("grep -c '\"from\":\"" + leaf + "\".*\"to\":\"" + matched_hub + "\"' '" + _ATLAS + "' 2>/dev/null")
+                if check2 > 0 { exists = true }
+            } catch e {}  // @allow-silent-catch
+        }
+        if exists { continue }
+
+        let edge = _mk_edge(matched_hub, leaf, "CrossDomain", 0.5)
+        rec_content = rec_content + edge + "\n"
+        println("    " + matched_hub + " -> " + leaf + "  [CrossDomain, 0.5]")
+        rec_count = rec_count + 1
+    }
+
+    println("")
+    println("  recommendations: " + to_string(rec_count))
+
+    if rec_count > 0 && !_dry_run {
+        println("")
+        println("  writing " + to_string(rec_count) + " recommended edges...")
+        _guarded_append_atlas(_ATLAS, rec_content)
+        // regenerate sidecars
+        _regen_deg()
+        _update_stats_full()
+    } else if _dry_run {
+        println("  (dry-run: no changes written)")
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// dispatch
+// ═══════════════════════════════════════════════════════════
+
+if _cmd == "status" { cmd_status() }
+else if _cmd == "scan" { cmd_scan() }
+else if _cmd == "hubs" { cmd_hubs() }
+else if _cmd == "bootstrap" { cmd_bootstrap() }
+else if _cmd == "growth-points" { cmd_growth_points() }
+else if _cmd == "recommend" { cmd_recommend() }
+else {
+    println("error: unknown command '" + _cmd + "'")
+    println("usage: hexa atlas_bootstrap.hexa <scan|bootstrap|hubs|status|growth-points|recommend>")
+    exit(1)  // @allow-silent-exit
+}

@@ -1,0 +1,349 @@
+// bt_target_recommender.hexa — CDG cross-grid results -> BT target recommendation engine
+// task: CDG-P8-2 — connect CDG pair scoring to BT attack targeting
+// usage: hexa bt_target_recommender.hexa <recommend|gaps|coverage|status> [--bt <id>]
+// output: stdout + append to shared/dse/bt_recommendations.jsonl
+// honesty: scoring is heuristic (weighted composite), not proof of BT feasibility
+// ref: pair_scores.jsonl (17205 pairs), metacog_BT-541..547, dse_cross_results.json
+
+let HOME = env("HOME")
+let NEXUS = HOME + "/Dev/nexus"
+let PAIR_SCORES = NEXUS + "/shared/dse/cross/pair_scores.jsonl"
+let OUT_PATH = NEXUS + "/shared/dse/bt_recommendations.jsonl"
+
+// BT-541..547 millennium problems: "domain|name|cdg_keywords"
+let BT_META = #{
+    "BT-541": "math:analytic_number_theory|Riemann Hypothesis|zeta,prime,analytic,number-theory,pure-mathematics,probability-statistics",
+    "BT-542": "cs:complexity_theory|P vs NP|complexity,graph,cryptography,coding-lattice,information-theory,programming-language",
+    "BT-543": "physics:particle_qcd|Yang-Mills mass gap|particle,gauge,qft,plasma-physics,statistical-mechanics,cosmology-particle,physics-fundamental",
+    "BT-544": "physics:fluid_dynamics|Navier-Stokes|fluid,turbulence,chaos-dynamical,oceanography,aerospace-propulsion,marine-propulsion",
+    "BT-545": "math:algebraic_geometry|Hodge Conjecture|algebraic,cohomology,topology,noncommutative-geometry,pure-mathematics,crystallography",
+    "BT-546": "math:number_theory|BSD Conjecture|elliptic,modular,number-theory,pure-mathematics,cryptography,elliptic-curves",
+    "BT-547": "math:topology|Poincare Conjecture|topology,manifold,ricci,pure-mathematics,noncommutative-geometry,cosmology-particle"
+}
+
+// attack history: BTs with existing attack results
+let BT_ATTACKS = #{
+    "BT-541": "round_1:MISS:RH_ladder_2_steps",
+    "BT-543": "round_1:MISS:beta0_sigma-sopfr_refined"
+}
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+fn now_ts() -> string {
+    let mut ts = ""
+    try { ts = _str(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim() } catch e {}
+    return ts
+}
+fn json_esc(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", " ")
+    return r
+}
+fn fs(x: float) -> string { return to_string(x) }
+fn _map_has(m: map, key: string) -> bool {
+    let ks = m.keys()
+    for k in ks {
+        if k == key { return true }
+    }
+    return false
+}
+fn safe_float(s: string) -> float {
+    let mut v = 0.0
+    try { v = to_float(s) } catch e {}
+    return v
+}
+fn load_top_pairs(n: int) -> [string] {
+    let raw = read_file(PAIR_SCORES)
+    let lines = raw.split("\n")
+    let mut result: [string] = []
+    let mut count = 0
+    let mut i = 0
+    while i < lines.len() {
+        let line = lines[i].trim()
+        if line.len() > 2 && line.starts_with("{") {
+            result = result.push(line)
+            count = count + 1
+            if count >= n { return result }
+        }
+        i = i + 1
+    }
+    return result
+}
+fn parse_pair(line: string) -> map {
+    let mut m = #{"a": "", "b": "", "score": "0", "n6_prox": "0", "bidir": "0", "bt_ids": "-", "shared_consts": "-", "jaccard": "0"}
+    let flds = ["a", "b", "score", "n6_prox", "bidir", "bt_ids", "shared_consts", "jaccard"]
+    for fld in flds {
+        let key = "\"" + fld + "\":"
+        let idx = line.index_of(key)
+        if idx >= 0 {
+            let after = line.substring((idx + key.len()), line.len())
+            let mut val = ""
+            if after.starts_with(" \"") || after.starts_with("\"") {
+                let start = after.index_of("\"") + 1
+                let end = after.substring(start, after.len()).index_of("\"")
+                if end >= 0 { val = after.substring(start, (start + end)) }
+            } else {
+                let trimmed = after.trim()
+                let comma = trimmed.index_of(",")
+                let brace = trimmed.index_of("}")
+                let mut stop = trimmed.len()
+                if comma >= 0 && comma < stop { stop = comma }
+                if brace >= 0 && brace < stop { stop = brace }
+                val = trimmed.substring(0, stop).trim()
+            }
+            m[fld] = val
+        }
+    }
+    return m
+}
+fn bt_domain_keywords(bt_id: string) -> [string] {
+    let meta_keys = BT_META.keys()
+    for k in meta_keys {
+        if k == bt_id {
+            let parts = BT_META[k].split("|")
+            if parts.len() >= 3 {
+                return parts[2].split(",")
+            }
+        }
+    }
+    return []
+}
+fn bt_name(bt_id: string) -> string {
+    let meta_keys = BT_META.keys()
+    for k in meta_keys {
+        if k == bt_id {
+            let parts = BT_META[k].split("|")
+            if parts.len() >= 2 { return parts[1] }
+        }
+    }
+    return bt_id
+}
+fn pair_bt_relevance(pair_a: string, pair_b: string, bt_id: string) -> float {
+    let kws = bt_domain_keywords(bt_id)
+    if kws.len() == 0 { return 0.0 }
+    let ab = pair_a + "|" + pair_b
+    let mut hits = 0.0
+    for kw in kws {
+        let kw_t = kw.trim()
+        if kw_t.len() > 0 && ab.contains(kw_t) {
+            hits = hits + 1.0
+        }
+    }
+    return hits / to_float(kws.len())
+}
+fn composite_score(cdg_score: float, n6_prox: float, bidir: float, bt_relevance: float, has_prior_attack: bool) -> float {
+    // weights: CDG 0.3 + n6_prox 0.25 + bidir 0.15 + BT_rel 0.3; +15% if prior MISS
+    let mut s = cdg_score * 0.3 + n6_prox * 0.25 + bidir * 0.15 + bt_relevance * 0.3
+    if has_prior_attack { s = s * 1.15 }
+    return s
+}
+fn has_attack(bt_id: string) -> bool {
+    let atk_keys = BT_ATTACKS.keys()
+    for k in atk_keys {
+        if k == bt_id { return true }
+    }
+    return false
+}
+fn emit_rec(bt_id: string, pair_a: string, pair_b: string, score: float, rationale: string, vector: string) {
+    let row = "{\"ts\":\"" + now_ts() + "\",\"bt_id\":\"" + json_esc(bt_id)
+        + "\",\"cdg_pair\":[\"" + json_esc(pair_a) + "\",\"" + json_esc(pair_b)
+        + "\"],\"composite_score\":" + fs(score) + ",\"rationale\":\""
+        + json_esc(rationale) + "\",\"attack_vector\":\"" + json_esc(vector) + "\"}"
+    append_file(OUT_PATH, row + "\n")
+}
+
+let cli_args = args()
+let mut mode = "recommend"
+let mut filter_bt = ""
+let mut i = 0
+while i < cli_args.len() {
+    let a = cli_args[i]
+    if a == "recommend" || a == "gaps" || a == "coverage" || a == "status" {
+        mode = a
+    }
+    if a == "--bt" && (i + 1) < cli_args.len() {
+        filter_bt = cli_args[(i + 1)]
+        i = i + 1
+    }
+    i = i + 1
+}
+
+// === MODE: status ===
+if mode == "status" {
+    let raw = read_file(PAIR_SCORES)
+    let total_lines = raw.split("\n").len()
+    let bt_keys = BT_META.keys()
+    let atk_keys = BT_ATTACKS.keys()
+    println("=== BT Target Recommender — Status ===")
+    println("CDG pairs available: " + to_string(total_lines))
+    println("BT targets (millennium): " + to_string(bt_keys.len()))
+    println("BTs with prior attacks: " + to_string(atk_keys.len()))
+    for ak in atk_keys {
+        println("  " + ak + ": " + BT_ATTACKS[ak])
+    }
+    let mut rec_count = 0
+    if file_exists(OUT_PATH) {
+        let rec_raw = read_file(OUT_PATH)
+        let rec_lines = rec_raw.split("\n")
+        for rl in rec_lines {
+            if rl.trim().len() > 2 { rec_count = rec_count + 1 }
+        }
+    }
+    println("Recommendations emitted: " + to_string(rec_count))
+    println("Output: shared/dse/bt_recommendations.jsonl")
+}
+// === MODE: coverage ===
+if mode == "coverage" {
+    let pairs = load_top_pairs(200)
+    let bt_keys = BT_META.keys()
+    println("=== BT Coverage Map ===")
+    println("BT_ID       | Name                     | CDG support | Prior attack | Top CDG pair")
+    println("----------- | ------------------------ | ----------- | ------------ | -----------")
+    for bt in bt_keys {
+        let name = bt_name(bt)
+        let short_name = name.substring(0, min(24, name.len()))
+        let mut best_pair = "-"
+        let mut best_rel = 0.0
+        let mut support = 0
+        for pline in pairs {
+            let p = parse_pair(pline)
+            let rel = pair_bt_relevance(p["a"], p["b"], bt)
+            if rel > 0.0 { support = support + 1 }
+            if rel > best_rel {
+                best_rel = rel
+                best_pair = p["a"] + " x " + p["b"]
+            }
+        }
+        let atk = has_attack(bt)
+        let atk_str = if atk { "YES" } else { "no" }
+        println(bt + " | " + short_name + " | "
+            + to_string(support) + " pairs   | " + atk_str
+            + "          | " + best_pair)
+    }
+}
+// === MODE: gaps ===
+if mode == "gaps" {
+    let pairs = load_top_pairs(100)
+    println("=== Unexplored High-Potential CDG Pairs (no BT attack overlap) ===")
+    println("Rank | Pair                                     | Score  | n6_prox | BT_ids | Consts")
+    println("---- | ---------------------------------------- | ------ | ------- | ------ | ------")
+    let mut rank = 0
+    for pline in pairs {
+        let p = parse_pair(pline)
+        let bt_ids_val = p["bt_ids"]
+        // gap = high score but bt_ids == "-" (no associated BTs)
+        if bt_ids_val == "-" {
+            rank = rank + 1
+            let sc = p["score"]
+            let np = p["n6_prox"]
+            let pname = p["a"] + " x " + p["b"]
+            println(to_string(rank) + "    | " + pname + " | " + sc + " | " + np + "     | GAP    | " + p["shared_consts"])
+            if rank >= 20 { break }
+        }
+    }
+    if rank == 0 { println("No gaps found in top 100 pairs.") }
+}
+// === MODE: recommend ===
+if mode == "recommend" {
+    let pairs = load_top_pairs(300)
+    let bt_keys = BT_META.keys()
+
+    let mut recs: [string] = []
+    let target_bts = if filter_bt.len() > 0 { [filter_bt] } else { bt_keys }
+    for bt in target_bts {
+        let prior = has_attack(bt)
+        for pline in pairs {
+            let p = parse_pair(pline)
+            let rel = pair_bt_relevance(p["a"], p["b"], bt)
+            if rel <= 0.0 { continue }
+            let cdg_score = safe_float(p["score"])
+            let n6p = safe_float(p["n6_prox"])
+            let bid = safe_float(p["bidir"])
+            let comp = composite_score(cdg_score, n6p, bid, rel, prior)
+            if comp < 0.2 { continue }
+            let rat = "CDG(" + p["a"] + "," + p["b"] + ") score=" + p["score"]
+                + " n6=" + p["n6_prox"] + " bidir=" + p["bidir"]
+                + " rel=" + fs(rel) + " consts=" + p["shared_consts"]
+            let vec = if rel >= 0.5 {
+                "direct domain bridge — pair keywords strongly overlap BT " + bt + " domain"
+            } else {
+                "cross-pollination — partial keyword overlap suggests bisociation angle"
+            }
+            let rec_str = fs(comp) + "|" + bt + "|" + p["a"] + "|" + p["b"] + "|" + rat + "|" + vec
+            recs = recs.push(rec_str)
+        }
+    }
+
+    // sort descending by composite score — selection sort (float compare)
+    let mut scored: [string] = recs
+    let mut si = 0
+    while si < scored.len() {
+        let mut best_idx = si
+        let pipe_si = scored[si].index_of("|")
+        let mut best_val = safe_float(scored[si].substring(0, pipe_si))
+        let mut sj = si + 1
+        while sj < scored.len() {
+            let pipe_sj = scored[sj].index_of("|")
+            let val_sj = safe_float(scored[sj].substring(0, pipe_sj))
+            if val_sj > best_val {
+                best_val = val_sj
+                best_idx = sj
+            }
+            sj = sj + 1
+        }
+        if best_idx != si {
+            let tmp = scored[si]
+            scored = scored.swap(si, best_idx)
+        }
+        si = si + 1
+    }
+
+    let show_n = min(10, scored.len())
+    if filter_bt.len() > 0 {
+        println("=== BT Target Recommendations for " + filter_bt + " (" + bt_name(filter_bt) + ") ===")
+    } else {
+        println("=== Top-10 BT Attack Targets (CDG-informed) ===")
+    }
+    println("Rank | BT      | Composite | CDG Pair                              | Attack Vector")
+    println("---- | ------- | --------- | ------------------------------------- | ---------------")
+
+    let mut shown = 0
+    let mut seen_bt_pair = #{"": true}
+    i = 0
+    while i < scored.len() && shown < show_n {
+        let entry = scored[i]
+        let parts = entry.split("|")
+        if parts.len() >= 6 {
+            let comp_s = parts[0]
+            let bt_id = parts[1]
+            let pair_a = parts[2]
+            let pair_b = parts[3]
+            let rat = parts[4]
+            let vec_short = if parts[5].len() > 40 { parts[5].substring(0, 40) + ".." } else { parts[5] }
+            let dedup_key = bt_id + ":" + pair_a + ":" + pair_b
+            if !_map_has(seen_bt_pair, dedup_key) {
+                seen_bt_pair[dedup_key] = true
+                shown = shown + 1
+                let pair_label = pair_a + " x " + pair_b
+                println(to_string(shown) + "    | " + bt_id + " | " + comp_s + "   | " + pair_label + " | " + vec_short)
+                // emit to file
+                emit_rec(bt_id, pair_a, pair_b, safe_float(comp_s), rat, parts[5])
+            }
+        }
+        i = i + 1
+    }
+
+    if shown == 0 {
+        println("No recommendations found" + (if filter_bt.len() > 0 { " for " + filter_bt } else { "" }) + ".")
+    } else {
+        println("")
+        println("Wrote " + to_string(shown) + " recommendations to shared/dse/bt_recommendations.jsonl")
+    }
+}
+println("")
+println("__BT_RECOMMENDER__ DONE")

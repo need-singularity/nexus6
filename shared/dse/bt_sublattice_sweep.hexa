@@ -1,0 +1,499 @@
+// bt_sublattice_sweep.hexa — BT sub-lattice exhaustive sweep (DSE-P9-1)
+// task: CDG 17,205 pair 전수 스캔 → BT-541..547 서브격자 매핑/갭/우선순위
+// usage: hexa bt_sublattice_sweep.hexa <sweep|gaps|summary|status>
+// output: shared/dse/bt_sublattice_report.jsonl
+// honesty: heuristic scoring, not proof of BT feasibility
+// ref: bt_target_recommender.hexa (P8), pair_scores.jsonl (17205)
+
+let HOME = env("HOME")
+let NEXUS = HOME + "/Dev/nexus"
+let PAIR_SCORES = NEXUS + "/shared/dse/cross/pair_scores.jsonl"
+let REC_PATH = NEXUS + "/shared/dse/bt_recommendations.jsonl"
+let REPORT_PATH = NEXUS + "/shared/dse/bt_sublattice_report.jsonl"
+let BT_KW_PATH = NEXUS + "/shared/bt/bt_keywords.jsonl"
+let BT_DOM_PATH = NEXUS + "/shared/bt/bt_domains.jsonl"
+
+// BT-541..547 millennium: "domain_class|name|cdg_keywords"
+let BT_META = #{
+    "BT-541": "math:analytic_number_theory|Riemann Hypothesis|zeta,prime,analytic,number-theory,pure-mathematics,probability-statistics",
+    "BT-542": "cs:complexity_theory|P vs NP|complexity,graph,cryptography,coding-lattice,information-theory,programming-language",
+    "BT-543": "physics:particle_qcd|Yang-Mills mass gap|particle,gauge,qft,plasma-physics,statistical-mechanics,cosmology-particle,physics-fundamental",
+    "BT-544": "physics:fluid_dynamics|Navier-Stokes|fluid,turbulence,chaos-dynamical,oceanography,aerospace-propulsion,marine-propulsion",
+    "BT-545": "math:algebraic_geometry|Hodge Conjecture|algebraic,cohomology,topology,noncommutative-geometry,pure-mathematics,crystallography",
+    "BT-546": "math:number_theory|BSD Conjecture|elliptic,modular,number-theory,pure-mathematics,cryptography,elliptic-curves",
+    "BT-547": "math:topology|Poincare Conjecture|topology,manifold,ricci,pure-mathematics,noncommutative-geometry,cosmology-particle"
+}
+
+// attack history
+let BT_ATTACKS = #{
+    "BT-541": "round_1:MISS:RH_ladder_2_steps",
+    "BT-543": "round_1:MISS:beta0_sigma-sopfr_refined"
+}
+
+// --- utility ---
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+fn now_ts() -> string {
+    let mut ts = ""
+    try { ts = _str(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim() } catch e {}
+    return ts
+}
+fn json_esc(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", " ")
+    return r
+}
+fn fs(x: float) -> string { return to_string(x) }
+fn _map_has(m: map, key: string) -> bool {
+    let ks = m.keys()
+    for k in ks {
+        if k == key { return true }
+    }
+    return false
+}
+fn safe_float(s: string) -> float {
+    let mut v = 0.0
+    try { v = to_float(s) } catch e {}
+    return v
+}
+
+// --- pair parser (minimal JSON field extraction) ---
+fn parse_pair(line: string) -> map {
+    let mut m = #{"a": "", "b": "", "score": "0", "n6_prox": "0", "bidir": "0", "bt_ids": "-", "shared_consts": "-", "jaccard": "0"}
+    let flds = ["a", "b", "score", "n6_prox", "bidir", "bt_ids", "shared_consts", "jaccard"]
+    for fld in flds {
+        let key = "\"" + fld + "\":"
+        let idx = line.index_of(key)
+        if idx >= 0 {
+            let after = line.substring((idx + key.len()), line.len())
+            let mut val = ""
+            if after.starts_with(" \"") || after.starts_with("\"") {
+                let start = after.index_of("\"") + 1
+                let end = after.substring(start, after.len()).index_of("\"")
+                if end >= 0 { val = after.substring(start, (start + end)) }
+            } else {
+                let trimmed = after.trim()
+                let comma = trimmed.index_of(",")
+                let brace = trimmed.index_of("}")
+                let mut stop = trimmed.len()
+                if comma >= 0 && comma < stop { stop = comma }
+                if brace >= 0 && brace < stop { stop = brace }
+                val = trimmed.substring(0, stop).trim()
+            }
+            m[fld] = val
+        }
+    }
+    return m
+}
+
+// --- BT keyword matching ---
+fn bt_keywords(bt_id: string) -> [string] {
+    let meta_keys = BT_META.keys()
+    for k in meta_keys {
+        if k == bt_id {
+            let parts = BT_META[k].split("|")
+            if parts.len() >= 3 {
+                return parts[2].split(",")
+            }
+        }
+    }
+    return []
+}
+fn bt_name(bt_id: string) -> string {
+    let meta_keys = BT_META.keys()
+    for k in meta_keys {
+        if k == bt_id {
+            let parts = BT_META[k].split("|")
+            if parts.len() >= 2 { return parts[1] }
+        }
+    }
+    return bt_id
+}
+fn has_attack(bt_id: string) -> bool {
+    let atk_keys = BT_ATTACKS.keys()
+    for k in atk_keys {
+        if k == bt_id { return true }
+    }
+    return false
+}
+
+// relevance: fraction of BT keywords that appear in pair domain names
+fn pair_bt_relevance(pair_a: string, pair_b: string, bt_id: string) -> float {
+    let kws = bt_keywords(bt_id)
+    if kws.len() == 0 { return 0.0 }
+    let ab = pair_a + "|" + pair_b
+    let mut hits = 0.0
+    for kw in kws {
+        let kw_t = kw.trim()
+        if kw_t.len() > 0 && ab.contains(kw_t) {
+            hits = hits + 1.0
+        }
+    }
+    return hits / to_float(kws.len())
+}
+
+// novelty: inverse of existing recommendation count for this BT+pair
+fn load_existing_recs() -> map {
+    // returns #{bt_id:pair_a:pair_b -> count}
+    let mut recs = #{"_init": "0"}
+    if !file_exists(REC_PATH) { return recs }
+    let raw = read_file(REC_PATH)
+    let lines = raw.split("\n")
+    for line in lines {
+        let lt = line.trim()
+        if lt.len() < 5 { continue }
+        // extract bt_id
+        let bt_key = "\"bt_id\":\""
+        let bi = lt.index_of(bt_key)
+        if bi < 0 { continue }
+        let after_bt = lt.substring((bi + bt_key.len()), lt.len())
+        let bt_end = after_bt.index_of("\"")
+        if bt_end < 0 { continue }
+        let bt_val = after_bt.substring(0, bt_end)
+        // extract cdg_pair[0], cdg_pair[1]
+        let cp_key = "\"cdg_pair\":[\""
+        let ci = lt.index_of(cp_key)
+        if ci < 0 { continue }
+        let after_cp = lt.substring((ci + cp_key.len()), lt.len())
+        let p0_end = after_cp.index_of("\"")
+        if p0_end < 0 { continue }
+        let p0 = after_cp.substring(0, p0_end)
+        let rest = after_cp.substring((p0_end + 3), after_cp.len())
+        let p1_end = rest.index_of("\"")
+        if p1_end < 0 { continue }
+        let p1 = rest.substring(0, p1_end)
+        let rkey = bt_val + ":" + p0 + ":" + p1
+        if _map_has(recs, rkey) {
+            let c = safe_float(recs[rkey])
+            recs[rkey] = to_string(to_int((c + 1.0)))
+        } else {
+            recs[rkey] = "1"
+        }
+    }
+    return recs
+}
+
+fn novelty_score(bt_id: string, pair_a: string, pair_b: string, existing: map) -> float {
+    let rkey = bt_id + ":" + pair_a + ":" + pair_b
+    if _map_has(existing, rkey) {
+        let c = safe_float(existing[rkey])
+        if c > 0.0 { return 1.0 / (1.0 + c) }
+    }
+    return 1.0
+}
+
+// composite: score x relevance x novelty, with attack bonus
+fn sweep_composite(cdg_score: float, n6_prox: float, bidir: float, bt_rel: float, novelty: float, prior_attack: bool) -> float {
+    // base = CDG 0.25 + n6 0.20 + bidir 0.10 + bt_rel 0.30 + novelty 0.15
+    let mut s = cdg_score * 0.25 + n6_prox * 0.20 + bidir * 0.10 + bt_rel * 0.30 + novelty * 0.15
+    if prior_attack { s = s * 1.15 }
+    return s
+}
+
+// --- load all pairs ---
+fn load_all_pairs() -> [string] {
+    let raw = read_file(PAIR_SCORES)
+    let lines = raw.split("\n")
+    let mut result: [string] = []
+    for line in lines {
+        let lt = line.trim()
+        if lt.len() > 2 && lt.starts_with("{") {
+            result = result.push(lt)
+        }
+    }
+    return result
+}
+
+// --- emit jsonl row ---
+fn emit_report(bt_id: string, pair_a: string, pair_b: string, cdg_score: float, n6_prox: float, bidir: float, bt_rel: float, novelty: float, composite: float, gap: bool, consts: string) {
+    let gap_str = if gap { "true" } else { "false" }
+    let row = "{\"bt_id\":\"" + json_esc(bt_id) + "\",\"bt_name\":\"" + json_esc(bt_name(bt_id))
+        + "\",\"pair\":[\"" + json_esc(pair_a) + "\",\"" + json_esc(pair_b)
+        + "\"],\"cdg_score\":" + fs(cdg_score) + ",\"n6_prox\":" + fs(n6_prox)
+        + ",\"bidir\":" + fs(bidir) + ",\"bt_relevance\":" + fs(bt_rel)
+        + ",\"novelty\":" + fs(novelty) + ",\"composite\":" + fs(composite)
+        + ",\"is_gap\":" + gap_str + ",\"shared_consts\":\"" + json_esc(consts)
+        + "\",\"ts\":\"" + now_ts() + "\"}"
+    append_file(REPORT_PATH, row + "\n")
+}
+
+// === CLI ===
+let cli_args = args()
+let mut mode = "sweep"
+let mut i = 0
+while i < cli_args.len() {
+    let a = cli_args[i]
+    if a == "sweep" || a == "gaps" || a == "summary" || a == "status" {
+        mode = a
+    }
+    i = i + 1
+}
+
+// === MODE: status ===
+if mode == "status" {
+    let mut report_lines = 0
+    if file_exists(REPORT_PATH) {
+        let raw = read_file(REPORT_PATH)
+        let lines = raw.split("\n")
+        for line in lines {
+            if line.trim().len() > 2 { report_lines = report_lines + 1 }
+        }
+    }
+    println("=== BT Sub-Lattice Sweep — Status ===")
+    println("pair_scores.jsonl: " + PAIR_SCORES)
+    println("report: " + REPORT_PATH)
+    println("report rows: " + to_string(report_lines))
+    println("BTs: 541..547 (7 millennium)")
+    println("__SUBLATTICE_SWEEP__ DONE")
+}
+
+// === MODE: sweep ===
+if mode == "sweep" {
+    println("=== BT Sub-Lattice Exhaustive Sweep ===")
+    println("Loading all CDG pairs...")
+    let all_pairs = load_all_pairs()
+    let total = all_pairs.len()
+    println("CDG pairs loaded: " + to_string(total))
+
+    let existing_recs = load_existing_recs()
+    let bt_keys = BT_META.keys()
+
+    // clear report (fresh sweep)
+    write_file(REPORT_PATH, "")
+
+    let mut grand_total = 0
+    let mut grand_relevant = 0
+    let mut grand_gaps = 0
+
+    for bt in bt_keys {
+        let prior = has_attack(bt)
+        let mut bt_relevant = 0
+        let mut bt_gaps = 0
+        let mut bt_explored = 0
+
+        let mut j = 0
+        while j < total {
+            let p = parse_pair(all_pairs[j])
+            let pa = p["a"]
+            let pb = p["b"]
+            let rel = pair_bt_relevance(pa, pb, bt)
+
+            if rel > 0.0 {
+                bt_relevant = bt_relevant + 1
+                let cdg_s = safe_float(p["score"])
+                let n6p = safe_float(p["n6_prox"])
+                let bid = safe_float(p["bidir"])
+                let nov = novelty_score(bt, pa, pb, existing_recs)
+                let comp = sweep_composite(cdg_s, n6p, bid, rel, nov, prior)
+
+                // gap = relevant pair with no prior recommendation
+                let is_gap = nov >= 1.0
+                if is_gap { bt_gaps = bt_gaps + 1 }
+                if !is_gap { bt_explored = bt_explored + 1 }
+
+                if comp >= 0.15 {
+                    emit_report(bt, pa, pb, cdg_s, n6p, bid, rel, nov, comp, is_gap, p["shared_consts"])
+                    grand_total = grand_total + 1
+                }
+            }
+            j = j + 1
+        }
+
+        grand_relevant = grand_relevant + bt_relevant
+        grand_gaps = grand_gaps + bt_gaps
+
+        let gap_pct = if bt_relevant > 0 { to_string(to_int((to_float(bt_gaps) / to_float(bt_relevant) * 100.0))) } else { "0" }
+        println(bt + " " + bt_name(bt) + ": relevant=" + to_string(bt_relevant)
+            + " explored=" + to_string(bt_explored) + " gaps=" + to_string(bt_gaps)
+            + " (" + gap_pct + "% unexplored)" + (if prior { " [PRIOR ATTACK]" } else { "" }))
+    }
+
+    println("")
+    println("Grand total: " + to_string(grand_total) + " entries in report")
+    println("Total relevant pairs: " + to_string(grand_relevant) + " / " + to_string(total * 7) + " BT-pair combos")
+    println("Total gaps (unexplored): " + to_string(grand_gaps))
+    println("Output: shared/dse/bt_sublattice_report.jsonl")
+    println("__SUBLATTICE_SWEEP__ DONE")
+}
+
+// === MODE: gaps ===
+if mode == "gaps" {
+    if !file_exists(REPORT_PATH) {
+        println("ERROR: report not found. Run 'sweep' first.")
+        println("__SUBLATTICE_SWEEP__ DONE")
+    }
+    if file_exists(REPORT_PATH) {
+        println("=== BT Sub-Lattice Gap Analysis ===")
+        let raw = read_file(REPORT_PATH)
+        let lines = raw.split("\n")
+
+        // collect gap entries, sort by composite desc
+        let mut gap_entries: [string] = []
+        for line in lines {
+            let lt = line.trim()
+            if lt.len() < 5 { continue }
+            if lt.contains("\"is_gap\":true") {
+                // extract composite
+                let ck = "\"composite\":"
+                let ci = lt.index_of(ck)
+                if ci >= 0 {
+                    let after = lt.substring((ci + ck.len()), lt.len())
+                    let comma = after.index_of(",")
+                    let mut comp_s = after
+                    if comma >= 0 { comp_s = after.substring(0, comma) }
+                    gap_entries = gap_entries.push(comp_s.trim() + "|" + lt)
+                }
+            }
+        }
+
+        // selection sort desc by composite
+        let mut si = 0
+        while si < gap_entries.len() {
+            let mut best_idx = si
+            let pipe_si = gap_entries[si].index_of("|")
+            let mut best_val = safe_float(gap_entries[si].substring(0, pipe_si))
+            let mut sj = si + 1
+            while sj < gap_entries.len() {
+                let pipe_sj = gap_entries[sj].index_of("|")
+                let val_sj = safe_float(gap_entries[sj].substring(0, pipe_sj))
+                if val_sj > best_val {
+                    best_val = val_sj
+                    best_idx = sj
+                }
+                sj = sj + 1
+            }
+            if best_idx != si {
+                let tmp = gap_entries[si]
+                gap_entries = gap_entries.swap(si, best_idx)
+            }
+            si = si + 1
+        }
+
+        println("Top-30 unexplored high-potential BT-pair combinations:")
+        println("Rank | BT      | Composite | Pair")
+        println("---- | ------- | --------- | ----")
+
+        let show_n = min(30, gap_entries.len())
+        let mut k = 0
+        while k < show_n {
+            let entry = gap_entries[k]
+            let pipe = entry.index_of("|")
+            let comp_s = entry.substring(0, pipe)
+            let json_line = entry.substring((pipe + 1), entry.len())
+            // extract bt_id
+            let bk = "\"bt_id\":\""
+            let bi = json_line.index_of(bk)
+            let mut bt_val = "?"
+            if bi >= 0 {
+                let ab = json_line.substring((bi + bk.len()), json_line.len())
+                let be = ab.index_of("\"")
+                if be >= 0 { bt_val = ab.substring(0, be) }
+            }
+            // extract pair
+            let pk = "\"pair\":[\""
+            let pi = json_line.index_of(pk)
+            let mut pair_label = "?"
+            if pi >= 0 {
+                let ap = json_line.substring((pi + pk.len()), json_line.len())
+                let p0e = ap.index_of("\"")
+                if p0e >= 0 {
+                    let p0 = ap.substring(0, p0e)
+                    let rest = ap.substring((p0e + 3), ap.len())
+                    let p1e = rest.index_of("\"")
+                    if p1e >= 0 {
+                        pair_label = p0 + " x " + rest.substring(0, p1e)
+                    }
+                }
+            }
+            println(to_string((k + 1)) + "    | " + bt_val + " | " + comp_s + " | " + pair_label)
+            k = k + 1
+        }
+        println("")
+        println("Total gaps: " + to_string(gap_entries.len()))
+        println("__SUBLATTICE_SWEEP__ DONE")
+    }
+}
+
+// === MODE: summary ===
+if mode == "summary" {
+    if !file_exists(REPORT_PATH) {
+        println("ERROR: report not found. Run 'sweep' first.")
+        println("__SUBLATTICE_SWEEP__ DONE")
+    }
+    if file_exists(REPORT_PATH) {
+        println("=== BT Sub-Lattice Summary ===")
+        let raw = read_file(REPORT_PATH)
+        let lines = raw.split("\n")
+
+        // per-BT counts
+        let bt_keys = BT_META.keys()
+        let mut bt_total = #{"BT-541": "0", "BT-542": "0", "BT-543": "0", "BT-544": "0", "BT-545": "0", "BT-546": "0", "BT-547": "0"}
+        let mut bt_gap = #{"BT-541": "0", "BT-542": "0", "BT-543": "0", "BT-544": "0", "BT-545": "0", "BT-546": "0", "BT-547": "0"}
+        let mut bt_best = #{"BT-541": "0", "BT-542": "0", "BT-543": "0", "BT-544": "0", "BT-545": "0", "BT-546": "0", "BT-547": "0"}
+        let mut all_count = 0
+
+        for line in lines {
+            let lt = line.trim()
+            if lt.len() < 5 { continue }
+            all_count = all_count + 1
+
+            // bt_id
+            let bk = "\"bt_id\":\""
+            let bi = lt.index_of(bk)
+            if bi < 0 { continue }
+            let ab = lt.substring((bi + bk.len()), lt.len())
+            let be = ab.index_of("\"")
+            if be < 0 { continue }
+            let bt_val = ab.substring(0, be)
+
+            if _map_has(bt_total, bt_val) {
+                let c = safe_float(bt_total[bt_val])
+                bt_total[bt_val] = to_string(to_int((c + 1.0)))
+            }
+
+            if lt.contains("\"is_gap\":true") && _map_has(bt_gap, bt_val) {
+                let g = safe_float(bt_gap[bt_val])
+                bt_gap[bt_val] = to_string(to_int((g + 1.0)))
+            }
+
+            // track best composite
+            let ck = "\"composite\":"
+            let ci = lt.index_of(ck)
+            if ci >= 0 {
+                let after = lt.substring((ci + ck.len()), lt.len())
+                let comma = after.index_of(",")
+                let mut comp_s = after
+                if comma >= 0 { comp_s = after.substring(0, comma) }
+                let comp_v = safe_float(comp_s.trim())
+                let cur_best = safe_float(bt_best[bt_val])
+                if comp_v > cur_best {
+                    bt_best[bt_val] = comp_s.trim()
+                }
+            }
+        }
+
+        println("BT_ID   | Name                     | Total | Gaps  | Gap%  | Best Score | Attack")
+        println("------- | ------------------------ | ----- | ----- | ----- | ---------- | ------")
+        for bt in bt_keys {
+            let name = bt_name(bt)
+            let short = name.substring(0, min(24, name.len()))
+            let tot = bt_total[bt]
+            let gap = bt_gap[bt]
+            let tot_f = safe_float(tot)
+            let gap_f = safe_float(gap)
+            let pct = if tot_f > 0.0 { to_string(to_int((gap_f / tot_f * 100.0))) } else { "0" }
+            let best = bt_best[bt]
+            let atk = if has_attack(bt) { "YES" } else { "no" }
+            println(bt + " | " + short + " | " + tot + " | " + gap + " | " + pct + "%  | " + best + " | " + atk)
+        }
+
+        println("")
+        println("Total report entries: " + to_string(all_count))
+        println("__SUBLATTICE_SWEEP__ DONE")
+    }
+}

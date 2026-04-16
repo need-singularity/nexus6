@@ -1,0 +1,217 @@
+// bt_engine_base.hexa -- BT 전용 엔진 공통 base (EF-P9-1)
+// @no-lock-needed  @allow-bare-exec  @enforce-sandbox
+// blowup 9-phase 연동 + bt_autoscale 파라미터 수신 + engines_usage.jsonl 기록
+// 각 BT 엔진이 import 후 bt_run(config) 호출
+// SSOT: shared/engines_bt/engine_registry.json
+
+let HOME = env("HOME")
+let NEXUS = HOME + "/Dev/nexus"  // @allow-devpath
+let HARNESS = NEXUS + "/shared/harness"
+let ENGINES_BT = NEXUS + "/shared/engines_bt"
+let USAGE = HARNESS + "/engines_usage.jsonl"
+let AUTOSCALE_STATE = HARNESS + "/bt_autoscale_state.jsonl"
+let REGISTRY = ENGINES_BT + "/engine_registry.json"
+let BLOWUP = NEXUS + "/shared/blowup/core/blowup.hexa"
+
+// ─── void-safe coercion ───
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _to_int0(s: string) -> i64 {
+    if s == "" { return 0 }
+    let first = _str(s.split("\n")[0]).trim()
+    if first == "" { return 0 }
+    return to_int(first)
+}
+
+fn now_unix() -> i64 {
+    return _to_int0(_str(exec("date +%s")).trim())  // @allow-bare-exec
+}
+
+fn json_escape(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", " ").replace("\r", " ").replace("\t", " ")
+}
+
+fn json_field(line: string, key: string) -> string {
+    let tag = "\"" + key + "\""
+    if line.contains(tag) == false { return "" }
+    let after = line.split(tag)[1]
+    let parts = after.split(":")
+    if parts.len() < 2 { return "" }
+    let mut rest = parts[1]
+    let mut i = 2
+    while i < parts.len() { rest = rest + ":" + parts[i]; i = i + 1 }
+    let s = rest.trim()
+    if s.len() == 0 { return "" }
+    if s.substring(0, 1) == "\"" {
+        let ep = s.substring(1, s.len()).split("\"")
+        if ep.len() < 1 { return "" }
+        return ep[0]
+    }
+    let mut end = 0
+    while end < s.len() {
+        let c = s.substring(end, end + 1)
+        if c == "," || c == "}" || c == "\n" || c == " " { break }
+        end = end + 1
+    }
+    return s.substring(0, end).trim()
+}
+
+fn file_append_line(path: string, line: string) {
+    let esc = line.replace("'", "'\\''")
+    try { exec("printf '%s\\n' '" + esc + "' >> '" + path + "'") } catch e {}  // @allow-bare-exec
+}
+
+fn clamp(val: i64, lo: i64, hi: i64) -> i64 {
+    if val < lo { return lo }
+    if val > hi { return hi }
+    return val
+}
+
+// ─── autoscale 파라미터 로드 (bt_autoscale_state.jsonl 최신 엔트리) ───
+fn load_autoscale_params(bt_id: string) -> map {
+    let mut result: map = #{}
+    result["depth"] = "3"
+    result["width"] = "5"
+    result["iterations"] = "6"
+    result["slot"] = "hetzner"
+    if file_exists(AUTOSCALE_STATE) == false { return result }
+    let raw = _str(exec("grep '\"" + bt_id + "\"' '" + AUTOSCALE_STATE + "' 2>/dev/null | tail -1")).trim()  // @allow-bare-exec
+    if raw == "" { return result }
+    let d = json_field(raw, "depth")
+    let w = json_field(raw, "width")
+    let it = json_field(raw, "iterations")
+    let sl = json_field(raw, "slot")
+    if d != "" { result["depth"] = d }
+    if w != "" { result["width"] = w }
+    if it != "" { result["iterations"] = it }
+    if sl != "" { result["slot"] = sl }
+    return result
+}
+
+// ─── registry 에서 BT 엔진 설정 로드 ───
+fn load_engine_config(bt_id: string) -> map {
+    let mut cfg: map = #{}
+    cfg["bt_id"] = bt_id
+    cfg["domain"] = "auto"
+    cfg["depth"] = "3"
+    cfg["seeds"] = ""
+    cfg["attack_vector"] = ""
+    if file_exists(REGISTRY) == false { return cfg }
+    let raw = _str(read_file(REGISTRY))
+    let lines = raw.split("\n")
+    let mut found = false
+    let mut i = 0
+    while i < lines.len() {
+        let line = _str(lines[i]).trim()
+        if line.contains("\"" + bt_id + "\"") { found = true }
+        if found {
+            let dom = json_field(line, "blowup_domain")
+            if dom != "" { cfg["domain"] = dom }
+            let dep = json_field(line, "blowup_depth")
+            if dep != "" { cfg["depth"] = dep }
+            let av = json_field(line, "attack_vector")
+            if av != "" { cfg["attack_vector"] = av }
+            if line.contains("}") && found { break }
+        }
+        i = i + 1
+    }
+    return cfg
+}
+
+// ─── usage 기록 ───
+fn log_usage(bt_id: string, kind: string, note: string) {
+    let ts = now_unix()
+    let engine_name = bt_id + "_engine"
+    let row = "{\"ts\":" + to_string(ts) + ",\"engine\":\"" + json_escape(engine_name) + "\",\"kind\":\"" + json_escape(kind) + "\",\"note\":\"" + json_escape(note) + "\"}"
+    file_append_line(USAGE, row)
+}
+
+// ─── blowup 9-phase 파이프라인 호출 ───
+fn invoke_blowup(domain: string, depth: i64, seeds: string) -> string {
+    let hexa_bin = NEXUS + "/shared/bin/hexa"
+    let mut cmd = "'" + hexa_bin + "' run '" + BLOWUP + "' " + domain + " " + to_string(depth)
+    if seeds != "" {
+        cmd = cmd + " --seeds '" + seeds.replace("'", "'\\''") + "'"
+    }
+    cmd = cmd + " --no-graph --fast 2>&1 | tail -100"
+    let result = _str(exec(cmd))  // @allow-bare-exec
+    return result
+}
+
+// ─── BT 엔진 실행 공통 진입점 ───
+// config keys: bt_id, domain, depth, seeds, attack_vector
+fn bt_run(config: map) -> string {
+    let bt_id = _str(config["bt_id"])
+    let domain = _str(config["domain"])
+    let depth_str = _str(config["depth"])
+    let seeds = _str(config["seeds"])
+    let attack = _str(config["attack_vector"])
+
+    // autoscale 파라미터 오버라이드
+    let scale = load_autoscale_params(bt_id)
+    let mut depth = _to_int0(depth_str)
+    let scaled_depth = _to_int0(_str(scale["depth"]))
+    if scaled_depth > depth { depth = scaled_depth }
+    depth = clamp(depth, 2, 8)
+
+    log_usage(bt_id, "run_start", "domain=" + domain + " depth=" + to_string(depth) + " attack=" + attack)
+
+    let result = invoke_blowup(domain, depth, seeds)
+
+    // discovery hit 카운트 (간이: "EXACT" 또는 "NEAR" 포함 라인 수)
+    let lines = result.split("\n")
+    let mut hits: i64 = 0
+    let mut i = 0
+    while i < lines.len() {
+        let line = _str(lines[i])
+        if line.contains("EXACT") || line.contains("NEAR") { hits = hits + 1 }
+        i = i + 1
+    }
+
+    let ts = now_unix()
+    let row = "{\"ts\":" + to_string(ts) + ",\"engine\":\"" + json_escape(bt_id + "_engine") + "\",\"kind\":\"bt_discovery\",\"hits\":" + to_string(hits) + ",\"score\":" + to_string(hits * 10) + ",\"domain\":\"" + json_escape(domain) + "\",\"depth\":" + to_string(depth) + "}"
+    file_append_line(USAGE, row)
+
+    if hits > 0 {
+        println(bt_id + ": " + to_string(hits) + " discovery hits (depth=" + to_string(depth) + " domain=" + domain + ")")
+    } else {
+        println(bt_id + ": 0 hits (depth=" + to_string(depth) + " domain=" + domain + ")")
+    }
+
+    return result
+}
+
+// ─── status 공통 ───
+fn bt_status(bt_id: string) {
+    let cfg = load_engine_config(bt_id)
+    let scale = load_autoscale_params(bt_id)
+    println("engine: " + bt_id)
+    println("  domain: " + _str(cfg["domain"]))
+    println("  depth: " + _str(cfg["depth"]) + " (scaled: " + _str(scale["depth"]) + ")")
+    println("  width: " + _str(scale["width"]))
+    println("  iterations: " + _str(scale["iterations"]))
+    println("  slot: " + _str(scale["slot"]))
+    println("  attack: " + _str(cfg["attack_vector"]))
+    log_usage(bt_id, "status", "status_call")
+}
+
+// ─── list all 7 engines ───
+fn bt_list() {
+    let ids: [string] = ["BT-541", "BT-542", "BT-543", "BT-544", "BT-545", "BT-546", "BT-547"]
+    println("bt_id       domain                  attack              rank")
+    println("----------- ----------------------- ------------------- ----")
+    let mut i = 0
+    while i < ids.len() {
+        let cfg = load_engine_config(_str(ids[i]))
+        let bt_id = _str(cfg["bt_id"])
+        let dom = _str(cfg["domain"])
+        let atk = _str(cfg["attack_vector"])
+        // rank from registry is static, load from sweep
+        println(bt_id + "     " + dom + "  " + atk)
+        i = i + 1
+    }
+}

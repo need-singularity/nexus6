@@ -1,0 +1,656 @@
+// ═══════════════════════════════════════════════════════════
+// scan_ext_atlas.hexa — ATLAS-P8-1 외부 프로젝트 atlas.n6 sync scanner
+// 용도: airgenome/n6-architecture/anima/papers 의 발견/돌파 데이터를
+//       atlas.n6 JSON node/edge 포맷으로 변환 + _guarded_append_atlas() 경유 추가
+// 실행: hexa shared/n6/scan_ext_atlas.hexa [--dry-run] [--verbose] [--project NAME]
+// SSOT: shared/harness/sync_manifest.json (atlas_ext_sync 태스크)
+// ═══════════════════════════════════════════════════════════
+
+// ─── HOME + 경로 설정 ───
+let mut _HOME = ""
+try { _HOME = to_string(exec("printenv HOME")).trim() } catch e {}  // @allow-silent-catch
+if _HOME == "" {
+    try { _HOME = to_string(exec("echo $HOME")).trim() } catch e {}  // @allow-silent-catch
+}
+let _NEXUS = _HOME + "/Dev/nexus"
+let _DEV = _HOME + "/Dev"
+let _ATLAS_PATH = _NEXUS + "/shared/n6/atlas.n6"
+
+// ─── CLI 파싱 ───
+let _args = args()
+let mut _dry_run = false
+let mut _verbose = false
+let mut _project_filter = ""
+let mut _ai: i64 = 2
+while _ai < len(_args) {
+    let tok = _args[_ai]
+    if tok == "--dry-run" { _dry_run = true }
+    else if tok == "--verbose" || tok == "-v" { _verbose = true }
+    else if tok == "--project" && _ai + 1 < len(_args) {
+        _ai = _ai + 1
+        _project_filter = _args[_ai]
+    }
+    else if tok == "--help" || tok == "-h" {
+        println("usage: hexa scan_ext_atlas.hexa [--dry-run] [--verbose] [--project NAME]")
+        println("  projects: airgenome, n6-architecture, anima, papers")
+        println("  --dry-run   preview without writing to atlas.n6")
+        println("  --verbose   show each entry being processed")
+        exit(0)  // @allow-silent-exit
+    }
+    _ai = _ai + 1
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── atlas guard (atlas_guard.hexa.inc copy-paste, hexa import 미지원) ───
+// ═══════════════════════════════════════════════════════════
+
+fn _valid_atlas_line(line: string) -> bool {
+    let t = line.trim()
+    if len(t) == 0 { return true }
+    let first = t[0..1]
+    if first == "#" { return true }
+    if first == "{" { return true }
+    if first == "@" { return true }
+    if first == "\"" { return true }
+    if first == "<" { return true }
+    if first == ">" { return true }
+    if first == "!" { return true }
+    if first == "-" { return true }
+    return false
+}
+
+fn _guarded_append_atlas(path: string, content: string) -> i64 {
+    if len(content) == 0 { return 0 }
+    let is_atlas = path.contains("atlas.n6")
+    let lines = content.split("\n")
+    let mut clean = ""
+    let mut rejected: i64 = 0
+    let mut deduped: i64 = 0
+    let mut first = true
+    let mut i: i64 = 0
+    while i < len(lines) {
+        let line = lines[i]
+        if !_valid_atlas_line(line) {
+            rejected = rejected + 1
+            i = i + 1
+            continue
+        }
+        let t = line.trim()
+        if is_atlas && len(t) > 0 && !t.starts_with("#") {
+            let mut already = false
+            try {
+                let gr = exec("grep -Fxq -- '" + t.replace("'", "'\\''") + "' '" + path + "' 2>/dev/null && echo Y || echo N")
+                already = gr.trim() == "Y"
+            } catch e {}
+            if already {
+                deduped = deduped + 1
+                i = i + 1
+                continue
+            }
+        }
+        if !first { clean = clean + "\n" }
+        clean = clean + line
+        first = false
+        i = i + 1
+    }
+    if rejected > 0 {
+        println("  [schema guard] rejected " + to_string(rejected) + " invalid lines -> " + path)
+    }
+    if deduped > 0 {
+        println("  [dedup guard] skipped " + to_string(deduped) + " duplicate lines -> " + path)
+    }
+    if len(clean) > 0 {
+        if !clean.ends_with("\n") { clean = clean + "\n" }
+        try { append_file(path, clean) } catch e {}
+    }
+    return rejected
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── 공통 헬퍼 ───
+// ═══════════════════════════════════════════════════════════
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _to_int0(s: string) -> i64 {
+    if s == "" { return 0 }
+    let first = _str(s.split("\n")[0]).trim()
+    if first == "" { return 0 }
+    let mut v: i64 = 0
+    try { v = to_int(first) } catch e {}  // @allow-silent-catch
+    return v
+}
+
+fn _jesc(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", "\\n")
+    r = r.replace("\r", "\\r")
+    r = r.replace("\t", "\\t")
+    return r
+}
+
+fn _now_iso() -> string {
+    return _str(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()
+}
+
+// ─── intra-batch dedup (atlas 기존 ID 사전 로드 + 배치 내 중복 방지) ───
+// parallel list 패턴 (has_key 미지원 런타임 대응, scan_math_atlas.hexa _idx_of 패턴)
+let mut _seen_id_list: [string] = []
+
+fn _idx_of_id(id: string) -> i64 {
+    let mut i: i64 = 0
+    while i < len(_seen_id_list) {
+        if _seen_id_list[i] == id { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn _id_seen(id: string) -> bool {
+    return _idx_of_id(id) >= 0
+}
+
+fn _id_mark(id: string) {
+    if !_id_seen(id) {
+        _seen_id_list = _seen_id_list + [id]
+    }
+}
+
+// ─── atlas 기존 node ID 사전 로드 (grep 기반, OOM 회피) ───
+fn _load_existing_ids(atlas_path: string) {
+    let mut raw = ""
+    try {
+        raw = _str(exec("grep -o '\"id\":\"[^\"]*\"' '" + atlas_path + "' 2>/dev/null | sed 's/\"id\":\"//;s/\"$//'"))
+    } catch e {}  // @allow-silent-catch
+    if raw == "" { return }
+    let lines = raw.split("\n")
+    let mut i: i64 = 0
+    while i < len(lines) {
+        let id = _str(lines[i]).trim()
+        if id != "" { _id_mark(id) }
+        i = i + 1
+    }
+}
+
+// ─── JSON node/edge 라인 생성 ───
+fn _mk_node(id: string, node_type: string, domain: string, summary: string, confidence: f64) -> string {
+    return "{\"type\":\"node\",\"id\":\"" + _jesc(id) + "\",\"node_type\":\"" + _jesc(node_type) + "\",\"domain\":\"" + _jesc(domain) + "\",\"summary\":\"" + _jesc(summary) + "\",\"confidence\":" + to_string(confidence) + ",\"depth\":0}"
+}
+
+fn _mk_edge(from_id: string, to_id: string, edge_type: string, strength: f64) -> string {
+    return "{\"type\":\"edge\",\"from\":\"" + _jesc(from_id) + "\",\"to\":\"" + _jesc(to_id) + "\",\"edge_type\":\"" + _jesc(edge_type) + "\",\"strength\":" + to_string(strength) + ",\"bidirectional\":false}"
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── Project scanners ───
+// ═══════════════════════════════════════════════════════════
+
+// ─── n6-architecture: theory/breakthroughs BT-NNN 파싱 ───
+fn scan_n6_arch() -> [string] {
+    let mut entries: [string] = []
+    let root = _DEV + "/n6-architecture"
+    if !dir_exists(root) {
+        if _verbose { println("  [n6-architecture] directory not found, skip") }
+        return entries
+    }
+
+    // breakthroughs: parse BT-NNN from markdown tables
+    let bt_dir = root + "/theory/breakthroughs"
+    if dir_exists(bt_dir) {
+        let mut raw = ""
+        try { raw = _str(exec("ls -1 '" + bt_dir + "/'*.md 2>/dev/null")) } catch e {}  // @allow-silent-catch
+        let files = raw.split("\n")
+        let mut fi: i64 = 0
+        while fi < len(files) {
+            let fpath = _str(files[fi]).trim()
+            fi = fi + 1
+            if fpath == "" { continue }
+            if !file_exists(fpath) { continue }
+            // extract BT-NNN entries via grep
+            let mut bt_raw = ""
+            try {
+                bt_raw = _str(exec("grep -oE '\\*\\*BT-[0-9]+\\*\\*' '" + fpath + "' 2>/dev/null"))
+            } catch e {}  // @allow-silent-catch
+            if bt_raw == "" { continue }
+            let bt_ids = bt_raw.split("\n")
+            let mut bi: i64 = 0
+            while bi < len(bt_ids) {
+                let raw_id = _str(bt_ids[bi]).trim()
+                bi = bi + 1
+                if raw_id == "" { continue }
+                // strip ** markers
+                let id = raw_id.replace("**", "")
+                let full_id = "n6arch-" + id
+                if _id_seen(full_id) { continue }
+                _id_mark(full_id)
+                // extract the table row for summary (line containing this BT-NNN)
+                let mut summary = id
+                try {
+                    let row = _str(exec("grep '\\*\\*" + id + "\\*\\*' '" + fpath + "' 2>/dev/null | head -1"))
+                    // parse table row: | ID | Name | Statement | ...
+                    let cols = row.split("|")
+                    if len(cols) >= 4 {
+                        let name = _str(cols[2]).trim()
+                        if name != "" { summary = id + ": " + name }
+                    }
+                } catch e {}  // @allow-silent-catch
+                entries = entries + [_mk_node(full_id, "Breakthrough", "n6-architecture", summary, 0.8)]
+                entries = entries + [_mk_edge("n", full_id, "Derives", 0.7)]
+                if _verbose { println("    + " + full_id + " : " + summary) }
+            }
+        }
+    }
+
+    // predictions: .hexa files = verified predictions
+    let pred_dir = root + "/theory/predictions"
+    if dir_exists(pred_dir) {
+        let mut raw = ""
+        try { raw = _str(exec("ls -1 '" + pred_dir + "/'*.hexa 2>/dev/null")) } catch e {}  // @allow-silent-catch
+        let files = raw.split("\n")
+        let mut fi: i64 = 0
+        while fi < len(files) {
+            let fpath = _str(files[fi]).trim()
+            fi = fi + 1
+            if fpath == "" { continue }
+            // extract filename stem as ID
+            let mut name = fpath
+            let slash = name.split("/")
+            if len(slash) > 0 { name = _str(slash[len(slash) - 1]) }
+            let dot = name.index_of(".hexa")
+            if dot > 0 { name = name.substring(0, dot) }
+            let full_id = "n6arch-pred-" + name
+            if _id_seen(full_id) { continue }
+            _id_mark(full_id)
+            entries = entries + [_mk_node(full_id, "Prediction", "n6-architecture", "prediction: " + name, 0.7)]
+            if _verbose { println("    + " + full_id) }
+        }
+    }
+
+    // constants: verification files
+    let const_dir = root + "/theory/constants"
+    if dir_exists(const_dir) {
+        let mut raw = ""
+        try { raw = _str(exec("ls -1 '" + const_dir + "/'*.hexa 2>/dev/null")) } catch e {}  // @allow-silent-catch
+        let files = raw.split("\n")
+        let mut fi: i64 = 0
+        while fi < len(files) {
+            let fpath = _str(files[fi]).trim()
+            fi = fi + 1
+            if fpath == "" { continue }
+            let mut name = fpath
+            let slash = name.split("/")
+            if len(slash) > 0 { name = _str(slash[len(slash) - 1]) }
+            let dot = name.index_of(".hexa")
+            if dot > 0 { name = name.substring(0, dot) }
+            let full_id = "n6arch-const-" + name
+            if _id_seen(full_id) { continue }
+            _id_mark(full_id)
+            entries = entries + [_mk_node(full_id, "Constant", "n6-architecture", "constant verification: " + name, 0.7)]
+            if _verbose { println("    + " + full_id) }
+        }
+    }
+
+    return entries
+}
+
+// ─── anima: consciousness_laws.json psi_constants + laws ───
+fn scan_anima() -> [string] {
+    let mut entries: [string] = []
+    let root = _DEV + "/anima"
+    if !dir_exists(root) {
+        if _verbose { println("  [anima] directory not found, skip") }
+        return entries
+    }
+
+    // consciousness_laws.json — psi_constants
+    let laws_path = root + "/config/consciousness_laws.json"
+    if file_exists(laws_path) {
+        // extract psi_constants keys via grep
+        let mut raw = ""
+        try {
+            raw = _str(exec("grep -oE '\"[a-z_]+\":\\s*\\{' '" + laws_path + "' 2>/dev/null | head -20"))
+        } catch e {}  // @allow-silent-catch
+        let lines = raw.split("\n")
+        let mut li: i64 = 0
+        while li < len(lines) {
+            let line = _str(lines[li]).trim()
+            li = li + 1
+            if line == "" { continue }
+            // extract key name between quotes
+            let q1 = line.index_of("\"")
+            if q1 < 0 { continue }
+            let rest = line.substring(q1 + 1, len(line))
+            let q2 = rest.index_of("\"")
+            if q2 < 0 { continue }
+            let key = rest.substring(0, q2)
+            if key == "_meta" || key == "psi_constants" || key == "laws" { continue }
+            let full_id = "anima-psi-" + key
+            if _id_seen(full_id) { continue }
+            _id_mark(full_id)
+            entries = entries + [_mk_node(full_id, "Constant", "consciousness", "anima psi constant: " + key, 0.8)]
+            entries = entries + [_mk_edge("consciousness_structure", full_id, "Derives", 0.6)]
+            if _verbose { println("    + " + full_id) }
+        }
+    }
+
+    // progress.json — milestones as knowledge nodes
+    let prog_path = root + "/config/progress.json"
+    if file_exists(prog_path) {
+        // extract milestone keys
+        let mut raw = ""
+        try {
+            raw = _str(exec("grep -oE '\"milestone_[^\"]+\"' '" + prog_path + "' 2>/dev/null | head -30"))
+        } catch e {}  // @allow-silent-catch
+        let lines = raw.split("\n")
+        let mut li: i64 = 0
+        while li < len(lines) {
+            let line = _str(lines[li]).trim()
+            li = li + 1
+            if line == "" { continue }
+            let key = line.replace("\"", "")
+            if key == "" { continue }
+            let full_id = "anima-" + key
+            if _id_seen(full_id) { continue }
+            _id_mark(full_id)
+            entries = entries + [_mk_node(full_id, "Milestone", "consciousness", "anima " + key, 0.6)]
+            if _verbose { println("    + " + full_id) }
+        }
+    }
+
+    // experiments.json — experiment entries
+    let exp_path = root + "/config/experiments.json"
+    if file_exists(exp_path) {
+        let mut raw = ""
+        try {
+            raw = _str(exec("grep -oE '\"id\":\\s*\"[^\"]+\"' '" + exp_path + "' 2>/dev/null | head -30"))
+        } catch e {}  // @allow-silent-catch
+        let lines = raw.split("\n")
+        let mut li: i64 = 0
+        while li < len(lines) {
+            let line = _str(lines[li]).trim()
+            li = li + 1
+            if line == "" { continue }
+            // parse "id": "exp-xxx"
+            let parts = line.split(":")
+            if len(parts) < 2 { continue }
+            let val = _str(parts[1]).trim().replace("\"", "")
+            if val == "" { continue }
+            let full_id = "anima-exp-" + val
+            if _id_seen(full_id) { continue }
+            _id_mark(full_id)
+            entries = entries + [_mk_node(full_id, "Experiment", "consciousness", "anima experiment: " + val, 0.6)]
+            if _verbose { println("    + " + full_id) }
+        }
+    }
+
+    return entries
+}
+
+// ─── airgenome: convergence JSONL + gate config ───
+fn scan_airgenome() -> [string] {
+    let mut entries: [string] = []
+    let root = _DEV + "/airgenome"
+    if !dir_exists(root) {
+        if _verbose { println("  [airgenome] directory not found, skip") }
+        return entries
+    }
+
+    let shared_dir = root + "/nexus/shared"
+    if !dir_exists(shared_dir) { return entries }
+
+    // convergence JSONL files — extract convergence milestones
+    let mut conv_raw = ""
+    try {
+        conv_raw = _str(exec("ls -1 '" + shared_dir + "/'airgenome_convergence_*.jsonl 2>/dev/null | sort -r | head -1"))
+    } catch e {}  // @allow-silent-catch
+    let latest_conv = _str(conv_raw).trim()
+    if latest_conv != "" && file_exists(latest_conv) {
+        // count entries as a single convergence node
+        let mut count_raw = ""
+        try { count_raw = _str(exec("wc -l < '" + latest_conv + "' 2>/dev/null")).trim() } catch e {}  // @allow-silent-catch
+        let count = _to_int0(count_raw)
+        // extract date from filename
+        let mut fname = latest_conv
+        let sl = fname.split("/")
+        if len(sl) > 0 { fname = _str(sl[len(sl) - 1]) }
+        let full_id = "airgenome-convergence-latest"
+        if !_id_seen(full_id) {
+            _id_mark(full_id)
+            entries = entries + [_mk_node(full_id, "Convergence", "airgenome", "airgenome convergence: " + to_string(count) + " entries (" + fname + ")", 0.6)]
+            if _verbose { println("    + " + full_id + " (" + to_string(count) + " entries)") }
+        }
+    }
+
+    // gate_config.jsonl — active gates
+    let gate_path = shared_dir + "/gate_config.jsonl"
+    if file_exists(gate_path) {
+        let mut raw = ""
+        try {
+            raw = _str(exec("grep -oE '\"key\":\"[^\"]+\"' '" + gate_path + "' 2>/dev/null | head -20"))
+        } catch e {}  // @allow-silent-catch
+        let lines = raw.split("\n")
+        let mut li: i64 = 0
+        while li < len(lines) {
+            let line = _str(lines[li]).trim()
+            li = li + 1
+            if line == "" { continue }
+            let key = line.replace("\"key\":\"", "").replace("\"", "")
+            if key == "" { continue }
+            let full_id = "airgenome-gate-" + key
+            if _id_seen(full_id) { continue }
+            _id_mark(full_id)
+            entries = entries + [_mk_node(full_id, "Gate", "airgenome", "airgenome gate: " + key, 0.5)]
+            if _verbose { println("    + " + full_id) }
+        }
+    }
+
+    // detectors.jsonl — detector configurations
+    let det_path = shared_dir + "/detectors.jsonl"
+    if file_exists(det_path) {
+        let mut raw = ""
+        try {
+            raw = _str(exec("grep -oE '\"key\":\"[^\"]+\"' '" + det_path + "' 2>/dev/null | head -20"))
+        } catch e {}  // @allow-silent-catch
+        let lines = raw.split("\n")
+        let mut li: i64 = 0
+        while li < len(lines) {
+            let line = _str(lines[li]).trim()
+            li = li + 1
+            if line == "" { continue }
+            let key = line.replace("\"key\":\"", "").replace("\"", "")
+            if key == "" { continue }
+            let full_id = "airgenome-det-" + key
+            if _id_seen(full_id) { continue }
+            _id_mark(full_id)
+            entries = entries + [_mk_node(full_id, "Detector", "airgenome", "airgenome detector: " + key, 0.5)]
+            if _verbose { println("    + " + full_id) }
+        }
+    }
+
+    return entries
+}
+
+// ─── papers: manifest.json 논문 목록 ───
+fn scan_papers() -> [string] {
+    let mut entries: [string] = []
+    let root = _DEV + "/papers"
+    if !dir_exists(root) {
+        if _verbose { println("  [papers] directory not found, skip") }
+        return entries
+    }
+
+    let manifest_path = root + "/manifest.json"
+    if !file_exists(manifest_path) { return entries }
+
+    // extract paper IDs, titles, repos via grep
+    // format: "id": "P-NNN", "title": "...", "repo": "..."
+    let mut id_raw = ""
+    try {
+        id_raw = _str(exec("grep '\"id\":' '" + manifest_path + "' 2>/dev/null"))
+    } catch e {}  // @allow-silent-catch
+    let mut title_raw = ""
+    try {
+        title_raw = _str(exec("grep '\"title\":' '" + manifest_path + "' 2>/dev/null"))
+    } catch e {}  // @allow-silent-catch
+    let mut status_raw = ""
+    try {
+        status_raw = _str(exec("grep '\"status\":' '" + manifest_path + "' 2>/dev/null"))
+    } catch e {}  // @allow-silent-catch
+
+    let ids = id_raw.split("\n")
+    let titles = title_raw.split("\n")
+    let statuses = status_raw.split("\n")
+
+    let mut pi: i64 = 0
+    while pi < len(ids) {
+        let id_line = _str(ids[pi]).trim()
+        pi = pi + 1
+        if id_line == "" { continue }
+        if !id_line.contains("\"id\":") { continue }
+
+        // parse id
+        let mut paper_id = ""
+        let id_start = id_line.index_of("\"id\":")
+        if id_start >= 0 {
+            let after = id_line.substring(id_start + 5, len(id_line))
+            let q1 = after.index_of("\"")
+            if q1 >= 0 {
+                let rest = after.substring(q1 + 1, len(after))
+                let q2 = rest.index_of("\"")
+                if q2 >= 0 { paper_id = rest.substring(0, q2) }
+            }
+        }
+        if paper_id == "" { continue }
+        // skip _meta id
+        if paper_id == "harness-sync-v1" { continue }
+
+        // parse title (same index offset)
+        let mut title = paper_id
+        let ti = pi - 1
+        if ti < len(titles) {
+            let tline = _str(titles[ti]).trim()
+            let ts = tline.index_of("\"title\":")
+            if ts >= 0 {
+                let after = tline.substring(ts + 8, len(tline))
+                let q1 = after.index_of("\"")
+                if q1 >= 0 {
+                    let rest = after.substring(q1 + 1, len(after))
+                    let q2 = rest.index_of("\"")
+                    if q2 >= 0 { title = rest.substring(0, q2) }
+                }
+            }
+        }
+
+        // parse status
+        let mut status = ""
+        if ti < len(statuses) {
+            let sline = _str(statuses[ti]).trim()
+            if sline.contains("\"Published\"") { status = "Published" }
+            else if sline.contains("\"Draft\"") { status = "Draft" }
+        }
+
+        let full_id = "papers-" + paper_id
+        if _id_seen(full_id) { continue }
+        _id_mark(full_id)
+
+        let conf = if status == "Published" { 0.9 } else { 0.6 }
+        let mut summary = paper_id + ": " + title
+        if len(summary) > 120 { summary = summary.substring(0, 120) }
+
+        entries = entries + [_mk_node(full_id, "Paper", "papers", summary, conf)]
+        entries = entries + [_mk_edge("n", full_id, "Application", 0.5)]
+        if _verbose { println("    + " + full_id + " [" + status + "]") }
+    }
+
+    return entries
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── main ───
+// ═══════════════════════════════════════════════════════════
+
+// project registry: parallel lists (name, scan function result)
+let PROJ_NAMES = ["n6-architecture", "anima", "airgenome", "papers"]
+
+println("=== scan_ext_atlas: ATLAS-P8-1 external project sync ===")
+println("  atlas: " + _ATLAS_PATH)
+println("  mode:  " + if _dry_run { "DRY-RUN" } else { "LIVE" })
+println("  ts:    " + _now_iso())
+println("")
+
+// pre-load existing atlas IDs for dedup
+if !_dry_run {
+    println("  loading existing atlas IDs...")
+    _load_existing_ids(_ATLAS_PATH)
+    let known = len(_seen_id_list)
+    println("  existing IDs: " + to_string(known))
+    println("")
+}
+
+// stats parallel lists
+let mut stat_names: [string] = []
+let mut stat_counts: [i64] = []
+let mut total_new: i64 = 0
+
+// scan each project
+let mut pi: i64 = 0
+while pi < len(PROJ_NAMES) {
+    let pname = PROJ_NAMES[pi]
+    pi = pi + 1
+
+    // project filter
+    if _project_filter != "" && _project_filter != pname { continue }
+
+    println("  scanning: " + pname + " ...")
+
+    let mut entries: [string] = []
+    if pname == "n6-architecture" { entries = scan_n6_arch() }
+    else if pname == "anima" { entries = scan_anima() }
+    else if pname == "airgenome" { entries = scan_airgenome() }
+    else if pname == "papers" { entries = scan_papers() }
+
+    let count = len(entries)
+    stat_names = stat_names + [pname]
+    stat_counts = stat_counts + [count]
+    total_new = total_new + count
+
+    if count == 0 {
+        println("    (no new entries)")
+        continue
+    }
+
+    println("    new entries: " + to_string(count))
+
+    // write to atlas
+    if !_dry_run {
+        // build section header + content
+        let mut content = "# ── ext-sync: " + pname + " (" + _now_iso() + ") ──\n"
+        let mut ei: i64 = 0
+        while ei < count {
+            content = content + entries[ei] + "\n"
+            ei = ei + 1
+        }
+        _guarded_append_atlas(_ATLAS_PATH, content)
+    }
+}
+
+// ─── summary ───
+println("")
+println("=== sync summary ===")
+println("  total new entries: " + to_string(total_new))
+let mut si: i64 = 0
+while si < len(stat_names) {
+    println("    " + stat_names[si] + ": " + to_string(stat_counts[si]))
+    si = si + 1
+}
+if _dry_run {
+    println("")
+    println("  (dry-run: no changes written to atlas.n6)")
+}
+println("")

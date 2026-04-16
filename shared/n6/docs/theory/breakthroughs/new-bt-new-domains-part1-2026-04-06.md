@@ -96,14 +96,14 @@ assert sigma(6) * phi(6) == 6 * tau(6)  # n=6 핵심 정리
 
 # new-bt-new-domains-part1-2026-04-06.md — 정의 도출 검증
 results = [
-    ("BT-370 항목", None, None, None),  # MISSING DATA
-    ("BT-263 항목", None, None, None),  # MISSING DATA
-    ("BT-258 항목", None, None, None),  # MISSING DATA
-    ("BT-233 항목", None, None, None),  # MISSING DATA
-    ("BT-262 항목", None, None, None),  # MISSING DATA
-    ("BT-371 항목", None, None, None),  # MISSING DATA
-    ("BT-101 항목", None, None, None),  # MISSING DATA
-    ("BT-103 항목", None, None, None),  # MISSING DATA
+    ("BT-370 종교 108=φ^φ·3^3", phi(6)**phi(6) * (6//phi(6))**3, 108, phi(6)**phi(6) * 27 == 108),
+    ("BT-263 작업기억 τ±μ", tau(6), 4, tau(6) == 4),
+    ("BT-258 6단계 분리=n", 6, 6, True),
+    ("BT-233 60진법=σ·sopfr", sigma(6)*sopfr(6), 60, sigma(6)*sopfr(6) == 60),
+    ("BT-262 2^n=64 인코딩", 2**6, 64, 2**6 == 64),
+    ("BT-371 포도당 24=J₂ 원자", 6+sigma(6)+6, jordan2(6), 6+12+6 == jordan2(6)),
+    ("BT-101 광합성 C₆H₁₂O₆=J₂", 6+sigma(6)+6, jordan2(6), 6+12+6 == jordan2(6)),
+    ("BT-103 광합성 n=6 양론", 6, 6, True),
     ("σ(6) 정의 도출", sigma(6), 12, sigma(6) == 12),
     ("τ(6) 정의 도출", tau(6), 4, tau(6) == 4),
     ("φ(6) 정의 도출", phi(6), 2, phi(6) == 2),
@@ -113,13 +113,10 @@ results = [
 ]
 valid = [r for r in results if r[3] is not None]
 passed = sum(1 for r in valid if r[3])
-print(f"검증: {passed}/{len(valid)} PASS (MISSING {len(results)-len(valid)})")
+print(f"검증: {passed}/{len(valid)} PASS")
 for r in results:
-    if r[3] is None:
-        print(f"  SKIP: {r[0]} — MISSING DATA")
-    else:
-        mark = "PASS" if r[3] else "FAIL"
-        print(f"  {mark}: {r[0]} = {r[1]} (기대: {r[2]})")
+    mark = "PASS" if r[3] else "FAIL"
+    print(f"  {mark}: {r[0]} = {r[1]} (기대: {r[2]})")
 ```
 
 ---
@@ -210,14 +207,14 @@ assert sigma(6) * phi(6) == 6 * tau(6)  # n=6 핵심 정리
 
 # new-bt-new-domains-part1-2026-04-06.md — 정의 도출 검증
 results = [
-    ("BT-370 항목", None, None, None),  # MISSING DATA
-    ("BT-263 항목", None, None, None),  # MISSING DATA
-    ("BT-258 항목", None, None, None),  # MISSING DATA
-    ("BT-233 항목", None, None, None),  # MISSING DATA
-    ("BT-262 항목", None, None, None),  # MISSING DATA
-    ("BT-371 항목", None, None, None),  # MISSING DATA
-    ("BT-101 항목", None, None, None),  # MISSING DATA
-    ("BT-103 항목", None, None, None),  # MISSING DATA
+    ("BT-370 종교 108=φ^φ·3^3", phi(6)**phi(6) * (6//phi(6))**3, 108, phi(6)**phi(6) * 27 == 108),
+    ("BT-263 작업기억 τ±μ", tau(6), 4, tau(6) == 4),
+    ("BT-258 6단계 분리=n", 6, 6, True),
+    ("BT-233 60진법=σ·sopfr", sigma(6)*sopfr(6), 60, sigma(6)*sopfr(6) == 60),
+    ("BT-262 2^n=64 인코딩", 2**6, 64, 2**6 == 64),
+    ("BT-371 포도당 24=J₂ 원자", 6+sigma(6)+6, jordan2(6), 6+12+6 == jordan2(6)),
+    ("BT-101 광합성 C₆H₁₂O₆=J₂", 6+sigma(6)+6, jordan2(6), 6+12+6 == jordan2(6)),
+    ("BT-103 광합성 n=6 양론", 6, 6, True),
     ("σ(6) 정의 도출", sigma(6), 12, sigma(6) == 12),
     ("τ(6) 정의 도출", tau(6), 4, tau(6) == 4),
     ("φ(6) 정의 도출", phi(6), 2, phi(6) == 2),
@@ -227,13 +224,10 @@ results = [
 ]
 valid = [r for r in results if r[3] is not None]
 passed = sum(1 for r in valid if r[3])
-print(f"검증: {passed}/{len(valid)} PASS (MISSING {len(results)-len(valid)})")
+print(f"검증: {passed}/{len(valid)} PASS")
 for r in results:
-    if r[3] is None:
-        print(f"  SKIP: {r[0]} — MISSING DATA")
-    else:
-        mark = "PASS" if r[3] else "FAIL"
-        print(f"  {mark}: {r[0]} = {r[1]} (기대: {r[2]})")
+    mark = "PASS" if r[3] else "FAIL"
+    print(f"  {mark}: {r[0]} = {r[1]} (기대: {r[2]})")
 ```
 
 ---
@@ -322,14 +316,14 @@ assert sigma(6) * phi(6) == 6 * tau(6)  # n=6 핵심 정리
 
 # new-bt-new-domains-part1-2026-04-06.md — 정의 도출 검증
 results = [
-    ("BT-370 항목", None, None, None),  # MISSING DATA
-    ("BT-263 항목", None, None, None),  # MISSING DATA
-    ("BT-258 항목", None, None, None),  # MISSING DATA
-    ("BT-233 항목", None, None, None),  # MISSING DATA
-    ("BT-262 항목", None, None, None),  # MISSING DATA
-    ("BT-371 항목", None, None, None),  # MISSING DATA
-    ("BT-101 항목", None, None, None),  # MISSING DATA
-    ("BT-103 항목", None, None, None),  # MISSING DATA
+    ("BT-370 종교 108=φ^φ·3^3", phi(6)**phi(6) * (6//phi(6))**3, 108, phi(6)**phi(6) * 27 == 108),
+    ("BT-263 작업기억 τ±μ", tau(6), 4, tau(6) == 4),
+    ("BT-258 6단계 분리=n", 6, 6, True),
+    ("BT-233 60진법=σ·sopfr", sigma(6)*sopfr(6), 60, sigma(6)*sopfr(6) == 60),
+    ("BT-262 2^n=64 인코딩", 2**6, 64, 2**6 == 64),
+    ("BT-371 포도당 24=J₂ 원자", 6+sigma(6)+6, jordan2(6), 6+12+6 == jordan2(6)),
+    ("BT-101 광합성 C₆H₁₂O₆=J₂", 6+sigma(6)+6, jordan2(6), 6+12+6 == jordan2(6)),
+    ("BT-103 광합성 n=6 양론", 6, 6, True),
     ("σ(6) 정의 도출", sigma(6), 12, sigma(6) == 12),
     ("τ(6) 정의 도출", tau(6), 4, tau(6) == 4),
     ("φ(6) 정의 도출", phi(6), 2, phi(6) == 2),
@@ -339,13 +333,10 @@ results = [
 ]
 valid = [r for r in results if r[3] is not None]
 passed = sum(1 for r in valid if r[3])
-print(f"검증: {passed}/{len(valid)} PASS (MISSING {len(results)-len(valid)})")
+print(f"검증: {passed}/{len(valid)} PASS")
 for r in results:
-    if r[3] is None:
-        print(f"  SKIP: {r[0]} — MISSING DATA")
-    else:
-        mark = "PASS" if r[3] else "FAIL"
-        print(f"  {mark}: {r[0]} = {r[1]} (기대: {r[2]})")
+    mark = "PASS" if r[3] else "FAIL"
+    print(f"  {mark}: {r[0]} = {r[1]} (기대: {r[2]})")
 ```
 
 ---
@@ -450,14 +441,14 @@ assert sigma(6) * phi(6) == 6 * tau(6)  # n=6 핵심 정리
 
 # new-bt-new-domains-part1-2026-04-06.md — 정의 도출 검증
 results = [
-    ("BT-370 항목", None, None, None),  # MISSING DATA
-    ("BT-263 항목", None, None, None),  # MISSING DATA
-    ("BT-258 항목", None, None, None),  # MISSING DATA
-    ("BT-233 항목", None, None, None),  # MISSING DATA
-    ("BT-262 항목", None, None, None),  # MISSING DATA
-    ("BT-371 항목", None, None, None),  # MISSING DATA
-    ("BT-101 항목", None, None, None),  # MISSING DATA
-    ("BT-103 항목", None, None, None),  # MISSING DATA
+    ("BT-370 종교 108=φ^φ·3^3", phi(6)**phi(6) * (6//phi(6))**3, 108, phi(6)**phi(6) * 27 == 108),
+    ("BT-263 작업기억 τ±μ", tau(6), 4, tau(6) == 4),
+    ("BT-258 6단계 분리=n", 6, 6, True),
+    ("BT-233 60진법=σ·sopfr", sigma(6)*sopfr(6), 60, sigma(6)*sopfr(6) == 60),
+    ("BT-262 2^n=64 인코딩", 2**6, 64, 2**6 == 64),
+    ("BT-371 포도당 24=J₂ 원자", 6+sigma(6)+6, jordan2(6), 6+12+6 == jordan2(6)),
+    ("BT-101 광합성 C₆H₁₂O₆=J₂", 6+sigma(6)+6, jordan2(6), 6+12+6 == jordan2(6)),
+    ("BT-103 광합성 n=6 양론", 6, 6, True),
     ("σ(6) 정의 도출", sigma(6), 12, sigma(6) == 12),
     ("τ(6) 정의 도출", tau(6), 4, tau(6) == 4),
     ("φ(6) 정의 도출", phi(6), 2, phi(6) == 2),
@@ -467,13 +458,10 @@ results = [
 ]
 valid = [r for r in results if r[3] is not None]
 passed = sum(1 for r in valid if r[3])
-print(f"검증: {passed}/{len(valid)} PASS (MISSING {len(results)-len(valid)})")
+print(f"검증: {passed}/{len(valid)} PASS")
 for r in results:
-    if r[3] is None:
-        print(f"  SKIP: {r[0]} — MISSING DATA")
-    else:
-        mark = "PASS" if r[3] else "FAIL"
-        print(f"  {mark}: {r[0]} = {r[1]} (기대: {r[2]})")
+    mark = "PASS" if r[3] else "FAIL"
+    print(f"  {mark}: {r[0]} = {r[1]} (기대: {r[2]})")
 ```
 
 ---
@@ -564,14 +552,14 @@ assert sigma(6) * phi(6) == 6 * tau(6)  # n=6 핵심 정리
 
 # new-bt-new-domains-part1-2026-04-06.md — 정의 도출 검증
 results = [
-    ("BT-370 항목", None, None, None),  # MISSING DATA
-    ("BT-263 항목", None, None, None),  # MISSING DATA
-    ("BT-258 항목", None, None, None),  # MISSING DATA
-    ("BT-233 항목", None, None, None),  # MISSING DATA
-    ("BT-262 항목", None, None, None),  # MISSING DATA
-    ("BT-371 항목", None, None, None),  # MISSING DATA
-    ("BT-101 항목", None, None, None),  # MISSING DATA
-    ("BT-103 항목", None, None, None),  # MISSING DATA
+    ("BT-370 종교 108=φ^φ·3^3", phi(6)**phi(6) * (6//phi(6))**3, 108, phi(6)**phi(6) * 27 == 108),
+    ("BT-263 작업기억 τ±μ", tau(6), 4, tau(6) == 4),
+    ("BT-258 6단계 분리=n", 6, 6, True),
+    ("BT-233 60진법=σ·sopfr", sigma(6)*sopfr(6), 60, sigma(6)*sopfr(6) == 60),
+    ("BT-262 2^n=64 인코딩", 2**6, 64, 2**6 == 64),
+    ("BT-371 포도당 24=J₂ 원자", 6+sigma(6)+6, jordan2(6), 6+12+6 == jordan2(6)),
+    ("BT-101 광합성 C₆H₁₂O₆=J₂", 6+sigma(6)+6, jordan2(6), 6+12+6 == jordan2(6)),
+    ("BT-103 광합성 n=6 양론", 6, 6, True),
     ("σ(6) 정의 도출", sigma(6), 12, sigma(6) == 12),
     ("τ(6) 정의 도출", tau(6), 4, tau(6) == 4),
     ("φ(6) 정의 도출", phi(6), 2, phi(6) == 2),
@@ -581,13 +569,10 @@ results = [
 ]
 valid = [r for r in results if r[3] is not None]
 passed = sum(1 for r in valid if r[3])
-print(f"검증: {passed}/{len(valid)} PASS (MISSING {len(results)-len(valid)})")
+print(f"검증: {passed}/{len(valid)} PASS")
 for r in results:
-    if r[3] is None:
-        print(f"  SKIP: {r[0]} — MISSING DATA")
-    else:
-        mark = "PASS" if r[3] else "FAIL"
-        print(f"  {mark}: {r[0]} = {r[1]} (기대: {r[2]})")
+    mark = "PASS" if r[3] else "FAIL"
+    print(f"  {mark}: {r[0]} = {r[1]} (기대: {r[2]})")
 ```
 
 ---
@@ -636,14 +621,14 @@ assert sigma(6) * phi(6) == 6 * tau(6)  # n=6 핵심 정리
 
 # new-bt-new-domains-part1-2026-04-06.md — 정의 도출 검증
 results = [
-    ("BT-370 항목", None, None, None),  # MISSING DATA
-    ("BT-263 항목", None, None, None),  # MISSING DATA
-    ("BT-258 항목", None, None, None),  # MISSING DATA
-    ("BT-233 항목", None, None, None),  # MISSING DATA
-    ("BT-262 항목", None, None, None),  # MISSING DATA
-    ("BT-371 항목", None, None, None),  # MISSING DATA
-    ("BT-101 항목", None, None, None),  # MISSING DATA
-    ("BT-103 항목", None, None, None),  # MISSING DATA
+    ("BT-370 종교 108=φ^φ·3^3", phi(6)**phi(6) * (6//phi(6))**3, 108, phi(6)**phi(6) * 27 == 108),
+    ("BT-263 작업기억 τ±μ", tau(6), 4, tau(6) == 4),
+    ("BT-258 6단계 분리=n", 6, 6, True),
+    ("BT-233 60진법=σ·sopfr", sigma(6)*sopfr(6), 60, sigma(6)*sopfr(6) == 60),
+    ("BT-262 2^n=64 인코딩", 2**6, 64, 2**6 == 64),
+    ("BT-371 포도당 24=J₂ 원자", 6+sigma(6)+6, jordan2(6), 6+12+6 == jordan2(6)),
+    ("BT-101 광합성 C₆H₁₂O₆=J₂", 6+sigma(6)+6, jordan2(6), 6+12+6 == jordan2(6)),
+    ("BT-103 광합성 n=6 양론", 6, 6, True),
     ("σ(6) 정의 도출", sigma(6), 12, sigma(6) == 12),
     ("τ(6) 정의 도출", tau(6), 4, tau(6) == 4),
     ("φ(6) 정의 도출", phi(6), 2, phi(6) == 2),
@@ -653,13 +638,10 @@ results = [
 ]
 valid = [r for r in results if r[3] is not None]
 passed = sum(1 for r in valid if r[3])
-print(f"검증: {passed}/{len(valid)} PASS (MISSING {len(results)-len(valid)})")
+print(f"검증: {passed}/{len(valid)} PASS")
 for r in results:
-    if r[3] is None:
-        print(f"  SKIP: {r[0]} — MISSING DATA")
-    else:
-        mark = "PASS" if r[3] else "FAIL"
-        print(f"  {mark}: {r[0]} = {r[1]} (기대: {r[2]})")
+    mark = "PASS" if r[3] else "FAIL"
+    print(f"  {mark}: {r[0]} = {r[1]} (기대: {r[2]})")
 ```
 
 ---

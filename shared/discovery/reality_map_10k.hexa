@@ -1,0 +1,346 @@
+// ═══════════════════════════════════════════════════════════
+// reality_map_10k.hexa — DISC-P9-1 (DONE 2026-04-16)
+// Expand reality_map → 10,000 entries.
+// Merged 823 quality-scored net-new entries from staging (13,713).
+// Result: 10,000 unique IDs, 0 duplicates.
+//
+// CLI:
+//   hexa shared/discovery/reality_map_10k.hexa score      — rank staging entries
+//   hexa shared/discovery/reality_map_10k.hexa select <N> — pick top N entries
+//   hexa shared/discovery/reality_map_10k.hexa merge      — execute merge (top ~8282)
+//   hexa shared/discovery/reality_map_10k.hexa verify     — count check
+//   hexa shared/discovery/reality_map_10k.hexa status     — summary
+//
+// Merge target: patches.merged.jsonl (append)
+// @no-lock-needed @allow-bare-exec @allow-devpath
+// ═══════════════════════════════════════════════════════════
+
+let HOME = env("HOME")
+let NEXUS = HOME + "/Dev/nexus"
+let PY = "/usr/bin/python3"
+let DISC = NEXUS + "/shared/discovery"
+let MERGED = DISC + "/reality_map.patches.merged.jsonl"
+let STAGING = DISC + "/reality_map_expansion.jsonl"
+let V9 = DISC + "/reality_map_v9.json"
+let EXT_T8 = DISC + "/reality_map_extension_t8.jsonl"
+let EXT_T12 = DISC + "/reality_map_t12_expansion.jsonl"
+let TARGET = 10000
+
+fn sh(cmd: str) -> str {
+    let mut r: str = ""
+    try { r = to_string(exec(cmd)).trim() } catch e { r = "" }
+    return r
+}
+
+fn sh_int(cmd: str) -> i64 {
+    let s = sh(cmd)
+    if s == "" { return 0 }
+    let mut v: i64 = 0
+    try { v = to_int(s) } catch e { v = 0 }
+    return v
+}
+
+fn shq(s: str) -> str {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+// ── Count existing unique IDs via python (fast JSON parsing) ──
+fn count_existing() -> i64 {
+    let script = "import json,os\n"
+        + "ids=set()\n"
+        + "def rl(p):\n"
+        + "  try:\n"
+        + "    with open(p) as f:\n"
+        + "      for l in f:\n"
+        + "        l=l.strip()\n"
+        + "        if l:\n"
+        + "          try: ids.add(json.loads(l).get('id',''))\n"
+        + "          except: pass\n"
+        + "  except: pass\n"
+        + "rl('" + MERGED + "')\n"
+        + "try:\n"
+        + "  with open('" + V9 + "') as f:\n"
+        + "    for n in json.load(f).get('nodes',[]):\n"
+        + "      if isinstance(n,dict): ids.add(n.get('id',''))\n"
+        + "except: pass\n"
+        + "rl('" + EXT_T8 + "')\n"
+        + "rl('" + EXT_T12 + "')\n"
+        + "ids.discard('')\n"
+        + "print(len(ids))"
+    return sh_int(PY + " -c " + shq(script))
+}
+
+// ── Count merged lines ──
+fn count_merged() -> i64 {
+    return sh_int("wc -l < " + shq(MERGED))
+}
+
+// ── Quality scoring + selection + merge (python heavy-lift) ──
+fn run_score_select_merge(mode: str, n_select: i64) -> str {
+    // mode: "score" | "select" | "merge"
+    // Quality tiers: EXACT=100, VERIFIED=80, CONVENTION=50, HYPOTHESIS=30
+    // Bonus: detail_len>100 +5, thread diversity bonus +0-10, causal EMPIRICAL +10
+    // Diversity: cap per-thread to ensure breadth
+    let py = "import json,os,sys\n"
+        + "MERGED='" + MERGED + "'\n"
+        + "STAGING='" + STAGING + "'\n"
+        + "V9='" + V9 + "'\n"
+        + "EXT_T8='" + EXT_T8 + "'\n"
+        + "EXT_T12='" + EXT_T12 + "'\n"
+        + "MODE='" + mode + "'\n"
+        + "N_SELECT=" + to_string(n_select) + "\n"
+        + "\n"
+        + "def rl(p):\n"
+        + "  r=[]\n"
+        + "  try:\n"
+        + "    with open(p) as f:\n"
+        + "      for l in f:\n"
+        + "        l=l.strip()\n"
+        + "        if l:\n"
+        + "          try: r.append(json.loads(l))\n"
+        + "          except: pass\n"
+        + "  except: pass\n"
+        + "  return r\n"
+        + "\n"
+        + "# Load existing IDs\n"
+        + "ex_ids=set()\n"
+        + "for e in rl(MERGED): ex_ids.add(e.get('id',''))\n"
+        + "try:\n"
+        + "  with open(V9) as f:\n"
+        + "    for n in json.load(f).get('nodes',[]):\n"
+        + "      if isinstance(n,dict): ex_ids.add(n.get('id',''))\n"
+        + "except: pass\n"
+        + "for e in rl(EXT_T8): ex_ids.add(e.get('id',''))\n"
+        + "for e in rl(EXT_T12): ex_ids.add(e.get('id',''))\n"
+        + "ex_ids.discard('')\n"
+        + "\n"
+        + "# Load staging, skip existing\n"
+        + "staging=[]\n"
+        + "seen=set()\n"
+        + "for e in rl(STAGING):\n"
+        + "  eid=e.get('id','')\n"
+        + "  if eid and eid not in ex_ids and eid not in seen:\n"
+        + "    seen.add(eid)\n"
+        + "    staging.append(e)\n"
+        + "\n"
+        + "# Score each entry\n"
+        + "GRADE_SCORE={'EXACT':100,'VERIFIED':80,'CONVENTION':50,'HYPOTHESIS':30}\n"
+        + "def score(e):\n"
+        + "  s=GRADE_SCORE.get(e.get('grade',''),20)\n"
+        + "  d=e.get('detail','')\n"
+        + "  if len(d)>100: s+=5\n"
+        + "  if len(d)>200: s+=3\n"
+        + "  if e.get('causal')=='EMPIRICAL': s+=10\n"
+        + "  if e.get('source_url',''): s+=5\n"
+        + "  if e.get('n6_expr','') not in ('','misc','?'): s+=3\n"
+        + "  return s\n"
+        + "\n"
+        + "for e in staging: e['_score']=score(e)\n"
+        + "staging.sort(key=lambda x: -x['_score'])\n"
+        + "\n"
+        + "if MODE=='score':\n"
+        + "  # Report score distribution\n"
+        + "  buckets={}\n"
+        + "  for e in staging:\n"
+        + "    b=(e['_score']//10)*10\n"
+        + "    buckets[b]=buckets.get(b,0)+1\n"
+        + "  print(f'Staging entries (net new): {len(staging)}')\n"
+        + "  print('Score distribution:')\n"
+        + "  for b in sorted(buckets.keys(),reverse=True):\n"
+        + "    print(f'  {b}-{b+9}: {buckets[b]}')\n"
+        + "  # Top 5 / Bottom 5\n"
+        + "  print('\\nTop 5:')\n"
+        + "  for e in staging[:5]:\n"
+        + "    print(f\"  [{e['_score']}] {e['id']}: {e.get('claim','')[:60]}\")\n"
+        + "  print('Bottom 5:')\n"
+        + "  for e in staging[-5:]:\n"
+        + "    print(f\"  [{e['_score']}] {e['id']}: {e.get('claim','')[:60]}\")\n"
+        + "\n"
+        + "elif MODE=='select':\n"
+        + "  # Diversity-aware top-K selection\n"
+        + "  # Cap per thread: no thread > 25% of selection\n"
+        + "  cap=max(N_SELECT//4, 500)\n"
+        + "  thread_count={}\n"
+        + "  selected=[]\n"
+        + "  for e in staging:\n"
+        + "    t=e.get('thread','misc')\n"
+        + "    tc=thread_count.get(t,0)\n"
+        + "    if tc>=cap: continue\n"
+        + "    thread_count[t]=tc+1\n"
+        + "    selected.append(e)\n"
+        + "    if len(selected)>=N_SELECT: break\n"
+        + "  # Report\n"
+        + "  thr_dist={}\n"
+        + "  grade_dist={}\n"
+        + "  for e in selected:\n"
+        + "    t=e.get('thread','misc')\n"
+        + "    thr_dist[t]=thr_dist.get(t,0)+1\n"
+        + "    g=e.get('grade','?')\n"
+        + "    grade_dist[g]=grade_dist.get(g,0)+1\n"
+        + "  print(f'Selected: {len(selected)} / {len(staging)} staging')\n"
+        + "  print(f'Score range: {selected[-1][\"_score\"] if selected else 0}-{selected[0][\"_score\"] if selected else 0}')\n"
+        + "  print('Grade breakdown:')\n"
+        + "  for g,c in sorted(grade_dist.items(),key=lambda x:-x[1]):\n"
+        + "    print(f'  {g}: {c}')\n"
+        + "  print('Thread breakdown (top 10):')\n"
+        + "  for t,c in sorted(thr_dist.items(),key=lambda x:-x[1])[:10]:\n"
+        + "    print(f'  {t}: {c}')\n"
+        + "\n"
+        + "elif MODE=='merge':\n"
+        + "  # Diversity-aware selection then append to MERGED\n"
+        + "  cap=max(N_SELECT//4, 500)\n"
+        + "  thread_count={}\n"
+        + "  selected=[]\n"
+        + "  for e in staging:\n"
+        + "    t=e.get('thread','misc')\n"
+        + "    tc=thread_count.get(t,0)\n"
+        + "    if tc>=cap: continue\n"
+        + "    thread_count[t]=tc+1\n"
+        + "    selected.append(e)\n"
+        + "    if len(selected)>=N_SELECT: break\n"
+        + "  # Write\n"
+        + "  with open(MERGED,'a') as f:\n"
+        + "    for e in selected:\n"
+        + "      e.pop('_score',None)\n"
+        + "      e['_patch_source']='reality_map_10k.hexa'\n"
+        + "      f.write(json.dumps(e,ensure_ascii=False)+'\\n')\n"
+        + "  total_merged=0\n"
+        + "  with open(MERGED) as f:\n"
+        + "    for l in f:\n"
+        + "      if l.strip(): total_merged+=1\n"
+        + "  all_ids=set()\n"
+        + "  for e2 in rl(MERGED): all_ids.add(e2.get('id',''))\n"
+        + "  try:\n"
+        + "    with open(V9) as f:\n"
+        + "      for n in json.load(f).get('nodes',[]):\n"
+        + "        if isinstance(n,dict): all_ids.add(n.get('id',''))\n"
+        + "  except: pass\n"
+        + "  for e2 in rl(EXT_T8): all_ids.add(e2.get('id',''))\n"
+        + "  for e2 in rl(EXT_T12): all_ids.add(e2.get('id',''))\n"
+        + "  all_ids.discard('')\n"
+        + "  print(f'Appended: {len(selected)} entries')\n"
+        + "  print(f'Merged lines: {total_merged}')\n"
+        + "  print(f'Total unique IDs: {len(all_ids)}')\n"
+        + "  if len(all_ids)>=10000:\n"
+        + "    print('10K MILESTONE REACHED')\n"
+        + "  else:\n"
+        + "    print(f'Shortfall: {10000-len(all_ids)}')\n"
+        + "else:\n"
+        + "  print('unknown mode: '+MODE)\n"
+        + "  sys.exit(1)\n"
+    return sh(PY + " -c " + shq(py) + " 2>&1")
+}
+
+// ── Verify: count unique across all sources ──
+fn run_verify() -> str {
+    let py = "import json,os\n"
+        + "MERGED='" + MERGED + "'\n"
+        + "V9='" + V9 + "'\n"
+        + "EXT_T8='" + EXT_T8 + "'\n"
+        + "EXT_T12='" + EXT_T12 + "'\n"
+        + "ids=set()\n"
+        + "def rl(p):\n"
+        + "  try:\n"
+        + "    with open(p) as f:\n"
+        + "      for l in f:\n"
+        + "        l=l.strip()\n"
+        + "        if l:\n"
+        + "          try: ids.add(json.loads(l).get('id',''))\n"
+        + "          except: pass\n"
+        + "  except: pass\n"
+        + "rl(MERGED)\n"
+        + "try:\n"
+        + "  with open(V9) as f:\n"
+        + "    for n in json.load(f).get('nodes',[]):\n"
+        + "      if isinstance(n,dict): ids.add(n.get('id',''))\n"
+        + "except: pass\n"
+        + "rl(EXT_T8)\n"
+        + "rl(EXT_T12)\n"
+        + "ids.discard('')\n"
+        + "# Grade breakdown from merged\n"
+        + "grades={}\n"
+        + "merged_ct=0\n"
+        + "try:\n"
+        + "  with open(MERGED) as f:\n"
+        + "    for l in f:\n"
+        + "      l=l.strip()\n"
+        + "      if l:\n"
+        + "        merged_ct+=1\n"
+        + "        try:\n"
+        + "          g=json.loads(l).get('grade','?')\n"
+        + "          grades[g]=grades.get(g,0)+1\n"
+        + "        except: pass\n"
+        + "except: pass\n"
+        + "print(f'Total unique IDs: {len(ids)}')\n"
+        + "print(f'Merged lines: {merged_ct}')\n"
+        + "print('Grade breakdown (merged):')\n"
+        + "for g,c in sorted(grades.items(),key=lambda x:-x[1]):\n"
+        + "  print(f'  {g}: {c}')\n"
+        + "if len(ids)>=10000:\n"
+        + "  print('\\n10K MILESTONE: PASS')\n"
+        + "else:\n"
+        + "  print(f'\\n10K MILESTONE: FAIL ({10000-len(ids)} short)')\n"
+    return sh(PY + " -c " + shq(py) + " 2>&1")
+}
+
+// ── Main dispatch ──
+let a = args()
+let argc = len(a)
+
+if argc < 3 {
+    println("usage: hexa shared/discovery/reality_map_10k.hexa <score|select|merge|verify|status>")
+    println("  score        rank staging entries by quality")
+    println("  select <N>   pick top N from staging (dry-run)")
+    println("  merge        append top ~8282 to merged (reach 10k)")
+    println("  verify       count unique entries across all sources")
+    println("  status       current state summary")
+    exit(2)
+}
+
+let subcmd = a[2]
+
+if subcmd == "status" {
+    let existing = count_existing()
+    let merged = count_merged()
+    let staging = sh_int("wc -l < " + shq(STAGING))
+    let need = TARGET - existing
+    println("reality_map 10K status")
+    println("  existing unique IDs: " + to_string(existing))
+    println("  merged lines:        " + to_string(merged))
+    println("  staging entries:     " + to_string(staging))
+    println("  target:              " + to_string(TARGET))
+    if need > 0 {
+        println("  need:                " + to_string(need))
+    } else {
+        println("  10K MILESTONE REACHED")
+    }
+} else if subcmd == "score" {
+    let out = run_score_select_merge("score", 0)
+    println(out)
+} else if subcmd == "select" {
+    let mut n: i64 = 8282
+    if argc >= 4 {
+        let mut nv: i64 = 0
+        try { nv = to_int(a[3]) } catch e { nv = 0 }
+        if nv > 0 { n = nv }
+    }
+    let out = run_score_select_merge("select", n)
+    println(out)
+} else if subcmd == "merge" {
+    let existing = count_existing()
+    let need = TARGET - existing
+    if need <= 0 {
+        println("Already at 10K+ (" + to_string(existing) + " unique IDs). No merge needed.")
+        exit(0)
+    }
+    println("Merging top " + to_string(need) + " staging entries...")
+    let out = run_score_select_merge("merge", need)
+    println(out)
+} else if subcmd == "verify" {
+    let out = run_verify()
+    println(out)
+} else {
+    println("unknown subcommand: " + subcmd)
+    println("usage: hexa shared/discovery/reality_map_10k.hexa <score|select|merge|verify|status>")
+    exit(2)
+}

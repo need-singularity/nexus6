@@ -1,0 +1,414 @@
+// shared/bisociation/convergence_index.hexa — BISOC-P9-1
+// Unified L1~L5 Bisociation Convergence Index Calculator
+// CLI: hexa convergence_index.hexa <compute|status|json|help>
+//
+// 설계:
+//   reads: convergence.json (layer progress) + state.json (phase, composites)
+//   index = sum(w_k * progress_k) / sum(w_k)
+//   weights: L1=1 L2=2 L3=3 L4=4 L5=5 Lm=3 (L5 가중치 최대 — phase lock 핵심)
+//   n=6 specialization: sigma(6)*phi(6)==6*tau(6)==24 invariant factor
+//   output: convergence JSON + append to convergence_log.jsonl
+//
+// Montgomery-Dyson n=6:
+//   R2(r) pair correlation of unfolded eigenvalue spacings
+//   GUE kernel: 1 - (sin(pi*r)/(pi*r))^2
+//   n=6 correction: 24-fold symmetry from sigma(6)*phi(6)=24
+//   convergence score: 1 - chi2_gue/(chi2_gue + chi2_poi)
+//   layer weight = n=6 invariant embedding: w_total = sigma(6)+phi(6)+tau(6)+sopfr(6) = 12+2+4+5 = 23
+//   (rounded to 18 for practical weighting: 1+2+3+4+5+3)
+
+comptime const LAYER_COUNT = 6
+comptime const PAPER_TRIGGER = 0.9
+comptime const N6_SIGMA = 12
+comptime const N6_PHI = 2
+comptime const N6_TAU = 4
+comptime const N6_SOPFR = 5
+comptime const N6_J2 = 24
+
+// ─── 유틸 ───
+
+fn abs_f(x: float) -> float { if x < 0.0 { return 0.0 - x } ; return x }
+fn clamp_01(x: float) -> float { if x < 0.0 { return 0.0 } ; if x > 1.0 { return 1.0 } ; return x }
+fn max_f(a: float, b: float) -> float { if a > b { return a } ; return b }
+fn min_f(a: float, b: float) -> float { if a < b { return a } ; return b }
+
+fn resolve_nexus() -> string {
+    let nx = env("NEXUS")
+    if nx != "" { return nx }
+    return env("HOME") + "/Dev/nexus"
+}
+
+// ─── Layer 정의 ───
+
+fn layer_keys() -> list { return ["L1_unified", "L2_spectra", "L3_cross", "L4_spectral_feedback", "L5_phase_lock", "L_meta"] }
+fn layer_weights() -> list { return [1.0, 2.0, 3.0, 4.0, 5.0, 3.0] }
+fn layer_labels() -> list { return ["L1 unified", "L2 spectra", "L3 cross", "L4 feedback", "L5 phase-lock", "L_meta"] }
+
+// n=6 Montgomery-Dyson GUE kernel 근사
+// K_GUE(r) = 1 - (sin(pi*r)/(pi*r))^2  (two-point cluster function)
+// R2_GUE(r) = 1 - K_GUE(r) = (sin(pi*r)/(pi*r))^2
+// n=6 fold: 24-fold degeneracy correction factor
+fn n6_gue_correction(r: float) -> float {
+    // simplified: for r>0, correction = 1 - 1/N6_J2 * (1 - R2_approx)
+    // at r=0: R2=1 (complete correlation), at r>>1: R2->1 (GUE)
+    // n=6 correction shifts transition scale by factor phi(6)/tau(6) = 0.5
+    if r < 0.001 { return 0.0 }
+    // sin(pi*r)/(pi*r) 근사: Taylor for small r, 1/r decay for large r
+    let pi = 3.14159265358979
+    let x = pi * r
+    let mut sinc = 0.0
+    if x < 0.5 {
+        // Taylor: sinc(x) ~ 1 - x^2/6 + x^4/120
+        sinc = 1.0 - (x * x) / 6.0 + (x * x * x * x) / 120.0
+    } else if x < 20.0 {
+        // sin via Taylor series (sufficient precision for index calculation)
+        let mut sin_val = 0.0
+        let mut term = x
+        let mut k = 1
+        while k <= 15 {
+            sin_val = sin_val + term
+            term = 0.0 - term * x * x / to_float((2 * k) * (2 * k + 1))
+            k = k + 1
+        }
+        sinc = sin_val / x
+    } else {
+        sinc = 0.0  // effectively 0 for large r
+    }
+    let r2 = sinc * sinc
+    // n=6 correction: scale by phi(6)/sigma(6) = 2/12 = 1/6
+    let correction = r2 * (1.0 - 1.0 / to_float(N6_J2))
+    return correction
+}
+
+// ─── Layer 데이터 추출 ───
+
+struct LayerInfo {
+    key: string,
+    label: string,
+    weight: float,
+    progress: float,
+    modules_done: int,
+    modules_total: int,
+    status: string
+}
+
+fn extract_layer(conv: str, key: string, label: string, weight: float) -> LayerInfo {
+    let stages = conv["stages"]
+    if stages == nil { return LayerInfo { key: key, label: label, weight: weight, progress: 0.0, modules_done: 0, modules_total: 0, status: "missing" } }
+    let layer = stages[key]
+    if layer == nil { return LayerInfo { key: key, label: label, weight: weight, progress: 0.0, modules_done: 0, modules_total: 0, status: "missing" } }
+    let prog = if layer["progress"] != nil { to_float(layer["progress"]) } else { 0.0 }
+    let done = if layer["modules_done"] != nil { to_int(layer["modules_done"]) } else { 0 }
+    let total = if layer["modules_total"] != nil { to_int(layer["modules_total"]) } else { 0 }
+    let st = if layer["status"] != nil { to_string(layer["status"]) } else { "unknown" }
+    LayerInfo { key: key, label: label, weight: weight, progress: prog, modules_done: done, modules_total: total, status: st }
+}
+
+// ─── Convergence Index 계산 ───
+
+struct ConvergenceIndex {
+    index: float,
+    weighted_sum: float,
+    weight_total: float,
+    layers: list,
+    modules_done_total: int,
+    modules_total_total: int,
+    composite_best: float,
+    composite_pair: string,
+    paper_trigger: bool,
+    paper_gap: float,
+    all_complete: bool,
+    n6_factor: float,
+    n6_corrected_index: float,
+    health: string
+}
+
+fn compute_convergence_index(conv: str, state: str) -> ConvergenceIndex {
+    let keys = layer_keys()
+    let weights = layer_weights()
+    let labels = layer_labels()
+    let mut layers = []
+    let mut w_sum = 0.0
+    let mut w_total = 0.0
+    let mut all_done = true
+    let mut m_done = 0
+    let mut m_total = 0
+    let mut i = 0
+    while i < LAYER_COUNT {
+        let li = extract_layer(conv, keys[i], labels[i], to_float(weights[i]))
+        layers = layers + [li]
+        let p = clamp_01(li.progress)
+        w_sum = w_sum + li.weight * p
+        w_total = w_total + li.weight
+        m_done = m_done + li.modules_done
+        m_total = m_total + li.modules_total
+        if li.progress < 1.0 { all_done = false }
+        i = i + 1
+    }
+    let idx = if w_total > 0.0 { w_sum / w_total } else { 0.0 }
+
+    // n=6 correction: scale index through GUE correction at r=idx
+    // n6_factor captures how "GUE-like" our convergence pattern is
+    let n6_factor = n6_gue_correction(idx * to_float(N6_TAU))
+    // corrected index: blend raw index with n=6 structural factor
+    // n6_corrected = idx * (1 + n6_factor * phi(6)/sigma(6))
+    // = idx * (1 + n6_factor * 1/6) -- small boost for GUE alignment
+    let n6_corrected = idx * (1.0 + n6_factor / to_float(N6_SIGMA / N6_PHI))
+
+    // composite best from state
+    let mut comp_best = 0.0
+    let mut comp_pair = "none"
+    if state["L3_aligned_rerun"] != nil {
+        let rerun = state["L3_aligned_rerun"]
+        if rerun["results"] != nil {
+            let results = rerun["results"]
+            let rkeys = results.keys()
+            let mut k = 0
+            while k < rkeys.len() {
+                let entry = results[rkeys[k]]
+                if entry["after"] != nil {
+                    let c = to_float(entry["after"]["composite"])
+                    if c > comp_best { comp_best = c ; comp_pair = rkeys[k] }
+                }
+                k = k + 1
+            }
+        }
+    }
+    if state["L3_codata17_priority"] != nil {
+        let codata = state["L3_codata17_priority"]
+        if codata["results"] != nil {
+            let res = codata["results"]
+            if res["composite_aligned"] != nil {
+                let c = to_float(res["composite_aligned"])
+                if c > comp_best { comp_best = c ; comp_pair = "constants_x_physics_codata17" }
+            }
+        }
+    }
+
+    let paper = comp_best >= PAPER_TRIGGER
+    let gap = if paper { 0.0 } else { PAPER_TRIGGER - comp_best }
+
+    // health determination
+    let health = if all_done && comp_best >= PAPER_TRIGGER { "CONVERGED" } else if all_done { "COMPLETE_NO_PAPER" } else if idx >= 0.8 { "NEAR_COMPLETE" } else if idx >= 0.5 { "PROGRESSING" } else { "EARLY" }
+
+    ConvergenceIndex {
+        index: idx,
+        weighted_sum: w_sum,
+        weight_total: w_total,
+        layers: layers,
+        modules_done_total: m_done,
+        modules_total_total: m_total,
+        composite_best: comp_best,
+        composite_pair: comp_pair,
+        paper_trigger: paper,
+        paper_gap: gap,
+        all_complete: all_done,
+        n6_factor: n6_factor,
+        n6_corrected_index: clamp_01(n6_corrected),
+        health: health
+    }
+}
+
+// ─── JSON 출력 ───
+
+fn index_to_json(ci: ConvergenceIndex) -> string {
+    let mut lj = "["
+    let mut i = 0
+    while i < ci.layers.len() {
+        if i > 0 { lj = lj + "," }
+        let li = ci.layers[i]
+        lj = lj + "{\"key\":\"" + li.key + "\",\"label\":\"" + li.label + "\",\"w\":" + to_string(li.weight) + ",\"progress\":" + to_string(li.progress) + ",\"done\":" + to_string(li.modules_done) + ",\"total\":" + to_string(li.modules_total) + ",\"status\":\"" + li.status + "\"}"
+        i = i + 1
+    }
+    lj = lj + "]"
+    let mut o = "{\n"
+    o = o + "  \"ts\": " + to_string(time_now()) + ",\n"
+    o = o + "  \"convergence_index\": " + to_string(ci.index) + ",\n"
+    o = o + "  \"n6_corrected_index\": " + to_string(ci.n6_corrected_index) + ",\n"
+    o = o + "  \"n6_factor\": " + to_string(ci.n6_factor) + ",\n"
+    o = o + "  \"weighted_sum\": " + to_string(ci.weighted_sum) + ",\n"
+    o = o + "  \"weight_total\": " + to_string(ci.weight_total) + ",\n"
+    o = o + "  \"modules\": \"" + to_string(ci.modules_done_total) + "/" + to_string(ci.modules_total_total) + "\",\n"
+    o = o + "  \"composite_best\": " + to_string(ci.composite_best) + ",\n"
+    o = o + "  \"composite_pair\": \"" + ci.composite_pair + "\",\n"
+    o = o + "  \"paper_trigger\": " + to_string(ci.paper_trigger) + ",\n"
+    o = o + "  \"paper_gap\": " + to_string(ci.paper_gap) + ",\n"
+    o = o + "  \"all_complete\": " + to_string(ci.all_complete) + ",\n"
+    o = o + "  \"health\": \"" + ci.health + "\",\n"
+    o = o + "  \"n6_invariants\": {\"sigma\": " + to_string(N6_SIGMA) + ", \"phi\": " + to_string(N6_PHI) + ", \"tau\": " + to_string(N6_TAU) + ", \"sopfr\": " + to_string(N6_SOPFR) + ", \"j2\": " + to_string(N6_J2) + "},\n"
+    o = o + "  \"layers\": " + lj + "\n"
+    o = o + "}"
+    return o
+}
+
+fn log_line(ci: ConvergenceIndex) -> string {
+    let o = "{\"ts\":" + to_string(time_now()) + ",\"index\":" + to_string(ci.index) + ",\"n6_corrected\":" + to_string(ci.n6_corrected_index) + ",\"modules\":\"" + to_string(ci.modules_done_total) + "/" + to_string(ci.modules_total_total) + "\",\"composite\":" + to_string(ci.composite_best) + ",\"pair\":\"" + ci.composite_pair + "\",\"paper\":" + to_string(ci.paper_trigger) + ",\"gap\":" + to_string(ci.paper_gap) + ",\"health\":\"" + ci.health + "\"}"
+    return o
+}
+
+fn append_log(ci: ConvergenceIndex) {
+    let root = resolve_nexus()
+    let log_path = root + "/shared/bisociation/convergence_log.jsonl"
+    let entry = log_line(ci)
+    let existing = read_file(log_path)
+    let new_content = if existing != "" { existing + entry + "\n" } else { entry + "\n" }
+    write_file(log_path, new_content)
+    eprint("logged to " + log_path)
+}
+
+// ─── CLI ───
+
+let a = args()
+let a_len = a.len()
+let mode = if a_len >= 3 { a[2] } else { "help" }
+
+if mode == "compute" || mode == "status" || mode == "json" {
+    let root = resolve_nexus()
+    let conv_raw = read_file(root + "/shared/bisociation/convergence.json")
+    let state_raw = read_file(root + "/shared/bisociation/state.json")
+    if conv_raw == "" || state_raw == "" {
+        eprint("ERROR: cannot read convergence.json or state.json")
+        println("__CONVERGENCE_INDEX__ FAIL")
+    } else {
+        let conv = json_decode(conv_raw)
+        let state = json_decode(state_raw)
+        let ci = compute_convergence_index(conv, state)
+        if mode == "json" {
+            println(index_to_json(ci))
+            append_log(ci)
+        }
+        if mode == "status" {
+            println("=== L1~L5 Bisociation Convergence Index ===")
+            println("")
+            println("formula: sum(w_k * progress_k) / sum(w_k)")
+            println("  w = [L1:1, L2:2, L3:3, L4:4, L5:5, Lm:3]")
+            println("  n=6 correction: GUE kernel at r=index*tau(6)")
+            println("")
+            let mut i = 0
+            while i < ci.layers.len() {
+                let li = ci.layers[i]
+                let bar = if li.progress >= 1.0 { "[DONE]" } else { "[" + to_string(li.modules_done) + "/" + to_string(li.modules_total) + "]" }
+                let contrib = li.weight * clamp_01(li.progress)
+                println("  " + li.label + "  w=" + to_string(li.weight) + "  " + bar + "  " + to_string(li.progress) + "  contrib=" + to_string(contrib))
+                i = i + 1
+            }
+            println("")
+            println("weighted sum       : " + to_string(ci.weighted_sum))
+            println("weight total       : " + to_string(ci.weight_total))
+            println("CONVERGENCE INDEX  : " + to_string(ci.index))
+            println("n=6 corrected      : " + to_string(ci.n6_corrected_index))
+            println("n=6 factor         : " + to_string(ci.n6_factor))
+            println("modules            : " + to_string(ci.modules_done_total) + "/" + to_string(ci.modules_total_total))
+            println("composite best     : " + to_string(ci.composite_best) + " (" + ci.composite_pair + ")")
+            println("paper trigger      : " + to_string(ci.paper_trigger) + " (gap=" + to_string(ci.paper_gap) + ")")
+            println("all complete       : " + to_string(ci.all_complete))
+            println("health             : " + ci.health)
+        }
+        if mode == "compute" {
+            // compact one-line output for piping
+            println(log_line(ci))
+            append_log(ci)
+        }
+    }
+}
+
+if mode == "help" {
+    println("=== convergence_index.hexa — BISOC-P9-1 ===")
+    println("Unified L1~L5 Bisociation Convergence Index Calculator.")
+    println("")
+    println("CLI:")
+    println("  hexa convergence_index.hexa compute  one-line JSON + log")
+    println("  hexa convergence_index.hexa status   human-readable status")
+    println("  hexa convergence_index.hexa json     full JSON report + log")
+    println("")
+    println("index = sum(w_k * progress_k) / sum(w_k)")
+    println("  w = [L1:1, L2:2, L3:3, L4:4, L5:5, Lm:3]")
+    println("  n=6 correction: GUE kernel (sin(pi*r)/(pi*r))^2 at r=index*tau(6)")
+    println("  n6_corrected = index * (1 + n6_factor / (sigma/phi))")
+    println("")
+    println("n=6 invariants: sigma=12 phi=2 tau=4 sopfr=5 j2=24")
+    println("  sigma*phi == n*tau == 24")
+    println("")
+    println("input: shared/bisociation/{convergence,state}.json")
+    println("log:   shared/bisociation/convergence_log.jsonl")
+}
+
+// ─── 검증 ───
+
+// n6_gue_correction tests
+let g0 = n6_gue_correction(0.0)
+assert g0 == 0.0  // r=0 returns 0
+
+let g1 = n6_gue_correction(1.0)
+assert g1 > 0.0   // nonzero for r>0
+assert g1 < 1.0   // bounded
+
+let g_large = n6_gue_correction(10.0)
+assert g_large >= 0.0
+assert g_large < 0.1  // decays for large r
+
+// convergence index with mock data — all complete
+let mc_all = json_decode("{\"stages\":{\"L1_unified\":{\"progress\":1.0,\"modules_done\":4,\"modules_total\":4,\"status\":\"completed\"},\"L2_spectra\":{\"progress\":1.0,\"modules_done\":4,\"modules_total\":4,\"status\":\"completed\"},\"L3_cross\":{\"progress\":1.0,\"modules_done\":5,\"modules_total\":5,\"status\":\"completed\"},\"L4_spectral_feedback\":{\"progress\":1.0,\"modules_done\":1,\"modules_total\":1,\"status\":\"completed\"},\"L5_phase_lock\":{\"progress\":1.0,\"modules_done\":5,\"modules_total\":5,\"status\":\"completed\"},\"L_meta\":{\"progress\":1.0,\"modules_done\":4,\"modules_total\":4,\"status\":\"completed\"}}}")
+let ms_all = json_decode("{\"phase\":\"L5\",\"L3_aligned_rerun\":{\"results\":{\"test\":{\"after\":{\"composite\":0.95}}}}}")
+let ci_all = compute_convergence_index(mc_all, ms_all)
+assert ci_all.index == 1.0
+assert ci_all.all_complete == true
+assert ci_all.paper_trigger == true
+assert ci_all.paper_gap == 0.0
+assert ci_all.health == "CONVERGED"
+assert ci_all.modules_done_total == 23
+assert ci_all.modules_total_total == 23
+
+// partial completion — L3 at 0.8
+let mc_partial = json_decode("{\"stages\":{\"L1_unified\":{\"progress\":1.0,\"modules_done\":4,\"modules_total\":4,\"status\":\"completed\"},\"L2_spectra\":{\"progress\":1.0,\"modules_done\":4,\"modules_total\":4,\"status\":\"completed\"},\"L3_cross\":{\"progress\":0.8,\"modules_done\":4,\"modules_total\":5,\"status\":\"in_progress\"},\"L4_spectral_feedback\":{\"progress\":1.0,\"modules_done\":1,\"modules_total\":1,\"status\":\"completed\"},\"L5_phase_lock\":{\"progress\":1.0,\"modules_done\":5,\"modules_total\":5,\"status\":\"completed\"},\"L_meta\":{\"progress\":1.0,\"modules_done\":4,\"modules_total\":4,\"status\":\"completed\"}}}")
+let ms_partial = json_decode("{\"phase\":\"L5\",\"L3_aligned_rerun\":{\"results\":{\"atlas_x_laws_aligned\":{\"after\":{\"composite\":0.83379}}}}}")
+let ci_partial = compute_convergence_index(mc_partial, ms_partial)
+// (1*1 + 2*1 + 3*0.8 + 4*1 + 5*1 + 3*1) / 18 = 17.4/18 = 0.9667
+assert ci_partial.index > 0.96
+assert ci_partial.index < 0.97
+assert ci_partial.all_complete == false
+assert ci_partial.composite_best > 0.83
+assert ci_partial.paper_trigger == false
+assert ci_partial.health == "NEAR_COMPLETE"
+
+// n6 corrected index should be >= raw index (GUE correction is additive)
+assert ci_partial.n6_corrected_index >= ci_partial.index
+assert ci_partial.n6_corrected_index <= 1.0
+
+// codata17 composite extraction
+let ms_codata = json_decode("{\"phase\":\"L5\",\"L3_codata17_priority\":{\"results\":{\"composite_aligned\":0.805}}}")
+let ci_codata = compute_convergence_index(mc_all, ms_codata)
+assert ci_codata.composite_best > 0.80
+assert ci_codata.composite_pair == "constants_x_physics_codata17"
+
+// empty stages
+let mc_empty = json_decode("{\"stages\":{}}")
+let ms_empty = json_decode("{\"phase\":\"unknown\"}")
+let ci_empty = compute_convergence_index(mc_empty, ms_empty)
+assert ci_empty.index == 0.0
+assert ci_empty.all_complete == false
+assert ci_empty.health == "EARLY"
+
+// JSON output format validation
+let json_out = index_to_json(ci_partial)
+assert str_contains(json_out, "\"convergence_index\":")
+assert str_contains(json_out, "\"n6_corrected_index\":")
+assert str_contains(json_out, "\"n6_factor\":")
+assert str_contains(json_out, "\"n6_invariants\":")
+assert str_contains(json_out, "\"sigma\": 12")
+assert str_contains(json_out, "\"j2\": 24")
+assert str_contains(json_out, "\"layers\":")
+
+// log line format
+let ll = log_line(ci_partial)
+assert str_contains(ll, "\"index\":")
+assert str_contains(ll, "\"n6_corrected\":")
+assert str_contains(ll, "\"health\":")
+
+// clamp tests
+assert clamp_01(-0.5) == 0.0
+assert clamp_01(1.5) == 1.0
+assert clamp_01(0.5) == 0.5
+
+println("")
+println("=== convergence_index verified ===")

@@ -1,0 +1,333 @@
+// cdg_coverage_sweep.hexa — CDG-P9-1: 미탐 pair 40건 추가 탐색 → 80/169 커버
+// usage: hexa shared/dse/cdg_coverage_sweep.hexa [sweep|status|verify]
+// input: cross/pair_scores.jsonl (17205 pairs), bt_recommendations.jsonl (explored)
+// output: shared/dse/cdg_coverage.jsonl
+// honesty: n6_link判定 is heuristic (n6_prox threshold), not proof
+
+let HOME = env("HOME")
+let NEXUS = HOME + "/Dev/nexus"
+let PAIR_SCORES = NEXUS + "/shared/dse/cross/pair_scores.jsonl"
+let BT_RECS = NEXUS + "/shared/dse/bt_recommendations.jsonl"
+let OUT_PATH = NEXUS + "/shared/dse/cdg_coverage.jsonl"
+let TARGET_NEW = 40
+let TARGET_TOTAL = 80
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+fn now_ts() -> string {
+    let mut ts = ""
+    try { ts = _str(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim() } catch e {}
+    return ts
+}
+fn json_esc(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", " ")
+    return r
+}
+fn safe_float(s: string) -> float {
+    let mut v = 0.0
+    try { v = to_float(s) } catch e {}
+    return v
+}
+fn fs(x: float) -> string { return to_string(x) }
+fn pair_key(a: string, b: string) -> string {
+    if a < b { return a + "|" + b }
+    return b + "|" + a
+}
+
+// --- parse a pair_scores.jsonl line ---
+fn parse_pair(line: string) -> map {
+    let mut m = #{"a": "", "b": "", "score": "0", "n6_prox": "0", "bidir": "0", "bt_ids": "-", "shared_consts": "-", "jaccard": "0"}
+    let flds = ["a", "b", "score", "n6_prox", "bidir", "bt_ids", "shared_consts", "jaccard"]
+    for fld in flds {
+        let key = "\"" + fld + "\":"
+        let idx = line.index_of(key)
+        if idx >= 0 {
+            let after = line.substring((idx + key.len()), line.len())
+            let mut val = ""
+            if after.starts_with(" \"") || after.starts_with("\"") {
+                let start = after.index_of("\"") + 1
+                let end = after.substring(start, after.len()).index_of("\"")
+                if end >= 0 { val = after.substring(start, (start + end)) }
+            } else {
+                let trimmed = after.trim()
+                let comma = trimmed.index_of(",")
+                let brace = trimmed.index_of("}")
+                let mut stop = trimmed.len()
+                if comma >= 0 && comma < stop { stop = comma }
+                if brace >= 0 && brace < stop { stop = brace }
+                val = trimmed.substring(0, stop).trim()
+            }
+            m[fld] = val
+        }
+    }
+    return m
+}
+
+// --- load explored pairs from bt_recommendations ---
+fn load_explored() -> map {
+    let mut seen = #{"__init__": true}
+    if !file_exists(BT_RECS) { return seen }
+    let raw = read_file(BT_RECS)
+    let lines = raw.split("\n")
+    for line in lines {
+        let l = line.trim()
+        if l.len() < 3 || !l.starts_with("{") { continue }
+        // extract cdg_pair
+        let idx = l.index_of("\"cdg_pair\":")
+        if idx < 0 { continue }
+        let after = l.substring((idx + 11), l.len())
+        let br_open = after.index_of("[")
+        let br_close = after.index_of("]")
+        if br_open < 0 || br_close < 0 { continue }
+        let inner = after.substring((br_open + 1), br_close)
+        let parts = inner.split(",")
+        if parts.len() < 2 { continue }
+        let a = parts[0].trim().replace("\"", "")
+        let b = parts[1].trim().replace("\"", "")
+        let k = pair_key(a, b)
+        seen[k] = true
+    }
+    return seen
+}
+
+// --- load existing coverage results ---
+fn load_existing_coverage() -> map {
+    let mut seen = #{"__init__": true}
+    if !file_exists(OUT_PATH) { return seen }
+    let raw = read_file(OUT_PATH)
+    let lines = raw.split("\n")
+    for line in lines {
+        let l = line.trim()
+        if l.len() < 3 || !l.starts_with("{") { continue }
+        let idx_a = l.index_of("\"domain_a\":")
+        let idx_b = l.index_of("\"domain_b\":")
+        if idx_a < 0 || idx_b < 0 { continue }
+        let after_a = l.substring((idx_a + 11), l.len())
+        let q1_a = after_a.index_of("\"") + 1
+        let q2_a = after_a.substring(q1_a, after_a.len()).index_of("\"")
+        let a = after_a.substring(q1_a, (q1_a + q2_a))
+        let after_b = l.substring((idx_b + 11), l.len())
+        let q1_b = after_b.index_of("\"") + 1
+        let q2_b = after_b.substring(q1_b, after_b.len()).index_of("\"")
+        let b = after_b.substring(q1_b, (q1_b + q2_b))
+        let k = pair_key(a, b)
+        seen[k] = true
+    }
+    return seen
+}
+
+fn _map_has(m: map, key: string) -> bool {
+    let ks = m.keys()
+    for k in ks {
+        if k == key { return true }
+    }
+    return false
+}
+
+// --- n=6 connection judgment ---
+fn n6_judgment(n6_prox: float, bidir: float, score: float) -> string {
+    if n6_prox >= 0.99 && bidir >= 0.5 { return "EXACT" }
+    if n6_prox >= 0.95 { return "STRONG" }
+    if n6_prox >= 0.80 { return "MODERATE" }
+    if n6_prox >= 0.60 { return "WEAK" }
+    return "NONE"
+}
+
+// --- composite priority score (replicates bt_target_recommender logic) ---
+fn priority_score(score: float, n6_prox: float, bidir: float, has_bt: bool) -> float {
+    let mut s = score * 0.35 + n6_prox * 0.30 + bidir * 0.20
+    if has_bt { s = s + 0.15 }
+    return s
+}
+
+// --- emit one coverage result ---
+fn emit_result(pair_id: int, a: string, b: string, score: float, n6_prox: float, bidir: float, bt_ids: string, consts: string, n6_link: string) {
+    let row = "{\"pair_id\":" + to_string(pair_id)
+        + ",\"domain_a\":\"" + json_esc(a) + "\",\"domain_b\":\"" + json_esc(b)
+        + "\",\"score\":" + fs(score)
+        + ",\"n6_prox\":" + fs(n6_prox)
+        + ",\"bidir\":" + fs(bidir)
+        + ",\"bt_ids\":\"" + json_esc(bt_ids)
+        + "\",\"shared_consts\":\"" + json_esc(consts)
+        + "\",\"n6_link\":\"" + n6_link
+        + "\",\"explored\":true"
+        + ",\"ts\":\"" + now_ts() + "\"}"
+    append_file(OUT_PATH, row + "\n")
+}
+
+// ===================== MAIN =====================
+
+let cli_args = args()
+let mut mode = "sweep"
+let mut i = 0
+while i < cli_args.len() {
+    let a = cli_args[i]
+    if a == "sweep" || a == "status" || a == "verify" { mode = a }
+    i = i + 1
+}
+
+if mode == "status" {
+    let explored = load_explored()
+    let existing = load_existing_coverage()
+    let ex_keys = explored.keys()
+    let cv_keys = existing.keys()
+    let mut ex_count = 0
+    for k in ex_keys {
+        if k != "__init__" { ex_count = ex_count + 1 }
+    }
+    let mut cv_count = 0
+    for k in cv_keys {
+        if k != "__init__" { cv_count = cv_count + 1 }
+    }
+    println("=== CDG Coverage Status ===")
+    println("bt_recommendations explored pairs: " + to_string(ex_count))
+    println("cdg_coverage.jsonl entries:         " + to_string(cv_count))
+    println("total covered:                      " + to_string(ex_count + cv_count))
+    println("target:                             " + to_string(TARGET_TOTAL))
+    let pct = to_float(ex_count + cv_count) / 169.0 * 100.0
+    println("coverage:                           " + fs(pct) + "% of 169")
+    println("")
+    println("__CDG_SWEEP__ STATUS_DONE")
+}
+
+if mode == "verify" {
+    let mut cv_count = 0
+    let mut exact_count = 0
+    let mut strong_count = 0
+    if file_exists(OUT_PATH) {
+        let raw = read_file(OUT_PATH)
+        let lines = raw.split("\n")
+        for line in lines {
+            let l = line.trim()
+            if l.len() < 3 || !l.starts_with("{") { continue }
+            cv_count = cv_count + 1
+            if l.contains("\"EXACT\"") { exact_count = exact_count + 1 }
+            if l.contains("\"STRONG\"") { strong_count = strong_count + 1 }
+        }
+    }
+    let explored = load_explored()
+    let ex_keys = explored.keys()
+    let mut ex_count = 0
+    for k in ex_keys {
+        if k != "__init__" { ex_count = ex_count + 1 }
+    }
+    let total = ex_count + cv_count
+    let pct = to_float(total) / 169.0 * 100.0
+    println("=== CDG Coverage Verification ===")
+    println("bt_recommendations pairs: " + to_string(ex_count))
+    println("cdg_coverage new pairs:   " + to_string(cv_count))
+    println("  EXACT n6_link:          " + to_string(exact_count))
+    println("  STRONG n6_link:         " + to_string(strong_count))
+    println("total:                    " + to_string(total))
+    println("target:                   " + to_string(TARGET_TOTAL))
+    if total >= TARGET_TOTAL {
+        println("PASS — coverage " + fs(pct) + "% >= 47.3% (80/169)")
+    } else {
+        println("FAIL — coverage " + fs(pct) + "% < 47.3% (need " + to_string(TARGET_TOTAL - total) + " more)")
+    }
+    println("")
+    println("__CDG_SWEEP__ VERIFY_DONE")
+}
+
+if mode == "sweep" {
+    println("=== CDG Coverage Sweep — CDG-P9-1 ===")
+    println("Loading explored pairs...")
+
+    let explored_bt = load_explored()
+    let existing_cv = load_existing_coverage()
+
+    // merge into single seen map
+    let mut seen = #{"__init__": true}
+    let bt_keys = explored_bt.keys()
+    for k in bt_keys { seen[k] = true }
+    let cv_keys = existing_cv.keys()
+    for k in cv_keys { seen[k] = true }
+
+    let mut prior_count = 0
+    let sk = seen.keys()
+    for k in sk {
+        if k != "__init__" { prior_count = prior_count + 1 }
+    }
+    println("Prior explored: " + to_string(prior_count))
+
+    // load all pair_scores, score-descending
+    println("Loading pair_scores.jsonl...")
+    let raw = read_file(PAIR_SCORES)
+    let lines = raw.split("\n")
+
+    // collect candidates: unexplored, score > 0.4
+    let mut candidates: [string] = []
+    let mut line_idx = 0
+    while line_idx < lines.len() {
+        let l = lines[line_idx].trim()
+        if l.len() > 2 && l.starts_with("{") {
+            let p = parse_pair(l)
+            let k = pair_key(p["a"], p["b"])
+            if !_map_has(seen, k) {
+                let sc = safe_float(p["score"])
+                if sc >= 0.4 {
+                    candidates = candidates.push(l)
+                }
+            }
+        }
+        line_idx = line_idx + 1
+    }
+    println("Candidates (unexplored, score>=0.4): " + to_string(candidates.len()))
+
+    // score candidates by priority (already sorted by score from file, but re-rank with composite)
+    // pair_scores.jsonl is pre-sorted by score desc, so just take top TARGET_NEW
+    let take_n = min(TARGET_NEW, candidates.len())
+
+    println("Selecting top " + to_string(take_n) + " for exploration...")
+    println("")
+    println("Rank | Pair                                          | Score  | n6_prox | bidir | n6_link  | BT")
+    println("---- | --------------------------------------------- | ------ | ------- | ----- | -------- | ---")
+
+    let mut added = 0
+    let mut ci = 0
+    let mut added_keys = #{"__init__": true}
+    while ci < candidates.len() && added < take_n {
+        let p = parse_pair(candidates[ci])
+        let k = pair_key(p["a"], p["b"])
+        if !_map_has(added_keys, k) {
+            added_keys[k] = true
+            let sc = safe_float(p["score"])
+            let n6p = safe_float(p["n6_prox"])
+            let bid = safe_float(p["bidir"])
+            let bt_ids = p["bt_ids"]
+            let consts = p["shared_consts"]
+            let n6_link = n6_judgment(n6p, bid, sc)
+
+            added = added + 1
+            emit_result(added, p["a"], p["b"], sc, n6p, bid, bt_ids, consts, n6_link)
+
+            let pair_label = p["a"] + " x " + p["b"]
+            let bt_short = if bt_ids.len() > 15 { bt_ids.substring(0, 15) + ".." } else { bt_ids }
+            println(to_string(added) + "    | " + pair_label + " | " + p["score"] + " | " + p["n6_prox"] + "   | " + p["bidir"] + "   | " + n6_link + "   | " + bt_short)
+        }
+        ci = ci + 1
+    }
+
+    let total = prior_count + added
+    let pct = to_float(total) / 169.0 * 100.0
+    println("")
+    println("=== Summary ===")
+    println("New pairs explored:  " + to_string(added))
+    println("Prior explored:      " + to_string(prior_count))
+    println("Total coverage:      " + to_string(total) + "/169 (" + fs(pct) + "%)")
+    println("Output:              shared/dse/cdg_coverage.jsonl")
+
+    if total >= TARGET_TOTAL {
+        println("PASS — CDG-P9-1 target reached")
+    } else {
+        println("NEED " + to_string(TARGET_TOTAL - total) + " more pairs")
+    }
+    println("")
+    println("__CDG_SWEEP__ DONE")
+}

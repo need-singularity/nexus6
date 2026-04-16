@@ -1,0 +1,302 @@
+// evo_meta_apply.hexa — EVO-P9-1 meta-self-apply: rule engine self-modifies its own meta-rules
+// @no-lock-needed  @allow-bare-exec  @no-sandbox
+// Meta-criteria: (a) conflict (b) strength (c) redundancy
+// CLI: evaluate [--threshold N] | apply | status
+// Out: shared/rules/rules_v3_staging.json + shared/harness/evo_meta_log.jsonl
+
+let REPO = exec("git rev-parse --show-toplevel 2>/dev/null").trim()  // @allow-bare-exec
+let SHARED = REPO + "/shared"
+let HARNESS = SHARED + "/harness"
+let COMMON_PATH = SHARED + "/rules/common.json"
+let NEXUS_PATH = SHARED + "/rules/nexus.json"
+let STAGING_IN = HARNESS + "/rule_suggest_staging.jsonl"
+let STAGING_OUT = SHARED + "/rules/rules_v3_staging.json"
+let META_LOG = HARNESS + "/evo_meta_log.jsonl"
+let SCORE_THRESH = 5
+
+fn now_iso() -> string { return exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim() }  // @allow-bare-exec
+fn je(s: string) -> string { return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n") }
+fn _str(x) -> string {
+    if type_of(x) == "str" || type_of(x) == "string" { return x }
+    return ""
+}
+fn _int(x) -> i64 {
+    let mut v = 0
+    try { v = to_int(x) } catch e {}
+    return v
+}
+
+fn xf(line: string, field: string) -> string {
+    let key = "\"" + field + "\":\""
+    let idx = line.index_of(key)
+    if idx < 0 { return "" }
+    let rest = line.substring(idx + len(key), len(line))
+    let end = rest.index_of("\"")
+    if end < 0 { return "" }
+    return rest.substring(0, end)
+}
+
+fn xi(line: string, field: string) -> i64 {
+    let key = "\"" + field + "\":"
+    let idx = line.index_of(key)
+    if idx < 0 { return 0 }
+    let mut digits = ""
+    let mut i = idx + len(key)
+    while i < len(line) {
+        let ch = line.substring(i, i + 1)
+        if ch == " " || ch == "\t" { i = i + 1; continue }
+        if ch == "0" || ch == "1" || ch == "2" || ch == "3" || ch == "4" || ch == "5" || ch == "6" || ch == "7" || ch == "8" || ch == "9" {
+            digits = digits + ch
+        } else {
+            if len(digits) > 0 { break }
+        }
+        i = i + 1
+    }
+    let mut v = 0
+    try { v = to_int(digits) } catch e {}
+    return v
+}
+
+fn tail_lines(path: string, n: i64) -> [string] {
+    let mut raw = ""
+    try { raw = exec("tail -n " + to_string(n) + " '" + path + "' 2>/dev/null").trim() } catch e {}  // @allow-bare-exec
+    if len(raw) == 0 { return [] }
+    return raw.split("\n")
+}
+
+fn load_existing_rules() -> map {
+    let mut rules = #{}
+    let paths = [COMMON_PATH, NEXUS_PATH]
+    for p in paths {
+        let mut raw = ""
+        try { raw = read_file(p) } catch e {}
+        if len(raw) == 0 { continue }
+        let lines = raw.split("\n")
+        for line in lines {
+            let rid = xf(line, "id")
+            if len(rid) > 0 { rules[rid] = xf(line, "rule") }
+        }
+    }
+    return rules
+}
+
+fn load_proposals() -> [map] {
+    let mut out = []
+    if file_exists(STAGING_IN) == false { return out }
+    let lines = tail_lines(STAGING_IN, 500)
+    for line in lines {
+        if len(line.trim()) == 0 { continue }
+        let id = xf(line, "id")
+        if len(id) == 0 { continue }
+        out = out.push(#{
+            "id": id, "source_pattern": xf(line, "source_pattern"),
+            "title": xf(line, "title"), "description": xf(line, "description"),
+            "severity": xf(line, "severity"), "status": xf(line, "status"),
+            "occurrences": xi(line, "occurrences")
+        })
+    }
+    return out
+}
+
+// Meta-criterion (a): conflict — pattern matches existing rule ID or text
+fn chk_conflict(p: map, ex: map) -> i64 {
+    let pat = _str(p["source_pattern"])
+    let ek = keys(ex)
+    for eid in ek {
+        if pat == eid { return -3 }
+        if len(pat) > 4 && _str(ex[eid]).contains(pat) { return -1 }
+    }
+    return 0
+}
+
+// Meta-criterion (b): strength — occurrence count + severity weight
+fn chk_strength(p: map) -> i64 {
+    let occ = _int(p["occurrences"])
+    let sev = _str(p["severity"])
+    let mut s = 0
+    if occ > 3 { s = s + (occ - 3) }
+    if occ > 10 { s = s + 2 }
+    if occ > 20 { s = s + 3 }
+    if sev == "error" { s = s + 4 }
+    if sev == "warn" { s = s + 2 }
+    if sev == "info" { s = s + 1 }
+    return s
+}
+
+// Meta-criterion (c): redundancy — keyword overlap with existing rules
+fn chk_redundancy(p: map, ex: map) -> i64 {
+    let pat = _str(p["source_pattern"])
+    let ek = keys(ex)
+    let mut overlap = 0
+    for eid in ek {
+        let rt = _str(ex[eid]).to_lower()
+        let words = pat.replace("-", " ").replace("_", " ").split(" ")
+        let mut hits = 0
+        for w in words {
+            if len(w) > 2 && rt.contains(w.to_lower()) { hits = hits + 1 }
+        }
+        if hits >= 2 { overlap = overlap + 1 }
+    }
+    if overlap >= 3 { return -4 }
+    if overlap >= 2 { return -2 }
+    if overlap >= 1 { return -1 }
+    return 0
+}
+
+fn eval_proposal(p: map, ex: map) -> map {
+    let c = chk_conflict(p, ex)
+    let s = chk_strength(p)
+    let r = chk_redundancy(p, ex)
+    let total = c + s + r
+    let mut verdict = "reject"
+    if total >= SCORE_THRESH { verdict = "approve" }
+    if total >= 3 && total < SCORE_THRESH { verdict = "review" }
+    if c <= -3 { verdict = "conflict" }
+    return #{ "id": p["id"], "source_pattern": p["source_pattern"],
+        "conflict": c, "strength": s, "redundancy": r, "total": total, "verdict": verdict }
+}
+
+fn log_event(kind: string, id: string, detail: string) {
+    let line = "{\"ts\":\"" + now_iso() + "\",\"kind\":\"" + je(kind) + "\",\"id\":\"" + je(id) + "\",\"detail\":\"" + je(detail) + "\"}\n"
+    try { append_file(META_LOG, line) } catch e { print_err("[evo_meta] log error: " + to_string(e)) }
+}
+
+fn cmd_evaluate(thresh: i64) {
+    let proposals = load_proposals()
+    if len(proposals) == 0 {
+        println("[evo_meta] no proposals — run rule_suggest.hexa suggest --apply first")
+        println("__HARNESS_EVO_META__ EVALUATE_EMPTY")
+        return
+    }
+    let ex = load_existing_rules()
+    println("[evo_meta] evaluating " + to_string(len(proposals)) + " proposal(s) vs " + to_string(len(keys(ex))) + " rules, threshold=" + to_string(thresh))
+    let mut ac = 0
+    let mut rc = 0
+    let mut cc = 0
+    let mut rjc = 0
+    for p in proposals {
+        let r = eval_proposal(p, ex)
+        let v = _str(r["verdict"])
+        if v == "approve" { ac = ac + 1 }
+        if v == "review" { rc = rc + 1 }
+        if v == "conflict" { cc = cc + 1 }
+        if v == "reject" { rjc = rjc + 1 }
+        println("  [" + v.to_upper() + "] " + _str(r["id"]) + "  pat=" + _str(r["source_pattern"]) + "  score=" + to_string(_int(r["total"])) + " (c=" + to_string(_int(r["conflict"])) + " s=" + to_string(_int(r["strength"])) + " r=" + to_string(_int(r["redundancy"])) + ")")
+        log_event("evaluate", _str(r["id"]), "verdict=" + v + " score=" + to_string(_int(r["total"])))
+    }
+    println("[evo_meta] approve=" + to_string(ac) + " review=" + to_string(rc) + " conflict=" + to_string(cc) + " reject=" + to_string(rjc))
+    println("__HARNESS_EVO_META__ EVALUATE_OK")
+}
+
+fn cmd_apply() {
+    let proposals = load_proposals()
+    if len(proposals) == 0 {
+        println("[evo_meta] no proposals")
+        println("__HARNESS_EVO_META__ APPLY_EMPTY")
+        return
+    }
+    let ex = load_existing_rules()
+    let mut approved = []
+    for p in proposals {
+        let r = eval_proposal(p, ex)
+        if _str(r["verdict"]) != "approve" { continue }
+        approved = approved.push(#{ "id": _str(p["id"]), "rule": _str(p["title"]),
+            "source_pattern": _str(p["source_pattern"]), "occurrences": _int(p["occurrences"]),
+            "severity": _str(p["severity"]), "meta_score": _int(r["total"]) })
+    }
+    if len(approved) == 0 {
+        println("[evo_meta] no proposals passed — nothing to stage")
+        println("__HARNESS_EVO_META__ APPLY_NONE")
+        return
+    }
+    let ts = now_iso()
+    let mut j = "{\n  \"_meta\": {\"description\": \"Staged rules from evo_meta_apply\", \"generated\": \"" + ts + "\", \"total\": " + to_string(len(approved)) + "},\n  \"staged_rules\": [\n"
+    let mut idx = 0
+    for rule in approved {
+        if idx > 0 { j = j + ",\n" }
+        j = j + "    {\"id\": \"" + je(_str(rule["id"])) + "\", \"rule\": \"" + je(_str(rule["rule"])) + "\", \"source_pattern\": \"" + je(_str(rule["source_pattern"])) + "\", \"occurrences\": " + to_string(_int(rule["occurrences"])) + ", \"severity\": \"" + je(_str(rule["severity"])) + "\", \"meta_score\": " + to_string(_int(rule["meta_score"])) + ", \"origin\": \"evo_meta_apply\", \"status\": \"staged\"}"
+        log_event("apply", _str(rule["id"]), "staged pat=" + _str(rule["source_pattern"]) + " score=" + to_string(_int(rule["meta_score"])))
+        idx = idx + 1
+    }
+    j = j + "\n  ]\n}\n"
+    try {
+        write_file(STAGING_OUT, j)
+        println("[evo_meta] staged " + to_string(len(approved)) + " rule(s) -> " + STAGING_OUT)
+    } catch e {
+        print_err("[evo_meta] write error: " + to_string(e))
+        println("__HARNESS_EVO_META__ APPLY_ERROR")
+        return
+    }
+    println("__HARNESS_EVO_META__ APPLY_OK")
+}
+
+fn cmd_status() {
+    let ex = load_existing_rules()
+    println("=== Evo Meta-Apply Status ===")
+    println("existing rules (common+nexus): " + to_string(len(keys(ex))))
+    let mut pc = 0
+    if file_exists(STAGING_IN) { pc = len(tail_lines(STAGING_IN, 500)) }
+    println("proposals pending: " + to_string(pc))
+    let mut sc = 0
+    let mut sts = "none"
+    if file_exists(STAGING_OUT) {
+        let mut raw = ""
+        try { raw = read_file(STAGING_OUT) } catch e {}
+        if len(raw) > 0 {
+            sts = xf(raw, "generated")
+            let lines = raw.split("\n")
+            for line in lines {
+                if line.contains("\"id\":") && line.contains("\"source_pattern\":") { sc = sc + 1 }
+            }
+        }
+    }
+    println("staged rules: " + to_string(sc) + "  generated=" + sts)
+    let mut lc = 0
+    let mut le = "none"
+    if file_exists(META_LOG) {
+        let ll = tail_lines(META_LOG, 200)
+        lc = len(ll)
+        if lc > 0 { le = xf(ll[lc - 1], "kind") + " " + xf(ll[lc - 1], "id") + " @ " + xf(ll[lc - 1], "ts") }
+    }
+    println("meta-log events: " + to_string(lc) + "  last=" + le)
+    if pc > 0 {
+        let props = load_proposals()
+        let mut ac = 0
+        let mut rej = 0
+        for p in props {
+            if _str(eval_proposal(p, ex)["verdict"]) == "approve" { ac = ac + 1 } else { rej = rej + 1 }
+        }
+        println("live eval: approve=" + to_string(ac) + " other=" + to_string(rej))
+    }
+    println("__HARNESS_EVO_META__ STATUS_OK")
+}
+
+// CLI router
+let argv = args()
+let argc = len(argv)
+if argc < 1 {
+    println("usage: hexa evo_meta_apply.hexa <evaluate [--threshold N]|apply|status>")
+    exit(1)
+}
+let mode = _str(argv[0])
+if mode == "evaluate" {
+    let mut thresh = SCORE_THRESH
+    let mut i = 1
+    while i < argc {
+        if _str(argv[i]) == "--threshold" && (i + 1) < argc {
+            try { thresh = to_int(argv[i + 1]) } catch e {}
+            i = i + 2
+            continue
+        }
+        i = i + 1
+    }
+    cmd_evaluate(thresh)
+} else if mode == "apply" {
+    cmd_apply()
+} else if mode == "status" {
+    cmd_status()
+} else {
+    print_err("[evo_meta] unknown mode: " + mode)
+    println("usage: hexa evo_meta_apply.hexa <evaluate|apply|status>")
+    exit(1)
+}
