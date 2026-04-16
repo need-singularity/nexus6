@@ -32,7 +32,7 @@ CLIENT_ID="9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 BETA="oauth-2025-04-20"
 TIMEOUT=10
 CLI_TIMEOUT=30
-CAP=2  # direct POST cap (IP rate_limit 보호). CLI primary 라 잔여 EXPIRED 영향 없음.
+CAP=2  # pre_check 선별용. CLI 실패 시 direct POST 는 CAP 무관 항상 시도.
 PERL_TIMEOUT="$NEXUS_ROOT/shared/harness/perl_timeout.sh"
 CLI_LOCK="$CL_HOME/cl-refresh.cli.lock"
 
@@ -103,11 +103,18 @@ refresh_via_cli() {
     [ -n "$cfg" ] && [ -d "$cfg" ] || return 1
     command -v claude >/dev/null 2>&1 || return 1
 
-    # 직렬화 mutex (atomic mkdir). 동시 7개 → keychain race 회피.
-    while [ $i -lt 120 ]; do
-        if mkdir "$CLI_LOCK" 2>/dev/null; then break; fi
+    # 직렬화 mutex (atomic mkdir). 동시 12개 → keychain race 회피.
+    # lock 못 잡으면 CLI skip → 호출자가 direct POST fallback.
+    local got_lock=0
+    while [ $i -lt 40 ]; do
+        if mkdir "$CLI_LOCK" 2>/dev/null; then got_lock=1; break; fi
         sleep 0.5; i=$((i+1))
     done
+
+    if [ "$got_lock" -eq 0 ]; then
+        log "cli-refresh lock-timeout: $name (skip → direct fallback)"
+        return 1
+    fi
 
     if [ -x "$PERL_TIMEOUT" ]; then
         CLAUDE_CONFIG_DIR="$cfg" "$PERL_TIMEOUT" "$CLI_TIMEOUT" \
@@ -121,7 +128,7 @@ refresh_via_cli() {
     rmdir "$CLI_LOCK" 2>/dev/null || true
     [ $rc -eq 124 ] && log "cli-refresh timeout: $name"
     # 성공 여부는 호출자가 keychain 재조회로 판단.
-    return 0
+    return $rc
 }
 
 # ── 계정 1개 처리 → $td/$name.json 에 entry 또는 {error:"..."} ────────
@@ -152,8 +159,9 @@ process_one() {
             [ "$ea" -ge "$((now + 60000))" ] 2>/dev/null && method="cli"
         fi
 
-        # CLI 실패 시 direct POST fallback (cap 안에서만 — IP rate_limit 보호).
-        if [ -z "$method" ] && [ "$allowed" = "1" ]; then
+        # CLI 실패 시 direct POST fallback.
+        # CAP 은 pre_check 선별용 — CLI 실패 후에는 무조건 시도 (영구 refresh-failed 방지).
+        if [ -z "$method" ]; then
             new_blob=$(refresh_token "$rt" "$blob")
             if [ -n "$new_blob" ]; then
                 write_blob "$h8" "$new_blob" || { echo '{"error":"keychain-write"}' > "$out"; return; }
