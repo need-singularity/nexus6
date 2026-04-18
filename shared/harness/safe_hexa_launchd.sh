@@ -100,10 +100,29 @@ TAIL_ERR_PID=$!
 # as "done" would cleanup → bootout → kill the job before it ever ran.
 # Authoritative signal: `last exit code` flips from "(never exited)" to a
 # number, OR launchctl print returns nonzero (job was reaped).
+#
+# 2026-04-18 panic 재발 후 RSS watchdog 통합:
+# macOS 15.6 커널이 setrlimit(RLIMIT_AS) 와 ulimit -v 모두 EINVAL 거부.
+# launchd ResidentSetSize cap 은 best-effort — 단독 프로세스 폭주 시 enforcement 실패.
+# → parent polling watchdog 이 유일한 hard cap 수단.
+# HEXA_STAGE0_RSS_CAP_KB 로 override (default 4GB=4194304 KB).
+RSS_CAP_KB="${HEXA_STAGE0_RSS_CAP_KB:-4194304}"
 EXIT_CODE=""
 while true; do
   INFO=$(launchctl print gui/$UID_N/$LABEL 2>/dev/null)
   if [ $? -ne 0 ]; then break; fi
+  # RSS watchdog — pid from launchctl print, RSS from ps. 둘 다 없으면 skip.
+  JOB_PID=$(printf '%s' "$INFO" | awk -F'= ' '/^[[:space:]]*pid = / {gsub(/[^0-9]/,"",$2); print $2; exit}')
+  if [ -n "$JOB_PID" ] && [ "$JOB_PID" != "0" ]; then
+    RSS_KB=$(ps -o rss= -p "$JOB_PID" 2>/dev/null | tr -d ' ')
+    if [ -n "$RSS_KB" ] && [ "$RSS_KB" -gt "$RSS_CAP_KB" ]; then
+      echo "safe_hexa_launchd: RSS watchdog — pid=$JOB_PID rss=${RSS_KB}KB > cap=${RSS_CAP_KB}KB → SIGKILL" >&2
+      kill -KILL "$JOB_PID" 2>/dev/null || true
+      launchctl kill KILL "gui/$UID_N/$LABEL" 2>/dev/null || true
+      EXIT_CODE=137  # SIGKILL canonical
+      break
+    fi
+  fi
   EXIT_LINE=$(printf '%s' "$INFO" | awk -F'= ' '/last exit code/ {print $2; exit}')
   if [ -n "$EXIT_LINE" ] && [ "$EXIT_LINE" != "(never exited)" ]; then
     EXIT_CODE=$(printf '%s' "$EXIT_LINE" | tr -dc '0-9-')
