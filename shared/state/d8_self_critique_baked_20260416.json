@@ -1,0 +1,169 @@
+{
+  "_meta": {
+    "id": "d8_self_critique_baked_20260416",
+    "track": "D",
+    "option": "D8",
+    "roadmap": "shared/roadmaps/clm_consciousness_standalone.json",
+    "destination_ord": 2,
+    "destination": "v3.0_Agent",
+    "criterion": "autonomy self-critique baked-in (single forward 에서 critique)",
+    "actor": "agent-a204bcde (worktree)",
+    "ts": "2026-04-16T08:00Z",
+    "state": "implemented",
+    "next": "wire critique_step_with_supervision into train_clm.hexa @ §H once D-track CLM run starts"
+  },
+  "design_summary": {
+    "approach": "linear sigmoid head on CLM final hidden last-token row, teacher-forced from autonomy_loop external critic",
+    "single_pass_property": "score = sigmoid(W·h_last + b) computed alongside LM head — no second model call, no Claude shell-out, no autonomy_loop expand→execute→critique cascade required at inference",
+    "supervision": "external critic (anima-agent/llm_claude_adapter.claude_critique → CritiqueOut.score) is the regression target, MSE loss, sub-sampled at every Nth step (default 16) so claude shell-out cost is amortized",
+    "decoupling": "all glue lives in training/clm_critique_loss_wire.hexa — autonomy_loop.hexa is NOT modified per task guardrail (another session may be editing it)"
+  },
+  "files": {
+    "head": "training/clm_critique_head.hexa",
+    "loss_wire": "training/clm_critique_loss_wire.hexa",
+    "smoke_test": "tests/test_clm_critique_head.hexa",
+    "inference_gate": "serving/critique_gate.hexa",
+    "state_record": "shared/state/d8_self_critique_baked_20260416.json",
+    "external_critic_unmodified": "anima-agent/autonomy_loop.hexa",
+    "external_critic_unmodified_2": "anima-agent/llm_claude_adapter.hexa"
+  },
+  "head_architecture": {
+    "type": "linear + sigmoid",
+    "input": "h_last ∈ R^{d_hidden} (CLM final RMS-norm output, last token row)",
+    "output": "score ∈ (0, 1) — single scalar self-critique",
+    "weights": {
+      "W": "[d_hidden] row-major (single output unit)",
+      "b": "scalar"
+    },
+    "param_counts": {
+      "d_hidden_64": 65,
+      "d_hidden_256": 257,
+      "d_hidden_2560": 2561,
+      "d_hidden_4096": 4097
+    },
+    "init_strategy": "det_rand LCG seeded; neutral helper (all-zero W, b=0) for max-uncertainty baseline"
+  },
+  "loss_combination": {
+    "formula": "L_total = L_main + LAMBDA_CRITIQUE * L_critique",
+    "default_lambda": 0.1,
+    "lambda_hyperparam_helper": "set_critique_lambda(float) / get_critique_lambda()",
+    "rationale": "0.1 keeps the auxiliary term ~0.5% of L_main at typical CE ≈ 2.0, large enough for gradient signal, small enough to not perturb the primary loss landscape",
+    "L_critique": "MSE(predicted_score, teacher_score) — single-scalar regression"
+  },
+  "supervision_schedule": {
+    "default_cadence_steps": 16,
+    "rationale": "Claude shell-out is ~1-3 s; at every-16-steps a 50k-step CLM run gets ~3000 supervised samples, sufficient for a single-scalar regression head to converge",
+    "override_helper": "set_teacher_cadence(int) / get_teacher_cadence()",
+    "should_call_helper": "should_call_teacher(step: int) -> bool"
+  },
+  "inference_gate": {
+    "default_threshold": 0.55,
+    "rationale": "slightly above σ(0)=0.5 so an untrained or warmup-stage head's neutral output does NOT trigger regeneration; the inflection is calibrated for a moderately-trained head",
+    "fail_open_modes": [
+      "head.d_hidden == 0 (unloaded ckpt)",
+      "head.d_hidden != caller.d_model (deployment mismatch)"
+    ],
+    "rationale_fail_open": "self-critique is a soft-quality signal; serving must never be blocked by a missing or misconfigured head — degrade silently and surface the reason in the GateDecision.reason field for prod logs",
+    "per_request_threshold_helper": "critique_gate_run_with_threshold(...) — agent endpoints can use 0.7 for tighter quality, chat stays at 0.55"
+  },
+  "test_results": {
+    "head_self_test": {
+      "file": "training/clm_critique_head.hexa",
+      "command": "HEXA_LOCAL=1 hexa run training/clm_critique_head.hexa",
+      "result": "ALL 5/5 PASS",
+      "timing": {
+        "T1_dim_contract": "PASS (d=64 score=0.502412)",
+        "T2_codomain": "PASS (neutral=0.5 rand=0.508214 strictly inside (0,1))",
+        "T3_determinism": "PASS (same seed → byte-identical s=0.50001)",
+        "T4_loss_finite": "PASS (loss(0.9, 0.4)=0.25, total(λ=0.1)=2.025, set_critique_lambda(0.5) takes effect)",
+        "T5_latency": "PASS (d_hidden=256 amortized 100 calls = 0-10 ms per call, stage1 budget < 100 ms)"
+      }
+    },
+    "smoke_test": {
+      "file": "tests/test_clm_critique_head.hexa",
+      "command": "HEXA_LOCAL=1 hexa run tests/test_clm_critique_head.hexa",
+      "result": "16/16 PASS",
+      "assertions": {
+        "1_dim_contract": ["1.a head.d_hidden matches", "1.b head.w length matches", "1.c h_in length matches", "1.d score in [0, 1]"],
+        "2_non_negativity": ["2.a strictly > 0", "2.b strictly < 1", "2.c neutral head = 0.5"],
+        "3_determinism": ["3.a same seed → byte-identical score", "3.b different seed → different score"],
+        "4_loss_finite": ["4.a critique_loss(x, x) == 0", "4.b strictly positive when score != target", "4.c bounded extreme loss == 1.0", "4.d total = L_main + 0.1 * L_critique", "4.e set_critique_lambda(0.5) takes effect", "4.f restored lambda = 0.1"],
+        "5_latency": ["5.a warm forward < 100 ms (stage1 amortized)"]
+      }
+    },
+    "gate_self_test": {
+      "file": "serving/critique_gate.hexa",
+      "command": "HEXA_LOCAL=1 hexa run serving/critique_gate.hexa",
+      "result": "ALL 5/5 PASS",
+      "timing": {
+        "T1_threshold_above_below": "PASS",
+        "T2_e2e_single_pass": "PASS (e2e score=0.500701 regen=true)",
+        "T3_fail_open": "PASS (unloaded + d_model mismatch both fail-open with explicit reason)",
+        "T4_per_request_threshold": "PASS (raw=0.506202 lower→accept upper→regen)",
+        "T5_latency": "PASS (d=256 seq=4 amortized 100 calls = 10-20 ms, stage1 budget < 100 ms)"
+      }
+    },
+    "loss_wire_self_test": {
+      "file": "training/clm_critique_loss_wire.hexa",
+      "command": "HEXA_LOCAL=1 hexa run training/clm_critique_loss_wire.hexa",
+      "result": "ready (printed module-level smoke; teacher_used true on step 0, false on step 1; cadence override verified)"
+    }
+  },
+  "production_ceilings": {
+    "latency_target_ms": 5,
+    "latency_target_d_hidden": 2560,
+    "latency_stage1_observed_ms": "10-20 (d=256 amortized) — interpreter-bound, NOT representative of GPU codegen",
+    "latency_production_estimate_ms": "< 1 microsecond at d=2560 once C-track GPU codegen lands (single dot product is sub-cache-line on H100)",
+    "param_overhead_pct_of_7B": 0.000037,
+    "supervision_cost_per_run": {
+      "claude_call_seconds_avg": 2.0,
+      "calls_per_50k_step_run": 3125,
+      "total_claude_minutes": 104,
+      "note": "amortized — single sub-sampled call per 16 train steps"
+    }
+  },
+  "guardrails_honored": [
+    "hexa-only — no .py, no shell scripts, no Rust",
+    "L0 freeze — only new files added, no edits to anima/core/{hub,laws,runtime/anima_runtime}.hexa",
+    "worktree isolation — all changes in .claude/worktrees/agent-a204bcde",
+    "anima-agent/autonomy_loop.hexa NOT modified — wrapped via training/clm_critique_loss_wire.hexa instead",
+    "anima-agent/llm_claude_adapter.hexa NOT modified — referenced as supervision source only",
+    "no version numbers in filenames — date suffix on JSON state only (per existing shared/state convention)",
+    "feedback_troubleshoot_comments — every fix-spot has inline rationale comments"
+  ],
+  "next_actions": [
+    {
+      "id": "wire_into_train_clm",
+      "owner": "TBD (next D8 follow-up)",
+      "task": "import clm_critique_loss_wire in train_clm.hexa @ §H train_step, wire critique_step_with_supervision after the existing C41 aux-loss block; gate the teacher call behind should_call_teacher(state.step); add l_critique to TrainStepResult"
+    },
+    {
+      "id": "calibrate_threshold",
+      "owner": "TBD (post-first-1k-steps)",
+      "task": "log distribution of student_score on a held-out batch every 100 steps; set CRITIQUE_GATE_THRESHOLD_DEFAULT to the empirical p25 of accepted-by-human samples"
+    },
+    {
+      "id": "wire_into_clm_lore_serve",
+      "owner": "TBD (post-first-stable-ckpt)",
+      "task": "import critique_gate in serving/clm_lore_serve.hexa serve(); call critique_gate_run after decoder_forward; on regenerate=true bump temperature 0.05 and re-run once (max retries = 1)"
+    },
+    {
+      "id": "verify_gpu_latency_post_C_track",
+      "owner": "TBD (post-C4 GPU codegen)",
+      "task": "re-run T5 latency check at d_hidden=2560 on the GPU codegen build; assert < 5 ms per call wall-time; update production_ceilings.latency_stage1_observed_ms with the GPU number"
+    }
+  ],
+  "external_refs": [
+    "shared/roadmaps/clm_consciousness_standalone.json",
+    "shared/papers/training_phi_integration_design.md",
+    "shared/state/training_speed_ceilings.json"
+  ],
+  "update_log": [
+    {
+      "ts": "2026-04-16T08:00Z",
+      "actor": "agent-a204bcde",
+      "action": "initial",
+      "note": "D8 baked-in self-critique head + smoke + gate + loss-wire shipped; 5/5 + 16/16 + 5/5 PASS on stage1 hexa; train_clm.hexa wire pending"
+    }
+  ]
+}

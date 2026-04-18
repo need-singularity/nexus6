@@ -1,0 +1,717 @@
+// rules_unifier.hexa — GOV-P9-1 unified rules v3
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+//
+// Integrates AI-proposed rules into unified rules v3 staging.
+// NEVER modifies common.json — staging output only.
+//
+// Usage:
+//   hexa shared/rules/rules_unifier.hexa analyze    — conflict/subsumption check
+//   hexa shared/rules/rules_unifier.hexa merge      — generate common_v3_staging.json
+//   hexa shared/rules/rules_unifier.hexa diff       — v2 vs v3 delta report
+//   hexa shared/rules/rules_unifier.hexa status     — summary overview
+//
+// Sources:
+//   1. shared/harness/rule_suggest_staging.jsonl (from rule_suggest.hexa)
+//   2. shared/rules/proposed/*.json (manual proposals)
+//
+// Output:
+//   shared/rules/common_v3_staging.json
+
+let REPO = exec("git rev-parse --show-toplevel 2>/dev/null").trim()  // @allow-bare-exec
+let SHARED = REPO + "/shared"
+let COMMON_PATH = SHARED + "/rules/common.json"
+let NEXUS_PATH = SHARED + "/rules/nexus.json"
+let STAGING_JSONL = SHARED + "/harness/rule_suggest_staging.jsonl"
+let PROPOSED_DIR = SHARED + "/rules/proposed"
+let OUTPUT_PATH = SHARED + "/rules/common_v3_staging.json"
+
+fn now_iso() -> string {
+    return exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()  // @allow-bare-exec
+}
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn json_escape(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", "\\n")
+    r = r.replace("\t", "\\t")
+    return r
+}
+
+// ─── fast field extraction from JSON line ───
+fn xf(line: string, field: string) -> string {
+    let key = "\"" + field + "\":\""
+    let idx = line.index_of(key)
+    if idx < 0 { return "" }
+    let start = idx + len(key)
+    let rest = line.substring(start, len(line))
+    let end = rest.index_of("\"")
+    if end < 0 { return "" }
+    return rest.substring(0, end)
+}
+
+// Extract numeric field from JSON line
+fn xf_int(line: string, field: string) -> i64 {
+    let key = "\"" + field + "\":"
+    let idx = line.index_of(key)
+    if idx < 0 { return 0 }
+    let start = idx + len(key)
+    let rest = line.substring(start, len(line)).trim()
+    // read digits
+    let mut num_str = ""
+    let chars = rest.chars()
+    for c in chars {
+        if c == "0" || c == "1" || c == "2" || c == "3" || c == "4"
+            || c == "5" || c == "6" || c == "7" || c == "8" || c == "9" {
+            num_str = num_str + c
+        } else { break }
+    }
+    if len(num_str) == 0 { return 0 }
+    let mut v = 0
+    try { v = to_int(num_str) } catch e {}
+    return v
+}
+
+// ─── Load existing rules as flat list: [{id, rule, level, enforcement, line}] ───
+fn load_existing_rules() -> [map] {
+    let mut rules = []
+    let mut raw = ""
+    try { raw = read_file(COMMON_PATH) } catch e {
+        print_err("[rules_unifier] ERROR reading common.json: " + to_string(e))
+        return rules
+    }
+    let lines = raw.split("\n")
+    let mut current_id = ""
+    let mut current_rule = ""
+    let mut current_level = ""
+    let mut current_enforcement = ""
+    for line in lines {
+        let id = xf(line, "id")
+        if len(id) > 0 { current_id = id }
+        let rule = xf(line, "rule")
+        if len(rule) > 0 { current_rule = rule }
+        let level = xf(line, "level")
+        if len(level) > 0 { current_level = level }
+        let enf = xf(line, "enforcement")
+        if len(enf) > 0 { current_enforcement = enf }
+        // Detect rule boundary (id field line)
+        if len(id) > 0 && len(current_rule) > 0 {
+            // Flush previous if needed — we accumulate and emit on next id
+        }
+        // Emit when we see closing brace after having id
+        if line.trim().starts_with("}") && len(current_id) > 0 && len(current_rule) > 0 {
+            let entry = #{
+                "id": current_id,
+                "rule": current_rule,
+                "level": current_level,
+                "enforcement": current_enforcement,
+                "source": "common.json"
+            }
+            rules = rules.push(entry)
+            current_id = ""
+            current_rule = ""
+            current_level = ""
+            current_enforcement = ""
+        }
+    }
+    // Also load nexus.json
+    let mut nraw = ""
+    try { nraw = read_file(NEXUS_PATH) } catch e {}
+    if len(nraw) > 0 {
+        let nlines = nraw.split("\n")
+        current_id = ""
+        current_rule = ""
+        current_level = ""
+        for nl in nlines {
+            let id = xf(nl, "id")
+            if len(id) > 0 { current_id = id }
+            let rule = xf(nl, "rule")
+            if len(rule) > 0 { current_rule = rule }
+            let level = xf(nl, "level")
+            if len(level) > 0 { current_level = level }
+            if nl.trim().starts_with("}") && len(current_id) > 0 && len(current_rule) > 0 {
+                let entry = #{
+                    "id": current_id,
+                    "rule": current_rule,
+                    "level": current_level,
+                    "enforcement": "",
+                    "source": "nexus.json"
+                }
+                rules = rules.push(entry)
+                current_id = ""
+                current_rule = ""
+                current_level = ""
+            }
+        }
+    }
+    return rules
+}
+
+// Build id->rule lookup map
+fn build_id_map(rules: [map]) -> map {
+    let mut m = #{}
+    for r in rules {
+        m[_str(r["id"])] = r
+    }
+    return m
+}
+
+// Build keyword set from rule text (lowercase split)
+fn rule_keywords(text: string) -> [string] {
+    let lower = text.to_lower()
+    let words = lower.replace(",", " ").replace(".", " ").replace("(", " ")
+        .replace(")", " ").replace("/", " ").replace("-", " ").split(" ")
+    let mut kws = []
+    for w in words {
+        let tw = w.trim()
+        if len(tw) > 2 { kws = kws.push(tw) }
+    }
+    return kws
+}
+
+// Jaccard similarity between two keyword lists
+fn jaccard(a: [string], b: [string]) -> f64 {
+    let mut a_set = #{}
+    for w in a { a_set[w] = true }
+    let mut b_set = #{}
+    for w in b { b_set[w] = true }
+    let mut intersect = 0
+    let a_keys = keys(a_set)
+    for k in a_keys {
+        let mut found = false
+        try { found = b_set[k] == true } catch e {}
+        if found { intersect = intersect + 1 }
+    }
+    let union = len(a_keys) + len(keys(b_set)) - intersect
+    if union == 0 { return 0.0 }
+    return to_float(intersect) / to_float(union)
+}
+
+// ─── Load proposals from both sources ───
+fn load_proposals() -> [map] {
+    let mut proposals = []
+    // Source 1: staging JSONL
+    if file_exists(STAGING_JSONL) {
+        let mut raw = ""
+        try { raw = read_file(STAGING_JSONL) } catch e {}
+        if len(raw) > 0 {
+            let lines = raw.trim().split("\n")
+            for line in lines {
+                if len(line.trim()) == 0 { continue }
+                let p = #{
+                    "id": xf(line, "id"),
+                    "source_pattern": xf(line, "source_pattern"),
+                    "title": xf(line, "title"),
+                    "description": xf(line, "description"),
+                    "severity": xf(line, "severity"),
+                    "occurrences": xf_int(line, "occurrences"),
+                    "origin": "staging_jsonl"
+                }
+                proposals = proposals.push(p)
+            }
+        }
+    }
+    // Source 2: proposed/*.json files
+    let mut ls_out = ""
+    try { ls_out = exec("ls " + PROPOSED_DIR + "/*.json 2>/dev/null").trim() } catch e {}  // @allow-bare-exec
+    if len(ls_out) > 0 {
+        let files = ls_out.split("\n")
+        for f in files {
+            if len(f.trim()) == 0 { continue }
+            let mut content = ""
+            try { content = read_file(f.trim()) } catch e { continue }
+            let p = #{
+                "id": xf(content, "id"),
+                "source_pattern": xf(content, "source_rule"),
+                "title": xf(content, "description"),
+                "description": xf(content, "why"),
+                "severity": xf(content, "severity"),
+                "occurrences": xf_int(content, "count"),
+                "how_to_detect": xf(content, "how_to_detect"),
+                "origin": "proposed_json",
+                "file": f.trim()
+            }
+            proposals = proposals.push(p)
+        }
+    }
+    return proposals
+}
+
+// ─── Classify a proposal against existing rules ───
+// Returns: "contradiction" | "subsumption" | "enhancement" | "new"
+fn classify_proposal(proposal: map, existing: [map], id_map: map) -> map {
+    let src = _str(proposal["source_pattern"])
+    let title = _str(proposal["title"])
+    let desc = _str(proposal["description"])
+    let prop_text = src + " " + title + " " + desc
+    let prop_kws = rule_keywords(prop_text)
+
+    // Check 1: Does source_pattern match an existing rule ID exactly?
+    let mut exact_match = false
+    let mut matched_rule = #{}
+    try {
+        matched_rule = id_map[src]
+        exact_match = len(_str(matched_rule["id"])) > 0
+    } catch e {}
+
+    if exact_match {
+        // Existing rule is being re-triggered — this is an enhancement (strengthen existing)
+        let occ = proposal["occurrences"]
+        let mut occ_i = 0
+        try { occ_i = to_int(occ) } catch e {}
+        if occ_i >= 10 {
+            return #{"type": "enhancement", "match_id": src, "reason": "existing rule " + src + " recurring " + to_string(occ_i) + "x — severity boost candidate", "score": 1.0}
+        }
+        return #{"type": "subsumption", "match_id": src, "reason": "already covered by " + src, "score": 1.0}
+    }
+
+    // Check 2: Keyword similarity — find best match
+    let mut best_sim = 0.0
+    let mut best_id = ""
+    for r in existing {
+        let r_text = _str(r["id"]) + " " + _str(r["rule"]) + " " + _str(r["enforcement"])
+        let r_kws = rule_keywords(r_text)
+        let sim = jaccard(prop_kws, r_kws)
+        if sim > best_sim {
+            best_sim = sim
+            best_id = _str(r["id"])
+        }
+    }
+
+    // Thresholds for classification
+    if best_sim >= 0.6 {
+        return #{"type": "subsumption", "match_id": best_id, "reason": "high similarity (" + to_string(best_sim) + ") with " + best_id, "score": best_sim}
+    }
+    if best_sim >= 0.35 {
+        return #{"type": "enhancement", "match_id": best_id, "reason": "partial overlap (" + to_string(best_sim) + ") with " + best_id + " — may strengthen", "score": best_sim}
+    }
+
+    // Check for contradiction: opposite enforcement keywords
+    let negation_pairs = [
+        ["allow", "block"], ["permit", "forbid"], ["enable", "disable"],
+        ["create", "delete"], ["add", "remove"]
+    ]
+    let prop_lower = prop_text.to_lower()
+    for r in existing {
+        let r_lower = (_str(r["rule"]) + " " + _str(r["enforcement"])).to_lower()
+        for pair in negation_pairs {
+            let a = _str(pair[0])
+            let b = _str(pair[1])
+            if (prop_lower.contains(a) && r_lower.contains(b))
+                || (prop_lower.contains(b) && r_lower.contains(a)) {
+                let r_kws = rule_keywords(_str(r["rule"]))
+                let topic_sim = jaccard(prop_kws, r_kws)
+                if topic_sim >= 0.25 {
+                    return #{"type": "contradiction", "match_id": _str(r["id"]), "reason": "potential contradiction with " + _str(r["id"]) + " (negation pair: " + a + "/" + b + ", topic_sim=" + to_string(topic_sim) + ")", "score": topic_sim}
+                }
+            }
+        }
+    }
+
+    return #{"type": "new", "match_id": "", "reason": "no existing rule covers this pattern", "score": 0.0}
+}
+
+// ─── Find next available R-number ───
+fn next_r_number(existing: [map]) -> i64 {
+    let mut max_r = 0
+    for r in existing {
+        let id = _str(r["id"])
+        if id.starts_with("R") {
+            let num_part = id.substring(1, len(id))
+            let mut n = 0
+            try { n = to_int(num_part) } catch e {}
+            if n > max_r { max_r = n }
+        }
+    }
+    return max_r + 1
+}
+
+// ─── cmd: analyze ───
+fn cmd_analyze() {
+    let existing = load_existing_rules()
+    let id_map = build_id_map(existing)
+    let proposals = load_proposals()
+
+    if len(proposals) == 0 {
+        println("[rules_unifier] no proposals found (staging JSONL empty, proposed/ empty)")
+        println("__HARNESS_RULES_UNIFIER__ ANALYZE_EMPTY")
+        return
+    }
+
+    println("=== Rules Unifier — Conflict Analysis ===")
+    println("existing rules: " + to_string(len(existing)))
+    println("proposals:      " + to_string(len(proposals)))
+    println("")
+
+    let mut new_count = 0
+    let mut enhance_count = 0
+    let mut subsume_count = 0
+    let mut conflict_count = 0
+
+    for p in proposals {
+        let cls = classify_proposal(p, existing, id_map)
+        let typ = _str(cls["type"])
+        let pid = _str(p["id"])
+        let src = _str(p["source_pattern"])
+        let reason = _str(cls["reason"])
+
+        let label = ""
+        if typ == "new" {
+            println("  [NEW]          " + pid + "  src=" + src + "  — " + reason)
+            new_count = new_count + 1
+        } else if typ == "enhancement" {
+            println("  [ENHANCE]      " + pid + "  src=" + src + "  -> " + _str(cls["match_id"]) + "  — " + reason)
+            enhance_count = enhance_count + 1
+        } else if typ == "subsumption" {
+            println("  [SUBSUMED]     " + pid + "  src=" + src + "  <- " + _str(cls["match_id"]) + "  — " + reason)
+            subsume_count = subsume_count + 1
+        } else if typ == "contradiction" {
+            println("  [CONFLICT]     " + pid + "  src=" + src + "  <> " + _str(cls["match_id"]) + "  — " + reason)
+            conflict_count = conflict_count + 1
+        }
+    }
+
+    println("")
+    println("--- summary ---")
+    println("  new:           " + to_string(new_count))
+    println("  enhancement:   " + to_string(enhance_count))
+    println("  subsumed:      " + to_string(subsume_count))
+    println("  conflict:      " + to_string(conflict_count))
+
+    if conflict_count > 0 {
+        println("")
+        println("WARNING: " + to_string(conflict_count) + " conflict(s) require manual review before merge")
+    }
+    println("__HARNESS_RULES_UNIFIER__ ANALYZE_OK")
+}
+
+// ─── cmd: merge — generate common_v3_staging.json ───
+fn cmd_merge() {
+    let existing = load_existing_rules()
+    let id_map = build_id_map(existing)
+    let proposals = load_proposals()
+
+    if len(proposals) == 0 {
+        println("[rules_unifier] no proposals to merge")
+        println("__HARNESS_RULES_UNIFIER__ MERGE_EMPTY")
+        return
+    }
+
+    println("[rules_unifier] merging " + to_string(len(proposals)) + " proposals into v3 staging...")
+
+    let mut next_r = next_r_number(existing)
+    let mut new_rules = []
+    let mut enhancements = []
+    let mut conflicts = []
+    let mut subsumed = []
+
+    for p in proposals {
+        let cls = classify_proposal(p, existing, id_map)
+        let typ = _str(cls["type"])
+
+        if typ == "new" {
+            let new_id = "R" + to_string(next_r)
+            let entry = #{
+                "id": new_id,
+                "rule": _str(p["title"]),
+                "level": _str(p["severity"]),
+                "enforcement": _str(p["description"]),
+                "source_proposal": _str(p["id"]),
+                "origin": _str(p["origin"]),
+                "merged_as": "new"
+            }
+            new_rules = new_rules.push(entry)
+            next_r = next_r + 1
+        } else if typ == "enhancement" {
+            let entry = #{
+                "target_id": _str(cls["match_id"]),
+                "proposal_id": _str(p["id"]),
+                "reason": _str(cls["reason"]),
+                "suggested_severity": _str(p["severity"]),
+                "description": _str(p["description"]),
+                "merged_as": "enhancement"
+            }
+            enhancements = enhancements.push(entry)
+        } else if typ == "contradiction" {
+            let entry = #{
+                "target_id": _str(cls["match_id"]),
+                "proposal_id": _str(p["id"]),
+                "reason": _str(cls["reason"]),
+                "description": _str(p["description"]),
+                "merged_as": "conflict_manual_review"
+            }
+            conflicts = conflicts.push(entry)
+        } else {
+            let entry = #{
+                "covered_by": _str(cls["match_id"]),
+                "proposal_id": _str(p["id"]),
+                "reason": _str(cls["reason"]),
+                "merged_as": "subsumed_skip"
+            }
+            subsumed = subsumed.push(entry)
+        }
+    }
+
+    // Build output JSON
+    let mut out = "{\n"
+    out = out + "  \"_meta\": {\n"
+    out = out + "    \"description\": \"Unified rules v3 STAGING — pending user review before promotion to common.json\",\n"
+    out = out + "    \"generated\": \"" + now_iso() + "\",\n"
+    out = out + "    \"base\": \"common.json (R0~R36 + H-* + AI-NATIVE)\",\n"
+    out = out + "    \"proposals_processed\": " + to_string(len(proposals)) + ",\n"
+    out = out + "    \"new_rules\": " + to_string(len(new_rules)) + ",\n"
+    out = out + "    \"enhancements\": " + to_string(len(enhancements)) + ",\n"
+    out = out + "    \"conflicts\": " + to_string(len(conflicts)) + ",\n"
+    out = out + "    \"subsumed\": " + to_string(len(subsumed)) + "\n"
+    out = out + "  },\n"
+
+    // New rules section
+    out = out + "  \"new_rules\": [\n"
+    let mut i = 0
+    for nr in new_rules {
+        if i > 0 { out = out + ",\n" }
+        out = out + "    {\n"
+        out = out + "      \"id\": \"" + json_escape(_str(nr["id"])) + "\",\n"
+        out = out + "      \"rule\": \"" + json_escape(_str(nr["rule"])) + "\",\n"
+        out = out + "      \"level\": \"" + json_escape(_str(nr["level"])) + "\",\n"
+        out = out + "      \"enforcement\": \"" + json_escape(_str(nr["enforcement"])) + "\",\n"
+        out = out + "      \"source_proposal\": \"" + json_escape(_str(nr["source_proposal"])) + "\",\n"
+        out = out + "      \"origin\": \"" + json_escape(_str(nr["origin"])) + "\",\n"
+        out = out + "      \"status\": \"staging\"\n"
+        out = out + "    }"
+        i = i + 1
+    }
+    out = out + "\n  ],\n"
+
+    // Enhancements section
+    out = out + "  \"enhancements\": [\n"
+    i = 0
+    for en in enhancements {
+        if i > 0 { out = out + ",\n" }
+        out = out + "    {\n"
+        out = out + "      \"target_id\": \"" + json_escape(_str(en["target_id"])) + "\",\n"
+        out = out + "      \"proposal_id\": \"" + json_escape(_str(en["proposal_id"])) + "\",\n"
+        out = out + "      \"reason\": \"" + json_escape(_str(en["reason"])) + "\",\n"
+        out = out + "      \"suggested_severity\": \"" + json_escape(_str(en["suggested_severity"])) + "\",\n"
+        out = out + "      \"action\": \"review_severity_boost\"\n"
+        out = out + "    }"
+        i = i + 1
+    }
+    out = out + "\n  ],\n"
+
+    // Conflicts section
+    out = out + "  \"conflicts\": [\n"
+    i = 0
+    for cf in conflicts {
+        if i > 0 { out = out + ",\n" }
+        out = out + "    {\n"
+        out = out + "      \"target_id\": \"" + json_escape(_str(cf["target_id"])) + "\",\n"
+        out = out + "      \"proposal_id\": \"" + json_escape(_str(cf["proposal_id"])) + "\",\n"
+        out = out + "      \"reason\": \"" + json_escape(_str(cf["reason"])) + "\",\n"
+        out = out + "      \"action\": \"manual_review_required\"\n"
+        out = out + "    }"
+        i = i + 1
+    }
+    out = out + "\n  ],\n"
+
+    // Subsumed section
+    out = out + "  \"subsumed\": [\n"
+    i = 0
+    for sb in subsumed {
+        if i > 0 { out = out + ",\n" }
+        out = out + "    {\n"
+        out = out + "      \"covered_by\": \"" + json_escape(_str(sb["covered_by"])) + "\",\n"
+        out = out + "      \"proposal_id\": \"" + json_escape(_str(sb["proposal_id"])) + "\",\n"
+        out = out + "      \"reason\": \"" + json_escape(_str(sb["reason"])) + "\",\n"
+        out = out + "      \"action\": \"skip\"\n"
+        out = out + "    }"
+        i = i + 1
+    }
+    out = out + "\n  ]\n"
+    out = out + "}\n"
+
+    try {
+        write_file(OUTPUT_PATH, out)
+        println("[rules_unifier] v3 staging written: " + OUTPUT_PATH)
+    } catch e {
+        print_err("[rules_unifier] ERROR writing output: " + to_string(e))
+        println("__HARNESS_RULES_UNIFIER__ MERGE_FAIL")
+        return
+    }
+
+    println("")
+    println("--- merge results ---")
+    println("  new rules:     " + to_string(len(new_rules)))
+    for nr in new_rules {
+        println("    " + _str(nr["id"]) + "  <- " + _str(nr["source_proposal"]))
+    }
+    println("  enhancements:  " + to_string(len(enhancements)))
+    for en in enhancements {
+        println("    " + _str(en["target_id"]) + "  <- " + _str(en["proposal_id"]))
+    }
+    println("  conflicts:     " + to_string(len(conflicts)) + " (manual review)")
+    println("  subsumed:      " + to_string(len(subsumed)) + " (skipped)")
+    println("")
+    println("next step: review " + OUTPUT_PATH + " then promote to common.json")
+    println("__HARNESS_RULES_UNIFIER__ MERGE_OK")
+}
+
+// ─── cmd: diff — show v2 vs v3 delta ───
+fn cmd_diff() {
+    if file_exists(OUTPUT_PATH) == false {
+        println("[rules_unifier] no v3 staging found — run 'merge' first")
+        println("__HARNESS_RULES_UNIFIER__ DIFF_MISSING")
+        return
+    }
+
+    let existing = load_existing_rules()
+    let v3_raw = read_file(OUTPUT_PATH)
+
+    // Count v3 new rules
+    let mut new_count = 0
+    let mut search = 0
+    let marker = "\"status\": \"staging\""
+    while search < len(v3_raw) {
+        let rest = v3_raw.substring(search, len(v3_raw))
+        let idx = rest.index_of(marker)
+        if idx < 0 { break }
+        new_count = new_count + 1
+        search = search + idx + len(marker)
+    }
+
+    // Count enhancements
+    let mut enh_count = 0
+    search = 0
+    let enh_marker = "\"action\": \"review_severity_boost\""
+    while search < len(v3_raw) {
+        let rest = v3_raw.substring(search, len(v3_raw))
+        let idx = rest.index_of(enh_marker)
+        if idx < 0 { break }
+        enh_count = enh_count + 1
+        search = search + idx + len(enh_marker)
+    }
+
+    // Count conflicts
+    let mut conf_count = 0
+    search = 0
+    let conf_marker = "\"action\": \"manual_review_required\""
+    while search < len(v3_raw) {
+        let rest = v3_raw.substring(search, len(v3_raw))
+        let idx = rest.index_of(conf_marker)
+        if idx < 0 { break }
+        conf_count = conf_count + 1
+        search = search + idx + len(conf_marker)
+    }
+
+    println("=== Rules Unifier — v2 vs v3 Diff ===")
+    println("")
+    println("v2 (common.json):  " + to_string(len(existing)) + " rules")
+    println("v3 (staging):      " + to_string(len(existing) + new_count) + " rules (projected)")
+    println("")
+    println("delta:")
+    println("  +new rules:     " + to_string(new_count))
+    println("  ~enhancements:  " + to_string(enh_count))
+    println("  !conflicts:     " + to_string(conf_count))
+    println("  net change:     +" + to_string(new_count) + " rules")
+    println("")
+
+    // List new rule IDs from staging
+    if new_count > 0 {
+        println("--- new rule IDs ---")
+        let mut s = 0
+        let id_marker = "\"id\": \""
+        let status_marker = "\"status\": \"staging\""
+        // Scan for id fields near staging status
+        let lines = v3_raw.split("\n")
+        let mut last_id = ""
+        for line in lines {
+            let id = xf(line, "id")
+            if len(id) > 0 { last_id = id }
+            if line.contains("staging") && len(last_id) > 0 {
+                println("  " + last_id)
+                last_id = ""
+            }
+        }
+    }
+
+    if conf_count > 0 {
+        println("")
+        println("WARNING: " + to_string(conf_count) + " conflict(s) need manual resolution before promotion")
+    }
+
+    println("__HARNESS_RULES_UNIFIER__ DIFF_OK")
+}
+
+// ─── cmd: status ───
+fn cmd_status() {
+    let existing = load_existing_rules()
+    let proposals = load_proposals()
+
+    // Count by source
+    let mut staging_count = 0
+    let mut proposed_count = 0
+    for p in proposals {
+        let origin = _str(p["origin"])
+        if origin == "staging_jsonl" { staging_count = staging_count + 1 }
+        if origin == "proposed_json" { proposed_count = proposed_count + 1 }
+    }
+
+    let v3_exists = file_exists(OUTPUT_PATH)
+
+    println("=== Rules Unifier — Status ===")
+    println("existing rules (common.json + nexus.json): " + to_string(len(existing)))
+    println("proposals:")
+    println("  from rule_suggest_staging.jsonl:  " + to_string(staging_count))
+    println("  from rules/proposed/*.json:       " + to_string(proposed_count))
+    println("  total:                            " + to_string(len(proposals)))
+    println("v3 staging file: " + to_string(v3_exists))
+    if v3_exists {
+        let mtime = exec("stat -f '%Sm' '" + OUTPUT_PATH + "' 2>/dev/null").trim()  // @allow-bare-exec
+        println("  last modified: " + mtime)
+    }
+    println("")
+    if len(proposals) > 0 {
+        println("workflow: analyze -> merge -> diff -> user review -> promote")
+    } else {
+        println("no proposals pending — run rule_suggest.hexa suggest --apply first")
+    }
+    println("__HARNESS_RULES_UNIFIER__ STATUS_OK")
+}
+
+// ─── CLI router ───
+let argv = args()
+let argc = len(argv)
+
+if argc < 1 {
+    println("usage: hexa rules_unifier.hexa <analyze|merge|diff|status>")
+    println("")
+    println("  analyze  — conflict/subsumption check against existing rules")
+    println("  merge    — generate common_v3_staging.json with unified rule set")
+    println("  diff     — show v2 vs v3 delta report")
+    println("  status   — summary overview")
+    exit(1)
+}
+
+let mode = _str(argv[0])
+
+if mode == "analyze" {
+    cmd_analyze()
+} else if mode == "merge" {
+    cmd_merge()
+} else if mode == "diff" {
+    cmd_diff()
+} else if mode == "status" {
+    cmd_status()
+} else {
+    print_err("[rules_unifier] unknown mode: " + mode)
+    println("usage: hexa rules_unifier.hexa <analyze|merge|diff|status>")
+    exit(1)
+}

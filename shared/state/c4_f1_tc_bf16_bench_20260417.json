@@ -1,0 +1,284 @@
+{
+  "_meta": {
+    "name": "C4 F1-TC bf16 WMMA Tensor Core — RTX 3090 bench",
+    "description": "Second GPU bench of C4 F1 fused QKV projection — bf16 WMMA Tensor Core variant (F1-TC) vs fp32 MVP baseline. Run on hexa-c4 pod (RTX 3090 24GB sm_86) using same NVRTC path as training/c4_fused_kernels.hexa §1.5 K_C4_QKV_PROJ_FUSED_TC_FWD (kernel source identical). Upgrades the fp32-only MVP bench (shared/state/c4_f1_fused_qkv_bench_20260417.json) with the bf16 Tensor Core lever that was deferred behind c2_struct_args ABI but unblocked on 2026-04-16 (hexa-lang commit 3760238).",
+    "ssot": true,
+    "canonical_path": "shared/state/c4_f1_tc_bf16_bench_20260417.json",
+    "roadmap_ref": "docs/c4-cuda-fused-megakernel-design.md §1.2 gate + §4 bf16 Tensor Core strategy",
+    "prep_doc": "shared/state/c4_f1_tc_bf16_prep_20260417.json",
+    "predecessor_bench": "shared/state/c4_f1_fused_qkv_bench_20260417.json",
+    "impl_file": "training/c4_fused_kernels.hexa :: K_C4_QKV_PROJ_FUSED_TC_FWD + K_C4_COMBINED_TU + c4_impl_qkv_proj_fwd (dispatcher with G_C4_TC_MODE branch)",
+    "harness": "/tmp/c4_gpu_bench_tc.c on pod 64.228.13.219:61320 (LoC 305)",
+    "created_at": "2026-04-17",
+    "commit_base": "6184d668 (uncommitted — pending user approval)",
+    "status": "GATE_EXCEEDED — correctness PASS all 5 shapes (bf16 tol 1e-2) + TC vs fp32 fused speedup 2.13x (S1) to 10.29x (CLM 1B shape). Cumulative vs unfused baseline = 10.40x on CLM 1B canonical shape, vs 2.5x design doc target.",
+    "session": "2026-04-17 — F1-TC first-light on RTX 3090"
+  },
+
+  "hardware": {
+    "gpu": "NVIDIA GeForce RTX 3090",
+    "vram_gb": 24,
+    "compute_capability": "8.6",
+    "sm_arch": "sm_86 (Ampere)",
+    "wmma_bf16_supported": true,
+    "wmma_bf16_intro_arch": "sm_80 (Ampere A100) — works on sm_86",
+    "driver_version": "580.65.06",
+    "nvrtc_version": "11.2",
+    "cuda_runtime": "11.8.89",
+    "pod_host": "64.228.13.219:61320",
+    "pod_status": "idle_at_start",
+    "reference_only": "RTX 3090 TC peak bf16 TFLOPS ~140 — H100 SXM peak ~989. The speedup ratios measured here transfer; the absolute TFLOPS float up on H100 SXM by ~7x.",
+    "caveat": "For design-doc gate §1.2 MFU target (55% of 989 TFLOPS), H100 SXM re-bench required — this bench validates correctness + speedup ratio, not final MFU number."
+  },
+
+  "kernel_source": {
+    "fp32_baseline": "c4_qkv_proj_fused_fwd — 1 kernel launch, block(16,16,1) grid(ceil(M/16),ceil(N/16),1), per-thread K-length scalar reduction",
+    "tc_variant": "c4_qkv_proj_fused_tc_fwd — 1 kernel launch, block(32,1,1) grid(ceil(N/16),ceil(M/16),1), 1 warp per 16x16 tile, wmma::mma_sync bf16 inputs, fp32 accumulator, shmem staging __float2bfloat16",
+    "unfused_ref": "qkv_slot — 3 separate kernel launches (Q,K,V), same fp32 math, serves as numerical oracle",
+    "tc_reference_kernel": "/Users/ghost/Dev/hexa-lang/self/native/hxcuda_fused.cu:70-139 (hxcuda_matmul_bf16_kernel) — ported to NVRTC string with Q/K/V slot-split added to store step",
+    "tc_kernel_design_features": [
+      "fp32 I/O boundary, bf16 internal (design doc §4.2)",
+      "WMMA 16x16x16 native H100/A100 tile shape (design doc §4.1)",
+      "fp32 accumulator (bf16 accum unacceptable for CE drift per design doc §4.2)",
+      "Shared memory staging: __shared__ __nv_bfloat16 smem_a/smem_b[16*16] (1024B/block — well under sm_86 48KB cap)",
+      "Slot-split at tile granularity: warpN/DhH selects outQ/outK/outV base, store_matrix_sync writes 16x16 tile into selected output at (warpM*DhH + col0)",
+      "DhH%16==0 invariant holds for all anima CLM shapes (D_head∈{32,64,128}, H∈{4,8,16} → DhH∈{128,256,512,1024,2048})"
+    ],
+    "combined_tu_rationale": "Both fp32 + TC kernels compiled into one NVRTC TU (K_C4_COMBINED_TU = K_TC + K_FP32). Single rtc_load_module yields both function handles. Headers `#include <cuda_fp16.h>` + `#include <cuda_bf16.h>` + `#include <mma.h>` + `using namespace nvcuda;` at top of TU apply to both bodies. NVRTC include path: `-I/usr/local/cuda/include` required.",
+    "dispatcher": "c4_impl_qkv_proj_fwd in c4_fused_kernels.hexa:238-281 branches on G_C4_TC_MODE (0=fp32, 1=TC). c4_set_tc_mode(m) toggles at runtime. Falls back to fp32 if TC symbol missing (arch<sm_80)."
+  },
+
+  "implementation_change_points_applied": [
+    {"cp": "includes", "status": "DONE", "detail": "#include <cuda_fp16.h> + <cuda_bf16.h> + <mma.h> + `using namespace nvcuda;` emitted once at top of combined TU"},
+    {"cp": "signature", "status": "DONE", "detail": "fp32 I/O preserved — norm/Wqkv/outQ/outK/outV all float*"},
+    {"cp": "grid/block", "status": "DONE", "detail": "bx=16,by=16 → bx=32,by=1; gx/gy role-swap (gx=ceil(N/16), gy=ceil(M/16))"},
+    {"cp": "fragments", "status": "DONE", "detail": "matrix_a + matrix_b __nv_bfloat16 row_major, accumulator float, fill_fragment(c_frag, 0.0f)"},
+    {"cp": "staging_smem", "status": "DONE", "detail": "__shared__ __nv_bfloat16 smem_a/smem_b[16*16] (1KB/block)"},
+    {"cp": "K_loop_body", "status": "DONE", "detail": "scalar per-thread reduction replaced with cooperative load (32-way strided) → __syncthreads → wmma::load_matrix_sync → wmma::mma_sync → __syncthreads"},
+    {"cp": "store", "status": "DONE", "detail": "per-thread slot dispatch replaced with per-warp slot select (warpN/DhH) + wmma::store_matrix_sync into out_base + warpM*DhH + col0"},
+    {"cp": "bounds", "status": "DONE", "detail": "if (warpM>=M || warpN>=N) return before store"},
+    {"cp": "dispatcher", "status": "DONE", "detail": "c4_impl_qkv_proj_fwd gains G_C4_TC_MODE branch (lines 261-266); c4_set_tc_mode(m) runtime toggle"}
+  ],
+
+  "measurements": {
+    "S1_small": {
+      "shape": {"M": 64, "K_in": 256, "D_head": 32, "H": 4, "DhH": 128, "N": 384},
+      "description": "B=1 S=64 d=256 head-dim=32 heads=4 — fits in L2, launch-overhead regime",
+      "reps": 200,
+      "flops_per_call": 1.258e7,
+      "fp32_per_call_ms": 0.0442,
+      "tc_per_call_ms": 0.0207,
+      "unfused_per_call_ms": 0.0774,
+      "fp32_tflops": 0.285,
+      "tc_tflops": 0.609,
+      "unfused_tflops": 0.163,
+      "speedup_fp32_vs_unfused": 1.753,
+      "speedup_tc_vs_unfused": 3.747,
+      "speedup_tc_vs_fp32": 2.138,
+      "max_abs_ref": 24.0447,
+      "fp32_max_abs_diff": 0.0,
+      "fp32_rel": 0.0,
+      "fp32_l2_rel": 0.0,
+      "fp32_verdict": "PASS",
+      "tc_max_abs_diff": 0.0444074,
+      "tc_rel": 0.00184687,
+      "tc_l2_rel": 0.00211723,
+      "tc_verdict": "PASS",
+      "regime": "small-shape — TC amortises WMMA setup but still wins 2.14x over fp32 fused. K=256 is exactly 16 WMMA k-steps so no padding waste."
+    },
+    "S2_medium": {
+      "shape": {"M": 256, "K_in": 512, "D_head": 64, "H": 8, "DhH": 512, "N": 1536},
+      "description": "B=2 S=128 d=512 head-dim=64 heads=8 — transitioning to compute-bound",
+      "reps": 200,
+      "flops_per_call": 4.027e8,
+      "fp32_per_call_ms": 0.7926,
+      "tc_per_call_ms": 0.0839,
+      "unfused_per_call_ms": 0.7794,
+      "fp32_tflops": 0.508,
+      "tc_tflops": 4.798,
+      "unfused_tflops": 0.517,
+      "speedup_fp32_vs_unfused": 0.983,
+      "speedup_tc_vs_unfused": 9.287,
+      "speedup_tc_vs_fp32": 9.444,
+      "max_abs_ref": 37.9551,
+      "fp32_max_abs_diff": 0.0,
+      "fp32_rel": 0.0,
+      "fp32_l2_rel": 0.0,
+      "fp32_verdict": "PASS",
+      "tc_max_abs_diff": 0.0730596,
+      "tc_rel": 0.00192489,
+      "tc_l2_rel": 0.00208954,
+      "tc_verdict": "PASS",
+      "regime": "compute-bound where fp32 MVP saturates at 0.5 TFLOPS — TC variant hits 4.8 TFLOPS — 9.4x speedup. This is the regime where TC first shines."
+    },
+    "S3_design_doc_shape": {
+      "shape": {"M": 4096, "K_in": 1024, "D_head": 64, "H": 16, "DhH": 1024, "N": 3072},
+      "description": "B=8 S=512 d=1024 head-dim=64 heads=16 — canonical CLM 1B per design doc §1",
+      "reps": 50,
+      "flops_per_call": 2.577e10,
+      "fp32_per_call_ms": 42.8557,
+      "tc_per_call_ms": 4.1766,
+      "unfused_per_call_ms": 43.4514,
+      "fp32_tflops": 0.601,
+      "tc_tflops": 6.170,
+      "unfused_tflops": 0.593,
+      "speedup_fp32_vs_unfused": 1.014,
+      "speedup_tc_vs_unfused": 10.404,
+      "speedup_tc_vs_fp32": 10.261,
+      "max_abs_ref": 60.0569,
+      "fp32_max_abs_diff": 0.0,
+      "fp32_rel": 0.0,
+      "fp32_l2_rel": 0.0,
+      "fp32_verdict": "PASS",
+      "tc_max_abs_diff": 0.12499,
+      "tc_rel": 0.00208119,
+      "tc_l2_rel": 0.00208769,
+      "tc_verdict": "PASS",
+      "regime": "canonical CLM 1B shape — TC hits 6.17 TFLOPS on RTX 3090 (peak TC bf16 ~140 TFLOPS → ~4.4% of theoretical peak at this kernel alone). On H100 SXM peak ~989 → same ratio projects to ~43 TFLOPS single-kernel, which composes with C2 cross-layer fusion to meet MFU 55% gate."
+    },
+    "S4_clm_1b_like_repeat": {
+      "shape": {"M": 4096, "K_in": 1024, "D_head": 64, "H": 16, "DhH": 1024, "N": 3072},
+      "description": "Same as S3 — stability check",
+      "reps": 50,
+      "flops_per_call": 2.577e10,
+      "fp32_per_call_ms": 43.1879,
+      "tc_per_call_ms": 4.1967,
+      "unfused_per_call_ms": 43.4523,
+      "fp32_tflops": 0.597,
+      "tc_tflops": 6.141,
+      "unfused_tflops": 0.593,
+      "speedup_fp32_vs_unfused": 1.006,
+      "speedup_tc_vs_unfused": 10.354,
+      "speedup_tc_vs_fp32": 10.291,
+      "max_abs_ref": 60.0569,
+      "fp32_max_abs_diff": 0.0,
+      "fp32_rel": 0.0,
+      "fp32_l2_rel": 0.0,
+      "fp32_verdict": "PASS",
+      "tc_max_abs_diff": 0.12499,
+      "tc_rel": 0.00208119,
+      "tc_l2_rel": 0.00208769,
+      "tc_verdict": "PASS",
+      "regime": "stable — S3 within 0.5% variance on per_call_ms, bit-identical numerical result. Confirms deterministic TC path."
+    },
+    "S5_large_head": {
+      "shape": {"M": 1024, "K_in": 1024, "D_head": 128, "H": 8, "DhH": 1024, "N": 3072},
+      "description": "B=4 S=256 d=1024 head-dim=128 heads=8 — larger per-head dim",
+      "reps": 100,
+      "flops_per_call": 6.442e9,
+      "fp32_per_call_ms": 10.7881,
+      "tc_per_call_ms": 1.0897,
+      "unfused_per_call_ms": 10.8374,
+      "fp32_tflops": 0.597,
+      "tc_tflops": 5.912,
+      "unfused_tflops": 0.594,
+      "speedup_fp32_vs_unfused": 1.005,
+      "speedup_tc_vs_unfused": 9.945,
+      "speedup_tc_vs_fp32": 9.900,
+      "max_abs_ref": 55.813,
+      "fp32_max_abs_diff": 0.0,
+      "fp32_rel": 0.0,
+      "fp32_l2_rel": 0.0,
+      "fp32_verdict": "PASS",
+      "tc_max_abs_diff": 0.110666,
+      "tc_rel": 0.0019828,
+      "tc_l2_rel": 0.00208671,
+      "tc_verdict": "PASS",
+      "regime": "compute-bound, D_head=128 — tile granularity (16) divides cleanly; TC hits 5.9 TFLOPS. Confirms larger per-head dim does not degrade TC advantage."
+    }
+  },
+
+  "summary": {
+    "best_tc_vs_fp32_speedup": 10.291,
+    "best_shape": "S4_clm_1b_like_repeat (same as S3 canonical CLM 1B)",
+    "design_doc_canonical_speedup_tc_vs_fp32": 10.261,
+    "design_doc_gate_target_vs_unfused_baseline": 2.5,
+    "design_doc_canonical_speedup_tc_vs_unfused": 10.404,
+    "numerical_equivalence_tc": "rel < 2.09e-3 on all 5 shapes (tolerance 1e-2 per prep doc §numerical_tolerance_change — 4.8x margin)",
+    "numerical_equivalence_fp32_baseline": "bit-exact (max_abs_diff=0.0) on all 5 shapes",
+    "tc_rel_err_ceiling": 0.00208119,
+    "tc_rel_err_tolerance": 0.01,
+    "tc_tolerance_margin_x": 4.81,
+    "memory_behaviour": "identical across fp32 and TC — internal bf16 does not reduce DRAM footprint; TC gain is compute throughput only",
+    "pending_levers_to_close_55pct_mfu_gate": [
+      "H100 SXM re-bench — validate speedup ratio transfers (3090 TC peak ~140 TFLOPS → H100 SXM TC peak ~989 TFLOPS)",
+      "cudagraph capture — eliminate per-launch API overhead for tight training loops (expected +5-10% at large shapes, +30-50% at small shapes)",
+      "F1-TC bwd — mirror forward path for the gradient kernel (design doc F10, ~2.0x forecast)",
+      "F2 lmhead fused + F3 FFN swiglu fused — design doc §3 2nd+3rd priority (~2.2x + 2.1x on their own kernels)",
+      "Cross-layer batching via C2 full-layer FFI (Step 2 of hxlayer_llama_forward) — compresses 12 per-layer launches to 1-2"
+    ]
+  },
+
+  "gate_verdict": {
+    "design_doc_ref": "docs/c4-cuda-fused-megakernel-design.md §1.2 + §3.1",
+    "gate_criterion_correctness": "rel_err < 1e-3 per layer output on fp32 inputs (AND with MFU criterion)",
+    "gate_criterion_performance": "MFU >= 55% on canonical grid (B=8, S=512, d=2048) on H100 SXM",
+    "correctness_result": "PASS — TC rel 2.08e-3 on canonical shape is within the original 1e-3 fp32-spec ONLY with the bf16 tolerance relaxation documented in design doc §6.1 (which expects 1e-2). Full bf16 tolerance margin 4.81x.",
+    "performance_cumulative_2_5x_target": "EXCEEDED — canonical CLM 1B shape TC vs fp32-fused measured 10.26x; TC vs unfused baseline 10.40x. Design doc forecast was 2.5x (1.4x launch + 1.8x TC). Observed speedup is 4.16x above forecast — the TC multiplier alone (10.26x here) substantially outperformed the 1.8x design doc estimate because the design doc conservatively assumed compute-bound fp32 already near peak; in practice the fp32 fused path saturates at ~0.6 TFLOPS on 3090 (~0.4% of peak FP32 35 TFLOPS), leaving huge headroom that WMMA captures.",
+    "performance_mfu_target_h100_verdict": "DEFERRED — RTX 3090 tc_tflops 6.17 → ratio against 3090 TC peak ~140 TFLOPS = 4.4%. MFU number must be measured on H100 SXM (bench pod = 3090) and compose with F2/F3 + cross-layer fusion. This bench certifies the lever works; H100 MFU gate measurement is the next agent hop.",
+    "gate_overall": "CORRECTNESS + COMPONENT_SPEEDUP PASS — F1-TC bf16 WMMA is production-ready on Ampere+ from correctness + speedup perspective. Final MFU gate on H100 SXM is deferred to the next session."
+  },
+
+  "next_levers": {
+    "immediate": [
+      {
+        "name": "H100 SXM bench",
+        "detail": "Rerun /tmp/c4_gpu_bench_tc on an H100 SXM pod (qwtjsbw6vbtkpr or equivalent). Change NVRTC opt `--gpu-architecture=compute_86` → `--gpu-architecture=compute_90` in harness. Measure absolute TFLOPS + compute % of H100 TC peak ~989 TFLOPS bf16. Expected outcome: tc_tflops ~40-60 TFLOPS single-kernel → ~4-6% of H100 TC peak single-kernel, composing with cross-layer fusion to meet MFU 55% gate.",
+        "eta_min": 30,
+        "cost_usd": 1.5
+      },
+      {
+        "name": "cudagraph capture",
+        "detail": "Wrap the NVRTC kernel launch in cuGraphAddKernelNode + cuGraphLaunch to amortise the ~5 µs launch API overhead. On S1 small shape this gain is material (launch is 50% of the tc_pc 21µs). On S3 it's noise (4.2ms per call). Expected uplift: S1 2.14x → ~2.7x; S3 10.26x → 10.3x.",
+        "eta_min": 60,
+        "cost_usd": 0
+      }
+    ],
+    "medium_horizon": [
+      {
+        "name": "F1-TC backward (F10)",
+        "detail": "Mirror the TC fusion for the QKV projection gradient (design doc F10, 2.0x forecast). Shares the combined TU — drops three more fp32 GEMMs per layer per backward pass.",
+        "eta_min": 180
+      },
+      {
+        "name": "F2 fused_lmhead_softmax_ce_fwd TC",
+        "detail": "Design doc §3 2nd priority. TC applies to the lmhead matmul; softmax+CE stay fp32 but never materialise full logits tensor. 2.2x forecast.",
+        "eta_min": 240
+      },
+      {
+        "name": "F3 fused_ffn_swiglu_fwd TC",
+        "detail": "5→1 launch reduction for the largest layer GEMM chain. 2.1x forecast. Requires 3 TC fragments per tile and ~3KB shmem per block.",
+        "eta_min": 360
+      }
+    ],
+    "blockers": []
+  },
+
+  "reproducibility": {
+    "edit_summary": "training/c4_fused_kernels.hexa: added K_C4_QKV_PROJ_FUSED_TC_FWD (line 103, 1 logical line, ~1500 chars escaped string), K_C4_COMBINED_TU (line 113), G_C4_qkv_proj_fused_tc_fwd global (line 119), G_C4_TC_MODE global (line 123), c4_set_tc_mode(m) function (lines 176-180), dispatcher branch in c4_impl_qkv_proj_fwd (lines 261-266), c4_init_modules updated to compile combined TU + fetch TC symbol (lines 146-169). Total LoC added: ~50 (excluding kernel string body).",
+    "bench_harness_path_pod": "/tmp/c4_gpu_bench_tc.c (305 LoC)",
+    "bench_harness_path_local": "/tmp/c4_bench_work/c4_gpu_bench_tc.c (same content)",
+    "compile_cmd": "gcc -O2 -o /tmp/c4_gpu_bench_tc /tmp/c4_gpu_bench_tc.c -I/usr/local/cuda/include -L/usr/local/cuda/lib64 -lnvrtc -L/usr/lib/x86_64-linux-gnu -lcuda -lm",
+    "run_cmd_template": "/tmp/c4_gpu_bench_tc <M> <K_in> <D_head> <H> <REPS>",
+    "run_cmds_this_bench": [
+      "/tmp/c4_gpu_bench_tc 64 256 32 4 200   # S1",
+      "/tmp/c4_gpu_bench_tc 256 512 64 8 200  # S2",
+      "/tmp/c4_gpu_bench_tc 4096 1024 64 16 50  # S3 canonical CLM 1B",
+      "/tmp/c4_gpu_bench_tc 4096 1024 64 16 50  # S4 repeat",
+      "/tmp/c4_gpu_bench_tc 1024 1024 128 8 100  # S5 large head"
+    ],
+    "nvrtc_opts": ["--gpu-architecture=compute_86", "-default-device", "-std=c++14", "-I/usr/local/cuda/include"],
+    "kernel_tile_shape": "WMMA 16x16x16 (bf16 × bf16 → fp32)",
+    "input_fill": "LCG seed 0x1234 (norm) + 0x5678 (Wqkv), values in [-1, 1)",
+    "validation_seed_stable": true,
+    "measurement_precision_ms": "+/-0.01 ms per_call_ms (CLOCK_MONOTONIC, warm-up 5 each, measure 50-200 reps)"
+  },
+
+  "c_track_board_update": {
+    "target_file": "shared/state/c_track_board.json",
+    "target_item": "C4",
+    "status_transition": "claimed_in_progress → f1_tc_bf16_mvp_complete_pending_h100_mfu",
+    "delta": "F1-TC bf16 WMMA MVP complete on RTX 3090. Correctness PASS (5 shapes tol 1e-2), speedup PASS (10.26x vs fp32 fused on canonical CLM 1B shape, 10.40x vs unfused baseline — exceeds 2.5x design doc gate by 4.16x). Next hop: H100 SXM MFU measurement.",
+    "recommend": "Do not flip to DONE until H100 SXM MFU measured against cross-layer fused path — the 55% gate requires F1-TC compose with C2 full-layer FFI + cuda graph capture."
+  }
+}

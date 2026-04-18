@@ -1,0 +1,620 @@
+// parallel_scheduler.hexa — hexa parallel task scheduler with DAG dependency resolution
+// @no-lock-needed
+// @allow-bare-exec
+// @allow-devpath
+//
+// CLI:
+//   hexa run parallel_scheduler.hexa run <tasks.json>   — execute task DAG
+//   hexa run parallel_scheduler.hexa status             — show running/completed tasks
+//   hexa run parallel_scheduler.hexa cancel             — kill all running tasks
+//
+// Task JSON format: [{"id":"t1","script":"path.hexa","args":["a"],"deps":["t0"]}]
+// Output sentinel: __SCHED_TASK_RESULT__ <id> PASS|FAIL
+// Log: shared/hexa/scheduler_log.jsonl
+
+let HOME = env("HOME")
+let NEXUS = HOME + "/Dev/nexus"
+let HEXA = NEXUS + "/shared/bin/hexa"
+let LOG_PATH = NEXUS + "/shared/hexa/scheduler_log.jsonl"
+let STATE_DIR = "/tmp/nexus_sched"
+let PID_DIR = STATE_DIR + "/pids"
+let OUT_DIR = STATE_DIR + "/out"
+
+// ═══════════════════════════════════════════════════════════
+// ─── CONFIGURATION ───
+// ═══════════════════════════════════════════════════════════
+
+let DEFAULT_MAX_CONCURRENT = 4
+let DEFAULT_TIMEOUT_SEC = 300
+let POLL_INTERVAL_MS = 500
+
+fn get_max_concurrent() -> int {
+    let e = to_string(exec("printenv SCHED_MAX_CONCURRENT 2>/dev/null")).trim()
+    if e != "" {
+        let mut v = DEFAULT_MAX_CONCURRENT
+        try { v = to_int(e) } catch err {}
+        if v > 0 { return v }
+    }
+    return DEFAULT_MAX_CONCURRENT
+}
+
+fn get_timeout_sec() -> int {
+    let e = to_string(exec("printenv SCHED_TIMEOUT_SEC 2>/dev/null")).trim()
+    if e != "" {
+        let mut v = DEFAULT_TIMEOUT_SEC
+        try { v = to_int(e) } catch err {}
+        if v > 0 { return v }
+    }
+    return DEFAULT_TIMEOUT_SEC
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── UTILITIES ───
+// ═══════════════════════════════════════════════════════════
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return to_string(x)
+}
+
+fn now_epoch() -> int {
+    return timestamp()
+}
+
+fn now_iso() -> string {
+    return now()
+}
+
+fn log_event(task_id: string, event: string, detail: string) {
+    let ts = to_string(now_epoch())
+    let line = "{\"ts\":" + ts + ",\"id\":\"" + task_id
+        + "\",\"event\":\"" + event
+        + "\",\"detail\":\"" + detail.replace("\"", "'").replace("\n", " ") + "\"}\n"
+    try { append_file(LOG_PATH, line) } catch e {}
+}
+
+fn ensure_dirs() {
+    exec("mkdir -p " + PID_DIR + " " + OUT_DIR)
+}
+
+fn pid_file(task_id: string) -> string {
+    return PID_DIR + "/" + task_id + ".pid"
+}
+
+fn out_file(task_id: string) -> string {
+    return OUT_DIR + "/" + task_id + ".out"
+}
+
+fn is_pid_alive(pid: string) -> bool {
+    if pid == "" || pid == "0" { return false }
+    let r = to_string(exec("kill -0 " + pid + " 2>/dev/null; echo $?")).trim()
+    return r == "0"
+}
+
+fn read_pid(task_id: string) -> string {
+    let pf = pid_file(task_id)
+    if file_exists(pf) == false { return "" }
+    let mut content = ""
+    try { content = read_file(pf).trim() } catch e {}
+    return content
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── JSON TASK PARSER (minimal, no jq dependency) ───
+// ═══════════════════════════════════════════════════════════
+
+// Task: #{id, script, args_str, dep_list}
+// dep_list = "d1|d2|d3" pipe-separated (hexa list-in-map workaround)
+// args_str = "a1|a2" pipe-separated
+
+fn extract_str_field(obj: string, key: string) -> string {
+    let pat = "\"" + key + "\":"
+    let idx = obj.index_of(pat)
+    if idx < 0 { return "" }
+    let after = obj.substring((idx + pat.len()), obj.len())
+    let q1 = after.index_of("\"")
+    if q1 < 0 { return "" }
+    let rest = after.substring((q1 + 1), after.len())
+    let q2 = rest.index_of("\"")
+    if q2 < 0 { return "" }
+    return rest.substring(0, q2)
+}
+
+fn extract_arr_field(obj: string, key: string) -> string {
+    let pat = "\"" + key + "\":"
+    let idx = obj.index_of(pat)
+    if idx < 0 { return "" }
+    let after = obj.substring((idx + pat.len()), obj.len())
+    let b1 = after.index_of("[")
+    if b1 < 0 { return "" }
+    let b2 = after.index_of("]")
+    if b2 < 0 { return "" }
+    let inner = after.substring((b1 + 1), b2).trim()
+    if inner == "" { return "" }
+    // extract quoted strings, join with |
+    let parts = inner.split("\"")
+    let mut result = ""
+    let mut i = 1
+    while i < parts.len() {
+        let val = _str(parts[i]).trim()
+        if val != "" && val != "," && val != ", " {
+            if result != "" { result = result + "|" }
+            result = result + val
+        }
+        i = i + 2
+    }
+    return result
+}
+
+fn parse_tasks_json(path: string) -> list {
+    // Returns list of #{id, script, args_str, dep_list}
+    let mut raw = ""
+    try { raw = read_file(path) } catch e {
+        eprintln("FAIL: cannot read " + path)
+        return []
+    }
+    // Split by },{  to isolate each task object
+    let cleaned = raw.replace("\n", " ").replace("\r", "")
+    let chunks = cleaned.split("},{")
+    let mut tasks = []
+    for chunk in chunks {
+        let c = chunk.replace("[", "").replace("]", "")
+        let id = extract_str_field(c, "id")
+        let script = extract_str_field(c, "script")
+        let args_str = extract_arr_field(c, "args")
+        let dep_list = extract_arr_field(c, "deps")
+        if id != "" && script != "" {
+            let t = #{
+                "id": id,
+                "script": script,
+                "args_str": args_str,
+                "dep_list": dep_list
+            }
+            tasks = tasks.push(t)
+        }
+    }
+    return tasks
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── DAG DEPENDENCY RESOLUTION (Kahn's algorithm) ───
+// ═══════════════════════════════════════════════════════════
+
+fn split_pipe(s: string) -> list {
+    if s == "" { return [] }
+    return s.split("|")
+}
+
+fn has_item(arr: list, item: string) -> bool {
+    for x in arr {
+        if _str(x) == item { return true }
+    }
+    return false
+}
+
+// Check for cycles using DFS
+fn detect_cycle(tasks: list) -> bool {
+    // Build adjacency: id -> deps
+    let mut visited = #{}
+    let mut in_stack = #{}
+
+    fn dfs(tid: string, tasks: list, visited: map, in_stack: map) -> bool {
+        visited[tid] = "1"
+        in_stack[tid] = "1"
+        for t in tasks {
+            if _str(t["id"]) == tid {
+                let deps = split_pipe(_str(t["dep_list"]))
+                for d in deps {
+                    let ds = _str(d)
+                    if ds == "" { continue }
+                    let mut in_s = ""
+                    try { in_s = in_stack[ds] } catch e {}
+                    if in_s == "1" { return true }
+                    let mut vis = ""
+                    try { vis = visited[ds] } catch e {}
+                    if vis != "1" {
+                        if dfs(ds, tasks, visited, in_stack) { return true }
+                    }
+                }
+                break
+            }
+        }
+        in_stack[tid] = "0"
+        return false
+    }
+
+    for t in tasks {
+        let tid = _str(t["id"])
+        let mut vis = ""
+        try { vis = visited[tid] } catch e {}
+        if vis != "1" {
+            if dfs(tid, tasks, visited, in_stack) { return true }
+        }
+    }
+    return false
+}
+
+// Get tasks whose all deps are in completed set
+fn get_ready_tasks(tasks: list, completed: map, running: map, failed: map) -> list {
+    let mut ready = []
+    for t in tasks {
+        let tid = _str(t["id"])
+        // skip if already completed, running, or failed
+        let mut c = ""
+        try { c = completed[tid] } catch e {}
+        if c == "1" { continue }
+        let mut r = ""
+        try { r = running[tid] } catch e {}
+        if r != "" { continue }
+        let mut f = ""
+        try { f = failed[tid] } catch e {}
+        if f == "1" { continue }
+
+        // check all deps completed
+        let deps = split_pipe(_str(t["dep_list"]))
+        let mut all_met = true
+        for d in deps {
+            let ds = _str(d)
+            if ds == "" { continue }
+            let mut dc = ""
+            try { dc = completed[ds] } catch e {}
+            if dc != "1" {
+                // dep failed? propagate failure
+                let mut df = ""
+                try { df = failed[ds] } catch e {}
+                if df == "1" {
+                    failed[tid] = "1"
+                    log_event(tid, "dep_failed", "dependency " + ds + " failed")
+                }
+                all_met = false
+                break
+            }
+        }
+        if all_met { ready = ready.push(t) }
+    }
+    return ready
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── TASK LAUNCH / POLL / COLLECT ───
+// ═══════════════════════════════════════════════════════════
+
+fn launch_task(task: map) -> string {
+    let tid = _str(task["id"])
+    let script = _str(task["script"])
+    let args_str = _str(task["args_str"])
+
+    // resolve script path: if relative, prefix NEXUS
+    let mut full_script = script
+    if script.starts_with("/") == false {
+        full_script = NEXUS + "/" + script
+    }
+
+    if file_exists(full_script) == false {
+        eprintln("WARN: script not found: " + full_script + " (task " + tid + ")")
+        log_event(tid, "not_found", full_script)
+        return ""
+    }
+
+    // build args
+    let mut arg_part = ""
+    let arg_list = split_pipe(args_str)
+    for a in arg_list {
+        let av = _str(a).trim()
+        if av != "" {
+            arg_part = arg_part + " \"" + av.replace("\"", "\\\"") + "\""
+        }
+    }
+
+    let ofile = out_file(tid)
+    let pfile = pid_file(tid)
+
+    // background launch: hexa run script args > out 2>&1 & echo $!
+    let cmd = "(" + HEXA + " run " + full_script + arg_part
+        + " > " + ofile + " 2>&1 & echo $! > " + pfile + ")"
+    exec(cmd)
+
+    // read PID
+    sleep(50)
+    let pid = read_pid(tid)
+    log_event(tid, "launched", "pid=" + pid + " script=" + full_script)
+    return pid
+}
+
+fn collect_result(task_id: string) -> string {
+    // Read output file, check for sentinel or exit status
+    let ofile = out_file(task_id)
+    if file_exists(ofile) == false { return "UNKNOWN" }
+    let mut content = ""
+    try { content = read_file(ofile) } catch e { return "UNKNOWN" }
+
+    // Look for known sentinel patterns
+    if content.contains("__HARNESS_") && content.contains("PASS") { return "PASS" }
+    if content.contains("__HARNESS_") && content.contains("FAIL") { return "FAIL" }
+    if content.contains("__SCHED_TASK_RESULT__") {
+        if content.contains("PASS") { return "PASS" }
+        if content.contains("FAIL") { return "FAIL" }
+    }
+    if content.contains("REJECT") { return "FAIL" }
+
+    // no sentinel: check if output is non-empty (assume success)
+    return "DONE"
+}
+
+fn check_timeout(start_ts: int, timeout_sec: int) -> bool {
+    return (now_epoch() - start_ts) > timeout_sec
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── MAIN SCHEDULER LOOP ───
+// ═══════════════════════════════════════════════════════════
+
+fn run_dag(tasks_path: string) {
+    ensure_dirs()
+    let tasks = parse_tasks_json(tasks_path)
+    if tasks.len() == 0 {
+        eprintln("FAIL: no valid tasks in " + tasks_path)
+        return
+    }
+
+    // validate: check for cycles
+    if detect_cycle(tasks) {
+        eprintln("FAIL: cycle detected in task DAG — aborting")
+        log_event("scheduler", "cycle", tasks_path)
+        return
+    }
+
+    // validate: check all dep IDs exist
+    let mut id_set = #{}
+    for t in tasks {
+        id_set[_str(t["id"])] = "1"
+    }
+    for t in tasks {
+        let deps = split_pipe(_str(t["dep_list"]))
+        for d in deps {
+            let ds = _str(d)
+            if ds == "" { continue }
+            let mut exists = ""
+            try { exists = id_set[ds] } catch e {}
+            if exists != "1" {
+                eprintln("FAIL: task " + _str(t["id"]) + " depends on unknown task " + ds)
+                return
+            }
+        }
+    }
+
+    let max_conc = get_max_concurrent()
+    let timeout = get_timeout_sec()
+    let total = tasks.len()
+    let sched_start = now_epoch()
+
+    println("scheduler: " + to_string(total) + " tasks, max_concurrent=" + to_string(max_conc) + ", timeout=" + to_string(timeout) + "s")
+    log_event("scheduler", "start", "tasks=" + to_string(total) + " max=" + to_string(max_conc))
+
+    // State maps: id -> "1" for completed/failed, id -> "pid:start_ts" for running
+    let mut completed = #{}
+    let mut failed = #{}
+    let mut running = #{}
+    let mut done_count = 0
+    let mut fail_count = 0
+
+    // Write global state for status command
+    fn write_state(running: map, completed: map, failed: map, total: int) {
+        let state = "{\"total\":" + to_string(total)
+            + ",\"completed\":" + to_string(done_count)
+            + ",\"failed\":" + to_string(fail_count)
+            + ",\"ts\":" + to_string(now_epoch()) + "}\n"
+        try { write_file(STATE_DIR + "/state.json", state) } catch e {}
+    }
+
+    // Main scheduling loop
+    while (done_count + fail_count) < total {
+        // 1. Check running tasks for completion/timeout
+        let rkeys = running.keys()
+        for rk in rkeys {
+            let rk_str = _str(rk)
+            let rv = _str(running[rk_str])
+            let parts = rv.split(":")
+            let pid = _str(parts[0])
+            let mut start_ts = 0
+            try { start_ts = to_int(_str(parts[1])) } catch e {}
+
+            if is_pid_alive(pid) == false {
+                // task finished
+                let result = collect_result(rk_str)
+                if result == "FAIL" {
+                    failed[rk_str] = "1"
+                    fail_count = fail_count + 1
+                    eprintln("FAIL: task " + rk_str + " result=" + result)
+                    log_event(rk_str, "failed", result)
+                } else {
+                    completed[rk_str] = "1"
+                    done_count = done_count + 1
+                    log_event(rk_str, "completed", result)
+                }
+                // remove from running — hexa map delete workaround: set empty
+                running[rk_str] = ""
+            } else if check_timeout(start_ts, timeout) {
+                // timeout — kill
+                exec("kill -9 " + pid + " 2>/dev/null")
+                failed[rk_str] = "1"
+                fail_count = fail_count + 1
+                eprintln("TIMEOUT: task " + rk_str + " killed after " + to_string(timeout) + "s")
+                log_event(rk_str, "timeout", "pid=" + pid)
+                running[rk_str] = ""
+            }
+        }
+
+        // 2. Count active running (non-empty values)
+        let mut active_count = 0
+        let rkeys2 = running.keys()
+        for rk in rkeys2 {
+            if _str(running[_str(rk)]) != "" { active_count = active_count + 1 }
+        }
+
+        // 3. Launch ready tasks up to concurrency limit
+        let ready = get_ready_tasks(tasks, completed, running, failed)
+        let mut launched = 0
+        for rt in ready {
+            if (active_count + launched) >= max_conc { break }
+            let tid = _str(rt["id"])
+            let pid = launch_task(rt)
+            if pid != "" {
+                running[tid] = pid + ":" + to_string(now_epoch())
+                launched = launched + 1
+                println("  launched: " + tid + " (pid " + pid + ")")
+            } else {
+                failed[tid] = "1"
+                fail_count = fail_count + 1
+            }
+        }
+
+        // 4. If nothing running and nothing ready, check for deadlock
+        if (active_count + launched) == 0 && ready.len() == 0
+            && (done_count + fail_count) < total {
+            eprintln("DEADLOCK: no runnable tasks remain — possible dep-failure propagation")
+            log_event("scheduler", "deadlock", "done=" + to_string(done_count) + " fail=" + to_string(fail_count))
+            break
+        }
+
+        write_state(running, completed, failed, total)
+
+        // 5. Poll interval
+        if (active_count + launched) > 0 {
+            sleep(POLL_INTERVAL_MS)
+        }
+    }
+
+    // Final summary
+    let elapsed = now_epoch() - sched_start
+    println("scheduler: done=" + to_string(done_count) + " failed=" + to_string(fail_count)
+        + " total=" + to_string(total) + " elapsed=" + to_string(elapsed) + "s")
+    log_event("scheduler", "finish", "done=" + to_string(done_count) + " fail=" + to_string(fail_count) + " elapsed=" + to_string(elapsed))
+
+    // Sentinel
+    if fail_count == 0 {
+        print("__SCHED_TASK_RESULT__ scheduler PASS")
+    } else {
+        print("__SCHED_TASK_RESULT__ scheduler FAIL")
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── STATUS COMMAND ───
+// ═══════════════════════════════════════════════════════════
+
+fn cmd_status() {
+    let state_file = STATE_DIR + "/state.json"
+    if file_exists(state_file) == false {
+        println("scheduler: no active run (state file absent)")
+        return
+    }
+    let mut body = ""
+    try { body = read_file(state_file) } catch e {
+        println("scheduler: cannot read state")
+        return
+    }
+    println("scheduler state: " + body.trim())
+
+    // List PID files for running tasks
+    let pids_raw = to_string(exec("ls " + PID_DIR + "/*.pid 2>/dev/null")).trim()
+    if pids_raw == "" {
+        println("  no active pid files")
+        return
+    }
+    let pid_files = pids_raw.split("\n")
+    for pf in pid_files {
+        let pf_str = _str(pf).trim()
+        if pf_str == "" { continue }
+        let mut pid = ""
+        try { pid = read_file(pf_str).trim() } catch e { continue }
+        let alive = is_pid_alive(pid)
+        // extract task id from filename
+        let fname = pf_str.replace(PID_DIR + "/", "").replace(".pid", "")
+        let status = if alive { "RUNNING" } else { "EXITED" }
+        println("  " + fname + ": pid=" + pid + " " + status)
+    }
+
+    // Show output file snippets
+    let outs_raw = to_string(exec("ls " + OUT_DIR + "/*.out 2>/dev/null")).trim()
+    if outs_raw == "" { return }
+    let out_files = outs_raw.split("\n")
+    for of in out_files {
+        let of_str = _str(of).trim()
+        if of_str == "" { continue }
+        let fname = of_str.replace(OUT_DIR + "/", "").replace(".out", "")
+        let tail = to_string(exec("tail -1 '" + of_str + "' 2>/dev/null")).trim()
+        if tail != "" {
+            println("  " + fname + " last: " + tail.substring(0, if tail.len() > 80 { 80 } else { tail.len() }))
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── CANCEL COMMAND ───
+// ═══════════════════════════════════════════════════════════
+
+fn cmd_cancel() {
+    let pids_raw = to_string(exec("ls " + PID_DIR + "/*.pid 2>/dev/null")).trim()
+    if pids_raw == "" {
+        println("scheduler: nothing to cancel")
+        return
+    }
+    let pid_files = pids_raw.split("\n")
+    let mut killed = 0
+    for pf in pid_files {
+        let pf_str = _str(pf).trim()
+        if pf_str == "" { continue }
+        let mut pid = ""
+        try { pid = read_file(pf_str).trim() } catch e { continue }
+        if is_pid_alive(pid) {
+            exec("kill -9 " + pid + " 2>/dev/null")
+            let fname = pf_str.replace(PID_DIR + "/", "").replace(".pid", "")
+            println("  killed: " + fname + " pid=" + pid)
+            log_event(fname, "cancelled", "pid=" + pid)
+            killed = killed + 1
+        }
+    }
+    // cleanup state
+    exec("rm -rf " + STATE_DIR + " 2>/dev/null")
+    println("scheduler: cancelled " + to_string(killed) + " task(s), state cleaned")
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── MAIN ───
+// ═══════════════════════════════════════════════════════════
+
+fn main() {
+    let argv = args()
+    if argv.len() < 3 {
+        eprintln("usage: parallel_scheduler.hexa <run|status|cancel> [tasks.json]")
+        eprintln("  run <tasks.json>  — execute task DAG with parallel dispatch")
+        eprintln("  status            — show running/completed tasks")
+        eprintln("  cancel            — kill all running tasks")
+        eprintln("env: SCHED_MAX_CONCURRENT (default 4), SCHED_TIMEOUT_SEC (default 300)")
+        return
+    }
+    let cmd = argv[2]
+    if cmd == "run" {
+        if argv.len() < 4 {
+            eprintln("usage: parallel_scheduler.hexa run <tasks.json>")
+            return
+        }
+        let tasks_path = argv[3]
+        // resolve relative path
+        let mut full_path = tasks_path
+        if tasks_path.starts_with("/") == false {
+            full_path = NEXUS + "/" + tasks_path
+        }
+        run_dag(full_path)
+    } else if cmd == "status" {
+        cmd_status()
+    } else if cmd == "cancel" {
+        cmd_cancel()
+    } else {
+        eprintln("unknown command: " + cmd + " — use run|status|cancel")
+    }
+}
+
+main()

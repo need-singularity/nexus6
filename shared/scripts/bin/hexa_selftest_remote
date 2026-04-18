@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# hexa_selftest_remote — offload hexa-lang self/test_*.hexa suite to remote (AG6).
+#
+# Why: Mac burns 80%+ CPU running stage0 self-tests in a serial loop. Remote
+# ubu (12c) / htz (32c) sit idle. This script rsyncs the local hexa-lang
+# source to the remote, then fires the suite in parallel with a hard
+# SIGKILL fallback so infinite-loop tests can't pin a core for 60+ min.
+#
+# Usage:
+#   hexa_selftest_remote                    # defaults to hetzner, 24 parallel
+#   HOST=ubu PAR=10 hexa_selftest_remote    # ubu, 10 parallel
+#   FILTER='test_p2_5*' hexa_selftest_remote  # subset
+#   TIMEOUT=20 KILL_AFTER=3 hexa_selftest_remote
+#
+# Exit: 0 if all pass, 1 if any fail, 64 if remote unreachable.
+# Output: JSONL per test to stdout; summary on stderr.
+
+set -eu
+
+HOST="${HOST:-hetzner}"
+PAR="${PAR:-24}"
+TIMEOUT="${TIMEOUT:-15}"
+KILL_AFTER="${KILL_AFTER:-3}"
+FILTER="${FILTER:-test_*.hexa}"
+LOCAL_SRC="${HEXA_LOCAL_SRC:-$HOME/dev/hexa-lang}"
+[ -d "$LOCAL_SRC" ] || LOCAL_SRC="$HOME/Dev/hexa-lang"
+
+if [ ! -d "$LOCAL_SRC/self" ]; then
+    echo "hexa_selftest_remote: local source missing: $LOCAL_SRC/self" >&2
+    exit 1
+fi
+
+if ! ssh -o ConnectTimeout=5 -o BatchMode=yes "$HOST" true 2>/dev/null; then
+    echo "hexa_selftest_remote: $HOST unreachable" >&2
+    exit 64
+fi
+
+echo "[hexa_selftest_remote] host=$HOST par=$PAR timeout=${TIMEOUT}s+${KILL_AFTER}s" >&2
+
+# 1. Sync self/ (tests) + stdlib/ (imports). Exclude build products and data.
+rsync -az --delete \
+    --exclude='*.o' --exclude='*.dSYM' --exclude='/tmp/' \
+    "$LOCAL_SRC/self/" \
+    "$HOST:Dev/hexa-lang/self/" >&2
+
+# 2. Run suite on remote. xargs -P for parallelism.
+# timeout --kill-after ensures infinite loops die; plain `timeout` only SIGTERMs.
+ssh -T "$HOST" bash -s -- "$PAR" "$TIMEOUT" "$KILL_AFTER" "$FILTER" <<'REMOTE'
+set -u
+PAR="$1"; TIMEOUT="$2"; KILL_AFTER="$3"; FILTER="$4"
+cd ~/Dev/hexa-lang
+LOG="/tmp/hexa_selftest_$(date +%s).jsonl"
+: > "$LOG"
+
+run_one() {
+    local f="$1" name t0 t1 rc
+    name="$(basename "$f" .hexa)"
+    t0="$(date +%s%N)"
+    timeout --kill-after="$KILL_AFTER" "$TIMEOUT" build/hexa_stage0 "$f" >/dev/null 2>&1
+    rc=$?
+    t1="$(date +%s%N)"
+    local dur_ms=$(( (t1 - t0) / 1000000 ))
+    printf '{"name":"%s","rc":%d,"ms":%d}\n' "$name" "$rc" "$dur_ms"
+}
+export -f run_one
+export TIMEOUT KILL_AFTER
+
+ls self/$FILTER 2>/dev/null | xargs -P "$PAR" -I{} bash -c 'run_one "{}"' | tee "$LOG"
+
+PASS=$(grep -c '"rc":0' "$LOG" || true)
+TOTAL=$(wc -l < "$LOG" | tr -d ' ')
+FAIL=$((TOTAL - PASS))
+TIMEDOUT=$(grep -c '"rc":124\|"rc":137' "$LOG" || true)
+echo "===SUMMARY=== total=$TOTAL pass=$PASS fail=$FAIL timedout=$TIMEDOUT log=$LOG" >&2
+[ "$FAIL" -eq 0 ]
+REMOTE

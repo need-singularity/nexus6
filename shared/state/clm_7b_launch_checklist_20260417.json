@@ -1,0 +1,391 @@
+{
+  "_meta": {
+    "id": "clm_7b_launch_checklist_20260417",
+    "title": "CLM 7B launch checklist — F1-TC bf16 WMMA integrated, corpus 140GB in flight",
+    "author": "launch-checklist-agent (opus-4.6-1m, 1M ctx)",
+    "created_utc": "2026-04-17T01:10Z",
+    "purpose": "Prep 7B training to be fire-ready the moment corpus + H100 slots are available. Captures (a) binary build path, (b) F1-TC integration points, (c) launch sequence, (d) R2 archive plan, (e) dependency graph.",
+    "ssot_refs": [
+      "shared/state/clm_7b_upscale_spec.json",
+      "shared/state/clm_7b_readiness_20260416.json",
+      "shared/state/c4_f1_tc_bf16_bench_20260417.json",
+      "shared/state/corpus_140gb_plan.json",
+      "shared/state/corpus_7b_progress_20260416.json",
+      "shared/state/clm_r4_relaunch_20260416.json",
+      "shared/state/alm_a2_readiness_20260416.json"
+    ],
+    "code_refs": [
+      "training/c4_fused_kernels.hexa (F1 + F1-TC, uncommitted +84/-8 lines 103,113,119,123,176,261-266)",
+      "training/c4_fused_kernels_interface.hexa (pre-C2 stubs — do not touch)",
+      "training/train_clm_gpu.hexa (scale_7b_gpu lines 839-846, resolve_scale line 853)",
+      "training/train_clm.hexa (scale_7b line ~170)",
+      "training/test_scale_7b.hexa (40/40 regression PASS)",
+      "training/gpu_train.hexa (gpu_layer_fwd lines 436-438 — 3 separate sgemm = F1 fusion target)",
+      "training/fsdp_shard.hexa (layer-wise FSDP for 2xH100)"
+    ],
+    "constraints_honoured": [
+      "NO H100 launch this session (cap 2/2)",
+      "NO commit (uncommitted state kept)",
+      "NO .py files created",
+      "NO modification to train_clm_composed.c or runtime.c (sibling session ownership)",
+      "HEXA-FIRST strict — all new logic in .hexa",
+      "Total .py ban observed",
+      "Disk usage minimal — no new files in /tmp, repo-local only"
+    ]
+  },
+
+  "status": "PREP_COMPLETE_AWAITING_CORPUS_AND_H100_SLOT",
+  "gate_verdict": "GREEN for prep, RED for launch (corpus 49% + 0/2 H100 slots free)",
+  "earliest_realistic_launch_utc": "2026-04-19T00:00Z",
+  "optimistic_launch_utc": "2026-04-17T15:00Z (if A1 ends early + C9 NCCL lands + user OK)",
+
+  "binary_prep": {
+    "goal": "Produce train_clm_7b_composed.c + runtime_7b.c binary on H100 pod, scale=7b, F1-TC enabled",
+    "new_files_to_create_on_pod_only": {
+      "path_a": "/workspace/train_clm_7b_composed.c",
+      "path_b": "/workspace/runtime_7b.c (copy of current runtime.c — no edits needed)",
+      "binary_path": "/workspace/train_clm_7b_native"
+    },
+    "local_repo_7b_composed_c_path": "MUST NOT exist until corpus acquired and scale_7b_gpu validated on real pod. Generation is one-shot pod-side via codegen_c2 to avoid polluting repo with 300KB+ regenerated C source.",
+
+    "build_pathway": {
+      "step_1_env": [
+        "export CLM_SCALE=7b",
+        "export CLM_D=4096",
+        "export CLM_NL=32",
+        "export CLM_FF=14336",
+        "export CLM_SEQ=4096",
+        "export CLM_RANK=256",
+        "export CLM_BATCH=2",
+        "export CLM_GRAD_ACC=4",
+        "export CLM_STEPS=750000",
+        "export CLM_LR_MAX=3e-4",
+        "export CLM_WARMUP=5000",
+        "export CLM_EVAL=2500",
+        "export CLM_SAVE=5000",
+        "export CLM_LOG=100",
+        "export CLM_CORPUS_PATH=/workspace/corpus_clm_v2.txt",
+        "export CLM_CKPT_DIR=/workspace/ckpt_clm7b_r1",
+        "export CLM_R2_PREFIX=r2:anima-models/clm7b/r1",
+        "export USE_TC=1",
+        "export CLM_MULTI_STREAM=1",
+        "export CLM_CUDA_GRAPH=1",
+        "export FSDP_WORLD_SIZE=2",
+        "export FSDP_RANK=<0 or 1 per pod>"
+      ],
+      "step_2_codegen_invocation": "hexa build training/train_clm_gpu.hexa --emit-c --out /workspace/train_clm_7b_composed.c — codegen_c2 picks up CLM_SCALE=7b via env and produces composed C with D=4096 NL=32 etc inlined as constants. Alternative: ON-POD `hexa run training/train_clm_gpu.hexa --scale 7b --emit-c` via the existing holo_breakthrough_20260416/cuda_native bootstrap path. The 1.5B path has been validated with the same mechanism (binary_source line 24 in clm_r4_relaunch_20260416.json). Regeneration needed per memory:project_clm_r4_mmap_plan 'scale_1_5b C regen needed' — the 7B regen follows identical pattern.",
+      "step_3_gcc": "gcc -O3 -march=native -o /workspace/train_clm_7b_native /workspace/train_clm_7b_composed.c -I/usr/local/cuda-12.4/include -L/usr/local/cuda-12.4/lib64 -lm -ldl -lpthread -lcudart -lcublas -lnvrtc",
+      "step_4_nccl_linkage_when_multi_rank": "Once C9 NCCL multi-rank binding lands (5 extern fns at $HEXA_LANG/lib/hxnccl/), append `-lnccl -L/usr/local/cuda-12.4/lib64` to the gcc command. Until then the binary will run single-rank only and OOM on 7B (~84GB unsharded Adam > 80GB H100)."
+    },
+
+    "binary_inputs_from_repo": {
+      "source_hexa": [
+        "training/train_clm_gpu.hexa (entry point with scale_7b_gpu + env dispatch)",
+        "training/gpu_train.hexa (layer forward/backward)",
+        "training/cuda_kernels.hexa (12 base kernels)",
+        "training/c4_fused_kernels.hexa (F1 + F1-TC — this file wires in new QKV fusion)",
+        "training/cuda_ffi.hexa + cuda_rtc.hexa (FFI bindings)",
+        "training/fsdp_shard.hexa (layer-wise Zero-3 sharding)",
+        "training/clm_mmap_loader.hexa (corpus mmap — bypasses O(n²) list push)",
+        "training/nn_core.hexa (RMSNorm/SwiGLU/RoPE)"
+      ],
+      "import_chain_risk": "memory:feedback_hexa_silent_exit_5_imports — 3+ module chain can emit empty main. Validate build/artifacts/<file>.c body before trusting OK status. Mitigation: run test_scale_7b.hexa locally (already 40/40 PASS) and check composed.c size > 200KB before gcc step.",
+      "diff_vs_1_5b_composed": "1.5B composed.c is 291KB. 7B with D=4096 SEQ=4096 and expanded kernel literals should emit ~450-600KB composed.c. If the 7B composed.c ends up < 250KB the codegen stage failed silently — must re-invoke with import chain split."
+    }
+  },
+
+  "f1_tc_integration": {
+    "status": "PLUMBING_READY — kernel loads on c4_init_modules(); flag wiring needed before launch",
+    "lever_source_of_truth": "training/c4_fused_kernels.hexa:103 K_C4_QKV_PROJ_FUSED_TC_FWD + :123 G_C4_TC_MODE + :176 c4_set_tc_mode()",
+    "measured_speedup": "10.26x fused bf16 TC vs fp32 MVP on canonical CLM 1B shape (B=8 S=512 d=1024 DhH=1024) per shared/state/c4_f1_tc_bf16_bench_20260417.json#S3_design_doc_shape",
+    "applied_to_7b_shape_projection": "7B uses M=SEQ*BATCH=8192 (S=4096, B=2), K_in=D=4096, DhH=4096 (H=32 d_head=128). That is 16× the M of S3 and 4× K_in/DhH — compute-bound regime where TC advantage is 10-12x stable on H100 SXM (design-doc §1.2).",
+
+    "enable_sequence": [
+      {
+        "step": 1,
+        "where": "training/train_clm_gpu.hexa after line 1143 println('[train_clm_gpu] kernels: NVRTC compile OK ...')",
+        "action": "Insert `use \"c4_fused_kernels\"` at top of file (after `use \"cuda_kernels\"`); add block `if env_or(\"USE_TC\", \"0\") == \"1\" { let c4_rc = c4_init_modules(); if c4_rc == 0 { let _ = c4_set_tc_mode(1); println(\"[train_clm_gpu] F1-TC bf16 WMMA ENABLED\") } else { println(\"[train_clm_gpu] WARN F1-TC init rc=\" + str(c4_rc) + \" — falling back to fp32\") } }` between lines 1143 and 1145",
+        "hexa_edit_required": true,
+        "risk": "Import of c4_fused_kernels adds 1 module to existing 4+ → watch 5+ silent-exit. Mitigation: run `hexa build training/train_clm_gpu.hexa` locally and verify build/artifacts/train_clm_gpu.c body > 200KB before committing."
+      },
+      {
+        "step": 2,
+        "where": "training/gpu_train.hexa:436-438 gpu_layer_fwd — 3 sgemm Wq/Wk/Wv",
+        "action": "Introduce runtime branch: `if G_C4_TC_MODE == 1 && ptr_addr(layer.Wqkv) != 0 { c4_impl_qkv_proj_fwd(acts.norm1, layer.Wqkv, acts.q, acts.k, acts.v, SEQ, D, D/cfg.n_head, cfg.n_head) } else { gpu_sgemm(...); gpu_sgemm(...); gpu_sgemm(...) }`. Access G_C4_TC_MODE via c4_fused_kernels.hexa global.",
+        "dependency": "Requires GpuLayer struct to carry a `Wqkv` device ptr (fused [D, 3*DhH]) in addition to existing Wq/Wk/Wv. This means init_gpu_weights must allocate + fill Wqkv by packing the three separately-initialised Wq/Wk/Wv tensors once at init. Launch-time one-shot repack: `cuda_memcpy_d2d(Wqkv + 0*DhH*D, Wq, DhH*D*4); cuda_memcpy_d2d(Wqkv + 1*DhH*D, Wk, DhH*D*4); cuda_memcpy_d2d(Wqkv + 2*DhH*D, Wv, DhH*D*4)`. Memory cost = 3*D*DhH*4 bytes per layer = 3*4096*4096*4 = 192MB per layer → 32 layers = 6.1GB extra VRAM (acceptable on 80GB H100; must factor into FSDP shard plan).",
+        "hexa_edit_required": true,
+        "risk_medium": "Double-buffering Wqkv duplicates weights; optimizer updates must be applied to BOTH Wq/Wk/Wv AND Wqkv OR swap to Wqkv-only storage. Simpler path: drop separate Wq/Wk/Wv after init and keep Wqkv only — reduces VRAM by 6.1GB and halves the optimizer state. This is the 7B-launch-ready refactor.",
+        "recommended_impl": "Wqkv-only storage from init onwards. Backward path needs symmetric c4_impl_qkv_proj_bwd (F10) or temp unpacking — for MVP launch keep fp32 backward unfused (F1-TC forward only) since forward dominates 60% of flops."
+      },
+      {
+        "step": 3,
+        "where": "training/c4_fused_kernels.hexa module init",
+        "action": "Already done — K_C4_QKV_PROJ_FUSED_TC_FWD ships in K_C4_COMBINED_TU; c4_init_modules emits F1 + F1-TC into single NVRTC PTX; G_C4_TC_MODE flag already wired at line 123",
+        "hexa_edit_required": false
+      }
+    ],
+
+    "env_toggle": "export USE_TC=1 (drives the train_clm_gpu.hexa conditional). Default 0 = fp32 path remains bit-exact baseline.",
+    "expected_step_time_with_tc": {
+      "without_tc_s3_shape_at_1b": "42.9 ms/QKV-proj-kernel — 12-layer × 42.9 = 515ms per forward-QKV-only × (launch count 3 = 3 kernels) — observed 6.7 steps/sec = 150 ms/step total on 1.5B",
+      "with_tc_s3_shape_at_1b": "4.18 ms/QKV-proj-kernel (projected) × 12 = 50 ms per forward-QKV — saves ~65 ms/step in QKV alone (43% of forward time)",
+      "projected_7b_step_time_wo_tc_ms": 4500,
+      "projected_7b_step_time_w_tc_ms": 1600,
+      "projected_7b_step_time_w_tc_ms_h100_sxm_composed": 800,
+      "note_on_h100_speedup": "3090 tc_tflops 6.17 → H100 SXM TC peak 989 / 140 = 7.06× nominal. Composed with CUDA Graph (CLM_CUDA_GRAPH=1 already wired at line 1167) and multi-stream overlap → expect 800ms/step at 7B with F1-TC on H100 SXM single rank (before FSDP), 1000-1200ms/step with 2x FSDP all-reduce overhead."
+    }
+  },
+
+  "corpus_prerequisites": {
+    "current_corpus_download_status": {
+      "data_dir": "/Users/ghost/Dev/anima/data/corpus_v2_raw",
+      "kowiki_bz2": "1.3GB downloaded (complete — 100%)",
+      "cc100_ko_xz": "6.5GB of 13.1GB (~50%, PID 25477 running, ETA ~2h)",
+      "local_disk_avail_gb": 283,
+      "ok_to_continue": true,
+      "verified_at_utc": "2026-04-17T01:05Z"
+    },
+    "minimum_corpus_for_launch": {
+      "hard_floor_gb": 60,
+      "rationale": "At byte-level vocab=256, 60GB is still 2.3x undersized Chinchilla for 7B but triples current 5.38GB baseline → 4.57 epochs at 750k steps becomes 14 epochs → diminishing but non-trivial signal. 60GB = kowiki (5.5GB decompressed) + CC-100 (54GB decompressed) fits budget.",
+      "accept_undersized_floor_gb": 40,
+      "comfort_floor_gb": 120,
+      "chinchilla_optimal_gb": 140
+    },
+    "ok_to_launch_with_current_5_38gb": {
+      "verdict": "NO — fresh 7B with 5.38GB is 26x Chinchilla-undersized, reaches plateau ~step 100k, wastes $2K H100 time",
+      "alternative": "Wait for kowiki (done) + CC-100 (ETA 2h) decompression → ~60GB corpus ready in ~4h total"
+    },
+    "streaming_training_possible": {
+      "verdict": "YES — mmap loader is byte-shape independent (per clm_7b_upscale_spec.json#data.loader_changes_for_7b). CC-100 can stream-decompress during first hours of training if xz decompression lands before H100 fires. Prefer pre-decompression.",
+      "risk": "In-training xz decompress + mmap race → potential seek latency spike. Prefer complete pre-decompression.",
+      "eta_pre_decomp_gb": 60,
+      "eta_pre_decomp_hours": 2.5
+    }
+  },
+
+  "pod_spec": {
+    "target": "2x H100 NVL 95GB (preferred) OR 2x H100 SXM 80GB",
+    "rationale": "7B fp32 AdamW + bf16 weights/grads = ~84GB unsharded. FSDP-Full on 2 ranks brings per-GPU to 57GB. SXM 80GB has 23GB headroom (sufficient); NVL 95GB has 37GB headroom (preferred for long context + activation memory).",
+    "nvlink": "REQUIRED between ranks for FSDP all-reduce — 2x NVL in same RunPod pod auto-provides NVLink (60GB/s per link). 2 separate pods fall back to TCP NCCL (~10GB/s max) → 6x slower all-reduce → 20-30% training slowdown.",
+    "provider": "RunPod — historical H100 NVL at $3.07/hr/pod = $6.14/hr for 2",
+    "cost_400h_at_60pct_mfu": 2456,
+    "cost_1400h_current_1_65pct_mfu": 8596,
+    "cost_1400h_current_mfu_note": "At current 1.65% CLM MFU, 400h roadmap estimate inflates 36x → 14545h → $44677. F1-TC + C4 fused kernels must push MFU to 30%+ before launch is economically viable.",
+    "current_authorized_cap": "2 H100 per memory:feedback_h100_authorized",
+    "current_utilization": {
+      "slot_1": "u744u0lbts5v1w (anima-clm1b-r4-nvl) — CLM r4 1B training active (loss=2.29 step 2800, ETA ~31h to 750k)",
+      "slot_2": "lnzliav2e8du6i (anima-alm14b-a1) — ALM A1 fine-tune active",
+      "slot_2_when_free": "ALM A1 ETA ~30 min (per user context). After A1 completes, A2 auto-fires (12h+6h = 18h) per watch_a1_fire_a2.hexa. 7B cannot use slot 2 until A2 completes — earliest A2 release = 2026-04-18T07:00Z (~30h from now)",
+      "slot_1_when_free": "1.5B r4 ETA ~2026-04-17T21:30Z (~20h from now — keep running to harvest convergence signal)"
+    },
+    "h100_release_scenario_earliest": "Both H100 slots free simultaneously no earlier than 2026-04-18T21:30Z (1.5B r4 complete + A2 complete). That is the lower bound for 2x H100 7B launch without additional pod authorization."
+  },
+
+  "launch_command_sequence": {
+    "preflight_on_pod_a": [
+      "ssh -i /Users/ghost/.runpod/ssh/RunPod-Key-Go -p <port_a> root@<ip_a> 'nvidia-smi && nvcc --version'",
+      "rclone copy r2:anima-models/corpus/v2/corpus_clm_v2.txt /workspace/corpus_clm_v2.txt --progress --checkers 16",
+      "dd if=/dev/zero of=/workspace/_qtest bs=1M count=20000 status=none && rm /workspace/_qtest  # MFS quota preflight per training/CLAUDE.md",
+      "mkdir -p /workspace/ckpt_clm7b_r1",
+      "ldconfig -p | grep -E 'libnccl|libcudart|libcublas|libnvrtc' # verify linkage available"
+    ],
+    "preflight_on_pod_b": "Same as pod_a (corpus copy + mkdir + preflight)",
+    "codegen_on_pod_a": [
+      "cd /workspace && export CLM_SCALE=7b USE_TC=1 && hexa build /opt/anima/training/train_clm_gpu.hexa --emit-c --out /workspace/train_clm_7b_composed.c",
+      "ls -la /workspace/train_clm_7b_composed.c  # verify size > 250KB",
+      "gcc -O3 -march=native -o /workspace/train_clm_7b_native /workspace/train_clm_7b_composed.c -I/usr/local/cuda-12.4/include -L/usr/local/cuda-12.4/lib64 -lm -ldl -lpthread -lcudart -lcublas -lnvrtc -lnccl"
+    ],
+    "binary_transfer_to_pod_b": "scp train_clm_7b_native to pod_b OR re-run codegen on pod_b (safer — same build env)",
+    "launch_rank_0_pod_a": "nohup env CLM_SCALE=7b USE_TC=1 CLM_CORPUS_PATH=/workspace/corpus_clm_v2.txt CLM_CKPT_DIR=/workspace/ckpt_clm7b_r1 FSDP_WORLD_SIZE=2 FSDP_RANK=0 MASTER_ADDR=<ip_a> MASTER_PORT=29500 /workspace/train_clm_7b_native > /workspace/ckpt_clm7b_r1/train_rank0.log 2>&1 &",
+    "launch_rank_1_pod_b": "nohup env CLM_SCALE=7b USE_TC=1 CLM_CORPUS_PATH=/workspace/corpus_clm_v2.txt CLM_CKPT_DIR=/workspace/ckpt_clm7b_r1 FSDP_WORLD_SIZE=2 FSDP_RANK=1 MASTER_ADDR=<ip_a> MASTER_PORT=29500 /workspace/train_clm_7b_native > /workspace/ckpt_clm7b_r1/train_rank1.log 2>&1 &",
+    "r2_sync_watcher": "tmux new-session -d -s r2_sync_7b 'bash /workspace/r2_sync_watcher_7b.sh'  # mirror of 1.5B watcher, 60s poll, target prefix r2:anima-models/clm7b/r1/",
+    "tmux_sessions": ["clm_7b_rank0_tail", "clm_7b_rank1_tail", "r2_sync_7b"]
+  },
+
+  "save_eval_policy": {
+    "save_every": 5000,
+    "eval_every": 2500,
+    "log_every": 100,
+    "patience": 5,
+    "keep_local": 3,
+    "r2_prefix": "r2:anima-models/clm7b/r1/",
+    "ckpt_size_per_gb_bf16": 14,
+    "total_storage_estimate_tb": 2.1,
+    "r2_monthly_cost_usd": 30,
+    "policy_refs": [
+      "training/CLAUDE.md runpod_mfs_quota (save_every >= 2000, in-training rclone FORBIDDEN)",
+      "memory:feedback_r2_checkpoint (R2 bulk upload after training, not in-loop)"
+    ]
+  },
+
+  "expected_timing": {
+    "per_step_without_f1_tc_ms": 4500,
+    "per_step_with_f1_tc_fp32_h100_sxm_single_rank_ms": 1600,
+    "per_step_with_f1_tc_2xh100_fsdp_ms": 1200,
+    "per_step_with_f1_tc_plus_c2_c4_full_ms": 600,
+    "step_time_chosen_for_eta": 1200,
+    "total_steps": 750000,
+    "total_seconds_at_1200ms_step": 900000,
+    "total_hours": 250,
+    "total_hours_note": "1200ms/step × 750k steps = 250h wall. 2xH100 NVL at $6.14/hr = $1535 total — 37% under roadmap baseline $2456. GRAD_ACC=4 means token throughput = 65536 tokens/step / 1.2s = 54613 tokens/sec aggregate, 27306 tokens/sec per H100 — matches 1.5B r4 aggregate 27500 tokens/sec (which is 1.5B at 150ms/step).",
+    "eta_launch_to_complete_days": 10.4,
+    "realistic_eta_with_debug_and_restart": 15,
+    "fallback_to_3b_gate_at_step": 250000,
+    "fallback_3b_evaluated_at_wall_hours": 83,
+    "fallback_3b_criterion": "at step 250k, if phi_holo < 500 OR ce > 2.5, halt and switch to A2 3B fallback per clm_consciousness_standalone.json line 46-53"
+  },
+
+  "r2_binary_archive": {
+    "rationale": "Ephemeral workspace risk — pod deletion or /workspace wipe loses the 7B binary (observed with u744u0lbts5v1w prior restart, per clm_r4_health_20260416.json:41). Binary is 3-5MB, composed.c is 500KB — trivial to archive.",
+    "archive_after_first_successful_step_log": {
+      "trigger": "step 100 first log emitted + loss monotonic down + nvidia-smi util>30%",
+      "action": "rclone copy /workspace/train_clm_7b_native r2:anima-models/clm7b/binaries/native_r1_step_at_launch_YYYYMMDD/",
+      "also_archive": [
+        "/workspace/train_clm_7b_composed.c",
+        "/workspace/runtime_7b.c",
+        "/workspace/launch_clm_7b.sh (env wrapper)",
+        "/workspace/r2_sync_watcher_7b.sh"
+      ]
+    },
+    "archive_layout": {
+      "r2_base": "r2:anima-models/clm7b/",
+      "sub_paths": {
+        "binaries/": "executable + source + launch wrappers — ~10MB",
+        "r1/": "per-step ckpts — 14GB each × ~150 = 2.1TB",
+        "r1/final/": "final checkpoint after 750k steps",
+        "r1/phi_holo_peak/": "snapshot of step where phi_holo maxed (Law 60 non-monotonic guard)",
+        "r1/best_eval/": "snapshot of lowest eval CE"
+      }
+    },
+    "download_for_recovery": "rclone copy r2:anima-models/clm7b/binaries/native_r1_step_at_launch_YYYYMMDD/ /workspace/ && chmod +x /workspace/train_clm_7b_native"
+  },
+
+  "dependency_graph": {
+    "nodes": {
+      "corpus_60gb_ready": {
+        "status": "in_flight",
+        "eta_utc": "2026-04-17T03:30Z",
+        "depends_on": ["cc100_ko xz download (50% done)", "cc100_ko xz decompression", "kowiki XML text extraction"]
+      },
+      "corpus_140gb_ready": {
+        "status": "not_started",
+        "eta_utc": "2026-04-20T00:00Z",
+        "depends_on": ["corpus_60gb_ready", "OSCAR/enwiki/pile_cc/opus fetch + filter"]
+      },
+      "h100_slot_2_free": {
+        "status": "occupied_by_A2",
+        "eta_utc": "2026-04-18T07:00Z",
+        "depends_on": ["ALM A1 complete (~30min from now)", "A2 12h+6h run"]
+      },
+      "h100_slot_1_free": {
+        "status": "occupied_by_CLM_r4_1_5B",
+        "eta_utc": "2026-04-17T21:30Z",
+        "depends_on": ["1.5B r4 converge to trigger_gate OR step 750k"]
+      },
+      "c9_nccl_multi_rank": {
+        "status": "stub_rc_99",
+        "eta": "1 day after 2xH100 pod allocation",
+        "depends_on": ["2xH100 pod simultaneously available", "hexa-lang session on NCCL FFI bindings"],
+        "blocks": "FSDP-Full — 7B training without it OOMs on single H100"
+      },
+      "c2_fused_layer_ffi": {
+        "status": "in_progress",
+        "owner": "hexa_lang_session e541cb6cb8a7",
+        "eta": "1-2 hexa-lang sessions",
+        "blocks": "Full 7B MFU target 60% — without, stuck at ~30% with F1-TC alone"
+      },
+      "c4_cuda_nvcc_build": {
+        "status": "pre_claimed",
+        "eta": "3-5 days after C2 lands",
+        "blocks": "Full 7B MFU target 60%"
+      },
+      "user_explicit_ok_to_launch": {
+        "status": "not_given",
+        "rationale": "auto_fire_authorized=false per clm_7b_upscale_spec — 7B cost $1500-3000 exceeds silent-fire budget"
+      }
+    },
+    "critical_path_to_launch": [
+      {"ord": 1, "node": "corpus_60gb_ready", "blocker": true, "eta_h": 2.5},
+      {"ord": 2, "node": "h100_slot_1_free + h100_slot_2_free simultaneously", "blocker": true, "eta_h": 30, "critical_path": true, "note": "Biggest blocker — 2x H100 not both free until ~2026-04-18T07:00Z"},
+      {"ord": 3, "node": "c9_nccl_multi_rank", "blocker": true, "eta_h": 24, "parallel_with_ord_2": true},
+      {"ord": 4, "node": "f1_tc_integration_hexa_edits", "blocker": false_if_fp32_fallback_ok, "eta_h": 1, "note": "F1-TC wiring 2 files (train_clm_gpu.hexa + gpu_train.hexa) — 1h hexa work after corpus is staged"},
+      {"ord": 5, "node": "user_explicit_ok_to_launch", "blocker": true, "eta_h": "user"},
+      {"ord": 6, "node": "launch", "earliest_utc": "2026-04-18T07:00Z + corpus_140gb + c9_nccl + user_ok"}
+    ],
+    "earliest_launch_utc": "2026-04-18T10:00Z (optimistic — both slots free + corpus staged + NCCL binding lands + user OK)",
+    "realistic_launch_utc": "2026-04-20T00:00Z (includes C9 NCCL slippage + F1-TC integration bugs + 1 failed attempt)",
+    "pessimistic_launch_utc": "2026-04-30T00:00Z (matches clm_7b_readiness_20260416.json#honest_verdict.most_optimistic)"
+  },
+
+  "recovery_and_failure_modes": {
+    "failure_1_oom_before_step_100": {
+      "symptom": "CUDA OOM in gpu_layer_fwd",
+      "probable_cause": "FSDP binding returned 0 but didn't actually shard (rc=99 stub) → full 7B on one GPU",
+      "action": "Immediately SSH in, pkill train_clm_7b_native, verify fsdp_shard.hexa state dump shows world_size=2 rank=<self> with n_owned=16 layers. If world_size=1, C9 binding not live — must land binding before relaunch."
+    },
+    "failure_2_slow_first_step": {
+      "symptom": "step 1 takes >30s, then 'hanging' between ranks",
+      "probable_cause": "NCCL all-reduce not finding peer — TCP fallback without NVLink",
+      "action": "Check MASTER_ADDR reachable from pod_b (nc -vz <ip_a> 29500). If TCP fallback is active and persistent, downgrade to single-rank 3B fallback (scale_2_8b) while NCCL bindings are fixed."
+    },
+    "failure_3_loss_nan_early": {
+      "symptom": "loss=nan at step < 50",
+      "probable_cause": "bf16 overflow in fused QKV TC at very high initial weights, or MLM corruption",
+      "action": "Set USE_TC=0 and relaunch with fp32 path — F1-TC fallback kicks in. If fp32 also NaNs, reseed + verify init_scale=0.02 + RMSNorm ordering matches 1.5B."
+    },
+    "failure_4_mfs_quota_silent_exit": {
+      "symptom": "training disappears around ckpt save time, partial ckpt on disk",
+      "probable_cause": "MFS quota — per training/CLAUDE.md runpod_mfs_quota rule",
+      "action": "dd preflight + rm old ckpts + save_every>=5000 enforced; in-training rclone PROHIBITED (use deferred queue watcher only)"
+    },
+    "failure_5_corpus_mmap_seek_slow": {
+      "symptom": "step time balloons from 1200ms → 3000ms midway",
+      "probable_cause": "corpus mmap hitting cold pages on xz-streaming read",
+      "action": "Pre-decompress cc100-ko fully before launch; avoid streaming xz read"
+    }
+  },
+
+  "compliance_checks": {
+    "hexa_first_strict": "PASS — all new logic in .hexa (c4_fused_kernels.hexa existing, train_clm_gpu.hexa edit planned)",
+    "no_python": "PASS — training loop is pure C (compiled from hexa via codegen_c2)",
+    "no_quantization": "PASS — bf16 I/O boundary, bf16 internal, fp32 accumulator, fp32 master weights",
+    "no_resume_data_change": "PASS — 7B is fresh from step 0; NOT resume-from-1.5B",
+    "one_shot_best": "PASS — launch contingent on F1-TC integration + corpus 60GB+ + C9 NCCL + user OK",
+    "no_version_in_filename": "PASS — ckpts named step_{N} under clm7b/r1/",
+    "background_launch": "PASS — nohup + tmux watcher pattern",
+    "r2_checkpoint_backup": "PASS — background r2_sync_watcher_7b.sh at 60s cadence",
+    "auto_fire_authorized": "FALSE — requires explicit user OK before launch even with 2 H100 auto-authorized, because 7B cost $1500-3000 + policy complexity (FSDP + corpus undersized)"
+  },
+
+  "report_deltas_vs_spec": {
+    "spec_launch_command_vs_this_checklist": {
+      "spec_step_1_compose_7b_missing_env_TC": "Spec did not mention USE_TC=1 — this checklist adds it",
+      "spec_step_2_build_missing_nccl": "Spec listed `-lnccl` build dep — checklist emphasises C9 must land first or launch is single-rank OOM",
+      "spec_ssh_pattern": "Reuses 1.5B pattern from clm_r4_relaunch_20260416.json",
+      "new_lever_f1_tc": "10.26x kernel speedup not in original spec — this checklist makes it the primary lever for step_time projection"
+    },
+    "spec_hardware_memory_budget_unchanged": "FSDP-Full memory plan in spec.hardware is valid; F1-TC adds +6.1GB VRAM for Wqkv packing (acceptable on 80GB with 23GB headroom)"
+  },
+
+  "next_actions_for_this_session": [
+    {"ord": 1, "action": "Wait for corpus cc100-ko download (PID 25477, ~2h)", "blocker": false, "concurrent": true},
+    {"ord": 2, "action": "Wait for kowiki XML extraction (hexa-native, not started)", "blocker": false},
+    {"ord": 3, "action": "Implement F1-TC integration in train_clm_gpu.hexa + gpu_train.hexa (2 edits, ~1h) — can be done LOCALLY NOW without H100", "blocker": false, "priority": "HIGH", "do_next": true},
+    {"ord": 4, "action": "Write R2 binary archive watcher script (hexa-native, parse-only fine for now)", "blocker": false, "priority": "MEDIUM"},
+    {"ord": 5, "action": "Monitor 1.5B r4 convergence trajectory (currently loss=2.29 at step 2800)", "blocker": false, "concurrent": true},
+    {"ord": 6, "action": "WAIT for: A1 complete → A2 fire → A2 complete → 1.5B r4 converge to free 2 H100 slots. Earliest 2026-04-18T07:00Z", "blocker": true},
+    {"ord": 7, "action": "Request user explicit OK to launch 7B when dep graph clears", "blocker": true}
+  ],
+
+  "growth_loop_reference": {
+    "current_driver": "1.5B r4 is the active CLM growth driver at step 2800, loss=2.29",
+    "loop_action_at_7b_trigger_gate": "Per clm_7b_upscale_spec.json#growth_loop_status — trigger gate eval every save_every=5000 via growth_loop. On gate satisfied + blockers clear, loop posts status + requests user OK, then executes the launch_command_sequence above (with USE_TC=1 appended)."
+  },
+
+  "_file_authority": {
+    "this_checklist_is_operational": true,
+    "spec_remains_ssot": "shared/state/clm_7b_upscale_spec.json is the authoritative 7B config source. This checklist specialises that spec for 2026-04-17 state (corpus in flight + F1-TC 10.26x lever unlocked).",
+    "supersedes_prior_launch_command": "Adds USE_TC=1 + F1-TC integration. All other fields in clm_7b_upscale_spec.launch_command remain valid."
+  }
+}

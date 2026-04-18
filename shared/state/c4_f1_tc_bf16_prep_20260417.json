@@ -1,0 +1,189 @@
+{
+  "_meta": {
+    "name": "C4 F1-TC bf16 WMMA prep — reconnaissance + launch plan",
+    "description": "Recon-only reconnaissance of C2 struct-args ABI status + F1-TC bf16 Tensor Core implementation plan. No code written, no commits. Produced after the C4 F1 fp32 MVP bench (shared/state/c4_f1_fused_qkv_bench_20260417.json) showed GATE_PARTIAL — correctness PASS, fp32-only performance hits compute-bound at production shapes. The next lever is bf16 WMMA behind c2_struct_args. This file maps where that ABI lives and how to wire F1-TC once the audit confirms readiness.",
+    "ssot": true,
+    "canonical_path": "shared/state/c4_f1_tc_bf16_prep_20260417.json",
+    "roadmap_ref": "docs/c4-cuda-fused-megakernel-design.md §4 bf16 Tensor Core strategy",
+    "bench_predecessor": "shared/state/c4_f1_fused_qkv_bench_20260417.json",
+    "c_track_ref": "shared/state/c_track_board.json :: items.C4 + items.C2",
+    "created_at": "2026-04-17",
+    "session": "2026-04-17 — F1-TC recon (no code)",
+    "constraint": "recon only — NO code edits, NO .py, NO H100 launch, NO commits"
+  },
+
+  "c2_struct_args_abi_status": {
+    "verdict": "LIVE — not a blocker. Design doc's `c2_struct_args ABI blocker` note is obsolete as of hexa-lang commit 3760238 (C2 Step 3, 2026-04-16T00:10Z KST).",
+    "evidence_primary": {
+      "hexa_lang_commit": "3760238",
+      "hexa_lang_commit_title": "feat(rt+interp+codegen): C2 Step 3 interp FFI + C3 PBV in-place + C1 native-int for — Day-1 runtime uplift",
+      "hexa_lang_files_landed": [
+        "/Users/ghost/Dev/hexa-lang/self/runtime.c :: hexa_host_ffi_call_14 (14-arg FFI dispatch, scalar fanout, float_mask, ret_kind)",
+        "/Users/ghost/Dev/hexa-lang/self/runtime.c :: hexa_ptr_alloc + hexa_ptr_write + hexa_ptr_free (raw struct-arg buffer ABI)",
+        "/Users/ghost/Dev/hexa-lang/self/ml/hxcuda.hexa :: `extern fn hxcuda_matmul_bf16(args_p: *Void) -> int` + HXCUDA_MM_STRUCT_BYTES=48 + HXCUDA_LM_STRUCT_BYTES=80 offset tables",
+        "/Users/ghost/Dev/hexa-lang/self/native/hxcuda_fused.cu :: hxcuda_matmul_bf16_kernel with wmma::fragment<matrix_a/b/accumulator, 16,16,16, __nv_bfloat16, row_major> + fp32 accumulator + __float2bfloat16 staging",
+        "/Users/ghost/Dev/hexa-lang/self/test_hxcuda.hexa :: `alloc_raw(48) + ptr_write(off, M/K/N/A_dev/B_dev/C_dev)` proven-test pattern"
+      ],
+      "bench_pass": "bench(C2): hxlayer FFI DIM sweep 64..1024 — 12.5x→50x interpreter vs FFI (hexa-lang commit 1f5c9c1)"
+    },
+    "evidence_secondary_anima_already_uses_it": {
+      "file": "/Users/ghost/Dev/anima/training/train_clm.hexa",
+      "lines": "446-468",
+      "pattern": "extern fn hxlmhead_bwd(args_p: *Void) -> int with HXLMH_STRUCT_BYTES=120 using `alloc_raw(120) + ptr_write(off, S/H/M/V/loss_scale/x/mid/targets/Wu/Wv/dL_dx/dW_u/dW_v/loss_out/reserved0)`",
+      "note": "Anima CLM already production-uses the exact struct-args ABI that F1-TC needs — there is no new ABI integration cost."
+    },
+    "status_in_c_track_board": {
+      "item_id": "C2",
+      "reported_status": "in_progress",
+      "actual_status": "Step 1 + Step 3 LANDED (rmsnorm+silu fused + 14-arg scalar FFI + struct-args ABI). Step 2 (bulk per-layer hxlayer_llama_forward) remains in progress but is NOT required for F1-TC.",
+      "correction_recommended": "C2 Step 3 landing on 2026-04-16 already supplies everything F1-TC needs — board is stale by 1 day."
+    },
+    "remaining_c2_work_orthogonal_to_f1_tc": [
+      "C2 Step 2 full-layer bulk FFI (hxlayer_llama_forward) — this is the 20-field struct that spans every per-layer weight pointer. Not needed for F1 (QKV projection only).",
+      "C10 H100 wire (grad ckpt GPU path) — depends on Step 2, not on F1-TC."
+    ]
+  },
+
+  "f1_tc_bf16_wmma_implementation_plan": {
+    "scope": "Upgrade training/c4_fused_kernels.hexa :: K_C4_QKV_PROJ_FUSED_FWD NVRTC kernel string from fp32 per-thread scalar reduction to bf16 WMMA 16x16x16 Tensor Core tile.",
+    "chosen_path": "NVRTC string (in-file kernel, rtc_launch) — NOT FFI @link. The C4 MVP already uses rtc_compile_ptx → rtc_get_function → rtc_launch with an arg-pointer array (_c4_arg_ptr/_c4_arg_i32). F1-TC keeps this path because (a) no new dylib to build on H100 pod, (b) no ABI coupling with hexa-lang repo, (c) NVRTC strings rebuild per-run so iterating is 2 lines of string edit. The struct-args ABI is used only by `@link`-imported C functions; rtc_launch-driven NVRTC kernels pass args as a pointer-array-of-pointers, which the MVP already supports.",
+    "alternative_path_rejected": "Port QKV fusion into libhxcuda.so with `@link('hxcuda')` — rejected because it adds a build dependency (nvcc on H100 pod, hexa-lang dylib install) and cross-repo coupling, for zero functional benefit over the in-file NVRTC path.",
+    "nvrtc_string_diff_summary": {
+      "current_fp32_kernel_lines": 28,
+      "target_bf16_wmma_kernel_lines": "~90 (based on hxcuda_matmul_bf16_kernel at hexa-lang/self/native/hxcuda_fused.cu:70-139)",
+      "change_points": [
+        {
+          "section": "includes",
+          "change": "ADD `#include <cuda_fp16.h>` + `#include <mma.h>` + `using namespace nvcuda;` at top of NVRTC string — NVRTC 11.2 on pod supports both, no extra flags needed."
+        },
+        {
+          "section": "signature",
+          "change": "KEEP `const float* norm, const float* Wqkv, float* outQ/K/V, int M, int K_in, int DhH`. Inputs/outputs stay fp32 — matches design doc §4.2 'fp32 in / fp32 out, bf16 internal' to avoid disrupting hexa-side weight storage."
+        },
+        {
+          "section": "grid/block",
+          "change": "CHANGE from block(16,16,1) grid(ceil(M/16),ceil(N/16),1) = 256 threads/block, 1 thread per output → block(32,1,1) grid(ceil(N/16),ceil(M/16),1) = 1 warp/block, 1 warp per 16x16 output tile. Matches hxcuda_matmul_bf16_kernel shape exactly."
+        },
+        {
+          "section": "fragments",
+          "change": "ADD `wmma::fragment<matrix_a, 16,16,16, __nv_bfloat16, row_major> a_frag; wmma::fragment<matrix_b, 16,16,16, __nv_bfloat16, row_major> b_frag; wmma::fragment<accumulator, 16,16,16, float> c_frag; wmma::fill_fragment(c_frag, 0.0f);`"
+        },
+        {
+          "section": "staging_smem",
+          "change": "ADD `__shared__ __nv_bfloat16 smem_a[16*16]; __shared__ __nv_bfloat16 smem_b[16*16];` (512 bytes/block, well under 228KB cap)"
+        },
+        {
+          "section": "K_loop_body",
+          "change": "REPLACE `for (k=0; k<K_in; k++) acc += norm[m*K_in+k] * Wqkv[k*N+n]` (per-thread scalar) with `for (k_step=0; k_step<K_in; k_step+=16) { cooperatively-load smem_a/b with __float2bfloat16; __syncthreads(); wmma::load_matrix_sync(a_frag,smem_a,16); wmma::load_matrix_sync(b_frag,smem_b,16); wmma::mma_sync(c_frag,a_frag,b_frag,c_frag); __syncthreads(); }`"
+        },
+        {
+          "section": "store",
+          "change": "REPLACE per-thread `if (slot==0) outQ[idx]=acc; else if (slot==1) outK[idx]=acc; else outV[idx]=acc;` with `wmma::store_matrix_sync` into a temp fp32 16x16 tile, then let lane 0..31 dispatch to outQ/outK/outV based on warpN/DhH. The slot-split happens per-warp not per-thread — same slot math, applied to the tile's base column."
+        },
+        {
+          "section": "bounds",
+          "change": "KEEP `if (m>=M || n>=N) return` guard semantics; replace with `if (warpM<M && warpN<N)` guarding the wmma::store_matrix_sync call (matches hxcuda_matmul_bf16_kernel:136-138)."
+        }
+      ]
+    },
+    "launcher_changes_c4_impl_qkv_proj_fwd": {
+      "bx_by_change": "CHANGE from bx=16, by=16 (256 threads/block) to bx=32, by=1 (1 warp/block). gx/gy swap roles: gx=ceil(N/16), gy=ceil(M/16).",
+      "args_unchanged": "The _c4_arg_ptr/_c4_arg_i32 arg-pointer array packed for rtc_launch stays byte-identical — NVRTC WMMA kernels accept the same uintptr_t scalar-pointer dispatch.",
+      "rtc_compile_flags": "ADD `-arch=sm_86` (RTX 3090) or `-arch=sm_90` (H100) at rtc_compile_ptx call site. Current MVP uses `compute_86 -default-device`. For H100 switch to `-arch=sm_90 -use_fast_math -DNDEBUG` per design doc §9.",
+      "initialization": "No change — c4_init_modules() still compiles a single NVRTC module holding the kernel string."
+    },
+    "numerical_tolerance_change": {
+      "current_fp32_tol": "1e-3 relative (bit-exact on bench)",
+      "bf16_target_tol": "1e-2 relative (bf16 mantissa is 8 bits — 1/128 per-multiply relative error, K=1024 accumulation → ~1e-2 ceiling). Matches design doc §6.1 'WMMA bf16 fused vs pure-hexa ref: ≤ 1e-2 relative'.",
+      "gate_numerical": "max |fused_bf16 - fused_fp32| / max |fused_fp32| < 1e-2 on S3 shape (M=4096, K_in=1024, D_head=64, H=16, DhH=1024)."
+    },
+    "expected_performance_lift": {
+      "design_doc_forecast_multiplier": 1.8,
+      "forecast_source": "docs/c4-cuda-fused-megakernel-design.md §3 (F1 '2.5× (1.4× launch + 1.8× TC / input reuse)') — fp32 MVP captured ~1.0x of that at CLM 1B shape (launch reduction only at large shapes); TC captures the remaining 1.8x multiplicative.",
+      "cumulative_vs_unfused_fp32_baseline": "2.5x target (fp32 mvp 1.0x × TC 1.8x = ~1.8x baseline; design doc also counts input-reuse fragment caching as part of the 2.5x)",
+      "mfu_projection_h100_clm_1b": "27% → ~49% from F1-TC alone (design doc §3.1 combined with F2+F3 targets 55-65%)"
+    }
+  },
+
+  "blocker_assessment": {
+    "active_blockers": [],
+    "previously_believed_blocker": {
+      "description": "c2_struct_args ABI not yet landed — F1-TC deferred until hexa-lang exposes the struct-args FFI",
+      "actual_status": "CLEARED on 2026-04-16 via hexa-lang commit 3760238 (3 days ago relative to 2026-04-17)",
+      "resolution_path": "No action required — F1-TC can proceed immediately against the in-file NVRTC path, which doesn't even need the struct-args ABI (it uses rtc_launch's arg-pointer array)."
+    },
+    "soft_blockers_not_on_critical_path": [
+      {
+        "id": "rtx_3090_vs_h100",
+        "description": "F1-TC bf16 WMMA requires sm_80+ (A100) or sm_90 (H100). RTX 3090 is sm_86 — WMMA bf16 works on sm_86 per CUDA 11.2+ (introduced in sm_80). Bench pod 64.228.13.219 is RTX 3090 = sm_86 → F1-TC bench will succeed on that pod but with ~1/3 the Tensor Core TFLOPS of H100. For the final MFU gate measurement we still need an H100.",
+        "impact": "informational — does NOT block bring-up; only the final gate measurement needs H100.",
+        "mitigation": "Bench on RTX 3090 for correctness + ratio, promote to H100 for MFU numbers."
+      },
+      {
+        "id": "shape_gate_small_shapes",
+        "description": "Design doc §5.3 says stay unfused when d < 256 (WMMA 16x16 tile granularity wastes TC area at tiny d). F1-TC must add the shape gate in c4_impl_qkv_proj_fwd.",
+        "impact": "minor — one if-check in launcher."
+      }
+    ],
+    "integration_eta_if_approved_now": {
+      "nvrtc_string_edit": "~40 min (copy structure from hxcuda_matmul_bf16_kernel, replace scalar K-loop with WMMA K-loop, keep slot-split store)",
+      "launcher_edit": "~10 min (bx=32 by=1, flip grid dims, add -arch=sm_XX flag passthrough, add shape gate)",
+      "rtx_3090_correctness_bench": "~30 min (compile + run against existing c4_gpu_bench.c harness, compare against c4_ref_qkv_unfused tolerance 1e-2)",
+      "h100_correctness_and_mfu_bench": "~60 min (H100 pod already available to project; rerun same harness with nvidia-smi dmon -s u capture)",
+      "total": "~140 min wall-clock from approval to H100 MFU number"
+    }
+  },
+
+  "launch_checklist_immediate_readiness": {
+    "ready_now": [
+      "C2 struct-args ABI — LIVE (commit 3760238)",
+      "hxcuda_fused.cu WMMA bf16 reference kernel — LANDED (hexa-lang/self/native/hxcuda_fused.cu:70-139)",
+      "anima NVRTC path — LIVE (training/c4_fused_kernels.hexa §3, rtc_init + rtc_compile_ptx + rtc_launch proven on RTX 3090 pod 64.228.13.219:61320)",
+      "CPU reference oracle — LIVE (c4_ref_qkv_unfused + c4_ref_qkv_fused, used by bench harness)",
+      "Bench harness — LIVE (c4_gpu_bench.c compiled with -lnvrtc -lcuda, 5 shapes validated)",
+      "Design doc guidance — LIVE (docs/c4-cuda-fused-megakernel-design.md §4.1 chooses m16n16k16, §4.2 fp32 in/fp32 out/bf16 internal, §4.3 shmem budget 1536B)",
+      "Pre-claim approval — LIVE (c_track_board.json :: items.C4.claim_approval at 2026-04-16T14:05Z)",
+      "Board item ownership — anima_session owns C4 unambiguously"
+    ],
+    "required_before_launch": [
+      "User approval to write code (this session is recon-only — must be greenlit before editing c4_fused_kernels.hexa)",
+      "Confirm C-track audit session (the 'other session' holding uncommitted work) is not simultaneously editing c4_fused_kernels.hexa — grep git status on anima repo before writing",
+      "RTX 3090 pod 64.228.13.219:61320 still warm (last-known status 'idle_at_start' per bench file; low risk)"
+    ],
+    "launch_sequence": [
+      "Step 1: Edit training/c4_fused_kernels.hexa § K_C4_QKV_PROJ_FUSED_FWD string → bf16 WMMA variant per plan above",
+      "Step 2: Edit c4_impl_qkv_proj_fwd launcher bx/by flip + shape gate",
+      "Step 3: Add -arch=sm_86 to rtc_compile_ptx call site (parameterize via env var CUDA_ARCH for H100 later)",
+      "Step 4: Rebuild /tmp/c4_gpu_bench on RTX 3090 pod, run against same 5 shapes",
+      "Step 5: Expected result — S1 small ≥ 1.0x (WMMA wasteful at K=256), S3 design-doc shape ≥ 1.5x (TC kicks in at K=1024), bit-exact tolerance 1e-2",
+      "Step 6: If RTX 3090 PASS, dispatch agent to H100 pod for MFU measurement against nvidia-smi dmon -s u",
+      "Step 7: Write shared/state/c4_f1_tc_bf16_bench_YYYYMMDD.json with before/after speedup + MFU number",
+      "Step 8: Update training_speed_ceilings.json :: CLM with the F1-TC gain",
+      "Step 9: Flag C4 item status → 'f1_tc_fp32_bf16_done_pending_f2_f3' in c_track_board.json"
+    ]
+  },
+
+  "cross_session_coordination_notes": {
+    "uncommitted_work_check": "Task briefing mentioned C-track audit session has uncommitted changes (T34 codegen + G39 parser + 14 _pure.hexa runtime + vm.hexa O(n²)→O(1) push + 313/313 smoke PASS). Verified via `git status` on /Users/ghost/Dev/hexa-lang — changes confirmed uncommitted, all in hexa-lang repo (not anima). No conflict with F1-TC work on anima/training/c4_fused_kernels.hexa.",
+    "anima_repo_clean_for_c4_edits": "Anima repo tip is 6184d668 (7B pre-flight regression 40/40 + C2 F1 fused QKV MVP). No uncommitted changes to training/c4_fused_kernels.hexa detected from task briefing context.",
+    "recommended_coordination": "Before writing F1-TC code, post a claim to c_track_board.json :: items.C4 flipping status 'pre_claimed_pending_c2_landing' → 'claimed_in_progress' with session_id of executing agent. Post an entry to session_log."
+  },
+
+  "next_action_recommendation": "Get user approval to promote this recon into implementation. The bottleneck said to be c2_struct_args ABI is in fact resolved — F1-TC can launch immediately. Expected wall-clock from green-light to H100 MFU number: ~140 minutes.",
+
+  "files_referenced_for_audit_trail": [
+    "/Users/ghost/Dev/anima/docs/c4-cuda-fused-megakernel-design.md",
+    "/Users/ghost/Dev/anima/shared/state/c4_f1_fused_qkv_bench_20260417.json",
+    "/Users/ghost/Dev/anima/shared/state/c_track_board.json",
+    "/Users/ghost/Dev/anima/shared/state/c_track_audit_20260416.json",
+    "/Users/ghost/Dev/anima/training/c4_fused_kernels.hexa",
+    "/Users/ghost/Dev/anima/training/c4_fused_kernels_interface.hexa",
+    "/Users/ghost/Dev/anima/training/train_clm.hexa",
+    "/Users/ghost/Dev/hexa-lang/self/ml/hxcuda.hexa",
+    "/Users/ghost/Dev/hexa-lang/self/ml/hxlayer.hexa",
+    "/Users/ghost/Dev/hexa-lang/self/native/hxcuda_fused.cu",
+    "/Users/ghost/Dev/hexa-lang/self/native/hxlayer_linux.c",
+    "/Users/ghost/Dev/hexa-lang/self/runtime.c",
+    "/Users/ghost/Dev/hexa-lang/self/test_hxcuda.hexa"
+  ]
+}
