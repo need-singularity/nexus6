@@ -68,23 +68,43 @@ write_blob() {
     security add-generic-password -l "$label" -s "$label" -a ghost -w "$2" 2>/dev/null
 }
 
-# ── 토큰 refresh: stdout = 새 blob JSON (성공) / 빈 (실패) ──────────────
+# ── 토큰 refresh ────────────────────────────────────────────────────────
+# stdout: 성공 시 새 blob JSON, 실패 시 빈
+# return code (L3, 2026-04-18 — 원인별 분류):
+#   0 — 성공
+#   1 — 네트워크/알 수 없는 에러 (기존 refresh-failed 와 동일 취급)
+#   2 — rate_limit_error (transient — usage-cache 에 error 마킹 금지)
+#   3 — invalid_grant/invalid_request (permanent — refresh-failed 마킹)
+# @convergence state=ossified id=REFRESH_ERROR_CLASS value="rate_limit vs invalid_grant 분리 — rate_limit 은 transient 로 대시보드에 error 미표시" ossified_at=2026-04-18 rationale="CAP=2 cascade + rate_limit 이 영구 refresh-failed 로 오진되어 블랙홀 누적되던 문제 해결"
 refresh_token() {
-    local rt="$1" old="$2" body resp at nrt ein
+    local rt="$1" old="$2" body resp at nrt ein http_code error_type
     body=$(jq -cn --arg rt "$rt" --arg cid "$CLIENT_ID" \
         '{grant_type:"refresh_token", refresh_token:$rt, client_id:$cid}')
     resp=$(printf '%s' "$body" | curl -sS -m "$TIMEOUT" -X POST "$TOKEN_URL" \
-        -H "Content-Type: application/json" --data @- 2>/dev/null) || return 1
+        -H "Content-Type: application/json" --data @- \
+        -w '|%HTTP%|%{http_code}' 2>/dev/null) || return 1
+    # HTTP_CODE 분리 — JSON body 와 충돌 안 날 delimiter |%HTTP%|
+    http_code="${resp##*|%HTTP%|}"
+    resp="${resp%|%HTTP%|*}"
     at=$(jq -r '.access_token // empty' <<< "$resp" 2>/dev/null)
-    [ -n "$at" ] || return 1
-    nrt=$(jq -r '.refresh_token // empty' <<< "$resp" 2>/dev/null)
-    ein=$(jq -r '.expires_in // 3600' <<< "$resp" 2>/dev/null)
-    # 기존 blob 에 accessToken/expiresAt 주입. refreshToken 은 새 값 있을 때만 교체.
-    jq -c --arg at "$at" --arg nrt "$nrt" --argjson ein "$ein" \
-        '.claudeAiOauth.accessToken = $at
-         | .claudeAiOauth.expiresAt = ((now*1000 | floor) + $ein*1000)
-         | (if $nrt != "" then .claudeAiOauth.refreshToken = $nrt else . end)' \
-        <<< "$old" 2>/dev/null
+    if [ -n "$at" ]; then
+        nrt=$(jq -r '.refresh_token // empty' <<< "$resp" 2>/dev/null)
+        ein=$(jq -r '.expires_in // 3600' <<< "$resp" 2>/dev/null)
+        jq -c --arg at "$at" --arg nrt "$nrt" --argjson ein "$ein" \
+            '.claudeAiOauth.accessToken = $at
+             | .claudeAiOauth.expiresAt = ((now*1000 | floor) + $ein*1000)
+             | (if $nrt != "" then .claudeAiOauth.refreshToken = $nrt else . end)' \
+            <<< "$old" 2>/dev/null
+        return 0
+    fi
+    error_type=$(jq -r '.error.type // .error // empty' <<< "$resp" 2>/dev/null)
+    case "$error_type" in
+        rate_limit_error|rate_limited) return 2 ;;
+        invalid_grant|invalid_request) return 3 ;;
+    esac
+    [ "$http_code" = "429" ] && return 2
+    [ "$http_code" = "400" ] && return 3
+    return 1
 }
 
 fetch_usage() {
@@ -161,8 +181,10 @@ process_one() {
 
         # CLI 실패 시 direct POST fallback.
         # CAP 은 pre_check 선별용 — CLI 실패 후에는 무조건 시도 (영구 refresh-failed 방지).
+        # L3 (2026-04-18): refresh_token return code 로 원인 분류.
+        local direct_rc=0
         if [ -z "$method" ]; then
-            new_blob=$(refresh_token "$rt" "$blob")
+            new_blob=$(refresh_token "$rt" "$blob"); direct_rc=$?
             if [ -n "$new_blob" ]; then
                 write_blob "$h8" "$new_blob" || { echo '{"error":"keychain-write"}' > "$out"; return; }
                 at=$(jq -r '.claudeAiOauth.accessToken' <<< "$new_blob" 2>/dev/null)
@@ -172,7 +194,12 @@ process_one() {
         fi
 
         if [ -z "$method" ]; then
-            echo '{"error":"refresh-failed"}' > "$out"; return
+            # 원인별 라벨링 — rate_limit 은 transient 라 error=null, invalid_grant 만 영구.
+            case "$direct_rc" in
+                2) echo '{"error":null,"detail":"rate-limit"}' > "$out"; log "rate-limit(transient): $name"; return ;;
+                3) echo '{"error":"invalid-grant"}'          > "$out"; log "invalid-grant(permanent): $name"; return ;;
+                *) echo '{"error":"refresh-failed"}'         > "$out"; return ;;
+            esac
         fi
         log "refreshed($method): $name"
     fi

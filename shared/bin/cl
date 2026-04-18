@@ -224,6 +224,50 @@ cl_load_data() {
         CL_NAMES+=("$n"); CL_WK+=("$w"); CL_SS+=("$s"); CL_ERR+=("$e")
         CL_SRT+=("$srt"); CL_WRT+=("$wrt")
     done <<< "$raw"
+
+    # L1+L2 (2026-04-18) — post-login self-heal.
+    # Mac 의 login signal = ~/.claude-claudeN/.claude.json mtime (Claude Code 가 login 완료 시 재작성).
+    # .claude.json mtime > usage-cache._ts 면 사용자가 /login 등으로 토큰을 갱신한 것 → refresh-failed 는 stale.
+    # (a) 현재 프레임 표시: CL_ERR 비움 (L1 display guard)
+    # (b) usage-cache.json 에 영속 clear (L2) — 다음 cl-refresh 전까지 깨끗 유지.
+    # 근본 목적: rate-limit/CAP cascade 로 누적된 영구 블랙홀을 Mac /login 한 번에 해소.
+    # 주의: Mac 은 .credentials.json 을 사용하지 않음(keychain-only). 원격(ubu) 은 .credentials.json — 둘 다 cover.
+    # @convergence state=ossified id=REFRESH_FAILED_POSTLOGIN_SELFHEAL value="login signal (~/.claude-N/.claude.json 또는 .credentials.json) mtime > usage-cache._ts 면 refresh-failed 자동 clear (표시+영속)" ossified_at=2026-04-18 rationale="refresh-failed 영구화 수렴. Mac SSOT 원칙 — keychain 갱신 → .claude.json rewrite → cl 자동 인지."
+    if [ ${#CL_NAMES[@]} -gt 0 ] && [ -n "$CL_CACHE_TS" ] && [ "$CL_CACHE_TS" != "null" ]; then
+        local __i __sig __mt __cache_ts_int __mt_best
+        __cache_ts_int=${CL_CACHE_TS%.*}
+        local __to_clear=()
+        for __i in "${!CL_NAMES[@]}"; do
+            [ -z "${CL_ERR[$__i]:-}" ] && continue
+            # login signal 후보 — mtime 가장 최근 값을 사용.
+            __mt_best=0
+            for __sig in "$HOME/.claude-${CL_NAMES[$__i]}/.claude.json" \
+                         "$HOME/.claude-${CL_NAMES[$__i]}/.credentials.json"; do
+                [ -f "$__sig" ] || continue
+                __mt=$(stat -f %m "$__sig" 2>/dev/null || stat -c %Y "$__sig" 2>/dev/null)
+                [ -z "$__mt" ] && continue
+                [ "$__mt" -gt "$__mt_best" ] 2>/dev/null && __mt_best=$__mt
+            done
+            [ "$__mt_best" -eq 0 ] && continue
+            if [ "$__mt_best" -gt "$__cache_ts_int" ] 2>/dev/null; then
+                CL_ERR[$__i]=""
+                __to_clear+=("${CL_NAMES[$__i]}")
+            fi
+        done
+        if [ ${#__to_clear[@]} -gt 0 ] && [ -w "$USAGE" ]; then
+            local __names_json __tmp
+            __names_json=$(printf '%s\n' "${__to_clear[@]}" | jq -R . | jq -sc .)
+            __tmp="${USAGE}.tmp.$$"
+            if jq --argjson names "$__names_json" --argjson ts "$(date -u +%s)" \
+                'reduce $names[] as $n (.; if has($n) then .[$n].error = null | .[$n]._ts = $ts else . end)' \
+                "$USAGE" > "$__tmp" 2>/dev/null; then
+                chmod 600 "$__tmp" 2>/dev/null || true
+                mv "$__tmp" "$USAGE"
+            else
+                rm -f "$__tmp"
+            fi
+        fi
+    fi
 }
 
 # fmt_until <out_var> <target_epoch> [width] — 남은 시간 문자열 (최대 7자).
@@ -543,14 +587,32 @@ cmd_passthrough() {
 # @convergence state=ossified id=LAUNCHD_PATH_HARDENED value="plist EnvironmentVariables.PATH 선두에 /Users/ghost/.local/bin — cron 컨텍스트에서 command -v claude 성공" threshold="refresh_via_cli 정상 동작 + IP rate_limit 우회 작동. 로그에 refreshed(cli) 다수 등장" ossified_at=2026-04-15 ref_commit=dba4246f rationale="2026-04-15 재발 사고 — claude=/Users/ghost/.local/bin/claude 인데 plist PATH(/opt/homebrew/bin:/usr/local/bin:...) 누락 → refresh_via_cli 조기 리턴 → direct POST CAP=2 캐스케이드 → fail=11 도달. 로그 전체에 refreshed(cli) 1건만 존재."
 # @convergence state=stable id=STALE_REFRESH_UNUSED value="~/.airgenome/cl-stale-refresh.<name> 마커 생성되지만 cl 은 안 읽음" symptom="2026-04-13 12:01 cl-stale-refresh.claude10 생성, 픽커는 여전히 0% 표시" mitigation="2026-04-14 shared/.runtime/accounts/markers/ 로 이관 + cl-refresh 가 launchd 로 실측 갱신. 레거시 ~/.airgenome 마커는 deprecated" threshold="마커 존재 시 해당 계정 경고 표시 or refresh 트리거" original_status=RESOLVED
 # @convergence state=evolving id=REFRESH_BACKOFF_PERSISTENCE value="cl-refresh 실패 계정별 지수 backoff 상태를 shared/.runtime/accounts/cl-refresh-cooldown.json 에 영속 — 현재는 매 사이클 재시도" priority=low note="spec — rate_limit_policy.cooldown_persistence. 현재 구현은 cap=2/cycle 만"
+
+# cl 실행 시 background cl-refresh 를 cooldown(기본 30m)으로 트리거.
+# launchd 자동실행 대체 — cl 을 쓰는 맥락에서만 usage-cache 가 갱신됨.
+# CL_KICK_COOLDOWN 환경변수로 초 단위 조정. CL_KICK=0 로 완전 차단.
+kick_bg_refresh() {
+    [ "${CL_KICK:-1}" = "0" ] && return 0
+    local marker="${HOME}/.airgenome/cl-refresh.last_kick"
+    local cooldown="${CL_KICK_COOLDOWN:-1800}"
+    if [ -f "$marker" ]; then
+        local age=$(( $(date +%s) - $(stat -f %m "$marker" 2>/dev/null || echo 0) ))
+        [ "$age" -lt "$cooldown" ] && return 0
+    fi
+    mkdir -p "$(dirname "$marker")" 2>/dev/null
+    : > "$marker"
+    nohup "$(dirname "$0")/cl-refresh" >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+}
+
 case "${1:-interactive}" in
-    ""|interactive)  cmd_interactive ;;
-    u|dashboard|list) show_dashboard ;;
-    status)          show_status ;;
-    pick)            shift || true; cmd_pick "${1:-}" ;;
+    ""|interactive)  kick_bg_refresh; cmd_interactive ;;
+    u|dashboard|list) kick_bg_refresh; show_dashboard ;;
+    status)          kick_bg_refresh; show_status ;;
+    pick)            shift || true; kick_bg_refresh; cmd_pick "${1:-}" ;;
     env)             cmd_env ;;
     refresh)         shift || true; exec "$(dirname "$0")/cl-refresh" "$@" ;;
-    --)              shift; cmd_passthrough "" "$@" ;;
+    --)              shift; kick_bg_refresh; cmd_passthrough "" "$@" ;;
     help|-h|--help)
         cat <<USAGE
 cl — Claude Code multi-account launcher (nexus-managed)
@@ -600,6 +662,7 @@ USAGE
         if account_exists "$1"; then
             name="$1"; shift
             [ "${1:-}" = "--" ] && shift || true
+            kick_bg_refresh
             cmd_passthrough "$name" "$@"
         else
             echo "ERROR(cl): unknown subcommand '$1' — 'cl help'" >&2; exit 64
