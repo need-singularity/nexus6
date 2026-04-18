@@ -8,8 +8,10 @@ cli:   hexa smash --seed "..." [--depth 3]                  (권장, nexus-cli p
 
 core/        blowup.hexa
 guard/       blowup_guard.hexa
-modules/     blowup_{field,holographic,quantum,string,toe,qft}.hexa        (변종6)
-             + 벤치마크/유틸 포함 총 44개 .hexa
+modules/     blowup_{field,holographic,quantum,string,toe,absolute}.hexa   (core6 = n=6 완성)
+             blowup_{qft}.hexa + 벤치마크/유틸 포함 총 53개 .hexa
+             absolute: Mk.VIII (2026-04-19) — Δ₀-absolute Π₀¹ 검증 + [10*]→[11*] 자동 승급
+             compose --modules all = 6 core 순차 실행 (field→holo→quantum→string→toe→absolute)
 lens/        telescope{,_holographic,_quantum}.hexa
              lenses_{core,applied,constants,math,physics,quantum}.hexa
              lens_forge.hexa

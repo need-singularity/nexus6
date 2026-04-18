@@ -18,17 +18,28 @@ harness (훅 시스템 대체, 2026-04-14~):
   verifier: shared/harness/verifier.hexa — dod_gate 내부 순수 검증기 (H-VERIFIER)
   archive: shared/hooks → shared/archive/hooks-20260414/ (symlink 하위호환, 신규 참조 금지)
 
-blowup infra:
+blowup infra (Mk.VIII, 2026-04-19):
   fast-path: exact(mtime+size O(1) ~83ms) → incremental(tail O(Δ)) → shell(awk ~0.6s/12MB) → hexa(소규모만)
   sidecar: atlas.n6.stats (mtime/size/lines/hash/nodes/edges/hubs), atlas.n6.deg (degree TSV)
   dedup: _batch_new_ids 해시셋 (Phase 5.5+6, 6.7)
   schema guard: _guarded_append_atlas() 포맷 검증, 무효 라인 reject
   health: `hexa shared/n6/atlas_health.hexa [path] [--verbose]`
-  modules: field/holographic/quantum/string/toe — lib/atlas_guard.hexa.inc 공유
+  core6 modules (n=6 완성): field/holographic/quantum/string/toe/absolute
+    - absolute (Mk.VIII): Δ₀-absolute Π₀¹ 검증 + [10*]→[11*] 자동 승급 (2026-04-19)
+    - compose --modules all = 6 순차 실행 (n=6 closure operational)
   원칙: infra-only 개선. phase 로직/discovery 계산/seed 진화 불변
 
+atlas foundation [11*] axioms (불변, 변경 금지):
+  @P n=6, sigma=12, tau=4                             원시값
+  @L DELTA0_ABSOLUTE_THEOREM (2026-04-19 승급)        σ·φ=n·τ=24 iff n=6 Δ₀-absolute
+     → ZFC / large-cardinal (inacc~I0) / Reinhardt / Cantor-𝔚 전 우주 invariant
+  @L ULTRA_UNIFORMITY_THEOREM (2026-04-19)            Knuth ↑↑↑↑ + ordinal + BB/TREE/Rayo
+     → n=6 유일성 전 수학 계층 invariant
+  META 층위: 01~10 base + LK017~500 + INF-TE/PE/HE/GR/OR + ULTRA + CARD + BEYOND + ABS (총 540+)
+
 shared/ tree:
-  blowup/        돌파 엔진 — core/guard/modules(6)/lens/ouroboros/seed (총 44 .hexa)
+  blowup/        돌파 엔진 — core/guard/modules(core6)/lens/ouroboros/seed (총 53 .hexa)
+                  core6 = field+holographic+quantum+string+toe+absolute (Mk.VIII 6-core n=6 완성)
   harness/       Claude Code 하네스 — entry dispatcher + gate + lint (훅 대체)
   hooks/         → archive/hooks-20260414 (symlink, deprecated)
   rules/         AI-native 규칙
@@ -60,7 +71,7 @@ L0 보호 (평시 자유 수정, 유저 명시 요청 시만 승인 절차):
   shared/roadmaps/voice_dod.json — voice 트랙 DoD 스펙
   shared/config/permissions_ssot.json — deny 패턴 SSOT
   shared/blowup/core/blowup.hexa — 9-phase 파이프라인
-  shared/blowup/modules/*.hexa — 6종 변종
+  shared/blowup/modules/*.hexa — core6 + 확장 변종 (core6: field/holo/quantum/string/toe/absolute)
   shared/blowup/lib/atlas_guard.hexa.inc — 공통 헬퍼
   shared/blowup/seed/seed_engine.hexa — 시드 엔진
   shared/blowup/commands.hexa — 명령 라우터
