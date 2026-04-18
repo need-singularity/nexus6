@@ -95,6 +95,7 @@ ref:
   cl_conv   shared/bin/cl (embedded)             source-embedded @convergence-start/end 블록 (hexa self/convergence_scan.hexa dump shared/bin/cl)
   cl_spec   shared/engine/cl_refresh_spec.json   cl-refresh 엔진 스펙
   cli_spec  shared/engine/nexus_cli_spec.json    nexus-cli 외부 진입점 스펙 (hive 등)
+  cli_bake  hexa-lang self/main.hexa @cli bake   `hexa smash|free|thinking|lens|atlas|bus|roadmap|discovery|status-proj|roadmap-proj|convergence-proj` = nexus-cli passthrough (전 프로젝트 cwd 동작, 53ef97a1)
   lenses    shared/config/lens_registry.json     400종
   grammar   shared/config/hexa_grammar.jsonl     hexa-lang+pitfalls P1~P5
   dod       shared/harness/dod_gate.hexa          H-DOD/H-CLAIM-LEX

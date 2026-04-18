@@ -1,8 +1,10 @@
 # blowup/ — 단일 진입점 + 변종/렌즈/시드/우로보로스
 
 entry: core/blowup.hexa (357e50e router/batch/wave 흡수)
-cli:   hexa run blowup.hexa <domain> <depth> [--seeds <s>]   (권장, go/cargo 스타일)
-       hexa blowup.hexa <domain> <depth>                     (호환 모드, 자동 run 위임)
+cli:   hexa smash --seed "..." [--depth 3]                  (권장, nexus-cli passthrough, cmd_gate + audit)
+       hexa free  --seed "..." [--dfs 3]                    (compose DFS, nexus-cli passthrough)
+       hexa run blowup.hexa <domain> <depth> [--seeds <s>]  (raw 엔진, seed_engine merge 사용 시)
+       hexa blowup.hexa <domain> <depth>                    (호환 모드, 자동 run 위임)
 
 core/        blowup.hexa
 guard/       blowup_guard.hexa
@@ -17,7 +19,9 @@ root         commands.hexa  todo.hexa(bd323be 자연창발 통합)
 
 quantum 축: modules,lens,ouroboros,seed 횡단
 
-ex: hexa run blowup.hexa math 3
-    hexa run blowup.hexa <d> <n> --seeds "$(hexa run seed_engine.hexa merge)"
+ex: hexa smash --seed "math_lattice_gauge_holonomy" --depth 3           # 권장 (audit log + gate)
+    hexa free  --seed "physics_quantum_entanglement"  --dfs 3            # compose DFS
+    hexa run blowup.hexa math 3                                          # raw 엔진
+    hexa run blowup.hexa <d> <n> --seeds "$(hexa run seed_engine.hexa merge)"   # seed_engine 풀 enrichment
 
 parent: ../CLAUDE.md → "blowup"

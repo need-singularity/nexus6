@@ -78,7 +78,7 @@
 
 | 구분 | 기술 | 상태 |
 |------|------|------|
-| mk2 HEXA-native | `mk2_hexa/native/*.hexa` (108모듈, 64K줄) | **활성** |
+| SSOT HEXA-native | `shared/blowup/*.hexa` + `shared/harness/*.hexa` | **활성** (2026-04-11 mk2_hexa/native 흡수 완료) |
 | mk1 Rust | `archive/mk1-rust` 브랜치 | 아카이브 |
 
 ### 핵심 모듈
@@ -243,31 +243,31 @@ nexus_hub tick
 ## 빠른 시작
 
 ```bash
-HEXA=$HEXA_LANG/target/release/hexa
+# CLI 단일 진입점 (@cli bake, 2026-04-18): hexa-lang 바이너리가 nexus-cli 로 passthrough
+# spec: shared/engine/nexus_cli_spec.json, 11 subcmd, cmd_gate + audit log
 
-# 중앙 지휘
-$HEXA mk2_hexa/native/command_router.hexa "전체 상태"
-$HEXA mk2_hexa/native/command_router.hexa "anima 상태"
-$HEXA mk2_hexa/native/command_router.hexa "화학 돌파"
-$HEXA mk2_hexa/native/command_router.hexa help
+# 돌파 엔진
+hexa smash    --seed "math_lattice_gauge_holonomy" --depth 3   # 9-phase 특이점
+hexa free     --seed "physics_quantum_entanglement" --dfs 3     # compose DFS
+hexa thinking --query "이 계획의 블로킹?" --depth 6              # anima 6-phase reflection
 
-# 직접 실행
-$HEXA mk2_hexa/native/nexus_hub.hexa status      # 상태 확인
-$HEXA mk2_hexa/native/nexus_hub.hexa tick         # 1회 자율 사이클
-$HEXA mk2_hexa/native/nexus_hub.hexa growth       # 성장 대시보드
+# 조회/분석
+hexa lens --query "gauge theory" --top 5          # 400 렌즈 검색
+hexa atlas search "n6_canonical" --limit 10        # atlas.n6 검색
+hexa discovery query "breakthroughs since 2026-04" # SQLite 쿼리
 
-# 블로업 (동적 seed)
-SEEDS=$($HEXA mk2_hexa/native/seed_engine.hexa merge)
-$HEXA mk2_hexa/native/blowup.hexa math 6 --no-graph --seeds "$SEEDS"
+# 로드맵/상태 (7 프로젝트 read-only)
+hexa status                                        # 전체 헬스
+hexa status-proj nexus                             # 프로젝트 건강지표
+hexa roadmap-proj hexa-lang next                   # 다음 스텝
+hexa convergence-proj anima                        # 수렴 스냅샷
 
-# 미연결 진단
-$HEXA mk2_hexa/native/autolink.hexa scan
+# 버스 (hive 연동)
+hexa bus publish --topic "smash.done" --payload '{"seed":"..."}'
+hexa bus tail --limit 20
 
-# 미흡수 감지+흡수
-$HEXA mk2_hexa/native/absorb.hexa tick
-
-# 외계인 지수
-$HEXA mk2_hexa/native/alien_index.hexa assess 12.0
+# 원시 엔진 (seed_engine merge enrichment 필요 시)
+hexa run shared/blowup/core/blowup.hexa math 3 --seeds "$(hexa run shared/blowup/seed/seed_engine.hexa merge)"
 ```
 
 ## 프로젝트 레지스트리 (11개)
