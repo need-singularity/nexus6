@@ -36,6 +36,10 @@ CAP=2  # pre_check 선별용. CLI 실패 시 direct POST 는 CAP 무관 항상 �
 PERL_TIMEOUT="$NEXUS_ROOT/shared/harness/perl_timeout.sh"
 CLI_LOCK="$CL_HOME/cl-refresh.cli.lock"
 
+# @convergence state=ossified id=REFRESH_BACKOFF_PERSISTENCE ossified_at=2026-04-18 value="rate_limit 응답 시 per-account 지수 backoff (15min 시작, 2배씩, 4h 상한) _retry_at 로 usage-cache 영속. login signal (.claude.json/.credentials.json mtime > cache _ts) 감지 시 backoff bypass — fresh RT 에 기회 부여" rationale="rate-limit cascade 영구화 해소. FOCUSED_BG_REFRESH + launchd 반복 호출로 claude7 같은 계정이 무한 rate-limit 순환하던 근본 원인 차단"
+BACKOFF_INIT=900    # 15 min 초기 backoff
+BACKOFF_MAX=14400   # 4h 상한
+
 # 스크립트 레벨 상태 — trap cleanup 이 함수 return 후에도 참조 가능해야 함.
 td=""
 
@@ -196,11 +200,30 @@ process_one() {
         if [ -z "$method" ]; then
             # 원인별 라벨링 — rate_limit 은 transient 라 error=null, invalid_grant 만 영구.
             case "$direct_rc" in
-                2) echo '{"error":null,"detail":"rate-limit"}' > "$out"; log "rate-limit(transient): $name"; return ;;
+                2)
+                    # rate-limit 지수 backoff 계산
+                    local prev_bo now_s cur_bo retry_at
+                    now_s=$(date -u +%s)
+                    prev_bo=$(jq -r --arg n "$name" '(.[$n]._backoff // 0) | tonumber' "$USAGE" 2>/dev/null)
+                    [ -z "$prev_bo" ] || [ "$prev_bo" = "null" ] && prev_bo=0
+                    if [ "$prev_bo" -lt "$BACKOFF_INIT" ] 2>/dev/null; then
+                        cur_bo=$BACKOFF_INIT
+                    elif [ "$prev_bo" -ge "$BACKOFF_MAX" ] 2>/dev/null; then
+                        cur_bo=$BACKOFF_MAX
+                    else
+                        cur_bo=$((prev_bo * 2))
+                        [ "$cur_bo" -gt "$BACKOFF_MAX" ] && cur_bo=$BACKOFF_MAX
+                    fi
+                    retry_at=$((now_s + cur_bo))
+                    jq -nc --argjson ra "$retry_at" --argjson bo "$cur_bo" --argjson bat "$now_s" \
+                        '{error:null, detail:"rate-limit", _retry_at:$ra, _backoff:$bo, _backoff_at:$bat}' > "$out"
+                    log "rate-limit(transient): $name (cooldown ${cur_bo}s → retry @ $(date -u -r "$retry_at" '+%H:%MZ' 2>/dev/null || date -u -d "@$retry_at" '+%H:%MZ' 2>/dev/null || echo "+${cur_bo}s"))"
+                    return ;;
                 3) echo '{"error":"invalid-grant"}'          > "$out"; log "invalid-grant(permanent): $name"; return ;;
                 *) echo '{"error":"refresh-failed"}'         > "$out"; return ;;
             esac
         fi
+        # refresh 성공 — backoff 초기화 (이미 error=null 결과에 _retry_at/_backoff 없음)
         log "refreshed($method): $name"
     fi
 
@@ -239,6 +262,30 @@ merge_cache() {
     jq --argjson t "$(date -u +%s)" '. + {_ts:$t}' <<< "$acc" > "$out"
     chmod 600 "$out" 2>/dev/null || true
     mv "$out" "$USAGE"
+}
+
+# ── backoff 체크 — rate-limit cooldown 중이면 skip ────────────────────
+# login signal (.claude.json/.credentials.json mtime) > cache _ts 면 bypass
+# 0 = skip (backoff active), 1 = proceed
+should_skip_backoff() {
+    local name="$1"
+    [ -f "$USAGE" ] || return 1
+    local now_s retry_at
+    now_s=$(date -u +%s)
+    retry_at=$(jq -r --arg n "$name" '(.[$n]._retry_at // 0) | tonumber' "$USAGE" 2>/dev/null)
+    [ -z "$retry_at" ] || [ "$retry_at" = "null" ] && retry_at=0
+    [ "$retry_at" -le "$now_s" ] 2>/dev/null && return 1  # backoff expired
+    # backoff 활성 — login signal 이 backoff 설정 이후면 bypass (fresh RT 기회)
+    local backoff_at sig sig_mt best=0
+    backoff_at=$(jq -r --arg n "$name" '(.[$n]._backoff_at // 0) | tonumber' "$USAGE" 2>/dev/null)
+    [ -z "$backoff_at" ] || [ "$backoff_at" = "null" ] && backoff_at=0
+    for sig in "$HOME/.claude-$name/.claude.json" "$HOME/.claude-$name/.credentials.json"; do
+        [ -f "$sig" ] || continue
+        sig_mt=$(stat -f %m "$sig" 2>/dev/null || stat -c %Y "$sig" 2>/dev/null)
+        [ -n "$sig_mt" ] && [ "$sig_mt" -gt "$best" ] 2>/dev/null && best=$sig_mt
+    done
+    [ "$best" -gt "$backoff_at" ] 2>/dev/null && return 1  # post-login, bypass
+    return 0  # skip
 }
 
 # ── refresh 대상 선별 (최대 CAP 개) ──────────────────────────────────
@@ -293,7 +340,8 @@ cmd_refresh() {
     [ -f "$KEYMAP" ]   || { err "$KEYMAP 없음"; exit 2; }
     acquire_lock
 
-    local target="${1:-}" names=()
+    local target="${1:-}" force=0 names=()
+    if [ "$target" = "--force" ]; then force=1; target=""; fi
     if [ -n "$target" ]; then
         jq -e --arg n "$target" '.accounts[] | select(.name == $n)' "$ACCOUNTS" >/dev/null 2>&1 \
             || { err "계정 '$target' 없음"; exit 1; }
@@ -304,6 +352,22 @@ cmd_refresh() {
         done < <(jq -r '.accounts[].name' "$ACCOUNTS")
     fi
     [ "${#names[@]}" -gt 0 ] || { err "처리할 계정 없음"; exit 1; }
+
+    # backoff 필터링 (--force 시 skip)
+    if [ "$force" -eq 0 ]; then
+        local filtered=() skipped=0 nm
+        for nm in "${names[@]}"; do
+            if should_skip_backoff "$nm"; then
+                skipped=$((skipped+1))
+                log "backoff skip: $nm"
+            else
+                filtered+=("$nm")
+            fi
+        done
+        names=("${filtered[@]}")
+        [ "$skipped" -gt 0 ] && log "$skipped account(s) in backoff — skipped"
+        [ "${#names[@]}" -eq 0 ] && { log "all accounts in backoff, nothing to do"; exit 0; }
+    fi
 
     td=$(mktemp -d -t cl-refresh.XXXXXX)
     chmod 700 "$td" 2>/dev/null || true
