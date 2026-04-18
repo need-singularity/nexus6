@@ -108,16 +108,68 @@ TAIL_ERR_PID=$!
 # HEXA_STAGE0_RSS_CAP_KB 로 override (default 4GB=4194304 KB).
 RSS_CAP_KB="${HEXA_STAGE0_RSS_CAP_KB:-4194304}"
 EXIT_CODE=""
+
+# pid_tree <root> — echo root pid + all descendants (DFS, ps-based). macOS 호환.
+pid_tree() {
+  local root="$1" frontier next pid parent
+  frontier="$root"
+  printf '%s\n' "$root"
+  # Walk up to 8 generations to avoid runaway; stage0 child depth is usually ≤3.
+  for _ in 1 2 3 4 5 6 7 8; do
+    next=""
+    # 1 pass over full ps table per generation (cheap: hundreds of rows).
+    while IFS= read -r line; do
+      pid=$(printf '%s' "$line" | awk '{print $1}')
+      parent=$(printf '%s' "$line" | awk '{print $2}')
+      case " $frontier " in
+        *" $parent "*)
+          printf '%s\n' "$pid"
+          next="$next $pid" ;;
+      esac
+    done < <(ps -Ao pid=,ppid= 2>/dev/null)
+    [ -z "$next" ] && break
+    frontier="$next"
+  done
+}
+
+# sum_rss_kb <pid...> — echo total RSS (KB) of given pids. Missing pids skipped.
+sum_rss_kb() {
+  local pids="$*"
+  [ -z "$pids" ] && { echo 0; return; }
+  # -p accepts comma-separated list; build it from space-separated input.
+  local csv
+  csv=$(printf '%s' "$pids" | tr ' \n' ',,' | sed 's/,,*/,/g; s/^,//; s/,$//')
+  ps -o rss= -p "$csv" 2>/dev/null | awk '{s+=$1} END {print s+0}'
+}
+
 while true; do
   INFO=$(launchctl print gui/$UID_N/$LABEL 2>/dev/null)
   if [ $? -ne 0 ]; then break; fi
-  # RSS watchdog — pid from launchctl print, RSS from ps. 둘 다 없으면 skip.
-  JOB_PID=$(printf '%s' "$INFO" | awk -F'= ' '/^[[:space:]]*pid = / {gsub(/[^0-9]/,"",$2); print $2; exit}')
+  # RSS watchdog — pid from launchctl print, RSS = job pid + all descendants.
+  #
+  # awk regex tolerance (2026-04-18 91306 incident post-mortem):
+  #   launchctl print emits `\tpid = NNN` on its own line when state=running.
+  #   Old regex `/^[[:space:]]*pid = /` only matched single-space after `=`; a
+  #   future launchd reformat to `pid  =  NNN` or `pid=NNN` would silently drop
+  #   watchdog. New regex: `/^[[:space:]]*pid[[:space:]]*=/` tolerates any
+  #   whitespace around `=` and pulls first numeric field. Does NOT match
+  #   `pid-local`/`pidfile`/`pid-forwarding` (char after `pid` must be space
+  #   or `=`). sed fallback preserved for parity debugging.
+  #
+  # Descendant aggregation (2026-04-18 post-mortem):
+  #   Even though ProgramArguments invokes hexa_stage0.real directly (not the
+  #   shell shim), stage0.real itself shells out clang/flatten/cc during
+  #   codegen. 91306 incident: JOB_PID's RSS was small (stage0 awaiting child)
+  #   while descendant clang ate 13GB. ps rss of JOB_PID alone missed this.
+  #   Fix: sum RSS across pid tree (pid + descendants via ppid walk).
+  JOB_PID=$(printf '%s' "$INFO" | awk '/^[[:space:]]*pid[[:space:]]*=/ {for (i=1;i<=NF;i++) if ($i ~ /^[0-9]+$/) {print $i; exit}}')
   if [ -n "$JOB_PID" ] && [ "$JOB_PID" != "0" ]; then
-    RSS_KB=$(ps -o rss= -p "$JOB_PID" 2>/dev/null | tr -d ' ')
+    TREE=$(pid_tree "$JOB_PID" | tr '\n' ' ')
+    RSS_KB=$(sum_rss_kb $TREE)
     if [ -n "$RSS_KB" ] && [ "$RSS_KB" -gt "$RSS_CAP_KB" ]; then
-      echo "safe_hexa_launchd: RSS watchdog — pid=$JOB_PID rss=${RSS_KB}KB > cap=${RSS_CAP_KB}KB → SIGKILL" >&2
-      kill -KILL "$JOB_PID" 2>/dev/null || true
+      echo "safe_hexa_launchd: RSS watchdog — pid=$JOB_PID tree=[$TREE] rss=${RSS_KB}KB > cap=${RSS_CAP_KB}KB → SIGKILL" >&2
+      # Kill descendants first so stage0 sees children die, then kill stage0.
+      for p in $TREE; do kill -KILL "$p" 2>/dev/null || true; done
       launchctl kill KILL "gui/$UID_N/$LABEL" 2>/dev/null || true
       EXIT_CODE=137  # SIGKILL canonical
       break
