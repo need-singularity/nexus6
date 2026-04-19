@@ -1,0 +1,88 @@
+{
+  "schema": "anima.troubleshoot.ossified.v1",
+  "bug_id": "voice_routes_loader_stall_20260420",
+  "date_recorded": "2026-04-20",
+  "recorded_by": "dest1_alm P1 serve blocker close session",
+  "severity": "high",
+  "status": "workaround_shipped_followup_tracked",
+  "bug_class": "hexa_stage0_interpreter_semantics",
+  "short_title": "serve_alm_native.hexa never binds because imported vr_*/hr_* functions are undefined at runtime",
+  "initial_symptom_reported": "`use \"voice_routes\"` module loader stalls 20s+ without listen bind",
+  "actual_symptom_on_investigation": "Smoke test fails 3/8 (T3/T6/T7) with 'Runtime error: undefined function: vr_extract_string, vr_extract_int, vr_json_escape, hr_presets_extended, hr_personas, hr_capabilities_json'. main() returns early at serve_alm_native.hexa:800 (`if rc > 0 { return }`) BEFORE reaching net_listen. No 20s stall — full run took 10.94s (3.70s without imports, 7s is just the redundant parse of voice_routes + hire_routes).",
+  "root_cause": {
+    "summary": "stage0 interpreter treats `use \"path\"` as a runtime no-op — imported functions NEVER land in env_fns.",
+    "evidence_path": "/Users/ghost/Dev/hexa-lang/self/hexa_full.hexa",
+    "evidence_line": 8256,
+    "evidence_snippet": "if k == \"Use\" || k == \"UseStmt\" || k == \"ImportStmt\" { return val_void() }",
+    "design_context": "Proper flow requires flatten_imports preprocessor (self/module_loader.hexa) to inline all transitively-used files into a single flattened source BEFORE `hexa run`. Running `hexa run` directly on a file with `use` statements silently drops the imports. http_server.hexa and others in serving/ have the same latent bug but fail at parse (pre-existing `Handle` token regression at line 92), masking the use-resolution gap."
+  },
+  "diagnosis_steps": [
+    "`hexa parse serving/voice_routes.hexa` → 0.09s OK (not a parse stall)",
+    "`hexa parse serving/serve_alm_native.hexa` → 0.06s OK",
+    "`/usr/bin/time hexa run serving/serve_alm_native.hexa` → 10.94s with use / 3.70s without — 7s delta is redundant parse only, not a hang",
+    "Runtime logs show `Runtime error: undefined function: vr_*` at every call site → confirms use is no-op",
+    "Grep `use` handler in hexa_full.hexa → returns val_void() immediately",
+    "Check module_loader.hexa → CLI-driven preprocessor, not wired into `hexa run`"
+  ],
+  "fix_applied": {
+    "kind": "workaround_inline_minimum_viable",
+    "commit_message": "fix(serve): stage0 use-is-noop — inline JSON helpers, stub /voice/* /hire/* to 501",
+    "file": "/Users/ghost/Dev/anima/serving/serve_alm_native.hexa",
+    "changes": [
+      "Removed `use \"voice_routes\"` and `use \"hire_routes\"` (no-op; skipped the 7s dead parse).",
+      "Inlined `san_json_escape`, `san_extract_string`, `san_extract_int`, `san_is_digit` — byte-only ASCII JSON helpers (verbatim ports of vr_* trio at voice_routes.hexa:856/877/916).",
+      "Replaced 4 call sites (san_persona_json, san_parse_persona_req, san_route /generate, 404 handler) with san_* equivalents.",
+      "Stubbed /voice/health, /voice/profiles, /voice/tts, /voice/e2e, /hire/capabilities to status=501 with body `{\"error\":\"...pending module_loader integration\",\"see\":\"<path>\"}` — re-enable flag stored inline with file:line pointers.",
+      "T7 smoke test expectation flipped from 200 to 501 (pending-state guard).",
+      "Added explanatory comment block in Section 6 documenting the stage0 use-is-noop root cause so future readers understand the inlined copies."
+    ]
+  },
+  "verification": {
+    "startup_time_before_fix": "10.94s (failed smoke, never reached net_listen)",
+    "startup_time_after_fix": "3.8s parse + ~2s smoke, bind within 6s of launch",
+    "smoke_test_result": "8/8 PASS",
+    "curl_get_health": "200 OK {status:ok, model:ALM-14B-chainmerge, runtime_has_net:true, weight_origin:a1_a2orch_a2tool_chainmerge}",
+    "curl_post_alm_persona": "200 OK {text, phi_vec:{16 dims}, laws_pass:true, violations:[], weight_origin, gen_ms, backend:hexa-native-stub} — AN11 schema compliant",
+    "an11_weight_emergent": true,
+    "an11_phi_vec_present": true,
+    "an11_laws_gate_present": true,
+    "bind_proof": "lsof -nP -iTCP:8090 -sTCP:LISTEN reported: hexa_stag PID ... IPv4 ... TCP *:8090 (LISTEN)"
+  },
+  "reproducer": {
+    "before_fix": [
+      "cd /Users/ghost/Dev/anima",
+      "git checkout 4babe794~ -- serving/serve_alm_native.hexa  # revert to pre-inline state",
+      "hexa run serving/serve_alm_native.hexa   # observe: 3 undefined-function errors, 5/8 smoke, main returns before listen, port 8090 stays free"
+    ],
+    "after_fix": [
+      "cd /Users/ghost/Dev/anima",
+      "hexa run serving/serve_alm_native.hexa &",
+      "sleep 6",
+      "curl -s http://127.0.0.1:8090/health   # 200 OK",
+      "curl -s -X POST http://127.0.0.1:8090/alm/persona -d '{\"persona\":\"smoke\",\"prompt\":\"hi\"}'   # 200 OK with AN11 JSON"
+    ]
+  },
+  "affected_versions": {
+    "hexa_toolchain": "0.1.0-stage1 (status reports stage0 interp at build/hexa_stage0)",
+    "hexa_full_hexa_commit_context": "self/hexa_full.hexa @ 8256 use-is-noop — present in all stage0 builds 2026-04-13 onwards",
+    "anima_commits_with_latent_bug": "any serve_alm_native.hexa with `use` directives prior to 4babe794 / this session's fix commit"
+  },
+  "followup_tickets": [
+    {
+      "id": "dest1_alm/P1_followup_module_loader_flatten",
+      "goal": "Integrate self/module_loader.hexa flatten step into `hexa run` (or add a `hexa run --flatten` subcommand) so `use \"x\"` actually links functions.",
+      "unblocks": "re-enable /voice/* and /hire/* routes in serve_alm_native.hexa by reverting the 501 stubs — file:line pointers are preserved in the stubs' own comments.",
+      "acceptance": "serving/voice_routes.hexa:1373 vr_health_json and serving/hire_routes.hexa:842 hr_capabilities_json callable from serve_alm_native.hexa without inlining."
+    }
+  ],
+  "constraints_respected": {
+    "R37_hexa_first": "no .py / .rs / .sh created or modified",
+    "L0_freeze": "anima/core/{hub,laws,runtime/anima_runtime}.hexa untouched",
+    "AN11": "weight_emergent + phi_vec[16] + laws_pass + weight_origin — verified via curl",
+    "feedback_troubleshoot_comments": "inline comment in serve_alm_native.hexa Section 6 explains root cause + fix",
+    "feedback_troubleshoot_ossified": "this JSON"
+  },
+  "also_observed_not_fixed": [
+    "serving/http_server.hexa:92 Parse error at col 22: expected RParen, got Handle ('handle') — unrelated pre-existing parser regression, out of dest1_alm P1 scope."
+  ]
+}
