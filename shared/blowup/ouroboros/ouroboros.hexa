@@ -25,6 +25,138 @@ pure fn sqrt_f(x: float) -> float {
     guess
 }
 
+// ─── SR(Stochastic Resonance) adaptive threshold ───
+// 발견 p-stochastic-resonance-nexus.md: σ≈0.1 에서 ouroboros 수렴률 peak (25%)
+// σ_peak 은 실측 re-estimate 가능하도록 상수 분리 (후속 세션 tuning 대상)
+comptime const sr_sigma_peak = 0.1
+comptime const sr_base_threshold = 0.5
+comptime const sr_rolling_window = 5
+
+// 표본 표준편차 σ = sqrt( Σ(x_i - mean)^2 / (N-1) )
+pure fn estimate_sigma(history)  -> float {
+    let n = history.len()
+    if n < 2 { return 0.0 }
+    let mut sum = 0.0
+    let mut i = 0
+    while i < n { sum = sum + history[i]; i = i + 1 }
+    let mean = sum / to_float(n)
+    let mut ss = 0.0
+    i = 0
+    while i < n {
+        let d = history[i] - mean
+        ss = ss + d * d
+        i = i + 1
+    }
+    sqrt_f(ss / to_float(n - 1))
+}
+
+// SR-adaptive threshold: σ 가 peak 근처면 관대 (탐지 ↑), 멀어지면 엄격
+// new_threshold = base × (1 + σ/σ_peak)
+// σ=0 → base (기존과 동일), σ=σ_peak → 2×base, σ=2σ_peak → 3×base
+pure fn sr_adaptive_threshold(round_idx: int, resonance_history) -> float {
+    let n = resonance_history.len()
+    if n < 2 { return sr_base_threshold }
+    // rolling window — 최근 sr_rolling_window 항목만
+    let start = if n > sr_rolling_window { n - sr_rolling_window } else { 0 }
+    let mut window = []
+    let mut k = start
+    while k < n { window = window + [resonance_history[k]]; k = k + 1 }
+    let sigma = estimate_sigma(window)
+    let ratio = sigma / sr_sigma_peak
+    sr_base_threshold * (1.0 + ratio)
+}
+
+// nexus.json sr_sigma_tracker append (최신 50 round 만 유지)
+// 기존 스키마 유지하며 sr_sigma_tracker 배열만 append
+fn append_sr_sigma_tracker(round_idx: int, sigma: float, threshold: float, emergence_count: int) {
+    let nx = env("NEXUS")
+    let root = if nx != "" { nx } else { env("HOME") + "/Dev/nexus" }
+    let path = root + "/shared/convergence/nexus.json"
+    let existing = read_file(path)
+    let entry = "{\"ts\":" + to_string(time_now()) + ",\"round\":" + to_string(round_idx) + ",\"sigma\":" + to_string(sigma) + ",\"threshold\":" + to_string(threshold) + ",\"emergence\":" + to_string(emergence_count) + "}"
+
+    // 간단한 접근: 파일 없으면 최소 스키마 생성
+    if existing == "" {
+        let seed = "{\n  \"_meta\": {\n    \"project\": \"nexus\",\n    \"schema\": \"sr_sigma_tracker v1\",\n    \"sr_sigma_peak\": " + to_string(sr_sigma_peak) + ",\n    \"sr_base_threshold\": " + to_string(sr_base_threshold) + ",\n    \"max_entries\": 50\n  },\n  \"sr_sigma_tracker\": [" + entry + "]\n}\n"
+        write_file(path, seed)
+        return
+    }
+
+    // 기존 내용에서 sr_sigma_tracker 배열을 찾아 append
+    // 간단 문자열 처리 — "sr_sigma_tracker": [ ... ] 직전 "]" 위치에 "," + entry 삽입
+    let key = "\"sr_sigma_tracker\""
+    let idx = existing.find(key)
+    if idx < 0 {
+        // 키 없음 → _meta 뒤에 추가
+        let close_brace_pos = existing.rfind("}")
+        if close_brace_pos < 0 {
+            // fallback: 새로 씀
+            let seed = "{\n  \"_meta\": {\"project\": \"nexus\", \"sr_sigma_peak\": " + to_string(sr_sigma_peak) + "},\n  \"sr_sigma_tracker\": [" + entry + "]\n}\n"
+            write_file(path, seed)
+            return
+        }
+        let prefix = existing.slice(0, close_brace_pos)
+        // trailing comma 안전 처리 — prefix 끝 }/ 직전이 { 이면 콤마 불필요
+        let has_content = prefix.find("\"") >= 0
+        let sep = if has_content { ",\n  " } else { "\n  " }
+        let new_content = prefix + sep + "\"sr_sigma_tracker\": [" + entry + "]\n}\n"
+        write_file(path, new_content)
+        return
+    }
+
+    // 배열 끝 "]" 위치 찾기 (key 이후 첫 "]")
+    let after_key = existing.slice(idx, existing.len())
+    let arr_open = after_key.find("[")
+    if arr_open < 0 {
+        // 스키마 비정상 → 덮어쓰기 skip
+        return
+    }
+    let arr_close_rel = after_key.find("]")
+    if arr_close_rel < 0 { return }
+    let abs_open = idx + arr_open
+    let abs_close = idx + arr_close_rel
+    let inside = existing.slice(abs_open + 1, abs_close)
+    // 기존 항목 수 제한 (최신 50 round) — 콤마 카운트 + 1
+    let mut entries = []
+    if inside.len() > 0 {
+        let parts = inside.split("},{")
+        let mut p_i = 0
+        while p_i < parts.len() {
+            let raw = parts[p_i]
+            let fixed = if parts.len() == 1 {
+                raw
+            } else if p_i == 0 {
+                raw + "}"
+            } else if p_i == parts.len() - 1 {
+                "{" + raw
+            } else {
+                "{" + raw + "}"
+            }
+            entries = entries + [fixed]
+            p_i = p_i + 1
+        }
+    }
+    entries = entries + [entry]
+    // 최신 50 만 유지
+    if entries.len() > 50 {
+        let mut trimmed = []
+        let mut t_i = entries.len() - 50
+        while t_i < entries.len() { trimmed = trimmed + [entries[t_i]]; t_i = t_i + 1 }
+        entries = trimmed
+    }
+    let mut new_inside = ""
+    let mut e_i = 0
+    while e_i < entries.len() {
+        if e_i > 0 { new_inside = new_inside + "," }
+        new_inside = new_inside + entries[e_i]
+        e_i = e_i + 1
+    }
+    let prefix = existing.slice(0, abs_open + 1)
+    let suffix = existing.slice(abs_close, existing.len())
+    let new_content = prefix + new_inside + suffix
+    write_file(path, new_content)
+}
+
 // ─── 변이 전략 (MutationStrategy) ───
 
 comptime const strategy_parameter_shift = 0
@@ -421,8 +553,9 @@ fn new_growth_state() -> GrowthState {
     }
 }
 
-// apply: 가중 필터링 + 공명 탐지
-fn growth_apply(state: GrowthState, input)  {
+// apply: 가중 필터링 + 공명 탐지 (SR-adaptive threshold)
+// threshold 는 sr_adaptive_threshold() 로 round 마다 동적 계산 (메모리 p-stochastic-resonance-nexus.md)
+fn growth_apply(state: GrowthState, input, threshold: float)  {
     let mut output = []
     let mut i = 0
     while i < input.len() {
@@ -439,10 +572,10 @@ fn growth_apply(state: GrowthState, input)  {
             }]
         }
 
-        // 인접 이벤트 공명 체크
+        // 인접 이벤트 공명 체크 — SR-adaptive threshold
         if i + 1 < input.len() {
             let resonance = abs_f(event.value - input[i + 1].value)
-            if resonance < 0.5 {
+            if resonance < threshold {
                 output = output + [GrowthEvent {
                     source: "resonance(" + event.source + "," + input[i + 1].source + ")",
                     kind: "emergence",
@@ -453,6 +586,18 @@ fn growth_apply(state: GrowthState, input)  {
         i = i + 1
     }
     output
+}
+
+// 공명 샘플 추출 (threshold 계산용 history)
+// 인접 쌍 |v_i - v_{i+1}| 목록 반환
+pure fn extract_resonance_samples(input)  {
+    let mut samples = []
+    let mut i = 0
+    while i + 1 < input.len() {
+        samples = samples + [abs_f(input[i].value - input[i + 1].value)]
+        i = i + 1
+    }
+    samples
 }
 
 // absorb_self: 산출물이 가중치를 변형
@@ -503,7 +648,7 @@ pure fn depth_label(d: int) -> string {
     }
 }
 
-// Absorber 실행: f(f(f(...))) 수렴 루프
+// Absorber 실행: f(f(f(...))) 수렴 루프 + SR-adaptive threshold
 fn run_absorber(initial_input) -> AbsorptionChain {
     let mut state = new_growth_state()
     let mut layers = []
@@ -511,11 +656,47 @@ fn run_absorber(initial_input) -> AbsorptionChain {
     let mut prev_measure = 0.0
     let mut total_yield = 0
 
+    // SR rolling window: 최근 round 의 resonance 샘플 누적
+    let mut resonance_history = []
+
     let mut depth = 0
     while depth < absorber_max_depth {
-        let output = growth_apply(state, current_input)
+        // SR-adaptive threshold: round 시작 시 history 기반 계산
+        let threshold = sr_adaptive_threshold(depth, resonance_history)
+
+        // 이번 round 의 resonance 샘플을 추출해서 history 에 추가
+        let samples = extract_resonance_samples(current_input)
+        let mut s_i = 0
+        while s_i < samples.len() {
+            resonance_history = resonance_history + [samples[s_i]]
+            s_i = s_i + 1
+        }
+        // history trim (최신 sr_rolling_window × 8 만 유지 — 폭주 방지)
+        let max_hist = sr_rolling_window * 8
+        if resonance_history.len() > max_hist {
+            let mut trimmed = []
+            let mut t_i = resonance_history.len() - max_hist
+            while t_i < resonance_history.len() { trimmed = trimmed + [resonance_history[t_i]]; t_i = t_i + 1 }
+            resonance_history = trimmed
+        }
+
+        // SR tracker 기록용 sigma (현재 history 기반)
+        let sigma_now = estimate_sigma(resonance_history)
+
+        let output = growth_apply(state, current_input, threshold)
         let yield_count = output.len()
         total_yield = total_yield + yield_count
+
+        // emergence count (kind == "emergence")
+        let mut emergence_count = 0
+        let mut eo_i = 0
+        while eo_i < output.len() {
+            if output[eo_i].kind == "emergence" { emergence_count = emergence_count + 1 }
+            eo_i = eo_i + 1
+        }
+
+        // nexus.json sr_sigma_tracker append
+        append_sr_sigma_tracker(depth, sigma_now, threshold, emergence_count)
 
         let current_measure = growth_measure(output)
         let delta = abs_f(current_measure - prev_measure)

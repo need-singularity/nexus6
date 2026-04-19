@@ -101,18 +101,36 @@ println("")
 
 println("── 2. Degree Distribution ────────────────────────────────")
 
-// Bucket the distribution into useful ranges
-let deg0  = _exec_int("awk -F'\\t' '$NF==0' '" + DEG_PATH + "' | wc -l")
-let deg1  = _exec_int("awk -F'\\t' '$NF==1' '" + DEG_PATH + "' | wc -l")
-let deg2  = _exec_int("awk -F'\\t' '$NF==2' '" + DEG_PATH + "' | wc -l")
-let deg3  = _exec_int("awk -F'\\t' '$NF==3' '" + DEG_PATH + "' | wc -l")
-let deg4  = _exec_int("awk -F'\\t' '$NF==4' '" + DEG_PATH + "' | wc -l")
-let deg5  = _exec_int("awk -F'\\t' '$NF==5' '" + DEG_PATH + "' | wc -l")
-let deg_6_10  = _exec_int("awk -F'\\t' '$NF>=6 && $NF<=10' '" + DEG_PATH + "' | wc -l")
-let deg_11_50 = _exec_int("awk -F'\\t' '$NF>=11 && $NF<=50' '" + DEG_PATH + "' | wc -l")
-let deg_51_100 = _exec_int("awk -F'\\t' '$NF>=51 && $NF<=100' '" + DEG_PATH + "' | wc -l")
-let deg_101_500 = _exec_int("awk -F'\\t' '$NF>=101 && $NF<=500' '" + DEG_PATH + "' | wc -l")
-let deg_500p = _exec_int("awk -F'\\t' '$NF>500' '" + DEG_PATH + "' | wc -l")
+// ROI #34 (2026-04-19): 11 awk+wc 스캔 → 단일 awk 11-버킷 누산.
+//   이전: 11회 exec(awk ... | wc -l) — 11x 파일 스캔 + 11 syscall
+//   현재: 1회 exec(awk) — 11 카운터를 단일 패스로 누산, 공백 분리 11개 출력
+//   출력 순서 고정: deg0 deg1 deg2 deg3 deg4 deg5 deg_6_10 deg_11_50 deg_51_100 deg_101_500 deg_500p
+let hist_raw = _exec_str("awk -F'\\t' '{d=$NF+0; if(d==0)b0++; else if(d==1)b1++; else if(d==2)b2++; else if(d==3)b3++; else if(d==4)b4++; else if(d==5)b5++; else if(d<=10)b610++; else if(d<=50)b1150++; else if(d<=100)b51100++; else if(d<=500)b101500++; else b500p++} END{printf \"%d %d %d %d %d %d %d %d %d %d %d\", b0+0,b1+0,b2+0,b3+0,b4+0,b5+0,b610+0,b1150+0,b51100+0,b101500+0,b500p+0}' '" + DEG_PATH + "'")
+let hist_parts = hist_raw.split(" ")
+let mut deg0: i64  = 0
+let mut deg1: i64  = 0
+let mut deg2: i64  = 0
+let mut deg3: i64  = 0
+let mut deg4: i64  = 0
+let mut deg5: i64  = 0
+let mut deg_6_10: i64 = 0
+let mut deg_11_50: i64 = 0
+let mut deg_51_100: i64 = 0
+let mut deg_101_500: i64 = 0
+let mut deg_500p: i64 = 0
+if len(hist_parts) >= 11 {
+    try { deg0 = to_int(hist_parts[0]) } catch e {}  // @allow-silent-catch
+    try { deg1 = to_int(hist_parts[1]) } catch e {}  // @allow-silent-catch
+    try { deg2 = to_int(hist_parts[2]) } catch e {}  // @allow-silent-catch
+    try { deg3 = to_int(hist_parts[3]) } catch e {}  // @allow-silent-catch
+    try { deg4 = to_int(hist_parts[4]) } catch e {}  // @allow-silent-catch
+    try { deg5 = to_int(hist_parts[5]) } catch e {}  // @allow-silent-catch
+    try { deg_6_10 = to_int(hist_parts[6]) } catch e {}  // @allow-silent-catch
+    try { deg_11_50 = to_int(hist_parts[7]) } catch e {}  // @allow-silent-catch
+    try { deg_51_100 = to_int(hist_parts[8]) } catch e {}  // @allow-silent-catch
+    try { deg_101_500 = to_int(hist_parts[9]) } catch e {}  // @allow-silent-catch
+    try { deg_500p = to_int(hist_parts[10]) } catch e {}  // @allow-silent-catch
+}
 
 fn _pct(part: i64, whole: i64) -> string {
     if whole == 0 { return "0.0%" }
@@ -158,8 +176,53 @@ println("")
 
 println("── 3. Sparsest Domains (by % degree-1 nodes) ────────────")
 
-// Compute per-domain stats via awk
-let domain_stats_raw = _exec_str("awk -F'\\t' '{ split($1, a, \"-\"); pfx=a[1]; total[pfx]++; if($NF<=1) sparse[pfx]++; degsum[pfx]+=$NF } END { for(p in total) { s=0; if(p in sparse) s=sparse[p]; ds=0; if(p in degsum) ds=degsum[p]; printf \"%s\\t%d\\t%d\\t%d\\n\", p, total[p], s, ds } }' '" + DEG_PATH + "' | sort -t$'\\t' -k2 -rn")
+// ROI #35 (2026-04-19): 4 awk+sort chains (lines 162/237/269/417) → 단일 awk 4-accumulator pass.
+//   이전: 4x DEG_PATH 스캔 (per-domain / cluster / domain-hub / raw-hist) + 외부 sort
+//   현재: 1x DEG_PATH 스캔, 4 accumulator 동시 누산, prefixed lines 로 배출
+//   섹션 마커: "D\t" domain_stats, "C\t" cluster (deg==1 cluster), "H\t" domain_hubs, "R\t" raw_hist
+//   sort 는 hexa-land 에서 필요한 섹션만 수행 (외부 sort 제거)
+let merged_raw = _exec_str(
+    "awk -F'\\t' '{" +
+      "n=$1; d=$NF+0; " +
+      // section D: domain totals
+      "dash=index(n,\"-\"); pfx=(dash>0?substr(n,1,dash-1):n); " +
+      "Dt[pfx]++; if(d<=1) Ds[pfx]++; Dg[pfx]+=d; " +
+      // section H: domain hub (max degree per prefix)
+      "if(d>Hmax[pfx]){Hmax[pfx]=d; Hbest[pfx]=n} " +
+      // section C: cluster prefix for degree-1 nodes (depth-2)
+      "if(d==1){" +
+        "if(dash>0){rest=substr(n,dash+1); d2=index(rest,\"_\"); " +
+        "cp=(d2>0?substr(n,1,dash+d2-1):substr(n,1,dash+length(rest)))} " +
+        "else {cp=n} " +
+        "Cc[cp]++" +
+      "} " +
+      // section R: raw histogram
+      "Rc[d]++" +
+    "} END {" +
+      "for(p in Dt){s=0; if(p in Ds) s=Ds[p]; ds=0; if(p in Dg) ds=Dg[p]; printf \"D\\t%s\\t%d\\t%d\\t%d\\n\", p, Dt[p], s, ds} " +
+      "for(p in Hbest){printf \"H\\t%s\\t%s\\t%d\\n\", p, Hbest[p], Hmax[p]} " +
+      "for(cp in Cc){if(Cc[cp]>=5) printf \"C\\t%d\\t%s\\n\", Cc[cp], cp} " +
+      "for(dv in Rc){printf \"R\\t%d\\t%d\\n\", dv, Rc[dv]}" +
+    "}' '" + DEG_PATH + "'"
+)
+let merged_lines = merged_raw.split("\n")
+
+// partition into D/H/C/R sections
+let mut domain_stats_buf = ""
+let mut domain_hubs_buf = ""
+let mut cluster_buf = ""
+let mut raw_hist_buf = ""
+for ml in merged_lines {
+    let mt = ml
+    if mt == "" { continue }
+    if mt.starts_with("D\t") { domain_stats_buf = domain_stats_buf + mt.substring(2, len(mt)) + "\n" }
+    else if mt.starts_with("H\t") { domain_hubs_buf = domain_hubs_buf + mt.substring(2, len(mt)) + "\n" }
+    else if mt.starts_with("C\t") { cluster_buf = cluster_buf + mt.substring(2, len(mt)) + "\n" }
+    else if mt.starts_with("R\t") { raw_hist_buf = raw_hist_buf + mt.substring(2, len(mt)) + "\n" }
+}
+
+// sort domain_stats by total desc (col 2), top 20 taken downstream
+let domain_stats_raw = _exec_str("printf '%s' '" + domain_stats_buf.replace("'", "'\\''") + "' | sort -t$'\\t' -k2 -rn")
 
 let domain_lines = domain_stats_raw.split("\n")
 println("  domain          total   sparse(d<=1)   %sparse   avg_deg")
@@ -233,8 +296,9 @@ println("── 5. Sparse Clusters (domain×depth groups) ───────�
 println("  Groups of degree-1 nodes sharing a common domain prefix.")
 println("")
 
-// Deeper domain grouping for degree-1 nodes: first two segments
-let cluster_raw = _exec_str("awk -F'\\t' '$NF==1 { n=$1; dash=index(n,\"-\"); if(dash>0) { rest=substr(n,dash+1); d2=index(rest,\"_\"); if(d2>0) pfx=substr(n,1,dash+d2-1); else pfx=substr(n,1,dash+length(rest)); } else pfx=n; counts[pfx]++ } END { for(p in counts) if(counts[p]>=5) printf \"%d\\t%s\\n\",counts[p],p }' '" + DEG_PATH + "' | sort -rn | head -25")
+// ROI #35: 이전 awk 스캔 → 병합 awk 의 C 섹션 재사용 (DEG 재스캔 제거)
+let cluster_raw_all = _exec_str("printf '%s' '" + cluster_buf.replace("'", "'\\''") + "' | sort -rn | head -25")
+let cluster_raw = cluster_raw_all
 
 let cluster_lines = cluster_raw.split("\n")
 println("  count   cluster_prefix")
@@ -266,7 +330,8 @@ println("  domain hub. Prioritized by domain sparsity × hub degree.")
 println("")
 
 // Step 6a: Find the top hub per major domain prefix
-let domain_hubs_raw = _exec_str("awk -F'\\t' '{ split($1,a,\"-\"); pfx=a[1]; if($NF > max[pfx]) { max[pfx]=$NF; best[pfx]=$1 } } END { for(p in best) printf \"%s\\t%s\\t%d\\n\", p, best[p], max[p] }' '" + DEG_PATH + "' | sort -t$'\\t' -k3 -rn")
+// ROI #35: 병합 awk 의 H 섹션 재사용 (DEG 재스캔 제거)
+let domain_hubs_raw = _exec_str("printf '%s' '" + domain_hubs_buf.replace("'", "'\\''") + "' | sort -t$'\\t' -k3 -rn")
 
 // Build hub lookup (domain → hub_id)
 let hub_lookup_lines = domain_hubs_raw.split("\n")
@@ -414,7 +479,8 @@ println("")
 // ─── Verbose: raw histogram ───
 if verbose {
     println("── [verbose] Raw Degree Histogram ────────────────────────")
-    let raw_hist = _exec_str("awk -F'\\t' '{deg=$NF; counts[deg]++} END {for(d in counts) printf \"%d\\t%d\\n\", d, counts[d]}' '" + DEG_PATH + "' | sort -n")
+    // ROI #35: 병합 awk 의 R 섹션 재사용 (DEG 재스캔 제거)
+    let raw_hist = _exec_str("printf '%s' '" + raw_hist_buf.replace("'", "'\\''") + "' | sort -n")
     println(raw_hist)
     println("")
 
