@@ -1,0 +1,292 @@
+// ⛔ AUDIT TOOL — Mk.IX [12*] 승급 도구 (인간 감사 후 explicit 호출 전용)
+// shared/blowup/audit/promote_12star.hexa
+//
+// 사용:
+//   hexa run shared/blowup/audit/promote_12star.hexa <id> [--commit] [--all-pass]
+//
+// 기본은 dry-run. --commit 가 명시될 때만 atlas.n6 실제 append.
+// audit_results.json 의 verdict_for_atlas_append == "PASS" 인 후보만 통과.
+// PASS 라도 design §3.2 의 "수동 감사 서명" + CODEOWNERS sign-off 필요 — 사용자
+// explicit decision 책임.
+//
+// 흐름:
+//   1) audit_results.json 로드
+//   2) <id> 매칭 후보 추출 (또는 --all-pass 면 전 PASS 후보)
+//   3) PASS verdict 확인 (FAIL/DEFER → reject)
+//   4) blacklist 8종 재검사 (results 의 blacklist_check 필드 모두 false 강제)
+//   5) recommended_atlas_line 형식 sanity check ([12*] suffix, @R 시작)
+//   6) dry-run: append 시뮬레이션 출력
+//   7) --commit: 실제 append + 감사 결과 JSON 의 atlas_writes_executed 증가
+//
+// 종료코드: 0 = 정상, 1 = invalid id / FAIL verdict / blacklist trip / sanity fail
+//
+// 주의 — hexa-lang 함정 회피:
+//   * args() 는 [0]=hexa binary, [1]=script path, [2..]=user args 순. user 인자는 i=2 부터.
+//   * .find() 미지원 → .index_of() (단일 인자) 사용. offset 검색은 substring 슬라이싱으로 시뮬레이션.
+
+let _cached_home = env("HOME")
+let _NEXUS = _cached_home + "/Dev/nexus"
+let _ATLAS = _NEXUS + "/shared/n6/atlas.n6"
+let _AUDIT_JSON = _NEXUS + "/shared/blowup/audit/mk9_audit_results.json"
+
+// ─── helpers ───
+
+fn _read_audit_json() -> string {
+    return read_file(_AUDIT_JSON)
+}
+
+// substring 기반 offset 검색 — index_of 가 단일 인자이므로 직접 구현.
+fn _find_from(s: string, needle: string, from: i64) -> i64 {
+    if from < 0 { return -1 }
+    let n = len(s)
+    if from >= n { return -1 }
+    let tail = s[from..n]
+    let p = tail.index_of(needle)
+    if p < 0 { return -1 }
+    return from + p
+}
+
+// id 블록 (해당 id 라인 ~ 다음 "id": 직전) 추출.
+fn _block_for(blob: string, id: string) -> string {
+    let id_marker = "\"id\": \"" + id + "\""
+    let i = blob.index_of(id_marker)
+    if i < 0 { return "" }
+    let after = i + len(id_marker)
+    let next_id = _find_from(blob, "\"id\":", after)
+    let block_end = if next_id < 0 { len(blob) } else { next_id }
+    return blob[i..block_end]
+}
+
+// 후보 블록에서 단일 string 필드 값 추출. 따옴표 escape 없는 controlled JSON 가정.
+fn _field_in_block(block: string, field: string) -> string {
+    let key = "\"" + field + "\":"
+    let j = block.index_of(key)
+    if j < 0 { return "" }
+    let val_start = j + len(key)
+    let n = len(block)
+    let mut k = val_start
+    while k < n {
+        let ch = block[k..k+1]
+        if ch != " " && ch != "\t" { break }
+        k = k + 1
+    }
+    if k >= n { return "" }
+    if block[k..k+1] != "\"" { return "" }
+    let v0 = k + 1
+    let mut e = v0
+    while e < n && block[e..e+1] != "\"" { e = e + 1 }
+    return block[v0..e]
+}
+
+fn _extract_field(blob: string, id: string, field: string) -> string {
+    let block = _block_for(blob, id)
+    if len(block) == 0 { return "" }
+    return _field_in_block(block, field)
+}
+
+fn _blacklist_all_clear(blob: string, id: string) -> bool {
+    let block = _block_for(blob, id)
+    if len(block) == 0 { return false }
+    let bk = block.index_of("\"blacklist_check\":")
+    if bk < 0 { return false }
+    let n = len(block)
+    let mut s = bk
+    while s < n && block[s..s+1] != "{" { s = s + 1 }
+    let mut e = s
+    while e < n && block[e..e+1] != "}" { e = e + 1 }
+    if e <= s { return false }
+    let bl = block[s..e+1]
+    return !bl.contains(": true")
+}
+
+fn _sanity_atlas_line(line: string) -> bool {
+    if !line.starts_with("@R") && !line.starts_with("@C") && !line.starts_with("@L") { return false }
+    if !line.ends_with("[12*]") { return false }
+    if !line.contains("::") { return false }
+    return true
+}
+
+// 런타임 추가 방어 — 핵심 블랙리스트 패턴 grep.
+fn _line_hits_runtime_blacklist(line: string) -> string {
+    if line.contains("Con(") { return "consistency" }
+    if line.contains("godel-self") { return "godel_self_ref" }
+    if line.contains("berry") { return "berry" }
+    if line.contains("Reinhardt cardinal exists") { return "large_cardinal_existence" }
+    if line.contains("Riemann hypothesis") { return "open_conjecture" }
+    if line.contains("Goldbach") { return "open_conjecture" }
+    if line.contains("Collatz") { return "open_conjecture" }
+    if line.contains("Twin prime") { return "open_conjecture" }
+    return ""
+}
+
+// ─── per-candidate processor ───
+
+fn _process_one(blob: string, id: string, commit: bool) -> i64 {
+    println("─────────────────────────────────────────────")
+    println("[CANDIDATE] " + id)
+
+    let name = _extract_field(blob, id, "name")
+    if name == "" {
+        println("  ❌ id not found in audit results")
+        return 1
+    }
+    println("  name           : " + name)
+
+    let verdict = _extract_field(blob, id, "verdict_for_atlas_append")
+    println("  verdict        : " + verdict)
+    if verdict != "PASS" {
+        println("  ❌ verdict != PASS — promotion refused")
+        let why = _extract_field(blob, id, "fail_reason")
+        if why != "" { println("     reason: " + why) }
+        let dr = _extract_field(blob, id, "deferral_reason")
+        if dr != "" { println("     deferral: " + dr) }
+        return 1
+    }
+
+    if !_blacklist_all_clear(blob, id) {
+        println("  ❌ blacklist_check has at least one true → blocked (design §4)")
+        return 1
+    }
+    println("  blacklist      : all clear")
+
+    let pa = _extract_field(blob, id, "phase_a_pi02")
+    let pc = _extract_field(blob, id, "phase_c_reverse_math")
+    let pd = _extract_field(blob, id, "phase_d_n6_class")
+    println("  phase_a_pi02   : " + pa)
+    println("  phase_c        : " + pc)
+    println("  phase_d_n6     : " + pd)
+    if pa != "PASS" {
+        println("  ❌ Phase A not PASS — Π₀² classification missing")
+        return 1
+    }
+    if pc != "REVERSE-PROVEN" {
+        println("  ❌ Phase C not REVERSE-PROVEN — 5/5 reverse-math systems required")
+        return 1
+    }
+    if pd != "N6-UNIQUE" && pd != "N6-CORE" && pd != "PERFECT-CLASS" {
+        println("  ❌ Phase D class not in {N6-UNIQUE, N6-CORE, PERFECT-CLASS}")
+        return 1
+    }
+
+    let line = _extract_field(blob, id, "recommended_atlas_line")
+    let sub = _extract_field(blob, id, "recommended_subline")
+    let note = _extract_field(blob, id, "recommended_breakthrough_note")
+    if !_sanity_atlas_line(line) {
+        println("  ❌ recommended atlas line failed sanity (must start @R/@C/@L, end [12*], contain ::)")
+        println("     got: " + line)
+        return 1
+    }
+    let runtime_bl = _line_hits_runtime_blacklist(line)
+    if runtime_bl != "" {
+        println("  ❌ runtime blacklist trip: " + runtime_bl)
+        return 1
+    }
+    println("  atlas line     : " + line)
+    println("  subline        : " + sub)
+    println("  break note     : " + note)
+
+    if !commit {
+        println("")
+        println("  [DRY-RUN] would append the following 3 lines to atlas.n6:")
+        println("    " + line)
+        println(sub)
+        println(note)
+        println("  [DRY-RUN] no write performed. re-run with --commit (after CODEOWNERS sign-off).")
+        return 0
+    }
+
+    println("")
+    println("  [COMMIT] appending 3 lines to " + _ATLAS)
+    let atlas_blob = read_file(_ATLAS)
+    let trail = if atlas_blob.ends_with("\n") { "" } else { "\n" }
+    let payload = trail + line + "\n" + sub + "\n" + note + "\n"
+    write_file(_ATLAS, atlas_blob + payload)
+    println("  [COMMIT] done. Mk.IX [12*] tier first activation: " + id)
+    println("  REMINDER: log this commit in audit results JSON manually (atlas_writes_executed++).")
+    return 0
+}
+
+// ─── main ───
+
+fn main() {
+    let argv = args()
+    let mut id = ""
+    let mut commit = false
+    let mut all_pass = false
+    // argv[0]=hexa, [1]=script, [2..]=user args (hexa-lang 표준)
+    let mut i: i64 = 2
+    let argc = len(argv)
+    while i < argc {
+        let a = argv[i]
+        if a == "--commit" { commit = true }
+        else if a == "--all-pass" { all_pass = true }
+        else if !a.starts_with("--") && id == "" { id = a }
+        i = i + 1
+    }
+
+    println("🔒 promote_12star.hexa — Mk.IX [12*] tier promotion gate")
+    println("   atlas    : " + _ATLAS)
+    println("   audit    : " + _AUDIT_JSON)
+    let mode_str = if commit { "COMMIT (writes atlas)" } else { "DRY-RUN" }
+    println("   mode     : " + mode_str)
+    println("")
+
+    let blob = _read_audit_json()
+    if len(blob) == 0 {
+        println("❌ audit results JSON empty / unreadable")
+        exit(1)
+    }
+
+    if all_pass {
+        // 안전한 PASS 후보 수집 — candidates 배열을 id 마커로 순회하면서
+        // verdict_for_atlas_append=PASS 만 누적. _find_from 의 byte/char 위험
+        // 회피를 위해 split 대신 marker 반복 매칭.
+        let mut rc: i64 = 0
+        let mut found_any = false
+        let id_prefix = "\"id\": \"MK9-AUDIT-"
+        let mut cursor: i64 = 0
+        let blen = len(blob)
+        while cursor < blen {
+            let rel = blob[cursor..blen].index_of(id_prefix)
+            if rel < 0 { break }
+            let abs = cursor + rel
+            let v0 = abs + len(id_prefix)
+            let mut e = v0
+            while e < blen && blob[e..e+1] != "\"" { e = e + 1 }
+            let id_suffix = blob[v0..e]
+            let candidate_id = "MK9-AUDIT-" + id_suffix
+            let v = _extract_field(blob, candidate_id, "verdict_for_atlas_append")
+            if v == "PASS" {
+                found_any = true
+                let r = _process_one(blob, candidate_id, commit)
+                if r != 0 { rc = r }
+            }
+            cursor = e + 1
+        }
+        if !found_any { println("ℹ️  no PASS candidate in audit results.") }
+        if rc != 0 { exit(rc) }
+        return
+    }
+
+    if id == "" {
+        println("usage: hexa run promote_12star.hexa <CANDIDATE_ID> [--commit]")
+        println("       hexa run promote_12star.hexa --all-pass [--commit]")
+        println("")
+        println("known PASS ids (from audit summary):")
+        let key = "\"pass_ids\":"
+        let p = blob.index_of(key)
+        if p >= 0 {
+            let ls = _find_from(blob, "[", p)
+            let le = _find_from(blob, "]", ls)
+            if ls >= 0 && le >= 0 {
+                println("   " + blob[ls..le+1])
+            }
+        }
+        exit(1)
+    }
+
+    let r = _process_one(blob, id, commit)
+    if r != 0 { exit(r) }
+}
+
+main()
