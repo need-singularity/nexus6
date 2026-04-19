@@ -144,10 +144,14 @@ if printf '%s' "$RESULT" | tail -1 | jq -e . >/dev/null 2>&1; then
         CAUSE=$(printf '%s' "$BRAIN_JSON" | jq -r '.cause // ""' 2>/dev/null)
         MSG="$SUMMARY"
         [[ -n "$CAUSE" ]] && [[ "$CAUSE" != "null" ]] && MSG="$MSG — $CAUSE"
-        # osascript — AppleScript 인자 escape
-        MSG_ESC=$(printf '%s' "$MSG" | sed 's/\\/\\\\/g; s/"/\\"/g')
-        TITLE="airgenome $BRAIN_STATUS"
-        /usr/bin/osascript -e "display notification \"$MSG_ESC\" with title \"$TITLE\" sound name \"Basso\"" 2>/dev/null || true
+        # airgenome gate — ~/.airgenome/notify-script.off 존재 시 skip
+        # (Script Editor alert 스타일 팝업 일괄 차단. rm 으로 해제)
+        if [[ ! -f "$HOME/.airgenome/notify-script.off" ]]; then
+            # osascript — AppleScript 인자 escape
+            MSG_ESC=$(printf '%s' "$MSG" | sed 's/\\/\\\\/g; s/"/\\"/g')
+            TITLE="airgenome $BRAIN_STATUS"
+            /usr/bin/osascript -e "display notification \"$MSG_ESC\" with title \"$TITLE\" sound name \"Basso\"" 2>/dev/null || true
+        fi
     fi
 fi
 
