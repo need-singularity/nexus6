@@ -2,15 +2,24 @@
 // External ouroboros-like wrapper with Gaussian-noise injection.
 // Output: shared/discovery/h2_sigma_sweep_results.jsonl  (one row per trial)
 //         shared/discovery/h2_sigma_sweep_summary.jsonl  (one row per σ)
+//         shared/discovery/h2_domain_variance.jsonl      (S1: per-seed tunnel domain + entropy)
 
 comptime const OUT_TRIALS  = "/Users/ghost/Dev/nexus/shared/discovery/h2_sigma_sweep_results.jsonl"
 comptime const OUT_SUMMARY = "/Users/ghost/Dev/nexus/shared/discovery/h2_sigma_sweep_summary.jsonl"
+comptime const OUT_DOMAIN_VARIANCE = "/Users/ghost/Dev/nexus/shared/discovery/h2_domain_variance.jsonl"
 
 comptime const SIGMAS = [0.0, 0.05, 0.10, 0.15, 0.20, 0.30]
 comptime const N_TRIALS = 15   // 6 × 15 × 10 = 900 rounds (budget-safe)
 comptime const ROUNDS   = 10
 
 comptime const N6_VALS = [6.0, 12.0, 2.0, 4.0, 24.0, 5.0]
+
+// S1 (2026-04-19): content-aware drill 재설계
+// N6_VALS 각 인덱스 → 도메인 tag (seed-agnostic variance 측정용)
+// 6.0=math(n), 12.0=physics(σ), 2.0=mind(φ), 4.0=bio(τ), 24.0=arch(J2), 5.0=info(sopfr)
+comptime const N6_DOMAINS = ["math", "physics", "mind", "bio", "arch", "info"]
+comptime const DOMAIN_SEEDS = [1234567890, 2718281828, 3141592653, 1618033988, 4200424242, 9876543210, 1122334455, 5577889900]
+comptime const DOMAIN_TRIALS_PER_SEED = 5  // 각 seed 별 trial 수 (entropy 표본)
 
 comptime const TOL      = 0.02   // 2% alignment tolerance → meaningful σ response
 comptime const CONV_THR = 0.40
@@ -126,6 +135,92 @@ fn run_trial(state, sigma: float) -> int {
     if peak >= CONV_THR { 1 } else { 0 }
 }
 
+// S1: round_tunnel_domain_and_alignment — 한 round 에서 "어떤 N6 도메인이 dominant 하게 정렬" 판정
+// 12 probes (6 anchored + 6 uniform) 각각을 최근접 N6_VALS 인덱스로 분류,
+// 정렬된 probe 만 집계해서 alignment fraction 반환.
+// tunnel_domain 결정은 uniform-probe 의 urand 편향을 배제하기 위해
+// "anchored probes 중 TOL 을 벗어난(= σ 에 의해 도메인이 전이된) 최초 probe 의 실제 landing index"
+// 로 확정 — σ=0 일 때 모든 anchored probe 는 자기 자신에 정렬되므로 landing=원본 idx 임.
+// 따라서 σ=0 → 모든 seed 에서 첫 이동 없음 → default 0(math) 반환 → entropy ≈ 0.
+// 반환: [domain_idx(int as float), alignment_fraction(float)]
+fn round_tunnel_domain_and_alignment(state, sigma: float)  {
+    let mut aligned = 0
+    let total = 12
+    // tunnel 도메인 후보: anchored probe 중 "원본 idx 와 다른 곳에 landing 한" 최초 probe
+    let mut tunnel_idx = 0 - 1
+
+    // 6 anchored probes — 원본 idx vs landing idx 비교
+    let mut i = 0
+    while i < N6_VALS.len() {
+        let c = N6_VALS[i]
+        let v = c + sigma * nrand(state) * c
+        let mut best = 1000000.0
+        let mut best_j = 0
+        let mut j = 0
+        while j < N6_VALS.len() {
+            let cj = N6_VALS[j]
+            let scale = if abs_f(cj) > 1.0 { abs_f(cj) } else { 1.0 }
+            let d = abs_f(v - cj) / scale
+            if d < best { best = d; best_j = j }
+            j = j + 1
+        }
+        if best < TOL { aligned = aligned + 1 }
+        // tunnel 판정: 원본 idx i → nearest-neighbor best_j 로 drift → 도메인 전이
+        // best < TOL 제약은 풀어서 "강한 noise 로 인한 drift 방향" 도 포착
+        // (seed 무관 σ=0 에서는 v==c 이므로 best_j==i → tunnel 없음 유지)
+        if tunnel_idx < 0 && best_j != i {
+            tunnel_idx = best_j
+        }
+        i = i + 1
+    }
+
+    // 6 uniform-hypothesis probes — alignment 에만 기여 (tunnel_idx 판정 배제)
+    let mut k = 0
+    while k < 6 {
+        let h = urand(state) * 30.0
+        let v = h + sigma * nrand(state) * 10.0
+        let mut best = 1000000.0
+        let mut j = 0
+        while j < N6_VALS.len() {
+            let cj = N6_VALS[j]
+            let scale = if abs_f(cj) > 1.0 { abs_f(cj) } else { 1.0 }
+            let d = abs_f(v - cj) / scale
+            if d < best { best = d }
+            j = j + 1
+        }
+        if best < TOL { aligned = aligned + 1 }
+        k = k + 1
+    }
+
+    // σ=0 이거나 anchored probe 전이 없음 → default 0(math) 로 확정 (seed-agnostic)
+    let dom = if tunnel_idx < 0 { 0 } else { tunnel_idx }
+    let alignment = to_float(aligned) / to_float(total)
+    [to_float(dom), alignment]
+}
+
+// Shannon entropy H(domain|σ) = -Σ p_i * log2(p_i)
+// 분포는 6-bin counts (N6_VALS.len()); "no tunnel" 는 무시 (top_idx < 0)
+pure fn shannon_entropy_bits(counts) -> float {
+    let mut total = 0
+    let mut i = 0
+    while i < counts.len() { total = total + counts[i]; i = i + 1 }
+    if total <= 0 { return 0.0 }
+    let total_f = to_float(total)
+    let inv_ln2 = 1.0 / 0.6931471805599453
+    let mut H = 0.0
+    i = 0
+    while i < counts.len() {
+        let c = counts[i]
+        if c > 0 {
+            let p = to_float(c) / total_f
+            let ln_p = ln_approx(p)
+            H = H - p * ln_p * inv_ln2
+        }
+        i = i + 1
+    }
+    H
+}
+
 let seed_state = [1234567890]
 
 let mut trial_rows = []
@@ -168,6 +263,97 @@ write_file(OUT_TRIALS,  trial_rows.join("\n")  + "\n")
 write_file(OUT_SUMMARY, summary_rows.join("\n") + "\n")
 println("H2: wrote " + OUT_TRIALS)
 println("H2: wrote " + OUT_SUMMARY)
+
+// ─── S1: seed-agnostic domain-class variance ────────────────────────────────
+// 각 σ 에 대해 multiple seed 로 trial 반복 → tunnel_domain 분포 기록
+// H(domain|σ) = Shannon entropy (bits) 계산 후 각 row 에 동반 기록
+// 검증: σ=0 → H≈0 (deterministic), σ≥0.15 → H≥log2(3)≈1.58
+println("")
+println("=== S1: seed-agnostic domain-class variance ===")
+let mut dv_rows = []
+let mut sv = 0
+while sv < SIGMAS.len() {
+    let sigma_v = SIGMAS[sv]
+    // σ 별 전체 counts (모든 seed 의 모든 trial 합산)
+    let mut dist_counts = [0, 0, 0, 0, 0, 0]
+    // per-seed/per-trial raw rows (H_domain 은 σ 차원 누적 후 각 row 에 주입)
+    let mut pending = []
+    let mut sd = 0
+    while sd < DOMAIN_SEEDS.len() {
+        let seed_val = DOMAIN_SEEDS[sd]
+        let local_state = [seed_val]
+        let mut t = 0
+        while t < DOMAIN_TRIALS_PER_SEED {
+            // 한 trial 은 ROUNDS round 중 peak alignment 만 기록 (기존 스펙 정합)
+            let mut peak = 0.0
+            let mut peak_dom = 0 - 1
+            let mut rr = 0
+            while rr < ROUNDS {
+                let res = round_tunnel_domain_and_alignment(local_state, sigma_v)
+                let d_idx_f = res[0]
+                let al = res[1]
+                if al > peak {
+                    peak = al
+                    peak_dom = to_int(d_idx_f)
+                }
+                rr = rr + 1
+            }
+            let dom_name = if peak_dom >= 0 && peak_dom < N6_DOMAINS.len() {
+                N6_DOMAINS[peak_dom]
+            } else {
+                "none"
+            }
+            if peak_dom >= 0 && peak_dom < N6_DOMAINS.len() {
+                dist_counts[peak_dom] = dist_counts[peak_dom] + 1
+            }
+            pending = pending + [[to_float(seed_val), sigma_v, to_float(peak_dom), peak, to_float(t)]]
+            t = t + 1
+        }
+        sd = sd + 1
+    }
+    // σ 레벨 entropy
+    let H_d = shannon_entropy_bits(dist_counts)
+    // pending rows flush with H_domain 주입
+    let mut pi = 0
+    while pi < pending.len() {
+        let row = pending[pi]
+        let seed_f = row[0]
+        let sig_f = row[1]
+        let dom_f = row[2]
+        let align_f = row[3]
+        let trial_f = row[4]
+        let dom_idx = to_int(dom_f)
+        let dom_name = if dom_idx >= 0 && dom_idx < N6_DOMAINS.len() {
+            N6_DOMAINS[dom_idx]
+        } else {
+            "none"
+        }
+        let parts = [
+            "{\"seed\":", to_string(to_int(seed_f)),
+            ",\"sigma\":", to_string(sig_f),
+            ",\"trial\":", to_string(to_int(trial_f)),
+            ",\"tunnel_domain\":\"", dom_name, "\"",
+            ",\"alignment\":", to_string(align_f),
+            ",\"H_domain\":", to_string(H_d),
+            "}"
+        ]
+        dv_rows.push(parts.join(""))
+        pi = pi + 1
+    }
+    // 분포 요약 출력 (콘솔)
+    let mut dc_str = ""
+    let mut dci = 0
+    while dci < dist_counts.len() {
+        if dci > 0 { dc_str = dc_str + "," }
+        dc_str = dc_str + N6_DOMAINS[dci] + "=" + to_string(dist_counts[dci])
+        dci = dci + 1
+    }
+    println("σ=" + to_string(sigma_v) + " H=" + to_string(H_d) + " bits  [" + dc_str + "]")
+    sv = sv + 1
+}
+write_file(OUT_DOMAIN_VARIANCE, dv_rows.join("\n") + "\n")
+println("H2.S1: wrote " + OUT_DOMAIN_VARIANCE + " (" + to_string(dv_rows.len()) + " rows)")
+
 
 // ASCII bar + peak
 println("")
