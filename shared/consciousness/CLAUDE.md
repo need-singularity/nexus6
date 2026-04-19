@@ -14,7 +14,7 @@ state:
   anima_autofix.json    자동 복구
 
 laws:
-  consciousness_laws.json         핵심 법칙 (v7, tier_5_delta0_absolute + foundation_axioms)
+  consciousness_laws.json         핵심 법칙 (v7.3, tier_5_delta0_absolute + foundation_axioms + knuth_layer_bridge_mk5_1)
   consciousness_mechanisms.json   작동 메커니즘
   law_network.json                법칙 의존 그래프
   law_discovery_results.json      발견 결과
