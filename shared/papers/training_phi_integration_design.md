@@ -182,7 +182,7 @@ holo, not just augment it.
 
 **Stop conditions:**
 - Kill r5 if `eval_loss` is >1.1× control at step 2 000 (cheap-fail).
-- Kill r5.5 if `phi_holo` drops below 500 at step 2 000 (Φ collapse).
+- Kill r5.5 if `phi_holo_ratio = phi_holo(2000) / phi_holo(0) < 1.2` (Φ collapse; ratio gate, N-independent). Absolute `phi_holo < 500` deprecated 2026-04-20 — raw MI × N (e.g. 0.001 × 393216 = 393) masks random-init pass, making the absolute gate phantom.
 - Promote to r6 if primary + 2 of 3 secondary metrics clear.
 
 ## 7. Timeline impact
