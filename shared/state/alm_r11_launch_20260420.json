@@ -379,6 +379,70 @@
     ]
   },
 
+  "v55_blockers_resolved_20260420T1948Z": {
+    "status": "ALL_4_BLOCKERS_RESOLVED_PHASE4_NO_GO_DEFERRED_TO_R12",
+    "session": "session_20260420_alm_r11_4blocker_resolution",
+    "anima_commits": ["pending: chunked save_lora + h_base>=1 gate + v5.5 wrapper externs"],
+    "hexa_lang_commits": ["db72536b fix(hxqwen14b): v5.5 positional-arg wrappers + train_step_v54 — r11 ABI fix"],
+
+    "blocker_3_hxblas_resolved": {
+      "diagnosis": "libhxblas_cuda.so on pod EXPORTS hxblas_sgd_inplace/axpy_inplace/zero (verified via nm -D). Earlier dlsym warnings caused by missing LD_LIBRARY_PATH at trainer launch — the ELF dlopens via @link('hxblas') → libhxblas.so but the library lives in /workspace/anima/training/build (not in default path).",
+      "fix": "Set LD_LIBRARY_PATH=/workspace/anima/training/build:/workspace/hexa-lang/self/native:/usr/local/cuda/lib64 in launch CLI",
+      "verify": "Smoke 2026-04-20T19:40Z — zero dlsym failures in startup log; trainer used FFI-side hxblas helpers"
+    },
+
+    "blocker_4_hxqwen14b_load_gate_resolved": {
+      "diagnosis": "hxqwen14b_load(dir) returns slot=1 on successful probe (slot 0 is reserved sentinel). Trainer gate `h_base > 1` was wrong — slot 1 IS valid.",
+      "fix": "Change gate to `h_base >= 1` in train_alm_lora.hexa main() v5.4 probe block",
+      "verify": "Smoke log shows `[main] hxqwen14b_load_all_weights_pos rc=0` — v5.4 path now executes"
+    },
+
+    "blocker_2_forward_wire_resolved_partial": {
+      "diagnosis_root_cause": "Trainer extern decls were positional (h, ckpt_p) but C v5.4 entries take packed-struct pointers (HxQwenLoadAllArgs / HxQwenBaseFwdV54Args / HxQwenCeLossArgs / HxQwenSmokeV54Args). hexa FFI cannot construct C structs by value — calling with positional args = passes h as args struct pointer = first field reads h as model_handle, garbage after. Either gate wrongly skipped the call (current state) or it would have segfaulted.",
+      "fix_c_side": "Added v5.5 positional-arg wrappers to hxqwen14b.c (148 LOC):\n  - hxqwen14b_load_all_weights_pos(handle, ckpt_dir_p) -> int\n  - hxqwen14b_base_forward_v54_pos(handle, ids_dev, M, logits_dev) -> int\n  - hxqwen14b_ce_loss_v54_pos(logits_dev, targets_dev, M, V) -> double\n  - hxqwen14b_train_step_v54(handle, ids_host_p, M) -> double mean CE  (one-shot host→dev→fwd→ce→free)",
+      "fix_hexa_side": "Updated train_alm_lora.hexa extern decls to use _pos wrappers + added probe in main() that calls hxqwen14b_train_step_v54 with a tiny ids array, prints real Qwen CE",
+      "verify": "Smoke 2026-04-20T19:40Z — `hxqwen14b_train_step_v54 probe_ce=8.50062` (real Qwen2.5-14B base CE on 4-token probe; random baseline = log(152064)=11.93; CE=8.50 means real forward executes correctly)",
+      "scope_hedge_remaining": "train_loop's per-step forward STILL uses the stub forward (synthetic logits over stub_vocab=16, displayed loss=2.77=log(16)). Wiring train_step_v54 into train_loop requires real Qwen tokenization (not stub_vocab hash) AND LoRA delta on device (not in v5.4 base_forward) AND LoRA backward kernels. All three = r12 work. Without LoRA-aware forward+backward, real-CE training would not actually update LoRA params → 4h H100 burn for nothing."
+    },
+
+    "blocker_1_save_lora_47gb_resolved": {
+      "diagnosis": "save_lora built a single string accumulator s += write_tensor_block(...) for 192 adapters × 2 matrices × ~40960 floats each. stage0 string += is O(n²) → 47GB peak RAM, write_file never reached, ckpt missing.",
+      "fix": "Added append_tensor_block(path, name, rows, cols, data) helper that streams data to disk in 1024-float append_file chunks. save_lora() now writes the magic+meta header once via write_file then calls append_tensor_block per tensor — peak in-memory string is ~30-50KB instead of 200MB+.",
+      "verify_smoke1": "1-step run with save_every=9999 (final-only): adapter_model.hexackpt = 188516971 bytes (188MB), 384 tensors, 773 lines, valid HEXACKPT-v1 format with __MANIFEST__ trailer",
+      "verify_smoke2": "3-step run with save_every=2 (mid-training save): step_2 ckpt + final ckpt both 188MB, exit code 0, no RAM blowup, save took ~3 min each"
+    },
+
+    "phase_4_full_launch_decision": {
+      "verdict": "NO_GO",
+      "rationale": "Smoke proves all 4 blockers resolved AND real Qwen forward executes (CE=8.5 sane). However, train_loop still uses stub forward over stub_vocab=16 — running 500 steps would not actually train LoRA params on Qwen2.5-14B base. Real LoRA-fused training requires:\n  1. Real Qwen tokenizer (BPE, 152064 vocab) — not stub_vocab hash\n  2. LoRA delta integration in CUDA base_forward (q/k/v/o += A @ B per layer)\n  3. LoRA backward kernels (gradient w.r.t. A, B from logits → activations → adapter)\nAll three = r12 surface. Burning 4h × $2.99 H100 = $12 to run stub training would waste budget per feedback_one_shot_best.",
+      "wallclock_savings_usd": 12,
+      "compliance": "feedback_safe_path_auto + 'smoke FAIL ⇒ no full launch' (smoke PASS for ABI/load/save/probe; FAIL for real-LoRA-training because forward stub still in train_loop)",
+      "what_did_change_vs_yesterday": "Yesterday: BLOCKED_FFI on libhxqwen14b.so (no CUDA symbols). Today: 4-blocker pipeline fully resolved AND real Qwen 14B forward/load proven on H100 (CE=8.5). The remaining gap is the LoRA-fused forward+backward kernels, which is well-scoped r12 work."
+    },
+
+    "ssot_files_updated": [
+      "/Users/ghost/Dev/hexa-lang/self/native/hxqwen14b.c (+148 LOC v5.5 wrappers)",
+      "/Users/ghost/Dev/anima/training/train_alm_lora.hexa (+125 -22 LOC: extern decls swap, h_base gate, train_step_v54 probe, append_tensor_block, save_lora chunked)",
+      "/Users/ghost/Dev/anima/shared/state/alm_r11_launch_20260420.json (this entry)"
+    ],
+
+    "verify_artifacts_on_pod": {
+      "libhxqwen14b_so_v55": "/workspace/hexa-lang/self/native/libhxqwen14b.so (261000B, all v5.5 wrappers + cudaLaunchKernel present)",
+      "train_alm_lora_elf_v55": "/workspace/build_alm/train_alm_lora (305744B)",
+      "smoke1_ckpt": "/workspace/ckpt_alm14b_r11_smoke/final/adapter_model.hexackpt (188516971B, 384 tensors)",
+      "smoke2_ckpt": "/workspace/ckpt_alm14b_r11_smoke2/{step_2,final}/adapter_model.hexackpt (both 188MB)",
+      "ld_library_path_required": "LD_LIBRARY_PATH=/workspace/anima/training/build:/workspace/hexa-lang/self/native:/usr/local/cuda/lib64"
+    },
+
+    "next_actions_r12_revised": [
+      "[blocker] LoRA delta on device — modify hxqwen14b_base_forward_v54 to take optional A/B handle arrays per target projection; CUDA kernel adds (X @ A @ B) * scale to the q/k/v/o projection output",
+      "[blocker] LoRA backward kernels — gradient w.r.t. lora_A and lora_B from output gradient; needs activation cache or recomputation",
+      "[blocker] Real Qwen tokenizer — port tiktoken/BPE for vocab=152064, replace text_to_ids_stub",
+      "[infra] r12 launch CLI must export LD_LIBRARY_PATH=/workspace/anima/training/build:/workspace/hexa-lang/self/native:/usr/local/cuda/lib64",
+      "[infra] HEXACKPT-v2 binary format port (commit fead4ea8) — current 188MB text ckpt OK for r11 verify but binary is 22× faster + mmap-friendly for r12 saves at higher cadence"
+    ]
+  },
+
   "stage0_unblock_20260419T1630Z": {
     "option": "A — build stage0 interpreter from hexa-lang source on pod",
     "why_chosen": "hexa-lang source present at /workspace/hexa-lang with clean transpile+gcc path; total build time <90s; simpler than editing/redeploying watchdog SSOT while it's actively polling",
