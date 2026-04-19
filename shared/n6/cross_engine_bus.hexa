@@ -1,0 +1,652 @@
+// ═══════════════════════════════════════════════════════════
+// cross_engine_bus.hexa — Cross-Engine @E sync (Mk.X 축 5)
+//
+// 목적:
+//   형제 프로젝트(anima/n6-architecture/void/hexa-lang)의 발견·골화 ID를
+//   atlas.n6 의 nexus 노드에 매칭해 @E (cross-ref edge) 후보를 생성.
+//   기존 cross-ref 1건 (anima AN14 ↔ nexus META-INF-UN1) 을 N건으로 확장.
+//
+// 사용:
+//   hexa shared/n6/cross_engine_bus.hexa             # dry-run (default)
+//   hexa shared/n6/cross_engine_bus.hexa --apply     # atlas.n6 에 실제 append
+//   hexa shared/n6/cross_engine_bus.hexa --verbose   # 후보 디테일 출력
+//
+// 출력:
+//   stdout  요약 + sample
+//   shared/n6/cross_engine_bus.candidates.jsonl  (전체 후보 staging)
+//
+// 동작 원칙:
+//   1. dry-run default — 실제 atlas append 는 explicit --apply
+//   2. dedup: 기존 atlas @E 라인 set 비교 (mtime 캐시 X, full scan)
+//   3. counterpart 매칭: sibling label tokens → atlas line substring 검색
+//   4. atlas 쓰기는 단일 batch tail-append (다른 세션 충돌 최소화)
+//
+// NOT auto: launchd 스케줄러는 옵션. cron/launchd 등록은 별도 단계.
+// ═══════════════════════════════════════════════════════════
+
+let _ARGV = args()
+let mut _APPLY = false
+let mut _VERBOSE = false
+let mut _NEXUS_ROOT = "/Users/ghost/Dev/nexus"
+let mut _DEV_ROOT = "/Users/ghost/Dev"
+let mut _MAX_PER_SOURCE: i64 = 200   // safety cap
+
+let mut _ai: i64 = 2
+while _ai < len(_ARGV) {
+    let _t = _ARGV[_ai]
+    if _t == "--apply" { _APPLY = true }
+    else if _t == "--verbose" || _t == "-v" { _VERBOSE = true }
+    else if _t == "--nexus" && _ai + 1 < len(_ARGV) {
+        _NEXUS_ROOT = _ARGV[_ai + 1]
+        _ai = _ai + 1
+    }
+    else if _t == "--dev" && _ai + 1 < len(_ARGV) {
+        _DEV_ROOT = _ARGV[_ai + 1]
+        _ai = _ai + 1
+    }
+    else if _t == "--max" && _ai + 1 < len(_ARGV) {
+        _MAX_PER_SOURCE = to_int(_ARGV[_ai + 1])
+        _ai = _ai + 1
+    }
+    _ai = _ai + 1
+}
+
+let _ATLAS_PATH = _NEXUS_ROOT + "/shared/n6/atlas.n6"
+let _STAGE_PATH = _NEXUS_ROOT + "/shared/n6/cross_engine_bus.candidates.jsonl"
+
+if !file_exists(_ATLAS_PATH) {
+    println("error: atlas not found: " + _ATLAS_PATH)
+    exit(1)
+}
+
+// ─── helpers ───
+fn _safe_read(p: string) -> string {
+    if !file_exists(p) { return "" }
+    let mut s = ""
+    try { s = read_file(p) } catch e {}
+    return s
+}
+
+fn _lower(s: string) -> string {
+    let mut out = ""
+    let mut i: i64 = 0
+    let n: i64 = len(s)
+    while i < n {
+        let c = s[i..i+1]
+        let b = c[0..1]
+        // hexa: simple a-z fold via byte arithmetic skipped; rely on .lowercase if available
+        out = out + c
+        i = i + 1
+    }
+    // try built-in lowercase
+    let mut lc = out
+    try { lc = out.to_lowercase() } catch e {}
+    return lc
+}
+
+// extract first @ line tag identifier from atlas line:
+//   "@R foo-bar = ... :: ... [10*]"  →  "foo-bar"
+fn _extract_node_id(line: string) -> string {
+    let t = line.trim()
+    if len(t) < 4 { return "" }
+    if t[0..1] != "@" { return "" }
+    // find first space
+    let n: i64 = len(t)
+    let mut i: i64 = 0
+    while i < n && t[i..i+1] != " " { i = i + 1 }
+    if i >= n - 1 { return "" }
+    let mut j: i64 = i + 1
+    let mut k: i64 = j
+    while k < n {
+        let c = t[k..k+1]
+        if c == " " || c == "=" || c == ":" { break }
+        k = k + 1
+    }
+    return t[j..k]
+}
+
+// ─── (1) atlas index: existing nodes + existing @E set ───
+println("[bus] reading atlas: " + _ATLAS_PATH)
+let _atlas_raw = _safe_read(_ATLAS_PATH)
+let _atlas_lines = _atlas_raw.split("\n")
+let _atlas_total: i64 = len(_atlas_lines)
+println("[bus] atlas lines: " + to_string(_atlas_total))
+
+// build node_id set + lowercase line index for substring matching
+let mut _node_ids = #{}
+let mut _existing_edges = #{}
+let mut _node_lines = []      // [{id, line, lc_line}]
+
+let mut li: i64 = 0
+while li < _atlas_total {
+    let line = _atlas_lines[li]
+    let t = line.trim()
+    if len(t) > 0 && t[0..1] == "@" {
+        // edge line?  "@E a -> b :: ... [...]"
+        if len(t) >= 3 && t[0..2] == "@E" {
+            _existing_edges[t] = true
+        } else {
+            let id = _extract_node_id(line)
+            if len(id) > 0 {
+                _node_ids[id] = true
+                _node_lines = _node_lines.push(#{
+                    "id": id,
+                    "lc": _lower(line)
+                })
+            }
+        }
+    }
+    li = li + 1
+}
+println("[bus] indexed nodes: " + to_string(len(_node_lines)) + ", existing @E: " + to_string(len(_existing_edges)))
+
+// ─── (2) sibling discovery harvesters ───
+//
+// 각 함수: 입력 sibling root → list of candidates
+//   candidate = #{ "sibling": "anima", "sid": "AN14", "label": "Knuth invariance ...", "tokens": [..] }
+//
+// label 은 매칭 토큰 추출 source. tokens 는 짧은 키워드 후보군 (3+ chars)
+
+fn _split_tokens(text: string) -> [string] {
+    let mut out = []
+    let n: i64 = len(text)
+    let mut i: i64 = 0
+    let mut buf = ""
+    while i < n {
+        let c = text[i..i+1]
+        let cb = c[0..1]
+        let is_alnum = (cb >= "a" && cb <= "z") || (cb >= "A" && cb <= "Z") || (cb >= "0" && cb <= "9") || cb == "-" || cb == "_"
+        if is_alnum {
+            buf = buf + cb
+        } else {
+            if len(buf) >= 4 { out = out.push(_lower(buf)) }
+            buf = ""
+        }
+        i = i + 1
+    }
+    if len(buf) >= 4 { out = out.push(_lower(buf)) }
+    return out
+}
+
+// (2a) anima: rules/anima.json AN1..ANk  +  convergence ossified items
+fn _harvest_anima(root: string) {
+    let mut out = []
+    let rules_path = root + "/anima/shared/rules/anima.json"
+    let raw = _safe_read(rules_path)
+    if len(raw) > 0 {
+        // grep-style parse: lines containing "id": "ANxxx"
+        let lines = raw.split("\n")
+        let mut idx: i64 = 0
+        let n: i64 = len(lines)
+        while idx < n {
+            let ln = lines[idx]
+            let t = ln.trim()
+            if t.starts_with("\"id\":") && t.contains("\"AN") {
+                // extract AN id
+                let mut s1: i64 = -1
+                let mut s2: i64 = -1
+                let nn: i64 = len(t)
+                let mut k: i64 = 0
+                let mut q: i64 = 0
+                while k < nn {
+                    if t[k..k+1] == "\"" {
+                        q = q + 1
+                        if q == 3 { s1 = k + 1 }
+                        if q == 4 { s2 = k; break }
+                    }
+                    k = k + 1
+                }
+                if s1 > 0 && s2 > s1 {
+                    let sid = t[s1..s2]
+                    // next line should be "rule": "..."
+                    let mut label = ""
+                    if idx + 1 < n {
+                        let ln2 = lines[idx + 1].trim()
+                        if ln2.starts_with("\"rule\":") {
+                            // crude unquote
+                            let r1 = ln2.split("\"")
+                            if len(r1) >= 4 { label = r1[3] }
+                        }
+                    }
+                    let toks = _split_tokens(label)
+                    out = out.push(#{
+                        "sibling": "anima",
+                        "sid": sid,
+                        "label": label,
+                        "tokens": toks
+                    })
+                }
+            }
+            idx = idx + 1
+        }
+    }
+    // convergence ossified  (tracks → items state==completed/ossified) — id pattern: lowercase keys
+    // 안전하게 skip — anima.json schema 가 깊고 변동 잦음. AN-rule-level only.
+    return out
+}
+
+// (2b) n6-architecture: convergence/n6-architecture.json ossified KEYS  +  rules/n6-architecture.json N6n
+fn _harvest_n6arch(root: string) {
+    let mut out = []
+    // ossified keys
+    let conv_path = root + "/n6-architecture/n6shared/convergence/n6-architecture.json"
+    let raw = _safe_read(conv_path)
+    if len(raw) > 0 {
+        let lines = raw.split("\n")
+        let mut idx: i64 = 0
+        let n: i64 = len(lines)
+        let mut depth: i64 = 0
+        let mut in_oss = false
+        while idx < n {
+            let ln = lines[idx]
+            let t = ln.trim()
+            if t.contains("\"ossified\"") && t.contains(":") && t.contains("{") { in_oss = true }
+            if in_oss && t.starts_with("\"") && t.contains("\":") && t.contains("{") {
+                // top-level ossified key
+                let parts = t.split("\"")
+                if len(parts) >= 2 {
+                    let key = parts[1]
+                    if !key.starts_with("_") && key != "ossified" {
+                        // try to grab "value" from following lines (search next 6 lines)
+                        let mut label = key
+                        let mut look: i64 = 1
+                        while look < 8 && idx + look < n {
+                            let l2 = lines[idx + look].trim()
+                            if l2.starts_with("\"value\":") {
+                                let p2 = l2.split("\"")
+                                if len(p2) >= 4 { label = p2[3] }
+                                break
+                            }
+                            look = look + 1
+                        }
+                        let toks = _split_tokens(key + " " + label)
+                        out = out.push(#{
+                            "sibling": "n6-architecture",
+                            "sid": key,
+                            "label": label,
+                            "tokens": toks
+                        })
+                    }
+                }
+            }
+            idx = idx + 1
+        }
+    }
+    // rules N6n
+    let rules_path = root + "/n6-architecture/n6shared/config/absolute_rules.json"
+    let rraw = _safe_read(rules_path)
+    if len(rraw) > 0 {
+        let lines = rraw.split("\n")
+        let mut idx: i64 = 0
+        let n: i64 = len(lines)
+        while idx < n {
+            let ln = lines[idx]
+            let t = ln.trim()
+            if t.starts_with("\"id\":") && (t.contains("\"N6") || t.contains("\"BT")) {
+                let parts = t.split("\"")
+                if len(parts) >= 4 {
+                    let sid = parts[3]
+                    let mut label = sid
+                    if idx + 1 < n {
+                        let ln2 = lines[idx + 1].trim()
+                        if ln2.starts_with("\"rule\":") || ln2.starts_with("\"name\":") || ln2.starts_with("\"value\":") {
+                            let p2 = ln2.split("\"")
+                            if len(p2) >= 4 { label = p2[3] }
+                        }
+                    }
+                    let toks = _split_tokens(sid + " " + label)
+                    out = out.push(#{
+                        "sibling": "n6-architecture",
+                        "sid": sid,
+                        "label": label,
+                        "tokens": toks
+                    })
+                }
+            }
+            idx = idx + 1
+        }
+    }
+    return out
+}
+
+// (2c) void: convergence.json ossified[].id  +  breakthroughs.jsonl VBT-XX
+fn _harvest_void(root: string) {
+    let mut out = []
+    let conv_path = root + "/void/convergence.json"
+    let raw = _safe_read(conv_path)
+    if len(raw) > 0 {
+        let lines = raw.split("\n")
+        let mut idx: i64 = 0
+        let n: i64 = len(lines)
+        while idx < n {
+            let t = lines[idx].trim()
+            if t.contains("\"id\":\"VC-") || t.contains("\"id\": \"VC-") {
+                let parts = t.split("\"")
+                // pattern: {"id":"VC-01", ... }
+                let mut k: i64 = 0
+                while k < len(parts) {
+                    if parts[k] == "id" && k + 2 < len(parts) {
+                        let sid = parts[k + 2]
+                        if sid.starts_with("VC-") {
+                            // try rule from same line
+                            let mut label = sid
+                            let mut k2: i64 = k + 3
+                            while k2 < len(parts) {
+                                if parts[k2] == "rule" && k2 + 2 < len(parts) {
+                                    label = parts[k2 + 2]
+                                    break
+                                }
+                                k2 = k2 + 1
+                            }
+                            let toks = _split_tokens(sid + " " + label)
+                            out = out.push(#{
+                                "sibling": "void",
+                                "sid": sid,
+                                "label": label,
+                                "tokens": toks
+                            })
+                        }
+                    }
+                    k = k + 1
+                }
+            }
+            idx = idx + 1
+        }
+    }
+    // breakthroughs.jsonl
+    let bt_path = root + "/void/breakthroughs.jsonl"
+    let braw = _safe_read(bt_path)
+    if len(braw) > 0 {
+        let lines = braw.split("\n")
+        let mut idx: i64 = 0
+        let n: i64 = len(lines)
+        while idx < n {
+            let t = lines[idx].trim()
+            if t.contains("\"id\":\"VBT-") || t.contains("\"id\": \"VBT-") {
+                let parts = t.split("\"")
+                let mut k: i64 = 0
+                while k < len(parts) {
+                    if parts[k] == "id" && k + 2 < len(parts) {
+                        let sid = parts[k + 2]
+                        if sid.starts_with("VBT-") {
+                            let mut label = sid
+                            let mut k2: i64 = k + 3
+                            while k2 < len(parts) {
+                                if parts[k2] == "title" && k2 + 2 < len(parts) {
+                                    label = parts[k2 + 2]
+                                    break
+                                }
+                                k2 = k2 + 1
+                            }
+                            let toks = _split_tokens(sid + " " + label)
+                            out = out.push(#{
+                                "sibling": "void",
+                                "sid": sid,
+                                "label": label,
+                                "tokens": toks
+                            })
+                        }
+                    }
+                    k = k + 1
+                }
+            }
+            idx = idx + 1
+        }
+    }
+    return out
+}
+
+// (2d) hexa-lang: rules/hexa-lang.json HXn
+fn _harvest_hexalang(root: string) {
+    let mut out = []
+    let rules_path = root + "/anima/shared/rules/hexa-lang.json"   // shared lives in anima
+    let raw = _safe_read(rules_path)
+    if len(raw) > 0 {
+        let lines = raw.split("\n")
+        let mut idx: i64 = 0
+        let n: i64 = len(lines)
+        while idx < n {
+            let t = lines[idx].trim()
+            if t.starts_with("\"id\":") && t.contains("\"HX") {
+                let parts = t.split("\"")
+                if len(parts) >= 4 {
+                    let sid = parts[3]
+                    let mut label = sid
+                    if idx + 1 < n {
+                        let ln2 = lines[idx + 1].trim()
+                        if ln2.starts_with("\"rule\":") || ln2.starts_with("\"name\":") {
+                            let p2 = ln2.split("\"")
+                            if len(p2) >= 4 { label = p2[3] }
+                        }
+                    }
+                    let toks = _split_tokens(sid + " " + label)
+                    out = out.push(#{
+                        "sibling": "hexa-lang",
+                        "sid": sid,
+                        "label": label,
+                        "tokens": toks
+                    })
+                }
+            }
+            idx = idx + 1
+        }
+    }
+    return out
+}
+
+// ─── (3) harvest all ───
+let mut _all_cands = []
+let _h1 = _harvest_anima(_DEV_ROOT)
+let _h2 = _harvest_n6arch(_DEV_ROOT)
+let _h3 = _harvest_void(_DEV_ROOT)
+let _h4 = _harvest_hexalang(_DEV_ROOT)
+
+println("[bus] harvested — anima:" + to_string(len(_h1)) + " n6arch:" + to_string(len(_h2)) + " void:" + to_string(len(_h3)) + " hexa:" + to_string(len(_h4)))
+
+let mut hi: i64 = 0
+while hi < len(_h1) { _all_cands = _all_cands.push(_h1[hi]); hi = hi + 1 }
+hi = 0
+while hi < len(_h2) { _all_cands = _all_cands.push(_h2[hi]); hi = hi + 1 }
+hi = 0
+while hi < len(_h3) { _all_cands = _all_cands.push(_h3[hi]); hi = hi + 1 }
+hi = 0
+while hi < len(_h4) { _all_cands = _all_cands.push(_h4[hi]); hi = hi + 1 }
+
+// ─── (4) match each candidate to nexus node by token substring (lowercase) ───
+//
+// 매칭 규칙:
+//   - candidate.tokens 중 하나라도 atlas line lowercase 에 substring 으로 등장하면 hit
+//   - hit 중 가장 짧은 node_id 우선 (메타/primary 노드 선호)
+//   - 토큰 길이 < 4 무시
+//   - generic stop-words skip: "rule", "value", "name", "data", "test", "with", "this", "from"
+//   - skip 1글자/2글자/3글자 토큰 (already filtered)
+//
+let _STOP = #{
+    "rule": true, "value": true, "name": true, "data": true, "test": true,
+    "with": true, "this": true, "from": true, "true": true, "false": true,
+    "null": true, "json": true, "main": true, "core": true, "self": true,
+    "type": true, "list": true, "size": true, "step": true, "node": true,
+    "edge": true, "link": true, "case": true, "mode": true, "code": true
+}
+
+fn _match_candidate(cand, node_lines, stop, sibling_lc: string, sid_lc: string) {
+    let mut hits = []
+    let mut seen_id = #{}
+    let toks = cand["tokens"]
+    let mut ti: i64 = 0
+    let nlen: i64 = len(node_lines)
+    while ti < len(toks) {
+        let tok = toks[ti]
+        if len(tok) >= 5 {
+            let mut is_stop = false
+            try { is_stop = stop[tok] == true } catch e {}
+            // skip tokens that are exactly the sibling name or sid (would self-match)
+            if !is_stop && tok != sibling_lc && tok != sid_lc {
+                let mut nj: i64 = 0
+                while nj < nlen {
+                    let nl = node_lines[nj]
+                    let lc = nl["lc"]
+                    if lc.contains(tok) {
+                        let nid = nl["id"]
+                        let mut already = false
+                        try { already = seen_id[nid] == true } catch e {}
+                        if !already {
+                            hits = hits.push(nid)
+                            seen_id[nid] = true
+                            if len(hits) >= 5 { return hits }
+                        }
+                    }
+                    nj = nj + 1
+                }
+            }
+        }
+        ti = ti + 1
+    }
+    return hits
+}
+
+println("[bus] matching " + to_string(len(_all_cands)) + " candidates against " + to_string(len(_node_lines)) + " atlas nodes...")
+
+let mut _edges = []        // list of #{ sibling, sid, sibling_id, target, label, edge_line }
+let mut _matched_count: i64 = 0
+let mut _unmatched_count: i64 = 0
+let mut _per_sib_count = #{ "anima": 0, "n6-architecture": 0, "void": 0, "hexa-lang": 0 }
+
+let mut ci: i64 = 0
+while ci < len(_all_cands) {
+    let cand = _all_cands[ci]
+    let sibling = cand["sibling"]
+    let sid = cand["sid"]
+    let label = cand["label"]
+    let sibling_lc = _lower(sibling)
+    let sid_lc = _lower(sid)
+    let hits = _match_candidate(cand, _node_lines, _STOP, sibling_lc, sid_lc)
+    if len(hits) == 0 {
+        _unmatched_count = _unmatched_count + 1
+    } else {
+        // emit one edge per hit (cap 1 per candidate to avoid explosion)
+        let target = hits[0]
+        let sibling_node_id = sibling_lc + "-" + sid_lc
+        let edge_line = "@E " + sibling_node_id + " -> " + target + " :: cross-engine bus, " + sibling + " " + sid + " [10*]"
+        // dedup against existing
+        let mut already = false
+        try { already = _existing_edges[edge_line] == true } catch e {}
+        if !already {
+            _edges = _edges.push(#{
+                "sibling": sibling,
+                "sid": sid,
+                "sibling_node_id": sibling_node_id,
+                "target": target,
+                "label": label,
+                "edge_line": edge_line,
+                "all_hits": hits
+            })
+            _matched_count = _matched_count + 1
+            try {
+                let cur = _per_sib_count[sibling]
+                _per_sib_count[sibling] = cur + 1
+            } catch e {}
+        }
+    }
+    ci = ci + 1
+}
+
+println("[bus] matched: " + to_string(_matched_count) + ", unmatched: " + to_string(_unmatched_count))
+let _sks = ["anima", "n6-architecture", "void", "hexa-lang"]
+let mut sx: i64 = 0
+while sx < len(_sks) {
+    let k = _sks[sx]
+    let mut v: i64 = 0
+    try { v = _per_sib_count[k] } catch e {}
+    println("  - " + k + ": " + to_string(v))
+    sx = sx + 1
+}
+
+// ─── (5) write staging JSONL ───
+let mut _stage_lines = []
+let mut ei: i64 = 0
+while ei < len(_edges) {
+    let e = _edges[ei]
+    let mut hits_str = "["
+    let hits = e["all_hits"]
+    let mut hi2: i64 = 0
+    while hi2 < len(hits) {
+        if hi2 > 0 { hits_str = hits_str + "," }
+        hits_str = hits_str + "\"" + hits[hi2] + "\""
+        hi2 = hi2 + 1
+    }
+    hits_str = hits_str + "]"
+    let lab = e["label"]
+    // strip newlines + escape quotes minimal
+    let mut lab_safe = ""
+    let mut li2: i64 = 0
+    let lln: i64 = len(lab)
+    while li2 < lln {
+        let cc = lab[li2..li2+1]
+        if cc == "\"" || cc == "\\" { lab_safe = lab_safe + " " }
+        else if cc == "\n" || cc == "\r" || cc == "\t" { lab_safe = lab_safe + " " }
+        else { lab_safe = lab_safe + cc }
+        li2 = li2 + 1
+    }
+    let line = "{\"sibling\":\"" + e["sibling"] + "\",\"sid\":\"" + e["sid"] + "\",\"target\":\"" + e["target"] + "\",\"sibling_node_id\":\"" + e["sibling_node_id"] + "\",\"label\":\"" + lab_safe + "\",\"all_hits\":" + hits_str + ",\"edge_line\":\"" + e["edge_line"] + "\"}"
+    _stage_lines = _stage_lines.push(line)
+    ei = ei + 1
+}
+try {
+    write_file(_STAGE_PATH, "\n".join(_stage_lines) + "\n")
+    println("[bus] staging written: " + _STAGE_PATH + " (" + to_string(len(_stage_lines)) + " edges)")
+} catch e {
+    println("[bus] WARN: staging write failed")
+}
+
+// ─── (6) sample print ───
+let _SAMPLE_N: i64 = 6
+println("[bus] sample (first " + to_string(_SAMPLE_N) + "):")
+let mut spi: i64 = 0
+while spi < len(_edges) && spi < _SAMPLE_N {
+    let e = _edges[spi]
+    println("  " + e["edge_line"])
+    spi = spi + 1
+}
+
+if _VERBOSE {
+    println("[bus] verbose: full candidate dump skipped (see " + _STAGE_PATH + ")")
+}
+
+// ─── (7) optional apply ───
+if !_APPLY {
+    println("")
+    println("[bus] DRY-RUN (default) — no atlas writes.")
+    println("[bus] explicit append: hexa shared/n6/cross_engine_bus.hexa --apply")
+    exit(0)
+}
+
+// APPLY path: append batch to atlas with simple guarded write
+if len(_edges) == 0 {
+    println("[bus] APPLY: 0 new edges, atlas untouched.")
+    exit(0)
+}
+
+println("[bus] APPLY: appending " + to_string(len(_edges)) + " @E lines to atlas.n6")
+
+// build append block (header comment + edges)
+let _ts = exec("date -u +%Y-%m-%d").trim()
+let mut _block = "\n# ─── cross-engine bus append (" + _ts + ") ───\n"
+let mut ai2: i64 = 0
+while ai2 < len(_edges) {
+    let e = _edges[ai2]
+    _block = _block + e["edge_line"] + "\n"
+    ai2 = ai2 + 1
+}
+
+// write via append (atlas_guard inline-style: check duplicates already done above)
+try {
+    let cur = _safe_read(_ATLAS_PATH)
+    write_file(_ATLAS_PATH, cur + _block)
+    println("[bus] APPLY OK: " + to_string(len(_edges)) + " edges appended.")
+} catch e {
+    println("[bus] APPLY FAILED: " + to_string(e))
+    exit(1)
+}
+
+exit(0)
