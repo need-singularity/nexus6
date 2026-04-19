@@ -98,7 +98,8 @@ fn stats(xs) {
 fn z_and_p(obs, dist) {
     // z-점수와 p-값 계산
     let (m, s) = stats(dist)
-    let z = if s > 0 { (obs - m) / s } else { if obs > m { inf } else { 0.0 } }
+    let mut z = 0.0
+    if s > 0 { z = (obs - m) / s } else if obs > m { z = inf }
     let cnt = dist.count(fn(v) { v >= obs })
     let p = if dist.len() > 0 { float(cnt) / float(dist.len()) } else { 1.0 }
     return (z, p, m, s)
@@ -203,10 +204,90 @@ fn diagnose(targets, all_int) {
     return lines.join("\n")
 }
 
+// ─── B8 — Metropolis-Hastings posterior over n ∈ {2..12} ─────────────────
+// prior: uniform on {2..12} except n=6 weight 2× (n=6 bias)
+// likelihood: hit-rate from single run_mc call (hits / reach_size)
+// chain: 1000 × 10 steps, burn-in 100 — posterior mode + Bayes factor vs uniform.
+
+fn _mcmc_prior(n) {
+    // n=6 weight 2.0, else 1.0; domain {2..12}
+    if n < 2 || n > 12 { return 0.0 }
+    if n == 6 { return 2.0 }
+    return 1.0
+}
+
+fn _mcmc_likelihood(n, targets) {
+    // hits / reach_size as proxy (one-shot, no trial loop — MVP)
+    let c = n_constants(n)
+    let r = reachable(c, nil, nil)
+    let rs = r.len()
+    if rs == 0 { return 0.0 }
+    let h = targets.count(fn(t) { r.contains(t) })
+    return float(h) / float(rs)
+}
+
+fn run_mcmc(targets, n_chains, n_steps, burn_in) {
+    let rng = random_seed(SEED + 7)
+    let counts = {}
+    let mut total_accept = 0
+    let mut total_proposed = 0
+    let mut ci = 0
+    while ci < n_chains {
+        let mut cur = 2 + rng.randint(0, 10)  // seed in [2..12]
+        let mut cur_post = _mcmc_prior(cur) * _mcmc_likelihood(cur, targets)
+        let mut si = 0
+        while si < n_steps {
+            // neighbor proposal: ±1 (clamped)
+            let delta = if rng.randint(0, 1) == 0 { -1 } else { 1 }
+            let prop = cur + delta
+            if prop >= 2 && prop <= 12 {
+                total_proposed = total_proposed + 1
+                let prop_post = _mcmc_prior(prop) * _mcmc_likelihood(prop, targets)
+                let mut accept = false
+                if cur_post == 0.0 {
+                    accept = prop_post > 0.0
+                } else {
+                    let ratio = prop_post / cur_post
+                    if ratio >= 1.0 { accept = true }
+                    else {
+                        let u = float(rng.randint(0, 10000)) / 10000.0
+                        if u < ratio { accept = true }
+                    }
+                }
+                if accept {
+                    cur = prop
+                    cur_post = prop_post
+                    total_accept = total_accept + 1
+                }
+            }
+            // post burn-in only
+            if si >= burn_in {
+                counts[cur] = counts.get(cur, 0) + 1
+            }
+            si = si + 1
+        }
+        ci = ci + 1
+    }
+    // posterior mode
+    let mut mode_n = 6
+    let mut mode_c = 0
+    for k in counts.keys() {
+        let v = counts[k]
+        if v > mode_c { mode_c = v; mode_n = k }
+    }
+    // Bayes factor: P(n=6 | data) / (1/11 uniform)
+    let total = (n_steps - burn_in) * n_chains
+    let p_n6 = if total > 0 { float(counts.get(6, 0)) / float(total) } else { 0.0 }
+    let p_unif = 1.0 / 11.0
+    let bf = if p_unif > 0.0 { p_n6 / p_unif } else { 0.0 }
+    let acc_rate = if total_proposed > 0 { float(total_accept) / float(total_proposed) } else { 0.0 }
+    return { "counts": counts, "mode": mode_n, "p_n6": p_n6, "bf_vs_uniform": bf, "accept_rate": acc_rate, "samples": total }
+}
+
 fn main() {
     let args = get_args()
     if args.len() < 4 {
-        println("사용법: hexa monte_carlo_v6_engine.hexa <map_path> <out_path> <report_path> <n_trials> [diagnose]")
+        println("사용법: hexa monte_carlo_v6_engine.hexa <map_path> <out_path> <report_path> <n_trials> [diagnose|--mcmc]")
         return
     }
 
@@ -215,6 +296,7 @@ fn main() {
     let report_path = args[2]
     let n_trials = int(args[3])
     let do_diagnose = if args.len() > 4 { args[4] == "1" } else { false }
+    let do_mcmc = if args.len() > 4 { args[4] == "--mcmc" } else { false }
 
     let t0 = now()
     let (nat_int, all_int, org_cnt, org_hits, meta) = load_targets(map_path)
@@ -239,6 +321,33 @@ fn main() {
         let d = diagnose(nat_int, all_int)
         println(d)
         write_file(report_path, d)
+        return
+    }
+
+    if do_mcmc {
+        // B8: MCMC-Bayesian hybrid — Metropolis-Hastings over n ∈ {2..12}
+        let tgt_u = set(nat_int).to_list().sort()
+        println("-- MCMC Metropolis-Hastings (n=6 prior 2×) --")
+        let mcmc = run_mcmc(tgt_u, 1000, 10, 100)
+        println("  posterior mode:    n=" + str(mcmc["mode"]))
+        println("  P(n=6 | data):     " + format(mcmc["p_n6"], ".4f"))
+        println("  BF vs uniform:     " + format(mcmc["bf_vs_uniform"], ".2f"))
+        println("  accept rate:       " + format(mcmc["accept_rate"], ".3f"))
+        println("  total samples:     " + str(mcmc["samples"]))
+        let mcmc_out = {
+            "mode": "mcmc",
+            "posterior_mode": mcmc["mode"],
+            "p_n6": mcmc["p_n6"],
+            "bayes_factor_vs_uniform": mcmc["bf_vs_uniform"],
+            "accept_rate": mcmc["accept_rate"],
+            "samples": mcmc["samples"],
+            "chains": 1000,
+            "steps": 10,
+            "burn_in": 100,
+            "prior": "uniform_2_12_with_n6_weight_2x"
+        }
+        write_json(out_path, mcmc_out)
+        println("저장: " + out_path)
         return
     }
 
