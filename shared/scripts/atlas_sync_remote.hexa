@@ -1,0 +1,249 @@
+// atlas_sync_remote.hexa — atlas.n6 원격→로컬 sync 도구 (pull/diff)
+// drill/blowup 자동 hetzner 라우팅 (memory: p-drill-remote-routing) →
+// 로컬 atlas.n6 stale 방지. pull-only first (R-SAFE), push 미구현.
+//
+// 사용 (반드시 mac 로컬에서, ssh credentials 가 mac 에 있음):
+//   HEXA_LOCAL=1 hexa shared/scripts/atlas_sync_remote.hexa --direction diff --host all
+//   HEXA_LOCAL=1 hexa shared/scripts/atlas_sync_remote.hexa --direction diff --host hetzner
+//   HEXA_LOCAL=1 hexa shared/scripts/atlas_sync_remote.hexa --direction pull --host hetzner [--dry-run]
+//
+// 안전:
+//   - pull 전 local atlas.n6.pre_sync_<ts> 백업
+//   - SHA256 + line count 사후 검증
+//   - mtime 충돌 감지 (양쪽 모두 변경 시 manual resolve 요구)
+//   - push: 미구현 (의도적 — 단방향 pull-only)
+//
+// hexa quirks (f-hexa-real-interpreter-quirks):
+//   exec("bash", ["-c", cmd]) 형태는 stdout 캡처가 빈 문자열 반환되는 경우 있음 →
+//   exec(cmdstr) 단일 문자열 형태 (security warning 무시) 사용
+
+let HOME = env("HOME")
+let LOCAL_ATLAS = HOME + "/Dev/nexus/shared/n6/atlas.n6"
+
+// 원격 호스트 → atlas 경로 매핑 (검증 완료 2026-04-19)
+//   ubu2     summer@... :/home/summer/Dev/nexus/shared/n6/atlas.n6  (1.5MB sync)
+//   hetzner  root@...   :/root/Dev/nexus/shared/n6/atlas.n6         (18MB+ HOT, drill 주 라우팅)
+fn _remote_path(host: str) -> str {
+    if host == "ubu2"    { return "/home/summer/Dev/nexus/shared/n6/atlas.n6" }
+    if host == "hetzner" { return "/root/Dev/nexus/shared/n6/atlas.n6" }
+    return ""
+}
+
+// --- args 파싱 ---
+let argv = args()
+let mut direction = "diff"
+let mut host = "ubu2"
+let mut dry_run = false
+let mut i = 0
+while i < argv.len() {
+    let a = argv[i]
+    if a == "--direction" && i + 1 < argv.len() { direction = argv[i+1]; i = i + 2; continue }
+    if a == "--host"      && i + 1 < argv.len() { host      = argv[i+1]; i = i + 2; continue }
+    if a == "--dry-run"   { dry_run = true; i = i + 1; continue }
+    if a == "-h" || a == "--help" {
+        println("usage: HEXA_LOCAL=1 hexa atlas_sync_remote.hexa --direction <pull|diff> --host <ubu2|hetzner|all> [--dry-run]")
+        exit(0)
+    }
+    i = i + 1
+}
+
+if direction != "pull" && direction != "diff" {
+    eprintln("[ERR] --direction must be pull|diff (push intentionally unimplemented)")
+    exit(2)
+}
+
+// ssh: ControlMaster 가 있으면 재사용, 없으면 자동 협상 (BatchMode 비활성 — agent/keychain 통과)
+let SSH_OPTS = "-o ConnectTimeout=8"
+
+// --- helpers (단일 문자열 exec — list 형태는 stdout 빈 반환 함정) ---
+fn _sh(cmd: str) -> str {
+    return to_string(exec(cmd)).trim()
+}
+fn _sh_raw(cmd: str) -> str {
+    return to_string(exec(cmd))
+}
+
+fn _local_sha(path: str) -> str {
+    return _sh("(sha256sum '" + path + "' 2>/dev/null || shasum -a 256 '" + path + "' 2>/dev/null) | cut -d' ' -f1")
+}
+fn _local_lines(path: str) -> str {
+    return _sh("wc -l < '" + path + "' | tr -d ' '")
+}
+fn _local_size(path: str) -> str {
+    return _sh("wc -c < '" + path + "' | tr -d ' '")
+}
+fn _local_mtime(path: str) -> str {
+    // mac BSD stat: -f %m, GNU 폴백
+    return _sh("stat -f %m '" + path + "' 2>/dev/null || stat -c %Y '" + path + "' 2>/dev/null")
+}
+
+fn _remote_sha(host: str, path: str) -> str {
+    let inner = "(sha256sum '" + path + "' 2>/dev/null || shasum -a 256 '" + path + "' 2>/dev/null) | cut -d' ' -f1"
+    return _sh("ssh " + SSH_OPTS + " " + host + " \"" + inner + "\"")
+}
+fn _remote_lines(host: str, path: str) -> str {
+    return _sh("ssh " + SSH_OPTS + " " + host + " \"wc -l < '" + path + "'\" 2>/dev/null | tr -d ' '")
+}
+fn _remote_size(host: str, path: str) -> str {
+    return _sh("ssh " + SSH_OPTS + " " + host + " \"wc -c < '" + path + "'\" 2>/dev/null | tr -d ' '")
+}
+fn _remote_mtime(host: str, path: str) -> str {
+    return _sh("ssh " + SSH_OPTS + " " + host + " \"stat -c %Y '" + path + "' 2>/dev/null || stat -f %m '" + path + "' 2>/dev/null\"")
+}
+fn _remote_head(host: str, path: str, n: int) -> str {
+    return _sh_raw("ssh " + SSH_OPTS + " " + host + " \"head -n " + to_string(n) + " '" + path + "'\" 2>/dev/null")
+}
+fn _remote_tail(host: str, path: str, n: int) -> str {
+    return _sh_raw("ssh " + SSH_OPTS + " " + host + " \"tail -n " + to_string(n) + " '" + path + "'\" 2>/dev/null")
+}
+fn _local_head(path: str, n: int) -> str {
+    return _sh_raw("head -n " + to_string(n) + " '" + path + "' 2>/dev/null")
+}
+fn _local_tail(path: str, n: int) -> str {
+    return _sh_raw("tail -n " + to_string(n) + " '" + path + "' 2>/dev/null")
+}
+
+// --- diff 출력 한 호스트 ---
+fn diff_one(host: str) -> bool {
+    let rpath = _remote_path(host)
+    if rpath == "" {
+        eprintln("[" + host + "] unknown host (allowed: ubu2|hetzner)")
+        return false
+    }
+    if file_exists(LOCAL_ATLAS) == false {
+        eprintln("[" + host + "] LOCAL atlas missing: " + LOCAL_ATLAS)
+        return false
+    }
+    let l_sha = _local_sha(LOCAL_ATLAS)
+    let l_lines = _local_lines(LOCAL_ATLAS)
+    let l_size = _local_size(LOCAL_ATLAS)
+    let l_mtime = _local_mtime(LOCAL_ATLAS)
+
+    let r_sha = _remote_sha(host, rpath)
+    if r_sha == "" {
+        eprintln("[" + host + "] ssh/sha failed (or remote atlas missing): " + rpath)
+        return false
+    }
+    let r_lines = _remote_lines(host, rpath)
+    let r_size = _remote_size(host, rpath)
+    let r_mtime = _remote_mtime(host, rpath)
+
+    println("=== diff: local vs " + host + " ===")
+    println("  remote_path : " + rpath)
+    println("  local  sha  : " + l_sha)
+    println("  remote sha  : " + r_sha)
+    println("  local  size : " + l_size + " bytes / " + l_lines + " lines / mtime " + l_mtime)
+    println("  remote size : " + r_size + " bytes / " + r_lines + " lines / mtime " + r_mtime)
+    let same = (l_sha == r_sha)
+    if same {
+        println("  STATUS      : IDENTICAL")
+    } else {
+        println("  STATUS      : DIFFERS")
+        // to_int0 미존재 환경 → bash numeric compare 로 우회
+        let lm_str = l_mtime
+        let rm_str = r_mtime
+        let cmp = _sh("a=" + lm_str + "; b=" + rm_str + "; if [ \"$a\" -gt \"$b\" ]; then echo lgt; elif [ \"$b\" -gt \"$a\" ]; then echo rgt; else echo eq; fi")
+        if cmp == "lgt" { println("  ADVISORY    : local NEWER than remote (mtime). pull may CLOBBER local edits.") }
+        if cmp == "rgt" { println("  ADVISORY    : remote NEWER than local (mtime). pull RECOMMENDED.") }
+        if cmp == "eq"  { println("  ADVISORY    : equal mtime but content differs. inspect manually.") }
+        println("  --- local head/tail (3) ---")
+        println(_local_head(LOCAL_ATLAS, 3))
+        println("  ...")
+        println(_local_tail(LOCAL_ATLAS, 3))
+        println("  --- remote head/tail (3) ---")
+        println(_remote_head(host, rpath, 3))
+        println("  ...")
+        println(_remote_tail(host, rpath, 3))
+    }
+    return same
+}
+
+// --- pull (단일 호스트) ---
+fn pull_one(host: str, dry: bool) -> bool {
+    let rpath = _remote_path(host)
+    if rpath == "" { eprintln("[" + host + "] unknown host"); return false }
+    if file_exists(LOCAL_ATLAS) == false {
+        eprintln("[" + host + "] LOCAL atlas missing — initial pull, no backup")
+    }
+
+    let l_sha_pre = if file_exists(LOCAL_ATLAS) { _local_sha(LOCAL_ATLAS) } else { "(none)" }
+    let r_sha = _remote_sha(host, rpath)
+    if r_sha == "" { eprintln("[" + host + "] remote sha failed — abort"); return false }
+
+    if l_sha_pre == r_sha {
+        println("[" + host + "] already in sync — skip pull (sha=" + r_sha + ")")
+        return true
+    }
+
+    if file_exists(LOCAL_ATLAS) {
+        let lm_str = _local_mtime(LOCAL_ATLAS)
+        let rm_str = _remote_mtime(host, rpath)
+        let cmp = _sh("a=" + lm_str + "; b=" + rm_str + "; if [ \"$a\" -gt \"$b\" ]; then echo lgt; else echo rle; fi")
+        if cmp == "lgt" {
+            eprintln("[" + host + "] CONFLICT: local mtime (" + lm_str + ") > remote (" + rm_str + "). manual resolve required.")
+            eprintln("  workaround: backup local, then re-run with: rm '" + LOCAL_ATLAS + "' && HEXA_LOCAL=1 hexa atlas_sync_remote.hexa --direction pull --host " + host)
+            return false
+        }
+    }
+
+    let ts = _sh("date +%Y%m%d_%H%M%S")
+    let backup = LOCAL_ATLAS + ".pre_sync_" + ts
+
+    if dry {
+        println("[DRY] would backup: " + LOCAL_ATLAS + " -> " + backup)
+        println("[DRY] would scp:    " + host + ":" + rpath + " -> " + LOCAL_ATLAS)
+        println("[DRY] expected sha (remote): " + r_sha)
+        return true
+    }
+
+    if file_exists(LOCAL_ATLAS) {
+        let cp_rc = _sh("cp -p '" + LOCAL_ATLAS + "' '" + backup + "' && echo OK || echo FAIL")
+        if cp_rc != "OK" { eprintln("[" + host + "] backup failed — abort"); return false }
+        println("[" + host + "] backup -> " + backup)
+    }
+
+    let scp_rc = _sh("scp -o ConnectTimeout=10 -p '" + host + ":" + rpath + "' '" + LOCAL_ATLAS + ".tmp' >/dev/null 2>&1 && echo OK || echo FAIL")
+    if scp_rc != "OK" { eprintln("[" + host + "] scp failed — local untouched"); return false }
+
+    let dl_sha = _local_sha(LOCAL_ATLAS + ".tmp")
+    if dl_sha != r_sha {
+        eprintln("[" + host + "] sha mismatch after scp! expected=" + r_sha + " got=" + dl_sha + " — aborting, .tmp left for inspection")
+        return false
+    }
+
+    let mv_rc = _sh("mv '" + LOCAL_ATLAS + ".tmp' '" + LOCAL_ATLAS + "' && echo OK || echo FAIL")
+    if mv_rc != "OK" { eprintln("[" + host + "] mv failed"); return false }
+
+    let post_lines = _local_lines(LOCAL_ATLAS)
+    let post_size = _local_size(LOCAL_ATLAS)
+    println("[" + host + "] PULLED OK  sha=" + r_sha + "  lines=" + post_lines + "  size=" + post_size)
+    println("[" + host + "] backup retained: " + backup)
+    return true
+}
+
+// --- 디스패치 ---
+let mut hosts = []
+if host == "all" { hosts = ["ubu2", "hetzner"] }
+else             { hosts = [host] }
+
+if direction == "diff" {
+    let mut all_same = true
+    let mut k = 0
+    while k < hosts.len() {
+        let same = diff_one(hosts[k])
+        if same == false { all_same = false }
+        k = k + 1
+    }
+    if all_same { exit(0) } else { exit(1) }
+}
+
+if direction == "pull" {
+    if host == "all" {
+        eprintln("[ERR] pull --host all not allowed (ambiguous source). pick one: ubu2|hetzner")
+        exit(2)
+    }
+    let ok = pull_one(host, dry_run)
+    if ok { exit(0) } else { exit(1) }
+}
+
+exit(0)
