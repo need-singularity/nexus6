@@ -208,6 +208,59 @@
     ]
   },
 
+  "v542_smoke_20260420T0230Z": {
+    "status": "OUT_OF_BAND (CE=16.09; target [1.5,5.0]; moved -0.17 from v5.4.1; still above random 11.93)",
+    "fix_applied": "QKV bias slots added (144 tensors; 48 layers × {q,k,v}_proj.bias). V54_N_LAYER_TENSORS 9→12. V54_N_SLOTS 435→579. v54_slot_name extended with bias suffixes. load_all_weights shape dispatch: k==9→[dq=5120,0], k==10/11→[dkv=1024,0]. base_forward_v54 wires hxqwen14b_cu_launch_add_bias_1d(q|k|v, b_q|b_k|b_v, M, dq|dkv) after sgemm but before rope. New CUDA kernel v54_add_bias_1d_kernel (grid=M, block=min(D,1024), inner-loop handles D>1024 for dq=5120). Version bumped 54→542.",
+    "sources_edited": [
+      "/workspace/hxqwen14b_build/hxqwen14b_v542.c (3872 LOC, +46)",
+      "/workspace/hxqwen14b_build/hxqwen14b_cuda_v542.cu (584 LOC, +32)",
+      "mirror: /Users/ghost/Dev/hexa-lang/self/native/hxqwen14b.c (+46)",
+      "mirror: /Users/ghost/Dev/hexa-lang/self/native/hxqwen14b_cuda.cu (+32)"
+    ],
+    "build": {
+      "cmds": [
+        "/usr/local/cuda/bin/nvcc -arch=sm_90 -O3 -Xcompiler -fPIC -c hxqwen14b_cuda_v542.cu -o hxqwen14b_cuda_v542.o",
+        "/usr/local/cuda/bin/nvcc -arch=sm_90 -O3 -Xcompiler -fPIC -DHXQWEN14B_CUDA -c hxqwen14b_v542.c -o hxqwen14b_v542.o",
+        "/usr/local/cuda/bin/nvcc -arch=sm_90 -O3 -Xcompiler -fPIC -shared hxqwen14b_v542.o hxqwen14b_cuda_v542.o -lcublas -lcudart -o libhxqwen14b_v542.so"
+      ],
+      "so_path": "/workspace/hxqwen14b_build/libhxqwen14b_v542.so",
+      "so_md5": "27db7c251bca187d91c14294d8db40ed",
+      "so_bytes": 142064
+    },
+    "smoke": {
+      "driver": "/workspace/hxqwen14b_build/smoke_driver",
+      "n_loaded": 579,
+      "mean_ce": 16.093564,
+      "target_band": "[1.5, 5.0]",
+      "random_baseline": 11.93,
+      "top1_tok": 135083,
+      "verdict": "FAIL_OUT_OF_BAND — tensors load completely (579 = 1 + 48×12 + 2 ✓), bias path executes, but CE barely moved vs v5.4.1 (16.26→16.09). Still >random — logits are actively wrong-direction, not just uninformative."
+    },
+    "live_so_untouched": true,
+    "v542_so_preserved": "/workspace/hxqwen14b_build/libhxqwen14b_v542.so (md5 27db7c25..., 142064 bytes; QKV-bias wired; CE=16.09; NOT swapped)",
+    "mac_mirror": "/Users/ghost/Dev/hexa-lang/self/native/{hxqwen14b.c,hxqwen14b_cuda.cu} updated with v5.4.2 diff",
+    "watchdog_impact": "NONE — live .so still v5.3 stub; trainer remains in BLOCKED_FFI retry loop; no state change needed",
+    "next_root_cause_hypothesis": {
+      "primary": "RoPE layout mismatch: v53_rope_kernel uses GPT-J/NeoX-style interleaved pair rotation (x0=x[2k], x1=x[2k+1]) but HF Qwen2 stores Q/K weights expecting Llama-style rotate_half (half-split: first D/2 cos-rotated against second D/2 sin-rotated). With wrong RoPE convention, every Q/K head is catastrophically miscomputed across all 48 layers, which exactly matches the observed CE>random signature — consistent for every sequence position.",
+      "evidence": [
+        "hxqwen14b_cuda.cu v53_rope_kernel: `offset = (bs*H+h)*D + 2*k; x0 = x[offset]; x1 = x[offset+1]; x[offset]=x0*cs-x1*sn; x[offset+1]=x0*sn+x1*cs;` — classic interleaved layout",
+        "HF Qwen2 modeling uses `rotate_half(x) = cat([-x[..., D/2:], x[..., :D/2]], dim=-1)` then `(x*cos + rotate_half(x)*sin)` — half-split layout",
+        "Constants verified: d=5120, n_head=40, n_kv_head=8, head_dim=128, rope_theta=1e6, vocab=152064 — all match config.json",
+        "Untie lm_head (-0.22 CE) + QKV bias (-0.17 CE) together barely moved the needle from CE=16.48; both fixes only reduce error at output boundary, not the core attention pattern",
+        "Random-baseline CE for V=152064 is log(152064)=11.93; actual 16.09 → logits actively peak on wrong tokens → upstream contextualization (attention) is systematically wrong"
+      ],
+      "secondary_checks_negative": [
+        "MLP biases: none in index.json (gate_proj, up_proj, down_proj all weight-only) ✓",
+        "Layer norm biases: none (RMSNorm weight-only) ✓",
+        "LM_head bias: not in index.json ✓",
+        "Pos offset: pos_offset=0 (correct for single-shot smoke)",
+        "GQA expand: n_q_head=40, n_kv_head=8, 5x expand — matches Qwen2.5-14B"
+      ],
+      "proposed_v543": "Replace v53_rope_kernel interleaved pair math with rotate_half layout: `x0 = x[offset+k]; x1 = x[offset + D/2 + k]; out[offset+k] = x0*cs - x1*sn; out[offset + D/2 + k] = x1*cs + x0*sn;` for k in 0..D/2. Preserve extern signature; no .c-side changes needed. Expected CE drop: 16.09 → [1.5, 5.0] if hypothesis correct.",
+      "risk_guard": "If v5.4.3 also misses target, next candidates in order: (2) sgemm_rowmajor_xwt transpose convention (W stored [N,K] row-major assumed; re-verify against safetensors layout), (3) RMSNorm eps/scale order, (4) softmax scale sqrt(head_dim) sign, (5) bf16→fp32 dequant endianness"
+    }
+  },
+
   "stage0_unblock_20260419T1630Z": {
     "option": "A — build stage0 interpreter from hexa-lang source on pod",
     "why_chosen": "hexa-lang source present at /workspace/hexa-lang with clean transpile+gcc path; total build time <90s; simpler than editing/redeploying watchdog SSOT while it's actively polling",
