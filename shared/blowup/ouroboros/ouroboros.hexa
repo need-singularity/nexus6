@@ -32,6 +32,15 @@ comptime const sr_sigma_peak = 0.1
 comptime const sr_base_threshold = 0.5
 comptime const sr_rolling_window = 5
 
+// sigma_peak_tracker (S2, 2026-04-19): content-aware drill 재설계
+// FIFO window=10 의 최근 sigma 관측치로 noise std 기반 dynamic threshold
+// threshold = sr_base_threshold ± std * k  (k=sr_tracker_k, 기본 0.3)
+// peak σ 에 의존하지 않고 실측 noise 분포를 반영 → deterministic bias 제거
+comptime const sr_tracker_window = 10
+comptime const sr_tracker_k = 0.3
+comptime const sr_tracker_min_threshold = 0.1
+comptime const sr_tracker_max_threshold = 1.5
+
 // 표본 표준편차 σ = sqrt( Σ(x_i - mean)^2 / (N-1) )
 pure fn estimate_sigma(history)  -> float {
     let n = history.len()
@@ -64,6 +73,41 @@ pure fn sr_adaptive_threshold(round_idx: int, resonance_history) -> float {
     let sigma = estimate_sigma(window)
     let ratio = sigma / sr_sigma_peak
     sr_base_threshold * (1.0 + ratio)
+}
+
+// sigma_peak_tracker: FIFO(window=10) → std 기반 dynamic threshold
+// push new_sigma, pop oldest (window 초과 시) → std(window) → threshold 반환
+// 반환: (new_window, threshold)
+// - 첫 호출(window 비었거나 1개): threshold = sr_base_threshold
+// - 안정화: std 작아질수록 threshold → sr_base_threshold 수렴
+pure fn sigma_peak_tracker_update(recent_sigmas, new_sigma: float)  {
+    // push
+    let mut window = recent_sigmas + [new_sigma]
+    // pop oldest (FIFO) — window 초과분 제거
+    if window.len() > sr_tracker_window {
+        let mut trimmed = []
+        let mut i = window.len() - sr_tracker_window
+        while i < window.len() { trimmed = trimmed + [window[i]]; i = i + 1 }
+        window = trimmed
+    }
+    // std 계산 후 threshold
+    let std = estimate_sigma(window)
+    // ±std*k 중 upper 분기(탐지 느슨): base + std*k
+    // (원 설계 "0.5 ± std*k" 중 +쪽 선택 — SR 관점에서 noise↑ 시 threshold ↑ → resonance↓ 균형)
+    let mut threshold = sr_base_threshold + std * sr_tracker_k
+    // clamp (divergence 방지)
+    if threshold < sr_tracker_min_threshold { threshold = sr_tracker_min_threshold }
+    if threshold > sr_tracker_max_threshold { threshold = sr_tracker_max_threshold }
+    [window, [threshold]]
+}
+
+// update_threshold(new_sigma): 외부 caller 용 래퍼
+// state (list<f64>) 를 참조 변경할 수 없으므로 (window, threshold) 튜플 반환
+// 기존 sr_adaptive_threshold 인터페이스는 후방호환 (old caller 무변경)
+pure fn update_threshold(recent_sigmas, new_sigma: float) -> float {
+    let r = sigma_peak_tracker_update(recent_sigmas, new_sigma)
+    let thr_box = r[1]
+    thr_box[0]
 }
 
 // nexus.json sr_sigma_tracker append (최신 50 round 만 유지)
@@ -554,7 +598,8 @@ fn new_growth_state() -> GrowthState {
 }
 
 // apply: 가중 필터링 + 공명 탐지 (SR-adaptive threshold)
-// threshold 는 sr_adaptive_threshold() 로 round 마다 동적 계산 (메모리 p-stochastic-resonance-nexus.md)
+// threshold 는 sigma_peak_tracker(window=10) 기반 round 마다 동적 계산 (S2, 2026-04-19)
+// 기존 sr_adaptive_threshold() 는 후방호환을 위해 보존 (old caller 무변경)
 fn growth_apply(state: GrowthState, input, threshold: float)  {
     let mut output = []
     let mut i = 0
@@ -659,10 +704,18 @@ fn run_absorber(initial_input) -> AbsorptionChain {
     // SR rolling window: 최근 round 의 resonance 샘플 누적
     let mut resonance_history = []
 
+    // sigma_peak_tracker (S2): round 별 sigma 관측치 FIFO window=10
+    let mut recent_sigmas = []
+
     let mut depth = 0
     while depth < absorber_max_depth {
-        // SR-adaptive threshold: round 시작 시 history 기반 계산
-        let threshold = sr_adaptive_threshold(depth, resonance_history)
+        // sigma_peak_tracker 기반 threshold: round 별 sigma 관측값을 FIFO 에 push 후 std 로 갱신
+        // round 시작 시의 sigma 를 먼저 계산해 tracker 에 넣고 threshold 수신
+        let sigma_obs = estimate_sigma(resonance_history)
+        let tracker_out = sigma_peak_tracker_update(recent_sigmas, sigma_obs)
+        recent_sigmas = tracker_out[0]
+        let thr_box = tracker_out[1]
+        let threshold = thr_box[0]
 
         // 이번 round 의 resonance 샘플을 추출해서 history 에 추가
         let samples = extract_resonance_samples(current_input)

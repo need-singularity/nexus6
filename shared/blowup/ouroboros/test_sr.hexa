@@ -1,19 +1,146 @@
-// Test typed list param
-pure fn sigma_test(history: list) -> float {
+// test_sr.hexa — S2 sigma_peak_tracker 안정화 검증
+// content-aware drill S2: 동일 seed 반복 주입 시 threshold 가 수렴하는지 확인
+// 2026-04-19
+
+comptime const sr_base_threshold = 0.5
+comptime const sr_tracker_window = 10
+comptime const sr_tracker_k = 0.3
+comptime const sr_tracker_min_threshold = 0.1
+comptime const sr_tracker_max_threshold = 1.5
+
+pure fn abs_f(x: float) -> float {
+    if x < 0.0 { 0.0 - x } else { x }
+}
+
+pure fn sqrt_f(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    let mut i = 0
+    while i < 20 {
+        g = (g + x / g) / 2.0
+        i = i + 1
+    }
+    g
+}
+
+pure fn estimate_sigma(history)  -> float {
     let n = history.len()
-    println("n=" + to_string(n))
     if n < 2 { return 0.0 }
     let mut sum = 0.0
     let mut i = 0
+    while i < n { sum = sum + history[i]; i = i + 1 }
+    let mean = sum / to_float(n)
+    let mut ss = 0.0
+    i = 0
     while i < n {
-        let v = history[i]
-        sum = sum + v
+        let d = history[i] - mean
+        ss = ss + d * d
         i = i + 1
     }
-    sum / to_float(n)
+    sqrt_f(ss / to_float(n - 1))
 }
 
-println("start")
-let h1 = [0.1, 0.15, 0.08, 0.12, 0.11]
-let s1 = sigma_test(h1)
-println("s1=" + to_string(s1))
+// ouroboros.hexa 의 sigma_peak_tracker_update 복제 (독립 검증용)
+pure fn sigma_peak_tracker_update(recent_sigmas, new_sigma: float)  {
+    let mut window = recent_sigmas + [new_sigma]
+    if window.len() > sr_tracker_window {
+        let mut trimmed = []
+        let mut i = window.len() - sr_tracker_window
+        while i < window.len() { trimmed = trimmed + [window[i]]; i = i + 1 }
+        window = trimmed
+    }
+    let std = estimate_sigma(window)
+    let mut threshold = sr_base_threshold + std * sr_tracker_k
+    if threshold < sr_tracker_min_threshold { threshold = sr_tracker_min_threshold }
+    if threshold > sr_tracker_max_threshold { threshold = sr_tracker_max_threshold }
+    [window, [threshold]]
+}
+
+// ─── TEST 1: 동일 sigma 반복 → threshold 가 base 에 수렴 (std → 0)
+println("=== TEST 1: constant sigma (std → 0, threshold → base) ===")
+let mut win1 = []
+let mut last_thr = 0.0
+let mut i = 0
+while i < 15 {
+    let r = sigma_peak_tracker_update(win1, 0.1)
+    win1 = r[0]
+    let thr_box = r[1]
+    last_thr = thr_box[0]
+    println("iter=" + to_string(i) + " window_len=" + to_string(win1.len()) + " threshold=" + to_string(last_thr))
+    i = i + 1
+}
+let diff1 = abs_f(last_thr - sr_base_threshold)
+println("final threshold=" + to_string(last_thr) + " |thr - base|=" + to_string(diff1))
+assert diff1 < 0.001
+println("TEST 1 PASS: threshold stabilized at base when sigma constant")
+println("")
+
+// ─── TEST 2: 노이즈 많은 sigma → threshold > base (std * k 증가분)
+println("=== TEST 2: noisy sigma (threshold > base) ===")
+let mut win2 = []
+let noisy = [0.05, 0.25, 0.08, 0.30, 0.10, 0.20, 0.15, 0.28, 0.06, 0.22]
+let mut j = 0
+let mut last_thr2 = 0.0
+while j < noisy.len() {
+    let r = sigma_peak_tracker_update(win2, noisy[j])
+    win2 = r[0]
+    let thr_box = r[1]
+    last_thr2 = thr_box[0]
+    j = j + 1
+}
+println("noisy final threshold=" + to_string(last_thr2) + " (expect > " + to_string(sr_base_threshold) + ")")
+assert last_thr2 > sr_base_threshold
+println("TEST 2 PASS: threshold elevated under noise")
+println("")
+
+// ─── TEST 3: FIFO window=10 상한 — 15 개 push 후에도 window.len()==10
+println("=== TEST 3: FIFO cap = 10 ===")
+let mut win3 = []
+let mut k3 = 0
+while k3 < 15 {
+    let r = sigma_peak_tracker_update(win3, to_float(k3) * 0.01)
+    win3 = r[0]
+    k3 = k3 + 1
+}
+println("after 15 pushes, window.len()=" + to_string(win3.len()))
+assert win3.len() == sr_tracker_window
+println("TEST 3 PASS: FIFO window correctly capped at " + to_string(sr_tracker_window))
+println("")
+
+// ─── TEST 4: 안정화 — 노이즈 후 constant 주입 시 threshold 재수렴
+println("=== TEST 4: stabilization after noise ===")
+let mut win4 = [0.05, 0.30, 0.10, 0.25, 0.08]  // initial noise
+let mut last_thr4 = 0.0
+let mut m = 0
+while m < 20 {
+    let r = sigma_peak_tracker_update(win4, 0.12)  // constant injection
+    win4 = r[0]
+    let thr_box = r[1]
+    last_thr4 = thr_box[0]
+    m = m + 1
+}
+let diff4 = abs_f(last_thr4 - sr_base_threshold)
+println("after 20 constant injections: threshold=" + to_string(last_thr4) + " |thr - base|=" + to_string(diff4))
+assert diff4 < 0.001
+println("TEST 4 PASS: threshold re-stabilized after noise washout")
+println("")
+
+// ─── TEST 5: clamp 작동 — 극단 std (현실적으론 거의 없음)
+println("=== TEST 5: clamp bounds ===")
+let mut win5 = []
+let extreme = [0.0, 10.0, 0.0, 10.0, 0.0, 10.0, 0.0, 10.0, 0.0, 10.0]
+let mut n5 = 0
+let mut last_thr5 = 0.0
+while n5 < extreme.len() {
+    let r = sigma_peak_tracker_update(win5, extreme[n5])
+    win5 = r[0]
+    let thr_box = r[1]
+    last_thr5 = thr_box[0]
+    n5 = n5 + 1
+}
+println("extreme std threshold=" + to_string(last_thr5) + " (expect ≤ " + to_string(sr_tracker_max_threshold) + ")")
+assert last_thr5 <= sr_tracker_max_threshold
+println("TEST 5 PASS: clamp active")
+println("")
+
+println("=== ALL S2 sigma_peak_tracker TESTS PASSED ===")
