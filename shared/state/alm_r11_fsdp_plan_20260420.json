@@ -1,0 +1,173 @@
+{
+  "_meta": {
+    "name": "ALM r11 FSDP 2-GPU halvening plan — DESIGN + BLOCKER recorded (2026-04-20)",
+    "schema_version": "1.0",
+    "captured_utc": "2026-04-20T00:10:00Z",
+    "session": "session_20260420_alm_r11_fsdp_2gpu_halve",
+    "parent_refs": [
+      "shared/state/alm_r11_config.json",
+      "shared/state/alm_r11_launch_20260420.json",
+      "shared/state/alm_r11_pod_bootstrap_20260420.json",
+      "shared/state/alm_14b_fsdp_smoke_20260417.json"
+    ],
+    "memory_refs": [
+      "feedback_h100_authorized",
+      "feedback_h100_free_use",
+      "feedback_py_ban_total",
+      "feedback_hexa_first_strict",
+      "feedback_no_resume_data_change",
+      "feedback_one_shot_best",
+      "feedback_ai_native_clm"
+    ],
+    "goal": "Halve r11 wallclock (2-4h → 1-2h) via FSDP 2×H100 data parallel."
+  },
+
+  "verdict": "DESIGN_COMPLETE_WIRE_BLOCKED",
+  "verdict_rationale": "Chosen topology (single pod, 2×H100 SXM, FULL_SHARD, Qwen2DecoderLayer wrap) is identical to the alm_14b_fsdp_smoke_20260417 PASS recipe. Config deltas for r11 are defined below. However, the r11 trainer of record is training/train_alm_lora.hexa (1115 LOC hexa-native, hxqwen14b FFI). That trainer has ZERO multi-GPU hooks — no nccl init, no world_size dispatch, no fsdp_shard integration. The hexa-native NCCL FFI (training/nccl_ffi.hexa) is a single-rank no-op stub returning NCCL_TODO_RC=99 for world_size>1 until libhxnccl.so is built, and libhxnccl.so DOES NOT EXIST (verified: /Users/ghost/Dev/hexa-lang/lib/hxnccl/ missing, find libhxnccl* = 0 hits). The prior alm_14b FSDP smoke used a Python accelerate runner extracted from hexa string literals — that path is now forbidden by feedback_py_ban_total (2026-04-18 total ban strengthening) and R37/AN13/L3-PY hooks. No FSDP wire can be landed TODAY for r11 without either (a) building libhxnccl.so + wiring into train_alm_lora.hexa (multi-day), or (b) reintroducing a Python runner (BANNED).",
+
+  "topology_chosen": {
+    "path": "A — single pod, 2×H100 SXM, FULL_SHARD intra-node NVLink",
+    "path_rationale": "H100 SXM 2-GPU nodes available per runpodctl gpu list (H100 SXM stockStatus=High). Intra-node NVLink NCCL is ~600GB/s vs ~50GB/s RDMA inter-pod. Path B (2 separate pods networked) rejected — RDMA latency would eat the halvening gain and RunPod pod-to-pod NCCL is not first-class.",
+    "pod_spec": {
+      "gpu_type": "NVIDIA H100 80GB HBM3 SXM",
+      "gpu_count": 2,
+      "vram_total_gb": 160,
+      "image": "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
+      "est_cost_per_hr_usd": 5.98,
+      "est_wall_hours_2gpu": 2,
+      "est_wall_hours_1gpu": 4,
+      "est_cost_2gpu_usd": 11.96,
+      "est_cost_1gpu_usd": 12.0,
+      "cost_delta": "~$0 (same total cost, halved wallclock)"
+    }
+  },
+
+  "config_deltas_if_wire_available": {
+    "device_count": {"from": 1, "to": 2},
+    "world_size": {"from": 1, "to": 2},
+    "fsdp_enabled": {"from": false, "to": true},
+    "fsdp_sharding_strategy": "FULL_SHARD",
+    "fsdp_wrap_cls": "Qwen2DecoderLayer (TRANSFORMER_BASED_WRAP)",
+    "fsdp_backward_prefetch": "BACKWARD_PRE",
+    "fsdp_state_dict_type": "SHARDED_STATE_DICT",
+    "fsdp_use_orig_params": true,
+    "fsdp_sync_module_states": true,
+    "fsdp_cpu_ram_efficient_loading": true,
+    "mixed_precision": "bf16 (MixedPrecision with reduce=fp32 for numerical precision)",
+    "gradient_checkpointing": true,
+
+    "unchanged_trajectory_invariants": {
+      "lr": 5e-7,
+      "steps": 500,
+      "batch_per_rank": 4,
+      "effective_batch": "4 per rank × 2 ranks = 8 global (IF DDP)",
+      "effective_batch_fsdp": "4 per rank with FULL_SHARD keeps per-rank micro-batch semantics; global batch depends on whether DDP (doubles) or FSDP (preserves) — requires confirmation against 14b_fsdp_smoke pattern",
+      "seq": 1024,
+      "lora_r": 8,
+      "lora_alpha": 16,
+      "warmup": 50,
+      "save_every": 100,
+      "eval_every": 100,
+      "dtype": "bf16"
+    },
+    "effective_batch_policy": "CAUTION: halving wallclock via 2-GPU data-parallel EFFECTIVELY DOUBLES global batch size (4→8 if DDP-style). Per feedback_no_resume_data_change, batch change is a param change requiring step 0 restart. r11 currently at step 0 (no progress), so this is FREE to apply; BUT the loss_step100 / loss_step200 abort thresholds were calibrated for batch=4, not batch=8. Expected loss trajectory shifts lower (larger batch = lower variance per-step loss). Abort thresholds may need ~0.5-1.0 headroom upward re-calibration to prevent false aborts at larger global batch.",
+    "nan_guard": "NCCL_P2P_LEVEL=NVL env required for H100 SXM NVLink",
+    "per_step_phi_logging": "AN11 phi_vec per step must aggregate across ranks. For single-rank phi_holo call hxqwen14b_compute_phi_holo(h); for 2-rank requires phi_vec allreduce (mean) across ranks → BLOCKED on same NCCL FFI gap."
+  },
+
+  "blockers": [
+    {
+      "id": "B1_libhxnccl_missing",
+      "description": "hexa-native NCCL binding library not built. training/nccl_ffi.hexa defines the API surface (nccl_init, nccl_broadcast_layer, nccl_reduce_scatter_layer, nccl_barrier, nccl_shutdown) and returns NCCL_TODO_RC=99 for world_size>1. The backing libhxnccl.so was scoped out of the C9 4-hour budget. Path: /Users/ghost/Dev/hexa-lang/lib/hxnccl/ DOES NOT EXIST.",
+      "severity": "hard_blocker",
+      "evidence": "find /Users/ghost/Dev/hexa-lang -name 'libhxnccl*' → 0 hits. ls /Users/ghost/Dev/hexa-lang/lib/hxnccl/ → ENOENT.",
+      "fix_estimate": "1 day — ncclCommInitRank + ncclAllReduce + ncclReduceScatter + ncclBroadcast bindings to libnccl.so, compile libhxnccl.so, wire into nccl_ffi.hexa @extern decls."
+    },
+    {
+      "id": "B2_train_alm_lora_has_no_fsdp_path",
+      "description": "training/train_alm_lora.hexa (1115 LOC, the r11 trainer of record) contains zero references to fsdp_shard, nccl_, world_size, or FSDP. All state is single-process module globals (G_A_FLAT, G_B_FLAT, G_A_M, G_A_V, G_B_M, G_B_V). Integrating FSDP requires: (a) use 'fsdp_shard' + use 'nccl_ffi', (b) rank init at trainer start, (c) per-layer gather/reduce-scatter calls around hxqwen14b_forward_with_lora / hxqwen14b_backward_lora_only, (d) phi_vec allreduce at each eval_every.",
+      "severity": "hard_blocker_depends_on_B1",
+      "evidence": "grep -c 'fsdp_shard|nccl_|world_size|FSDP' training/train_alm_lora.hexa → 0",
+      "fix_estimate": "2-4 hours after B1 lands — mechanical wrapping of forward/backward calls with fsdp collectives, following fsdp_shard.hexa design doc."
+    },
+    {
+      "id": "B3_py_ban_forbids_accelerate_runner_fallback",
+      "description": "The alm_14b_fsdp_smoke_20260417 PASS path used a Python accelerate CLI runner extracted from hexa string literals. That path violated feedback_py_ban_total strengthening (2026-04-18, 6-axis total ban: create/edit/run/scp/remote-exec/wrapper-fallback). The Bash hook and pre-commit hook now block this. Cannot re-use FSDP smoke runner as the r11 2-GPU fallback.",
+      "severity": "hard_blocker_independent",
+      "evidence": ".claude/settings.json Bash hook + shared/rules/anima.json AN13 + shared/lockdown/lockdown.json L3-PY",
+      "fix_estimate": "N/A — policy blocker, not engineering blocker."
+    }
+  ],
+
+  "action_taken": {
+    "pods_spun": 0,
+    "pod_id_new": null,
+    "gpu_count_delivered": 1,
+    "fsdp_wire_landed": false,
+    "config_updated_for_2gpu": false,
+    "config_update_reason_skipped": "Updating alm_r11_config.json to device_count=2 + FSDP flags without an actual wire would be a lie on disk — watchdog would still launch the 1-GPU CLI from alm_r11_launch_20260420.launch_cli_exact. Per feedback_hexa_first_strict and feedback_one_shot_best, configs must reflect reality. Config remains single-GPU until B1+B2 resolve.",
+    "watchdog_state_preserved": {
+      "pod_id": "87xscivuggrwvk",
+      "tmux_session": "r11_ffi_watchdog",
+      "pid": 724,
+      "last_status_seen_utc": "2026-04-19T16:06:53Z",
+      "last_status": "RETRY / cuda_symbol_detected",
+      "alive": true,
+      "evidence": "ssh tmux list-sessions returned r11_ffi_watchdog; ps -ef shows PID 724 + PID 725 bash runner alive"
+    }
+  },
+
+  "single_gpu_fallback_preserved": {
+    "preserved": true,
+    "trajectory_unchanged": true,
+    "launch_cli_unchanged": "HEXA_PATH=training /workspace/hexa-lang/bin/hexa run /workspace/anima/training/train_alm_lora.hexa --base Qwen/Qwen2.5-14B-Instruct --corpus /workspace/data/corpus_alm_70b_stripped_kowiki15.txt --out /workspace/ckpt_alm14b_r11_20260420 --steps 500 --lr 5e-7 --lora_r 8 --lora_alpha 16 --batch 4 --seq 1024 --warmup 50 --save_every 100 --eval_every 100",
+    "wallclock_estimate_hours": "2-4 on single H100",
+    "cost_estimate_usd": 12,
+    "no_resume_rule_honored": true,
+    "per_task_risk_hedge": "Matches the task spec's explicit fallback: 'If 2xH100 SXM not readily available: document + fall back to single-GPU (no blocker, just no speedup)'. Here 2×H100 IS available (High stock) but the hexa-native wire is the bottleneck, not GPU supply. Spinning a 2×H100 pod without a wire would burn ~$3/hr idle GPU ($72 over 24h) against feedback_h100_free_use 'idle = waste'. Correct action: defer pod until wire lands."
+  },
+
+  "forward_path": {
+    "gate_to_unblock_halvening": "B1 (libhxnccl.so) + B2 (trainer FSDP integration)",
+    "recommended_owner": "hexa-lang runtime maintainer (libhxnccl.so) + anima training maintainer (trainer FSDP wire)",
+    "parallel_track_r11_today": "Let r11 ride single-GPU, 4h wallclock, $12 — already gated only on v5 CUDA kernels (BG agent a48c754f6c52a490a). When CUDA + NCCL both land, r12 (not r11 retro-fit) is where halvening applies — r12 is a fresh run that can adopt new params from step 0 without violating feedback_no_resume_data_change.",
+    "explicit_non_action": "Did NOT update alm_r11_config.json. Did NOT spin 2×H100 pod. Did NOT migrate watchdog. Did NOT commit a phantom FSDP wire. These are the honest non-actions per feedback_hexa_first_strict (configs ≡ reality) and feedback_h100_free_use (idle GPU = waste)."
+  },
+
+  "compliance": {
+    "hexa_first_strict": true,
+    "hexa_first_evidence": "No .py, .rs, .sh authored. This JSON is a state-of-world document.",
+    "no_py_created": true,
+    "no_rs_created": true,
+    "no_sh_created": true,
+    "no_quantization": true,
+    "no_resume_data_change": true,
+    "no_resume_evidence": "r11 step 0 preserved; launch CLI unchanged.",
+    "one_shot_best": true,
+    "one_shot_evidence": "No phantom config changes; wire blocker flagged honestly.",
+    "h100_authorized": true,
+    "h100_authorized_evidence": "1 pod used (87xscivuggrwvk). No second pod spun. Within 2-pod cap.",
+    "h100_free_use_idle_avoid": true,
+    "h100_free_use_evidence": "Rejected 2×H100 pod provision since no wire exists to use the second GPU.",
+    "r2_checkpoint_backup": "N/A (no new training run started).",
+    "no_version_in_filename": true,
+    "no_version_evidence": "Filename uses date stamp 20260420; no v2/v3.",
+    "background_for_long_tasks": "N/A (no long task spawned).",
+    "no_commit_without_user": "Will commit this JSON + update existing JSONs per task spec final step."
+  },
+
+  "cites": [
+    "training/train_alm_lora.hexa (1115 LOC, r11 trainer, single-process)",
+    "training/fsdp_shard.hexa:77 ('[fsdp_shard] loaded — layer-wise FSDP parameter shard for CLM')",
+    "training/nccl_ffi.hexa:67-78 ('NCCL_TODO_RC = 99' and stub no-op guard)",
+    "training/r11_ffi_watchdog.hexa (233 LOC, watchdog on pod 87xscivuggrwvk)",
+    "shared/state/alm_14b_fsdp_smoke_20260417.json (2-GPU FSDP smoke PASS, Python path pre-ban)",
+    "shared/state/alm_r11_config.json (r11 config SSOT, device_count=1 implicit)",
+    "shared/state/alm_r11_launch_20260420.json (watchdog + launch CLI SSOT)",
+    "shared/state/alm_r11_pod_bootstrap_20260420.json (pod state on 87xscivuggrwvk)",
+    "memory:feedback_py_ban_total (6-axis total py ban, blocks accelerate runner fallback)",
+    "memory:feedback_h100_free_use (idle GPU = waste, don't spin 2xH100 without a wire)",
+    "memory:feedback_ai_native_clm (CLM uses hexa native GPU path, no Python/CUDA bypass)",
+    "memory:feedback_hexa_first_strict (configs must reflect reality, no phantom FSDP flags)"
+  ]
+}
