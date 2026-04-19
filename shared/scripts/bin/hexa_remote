@@ -18,7 +18,13 @@
 set -u
 
 # Pick host. Priority: HEXA_REMOTE_HOST env → dispatch_state.json compute → ubu.
-pick_host() {
+# Zero-defect reachability (2026-04-20):
+#   - multi-host fallback: preferred → ubu → ubu2 (host sshd 22/TCP, hexa binary 위치에 직결)
+#   - ConnectTimeout 3→8s (heavy load 대응)
+#   - ServerAliveInterval 로 BannerTimeout hang 방지
+#   - 최초 probe 실패 시 다음 후보로 (이전엔 exit 64 즉시 fallback → Mac SIGKILL)
+#   - htz 는 nexus drill 에서 remote 대상 제외 (compute workload 충돌 방지)
+pick_preferred_host() {
     if [ -n "${HEXA_REMOTE_HOST:-}" ]; then
         printf '%s' "$HEXA_REMOTE_HOST"; return
     fi
@@ -27,19 +33,44 @@ pick_host() {
         local h
         h="$(jq -r '.selection.compute // "ubu"' "$state" 2>/dev/null)"
         case "$h" in
-            ubu|ubu2|htz|hetzner) printf '%s' "$h"; return ;;
-            none|mac|"") ;;
+            ubu|ubu2) printf '%s' "$h"; return ;;
+            none|mac|htz|hetzner|"") ;;
         esac
     fi
     printf 'ubu'
 }
-HOST="$(pick_host)"
-# Normalize htz → hetzner for ssh config.
-[ "$HOST" = "htz" ] && HOST="hetzner"
+_probe_host() {
+    ssh -o ConnectTimeout=8 -o BatchMode=yes -o ServerAliveInterval=5 \
+        -o ServerAliveCountMax=1 "$1" true 2>/dev/null
+}
 
-# Reachability probe — 3s cap. Fail = signal caller to fall back locally.
-if ! ssh -o ConnectTimeout=3 -o BatchMode=yes "$HOST" true 2>/dev/null; then
-    echo "hexa_remote: $HOST unreachable, falling back to local" >&2
+PREFERRED="$(pick_preferred_host)"
+# Normalize htz → hetzner (ssh config 의 canonical alias).
+[ "$PREFERRED" = "htz" ] && PREFERRED="hetzner"
+
+# Build fallback chain — preferred 먼저, 그 다음 ubu/ubu2 (compute host).
+# htz(hetzner) 는 명시 override 로만 사용, 자동 fallback 엔 포함 X (default 루트 드리프트 방지).
+FALLBACK_CHAIN="$PREFERRED"
+for cand in ubu ubu2; do
+    case " $FALLBACK_CHAIN " in
+        *" $cand "*) ;;
+        *) FALLBACK_CHAIN="$FALLBACK_CHAIN $cand" ;;
+    esac
+done
+
+HOST=""
+for cand in $FALLBACK_CHAIN; do
+    if _probe_host "$cand"; then
+        HOST="$cand"
+        [ "$PREFERRED" != "$cand" ] && echo "hexa_remote: $PREFERRED unreachable, using $cand" >&2
+        break
+    else
+        echo "hexa_remote: probe fail → $cand (next)" >&2
+    fi
+done
+
+if [ -z "$HOST" ]; then
+    echo "hexa_remote: all hosts unreachable (tried: $FALLBACK_CHAIN), falling back to local" >&2
     exit 64
 fi
 
@@ -105,8 +136,10 @@ REL="${CWD_LC#$LOCAL_ROOT_LC}"
 REL="${REL#/}"
 
 if [ "${HEXA_REMOTE_NO_SYNC:-0}" != "1" ]; then
-  rsync -aH "${SYNC_EXCLUDES[@]}" "$LOCAL_ROOT/" "$HOST:${REMOTE_ROOT#\$HOME/}/" >/dev/null 2>&1 || {
-    echo "hexa_remote: rsync failed" >&2
+  # ssh 옵션 — rsync 중 네트워크 끊기면 30s 안에 감지 (기본 default 무한 대기 방지).
+  RSYNC_SSH='ssh -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o BatchMode=yes'
+  rsync -aH -e "$RSYNC_SSH" "${SYNC_EXCLUDES[@]}" "$LOCAL_ROOT/" "$HOST:${REMOTE_ROOT#\$HOME/}/" >/dev/null 2>&1 || {
+    echo "hexa_remote: rsync failed ($HOST)" >&2
     exit 64
   }
 fi
@@ -122,4 +155,5 @@ quote_args() {
 
 REMOTE_CMD="cd \"$REMOTE_ROOT${REL:+/$REL}\" && HEXA_LOCAL=1 HEXA_NO_LAUNCHD=1 $REMOTE_HEXA$(quote_args "$@")"
 
-exec ssh -T "$HOST" "$REMOTE_CMD"
+# -T = no pty, ServerAlive = 장시간 compute (drill) 중 네트워크 끊기면 30s 내 감지 후 종료.
+exec ssh -T -o ServerAliveInterval=10 -o ServerAliveCountMax=3 "$HOST" "$REMOTE_CMD"
