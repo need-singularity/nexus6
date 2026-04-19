@@ -215,6 +215,49 @@ fn safe_float(s: string) -> f64 {
     return v
 }
 
+// AI-native: 텍스트 시드용 결정론적 hash 인코더 (FNV-1a 32-bit 변형)
+// safe_float 0 함정 우회 — 텍스트 시드 → 비-zero 수치 매핑 [0.1, 100.0] 범위
+// 충돌 허용. 결정론적 (같은 입력 → 같은 출력)
+fn _is_numeric_seed(s: string) -> bool {
+    if s.len() == 0 { return false }
+    let c0 = char_code(s, 0)
+    // digit (0-9) 또는 부호 (+/-) 또는 소수점
+    if c0 >= 48 && c0 <= 57 { return true }
+    if c0 == 43 || c0 == 45 || c0 == 46 { return true }
+    return false
+}
+
+fn text_seed_hash(s: string) -> f64 {
+    if s.len() == 0 { return 1.0 }
+    // FNV-1a 32-bit: offset_basis=2166136261, prime=16777619
+    let mut h: i64 = 2166136261
+    let mut i: i64 = 0
+    let n = s.len()
+    while i < n {
+        let cc = char_code(s, i)
+        h = h ^ cc
+        // 32-bit mask 시뮬: hexa-lang i64 → modular
+        h = (h * 16777619) % 4294967296
+        i = i + 1
+    }
+    if h < 0 { h = 0 - h }
+    // [0.1, 100.0] 범위로 매핑 (모듈 메트릭 도메인 친화)
+    let frac = (to_float(h % 1000000) / 1000000.0)  // [0.0, 1.0)
+    let v = 0.1 + frac * 99.9
+    return v
+}
+
+// safe_float + text fallback: 텍스트 시드도 결정론적 수치로
+fn seed_to_float(s: string) -> f64 {
+    if _is_numeric_seed(s) {
+        let mut v = 0.0
+        let mut ok = false
+        try { v = to_float(s); ok = true } catch e {}
+        if ok && (v != 0.0 || s == "0" || s == "0.0") { return v }
+    }
+    return text_seed_hash(s)
+}
+
 fn abs_f(x: f64) -> f64 {
     if x < 0.0 { return 0.0 - x }
     return x
@@ -832,19 +875,36 @@ fn graph_deg_cache_path() -> string {
 fn _stat_mtime_size(path: string) -> string {
     // AI-native: file_size() 네이티브 + stat mtime 플랫폼별 분리 exec
     // 이전: stat -f ... || stat -c ... (|| 메타문자 경고)
-    // 현재: file_size() 네이티브 + BSD/GNU 순차 try (|| 제거)
+    // 2026-04-19 fix: GNU 우선 + 숫자 validation (bc75341 loop-guard 패턴 일치).
+    //   Linux 에서 `stat -f %m` 가 인자를 무시하고 verbose filesystem 정보를
+    //   stdout 으로 쏟아내 → atlas.n6.stats sidecar 손상 (mtime: 파일:... 형태).
+    //   `2>/dev/null` 은 stderr 만 차단; stdout 누수는 numeric guard 로 차단.
     let mut size_s = ""
     try { size_s = to_string(file_size(path)) } catch e {}
     if size_s == "" { return "" }
     let mut mt = ""
-    // BSD (macOS) 먼저 시도 — 실패 시 빈 문자열
-    try { mt = to_string(exec("stat -f %m '" + path + "' 2>/dev/null")).trim() } catch e {}
+    // GNU (Linux) 먼저 시도 — bc75341 loop-guard 와 동일 우선순위
+    try { mt = to_string(exec("stat -c %Y '" + path + "' 2>/dev/null")).trim() } catch e {}
+    if !_is_all_digits(mt) { mt = "" }
     if mt == "" {
-        // GNU (Linux) fallback
-        try { mt = to_string(exec("stat -c %Y '" + path + "' 2>/dev/null")).trim() } catch e {}
+        // BSD (macOS) fallback
+        try { mt = to_string(exec("stat -f %m '" + path + "' 2>/dev/null")).trim() } catch e {}
+        if !_is_all_digits(mt) { mt = "" }
     }
     if mt == "" { return "" }
     return mt + " " + size_s
+}
+
+fn _is_all_digits(s: string) -> bool {
+    let n = s.len()
+    if n == 0 { return false }
+    let mut i: i64 = 0
+    while i < n {
+        let c = char_code(s, i)
+        if c < 48 || c > 57 { return false }
+        i = i + 1
+    }
+    return true
 }
 
 fn _head_hash_256(path: string) -> string {
@@ -1099,6 +1159,56 @@ fn graph_stats_write_cache_after_awk(nodes: i64, edges: i64, hubs: i64) {
     try { line_count = to_int(lc_raw.trim()) } catch e {}
     let body = "{\"schema\":2,\"mtime\":" + mtime + ",\"size\":" + size + ",\"line_count\":" + to_string(line_count) + ",\"head_hash\":\"" + head_hash + "\",\"nodes\":" + to_string(nodes) + ",\"edges\":" + to_string(edges) + ",\"hubs\":" + to_string(hubs) + "}\n"
     try { write_file(graph_stats_cache_path(), body) } catch e {}
+}
+
+// ─── Hot-shard fast path (2026-04-19 sharding migration) ───
+// atlas.n6.hot 사이드카 (hub deg≥50 노드 + 모든 axiom 헤더) — atlas.n6 의 ~44%.
+// hub 정의상 deg≥50 노드의 모든 edge 는 hot 셔드에 있으므로 graph_hub_count(min_deg=50+) 정확.
+// 단, atlas.n6 에 새 append 가 발생하면 hot 사이드카는 stale → freshness 검증 필수.
+// 정책: hot/cold 는 query-only 사이드카. atlas.n6 가 SSOT.
+fn graph_hot_shard_path() -> string {
+    return _ATLAS_PATH + ".hot"
+}
+
+fn graph_shard_meta_path() -> string {
+    return _ATLAS_PATH + ".shard_meta.json"
+}
+
+// hot 사이드카가 atlas.n6 와 동기화 상태인지 확인.
+// 검증 조건: shard_meta.json 의 atlas_mtime/atlas_size 가 현재 atlas.n6 와 일치.
+// stale 이면 false → 호출자는 atlas.n6 full scan 으로 fallback.
+fn graph_hot_shard_fresh() -> bool {
+    let meta_path = graph_shard_meta_path()
+    if !file_exists(meta_path) { return false }
+    if !file_exists(graph_hot_shard_path()) { return false }
+    let mut raw = ""
+    try { raw = read_file(meta_path) } catch e { return false }
+    if raw.trim() == "" { return false }
+    let mut meta = #{}
+    try { meta = json_parse(raw) } catch e { return false }
+    let mut meta_mtime = ""
+    let mut meta_size = ""
+    try { meta_mtime = to_string(meta["atlas_mtime"]) } catch e { return false }
+    try { meta_size = to_string(meta["atlas_size"]) } catch e { return false }
+    let stat_raw = _stat_mtime_size(_ATLAS_PATH)
+    if stat_raw == "" { return false }
+    let sp = stat_raw.split(" ")
+    if len(sp) < 2 { return false }
+    if sp[0] != meta_mtime { return false }
+    if sp[1] != meta_size { return false }
+    return true
+}
+
+// hub_count fast-path: deg sidecar + hub_threshold 만으로 O(deg_entries) 계산.
+// graph_hub_count() 의 content.split("\n") 비용 (~110k lines) 회피 — deg 사이드카는 21k entries.
+// 호출 가능 시점: deg 사이드카가 fresh (graph_stats_awk 또는 graph_stats_incremental 직후).
+// 미사용 시 graph_hub_count() 가 atlas.n6 full scan 으로 동작 (기존 동작 유지).
+fn graph_hub_count_from_deg(min_deg: i64) -> i64 {
+    let dpath = graph_deg_cache_path()
+    if !file_exists(dpath) { return -1 }
+    let deg_map = _load_deg_sidecar(dpath)
+    if len(deg_map.keys()) == 0 { return -1 }
+    return _count_hubs(deg_map, min_deg)
 }
 
 // AI-native: 단일 패스 그래프 통계 — graph_count_type×2 + graph_hub_count 3회 순회 → 1회
@@ -2159,21 +2269,22 @@ let mut ax_name_set = #{}
 
 if ext_seeds.len() > 0 {
     // --seeds 모드: seed_engine 출력 사용 (구분자: , 또는 |)
+    // AI-native: 텍스트 시드도 hash 인코딩으로 비-zero 수치 (safe_float 0 함정 우회)
     let _sep = if ext_seeds.contains(",") { "," } else { "|" }
     let seed_parts = ext_seeds.split(_sep)
     let mut si: i64 = 0
     while si < seed_parts.len() {
         let sp_trimmed = seed_parts[si].trim()
         if sp_trimmed != "" {
-            let sv = safe_float(sp_trimmed)
-            if sv != 0.0 || sp_trimmed == "0" || sp_trimmed == "0.0" {
-                ax_val_arr = ax_val_arr.push(sv)
-                let nm = match_name(sv)
-                let _sn = if nm != "" { nm } else { "s" + to_string(si) }
-                ax_name_arr = ax_name_arr.push(_sn)
-                ax_name_set[_sn] = 1
-                ax_n = ax_n + 1
-            }
+            let sv = seed_to_float(sp_trimmed)
+            // 텍스트 시드는 hash → 항상 비-zero. numeric 0/0.0 도 허용
+            ax_val_arr = ax_val_arr.push(sv)
+            let nm = match_name(sv)
+            // 텍스트 시드면 원본 라벨 유지 (디버그 가독성)
+            let _sn = if nm != "" { nm } else if _is_numeric_seed(sp_trimmed) == false { sp_trimmed } else { "s" + to_string(si) }
+            ax_name_arr = ax_name_arr.push(_sn)
+            ax_name_set[_sn] = 1
+            ax_n = ax_n + 1
         }
         si = si + 1
     }
@@ -3691,13 +3802,13 @@ if logged > 0 {
                 + "    if d in inv: dc[d]=dc.get(d,0)+1\n"
                 + "top=sorted(dc.items(),key=lambda x:-x[1])[:3]\n"
                 + "print('|'.join(d for d,c in top))\n"
-            // R37/AN13/L3-PY violation — python3 wrapper-fallback removed 2026-04-18
-            // Original: exec("python3 -c \"" + adj_py + "\" 2>/dev/null") — adj-matrix eval
-            // Requires hexa-native JSON+mmap+topology scan replacement (non-trivial).
-            // Block invocation to surface violation. Surrounding try/catch lets the
-            // growth_bus fallback path run so the system degrades gracefully.
+            // R37/AN13/L3-PY: python3 wrapper-fallback removed 2026-04-18.
+            // Original: exec("python3 -c \"" + adj_py + "\" 2>/dev/null") — adj-matrix eval.
+            // Requires hexa-native JSON+mmap+topology scan replacement (TODO).
+            // 2026-04-19: panic() 제거 — hexa-lang panic 이 try/catch 미잡힘 → Phase 8 사망.
+            // Graceful degradation: adj_result="" 유지하면 if-분기 스킵 →
+            // 함수 끝의 growth_bus fallback (line ~3815) 가 자연스럽게 인접 도메인 채움.
             let _adj_py_unused = adj_py  // preserve binding for future hexa-native port
-            panic("R37/AN13/L3-PY: python3 invocation blocked at blowup.hexa:3556 (adj-matrix eval). Escalate to user for hexa-native replacement.")
             let adj_result = ""
             if adj_result != "" {
                 let adj_doms = adj_result.split("|")
