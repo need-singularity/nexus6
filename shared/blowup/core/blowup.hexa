@@ -1145,6 +1145,80 @@ fn _atlas_extract_id(trimmed: string) -> string {
     return ""
 }
 
+// S6 (2026-04-19): 12-class absorption tag resolver.
+//   기존 8: @R/@X/@F/@C/@P/@L/@?/@S (v1 1-char tags)
+//   신규 4: @EXP/@OBS/@NEG/@ANT (v2 3-char tags — schema 이미 등록)
+//   총 12 클래스 = 10-step drill saturation 판정 기준 (S8).
+// 시그니처: classify_absorption_tag(node_type, confidence, sign, status) -> str
+//   - node_type: "formula"/"rule"/"axiom"/"constant"/"primitive"/"large"/"ssot"/"experimental"/"observation"/"negation"/"antithesis"/"unknown" 또는 기존 grade ("EXACT"/"NEAR"/"CLOSE"/"MISS")
+//   - confidence: [0,1] — axiom/formula 경계 판정 (>=0.9 axiom, >=0.7 formula)
+//   - sign: "+"/"-"/"" — NEG/ANT 판정 용 (- 면 negation/antithesis 후보)
+//   - status: "proposed"/"verified"/"rejected"/"" — antithesis 게이트 (rejected → @ANT)
+// 반환: 단일 태그 문자열 (@R/@X/@F/@C/@P/@L/@?/@S/@EXP/@OBS/@NEG/@ANT 중 하나).
+fn classify_absorption_tag(node_type: string, confidence: f64, sign: string, status: string) -> string {
+    // 우선순위: 명시적 v2 tag types → status 게이트 → confidence/sign 게이트 → v1 → fallback
+    if node_type == "experimental" || node_type == "exp" { return "@EXP" }
+    if node_type == "observation"  || node_type == "obs" { return "@OBS" }
+    if node_type == "negation"     || node_type == "neg" { return "@NEG" }
+    if node_type == "antithesis"   || node_type == "ant" { return "@ANT" }
+    if status == "rejected" { return "@ANT" }
+    if sign == "-" && confidence >= 0.5 { return "@NEG" }
+    if status == "proposed" && confidence < 0.5 { return "@EXP" }
+    if status == "verified" && confidence < 0.7 { return "@OBS" }
+    // v1 1-char 태그 (grade/type 기반)
+    if node_type == "axiom"      || node_type == "EXACT" { return "@X" }
+    if node_type == "formula"    || node_type == "NEAR"  { return "@F" }
+    if node_type == "rule"       || node_type == "CLOSE" { return "@R" }
+    if node_type == "constant"                          { return "@C" }
+    if node_type == "primitive"                         { return "@P" }
+    if node_type == "large"                             { return "@L" }
+    if node_type == "ssot"                              { return "@S" }
+    // confidence-based fallback (grade 미정 시)
+    if confidence >= 0.9 { return "@X" }
+    if confidence >= 0.7 { return "@F" }
+    if confidence >= 0.5 { return "@R" }
+    return "@?"
+}
+
+// S6 보조: 12-class tag 리스트 (S8 saturation check 공용).
+fn _absorption_tag_classes() -> list {
+    return ["@R", "@X", "@F", "@C", "@P", "@L", "@?", "@S", "@EXP", "@OBS", "@NEG", "@ANT"]
+}
+
+// S8 보조: tag → 고정 index (parallel list 카운터 접근용. map 재대입 함정 우회).
+fn _tag_idx(tag: string) -> i64 {
+    if tag == "@R" { return 0 }
+    if tag == "@X" { return 1 }
+    if tag == "@F" { return 2 }
+    if tag == "@C" { return 3 }
+    if tag == "@P" { return 4 }
+    if tag == "@L" { return 5 }
+    if tag == "@?" { return 6 }
+    if tag == "@S" { return 7 }
+    if tag == "@EXP" { return 8 }
+    if tag == "@OBS" { return 9 }
+    if tag == "@NEG" { return 10 }
+    if tag == "@ANT" { return 11 }
+    return 6
+}
+
+// S8 보조: 외부 스코프 list 를 fn-local 로 복사 → 수정 → 반환 (hexa L1849 _deg_bump 패턴).
+// 외부 list 원-위치 증분이 nested while 에서 persist 안되는 문제 우회.
+fn _tag_bump(cnts: list, idx: i64) -> list {
+    let mut out: list = []
+    let mut i: i64 = 0
+    while i < len(cnts) {
+        if i == idx {
+            let v = to_int(to_string(cnts[i])) + 1
+            out = out.push(v)
+        } else {
+            out = out.push(cnts[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
 // ─── A4/A5 helpers (2026-04-19) ───
 // ts-hour bucket 추출: "2026-04-19T03:54:13Z" → "2026-04-19T03"
 fn _ts_hour_bucket(ts: string) -> string {
@@ -2141,9 +2215,23 @@ fn evo_mutate_combine(a: f64, b: f64) -> f64 {
     return sqrt_f(abs_f(a) * abs_f(b))
 }
 
-// Verification score: how well a value aligns with n=6
+// S5 (2026-04-19): seed-aware verification — domain seed 본질이 verify_score 에 반영.
+//   기존: n6_conf(value) 만으로 계산 → seed 무관 (동일 value 는 동일 score).
+//   신규: seed_n6_ratio(domain) 을 bias 로 블렌드 (α=0.85 value-dominant, β=0.15 seed-dominant)
+//   효과: 동일 feature vector 의 seed-less 흐름 파괴 → test_A vs test_B score stddev > 0.
+// 불변식: n=6 invariant (seed_n6_ratio 내부 basis 유지), 범위 [0,1] clamp01.
+// 글로벌: _verify_seed_str — Phase 2 진입 전 set (초기 "" 이면 bias 0, 레거시 동작).
+let mut _verify_seed_str: string = ""
+let mut _verify_seed_bias: f64 = 0.0
+
 fn evo_verify(value: f64) -> f64 {
-    return n6_conf(value)
+    let base = n6_conf(value)
+    if _verify_seed_str == "" { return base }
+    // seed_n6_ratio ∈ [0, 8D dot]. normalize by basis L2 sum (≈ 5.69) → [0,1] 목표대역.
+    // 결정론 blend: score = 0.85 * base + 0.15 * clamp01(seed_ratio / 5.69)
+    let seed_norm = clamp01(_verify_seed_bias / 5.69)
+    let blended = 0.85 * base + 0.15 * seed_norm
+    return clamp01(blended)
 }
 
 // Run one evolution cycle on seed values, return best score and mutated values
@@ -2803,6 +2891,10 @@ println("")
 
 _trace("[phase-2-ouroboros] start")
 println("--- Phase 2: OUROBOROS Evolution ---")
+// S5 (2026-04-19): seed ingress to verify_score — domain 을 seed_n6_ratio 에 투입
+_verify_seed_str = domain
+_verify_seed_bias = seed_n6_ratio(domain)
+println("  seed bias      : " + domain + " → seed_n6_ratio=" + to_string(_verify_seed_bias))
 // Build seed values from domain metrics
 let mut seed_parts: [string] = []
 let mut si: i64 = 0
@@ -3845,6 +3937,13 @@ let mut absorb_graph_edges: i64 = 0
 let mut absorb_bus_events: i64 = 0
 let growth_bus_path = atlas_path
 
+// S8 (2026-04-19): 12-class tag-granular absorption counter (saturation AND-check 기준).
+// 각 흡수 라인을 classify_absorption_tag() 로 분류, 태그별 카운터 증가.
+// Phase 9 saturation = 모든 12 태그 카운터가 0 (AND) 이어야 포화 선언.
+// hexa 함정: #{} map 은 nested while 에서 재대입이 persist 안되는 경우 관찰됨 →
+//           parallel list 카운터 (tag_absorptions_cnts) + _tag_idx() 로 우회.
+let mut tag_absorptions_cnts: list = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+
 // Cross-process dedup: grep 전체 log 검사 (tail -150 → grep per-ID, O(1) short-circuit)
 // 이전 tail -150 은 cross-process race 에서 중복 발생 (70758414 3건 관찰)
 let mut absorb_existing_log = ""  // intra-batch 추적용 (grep 불필요 영역)
@@ -3903,6 +4002,10 @@ while ci < len(recurse_all_corollaries) {
                 let log_entry = "{\"constant\":\"blowup-" + dn + "\",\"value\":\"" + to_string(cor_value) + "\",\"source\":\"hexa-blowup-mk2-recurse\",\"timestamp\":\"2026-04-06\",\"grade\":\"" + cor_grade + "\",\"processed\":true,\"alien_index\":{\"d\":" + to_string(ai_d) + ",\"r\":" + to_string(ai_r) + "},\"mk2\":{\"sector\":\"" + sector + "\",\"confidence\":" + to_string(cor_conf) + ",\"paths\":1,\"prime_set\":[],\"layer\":" + to_string(ai_d) + "},\"blowup\":{\"type\":\"" + cor_type + "\",\"src\":\"" + cor_src + "\"},\"phase\":\"6.7-auto-absorb\",\"recurse_round\":\"" + cor_id + "\"}"
                 absorb_log_entries = absorb_log_entries + log_entry + "\n"
                 absorb_logged = absorb_logged + 1
+                // S8 (2026-04-19): 12-class tag 카운터 증가 (parallel list, saturation AND 판정용).
+                let _tag_log = classify_absorption_tag(cor_grade, cor_conf, "", "verified")
+                let _ti_log = _tag_idx(_tag_log)
+                tag_absorptions_cnts = _tag_bump(tag_absorptions_cnts, _ti_log)
                 // Update existing_log to prevent duplicates within this batch
                 absorb_existing_log = absorb_existing_log + dup_needle
             }
@@ -4097,6 +4200,11 @@ if file_exists(atlas_n6_path) {
                     atlas_append = atlas_append + "  <- n\n"
                     atlas_append = atlas_append + "  !! \"자동흡수 conf=" + to_string(a_cor_conf) + "\"\n"
                     absorb_atlas_count = absorb_atlas_count + 1
+                    // S8 (2026-04-19): atlas.n6 emit 시점 12-class tag 카운터 (parallel list).
+                    // ac_n6_type = F (formula) or R (rule) — classify_absorption_tag 로 정규화.
+                    let _tag_atlas = classify_absorption_tag(ac_grade, a_cor_conf, "", "verified")
+                    let _ti_atlas = _tag_idx(_tag_atlas)
+                    tag_absorptions_cnts = _tag_bump(tag_absorptions_cnts, _ti_atlas)
                     abt = abt + 1
                 }
             }
@@ -4123,6 +4231,34 @@ if file_exists(atlas_n6_path) {
 if absorb_logged == 0 && absorb_graph_nodes == 0 && absorb_atlas_count == 0 {
     println("  no new absorptions (all duplicates or below threshold)")
 }
+
+// S8 (2026-04-19): 12-class tag 분포 출력 + AND-saturation 판정.
+// 기존: saturation = (new_absorptions == 0) 단일 스칼라
+// 신규: saturation = ∀ tag ∈ {@R,@X,@F,@C,@P,@L,@?,@S,@EXP,@OBS,@NEG,@ANT} : count == 0
+// 효과: 임의의 1개 tag class 만 살아있어도 non-saturated → 탐색 지속 결정에 세밀도 확보.
+let _tag_classes = _absorption_tag_classes()
+let mut _tag_hist = ""
+let mut _sat_all_zero = true
+let mut _tag_live_count: i64 = 0
+let mut _tag_total_abs: i64 = 0
+let mut _tgi: i64 = 0
+while _tgi < len(_tag_classes) {
+    let _tg = to_string(_tag_classes[_tgi])
+    let _tgv: i64 = to_int(to_string(tag_absorptions_cnts[_tgi]))
+    if _tgv > 0 {
+        _sat_all_zero = false
+        _tag_live_count = _tag_live_count + 1
+    }
+    _tag_total_abs = _tag_total_abs + _tgv
+    if len(_tag_hist) > 0 { _tag_hist = _tag_hist + " " }
+    _tag_hist = _tag_hist + _tg + "=" + to_string(_tgv)
+    _tgi = _tgi + 1
+}
+println("  tag histogram  : " + _tag_hist)
+println("  tag live/total : " + to_string(_tag_live_count) + "/12 classes, " + to_string(_tag_total_abs) + " absorptions")
+let _sat_verdict = if _sat_all_zero { "SATURATED (∀ 12 tags == 0)" } else { "active (" + to_string(_tag_live_count) + "/12 live)" }
+println("  saturation     : " + _sat_verdict)
+
 println("")
 try { arena_reset() } catch e {}  // AI-native: Phase 6.7 임시 메모리 해제
 
