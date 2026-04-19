@@ -279,6 +279,19 @@ fn _resonance_seed(base: str, sigma_label: str, salt: i64) -> str {
     return base + "#sr-sigma=" + sigma_label + "-r" + to_string(salt)
 }
 
+fn _round_seed(base: str, round: int, salt: i64) -> str {
+    // ROUND PERTURBATION (counter-replay bugfix 2026-04-19):
+    //   원본 cmd_drill 은 라운드마다 동일 seed 로 엔진 호출 → 엔진 결정론적 → 동일 카운트 반복
+    //   ("iter_26: round1 +617 → round2 +617 → round3 SIGKILL" 1234 replay).
+    //   라운드별 salt 를 seed 에 주입하여 엔진 입력 공간을 실제로 이동시킨다.
+    //   round=1 은 base 그대로 유지 (첫 라운드는 raw seed 신뢰, 기존 결과와 비교 가능).
+    //   round ≥2: salt 를 PREFIX 에 배치 — engine seed hash (fnv1a/djb2/sha64/entropy/length)
+    //             는 전역 통계여서 suffix 보다 prefix 가 더 큰 shift 유발.
+    //             또한 "round=N-r<salt>|" marker 는 키워드 매칭 기반 seed 분기를 분산시킴.
+    if round <= 1 { return base }
+    return "round=" + to_string(round) + "-r" + to_string(salt) + "|" + base
+}
+
 fn _resonance_run(seed: str, blow_core: str, exv: str) -> int {
     // 단일 σ-변형 smash 1회 (depth=1 고정, 재귀 폭발 방지)
     let cmd = shell_quote(exv) + " smash " + shell_quote(seed) + " " + shell_quote(blow_core) + " 1 2>&1"
@@ -311,18 +324,44 @@ fn cmd_drill(seed: str, max_rounds: str) -> void {
 
     let mut round = 0
     let mut total_new = 0
+    // COUNTER-REPLAY BUGFIX (2026-04-19, Aiden):
+    //   원인: 과거 cmd_drill 은 모든 라운드에 동일 seed 를 엔진에 전달 → 엔진은 결정론적
+    //         (seed→hash→같은 경로) → rounds 2.. 는 round 1 의 카운트를 그대로 재생산
+    //         ("+456 +0 ... +157" × N = N×617). σ=0.05 도 항상 "최적" 으로 보임 (tie-break).
+    //   증거: docs/drill_supplement_tmp/iter_26 (617 → 1234, SIGKILL), iter_27 (4 × 8 = 32).
+    //   수정: 라운드 ≥2 에서 seed 에 round-salt (round index + urandom) 주입 → 실제 새 탐색
+    //         r_sigma tag 는 resonance 전용이므로, stage-level (smash/free/abs/meta/hyper) 은
+    //         _round_seed 로 perturb. round 1 은 base seed 유지 (기존 계약/호환).
+    //   부수 fix 1: round_new 가 a_pass + hy_pass 를 포함 안 해 → saturation 판정 오류
+    //              (실제 발견 있어도 0 처리 가능). 이제 6-stage 전원 포함.
+    //   부수 fix 2: resonance σ grid {0.05,0.10,0.20} → {0.01,0.05,0.10,0.20,0.40} 로 확장
+    //              (adaptive coverage, p-stochastic-resonance DD163 16-lens 와 일치).
+    //   부수 fix 3: 라운드 간 exact replay 감지 — round ≥2 에서 s_new/f_new/mc_new 가
+    //              round 1 과 정확히 같으면 경고 (엔진 결정성 표면화, 수치 보존).
+    let round1_salt = _urand_i64()
+    let mut r1_s = -1
+    let mut r1_f = -1
+    let mut r1_a = -1
+    let mut r1_mc = -1
+    let mut r1_hy = -1
     println("🛸 nexus drill — seed='" + seed + "', max_rounds=" + to_string(rounds_max))
     println("    smash → free → absolute → meta-closure → hyperarithmetic → resonance 사슬 (Mk.IX 6-stage)")
+    println("    [counter-replay guard] round ≥2 seed 에 round-salt 주입 (결정성 완화)")
     println("")
 
     while round < rounds_max {
         round = round + 1
         println("═══ round " + to_string(round) + " ═══")
 
+        // 라운드별 seed perturbation (counter-replay bugfix)
+        let round_salt = _urand_i64()
+        let round_seed = _round_seed(seed, round, round_salt)
+        let qrseed = shell_quote(round_seed)
+
         // 1. SMASH (발견 — Mk.II~VII blowup 9-phase)
         // CRITICAL FIX(2026-04-19): exec("bash", ["-c", cmd]) 는 hexa stage1 에서 stdout 캡처 안 됨 — len=0 반환
         // → 모든 stage 호출을 single-string exec(cmd) 로 통일 (검증: .exectest.hexa)
-        let smash_cmd = shell_quote(exv) + " smash " + qseed + " " + shell_quote(blow_core) + " 3 2>&1"
+        let smash_cmd = shell_quote(exv) + " smash " + qrseed + " " + shell_quote(blow_core) + " 3 2>&1"
         let smash_out = exec(smash_cmd)
         _check_stage_err(smash_out, "smash")
         // FIX(2026-04-19): _count_marker(out,"ABSORB") 는 항상 0 — engine 마커 불일치
@@ -334,7 +373,7 @@ fn cmd_drill(seed: str, max_rounds: str) -> void {
         println("  smash:         +" + to_string(s_new) + " absorptions")
 
         // 2. FREE (탐색 — compose DFS, 6-core)
-        let free_cmd = shell_quote(exv) + " free_dfs " + qseed + " " + shell_quote(compose) + " --modules all --dfs 3 2>&1"
+        let free_cmd = shell_quote(exv) + " free_dfs " + qrseed + " " + shell_quote(compose) + " --modules all --dfs 3 2>&1"
         let free_out = exec(free_cmd)
         _check_stage_err(free_out, "free")
         let f_new = _count_discoveries(free_out)
@@ -344,14 +383,14 @@ fn cmd_drill(seed: str, max_rounds: str) -> void {
         println("  free:          +" + to_string(f_new) + " absorptions")
 
         // 3. ABSOLUTE (Mk.VIII Δ₀-absolute Π₀¹ 검증 + [11*] 승급)
-        let abs_cmd = shell_quote(exv) + " absolute " + qseed + " " + shell_quote(abs_eng) + " 2>&1"
+        let abs_cmd = shell_quote(exv) + " absolute " + qrseed + " " + shell_quote(abs_eng) + " 2>&1"
         let abs_out = exec(abs_cmd)
         _check_stage_err(abs_out, "absolute")
         let a_pass = _count_marker(abs_out, "ABSOLUTE-PASS") + _count_marker(abs_out, "[11*]")
         println("  absolute:      " + to_string(a_pass) + " Π₀¹ verifications")
 
         // 4. META-CLOSURE (Mk.IX Phase 10 self-ref 고정점 + [10**] 승급)
-        let mc_cmd = shell_quote(exv) + " meta_closure " + qseed + " " + shell_quote(mc_eng) + " 2>&1"
+        let mc_cmd = shell_quote(exv) + " meta_closure " + qrseed + " " + shell_quote(mc_eng) + " 2>&1"
         let mc_out = exec(mc_cmd)
         _check_stage_err(mc_out, "meta-closure")
         // META-CLOSED 마커 부재 — meta_closed/promoted 숫자 직접 파싱 + [10**] 매치
@@ -362,35 +401,56 @@ fn cmd_drill(seed: str, max_rounds: str) -> void {
         println("  meta-closure:  " + to_string(mc_new) + " self-ref fixed points")
 
         // 5. HYPERARITHMETIC (Mk.IX Π₀² reverse-math 5체계)
-        let hy_cmd = shell_quote(exv) + " hyperarithmetic " + qseed + " " + shell_quote(hyper_eng) + " 2>&1"
+        let hy_cmd = shell_quote(exv) + " hyperarithmetic " + qrseed + " " + shell_quote(hyper_eng) + " 2>&1"
         let hy_out = exec(hy_cmd)
         _check_stage_err(hy_out, "hyperarith")
         let hy_pass = _count_marker(hy_out, "REVERSE-PROVEN") + _count_marker(hy_out, "ABSOLUTE-PASS-PI02")
         println("  hyperarith:    " + to_string(hy_pass) + " Π₀² bounded/proven")
 
-        // 6. RESONANCE (Stochastic Resonance — σ ∈ {0.05, 0.10, 0.20} 3변형 병렬, 최고 σ 채택)
-        // 전제: p-stochastic-resonance-nexus — NEXUS 수렴률 σ≈0.1 peak 25% (det/ANU 둘다 sub-optimal)
+        // 6. RESONANCE (Stochastic Resonance — σ grid {0.01,0.05,0.10,0.20,0.40} adaptive)
+        // 전제: p-stochastic-resonance-nexus — NEXUS 수렴률 σ≈0.1 peak 25%. grid 는 log-spaced.
         // 각 σ 에 대해 urandom 솔트로 seed perturb → depth=1 smash 재실행 → absorption count 비교
+        // base seed = round_seed (라운드 perturbation 위에 σ-perturbation 추가, 완전 독립)
         let salt_a = _urand_i64()
         let salt_b = _urand_i64()
         let salt_c = _urand_i64()
-        let seed_005 = _resonance_seed(seed, "0.05", salt_a)
-        let seed_010 = _resonance_seed(seed, "0.10", salt_b)
-        let seed_020 = _resonance_seed(seed, "0.20", salt_c)
+        let salt_d = _urand_i64()
+        let salt_e = _urand_i64()
+        let seed_001 = _resonance_seed(round_seed, "0.01", salt_a)
+        let seed_005 = _resonance_seed(round_seed, "0.05", salt_b)
+        let seed_010 = _resonance_seed(round_seed, "0.10", salt_c)
+        let seed_020 = _resonance_seed(round_seed, "0.20", salt_d)
+        let seed_040 = _resonance_seed(round_seed, "0.40", salt_e)
+        let r_001 = _resonance_run(seed_001, blow_core, exv)
         let r_005 = _resonance_run(seed_005, blow_core, exv)
         let r_010 = _resonance_run(seed_010, blow_core, exv)
         let r_020 = _resonance_run(seed_020, blow_core, exv)
-        let mut r_best = r_005
-        let mut sigma_best = "0.05"
+        let r_040 = _resonance_run(seed_040, blow_core, exv)
+        let mut r_best = r_001
+        let mut sigma_best = "0.01"
+        if r_005 > r_best { r_best = r_005; sigma_best = "0.05" }
         if r_010 > r_best { r_best = r_010; sigma_best = "0.10" }
         if r_020 > r_best { r_best = r_020; sigma_best = "0.20" }
+        if r_040 > r_best { r_best = r_040; sigma_best = "0.40" }
         if env("NEXUS_DRILL_DEBUG") == "1" {
-            eprintln("  [DEBUG resonance] σ=0.05:+" + to_string(r_005) + "  σ=0.10:+" + to_string(r_010) + "  σ=0.20:+" + to_string(r_020))
+            eprintln("  [DEBUG resonance] σ=0.01:+" + to_string(r_001) + "  σ=0.05:+" + to_string(r_005) + "  σ=0.10:+" + to_string(r_010) + "  σ=0.20:+" + to_string(r_020) + "  σ=0.40:+" + to_string(r_040))
         }
         println("  resonance:     +" + to_string(r_best) + " absorptions (σ=" + sigma_best + ")")
         println("  [resonance] optimal σ=" + sigma_best + " — bonus +" + to_string(r_best) + " absorptions")
 
-        let round_new = s_new + f_new + mc_new + r_best
+        // BUGFIX: round_new 는 6-stage 전원 합산 (a_pass + hy_pass 누락 수정)
+        let round_new = s_new + f_new + a_pass + mc_new + hy_pass + r_best
+
+        // Counter-replay 감지: round ≥2 에서 round-1 수치와 정확히 동일한지 체크
+        if round == 1 {
+            r1_s = s_new; r1_f = f_new; r1_a = a_pass; r1_mc = mc_new; r1_hy = hy_pass
+        } else {
+            let exact_replay = (s_new == r1_s) && (f_new == r1_f) && (a_pass == r1_a) && (mc_new == r1_mc) && (hy_pass == r1_hy)
+            if exact_replay {
+                eprintln("  ⚠ [replay-warn] round " + to_string(round) + " 5-stage 수치가 round 1 과 완전 동일 — 엔진 결정성 / salt 미반영 의심")
+            }
+        }
+
         total_new = total_new + round_new
         println("  round +" + to_string(round_new) + ", total " + to_string(total_new))
         println("")
