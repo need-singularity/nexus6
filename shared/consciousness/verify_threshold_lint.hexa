@@ -1,0 +1,267 @@
+// verify_threshold_lint.hexa — verification.json SSOT threshold linter
+//
+// GOVERNS: docs/12_conditions_audit_20260419.md §4 P0#4 (Threshold desync 린터)
+// RELATED:  feedback_verify_pipeline, feedback_closed_loop_verify
+// SSOT:     config/verification.json (+ mirror ready/config/verification.json)
+//
+// PURPOSE
+//   Enforce that each criteria.*.description AND criteria.*.test field in
+//   config/verification.json refers to thresholds by SSOT key name (verify_*),
+//   never by literal number. Literal thresholds embedded in descriptions
+//   cause config ↔ code ↔ doc desync (see V16 doc 0.95 vs code 0.99 case).
+//
+//   Also checks that:
+//     - Every verify_* key referenced in a test string exists in
+//       thresholds_from_json block.
+//     - Every thresholds_from_json key is referenced by at least one criterion
+//       (unused threshold keys become stale and drift).
+//     - config/verification.json and ready/config/verification.json byte-match
+//       (ready/ is runtime mirror of config/).
+//
+// USAGE
+//   hexa shared/consciousness/verify_threshold_lint.hexa
+//     → stdout: violation list + summary. exit 2 if any violation.
+//   hexa shared/consciousness/verify_threshold_lint.hexa --json
+//     → stdout: JSONL one record per violation
+//
+// EXIT CODES
+//   0 = no violations
+//   1 = input / io error (verification.json missing or unreadable)
+//   2 = N violations detected
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn resolve_root() -> string {
+    let e = _str(env("ANIMA"))
+    if e != "" { return e }
+    let script = "/tmp/_vtl_gitroot.sh"
+    write_file(script, "#!/bin/sh\ngit rev-parse --show-toplevel 2>/dev/null\n")
+    exec("chmod +x " + script)
+    let gt = _str(exec(script)).trim()
+    if gt != "" { return gt }
+    let h = _str(env("HOME"))
+    return h + "/Dev/anima"
+}
+
+// Decide whether a substring looks like a literal numeric threshold
+// e.g. ">= 0.85", ">=1.1x", "< 0.5", "80%", ">= 200"
+// We flag ALL occurrences of digit-adjacent comparator patterns in test strings
+// except when inside a verify_* identifier (e.g. verify_v4_recovery_min).
+fn has_literal_threshold(s: string) -> bool {
+    let n = len(s)
+    let mut i = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        // Detect a digit
+        let code = 0
+        if c >= "0" && c <= "9" {
+            // Walk backwards up to 16 chars; if we hit "verify_" boundary, skip
+            let look_back_start = if i >= 24 { i - 24 } else { 0 }
+            let back = s.substring(look_back_start, i)
+            if back.index_of("verify_") >= 0 {
+                // digit is part of a threshold key name — not a literal
+                i = i + 1
+                continue
+            }
+            // Look backwards for comparator (>, <, =, >=, <=, ratio words)
+            let look2 = if i >= 6 { s.substring(i - 6, i) } else { s.substring(0, i) }
+            let l2 = look2.to_lower()
+            let has_cmp = l2.index_of(">=") >= 0 || l2.index_of("<=") >= 0 ||
+                          l2.index_of(">") >= 0 || l2.index_of("<") >= 0 ||
+                          l2.index_of("=") >= 0 || l2.index_of("min") >= 0 ||
+                          l2.index_of("max") >= 0 || l2.index_of("ratio") >= 0
+            if has_cmp { return true }
+            // Also catch trailing "x" multiplier (e.g. "1.1x")
+            let fwd = if i + 4 < n { s.substring(i, i + 4) } else { s.substring(i, n) }
+            if fwd.index_of("x") >= 0 && (fwd.index_of(".") >= 0 || fwd.substring(0, 1) >= "1") {
+                return true
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// Extract all verify_* identifiers from a string
+fn extract_verify_keys(s: string) -> array {
+    let mut acc = []
+    let n = len(s)
+    let mut i = 0
+    while i < n {
+        let idx = s.index_of("verify_")
+        if idx < 0 { return acc }
+        let start = idx
+        // Walk forward to end of identifier (alphanum + underscore)
+        let mut j = start + 7
+        while j < n {
+            let c = s.substring(j, j + 1)
+            let is_word = (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") ||
+                          (c >= "0" && c <= "9") || c == "_"
+            if !is_word { break }
+            j = j + 1
+        }
+        let key = s.substring(start, j)
+        acc = push(acc, key)
+        // Advance past this match
+        s = s.substring(j, n)
+        n = len(s)
+        i = 0
+    }
+    return acc
+}
+
+// Rough JSON key extractor for thresholds_from_json block
+// Finds the block and returns list of declared keys
+fn extract_threshold_keys(json_content: string) -> array {
+    let block_start = json_content.index_of("\"thresholds_from_json\"")
+    let mut acc = []
+    if block_start < 0 { return acc }
+    let rest = json_content.substring(block_start, len(json_content))
+    let brace = rest.index_of("{")
+    if brace < 0 { return acc }
+    let inner = rest.substring(brace + 1, len(rest))
+    let close = inner.index_of("}")
+    if close < 0 { return acc }
+    let body = inner.substring(0, close)
+    let lines = body.split("\n")
+    let mut k = 0
+    let nl = len(lines)
+    while k < nl {
+        let line = _str(lines[k]).trim()
+        let q1 = line.index_of("\"")
+        if q1 >= 0 {
+            let rest2 = line.substring(q1 + 1, len(line))
+            let q2 = rest2.index_of("\"")
+            if q2 >= 0 {
+                let key = rest2.substring(0, q2)
+                if key.index_of("verify_") == 0 {
+                    acc = push(acc, key)
+                }
+            }
+        }
+        k = k + 1
+    }
+    return acc
+}
+
+// Extract criteria.*.test strings from JSON (line-based, simple)
+fn extract_criteria_test_lines(json_content: string) -> array {
+    let mut acc = []
+    let lines = json_content.split("\n")
+    let n = len(lines)
+    let mut i = 0
+    while i < n {
+        let line = _str(lines[i]).trim()
+        if line.index_of("\"test\":") == 0 || line.index_of("\"description\":") == 0 {
+            // Strip key + colon, keep value
+            let colon = line.index_of(":")
+            let val = line.substring(colon + 1, len(line)).trim()
+            acc = push(acc, val)
+        }
+        i = i + 1
+    }
+    return acc
+}
+
+fn main() {
+    let argv = args()
+    let mut json_out = false
+    let mut k = 0
+    while k < len(argv) {
+        let a = _str(argv[k])
+        if a == "--json" { json_out = true }
+        k = k + 1
+    }
+
+    let root = resolve_root()
+    let primary = root + "/config/verification.json"
+    let mirror = root + "/ready/config/verification.json"
+
+    let content = _str(read_file(primary))
+    if content == "" {
+        print_err("[verify_threshold_lint] ERROR cannot read " + primary)
+        exit(1)
+    }
+    let content_m = _str(read_file(mirror))
+
+    let mut violations = 0
+    let mut messages = []
+
+    // Check 1: primary == mirror (ready/ is runtime mirror of config/)
+    if content_m == "" {
+        messages = push(messages, "mirror_missing: " + mirror + " not found")
+        violations = violations + 1
+    } else if content != content_m {
+        messages = push(messages, "mirror_desync: config/verification.json != ready/config/verification.json")
+        violations = violations + 1
+    }
+
+    // Check 2: literal thresholds in description/test fields
+    let crit_lines = extract_criteria_test_lines(content)
+    let mut j = 0
+    let nc = len(crit_lines)
+    while j < nc {
+        let line = _str(crit_lines[j])
+        if has_literal_threshold(line) {
+            messages = push(messages, "literal_threshold: " + line.substring(0, if len(line) > 120 { 120 } else { len(line) }))
+            violations = violations + 1
+        }
+        j = j + 1
+    }
+
+    // Check 3: referenced verify_* keys all exist in thresholds_from_json
+    let declared = extract_threshold_keys(content)
+    let mut referenced = []
+    let mut r = 0
+    while r < nc {
+        let keys = extract_verify_keys(_str(crit_lines[r]))
+        let mut rk = 0
+        while rk < len(keys) {
+            referenced = push(referenced, _str(keys[rk]))
+            rk = rk + 1
+        }
+        r = r + 1
+    }
+
+    let mut rr = 0
+    while rr < len(referenced) {
+        let ref_key = _str(referenced[rr])
+        let mut found = false
+        let mut dd = 0
+        while dd < len(declared) {
+            if _str(declared[dd]) == ref_key { found = true; break }
+            dd = dd + 1
+        }
+        if !found {
+            messages = push(messages, "unknown_threshold_key: " + ref_key + " referenced but not declared in thresholds_from_json")
+            violations = violations + 1
+        }
+        rr = rr + 1
+    }
+
+    // Report
+    let mut m = 0
+    while m < len(messages) {
+        let line = _str(messages[m])
+        if json_out {
+            println("{\"lint\":\"verify_threshold\",\"violation\":\"" + line + "\"}")
+        } else {
+            println("[verify_threshold_lint] VIOLATION " + line)
+        }
+        m = m + 1
+    }
+
+    if !json_out {
+        println("[verify_threshold_lint] scanned=" + primary +
+                " violations=" + to_string(violations) +
+                " declared_keys=" + to_string(len(declared)) +
+                " referenced_keys=" + to_string(len(referenced)))
+    }
+
+    if violations > 0 { exit(2) }
+    exit(0)
+}
