@@ -280,7 +280,7 @@ fn _resonance_seed(base: str, sigma_label: str, salt: i64) -> str {
 }
 
 fn _round_seed(base: str, round: int, salt: i64) -> str {
-    // ROUND PERTURBATION (counter-replay bugfix 2026-04-19):
+    // ROUND PERTURBATION (Day-1 counter-replay bugfix 2026-04-19):
     //   원본 cmd_drill 은 라운드마다 동일 seed 로 엔진 호출 → 엔진 결정론적 → 동일 카운트 반복
     //   ("iter_26: round1 +617 → round2 +617 → round3 SIGKILL" 1234 replay).
     //   라운드별 salt 를 seed 에 주입하여 엔진 입력 공간을 실제로 이동시킨다.
@@ -290,6 +290,69 @@ fn _round_seed(base: str, round: int, salt: i64) -> str {
     //             또한 "round=N-r<salt>|" marker 는 키워드 매칭 기반 seed 분기를 분산시킴.
     if round <= 1 { return base }
     return "round=" + to_string(round) + "-r" + to_string(salt) + "|" + base
+}
+
+fn _iter_nonce() -> str {
+    // DAY-2 INTER-ITER NONCE (2026-04-19):
+    //   Day-1 (_round_seed) 는 intra-iter (같은 drill 내 round 2+) 의 replay 만 제거.
+    //   그러나 iter_36/37 둘 다 round1 total=629, iter_38/39 둘 다 round1 total=693 관찰 →
+    //   **seed 텍스트가 다른데도** blowup 엔진의 deterministic 8-slot feature (len/entropy/
+    //   fnv1a/djb2/sha64/domain/digit/words) 가 seed 가 비슷하면 비슷한 atlas coord 를 생산.
+    //   즉 inter-iter 간 독립성이 보장되지 않음.
+    //
+    //   해결: drill 세션 시작 시 1회 urandom 기반 nonce 생성, round 1 부터 모든 seed 에 주입.
+    //   주입 방식: prefix 가 아닌 suffix `#iter-nonce=<N>` — prefix 는 keyword-match stage 의
+    //   비교를 앞부분에서 깨기 때문에 stage 의도를 왜곡. suffix 는 hash 공간만 이동.
+    //
+    //   우선순위:
+    //     1) NEXUS_DRILL_NONCE env — 명시 지정 (재현용). 공백/0 = 자동.
+    //     2) urandom — 기본값. 같은 drill 내 round 들은 공유 nonce, 다른 drill 은 독립.
+    //
+    //   round=1 salt prefix 와 독립 축 — Day-1 fix 유지 (round-salt) + Day-2 (iter-nonce) 중첩.
+    let env_val = env("NEXUS_DRILL_NONCE")
+    if env_val.len() > 0 && env_val != "0" { return env_val }
+    let r = _urand_i64()
+    return to_string(r)
+}
+
+fn _nonce_seed(base: str, nonce: str) -> str {
+    // iter-scoped nonce 주입. suffix 배치로 keyword-match stage 왜곡 최소화.
+    // round_seed 와 직교: round_seed(nonce_seed(base, N), round, salt)
+    //   = "round=K-r<salt>|base#iter-nonce=<N>"  (round ≥2)
+    //   = "base#iter-nonce=<N>"                   (round 1)
+    if nonce.len() == 0 { return base }
+    return base + "#iter-nonce=" + nonce
+}
+
+fn _cross_iter_log_path() -> str {
+    // cross-iter replay detector 로그. tmp 영역 — 10 iter rolling window.
+    return "/tmp/nexus_drill_cross_iter.log"
+}
+
+fn _cross_iter_check_and_append(total: int, seed: str) -> void {
+    // DAY-2 CROSS-ITER REPLAY DETECTOR:
+    //   최근 10 iter 의 final total 을 rolling 저장, 새 drill 의 total 이 최근 10 중 존재하면 warn.
+    //   - detector 만: 수치는 보존 (blowup 엔진 결정성 추가 증거)
+    //   - path: /tmp/nexus_drill_cross_iter.log  (CSV: total,seed_head40,ts)
+    //   - window: 10 lines, tail 로 자름
+    let path = _cross_iter_log_path()
+    let cur = to_string(total)
+    // 1) 기존 로그 읽기 (없으면 빈 문자열)
+    let existing = exec("[ -f " + path + " ] && cat " + path + " || echo ''")
+    // 2) 현 total 이 최근 10 중 존재하는지 (정확 매치)
+    //    라인 형식: "<total>,..." — prefix match 로 검사
+    let needle = cur + ","
+    if str_find(existing, needle) >= 0 {
+        eprintln("  ⚠ [cross-iter-replay-warn] total=" + cur + " 가 최근 drill 10 iter 중 동일 — inter-iter 결정성 의심")
+        eprintln("     path=" + path + "  seed_head='" + seed.substring(0, if seed.len() < 40 { seed.len() } else { 40 }) + "'")
+    }
+    // 3) append + tail -10 로 rolling 유지 (shell quoting 회피: 짧은 seed_head 만 로그)
+    let seed_head = seed.substring(0, if seed.len() < 40 { seed.len() } else { 40 })
+    let ts = exec("date +%s").trim()
+    // 안전: seed_head 내 개행/쉼표 제거
+    let sh_safe = seed_head.replace(",", " ").replace("\n", " ").replace("'", " ")
+    let line = cur + "," + sh_safe + "," + ts
+    exec("printf '%s\\n' " + shell_quote(line) + " >> " + path + " && tail -n 10 " + path + " > " + path + ".tmp && mv " + path + ".tmp " + path)
 }
 
 fn _resonance_run(seed: str, blow_core: str, exv: str) -> int {
@@ -325,28 +388,34 @@ fn cmd_drill(seed: str, max_rounds: str) -> void {
     let mut round = 0
     let mut total_new = 0
     // COUNTER-REPLAY BUGFIX (2026-04-19, Aiden):
-    //   원인: 과거 cmd_drill 은 모든 라운드에 동일 seed 를 엔진에 전달 → 엔진은 결정론적
-    //         (seed→hash→같은 경로) → rounds 2.. 는 round 1 의 카운트를 그대로 재생산
-    //         ("+456 +0 ... +157" × N = N×617). σ=0.05 도 항상 "최적" 으로 보임 (tie-break).
-    //   증거: docs/drill_supplement_tmp/iter_26 (617 → 1234, SIGKILL), iter_27 (4 × 8 = 32).
-    //   수정: 라운드 ≥2 에서 seed 에 round-salt (round index + urandom) 주입 → 실제 새 탐색
-    //         r_sigma tag 는 resonance 전용이므로, stage-level (smash/free/abs/meta/hyper) 은
-    //         _round_seed 로 perturb. round 1 은 base seed 유지 (기존 계약/호환).
-    //   부수 fix 1: round_new 가 a_pass + hy_pass 를 포함 안 해 → saturation 판정 오류
-    //              (실제 발견 있어도 0 처리 가능). 이제 6-stage 전원 포함.
-    //   부수 fix 2: resonance σ grid {0.05,0.10,0.20} → {0.01,0.05,0.10,0.20,0.40} 로 확장
-    //              (adaptive coverage, p-stochastic-resonance DD163 16-lens 와 일치).
-    //   부수 fix 3: 라운드 간 exact replay 감지 — round ≥2 에서 s_new/f_new/mc_new 가
-    //              round 1 과 정확히 같으면 경고 (엔진 결정성 표면화, 수치 보존).
+    //   Day-1 (3440614c): intra-iter — 라운드마다 동일 seed → round-salt PREFIX 주입으로 round 2+ 분기
+    //   Day-2 (2026-04-19): inter-iter — 다른 drill 호출 간에도 seed 가 비슷하면 engine deterministic
+    //                       8-slot feature (len/entropy/fnv1a/djb2/sha64/...) 가 같은 atlas coord 생산
+    //                       → iter_36(runtime)/37(registry) round1 total=629 동일,
+    //                         iter_38(l0_freeze)/39(godhead) round1 total=693 동일.
+    //                       해결: drill 세션 시작 시 1회 _iter_nonce() 생성, 모든 round seed 에 suffix 주입
+    //                            (_nonce_seed). round_seed 와 직교 — suffix 는 hash 분산, prefix 는 분기.
+    //                       재현성: NEXUS_DRILL_NONCE env 로 pin 가능 (기본 자동 urandom).
+    //
+    //   부수 fix (Day-1 유지):
+    //     1) round_new 가 6-stage 전원 합산 (a_pass + hy_pass 포함)
+    //     2) resonance σ grid log-spaced 5점
+    //     3) intra-round replay-warn (round ≥2 가 round 1 과 완전 동일 수치일 때)
+    //   Day-2 추가:
+    //     4) cross-iter replay-warn — 최근 10 drill total 과 비교. /tmp/nexus_drill_cross_iter.log.
     let round1_salt = _urand_i64()
     let mut r1_s = -1
     let mut r1_f = -1
     let mut r1_a = -1
     let mut r1_mc = -1
     let mut r1_hy = -1
+    // Day-2: iter-scoped nonce — round 1 부터 engine feature 공간 이동 (inter-iter 독립성)
+    let iter_nonce = _iter_nonce()
+    let nonce_base = _nonce_seed(seed, iter_nonce)
     println("🛸 nexus drill — seed='" + seed + "', max_rounds=" + to_string(rounds_max))
     println("    smash → free → absolute → meta-closure → hyperarithmetic → resonance 사슬 (Mk.IX 6-stage)")
-    println("    [counter-replay guard] round ≥2 seed 에 round-salt 주입 (결정성 완화)")
+    println("    [counter-replay guard Day-1] round ≥2 seed 에 round-salt 주입 (intra-iter)")
+    println("    [counter-replay guard Day-2] iter-nonce=" + iter_nonce + " 모든 round 에 suffix 주입 (inter-iter)")
     println("")
 
     while round < rounds_max {
@@ -354,8 +423,10 @@ fn cmd_drill(seed: str, max_rounds: str) -> void {
         println("═══ round " + to_string(round) + " ═══")
 
         // 라운드별 seed perturbation (counter-replay bugfix)
+        // Day-2: nonce_base (iter-scoped suffix) 를 베이스로 사용 → round 1 부터 inter-iter 독립성 확보
+        // round_seed 는 nonce_base 위에 round-salt prefix 추가 → Day-1 intra-iter 분기 보존
         let round_salt = _urand_i64()
-        let round_seed = _round_seed(seed, round, round_salt)
+        let round_seed = _round_seed(nonce_base, round, round_salt)
         let qrseed = shell_quote(round_seed)
 
         // 1. SMASH (발견 — Mk.II~VII blowup 9-phase)
@@ -459,11 +530,15 @@ fn cmd_drill(seed: str, max_rounds: str) -> void {
             println("▎ SATURATED at round " + to_string(round))
             println("▎ total absorptions: " + to_string(total_new))
             println("▎ 새 atlas 영역 없음 — Mk.IX 6-stage 경험적 확증 (absolute+meta+hyper+resonance)")
+            // Day-2: cross-iter replay detector — 최근 10 drill total 기록+비교
+            _cross_iter_check_and_append(total_new, seed)
             return
         }
     }
     println("▎ max rounds reached (" + to_string(rounds_max) + ")")
     println("▎ total absorptions: " + to_string(total_new))
+    // Day-2: cross-iter replay detector — 최근 10 drill total 기록+비교
+    _cross_iter_check_and_append(total_new, seed)
 }
 
 fn cmd_meta_closure(seed: str) -> void {
