@@ -26,6 +26,15 @@ if !file_exists(_ATLAS_PATH) {
     exit(1)  // @allow-silent-exit
 }
 
+// X1 (2026-04-19): atlas-blowup 분리 — JSON sidecar 합산 처리
+//   atlas.n6        : @-prefix 라벨 (1.5MB, axiom SSOT)
+//   atlas.blowup.jsonl : {"type":"node|edge",...} (17MB, 결과 사이드카)
+let mut _ATLAS_BLOWUP_PATH = ""
+if _ATLAS_PATH.ends_with("atlas.n6") {
+    let mut _bp = _ATLAS_PATH.substring(0, len(_ATLAS_PATH) - 8) + "atlas.blowup.jsonl"
+    if file_exists(_bp) { _ATLAS_BLOWUP_PATH = _bp }
+}
+
 // ─── mtime 캐시 체크 (exec 4회 → 0회 fast path) ───
 let _STATS_PATH = _ATLAS_PATH + ".stats"
 let mut _cache_hit = false
@@ -117,9 +126,28 @@ if _cache_hit {
     edges = _grep_count(_ATLAS_PATH, "\"type\":\"edge\"")
 }
 
+// X1: JSON sidecar 합산 (atlas.blowup.jsonl 의 nodes/edges 추가)
+let mut blowup_size: i64 = 0
+let mut blowup_lines: i64 = 0
+let mut blowup_nodes: i64 = 0
+let mut blowup_edges: i64 = 0
+if _ATLAS_BLOWUP_PATH != "" {
+    blowup_size = _stat_size(_ATLAS_BLOWUP_PATH)
+    blowup_lines = _line_count(_ATLAS_BLOWUP_PATH)
+    blowup_nodes = _grep_count(_ATLAS_BLOWUP_PATH, "\"type\":\"node\"")
+    blowup_edges = _grep_count(_ATLAS_BLOWUP_PATH, "\"type\":\"edge\"")
+    // 합산값으로 기존 nodes/edges 갱신 (downstream 호환)
+    nodes = nodes + blowup_nodes
+    edges = edges + blowup_edges
+}
+
 println("=== atlas.n6 health: " + _ATLAS_PATH + " ===")
-println("  size:          " + to_string(size_bytes) + " bytes")
-println("  lines:         " + to_string(lines))
+println("  size:          " + to_string(size_bytes) + " bytes (labels)")
+println("  lines:         " + to_string(lines) + " (labels)")
+if _ATLAS_BLOWUP_PATH != "" {
+    println("  blowup sidecar:" + to_string(blowup_size) + " bytes / " + to_string(blowup_lines) + " lines")
+    println("  total:         " + to_string(size_bytes + blowup_size) + " bytes / " + to_string(lines + blowup_lines) + " lines")
+}
 println("  nodes:         " + to_string(nodes))
 println("  edges:         " + to_string(edges))
 
@@ -149,15 +177,21 @@ if file_exists(lock_path) {
     if show_lock { println("  lock:          (none)") }
 }
 
+// X1: JSON 분석은 두 파일 합산 — sidecar 가 있으면 합쳐서 처리
+let mut _JSON_SOURCES = "'" + _ATLAS_PATH + "'"
+if _ATLAS_BLOWUP_PATH != "" {
+    _JSON_SOURCES = _JSON_SOURCES + " '" + _ATLAS_BLOWUP_PATH + "'"
+}
+
 // ─── 유일 node ID 카운트 (awk 경유) ───  // @allow-bare-interp
 // 'node' + 'absorb' 양쪽 인식 (R*-* 7대난제 absorb 도 정당한 노드)
-let node_uniq_raw = to_string(exec("awk -F'\"id\":\"' '/\"type\":\"(node|absorb)\"/{split($2,a,\"\\\"\");print a[1]}' '" + _ATLAS_PATH + "' 2>/dev/null | sort -u | wc -l")).trim()
+let node_uniq_raw = to_string(exec("awk -F'\"id\":\"' '/\"type\":\"(node|absorb)\"/{split($2,a,\"\\\"\");print a[1]}' " + _JSON_SOURCES + " 2>/dev/null | sort -u | wc -l")).trim()
 let mut node_uniq: i64 = 0
 try { node_uniq = to_int(node_uniq_raw) } catch e {}  // @allow-silent-catch
 println("  unique nodes:  " + to_string(node_uniq) + " (dup node IDs: " + to_string(nodes - node_uniq) + ")")  // @allow-bare-interp
 
 // ─── edge 참조 (from/to) 유일 집합 ───
-let refs_uniq_raw = to_string(exec("awk '/\"type\":\"edge\"/ { match($0, /\"from\":\"[^\"]*\"/); if(RSTART>0) print substr($0, RSTART+8, RLENGTH-9); match($0, /\"to\":\"[^\"]*\"/); if(RSTART>0) print substr($0, RSTART+6, RLENGTH-7) }' '" + _ATLAS_PATH + "' 2>/dev/null | sort -u | wc -l")).trim()
+let refs_uniq_raw = to_string(exec("awk '/\"type\":\"edge\"/ { match($0, /\"from\":\"[^\"]*\"/); if(RSTART>0) print substr($0, RSTART+8, RLENGTH-9); match($0, /\"to\":\"[^\"]*\"/); if(RSTART>0) print substr($0, RSTART+6, RLENGTH-7) }' " + _JSON_SOURCES + " 2>/dev/null | sort -u | wc -l")).trim()
 let mut refs_uniq: i64 = 0
 try { refs_uniq = to_int(refs_uniq_raw) } catch e {}  // @allow-silent-catch
 println("  unique refs:   " + to_string(refs_uniq))
@@ -165,7 +199,7 @@ println("  unique refs:   " + to_string(refs_uniq))
 // ─── orphan refs 분리 (virtual n6-/bt-/foundation- 제외) ───
 let orphans_tmp = "/tmp/.atlas_health_orphans." + to_string(exec("echo $$").trim())
 // 노드 ID 집합 = JSON node/absorb + 텍스트포맷 @<TAG> <id> (L*/MUS*/etc 7106개)
-try { exec("bash", ["-c", "comm -23 <(awk '/\"type\":\"edge\"/ { match($0, /\"from\":\"[^\"]*\"/); if(RSTART>0) print substr($0, RSTART+8, RLENGTH-9); match($0, /\"to\":\"[^\"]*\"/); if(RSTART>0) print substr($0, RSTART+6, RLENGTH-7) }' '" + _ATLAS_PATH + "' | sort -u) <( { awk -F'\"id\":\"' '/\"type\":\"(node|absorb)\"/{split($2,a,\"\\\"\");print a[1]}' '" + _ATLAS_PATH + "' ; awk '/^@[A-Z]+ /{print $2}' '" + _ATLAS_PATH + "' ; } | sort -u) > '" + orphans_tmp + "' 2>/dev/null"]) } catch e {}  // @allow-silent-catch
+try { exec("bash", ["-c", "comm -23 <(awk '/\"type\":\"edge\"/ { match($0, /\"from\":\"[^\"]*\"/); if(RSTART>0) print substr($0, RSTART+8, RLENGTH-9); match($0, /\"to\":\"[^\"]*\"/); if(RSTART>0) print substr($0, RSTART+6, RLENGTH-7) }' " + _JSON_SOURCES + " | sort -u) <( { awk -F'\"id\":\"' '/\"type\":\"(node|absorb)\"/{split($2,a,\"\\\"\");print a[1]}' " + _JSON_SOURCES + " ; awk '/^@[A-Z]+ /{print $2}' '" + _ATLAS_PATH + "' ; } | sort -u) > '" + orphans_tmp + "' 2>/dev/null"]) } catch e {}  // @allow-silent-catch
 let virtual_count_raw = to_string(exec("grep -cE '^(n6-|bt-|foundation-)' '" + orphans_tmp + "' 2>/dev/null")).trim()
 let mut virtual_count: i64 = 0
 try { virtual_count = to_int(virtual_count_raw) } catch e {}  // @allow-silent-catch

@@ -52,6 +52,11 @@ if _HOME == "" {
 }
 let _NEXUS = _HOME + "/Dev/nexus"
 let _ATLAS_PATH = _NEXUS + "/shared/n6/atlas.n6"
+// X1 (2026-04-19): atlas-blowup 분리 — JSON-line 결과는 별도 파일.
+//   atlas.n6        : @-prefix 라벨 + 주석/blank/들여쓰기 부속 (1.5MB, axiom SSOT)
+//   atlas.blowup.jsonl : {"type":"node|edge",...} blowup 결과 (17MB, 결과 사이드카)
+//   _guarded_append_atlas() 가 라인 첫 글자 검사 → 자동 라우팅.
+let _ATLAS_BLOWUP_PATH = _NEXUS + "/shared/n6/atlas.blowup.jsonl"
 _trace("[01-HOME-ok] HOME=" + _HOME)
 // R14 SSOT: blowup의 모든 출력(log/graph/growth_bus)은 atlas.n6 단일 파일로 통합.
 // growth_bus.jsonl은 airgenome 소유 별개 파일 — blowup은 읽지/쓰지 않음.
@@ -716,7 +721,15 @@ fn graph_extract_field(line: string, field: string) -> string {
 }
 
 fn graph_load() -> string {
+    // X1 (2026-04-19): graph stats/dedup 은 JSON sidecar 만 필요.
+    //   이전: 18.9MB atlas.n6 전체 read. 현재: 17.4MB atlas.blowup.jsonl 만.
+    //   라벨 (1.5MB) 은 graph_node_exists/stats 와 무관하므로 로딩 생략.
     let _h = _HOME
+    let jpath = _ATLAS_BLOWUP_PATH
+    if file_exists(jpath) {
+        return read_file(jpath)
+    }
+    // 폴백: 분리 전 단일 파일 환경 (legacy)
     let gpath = _ATLAS_PATH
     if file_exists(gpath) {
         return read_file(gpath)
@@ -751,6 +764,13 @@ fn _guarded_append_atlas(path: string, content: string) -> i64 {
 
     let is_atlas = path.contains("atlas.n6")
 
+    // X1 (2026-04-19): JSON-line 라우팅 — caller path 가 atlas.n6 이면
+    //   라인 첫 글자가 `{` 인 JSON 결과를 atlas.blowup.jsonl 로 자동 라우팅.
+    //   이전: 모든 라인이 atlas.n6 (18.9MB, 80%가 JSON 결과 → reload 병목).
+    //   현재: atlas.n6 = 라벨 SSOT (1.5MB), atlas.blowup.jsonl = 결과 사이드카 (17MB).
+    let mut json_route_path = ""
+    if is_atlas { json_route_path = _ATLAS_BLOWUP_PATH }
+
     // (1) schema 검증 — 1차 패스: 유효 라인만 추출 + dedup 후보 수집
     let lines = content.split("\n")
     let mut rejected: i64 = 0
@@ -760,6 +780,8 @@ fn _guarded_append_atlas(path: string, content: string) -> i64 {
     let mut valid_lines: list = []
     let mut valid_trimmed: list = []
     let mut needs_dedup: list = []
+    // X1: 라인별 라우팅 결정 (true=JSON sidecar, false=라벨 atlas.n6)
+    let mut is_json_line: list = []
     let mut i: i64 = 0
     while i < len(lines) {
         let line = lines[i]
@@ -770,9 +792,15 @@ fn _guarded_append_atlas(path: string, content: string) -> i64 {
         }
         let t = line.trim()
         let do_dedup = is_atlas && len(t) > 0 && !t.starts_with("#")
+        // X1: JSON-line 판정 — trimmed 첫 글자 `{` 면 atlas.blowup.jsonl 로 라우팅
+        let mut is_json = false
+        if is_atlas && len(t) > 0 {
+            if t[0..1] == "{" { is_json = true }
+        }
         valid_lines = valid_lines.push(line)
         valid_trimmed = valid_trimmed.push(t)
         needs_dedup = needs_dedup.push(do_dedup)
+        is_json_line = is_json_line.push(is_json)
         i = i + 1
     }
 
@@ -803,10 +831,15 @@ fn _guarded_append_atlas(path: string, content: string) -> i64 {
             // tmpfile에 패턴 기록 — write_file 네이티브 (heredoc 회피, metachar 경고 0)
             try { write_file(_tmp, patterns) } catch e {}
             // grep -Fxf: 패턴 파일의 각 라인을 고정 문자열 전체 라인 매치로 검색
-            // 결과 = atlas.n6에 이미 존재하는 라인 목록
+            // 결과 = atlas.n6 / atlas.blowup.jsonl 에 이미 존재하는 라인 목록
+            // X1 (2026-04-19): is_atlas 면 두 파일 모두 검사 (JSON sidecar 분리 대응)
             // AI-native: || true 제거 — grep 실패 (no-match exit 1) 는 try/catch 로 처리
             let mut found_raw = ""
-            try { found_raw = exec("grep -Fxf '" + _tmp + "' '" + path + "' 2>/dev/null") } catch e {}
+            let mut grep_targets = "'" + path + "'"
+            if is_atlas && file_exists(_ATLAS_BLOWUP_PATH) {
+                grep_targets = grep_targets + " '" + _ATLAS_BLOWUP_PATH + "'"
+            }
+            try { found_raw = exec("grep -hFxf '" + _tmp + "' " + grep_targets + " 2>/dev/null") } catch e {}
             let found_lines = found_raw.split("\n")
             for fl in found_lines {
                 let ft = fl.trim()
@@ -819,8 +852,9 @@ fn _guarded_append_atlas(path: string, content: string) -> i64 {
         try { exec("rm -f '" + _tmp + "' 2>/dev/null") } catch e {}
     }
 
-    // (3) 최종 필터: dup_set에 있으면 dedup, 없으면 통과
-    let mut clean_parts: [string] = []
+    // (3) 최종 필터 + X1 라우팅: dup 제외 + JSON 라인은 별도 buffer 로
+    let mut clean_label_parts: [string] = []
+    let mut clean_json_parts: [string] = []
     i = 0
     while i < dedup_count {
         if needs_dedup[i] {
@@ -833,10 +867,14 @@ fn _guarded_append_atlas(path: string, content: string) -> i64 {
                 continue
             }
         }
-        clean_parts.push(to_string(valid_lines[i]))
+        // X1: JSON 라인은 atlas.blowup.jsonl, 그 외는 기존 path (atlas.n6)
+        if is_json_line[i] && len(json_route_path) > 0 {
+            clean_json_parts.push(to_string(valid_lines[i]))
+        } else {
+            clean_label_parts.push(to_string(valid_lines[i]))
+        }
         i = i + 1
     }
-    let mut clean = clean_parts.join("\n")
 
     if rejected > 0 {
         println("  [schema guard] rejected " + to_string(rejected) + " invalid lines -> " + path)
@@ -844,24 +882,42 @@ fn _guarded_append_atlas(path: string, content: string) -> i64 {
     if deduped > 0 {
         println("  [dedup guard] skipped " + to_string(deduped) + " duplicate lines -> " + path)
     }
-    if len(clean) > 0 {
-        // 불변식 강제: 말미 newline 보장 (없으면 추가)
-        if !clean.ends_with("\n") { clean = clean + "\n" }
-        // DIAG-2026-04-19: heredoc/flock path 가 sh syntax error 로 silent drop 되는지 진단.
-        //   다라인 heredoc 가 hexa exec() 의 `\n` 처리 차이로 깨질 가능성 → append_file 우선화.
-        let _napp = len(clean_parts)
-        let mut _ok = false
-        try { append_file(path, clean); _ok = true } catch e {}
-        if !_ok {
-            // append_file 실패 시 flock fallback (구식 경로)
+
+    // (4) atlas.n6 라벨 append (caller path 그대로)
+    if len(clean_label_parts) > 0 {
+        let mut clean_lbl = clean_label_parts.join("\n")
+        if !clean_lbl.ends_with("\n") { clean_lbl = clean_lbl + "\n" }
+        let _nlbl = len(clean_label_parts)
+        let mut _ok_lbl = false
+        try { append_file(path, clean_lbl); _ok_lbl = true } catch e {}
+        if !_ok_lbl {
             let _lock = path + ".lock"
             try {
-                exec("(flock -w 30 200 && cat >> '" + path + "') 200>'" + _lock + "' <<'__BLOWUP_EOF__'\n" + clean + "__BLOWUP_EOF__")
-                _ok = true
+                exec("(flock -w 30 200 && cat >> '" + path + "') 200>'" + _lock + "' <<'__BLOWUP_EOF__'\n" + clean_lbl + "__BLOWUP_EOF__")
+                _ok_lbl = true
             } catch e {}
         }
-        if !_ok {
-            println("  [atlas WRITE FAIL] " + to_string(_napp) + " lines NOT persisted -> " + path)
+        if !_ok_lbl {
+            println("  [atlas WRITE FAIL] " + to_string(_nlbl) + " lines NOT persisted -> " + path)
+        }
+    }
+
+    // (5) X1: atlas.blowup.jsonl JSON-line append
+    if len(clean_json_parts) > 0 && len(json_route_path) > 0 {
+        let mut clean_json = clean_json_parts.join("\n")
+        if !clean_json.ends_with("\n") { clean_json = clean_json + "\n" }
+        let _njson = len(clean_json_parts)
+        let mut _ok_j = false
+        try { append_file(json_route_path, clean_json); _ok_j = true } catch e {}
+        if !_ok_j {
+            let _lock = json_route_path + ".lock"
+            try {
+                exec("(flock -w 30 200 && cat >> '" + json_route_path + "') 200>'" + _lock + "' <<'__BLOWUP_EOF__'\n" + clean_json + "__BLOWUP_EOF__")
+                _ok_j = true
+            } catch e {}
+        }
+        if !_ok_j {
+            println("  [atlas WRITE FAIL] " + to_string(_njson) + " lines NOT persisted -> " + json_route_path)
         }
     }
     return rejected
@@ -989,9 +1045,14 @@ fn _read_stats_sidecar() -> string {
 }
 
 fn graph_stats_read_cache(min_deg: i64) -> string {
+    // X1 (2026-04-19): cache key 는 JSON sidecar (실제 stats source) 의 mtime/size
     if min_deg != 3 { return "" }
-    if !file_exists(_ATLAS_PATH) { return "" }
-    let stat_raw = _stat_mtime_size(_ATLAS_PATH)
+    let mut src_path = _ATLAS_BLOWUP_PATH
+    if !file_exists(src_path) {
+        src_path = _ATLAS_PATH
+        if !file_exists(src_path) { return "" }
+    }
+    let stat_raw = _stat_mtime_size(src_path)
     if stat_raw == "" { return "" }
     let sp = stat_raw.split(" ")
     if len(sp) < 2 { return "" }
@@ -1070,14 +1131,17 @@ fn graph_stats_incremental(content: string, min_deg: i64) -> string {
     let c_head = cp[6]
     if len(content) <= c_size { return "" }
     if c_head == "" { return "" }
-    let cur_head = _head_hash_256(_ATLAS_PATH)
+    // X1 (2026-04-19): incremental tail 은 JSON sidecar 에 대해 수행
+    let mut src_path = _ATLAS_BLOWUP_PATH
+    if !file_exists(src_path) { src_path = _ATLAS_PATH }
+    let cur_head = _head_hash_256(src_path)
     if cur_head == "" { return "" }
     if cur_head != c_head { return "" }
     let mut deg_map = _load_deg_sidecar(graph_deg_cache_path())
     // (빈 map 이면 과거엔 조기 return 이었음 — file_exists 검사를 헬퍼가 흡수)
     // 시맨틱 보존 위해 수동 체크
     if !file_exists(graph_deg_cache_path()) { return "" }
-    let cur_stat = _stat_mtime_size(_ATLAS_PATH)
+    let cur_stat = _stat_mtime_size(src_path)
     if cur_stat == "" { return "" }
     let cs = cur_stat.split(" ")
     if len(cs) < 2 { return "" }
@@ -1085,7 +1149,7 @@ fn graph_stats_incremental(content: string, min_deg: i64) -> string {
     try { cur_bytes = to_int(cs[1]) } catch e { return "" }
     if cur_bytes <= c_size { return "" }
     let mut tail = ""
-    try { tail = to_string(exec("tail -c +" + to_string(c_size + 1) + " '" + _ATLAS_PATH + "' 2>/dev/null")) } catch e { return "" }
+    try { tail = to_string(exec("tail -c +" + to_string(c_size + 1) + " '" + src_path + "' 2>/dev/null")) } catch e { return "" }
     if len(tail) == 0 { return "" }
     let delta_lines = tail.split("\n")
     let delta_len = len(delta_lines)
@@ -1134,14 +1198,19 @@ fn _serialize_deg_map(deg_map: map) -> string {
 }
 
 fn graph_stats_write_cache_full(nodes: i64, edges: i64, hubs: i64, line_count: i64, deg_map: map) {
-    if !file_exists(_ATLAS_PATH) { return }
-    let stat_raw = _stat_mtime_size(_ATLAS_PATH)
+    // X1 (2026-04-19): cache key 는 JSON sidecar mtime/size
+    let mut src_path = _ATLAS_BLOWUP_PATH
+    if !file_exists(src_path) {
+        src_path = _ATLAS_PATH
+        if !file_exists(src_path) { return }
+    }
+    let stat_raw = _stat_mtime_size(src_path)
     if stat_raw == "" { return }
     let sp = stat_raw.split(" ")
     if len(sp) < 2 { return }
     let mtime = sp[0]
     let size = sp[1]
-    let head_hash = _head_hash_256(_ATLAS_PATH)
+    let head_hash = _head_hash_256(src_path)
     let body = "{\"schema\":2,\"mtime\":" + mtime + ",\"size\":" + size + ",\"line_count\":" + to_string(line_count) + ",\"head_hash\":\"" + head_hash + "\",\"nodes\":" + to_string(nodes) + ",\"edges\":" + to_string(edges) + ",\"hubs\":" + to_string(hubs) + "}\n"
     try { write_file(graph_stats_cache_path(), body) } catch e {}
     try { write_file(graph_deg_cache_path(), _serialize_deg_map(deg_map)) } catch e {}
@@ -1156,11 +1225,17 @@ fn graph_stats_write_cache_full(nodes: i64, edges: i64, hubs: i64, line_count: i
 // 본 함수: awk 1초로 동등한 nodes/edges/hubs 산출 + deg sidecar 생성.
 // 결과 무효 시 빈 문자열 반환 → 호출자가 legacy hexa-loop fallback.
 fn graph_stats_awk(min_deg: i64) -> string {
+    // X1 (2026-04-19): JSON sidecar 우선. node/edge stats 는 atlas.blowup.jsonl 에만 존재.
     let awk_script = _HOME + "/Dev/nexus/shared/blowup/lib/atlas_stats.awk"
     if !file_exists(awk_script) { return "" }
-    if !file_exists(_ATLAS_PATH) { return "" }
+    let mut src_path = _ATLAS_BLOWUP_PATH
+    if !file_exists(src_path) {
+        // 폴백: 분리 전 환경 (legacy single-file)
+        src_path = _ATLAS_PATH
+        if !file_exists(src_path) { return "" }
+    }
     let deg_path = graph_deg_cache_path()
-    let cmd = "awk -v min_deg=" + to_string(min_deg) + " -v deg_path='" + deg_path + "' -f '" + awk_script + "' '" + _ATLAS_PATH + "' 2>/dev/null"
+    let cmd = "awk -v min_deg=" + to_string(min_deg) + " -v deg_path='" + deg_path + "' -f '" + awk_script + "' '" + src_path + "' 2>/dev/null"
     let mut out = ""
     try { out = exec(cmd) } catch e { return "" }
     let trimmed = out.trim()
@@ -1172,16 +1247,21 @@ fn graph_stats_awk(min_deg: i64) -> string {
 
 // awk 우회 후 stats 사이드카 갱신 (deg sidecar 는 awk 가 직접 작성)
 fn graph_stats_write_cache_after_awk(nodes: i64, edges: i64, hubs: i64) {
-    if !file_exists(_ATLAS_PATH) { return }
-    let stat_raw = _stat_mtime_size(_ATLAS_PATH)
+    // X1 (2026-04-19): cache key 는 JSON sidecar mtime/size
+    let mut src_path = _ATLAS_BLOWUP_PATH
+    if !file_exists(src_path) {
+        src_path = _ATLAS_PATH
+        if !file_exists(src_path) { return }
+    }
+    let stat_raw = _stat_mtime_size(src_path)
     if stat_raw == "" { return }
     let sp = stat_raw.split(" ")
     if len(sp) < 2 { return }
     let mtime = sp[0]
     let size = sp[1]
-    let head_hash = _head_hash_256(_ATLAS_PATH)
+    let head_hash = _head_hash_256(src_path)
     let mut lc_raw = ""
-    try { lc_raw = exec("wc -l < '" + _ATLAS_PATH + "'") } catch e {}
+    try { lc_raw = exec("wc -l < '" + src_path + "'") } catch e {}
     let mut line_count: i64 = 0
     try { line_count = to_int(lc_raw.trim()) } catch e {}
     let body = "{\"schema\":2,\"mtime\":" + mtime + ",\"size\":" + size + ",\"line_count\":" + to_string(line_count) + ",\"head_hash\":\"" + head_hash + "\",\"nodes\":" + to_string(nodes) + ",\"edges\":" + to_string(edges) + ",\"hubs\":" + to_string(hubs) + "}\n"
@@ -3291,6 +3371,8 @@ if file_exists(atlas_n6_path) {
     let mut atlas_append = "\n\n# ── 돌파 자동흡수 (" + domain + ") ──────────────────────────\n"
     let mut abt: i64 = atlas_last_bt + 1
     let mut aci: i64 = 0
+    // Per-batch dedup: 같은 fingerprint 가 한 흡수 사이클 내 중복 append 되는 것 방지
+    let mut _atlas_batch_seen = #{}
     while aci < len(recurse_all_corollaries) {
         let a_cor_line = to_string(recurse_all_corollaries[aci])
         let a_cor_parts = a_cor_line.split("\t")
@@ -3306,17 +3388,24 @@ if file_exists(atlas_n6_path) {
 
             // EXACT + NEAR(conf>=0.9) 만 atlas에 흡수
             if ac_grade == "EXACT" || (ac_grade == "NEAR" && a_cor_conf >= 0.9) {
-                // Cross-process dedup: grep 전체 atlas.n6 (stale cache 대체, per-ID O(1))
+                // Line-anchor dedup: id 단독 contains() 는 false-positive (R1-3 substring 이 17MB atlas 어디든 매치).
+                // discovery 의 unique fingerprint = "= " + id + " = " + value + " :: " + domain (아래 append 포맷과 일치).
+                let _atlas_fp = "= " + a_cor_id + " = " + to_string(a_cor_value) + " :: " + a_cor_domain
                 let mut _atlas_dup = false
-                if atlas_content.contains(a_cor_id) {
+                if hset_has(_atlas_batch_seen, _atlas_fp) {
+                    _atlas_dup = true
+                } else if atlas_content.contains(_atlas_fp) {
                     _atlas_dup = true
                 } else {
+                    // Cross-process: cache 와 disk 가 diverge 가능 (멀티세션 동시 append).
+                    // grep -F (literal) + 정확한 fingerprint, single-quote 안전 (id/value/domain ASCII).
                     try {
-                        let _ag = exec("grep -qF '" + a_cor_id + "' '" + atlas_n6_path + "' 2>/dev/null && echo Y")
+                        let _ag = exec("grep -qF '" + _atlas_fp + "' '" + atlas_n6_path + "' 2>/dev/null && echo Y")
                         if to_string(_ag).trim() == "Y" { _atlas_dup = true }
                     } catch e {}
                 }
                 if !_atlas_dup {
+                    _atlas_batch_seen[_atlas_fp] = true
                     let g_mark = if ac_grade == "EXACT" { "*" } else { "?" }
                     let ar = to_int(a_cor_conf * 10.0)
                     let ac_n6_type = if ac_grade == "EXACT" { "F" } else { "R" }

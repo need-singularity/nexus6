@@ -84,9 +84,15 @@ fn _extract_trailing_grade(line: string) -> string {
 // OPT-P8-9: 라인별 grep -Fxq (N exec) → batched grep -Fxf (1 exec)
 // 이전: N줄 × exec("grep -Fxq ...") = N subprocess. 대형 append 시 병목.
 // 현재: 배치 패턴파일 → grep -Fxf 1회, hexa 메모리 0. (core blowup.hexa v3 동기화)
+// X1 (2026-04-19): atlas-blowup 분리 — JSON 라인은 atlas.blowup.jsonl 로 라우팅.
+//   호출자가 atlas.n6 path 를 넘겨도 라인 첫글자 `{` 면 사이드카로 분기.
+//   _ATLAS_BLOWUP_PATH 글로벌 미정의 환경에서는 안전하게 본 경로로 폴백.
 fn _guarded_append_atlas(path: string, content: string) -> i64 {
     if len(content) == 0 { return 0 }
     let is_atlas = path.contains("atlas.n6")
+    // X1: JSON sidecar path — 호출자 측 _ATLAS_BLOWUP_PATH 글로벌 정의 시 자동 라우팅
+    let mut json_route_path = ""
+    try { if is_atlas { json_route_path = _ATLAS_BLOWUP_PATH } } catch e {}
     let lines = content.split("\n")
     let mut rejected: i64 = 0
     let mut deduped: i64 = 0
@@ -95,6 +101,7 @@ fn _guarded_append_atlas(path: string, content: string) -> i64 {
     let mut valid_lines = []
     let mut valid_trimmed = []
     let mut needs_dedup = []
+    let mut is_json_line = []
     let mut i: i64 = 0
     while i < len(lines) {
         let line = lines[i]
@@ -105,9 +112,14 @@ fn _guarded_append_atlas(path: string, content: string) -> i64 {
         }
         let t = line.trim()
         let do_dedup = is_atlas && len(t) > 0 && !t.starts_with("#")
+        let mut is_json = false
+        if is_atlas && len(t) > 0 {
+            if t[0..1] == "{" { is_json = true }
+        }
         valid_lines = valid_lines.push(line)
         valid_trimmed = valid_trimmed.push(t)
         needs_dedup = needs_dedup.push(do_dedup)
+        is_json_line = is_json_line.push(is_json)
         i = i + 1
     }
 
@@ -133,9 +145,14 @@ fn _guarded_append_atlas(path: string, content: string) -> i64 {
         }
         try {
             write_file(_tmp, "\n".join(patterns))
+            // X1: 두 파일 모두 dedup 검사
+            let mut grep_targets = "'" + path + "'"
+            if len(json_route_path) > 0 && file_exists(json_route_path) {
+                grep_targets = grep_targets + " '" + json_route_path + "'"
+            }
             // AI-native: || true 제거 — grep no-match(exit 1) 는 try/catch 처리
             let mut found_raw = ""
-            try { found_raw = exec("grep -Fxf '" + _tmp + "' '" + path + "' 2>/dev/null") } catch e {}
+            try { found_raw = exec("grep -hFxf '" + _tmp + "' " + grep_targets + " 2>/dev/null") } catch e {}
             let found_lines = found_raw.split("\n")
             for fl in found_lines {
                 let ft = fl.trim()
@@ -147,8 +164,9 @@ fn _guarded_append_atlas(path: string, content: string) -> i64 {
         try { exec("rm -f '" + _tmp + "' 2>/dev/null") } catch e {}
     }
 
-    // (3) 최종 필터: dup_set에 있으면 dedup
-    let mut clean_parts = []
+    // (3) 최종 필터 + X1 라우팅: 라벨 vs JSON 분리 buffer
+    let mut clean_label_parts = []
+    let mut clean_json_parts = []
     i = 0
     while i < dedup_count {
         if needs_dedup[i] {
@@ -161,7 +179,11 @@ fn _guarded_append_atlas(path: string, content: string) -> i64 {
                 continue
             }
         }
-        clean_parts = clean_parts.push(valid_lines[i])
+        if is_json_line[i] && len(json_route_path) > 0 {
+            clean_json_parts = clean_json_parts.push(valid_lines[i])
+        } else {
+            clean_label_parts = clean_label_parts.push(valid_lines[i])
+        }
         i = i + 1
     }
 
@@ -171,10 +193,15 @@ fn _guarded_append_atlas(path: string, content: string) -> i64 {
     if deduped > 0 {
         println("  [dedup guard] skipped " + to_string(deduped) + " duplicate lines -> " + path)
     }
-    if len(clean_parts) > 0 {
-        let mut clean = "\n".join(clean_parts)
+    if len(clean_label_parts) > 0 {
+        let mut clean = "\n".join(clean_label_parts)
         if !clean.ends_with("\n") { clean = clean + "\n" }
         try { append_file(path, clean) } catch e {}
+    }
+    if len(clean_json_parts) > 0 && len(json_route_path) > 0 {
+        let mut clean_j = "\n".join(clean_json_parts)
+        if !clean_j.ends_with("\n") { clean_j = clean_j + "\n" }
+        try { append_file(json_route_path, clean_j) } catch e {}
     }
     return rejected
 }
