@@ -1,0 +1,667 @@
+// ═══════════════════════════════════════════════════════════
+// causal_dag.hexa — AU (Absorption → Causal DAG) extractor
+//
+// 배경:
+//   drill 은 각 round 에서 axiom/absorption 을 emit 한다. 각 absorption
+//   은 이전 axiom/absorption 들을 전제(parents) 로 삼아 파생된다.
+//   → 본 도구는 drill 의 NDJSON trace 를 읽어 absorption-DAG 를 구성하고
+//     (1) topological layer, (2) 중심 노드, (3) weakly-connected components
+//     를 계산, GraphViz DOT + JSON summary 로 출력한다.
+//
+// 입력 포맷 (NDJSON — 한 줄 한 레코드):
+//   {"id":"a017","parents":["a001","a004"],"round":3,"stage":"absorb","value":"..."}
+//
+//   필수 필드:
+//     id       string   — 노드 고유 id
+//     parents  [string] — 파생 전제 id 리스트 (drill output 에서 derived-from)
+//     round    i64      — drill round 번호
+//     stage    string   — "axiom" | "absorb" | 기타
+//     value    string   — 원시 표현식/요약 (optional, DOT label 에 사용)
+//
+//   주의: blowup.hexa 는 현재 "parents" 필드를 emit 하지 않는다. 본 도구는
+//         future schema 에 대한 stub 이며 trace 없이는 empty DAG 를 낸다.
+//         blowup 스키마 확장은 별도 티켓.
+//
+// 사용:
+//   hexa cli/scripts/causal_dag.hexa build <trace.ndjson> <out.dot> [--summary <out.json>]
+//
+// 제약:
+//   · hexa parse clean
+//   · pure graph algo — 외부 의존 0 (no zstd/awk/grep)
+//   · `>=` / `<=` 금지 — `<`/`>` 만 사용
+//   · no live exec — file I/O 는 read_file/write_file
+// ═══════════════════════════════════════════════════════════
+
+// ─── util: trim ends safely (empty-tolerant) ───
+fn _trim(s: string) -> string {
+    return s.trim()
+}
+
+// ─── util: naive JSON string-field extractor (flat objects only) ───
+//   "<key>":"<value>"  → value (unescaped naive; parents list handled별도)
+fn _json_str(raw: string, key: string) -> string {
+    let m = "\"" + key + "\":\""
+    let i = raw.index_of(m)
+    if i < 0 { return "" }
+    let after = raw.substring(i + len(m), len(raw))
+    // find next unescaped quote; naive (no \" handling — drill values ASCII-safe)
+    let e = after.index_of("\"")
+    if e < 0 { return "" }
+    return after.substring(0, e)
+}
+
+// ─── util: naive JSON int-field extractor ───
+fn _json_int(raw: string, key: string) -> i64 {
+    let m = "\"" + key + "\":"
+    let i = raw.index_of(m)
+    if i < 0 { return 0 }
+    let after = raw.substring(i + len(m), len(raw))
+    // scan digits only
+    let mut j: i64 = 0
+    let n = len(after)
+    // skip leading whitespace
+    while j < n {
+        let c = after.substring(j, j + 1)
+        if c == " " { j = j + 1 } else { break }
+    }
+    let start = j
+    // optional minus
+    if j < n {
+        let c0 = after.substring(j, j + 1)
+        if c0 == "-" { j = j + 1 }
+    }
+    while j < n {
+        let c = after.substring(j, j + 1)
+        if c == "0" || c == "1" || c == "2" || c == "3" || c == "4"
+           || c == "5" || c == "6" || c == "7" || c == "8" || c == "9" {
+            j = j + 1
+        } else { break }
+    }
+    if j == start { return 0 }
+    let mut v: i64 = 0
+    try { v = to_int(after.substring(start, j)) } catch e {}  // @allow-silent-catch
+    return v
+}
+
+// ─── util: extract parents array: "parents":[ "id1","id2" ] ───
+fn _json_parents(raw: string) -> [string] {
+    let mut out: [string] = []
+    let m = "\"parents\":["
+    let i = raw.index_of(m)
+    if i < 0 { return out }
+    let after = raw.substring(i + len(m), len(raw))
+    let close = after.index_of("]")
+    if close < 0 { return out }
+    let inner = after.substring(0, close)
+    // naive split by "," then strip surrounding quotes/space
+    let toks = inner.split(",")
+    let nt = len(toks)
+    let mut k: i64 = 0
+    while k < nt {
+        let t = toks[k].trim()
+        k = k + 1
+        if t == "" { continue }
+        // strip leading/trailing quote
+        let mut s = t
+        let ln = len(s)
+        if ln > 1 && s.substring(0, 1) == "\"" { s = s.substring(1, ln) }
+        let ln2 = len(s)
+        if ln2 > 0 && s.substring(ln2 - 1, ln2) == "\"" { s = s.substring(0, ln2 - 1) }
+        if s != "" { out.push(s) }
+    }
+    return out
+}
+
+// ─── util: locate id-index in ids array ───
+fn _idx_of(ids: [string], v: string) -> i64 {
+    let n = len(ids)
+    let mut i: i64 = 0
+    while i < n {
+        if ids[i] == v { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// ─── util: escape DOT label string ───
+fn _dot_escape(s: string) -> string {
+    let mut out: [string] = []
+    let n = len(s)
+    let mut i: i64 = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "\"" { out.push("\\\"") }
+        else if c == "\\" { out.push("\\\\") }
+        else if c == "\n" { out.push("\\n") }
+        else { out.push(c) }
+        i = i + 1
+    }
+    return out.join("")
+}
+
+// ═══════════════════════════════════════════════════════════
+//  DAG record — parallel arrays (hexa structural lite)
+// ═══════════════════════════════════════════════════════════
+//   ids[i]           node id
+//   rounds[i]        round number
+//   stages[i]        stage string
+//   values[i]        value label
+//   parents_csv[i]   comma-joined parent ids (resolved on demand)
+//   parents_idx[i][j]  parent index list (post-resolve)
+
+fn _parse_ndjson(path: string) -> [string] {
+    // returns a flat [string] of raw lines (empty-filtered)
+    let mut out: [string] = []
+    if !file_exists(path) { return out }
+    let raw = read_file(path)
+    let lines = raw.split("\n")
+    let n = len(lines)
+    let mut i: i64 = 0
+    while i < n {
+        let t = lines[i].trim()
+        i = i + 1
+        if t == "" { continue }
+        if t.substring(0, 1) == "#" { continue }
+        out.push(t)
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════
+//  TOPO LAYERS — iterative Kahn-variant
+//    layer(n) = 0 if no parents; else 1 + max(layer(p))
+//    unresolved (cycle / missing) → -1 sentinel (reported)
+// ═══════════════════════════════════════════════════════════
+fn _compute_layers(parents_idx: [[i64]]) -> [i64] {
+    let n = len(parents_idx)
+    let mut layers: [i64] = []
+    let mut i: i64 = 0
+    while i < n {
+        if len(parents_idx[i]) == 0 { layers.push(0) } else { layers.push(-1) }
+        i = i + 1
+    }
+    let max_iter: i64 = 1000
+    let mut iter: i64 = 0
+    let mut changed: bool = true
+    while iter < max_iter && changed {
+        changed = false
+        let mut k: i64 = 0
+        while k < n {
+            if layers[k] < 0 {
+                let ps = parents_idx[k]
+                let np = len(ps)
+                let mut ok: bool = true
+                let mut mx: i64 = -1
+                let mut j: i64 = 0
+                while j < np {
+                    let pi = ps[j]
+                    if pi < 0 { j = j + 1; continue }
+                    let pl = layers[pi]
+                    if pl < 0 { ok = false; break }
+                    if pl > mx { mx = pl }
+                    j = j + 1
+                }
+                if ok {
+                    layers[k] = mx + 1
+                    changed = true
+                }
+            }
+            k = k + 1
+        }
+        iter = iter + 1
+    }
+    return layers
+}
+
+// ═══════════════════════════════════════════════════════════
+//  CENTRALITY — descendant-count (how many nodes depend on n)
+//    iterative 전파: des[n] = |{m : n ∈ ancestors(m)}|
+//    간단 O(N·E) 근사 — round 수준 trace 크기 수백~수천 가정.
+// ═══════════════════════════════════════════════════════════
+fn _descendant_count(parents_idx: [[i64]]) -> [i64] {
+    let n = len(parents_idx)
+    // reach[i][j] = true ⟺ j is ancestor of i
+    // flatten into [i64] bit-set per node — here use [[bool]] 리스트
+    let mut reach: [[bool]] = []
+    let mut i: i64 = 0
+    while i < n {
+        let mut row: [bool] = []
+        let mut k: i64 = 0
+        while k < n { row.push(false); k = k + 1 }
+        reach.push(row)
+        i = i + 1
+    }
+    // transitive closure via iterative propagation (no recursion)
+    let max_iter: i64 = 1000
+    let mut iter: i64 = 0
+    let mut changed: bool = true
+    while iter < max_iter && changed {
+        changed = false
+        let mut a: i64 = 0
+        while a < n {
+            let ps = parents_idx[a]
+            let np = len(ps)
+            let mut j: i64 = 0
+            while j < np {
+                let p = ps[j]
+                j = j + 1
+                if p < 0 { continue }
+                if p > n - 1 { continue }
+                if !reach[a][p] {
+                    reach[a][p] = true
+                    changed = true
+                }
+                // also inherit p's ancestors
+                let mut k: i64 = 0
+                while k < n {
+                    if reach[p][k] && !reach[a][k] {
+                        reach[a][k] = true
+                        changed = true
+                    }
+                    k = k + 1
+                }
+            }
+            a = a + 1
+        }
+        iter = iter + 1
+    }
+    // desc[j] = Σ_i reach[i][j]
+    let mut desc: [i64] = []
+    let mut j: i64 = 0
+    while j < n {
+        let mut c: i64 = 0
+        let mut i2: i64 = 0
+        while i2 < n {
+            if reach[i2][j] { c = c + 1 }
+            i2 = i2 + 1
+        }
+        desc.push(c)
+        j = j + 1
+    }
+    return desc
+}
+
+// ═══════════════════════════════════════════════════════════
+//  WEAKLY CONNECTED COMPONENTS — union-find on undirected view
+// ═══════════════════════════════════════════════════════════
+fn _uf_find(par: [i64], x: i64) -> i64 {
+    let mut cur = x
+    while par[cur] != cur { cur = par[cur] }
+    return cur
+}
+
+fn _weak_components(parents_idx: [[i64]]) -> [i64] {
+    let n = len(parents_idx)
+    let mut par: [i64] = []
+    let mut i: i64 = 0
+    while i < n { par.push(i); i = i + 1 }
+    // union each edge (a → p) as undirected
+    let mut a: i64 = 0
+    while a < n {
+        let ps = parents_idx[a]
+        let np = len(ps)
+        let mut j: i64 = 0
+        while j < np {
+            let p = ps[j]
+            j = j + 1
+            if p < 0 { continue }
+            if p > n - 1 { continue }
+            let ra = _uf_find(par, a)
+            let rp = _uf_find(par, p)
+            if ra != rp { par[ra] = rp }
+        }
+        a = a + 1
+    }
+    // canonical root per node
+    let mut roots: [i64] = []
+    let mut k: i64 = 0
+    while k < n { roots.push(_uf_find(par, k)); k = k + 1 }
+    return roots
+}
+
+// ═══════════════════════════════════════════════════════════
+//  BUILD — parse + compute + emit
+// ═══════════════════════════════════════════════════════════
+fn cmd_build(trace: string, out_dot: string, summary_path: string) -> i64 {
+    if !file_exists(trace) {
+        eprintln("causal_dag: trace not found: " + trace)
+        return 1
+    }
+    let lines = _parse_ndjson(trace)
+    let nlines = len(lines)
+
+    // parallel arrays
+    let mut ids: [string] = []
+    let mut rounds: [i64] = []
+    let mut stages: [string] = []
+    let mut values: [string] = []
+    let mut parents_csv: [string] = []
+
+    let mut li: i64 = 0
+    while li < nlines {
+        let ln = lines[li]
+        li = li + 1
+        let id = _json_str(ln, "id")
+        if id == "" { continue }
+        let st = _json_str(ln, "stage")
+        let vl = _json_str(ln, "value")
+        let rd = _json_int(ln, "round")
+        let pa = _json_parents(ln)
+        ids.push(id)
+        rounds.push(rd)
+        stages.push(st)
+        values.push(vl)
+        parents_csv.push(pa.join(","))
+    }
+
+    let n = len(ids)
+
+    // resolve parent ids → indices (unknown id → -1, still counted as missing)
+    let mut parents_idx: [[i64]] = []
+    let mut unresolved: i64 = 0
+    let mut i: i64 = 0
+    while i < n {
+        let csv = parents_csv[i]
+        let mut row: [i64] = []
+        if csv != "" {
+            let toks = csv.split(",")
+            let nt = len(toks)
+            let mut k: i64 = 0
+            while k < nt {
+                let t = toks[k].trim()
+                k = k + 1
+                if t == "" { continue }
+                let pi = _idx_of(ids, t)
+                if pi < 0 { unresolved = unresolved + 1 }
+                row.push(pi)
+            }
+        }
+        parents_idx.push(row)
+        i = i + 1
+    }
+
+    let layers = _compute_layers(parents_idx)
+    let desc = _descendant_count(parents_idx)
+    let roots = _weak_components(parents_idx)
+
+    // max layer
+    let mut max_layer: i64 = -1
+    let mut li2: i64 = 0
+    while li2 < n {
+        if layers[li2] > max_layer { max_layer = layers[li2] }
+        li2 = li2 + 1
+    }
+
+    // top-k central nodes (k=10) — simple insertion-sort
+    let topk_target: i64 = 10
+    let mut top_idx: [i64] = []
+    let mut top_val: [i64] = []
+    let mut ci: i64 = 0
+    while ci < n {
+        let d = desc[ci]
+        // insert if top_idx smaller than target, else replace smallest
+        let tl = len(top_idx)
+        if tl < topk_target {
+            top_idx.push(ci)
+            top_val.push(d)
+        } else {
+            // find smallest
+            let mut smin: i64 = 0
+            let mut smv: i64 = top_val[0]
+            let mut q: i64 = 1
+            while q < tl {
+                if top_val[q] < smv { smv = top_val[q]; smin = q }
+                q = q + 1
+            }
+            if d > smv {
+                top_idx[smin] = ci
+                top_val[smin] = d
+            }
+        }
+        ci = ci + 1
+    }
+
+    // component set sizes
+    let mut uniq_roots: [i64] = []
+    let mut ri: i64 = 0
+    while ri < n {
+        let r = roots[ri]
+        ri = ri + 1
+        if _idx_of_i64(uniq_roots, r) < 0 { uniq_roots.push(r) }
+    }
+    let ncomp = len(uniq_roots)
+
+    // ─── DOT emission ───
+    let mut dot: [string] = []
+    dot.push("// causal_dag.hexa — absorption DAG\n")
+    dot.push("// trace: ")
+    dot.push(trace)
+    dot.push("\n")
+    dot.push("// nodes: ")
+    dot.push(to_string(n))
+    dot.push(", max_layer: ")
+    dot.push(to_string(max_layer))
+    dot.push(", components: ")
+    dot.push(to_string(ncomp))
+    dot.push("\n")
+    dot.push("digraph causal_dag {\n")
+    dot.push("  rankdir=TB;\n")
+    dot.push("  node [shape=box,style=filled,fontsize=10];\n")
+
+    // cluster by layer
+    if n > 0 {
+        let mut l: i64 = 0
+        while l < max_layer + 1 {
+            dot.push("  subgraph cluster_L")
+            dot.push(to_string(l))
+            dot.push(" {\n    label=\"layer ")
+            dot.push(to_string(l))
+            dot.push("\"; style=dashed;\n")
+            let mut j: i64 = 0
+            while j < n {
+                if layers[j] == l {
+                    dot.push("    \"")
+                    dot.push(_dot_escape(ids[j]))
+                    dot.push("\" [label=\"")
+                    dot.push(_dot_escape(ids[j]))
+                    dot.push("\\nr=")
+                    dot.push(to_string(rounds[j]))
+                    dot.push(" ")
+                    dot.push(_dot_escape(stages[j]))
+                    if values[j] != "" {
+                        dot.push("\\n")
+                        dot.push(_dot_escape(values[j]))
+                    }
+                    dot.push("\"];\n")
+                }
+                j = j + 1
+            }
+            dot.push("  }\n")
+            l = l + 1
+        }
+        // unresolved layer=-1 orphan block
+        let mut have_unres: bool = false
+        let mut jj: i64 = 0
+        while jj < n {
+            if layers[jj] < 0 { have_unres = true; break }
+            jj = jj + 1
+        }
+        if have_unres {
+            dot.push("  subgraph cluster_unresolved {\n    label=\"unresolved (cycle/missing)\"; color=red;\n")
+            let mut j2: i64 = 0
+            while j2 < n {
+                if layers[j2] < 0 {
+                    dot.push("    \"")
+                    dot.push(_dot_escape(ids[j2]))
+                    dot.push("\" [color=red];\n")
+                }
+                j2 = j2 + 1
+            }
+            dot.push("  }\n")
+        }
+    }
+
+    // edges
+    let mut ei: i64 = 0
+    while ei < n {
+        let ps = parents_idx[ei]
+        let np = len(ps)
+        let mut j: i64 = 0
+        while j < np {
+            let p = ps[j]
+            j = j + 1
+            if p < 0 { continue }
+            dot.push("  \"")
+            dot.push(_dot_escape(ids[p]))
+            dot.push("\" -> \"")
+            dot.push(_dot_escape(ids[ei]))
+            dot.push("\";\n")
+        }
+        ei = ei + 1
+    }
+    dot.push("}\n")
+
+    write_file(out_dot, dot.join(""))
+
+    // ─── JSON summary ───
+    if summary_path != "" {
+        let mut js: [string] = []
+        js.push("{\"trace\":\"")
+        js.push(trace)
+        js.push("\",\"n_nodes\":")
+        js.push(to_string(n))
+        js.push(",\"n_edges\":")
+        // count edges
+        let mut nedge: i64 = 0
+        let mut qi: i64 = 0
+        while qi < n {
+            let ps = parents_idx[qi]
+            let np = len(ps)
+            let mut qj: i64 = 0
+            while qj < np {
+                if ps[qj] > -1 { nedge = nedge + 1 }
+                qj = qj + 1
+            }
+            qi = qi + 1
+        }
+        js.push(to_string(nedge))
+        js.push(",\"max_layer\":")
+        js.push(to_string(max_layer))
+        js.push(",\"components\":")
+        js.push(to_string(ncomp))
+        js.push(",\"unresolved_edges\":")
+        js.push(to_string(unresolved))
+        js.push(",\"layers\":[")
+        let mut first = true
+        let mut l2: i64 = 0
+        while l2 < max_layer + 1 {
+            let mut c: i64 = 0
+            let mut j3: i64 = 0
+            while j3 < n {
+                if layers[j3] == l2 { c = c + 1 }
+                j3 = j3 + 1
+            }
+            if first { first = false } else { js.push(",") }
+            js.push("{\"layer\":")
+            js.push(to_string(l2))
+            js.push(",\"size\":")
+            js.push(to_string(c))
+            js.push("}")
+            l2 = l2 + 1
+        }
+        js.push("],\"top_central\":[")
+        // sort top_idx by top_val desc (simple selection sort)
+        let tk = len(top_idx)
+        let mut s1: i64 = 0
+        while s1 < tk {
+            let mut best: i64 = s1
+            let mut s2: i64 = s1 + 1
+            while s2 < tk {
+                if top_val[s2] > top_val[best] { best = s2 }
+                s2 = s2 + 1
+            }
+            if best != s1 {
+                let ti = top_idx[s1]; let tv = top_val[s1]
+                top_idx[s1] = top_idx[best]; top_val[s1] = top_val[best]
+                top_idx[best] = ti; top_val[best] = tv
+            }
+            s1 = s1 + 1
+        }
+        let mut first2 = true
+        let mut t: i64 = 0
+        while t < tk {
+            if first2 { first2 = false } else { js.push(",") }
+            js.push("{\"id\":\"")
+            js.push(ids[top_idx[t]])
+            js.push("\",\"descendants\":")
+            js.push(to_string(top_val[t]))
+            js.push(",\"layer\":")
+            js.push(to_string(layers[top_idx[t]]))
+            js.push("}")
+            t = t + 1
+        }
+        js.push("]}")
+        write_file(summary_path, js.join(""))
+    }
+
+    eprintln("NEXUS_CAUSAL_DAG {\"nodes\":" + to_string(n)
+        + ",\"max_layer\":" + to_string(max_layer)
+        + ",\"components\":" + to_string(ncomp)
+        + ",\"unresolved\":" + to_string(unresolved)
+        + ",\"dot\":\"" + out_dot + "\""
+        + (if summary_path != "" { ",\"summary\":\"" + summary_path + "\"" } else { "" })
+        + "}")
+    return 0
+}
+
+// ─── util: i64 idx_of for uniq_roots ───
+fn _idx_of_i64(xs: [i64], v: i64) -> i64 {
+    let n = len(xs)
+    let mut i: i64 = 0
+    while i < n {
+        if xs[i] == v { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// ═══════════════════════════════════════════════════════════
+//  CLI dispatch
+// ═══════════════════════════════════════════════════════════
+let a = args()
+let mut sub = "help"
+if len(a) > 2 { sub = a[2] }
+
+if sub == "build" {
+    if len(a) < 5 {
+        println("usage: causal_dag.hexa build <trace.ndjson> <out.dot> [--summary <out.json>]")
+        exit(1)  // @allow-silent-exit
+    }
+    let trace = a[3]
+    let out_dot = a[4]
+    let mut summary_path = ""
+    // parse optional --summary <path>
+    let mut i: i64 = 5
+    let na = len(a)
+    while i < na {
+        if a[i] == "--summary" && i + 1 < na {
+            summary_path = a[i + 1]
+            i = i + 2
+        } else {
+            i = i + 1
+        }
+    }
+    let rc = cmd_build(trace, out_dot, summary_path)
+    exit(rc)  // @allow-silent-exit
+} else {
+    println("causal_dag.hexa — AU: absorption → causal DAG extractor")
+    println("usage:")
+    println("  hexa cli/scripts/causal_dag.hexa build <trace.ndjson> <out.dot> [--summary <out.json>]")
+    println("")
+    println("input NDJSON schema:")
+    println("  {\"id\":\"<string>\",\"parents\":[\"<id>\",...],\"round\":<int>,\"stage\":\"<string>\",\"value\":\"<string>\"}")
+    println("")
+    println("note: blowup.hexa does not yet emit 'parents'. This tool is a stub")
+    println("      ready for the future schema — empty trace yields an empty DAG.")
+    exit(0)
+}
