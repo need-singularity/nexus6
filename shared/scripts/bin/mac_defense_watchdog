@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# nexus/shared/scripts/bin/mac_defense_watchdog
+#
+# Mac kernel panic 방어 — apfsd watchdog timeout 재발 차단.
+# 원인 패턴 (2026-04-20 incident, 03:33 panic):
+#   hexa_stage0 무한 loop → 디스크 I/O 폭주 → apfsd CPU 폭주 → watchdog 91s timeout → kernel panic
+#
+# launchd StartInterval=10 으로 호출되는 single-shot. Standalone (airgenome 의존성 zero).
+# 다른 프로젝트(anima/void/nexus/airgenome 등)의 hexa_stage0 폭주를 모두 보호.
+#
+# 환경:
+#   MAC_DEFENSE_KILL=1            실제 SIGSTOP/SIGKILL 수행 (default 0 = log only)
+#   MAC_DEFENSE_CPU_THRESHOLD     hexa_stage0 CPU% 임계 (default 50)
+#   MAC_DEFENSE_ETIME_THRESHOLD   hexa_stage0 etime 초 (default 300)
+#   MAC_DEFENSE_APFSD_THRESHOLD   apfsd CPU% 임계 (default 40)
+#   MAC_DEFENSE_LOAD_MULT         load1 > ncpu*N 이면 경고 (default 8)
+#   MAC_DEFENSE_LOG               log path (default ~/Library/Logs/mac_defense.log)
+
+set -u
+
+LOG="${MAC_DEFENSE_LOG:-$HOME/Library/Logs/mac_defense.log}"
+KILL_MODE="${MAC_DEFENSE_KILL:-0}"
+CPU_TH="${MAC_DEFENSE_CPU_THRESHOLD:-50}"
+ETIME_TH="${MAC_DEFENSE_ETIME_THRESHOLD:-300}"
+APFSD_TH="${MAC_DEFENSE_APFSD_THRESHOLD:-40}"
+LOAD_MULT="${MAC_DEFENSE_LOAD_MULT:-8}"
+
+mkdir -p "$(dirname "$LOG")" 2>/dev/null
+ts() { date +"%Y-%m-%dT%H:%M:%S%z"; }
+log() { printf '%s %s\n' "$(ts)" "$*" >> "$LOG"; }
+
+# Darwin 외에서는 no-op (Linux watchdog은 systemd가 담당)
+[ "$(uname -s)" = "Darwin" ] || exit 0
+
+ncpu=$(sysctl -n hw.ncpu 2>/dev/null || echo 8)
+load1=$(sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}')
+
+# etime 문자열을 초 단위로 — ps "etime" format: [[DD-]HH:]MM:SS
+_etime_to_sec() {
+    local e="$1" days=0 sec=0 n
+    n=$(echo "$e" | awk -F- '{print NF}')
+    if [ "$n" = "2" ]; then
+        days=$(echo "$e" | awk -F- '{print $1}')
+        e=$(echo "$e" | awk -F- '{print $2}')
+    fi
+    n=$(echo "$e" | awk -F: '{print NF}')
+    case "$n" in
+        3) sec=$(echo "$e" | awk -F: '{print $1*3600 + $2*60 + $3}') ;;
+        2) sec=$(echo "$e" | awk -F: '{print $1*60 + $2}') ;;
+        *) sec="$e" ;;
+    esac
+    echo $((days * 86400 + sec))
+}
+
+# 보호 PID 화이트리스트: claude CLI 본체 + 사용자가 의도적으로 local hexa 실행 중인 경우
+# (HEXA_LOCAL=1 환경변수로 spawn된 procs는 보호 — 의도적 local 실행)
+_is_protected() {
+    local pid="$1" comm="$2"
+    [ "$comm" = "claude" ] && return 0
+    [ "$comm" = "cl" ] && return 0
+    # HEXA_LOCAL=1 환경변수 확인
+    ps -p "$pid" -E 2>/dev/null | grep -q 'HEXA_LOCAL=1' && return 0
+    return 1
+}
+
+# === 1. hexa_stage0 폭주 검사 ===
+# pid, %cpu, etime, comm, command  (command 에 hexa_stage0 포함된 것만)
+ps -Ao pid,pcpu,etime,comm,command 2>/dev/null | awk 'NR>1 && index($0, "hexa_stage0") > 0' | \
+while read -r pid pcpu etime comm rest; do
+    cpu_int=$(printf '%.0f' "$pcpu" 2>/dev/null || echo 0)
+    etime_sec=$(_etime_to_sec "$etime")
+    [ "$etime_sec" -lt "$ETIME_TH" ] && continue
+    [ "$cpu_int" -lt "$CPU_TH" ] && continue
+    if _is_protected "$pid" "$comm"; then
+        log "PROTECTED hexa_stage0 pid=$pid cpu=${cpu_int}% etime=${etime_sec}s comm=$comm (skip)"
+        continue
+    fi
+    if [ "$KILL_MODE" = "1" ]; then
+        kill -STOP "$pid" 2>/dev/null
+        sleep 1
+        kill -KILL "$pid" 2>/dev/null
+        log "KILLED hexa_stage0 runaway pid=$pid cpu=${cpu_int}% etime=${etime_sec}s comm=$comm"
+    else
+        log "DRYRUN hexa_stage0 runaway pid=$pid cpu=${cpu_int}% etime=${etime_sec}s comm=$comm (set MAC_DEFENSE_KILL=1 to act)"
+    fi
+done
+
+# === 2. apfsd CPU 폭주 감지 (kill 안 함 — 시스템 데몬, 원인만 기록) ===
+apfsd_line=$(ps -Ao pid,pcpu,comm 2>/dev/null | awk '$3 ~ /apfsd$/ {print $1, $2; exit}')
+if [ -n "$apfsd_line" ]; then
+    apfsd_cpu=$(echo "$apfsd_line" | awk '{print $2}')
+    apfsd_int=$(printf '%.0f' "$apfsd_cpu" 2>/dev/null || echo 0)
+    if [ "$apfsd_int" -ge "$APFSD_TH" ]; then
+        # 디스크 I/O 후보 PID 5개 기록 (iotop 대용 — fs_usage 1초 샘플)
+        top_io=$(timeout 2 fs_usage -e -t 1 -f filesys 2>/dev/null | awk 'NR<=20{print $NF}' | sort -u | head -5 | tr '\n' ',')
+        log "APFSD-HIGH cpu=${apfsd_int}% (threshold=${APFSD_TH}%) load1=${load1} io_candidates=${top_io:-none}"
+    fi
+fi
+
+# === 3. load avg 추세 (panic 임계 근접 감지) ===
+if [ -n "$load1" ]; then
+    load_int=$(awk -v L="$load1" 'BEGIN{printf "%d", L}')
+    threshold=$((ncpu * LOAD_MULT))
+    if [ "$load_int" -ge "$threshold" ]; then
+        log "LOAD-HIGH load1=${load1} threshold=${threshold} (ncpu=${ncpu} × ${LOAD_MULT})"
+    fi
+fi
+
+exit 0
