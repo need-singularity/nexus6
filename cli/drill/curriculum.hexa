@@ -1,0 +1,358 @@
+// ═══════════════════════════════════════════════════════════
+// curriculum.hexa — AR curriculum drill (easy→hard progression + transfer)
+//
+// 배경 (AR):
+//   단일 어려운 seed (예: "Riemann hypothesis critical line zero spacing") 를
+//   곧바로 drill 돌리면 탐색 공간이 과도해 초기 round 에서 zero-yield 가 쉽게
+//   발생한다. 인간의 커리큘럼 학습처럼, target seed 의 하위 개념(토큰)을
+//   쉬운 순으로 먼저 drill → meta-buffer 상태 누적 → 최종 target 에 transfer.
+//
+// 알고리즘 (heuristic, NLP 무의존):
+//   1) target seed 를 whitespace split → tokens (불필요한 short token 은 유지).
+//   2) stages N 개를 요청하면 warm-up N-1 개 + final target 1 개 구성.
+//      warm-up i (1..N-1) 는 ceil(i * T / N) 개 토큰 사용 — 점진적 확장.
+//      토큰 부족 (T < N) 시 stage 수를 T 로 축소.
+//   3) 짧은 하위 seed 는 drill min-seed-length (30 char) 통과를 위해
+//      "curriculum stage-i: " prefix + 토큰 반복 확장으로 패딩 (의미 보존).
+//
+// Transfer 메커니즘:
+//   --transfer 플래그 ON 시 stage 간 meta-buffer 파일을 공유한다:
+//     NEXUS_META_BUFFER=/tmp/nexus_curriculum_<pid>.jsonl  (모든 stage 공용)
+//     NEXUS_META_LEARN=1                                   (hint push/read 활성)
+//   OFF 시 stage 간 buffer 를 rm 하여 독립 실행 (baseline 비교용).
+//   atlas.n6 는 프로세스-global 이므로 (shared/n6/atlas.n6) transfer 여부와
+//   상관없이 자연히 누적된다 — 순수 '추가 전달(state overlay)' 효과는 buffer 기반.
+//
+// 인터페이스 (run.hexa 측에서 dispatch):
+//   nexus curriculum --seed "<target>" --stages N [--transfer]
+//                    [--max-rounds M] [--engine mk9|mk10] [--preset fast|probe|...]
+//
+// 출력 (stdout, 마지막 line = JSON progression):
+//   {"stages":[{"seed":"...","abs":N,"ms":T}, ...],
+//    "target_result":{"abs":N,"ms":T},
+//    "transfer_benefit_estimate":X,
+//    "transfer":true|false,"stage_count":N}
+//
+// 제약:
+//   - hexa parse clean, `>=`/`<=` 미사용 (본 파일 규칙)
+//   - live smoke 없음 (호출 측 runtime 검증; 본 스크립트는 자체 drill 호출로 end-to-end 동작)
+//   - `nexus drill` 을 sub-process 로 호출 → /tmp/nexus_drill_last_total.txt sentinel 로 abs 수집
+// ═══════════════════════════════════════════════════════════
+
+// ─── util: shell-safe single-quote escape ───
+fn cr_shq(s: str) -> str {
+    let mut out = "'"
+    let mut i: i64 = 0
+    let n = s.len()
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "'" { out = out + "'\\''" } else { out = out + c }
+        i = i + 1
+    }
+    out = out + "'"
+    return out
+}
+
+// ─── util: ms epoch (mac fallback = sec*1000) ───
+fn cr_now_ms() -> i64 {
+    let raw = exec("date +%s%N").trim()
+    let mut v: i64 = 0
+    try { v = to_int(raw) } catch e { v = 0 }
+    if v > 1000000000000000 { return v / 1000000 }
+    let sec = exec("date +%s").trim()
+    let mut s: i64 = 0
+    try { s = to_int(sec) } catch e { s = 0 }
+    return s * 1000
+}
+
+// ─── util: flag helpers (min 재사용; run.hexa 와 독립) ───
+fn cr_find_flag(a: [str], flag: str, default_val: str) -> str {
+    let n = len(a)
+    let mut i: i64 = 0
+    while i < n {
+        if a[i] == flag {
+            if i + 1 < n { return a[i + 1] }
+        }
+        i = i + 1
+    }
+    return default_val
+}
+
+fn cr_has_flag(a: [str], flag: str) -> bool {
+    let n = len(a)
+    let mut i: i64 = 0
+    while i < n {
+        if a[i] == flag { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── tokenize: whitespace split, 빈 token 제거 ───
+fn cr_tokenize(seed: str) -> [str] {
+    // "\n" / "\t" 는 드물지만 안전하게 space 로 치환 후 split(" ").
+    let norm = seed.replace("\n", " ").replace("\t", " ")
+    let raw = norm.split(" ")
+    let mut out: [str] = []
+    let mut i: i64 = 0
+    while i < len(raw) {
+        let tok = raw[i].trim()
+        if tok.len() > 0 { out = out + [tok] }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── ceil(a*b/c) 정수 연산 (`>=`/`<=` 미사용 규칙 준수) ───
+fn cr_ceil_div(num: int, den: int) -> int {
+    if den < 1 { return 0 }
+    let q = num / den
+    let r = num - q * den
+    if r > 0 { return q + 1 }
+    return q
+}
+
+// ─── stage i (1..N-1) 가 취할 토큰 수 ───
+fn cr_stage_k(stage_idx_1based: int, total_stages: int, token_count: int) -> int {
+    // warm-up i 는 ceil(i * T / N). final stage (i == N) 는 token_count 전부.
+    if stage_idx_1based > total_stages - 1 { return token_count }
+    let k = cr_ceil_div(stage_idx_1based * token_count, total_stages)
+    if k < 1 { return 1 }
+    if k > token_count { return token_count }
+    return k
+}
+
+// ─── token 배열의 앞 k 개를 join ───
+fn cr_join_first(tokens: [str], k: int) -> str {
+    let mut out = ""
+    let mut i: i64 = 0
+    let lim = k
+    while i < lim && i < len(tokens) {
+        if i > 0 { out = out + " " }
+        out = out + tokens[i]
+        i = i + 1
+    }
+    return out
+}
+
+// ─── drill 은 seed ≥ 30 char 를 요구. 짧은 sub-seed 는 의미 prefix 로 패딩 ───
+fn cr_pad_seed(sub: str, stage_idx: int, target_hint: str) -> str {
+    // prefix: "curriculum stage <i> warm-up on: " + sub + " — derived from: " + target_hint (short)
+    // 이로써 stage 의미가 seed 자체에 담긴다 (hash/atlas 상 구분 가능).
+    let mut hint = target_hint
+    if hint.len() > 40 { hint = hint.substring(0, 40) }
+    let base = "curriculum stage " + to_string(stage_idx) + " warm-up on: " + sub
+    let full = base + " — derived from: " + hint
+    // drill min = 30 — base 단독으로 이미 충분하지만 target_hint 보존해 구분성 확보.
+    return full
+}
+
+// ─── drill 1회 호출 → (abs, ms) 반환. sub-process 로 run.hexa drill 실행 ───
+fn cr_run_stage(hx: str, run_hexa: str, stage_seed: str, max_rounds: str,
+                engine: str, preset: str, transfer: bool, mb_path: str) -> [int] {
+    // env 조립: transfer 모드에서 NEXUS_META_BUFFER + NEXUS_META_LEARN 활성.
+    // sentinel clear — 이전 drill 잔여 total.txt 오염 방지.
+    exec("rm -f /tmp/nexus_drill_last_total.txt 2>/dev/null || true")
+    let env_prefix = if transfer { "NEXUS_META_LEARN=1 NEXUS_META_BUFFER=" + cr_shq(mb_path) + " " } else { "NEXUS_META_LEARN=0 " }
+    let mut cmd = env_prefix + cr_shq(hx) + " run " + cr_shq(run_hexa)
+                + " drill --seed " + cr_shq(stage_seed)
+    if max_rounds.len() > 0 { cmd = cmd + " --max-rounds " + cr_shq(max_rounds) }
+    if engine.len() > 0 { cmd = cmd + " --engine " + cr_shq(engine) }
+    if preset.len() > 0 { cmd = cmd + " --preset " + cr_shq(preset) }
+    // stderr/stdout 모두 buffer — 본 스크립트는 요약만 stdout 으로 emit.
+    cmd = cmd + " 2>&1"
+    let t0 = cr_now_ms()
+    let out = exec(cmd)
+    let t1 = cr_now_ms()
+    let _ = out  // 본 구현은 sentinel 기반 abs 수집 (drill 끝에 /tmp/.../last_total.txt 기록).
+    let raw_total = exec("cat /tmp/nexus_drill_last_total.txt 2>/dev/null || echo 0").trim()
+    let mut abs_v: int = 0
+    try { abs_v = to_int(raw_total) } catch e { abs_v = 0 }
+    let mut ms: int = 0
+    let diff = t1 - t0
+    if diff > 0 {
+        // i64 → int downcast via to_string/to_int (hexa-lang `as` 미지원)
+        let mut dv: int = 0
+        try { dv = to_int(to_string(diff)) } catch e { dv = 0 }
+        ms = dv
+    }
+    return [abs_v, ms]
+}
+
+// ─── transfer benefit 추정 (warmup 합 / target_abs 비율, 0..100) ───
+fn cr_benefit_pct(warmup_abs_sum: int, target_abs: int) -> int {
+    if target_abs < 1 { return 0 }
+    let pct = (100 * warmup_abs_sum) / target_abs
+    if pct < 0 { return 0 }
+    if pct > 100 { return 100 }
+    return pct
+}
+
+// ─── JSON escape (seed 내 quote/backslash 만) ───
+fn cr_json_escape(s: str) -> str {
+    let mut out = ""
+    let mut i: i64 = 0
+    let n = s.len()
+    while i < n {
+        let cc = s.substring(i, i + 1)
+        if cc == "\"" { out = out + "\\\"" }
+        else if cc == "\\" { out = out + "\\\\" }
+        else if cc == "\n" { out = out + " " }
+        else { out = out + cc }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── main entry — dispatch 는 run.hexa curriculum subcommand 에서 호출 ───
+fn cmd_curriculum(seed: str, stages_raw: str, transfer: bool,
+                  max_rounds: str, engine: str, preset: str) -> void {
+    let _seed_t = seed.trim()
+    if _seed_t.len() == 0 {
+        eprintln("nexus curriculum: --seed 필수")
+        return
+    }
+    let mut stages: int = 3
+    if stages_raw.len() > 0 {
+        try { stages = to_int(stages_raw) } catch e { stages = 3 }
+    }
+    if stages < 2 { stages = 2 }
+    if stages > 12 { stages = 12 }
+
+    let tokens = cr_tokenize(_seed_t)
+    let mut tcount: int = 0
+    try { tcount = to_int(to_string(len(tokens))) } catch e { tcount = 0 }
+    if tcount < 1 {
+        eprintln("nexus curriculum: --seed token 이 없음 — whitespace split 실패")
+        return
+    }
+    // stage 수 > token 수 면 stage = token (중복 stage 방지)
+    if stages > tcount { stages = tcount }
+    if stages < 2 {
+        eprintln("nexus curriculum: target seed 가 token 1개 뿐 — 커리큘럼 불가, 직접 drill 권장")
+        return
+    }
+
+    // 엔진 경로 resolve
+    let _home = env("HOME")
+    let hx_env = env("HEXA")
+    let mut hx = hx_env
+    if hx.len() == 0 {
+        let cand1 = _home + "/Dev/hexa-lang/hexa"
+        let cand2 = _home + "/.hx/bin/hexa"
+        let chk1 = exec("[ -x " + cr_shq(cand1) + " ] && echo y || echo n").trim()
+        if chk1 == "y" { hx = cand1 }
+        else {
+            let chk2 = exec("[ -x " + cr_shq(cand2) + " ] && echo y || echo n").trim()
+            if chk2 == "y" { hx = cand2 } else { hx = "hexa" }
+        }
+    }
+    let nx_env = env("NEXUS")
+    let nexus_root = if nx_env.len() > 0 { nx_env } else { _home + "/Dev/nexus" }
+    let run_hexa = nexus_root + "/cli/run.hexa"
+
+    // meta-buffer path (transfer 공유)
+    let pid = exec("echo $$").trim()
+    let mb_path = "/tmp/nexus_curriculum_" + pid + ".jsonl"
+    // transfer OFF 여도 이전 잔여 파일 제거 — baseline 확보.
+    exec("rm -f " + cr_shq(mb_path) + " 2>/dev/null || true")
+
+    println("nexus curriculum — target='" + _seed_t + "' stages=" + to_string(stages)
+          + " transfer=" + (if transfer { "on" } else { "off" }))
+    println("  tokens=" + to_string(tcount) + " mb_path=" + mb_path)
+
+    // 단계별 drill 실행 — warm-up 1..N-1, 최종 target (i==N) 은 원본 seed 그대로.
+    let mut stages_json = "["
+    let mut warmup_sum: int = 0
+    let mut target_abs: int = 0
+    let mut target_ms: int = 0
+    let mut target_seed_out = ""
+    let mut si: int = 1
+    while si < stages + 1 {
+        let is_final = (si == stages)
+        // token k
+        let k = cr_stage_k(si, stages, tcount)
+        let sub_raw = cr_join_first(tokens, k)
+        let stage_seed = if is_final { _seed_t } else { cr_pad_seed(sub_raw, si, _seed_t) }
+        // transfer OFF: 매 stage 전 buffer clear — hint 누적 차단.
+        if !transfer {
+            exec("rm -f " + cr_shq(mb_path) + " 2>/dev/null || true")
+        }
+        println("▎ stage " + to_string(si) + "/" + to_string(stages)
+              + " (k=" + to_string(k) + ") seed='" + stage_seed + "'")
+        let r = cr_run_stage(hx, run_hexa, stage_seed, max_rounds, engine, preset, transfer, mb_path)
+        let abs_v = r[0]
+        let ms_v = r[1]
+        println("  → abs=" + to_string(abs_v) + " ms=" + to_string(ms_v))
+        if si > 1 { stages_json = stages_json + "," }
+        stages_json = stages_json
+                    + "{\"seed\":\"" + cr_json_escape(stage_seed) + "\""
+                    + ",\"abs\":" + to_string(abs_v)
+                    + ",\"ms\":" + to_string(ms_v)
+                    + ",\"k\":" + to_string(k)
+                    + ",\"final\":" + (if is_final { "true" } else { "false" }) + "}"
+        if is_final {
+            target_abs = abs_v
+            target_ms = ms_v
+            target_seed_out = stage_seed
+        } else {
+            warmup_sum = warmup_sum + abs_v
+        }
+        si = si + 1
+    }
+    stages_json = stages_json + "]"
+
+    // transfer OFF 세션은 실제 transfer 효과가 없으므로 benefit 를 0 으로 리포트
+    // (progression 비율은 동일 수식이지만 semantically "no transfer" = 0).
+    let benefit = if transfer { cr_benefit_pct(warmup_sum, target_abs) } else { 0 }
+
+    let out_json = "{\"stages\":" + stages_json
+                 + ",\"target_result\":{\"seed\":\"" + cr_json_escape(target_seed_out) + "\""
+                 + ",\"abs\":" + to_string(target_abs)
+                 + ",\"ms\":" + to_string(target_ms) + "}"
+                 + ",\"transfer_benefit_estimate\":" + to_string(benefit)
+                 + ",\"transfer\":" + (if transfer { "true" } else { "false" })
+                 + ",\"stage_count\":" + to_string(stages)
+                 + ",\"warmup_abs_sum\":" + to_string(warmup_sum)
+                 + ",\"mb_path\":\"" + cr_json_escape(mb_path) + "\"}"
+    println(out_json)
+
+    // 전사 cleanup — transfer 세션 종료 시 buffer 제거 (다음 호출 cross-pollution 방지)
+    exec("rm -f " + cr_shq(mb_path) + " 2>/dev/null || true")
+}
+
+// ─── standalone CLI dispatch ───
+// 호출 형태:
+//   hexa cli/drill/curriculum.hexa --seed "..." --stages N [--transfer] [--max-rounds M] [--engine mk9|mk10] [--preset fast|probe|...]
+// run.hexa 측에서 exec 로 호출해도 되고 직접 호출해도 된다.
+let a = args()
+// argv[0]=hexa, argv[1]=script.hexa, argv[2..]=user args.
+let mut user: [str] = []
+let mut ai: i64 = 2
+while ai < len(a) {
+    user = user + [a[ai]]
+    ai = ai + 1
+}
+// "run" 프리픽스 처리 (stage1 변종: [hexa, "run", script, user...])
+if len(a) > 2 && a[1] == "run" {
+    user = []
+    let mut ai2: i64 = 3
+    while ai2 < len(a) {
+        user = user + [a[ai2]]
+        ai2 = ai2 + 1
+    }
+}
+
+let seed = cr_find_flag(user, "--seed", "")
+let stages_s = cr_find_flag(user, "--stages", "3")
+let transfer = cr_has_flag(user, "--transfer")
+let max_rounds = cr_find_flag(user, "--max-rounds", "")
+let engine = cr_find_flag(user, "--engine", "")
+let preset = cr_find_flag(user, "--preset", "")
+
+if seed.len() == 0 {
+    println("usage: curriculum.hexa --seed \"<target>\" --stages N [--transfer]")
+    println("                        [--max-rounds M] [--engine mk9|mk10] [--preset fast|probe|coarse|standard]")
+    exit(0)  // @allow-silent-exit
+}
+cmd_curriculum(seed, stages_s, transfer, max_rounds, engine, preset)
