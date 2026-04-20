@@ -1,0 +1,206 @@
+// ═══════════════════════════════════════════════════════════
+// atlas_shard_gc.hexa — atlas.n6 shard 가비지 회수 (ROI#42)
+// 용도: manifest (atlas.n6.shard_meta.json) 기반 live shard 결정 + stale shard GC
+// 사용: hexa atlas_shard_gc.hexa [--dry-run] [--verbose]
+//       --dry-run    삭제 대상만 리스트, 실제 삭제 X
+//       --verbose    manifest 파싱 + 판정 로그
+// 규칙:
+//   - atlas.n6 mtime > manifest atlas_mtime  →  hot/cold sidecar stale → GC
+//   - pre_shard_* 파일은 항상 stale 후보 (이전 migration snapshot) → GC
+//   - manifest 자체는 유지 (재빌드 시 갱신)
+//   - "파일 없음" 은 정상 (이미 회수됨)
+// ═══════════════════════════════════════════════════════════
+
+let a = args()
+let mut dry_run = false
+let mut verbose = false
+let mut N6_DIR = "shared/n6"
+
+let mut ai: i64 = 2
+while ai < len(a) {
+    let tok = a[ai]
+    if tok == "--dry-run" || tok == "-n" { dry_run = true }
+    else if tok == "--verbose" || tok == "-v" { verbose = true }
+    else if tok == "--dir" && ai + 1 < len(a) { ai = ai + 1; N6_DIR = a[ai] }
+    else if tok == "--help" || tok == "-h" {
+        println("usage: hexa atlas_shard_gc.hexa [--dry-run] [--verbose] [--dir PATH]")
+        exit(0)
+    }
+    ai = ai + 1
+}
+
+let ATLAS_PATH    = N6_DIR + "/atlas.n6"
+let MANIFEST_PATH = N6_DIR + "/atlas.n6.shard_meta.json"
+let HOT_PATH      = N6_DIR + "/atlas.n6.hot"
+let COLD_PATH     = N6_DIR + "/atlas.n6.cold"
+
+println("═══ atlas shard GC sweep ═══")
+println("  atlas:    " + ATLAS_PATH)
+println("  manifest: " + MANIFEST_PATH)
+println("  mode:     " + (if dry_run { "DRY-RUN" } else { "APPLY" }))
+println("")
+
+if !file_exists(ATLAS_PATH) {
+    println("error: atlas.n6 부재 — GC 중단 (SSOT missing)")
+    exit(1)  // @allow-silent-exit
+}
+
+// ─── stat helper (BSD+GNU) ───
+fn _last_numeric(raw: string) -> string {
+    let lines = raw.split("\n")
+    let mut i: i64 = len(lines) - 1
+    while i >= 0 {
+        let t = lines[i].trim()
+        if t != "" {
+            let mut all_d = true
+            let mut j: i64 = 0
+            while j < len(t) {
+                let c = t.substring(j, j + 1)
+                if c < "0" || c > "9" { all_d = false; j = len(t) }
+                j = j + 1
+            }
+            if all_d { return t }
+        }
+        i = i - 1
+    }
+    return ""
+}
+
+fn _mtime(path: string) -> i64 {
+    let mut r: i64 = 0
+    try {
+        let raw = to_string(exec("stat -c '%Y' '" + path + "' 2>/dev/null; stat -f '%m' '" + path + "' 2>/dev/null"))
+        let v = _last_numeric(raw)
+        if v != "" { r = to_int(v) }
+    } catch e {}  // @allow-silent-catch
+    return r
+}
+
+fn _size(path: string) -> i64 {
+    let mut r: i64 = 0
+    try {
+        let raw = to_string(exec("stat -c '%s' '" + path + "' 2>/dev/null; stat -f '%z' '" + path + "' 2>/dev/null"))
+        let v = _last_numeric(raw)
+        if v != "" { r = to_int(v) }
+    } catch e {}  // @allow-silent-catch
+    return r
+}
+
+fn _json_int(raw: string, key: string) -> i64 {
+    let mut v: i64 = 0
+    let marker = "\"" + key + "\":"
+    let idx = raw.index_of(marker)
+    if idx >= 0 {
+        let after = raw.substring(idx + len(marker), len(raw))
+        let mut end = after.index_of(",")
+        let end2 = after.index_of("}")
+        if end < 0 || (end2 >= 0 && end2 < end) { end = end2 }
+        if end > 0 {
+            try { v = to_int(after.substring(0, end).trim()) } catch e {}  // @allow-silent-catch
+        }
+    }
+    return v
+}
+
+// ─── 1. atlas.n6 vs manifest mtime 비교 ───
+let atlas_mtime = _mtime(ATLAS_PATH)
+let mut manifest_atlas_mtime: i64 = 0
+let mut manifest_exists = file_exists(MANIFEST_PATH)
+
+if manifest_exists {
+    let mut raw = ""
+    try { raw = read_file(MANIFEST_PATH).trim() } catch e {}  // @allow-silent-catch
+    if raw != "" {
+        manifest_atlas_mtime = _json_int(raw, "atlas_mtime")
+    }
+}
+
+let sidecars_stale = manifest_exists && manifest_atlas_mtime > 0 && atlas_mtime > manifest_atlas_mtime
+let no_manifest = !manifest_exists
+
+if verbose {
+    println("  atlas mtime:          " + to_string(atlas_mtime))
+    println("  manifest atlas_mtime: " + to_string(manifest_atlas_mtime))
+    println("  verdict:              " + (if sidecars_stale { "STALE" } else if no_manifest { "NO MANIFEST" } else { "FRESH" }))
+    println("")
+}
+
+// ─── 2. GC 대상 후보 수집 ───
+// 후보:
+//   a) atlas.n6.hot / atlas.n6.cold       → manifest stale 시
+//   b) atlas.n6.pre_shard_*               → 항상 stale (migration snapshot)
+let mut targets: [string] = []
+let mut reasons: [string] = []
+
+// a) hot/cold — manifest stale 시에만 (또는 manifest 없을 때)
+if sidecars_stale || no_manifest {
+    if file_exists(HOT_PATH) {
+        targets.push(HOT_PATH)
+        reasons.push(if sidecars_stale { "stale (manifest mtime < atlas mtime)" } else { "orphan (no manifest)" })
+    }
+    if file_exists(COLD_PATH) {
+        targets.push(COLD_PATH)
+        reasons.push(if sidecars_stale { "stale (manifest mtime < atlas mtime)" } else { "orphan (no manifest)" })
+    }
+}
+
+// b) pre_shard_* — ls -1 + grep 으로 glob
+let pre_shard_list_raw = to_string(exec("ls -1 '" + N6_DIR + "'/atlas.n6.pre_shard_* 2>/dev/null")).trim()
+if pre_shard_list_raw != "" {
+    let pre_lines = pre_shard_list_raw.split("\n")
+    for pl in pre_lines {
+        let p = pl.trim()
+        if p != "" && file_exists(p) {
+            targets.push(p)
+            reasons.push("migration snapshot (pre_shard_*)")
+        }
+    }
+}
+
+// ─── 3. 보고 + 실행 ───
+if len(targets) == 0 {
+    println("▎ GC targets: 0 — shard state clean")
+    exit(0)
+}
+
+println("── GC targets (" + to_string(len(targets)) + ") ──────────────────────")
+let mut total_bytes: i64 = 0
+let mut i: i64 = 0
+while i < len(targets) {
+    let path = targets[i]
+    let sz = _size(path)
+    total_bytes = total_bytes + sz
+    println("  " + path + "  (" + to_string(sz) + " bytes)  ← " + reasons[i])
+    i = i + 1
+}
+println("")
+println("  total reclaim: " + to_string(total_bytes) + " bytes")
+println("")
+
+if dry_run {
+    println("▎ DRY-RUN — no files removed. rerun without --dry-run to apply.")
+    exit(0)
+}
+
+// 실제 삭제
+println("── removing ──────────────────────")
+let mut removed: i64 = 0
+let mut failed: i64 = 0
+let mut k: i64 = 0
+while k < len(targets) {
+    let path = targets[k]
+    let rc_raw = to_string(exec("rm -f '" + path + "' 2>&1; echo __RC_$?__")).trim()
+    if rc_raw.contains("__RC_0__") {
+        println("  ✓ removed: " + path)
+        removed = removed + 1
+    } else {
+        println("  ✗ failed:  " + path + "  " + rc_raw)
+        failed = failed + 1
+    }
+    k = k + 1
+}
+println("")
+println("▎ removed: " + to_string(removed) + "  failed: " + to_string(failed) + "  reclaimed: " + to_string(total_bytes) + " bytes")
+
+if failed > 0 { exit(1) }  // @allow-silent-exit
+exit(0)
