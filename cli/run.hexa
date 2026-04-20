@@ -606,6 +606,23 @@ fn _resonance_run(seed: str, blow_core: str, exv: str) -> int {
     return _count_discoveries(out)
 }
 
+// ─── E13 (2026-04-21 replay) Stage Pipelining — smash+free miss → abs/meta/hyper skip ───
+// 원본 커밋: a1cd0099 (e13-pending, 구 run.hexa 경로) — 079bc12d refactor 로 cli/run.hexa 이동 후
+// cherry-pick rename conflict → 재구현. 최소 diff (helper fn + 1 call site).
+// 원칙: smash AND free 둘 다 정확히 0 → abs/meta/hyper skip (resonance 는 smash 독립이라 그대로 실행).
+// Bypass: env NEXUS_DRILL_PIPELINE=0 → 항상 full pipeline.
+// Emit: NEXUS_DRILL_PIPELINE_SKIP {"round":N,"reason":"smash_free_both_zero"} on stderr.
+// 충돌 회피: 신규 함수 prefix `_stage_pipeline_*` (Agent E15 `_stage_parallel_*` / E14 LRU 와 분리).
+fn _stage_pipeline_should_skip(round: int, smash_yield: int, free_yield: int) -> bool {
+    // 보수적 guard — 둘 다 정확히 0 일 때만 skip
+    if smash_yield != 0 { return false }
+    if free_yield  != 0 { return false }
+    // Bypass: env NEXUS_DRILL_PIPELINE=0 → 항상 full pipeline
+    let ev = env("NEXUS_DRILL_PIPELINE")
+    if ev == "0" { return false }
+    return true
+}
+
 // ─── E15 (2026-04-21) Stage Parallel — smash/free/abs/meta/hyper 5-way concurrent ───
 // SSOT: shared/config/drill.json .parallelism.stage_parallel
 //   parallel_group=[smash,free,absolute,meta_closure,hyperarith], serial_after=[resonance]
@@ -2623,54 +2640,68 @@ fn cmd_drill(seed: str, max_rounds: str, engine_flag: str, preset: str, master_d
             }
             yields = _plan_set(yields, 1, f_new)
 
-            // 3. ABSOLUTE (Mk.VIII Δ₀-absolute Π₀¹ 검증 + [11*] 승급)
-            if cur_plan[2] > 0 {
-                let _pg_t0_a = _progress_now_ms()
-                _progress_emit(round, "absolute", "start", 0)
-                let abs_cmd = shell_quote(hexa_bin()) + " run " + shell_quote(abs_eng) + " " + qrseed + " 2>&1"
-                let abs_out = exec(abs_cmd)
-                if _check_stage_err(abs_out, "absolute") { err_stages = err_stages + "absolute,"; err_count = err_count + 1 }
-                a_pass = _count_marker(abs_out, "ABSOLUTE-PASS") + _count_marker(abs_out, "[11*]")
-                println("  absolute:      " + to_string(a_pass) + " Π₀¹ verifications")
-                _progress_emit(round, "absolute", "end", _progress_ms_diff(_pg_t0_a, _progress_now_ms()))
+            // ─── E13 stage pipelining hook (smash+free 둘 다 0 → abs/meta/hyper skip) ───
+            // call site: serial path only. parallel path 는 모든 stage 이미 동시 실행 → skip 효과 없음.
+            // resonance 는 smash 독립 경로 → pipeline skip 밖. round_new 집계 일관성 위해
+            //   a_pass/mc_new/hy_pass 는 이미 위에서 0 으로 reset 됨 (line 2553-2555).
+            let pipeline_skip = _stage_pipeline_should_skip(round, s_new, f_new)
+            if pipeline_skip {
+                let pj = "NEXUS_DRILL_PIPELINE_SKIP {\"round\":" + to_string(round) + ",\"reason\":\"smash_free_both_zero\"}"
+                eprintln(pj)
+                println("  pipelining:    SATURATED early (smash+free=0) — abs/meta/hyper skipped")
+                yields = _plan_set(yields, 2, 0)
+                yields = _plan_set(yields, 3, 0)
+                yields = _plan_set(yields, 4, 0)
             } else {
-                println("  absolute:      (skipped — depth=0)")
-            }
-            yields = _plan_set(yields, 2, a_pass)
+                // 3. ABSOLUTE (Mk.VIII Δ₀-absolute Π₀¹ 검증 + [11*] 승급)
+                if cur_plan[2] > 0 {
+                    let _pg_t0_a = _progress_now_ms()
+                    _progress_emit(round, "absolute", "start", 0)
+                    let abs_cmd = shell_quote(hexa_bin()) + " run " + shell_quote(abs_eng) + " " + qrseed + " 2>&1"
+                    let abs_out = exec(abs_cmd)
+                    if _check_stage_err(abs_out, "absolute") { err_stages = err_stages + "absolute,"; err_count = err_count + 1 }
+                    a_pass = _count_marker(abs_out, "ABSOLUTE-PASS") + _count_marker(abs_out, "[11*]")
+                    println("  absolute:      " + to_string(a_pass) + " Π₀¹ verifications")
+                    _progress_emit(round, "absolute", "end", _progress_ms_diff(_pg_t0_a, _progress_now_ms()))
+                } else {
+                    println("  absolute:      (skipped — depth=0)")
+                }
+                yields = _plan_set(yields, 2, a_pass)
 
-            // 4. META-CLOSURE (Mk.IX Phase 10 self-ref 고정점 + [10**] 승급)
-            if cur_plan[3] > 0 {
-                let _pg_t0_m = _progress_now_ms()
-                _progress_emit(round, "meta_closure", "start", 0)
-                let mc_cmd = shell_quote(hexa_bin()) + " run " + shell_quote(mc_eng) + " " + qrseed + " 2>&1"
-                let mc_out = exec(mc_cmd)
-                if _check_stage_err(mc_out, "meta-closure") { err_stages = err_stages + "meta-closure,"; err_count = err_count + 1 }
-                // META-CLOSED 마커 부재 — meta_closed/promoted 숫자 직접 파싱 + [10**] 매치
-                let mc_promoted = _extract_int_after(mc_out, "promoted [10**]  : ")
-                let mc_closed   = _extract_int_after(mc_out, "meta_closed      : ")
-                let mc_bracket  = _count_marker(mc_out, "[10**]")
-                mc_new = mc_promoted + mc_closed + mc_bracket
-                println("  meta-closure:  " + to_string(mc_new) + " self-ref fixed points")
-                _progress_emit(round, "meta_closure", "end", _progress_ms_diff(_pg_t0_m, _progress_now_ms()))
-            } else {
-                println("  meta-closure:  (skipped — depth=0)")
-            }
-            yields = _plan_set(yields, 3, mc_new)
+                // 4. META-CLOSURE (Mk.IX Phase 10 self-ref 고정점 + [10**] 승급)
+                if cur_plan[3] > 0 {
+                    let _pg_t0_m = _progress_now_ms()
+                    _progress_emit(round, "meta_closure", "start", 0)
+                    let mc_cmd = shell_quote(hexa_bin()) + " run " + shell_quote(mc_eng) + " " + qrseed + " 2>&1"
+                    let mc_out = exec(mc_cmd)
+                    if _check_stage_err(mc_out, "meta-closure") { err_stages = err_stages + "meta-closure,"; err_count = err_count + 1 }
+                    // META-CLOSED 마커 부재 — meta_closed/promoted 숫자 직접 파싱 + [10**] 매치
+                    let mc_promoted = _extract_int_after(mc_out, "promoted [10**]  : ")
+                    let mc_closed   = _extract_int_after(mc_out, "meta_closed      : ")
+                    let mc_bracket  = _count_marker(mc_out, "[10**]")
+                    mc_new = mc_promoted + mc_closed + mc_bracket
+                    println("  meta-closure:  " + to_string(mc_new) + " self-ref fixed points")
+                    _progress_emit(round, "meta_closure", "end", _progress_ms_diff(_pg_t0_m, _progress_now_ms()))
+                } else {
+                    println("  meta-closure:  (skipped — depth=0)")
+                }
+                yields = _plan_set(yields, 3, mc_new)
 
-            // 5. HYPERARITHMETIC (Mk.IX Π₀² reverse-math 5체계)
-            if cur_plan[4] > 0 {
-                let _pg_t0_h = _progress_now_ms()
-                _progress_emit(round, "hyperarith", "start", 0)
-                let hy_cmd = shell_quote(hexa_bin()) + " run " + shell_quote(hyper_eng) + " " + qrseed + " 2>&1"
-                let hy_out = exec(hy_cmd)
-                if _check_stage_err(hy_out, "hyperarith") { err_stages = err_stages + "hyperarith,"; err_count = err_count + 1 }
-                hy_pass = _count_marker(hy_out, "REVERSE-PROVEN") + _count_marker(hy_out, "ABSOLUTE-PASS-PI02")
-                println("  hyperarith:    " + to_string(hy_pass) + " Π₀² bounded/proven")
-                _progress_emit(round, "hyperarith", "end", _progress_ms_diff(_pg_t0_h, _progress_now_ms()))
-            } else {
-                println("  hyperarith:    (skipped — depth=0)")
+                // 5. HYPERARITHMETIC (Mk.IX Π₀² reverse-math 5체계)
+                if cur_plan[4] > 0 {
+                    let _pg_t0_h = _progress_now_ms()
+                    _progress_emit(round, "hyperarith", "start", 0)
+                    let hy_cmd = shell_quote(hexa_bin()) + " run " + shell_quote(hyper_eng) + " " + qrseed + " 2>&1"
+                    let hy_out = exec(hy_cmd)
+                    if _check_stage_err(hy_out, "hyperarith") { err_stages = err_stages + "hyperarith,"; err_count = err_count + 1 }
+                    hy_pass = _count_marker(hy_out, "REVERSE-PROVEN") + _count_marker(hy_out, "ABSOLUTE-PASS-PI02")
+                    println("  hyperarith:    " + to_string(hy_pass) + " Π₀² bounded/proven")
+                    _progress_emit(round, "hyperarith", "end", _progress_ms_diff(_pg_t0_h, _progress_now_ms()))
+                } else {
+                    println("  hyperarith:    (skipped — depth=0)")
+                }
+                yields = _plan_set(yields, 4, hy_pass)
             }
-            yields = _plan_set(yields, 4, hy_pass)
         }
 
         // 6. RESONANCE (Stochastic Resonance — σ grid adaptive)
