@@ -1,0 +1,133 @@
+// drill_sanity_check.hexa — drill engine 생존성 검증 (validation layer C)
+// SSOT: shared/config/drill.json .validation.layers.C_sanity_self_test
+//
+// usage:
+//   hexa shared/scripts/drill_sanity_check.hexa               → 기본 sanity seed
+//   hexa shared/scripts/drill_sanity_check.hexa --seed "<s>"  → 사용자 seed
+//   hexa shared/scripts/drill_sanity_check.hexa --json        → JSON 만
+//
+// 판정:
+//   ALIVE — absorption >= min_expected_absorption (SSOT 기본 1)
+//   DEAD  — absorption < threshold → engine 죽음 signal (exit 1)
+//
+// 호출 위치 후보:
+//   - nexus self-check (별도 통합 후속)
+//   - CI gate (결함 수리 후 deploy 전)
+//   - Pre-drill probe (run.hexa cmd_drill 진입부, E1 합류 시 내장)
+
+fn _nexus_root() -> str {
+    let n = env("NEXUS")
+    if n.len() > 0 { return n }
+    return env("HOME") + "/Dev/nexus"
+}
+
+fn _drill_json() -> str {
+    return _nexus_root() + "/shared/config/drill.json"
+}
+
+fn _jq_get(expr: str) -> str {
+    let cmd = "jq -r '" + expr + "' '" + _drill_json() + "' 2>/dev/null"
+    return exec(cmd).trim()
+}
+
+fn _extract_total(drill_out: str) -> int {
+    // "▎ total absorptions: N" 마지막 줄 파싱
+    let lines = drill_out.split("\n")
+    let mut total = -1
+    let mut i = 0
+    while i < len(lines) {
+        let line = lines[i]
+        if line.contains("total absorptions:") {
+            let parts = line.split(":")
+            if len(parts) >= 2 {
+                let tail = parts[1].trim()
+                try { total = to_int(tail) } catch e {}
+            }
+        }
+        i = i + 1
+    }
+    return total
+}
+
+fn _extract_err_count(drill_out: str) -> int {
+    // __DRILL_RESULT__ ERROR zero_yield err_count=N 파싱
+    let idx = str_find(drill_out, "err_count=")
+    if idx < 0 { return 0 }
+    let start = idx + 10
+    let tail = drill_out.substring(start, drill_out.len())
+    let parts = tail.split("\n")
+    if len(parts) == 0 { return 0 }
+    let num_str = parts[0].trim()
+    let mut v = 0
+    try { v = to_int(num_str) } catch e {}
+    return v
+}
+
+fn main() {
+    let a = args()
+    let mut user_seed = ""
+    let mut json_only = false
+    let mut i = 0
+    while i < len(a) {
+        let t = to_string(a[i])
+        if t == "--seed" && i + 1 < len(a) { user_seed = to_string(a[i + 1]); i = i + 1 }
+        if t == "--json" { json_only = true }
+        i = i + 1
+    }
+
+    // SSOT 에서 sanity seed + threshold 읽기
+    let sanity_seed = if user_seed.len() > 0 { user_seed } else { _jq_get(".validation.layers.C_sanity_self_test.seed") }
+    let min_exp_str = _jq_get(".validation.layers.C_sanity_self_test.min_expected_absorption")
+    let mut min_exp = 1
+    try { min_exp = to_int(min_exp_str) } catch e {}
+
+    if sanity_seed.len() < 10 {
+        eprintln("NEXUS_DRILL_SANITY_ERROR {\"kind\":\"seed_missing_or_short\",\"len\":" + to_string(sanity_seed.len()) + "}")
+        exit(2)
+    }
+
+    if json_only == false {
+        println("drill sanity — seed='" + sanity_seed + "' min_expected=" + to_string(min_exp))
+    }
+
+    // drill 1 round 실행 (최소 비용)
+    let drill_cmd = "nexus drill --seed '" + sanity_seed + "' --max-rounds 1 2>&1"
+    let out = exec(drill_cmd)
+
+    let total = _extract_total(out)
+    let err_ct = _extract_err_count(out)
+    let has_ai_error = out.contains("NEXUS_DRILL_ERROR") || out.contains("__DRILL_RESULT__ ERROR")
+
+    let mut verdict = "ALIVE"
+    let mut reason = ""
+
+    if has_ai_error {
+        verdict = "DEAD"
+        reason = "ai_native_error_emit"
+    } else {
+        if total < 0 {
+            verdict = "DEAD"
+            reason = "total_not_parsed"
+        } else {
+            if total < min_exp {
+                verdict = "DEAD"
+                reason = "below_min_expected"
+            }
+        }
+    }
+
+    let result_json = "{\"kind\":\"drill_sanity\",\"seed_len\":" + to_string(sanity_seed.len()) + ",\"total\":" + to_string(total) + ",\"min_expected\":" + to_string(min_exp) + ",\"err_stages\":" + to_string(err_ct) + ",\"verdict\":\"" + verdict + "\",\"reason\":\"" + reason + "\"}"
+
+    println("NEXUS_DRILL_SANITY " + result_json)
+    println("__DRILL_SANITY__ " + verdict)
+
+    if verdict == "DEAD" {
+        if env("NEXUS_DRILL_SANITY_OK") == "1" {
+            eprintln("NEXUS_DRILL_SANITY_OK=1 — DEAD verdict bypass, exit 0")
+            return
+        }
+        exit(1)
+    }
+}
+
+main()
