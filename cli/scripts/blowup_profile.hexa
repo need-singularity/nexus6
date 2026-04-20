@@ -1,0 +1,533 @@
+// ═══════════════════════════════════════════════════════════
+// blowup_profile.hexa — drill engine native profile harness
+//
+// 배경:
+//   cli/blowup/core/blowup.hexa (2800+ lines, N6 drill 엔진) 에서
+//   Phase 1..6 중 특정 phase 가 wall-time 의 대부분을 점유.
+//   어느 phase 가 hot 인지 정량화하지 않고는 타겟 최적화 어려움.
+//
+// 설계:
+//   (1) instrument — string-level rewrite.  blowup.hexa 를 읽어
+//       Phase N 경계 마커 (// Phase N  또는  println("--- Phase N:)
+//       를 regex 로 감지 → 직전에 `_profile_emit("phase-N-end", ...)`,
+//       직후에 `_profile_emit("phase-N-start", ...)` wrapper 를 inject.
+//       원본은 수정하지 않음; 새 경로에 instrumented copy 를 생성.
+//
+//   (2) analyze — NDJSON trace (한 줄당 하나의 JSON) 를 파싱,
+//       phase 별 총 ms / % of wall / call count / mean ms 를 집계하여
+//       표로 출력.  Top-3 hot phase 를 식별하고 최적화 제안을 생성.
+//
+// NDJSON trace 포맷 (_profile_emit 출력):
+//   {"phase":"phase-4-start","t":1713726123456789012}
+//   {"phase":"phase-4-end",  "t":1713726124001111111}
+//   (t 는 ns epoch, integer).  start/end 쌍을 매칭하여 duration 계산.
+//
+// 환경 변수:
+//   NEXUS_BLOWUP_PROFILE — trace 출력 경로 (default: /tmp/nexus_blowup_profile.ndjson)
+//
+// 사용:
+//   hexa cli/scripts/blowup_profile.hexa instrument <in.hexa> <out.hexa>
+//   hexa cli/scripts/blowup_profile.hexa analyze    <trace.ndjson>
+//
+// 규칙: hexa `>=`/`<=` 금지 — `<`/`>` only.
+//       live exec 금지 (엔진을 실행하지 않음, 파일 rewrite + trace 분석만).
+// ═══════════════════════════════════════════════════════════
+
+// ─── util: shell-safe single-quote ───
+fn _shq(s: string) -> string {
+    let mut parts: [string] = []
+    parts.push("'")
+    let n = len(s)
+    let mut i: i64 = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "'" { parts.push("'\\''") } else { parts.push(c) }
+        i = i + 1
+    }
+    parts.push("'")
+    return parts.join("")
+}
+
+// ─── util: left-trim ASCII whitespace ───
+fn _ltrim(s: string) -> string {
+    let n = len(s)
+    let mut i: i64 = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c != " " && c != "\t" { return s.substring(i, n) }
+        i = i + 1
+    }
+    return ""
+}
+
+// ─── util: check if s starts with prefix ───
+fn _starts_with(s: string, pfx: string) -> bool {
+    let ns = len(s)
+    let np = len(pfx)
+    if ns < np { return false }
+    return s.substring(0, np) == pfx
+}
+
+// ─── util: parse a decimal integer token; return -1 on failure ───
+fn _parse_int_prefix(s: string) -> i64 {
+    let n = len(s)
+    let mut i: i64 = 0
+    let mut v: i64 = 0
+    let mut any = false
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "0" || c == "1" || c == "2" || c == "3" || c == "4"
+           || c == "5" || c == "6" || c == "7" || c == "8" || c == "9" {
+            v = v * 10 + (to_int(c))
+            any = true
+            i = i + 1
+        } else {
+            return if any { v } else { 0 - 1 }
+        }
+    }
+    return if any { v } else { 0 - 1 }
+}
+
+// ─── Phase marker detect on a single line.
+//   Accept two patterns (spec-compatible):
+//     (A) bare comment:   `// Phase N`                       (or `// Phase N:`)
+//     (B) println marker: `println("--- Phase N:` ... `---")`
+//   Returns phase number (1..6) or -1 if not a tracked boundary.
+//   sub-phase like "Phase 6.5" is IGNORED (only integer 1..6 tracked).
+// ─── ── ─────────
+fn _detect_phase(raw_line: string) -> i64 {
+    let line = _ltrim(raw_line)
+    // pattern A: "// Phase N"
+    if _starts_with(line, "// Phase ") {
+        let rest = line.substring(9, len(line))
+        let n = _parse_int_prefix(rest)
+        if n < 1 { return 0 - 1 }
+        if n > 6 { return 0 - 1 }
+        // reject "Phase N.M" (sub-phase) — next char after digits must be ":" or " " or end
+        let digits = to_string(n)
+        let after = rest.substring(len(digits), len(rest))
+        if len(after) > 0 {
+            let c0 = after.substring(0, 1)
+            if c0 == "." { return 0 - 1 }
+        }
+        return n
+    }
+    // pattern B: `println("--- Phase N:`
+    let marker = "println(\"--- Phase "
+    let p = line.index_of(marker)
+    if p > 0 - 1 {
+        let rest = line.substring(p + len(marker), len(line))
+        let n = _parse_int_prefix(rest)
+        if n < 1 { return 0 - 1 }
+        if n > 6 { return 0 - 1 }
+        let digits = to_string(n)
+        let after = rest.substring(len(digits), len(rest))
+        if len(after) > 0 {
+            let c0 = after.substring(0, 1)
+            if c0 == "." { return 0 - 1 }
+        }
+        return n
+    }
+    return 0 - 1
+}
+
+// ═══════════════════════════════════════════════════════════
+// INSTRUMENT
+//   For each line that matches a Phase N boundary:
+//     if previous tracked phase P exists: emit `_profile_emit("phase-P-end")` just before
+//     emit `_profile_emit("phase-N-start")` just after
+//   Prepends a `_profile_emit` fn stub + bootstrap snippet at file top
+//   (before first `let`/`fn`/active statement — we just prepend to the
+//   header so the stub is in scope for injected calls).
+// ═══════════════════════════════════════════════════════════
+fn _profile_stub() -> string {
+    let mut p: [string] = []
+    p.push("// ─── BLOWUP PROFILE HARNESS (auto-injected by blowup_profile.hexa) ───\n")
+    p.push("let _profile_path: string = {\n")
+    p.push("    let mut _pp = \"/tmp/nexus_blowup_profile.ndjson\"\n")
+    p.push("    try {\n")
+    p.push("        let _e = to_string(exec(\"printf %s \\\"${NEXUS_BLOWUP_PROFILE:-}\\\"\")).trim()\n")
+    p.push("        if _e != \"\" { _pp = _e }\n")
+    p.push("    } catch _e {}  // @allow-silent-catch\n")
+    p.push("    _pp\n")
+    p.push("}\n")
+    p.push("try { let _ = exec(\": > \" + _profile_path) } catch _e {}  // @allow-silent-catch\n")
+    p.push("fn _profile_now_ns() -> i64 {\n")
+    p.push("    let mut r: i64 = 0\n")
+    p.push("    try { r = to_int(to_string(exec(\"date +%s%N\")).trim()) } catch _e {}  // @allow-silent-catch\n")
+    p.push("    return r\n")
+    p.push("}\n")
+    p.push("fn _profile_emit(tag: string) {\n")
+    p.push("    let t = _profile_now_ns()\n")
+    p.push("    let line = \"{\\\"phase\\\":\\\"\" + tag + \"\\\",\\\"t\\\":\" + to_string(t) + \"}\"\n")
+    p.push("    try {\n")
+    p.push("        let q = line.replace(\"'\", \"'\\\\''\")\n")
+    p.push("        let _ = exec(\"printf '%s\\\\n' '\" + q + \"' >> \" + _profile_path)\n")
+    p.push("    } catch _e {}  // @allow-silent-catch\n")
+    p.push("}\n")
+    p.push("// ─── END PROFILE HARNESS ───\n\n")
+    return p.join("")
+}
+
+fn cmd_instrument(in_path: string, out_path: string) -> i64 {
+    if !file_exists(in_path) {
+        eprintln("blowup_profile: input not found: " + in_path)
+        return 1
+    }
+    let raw = read_file(in_path)
+    let lines = raw.split("\n")
+    let n = len(lines)
+
+    let mut out_parts: [string] = []
+    // 1. Prepend stub (do NOT disturb original's first `//` banner — we
+    //    place the stub after the opening comment banner so the first
+    //    executable-ish line still parses cleanly.  Easiest/safest:
+    //    prepend at the very top.  hexa accepts top-level let/fn in any
+    //    order w.r.t. other comments.)
+    out_parts.push(_profile_stub())
+
+    let mut cur_phase: i64 = 0 - 1  // no phase active yet
+    let mut injected_count: i64 = 0
+    let mut i: i64 = 0
+    while i < n {
+        let ln = lines[i]
+        let pn = _detect_phase(ln)
+        if pn > 0 {
+            // close the previous phase first
+            if cur_phase > 0 {
+                out_parts.push("_profile_emit(\"phase-" + to_string(cur_phase) + "-end\")\n")
+            }
+            // original boundary line
+            out_parts.push(ln)
+            if i + 1 < n { out_parts.push("\n") }
+            // open the new phase
+            out_parts.push("_profile_emit(\"phase-" + to_string(pn) + "-start\")\n")
+            cur_phase = pn
+            injected_count = injected_count + 1
+        } else {
+            out_parts.push(ln)
+            if i + 1 < n { out_parts.push("\n") }
+        }
+        i = i + 1
+    }
+    // close the final active phase at end-of-file
+    if cur_phase > 0 {
+        out_parts.push("\n_profile_emit(\"phase-" + to_string(cur_phase) + "-end\")\n")
+    }
+
+    write_file(out_path, out_parts.join(""))
+    let src_lines = n
+    let mut log: [string] = []
+    log.push("NEXUS_BLOWUP_PROFILE_INSTRUMENT {\"in\":\"")
+    log.push(in_path)
+    log.push("\",\"out\":\"")
+    log.push(out_path)
+    log.push("\",\"src_lines\":")
+    log.push(to_string(src_lines))
+    log.push(",\"phase_boundaries\":")
+    log.push(to_string(injected_count))
+    log.push("}")
+    eprintln(log.join(""))
+    println("instrumented → " + out_path)
+    println("phase boundaries detected: " + to_string(injected_count))
+    return 0
+}
+
+// ═══════════════════════════════════════════════════════════
+// ANALYZE
+// ═══════════════════════════════════════════════════════════
+// Extract a string value from a flat JSON object for a given key.
+// Returns "" on miss.
+fn _json_str(raw: string, key: string) -> string {
+    let m = "\"" + key + "\":\""
+    let i = raw.index_of(m)
+    if i < 0 { return "" }
+    let after = raw.substring(i + len(m), len(raw))
+    let e = after.index_of("\"")
+    if e < 0 { return "" }
+    return after.substring(0, e)
+}
+
+// Extract an integer value for a key; tolerates whitespace.
+fn _json_int(raw: string, key: string) -> i64 {
+    let m = "\"" + key + "\":"
+    let i = raw.index_of(m)
+    if i < 0 { return 0 }
+    let after = raw.substring(i + len(m), len(raw)).trim()
+    // strip until non-digit
+    let n = len(after)
+    let mut j: i64 = 0
+    let mut v: i64 = 0
+    let mut any = false
+    while j < n {
+        let c = after.substring(j, j + 1)
+        if c == "0" || c == "1" || c == "2" || c == "3" || c == "4"
+           || c == "5" || c == "6" || c == "7" || c == "8" || c == "9" {
+            v = v * 10 + to_int(c)
+            any = true
+            j = j + 1
+        } else { j = n }
+    }
+    return if any { v } else { 0 }
+}
+
+// Parse "phase-N-start" / "phase-N-end" → [N, kind]  (kind: 0=start,1=end)
+// Returns [phase_no, kind] or [-1, -1] on miss.
+fn _parse_tag(tag: string) -> [i64] {
+    let mut r: [i64] = []
+    if !_starts_with(tag, "phase-") {
+        r.push(0 - 1); r.push(0 - 1); return r
+    }
+    let rest = tag.substring(6, len(tag))
+    let n = _parse_int_prefix(rest)
+    if n < 1 {
+        r.push(0 - 1); r.push(0 - 1); return r
+    }
+    let digits = to_string(n)
+    let tail = rest.substring(len(digits), len(rest))
+    if tail == "-start" { r.push(n); r.push(0); return r }
+    if tail == "-end"   { r.push(n); r.push(1); return r }
+    r.push(0 - 1); r.push(0 - 1); return r
+}
+
+// Right-pad a string to `w` chars with spaces.
+fn _rpad(s: string, w: i64) -> string {
+    let n = len(s)
+    if n > w - 1 { return s }
+    let mut p = s
+    let mut i: i64 = n
+    while i < w { p = p + " "; i = i + 1 }
+    return p
+}
+
+// Left-pad decimal string to `w`.
+fn _lpad(s: string, w: i64) -> string {
+    let n = len(s)
+    if n > w - 1 { return s }
+    let mut p = s
+    let mut i: i64 = n
+    while i < w { p = " " + p; i = i + 1 }
+    return p
+}
+
+// Format ms with 2 decimal places from nanoseconds.
+fn _ns_to_ms_str(ns: i64) -> string {
+    if ns < 0 {
+        return "-" + _ns_to_ms_str(0 - ns)
+    }
+    let ms_int: i64 = ns / 1000000
+    let frac: i64 = (ns % 1000000) / 10000  // 2 decimal digits = hundredths of ms
+    let mut fs = to_string(frac)
+    if len(fs) < 2 { fs = "0" + fs }
+    return to_string(ms_int) + "." + fs
+}
+
+// Format percent with 1 decimal place:  pct = 1000 * num / den  (tenths).
+fn _pct_str(num_ns: i64, den_ns: i64) -> string {
+    if den_ns < 1 { return "0.0" }
+    let tenths: i64 = (num_ns * 1000) / den_ns
+    let whole: i64 = tenths / 10
+    let one: i64 = tenths - whole * 10
+    return to_string(whole) + "." + to_string(one)
+}
+
+fn cmd_analyze(trace_path: string) -> i64 {
+    if !file_exists(trace_path) {
+        eprintln("blowup_profile: trace not found: " + trace_path)
+        return 1
+    }
+    let raw = read_file(trace_path)
+    let lines = raw.split("\n")
+    let n = len(lines)
+
+    // Per-phase (index 1..6) accumulators.
+    let mut total_ns: [i64] = [0, 0, 0, 0, 0, 0, 0]   // index 0 unused
+    let mut call_cnt: [i64] = [0, 0, 0, 0, 0, 0, 0]
+    // Most-recent start per phase (ns), 0 = no open start.
+    let mut open_t:   [i64] = [0, 0, 0, 0, 0, 0, 0]
+
+    let mut parsed: i64 = 0
+    let mut orphan_end: i64 = 0
+    let mut wall_min: i64 = 0
+    let mut wall_max: i64 = 0
+    let mut any_seen = false
+
+    let mut i: i64 = 0
+    while i < n {
+        let ln = lines[i].trim()
+        i = i + 1
+        if ln == "" { continue }
+        if !_starts_with(ln, "{") { continue }
+        let tag = _json_str(ln, "phase")
+        let t = _json_int(ln, "t")
+        let pk = _parse_tag(tag)
+        if pk[0] < 1 { continue }
+        let ph = pk[0]
+        let kind = pk[1]
+        parsed = parsed + 1
+        if !any_seen { wall_min = t; wall_max = t; any_seen = true }
+        if t < wall_min { wall_min = t }
+        if t > wall_max { wall_max = t }
+        if kind == 0 {
+            open_t[ph] = t
+        } else {
+            let s = open_t[ph]
+            if s < 1 {
+                orphan_end = orphan_end + 1
+            } else {
+                let d = t - s
+                if d > 0 {
+                    total_ns[ph] = total_ns[ph] + d
+                    call_cnt[ph] = call_cnt[ph] + 1
+                }
+                open_t[ph] = 0
+            }
+        }
+    }
+
+    let wall_ns = if any_seen { wall_max - wall_min } else { 0 }
+    let mut grand_ns: i64 = 0
+    let mut p: i64 = 1
+    while p < 7 { grand_ns = grand_ns + total_ns[p]; p = p + 1 }
+
+    // ── Report header
+    println("═══════════════════════════════════════════════════════")
+    println("  BLOWUP PROFILE REPORT")
+    println("  trace: " + trace_path)
+    println("═══════════════════════════════════════════════════════")
+    println("  events parsed        : " + to_string(parsed))
+    println("  orphan end markers   : " + to_string(orphan_end))
+    println("  wall span            : " + _ns_to_ms_str(wall_ns) + " ms")
+    println("  sum of phase time    : " + _ns_to_ms_str(grand_ns) + " ms")
+    println("")
+
+    // ── Per-phase table
+    println(_rpad("phase", 10) + _lpad("total_ms", 12) + _lpad("% wall", 9)
+            + _lpad("calls", 8) + _lpad("mean_ms", 12))
+    println("-------------------------------------------------------")
+    let denom_ns = if wall_ns > 0 { wall_ns } else { grand_ns }
+    let mut ph: i64 = 1
+    while ph < 7 {
+        let tot = total_ns[ph]
+        let cnt = call_cnt[ph]
+        let mean_ns = if cnt > 0 { tot / cnt } else { 0 }
+        let name = "phase-" + to_string(ph)
+        println(_rpad(name, 10)
+                + _lpad(_ns_to_ms_str(tot), 12)
+                + _lpad(_pct_str(tot, denom_ns), 9)
+                + _lpad(to_string(cnt), 8)
+                + _lpad(_ns_to_ms_str(mean_ns), 12))
+        ph = ph + 1
+    }
+    println("")
+
+    // ── Top-3 hot phases (simple 3-pass max, no sort needed)
+    let mut picked: [bool] = [false, false, false, false, false, false, false]
+    println("top-3 hot phases (by total_ms):")
+    let mut rank: i64 = 1
+    while rank < 4 {
+        let mut best_ph: i64 = 0 - 1
+        let mut best_ns: i64 = 0 - 1
+        let mut q: i64 = 1
+        while q < 7 {
+            if !picked[q] {
+                if total_ns[q] > best_ns {
+                    best_ns = total_ns[q]
+                    best_ph = q
+                }
+            }
+            q = q + 1
+        }
+        if best_ph < 0 { rank = 4 } else {
+            picked[best_ph] = true
+            println("  " + to_string(rank) + ". phase-" + to_string(best_ph)
+                    + "  " + _ns_to_ms_str(best_ns) + " ms"
+                    + "  (" + _pct_str(best_ns, denom_ns) + "% wall)")
+            rank = rank + 1
+        }
+    }
+    println("")
+
+    // ── Suggestions
+    //   Find the true #1 hot phase (largest total_ns).
+    let mut hot_ph: i64 = 0 - 1
+    let mut hot_ns: i64 = 0 - 1
+    let mut r: i64 = 1
+    while r < 7 {
+        if total_ns[r] > hot_ns { hot_ns = total_ns[r]; hot_ph = r }
+        r = r + 1
+    }
+    println("suggestions:")
+    if hot_ph < 1 {
+        println("  (no phase data — instrument + run the drill first)")
+    } else {
+        let hot_pct = _pct_str(hot_ns, if wall_ns > 0 { wall_ns } else { grand_ns })
+        let hint = _phase_hint(hot_ph)
+        println("  Phase " + to_string(hot_ph) + " dominates (" + hot_pct
+                + "% wall, " + _ns_to_ms_str(hot_ns) + " ms) — target " + hint)
+        if orphan_end > 0 {
+            println("  WARNING: " + to_string(orphan_end)
+                    + " end markers had no matching start — trace may be truncated or instrumentation skipped.")
+        }
+    }
+    println("")
+
+    // ── Machine-readable one-liner for downstream tooling.
+    let mut jl: [string] = []
+    jl.push("NEXUS_BLOWUP_PROFILE_ANALYZE {\"wall_ms\":")
+    jl.push(_ns_to_ms_str(wall_ns))
+    jl.push(",\"hot_phase\":")
+    jl.push(if hot_ph < 1 { "0" } else { to_string(hot_ph) })
+    jl.push(",\"hot_ms\":")
+    jl.push(_ns_to_ms_str(hot_ns))
+    jl.push(",\"parsed\":")
+    jl.push(to_string(parsed))
+    jl.push(",\"orphan_end\":")
+    jl.push(to_string(orphan_end))
+    jl.push("}")
+    eprintln(jl.join(""))
+    return 0
+}
+
+// Domain knowledge: map phase number → optimization axis hint.
+fn _phase_hint(ph: i64) -> string {
+    if ph == 1 { return "Z1 graph_load / atlas.n6 stats (cache atlas in-mem, stream stats)" }
+    if ph == 2 { return "Z2 OUROBOROS evolve (verify_score memo, seed bias short-circuit)" }
+    if ph == 3 { return "Z3 Singularity detection (closure cache, compression reuse)" }
+    if ph == 4 { return "Z1/Z2/Z3 corollary gen (memoize match_name, batch sector classify)" }
+    if ph == 5 { return "Z4 telescope lens scan (consensus short-circuit, lens fusion)" }
+    if ph == 6 { return "Z5 graph update (batch n6 writes, defer stats recount)" }
+    return "(custom) profile the inner loops of the dominant phase"
+}
+
+// ═══════════════════════════════════════════════════════════
+// CLI dispatch
+// ═══════════════════════════════════════════════════════════
+let a = args()
+let mut sub = "help"
+if len(a) > 2 { sub = a[2] }
+
+if sub == "instrument" {
+    if len(a) < 5 {
+        println("usage: blowup_profile.hexa instrument <in.hexa> <out.hexa>")
+        exit(1)  // @allow-silent-exit
+    }
+    let rc = cmd_instrument(a[3], a[4])
+    exit(rc)  // @allow-silent-exit
+} else if sub == "analyze" {
+    if len(a) < 4 {
+        println("usage: blowup_profile.hexa analyze <trace.ndjson>")
+        exit(1)  // @allow-silent-exit
+    }
+    let rc = cmd_analyze(a[3])
+    exit(rc)  // @allow-silent-exit
+} else {
+    println("blowup_profile.hexa — drill engine native profile + hot-path analysis")
+    println("usage:")
+    println("  hexa cli/scripts/blowup_profile.hexa instrument <in.hexa> <out.hexa>")
+    println("  hexa cli/scripts/blowup_profile.hexa analyze    <trace.ndjson>")
+    println("")
+    println("env:")
+    println("  NEXUS_BLOWUP_PROFILE  trace output path (default /tmp/nexus_blowup_profile.ndjson)")
+    exit(0)
+}
