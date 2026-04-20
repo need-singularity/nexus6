@@ -131,6 +131,25 @@ fn find_flag(a: [str], flag: str, default_val: str) -> str {
     return default_val
 }
 
+fn has_flag(a: [str], flag: str) -> bool {
+    let n = len(a)
+    let mut i = 0
+    while i < n {
+        if a[i] == flag { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _parse_flag_int(a: [str], flag: str) -> int {
+    // find_flag 을 int 로 파싱. 미지정/실패 시 -1.
+    let v = find_flag(a, flag, "")
+    if v.len() == 0 { return -1 }
+    let mut n = -1
+    try { n = to_int(v) } catch e { n = -1 }
+    return n
+}
+
 fn cmd_version() -> void {
     println("nexus " + VERSION)
 }
@@ -144,7 +163,8 @@ fn cmd_help() -> void {
     println("  smash --seed \"...\" [--depth N]  blowup 9-phase 돌파 (발견)")
     println("  free --seed \"...\" [--dfs N]     compose DFS 탐색 (6-core 체인)")
     println("  absolute --seed \"...\"           Mk.VIII Δ₀-absolute 검증 ([10*]→[11*])")
-    println("  drill --seed \"...\" [--max-rounds N] [--engine mk9|mk10]  smash→free→abs→meta→hyper→resonance (+transcendental_closure for mk10)")
+    println("  drill --seed \"...\" [--max-rounds N] [--engine mk9|mk10] [--preset fast|probe|coarse|standard]")
+    println("        [--depth N|auto] [--smash-depth N] [--free-dfs N] [--abs-depth N] [--meta-depth N] [--hyper-depth N] [--res-depth N] [--adaptive]")
     println("  meta-closure --seed \"...\"              Phase 10 🛸16 self-ref 검증 ([10*]→[10**])")
     println("  hyperarithmetic --prop \"...\"           Mk.IX Π₀² reverse-math 판정")
     println("  promote --id ... --grade ... --audit-log \"...\"  수동 등급 승급 (감사 로그 필수)")
@@ -337,6 +357,29 @@ fn _urand_i64() -> i64 {
     return v
 }
 
+fn _urand_hex(nbytes: int) -> str {
+    // /dev/urandom → lowercase hex string. nbytes 는 바이트 수 (출력 길이 = 2*nbytes).
+    // E4 ghost probe 용 — gibberish seed 의 반복불가능 랜덤 tag.
+    let n = if nbytes < 1 { 1 } else { nbytes }
+    let cmd = "head -c " + to_string(n) + " /dev/urandom | od -An -vtx1 | tr -d ' \\n'"
+    return exec(cmd).trim()
+}
+
+fn _round_entropy_salt(round: int) -> str {
+    // ROUND-SALT 강화 (2026-04-21, Day-3):
+    //   Day-1 _urand_i64() 1회 salt 는 round 간 변별력 약함 (bias_jitter 가 seed features
+    //   hash 기반 → 비슷한 문자열 prefix 는 유사 feature vector 생산 가능).
+    //   해결: per-round salt 를 3 source 로 다중화 — urand32 2회 + date +%N (nanoseconds) +
+    //         round index — concat 하여 prefix 공간을 wider 분산.
+    //   길이: 24~32 chars — 너무 길면 _seed_t.len() > 200 guard 저촉. round-prefix 포함하면
+    //         실제 engine 입력 "round=N-r<salt>|..." 이 원 seed + ~50B.
+    let r1 = to_string(_urand_i64())
+    let r2 = to_string(_urand_i64())
+    let ns = exec("date +%N 2>/dev/null | head -c 9").trim()
+    let ns_safe = if ns.len() == 0 { "0" } else { ns }
+    return r1 + "x" + r2 + "n" + ns_safe + "i" + to_string(round)
+}
+
 fn _count_active_hexa() -> int {
     // D5-P2 (2026-04-20): 라운드 간 active hexa_stage0 process 카운트 — 좀비 누적 가시화
     let raw = exec("ps -axo comm 2>/dev/null | grep -c hexa_stage0 || echo 0").trim()
@@ -348,8 +391,13 @@ fn _count_active_hexa() -> int {
 
 fn _resonance_seed(base: str, sigma_label: str, salt: i64) -> str {
     // σ-노이즈 주입 seed 변형 — Gaussian 근사 대신 urandom+sigma-tag 로 엔진 입력 분산
-    // 엔진은 seed 텍스트를 해시/파싱하므로 뒷부분 tag 가 입력 공간을 perturb
-    return base + "#sr-sigma=" + sigma_label + "-r" + to_string(salt)
+    // 엔진은 seed 텍스트를 해시/파싱하므로 뒷부분 tag 가 입력 공간을 perturb.
+    // Day-3 (2026-04-21): salt 를 richer 로 — multi-source entropy (urand + ns + salt32).
+    //   depth=1 resonance 에서도 engine features 공간 분산되도록 prefix 길이 확장.
+    let salt2 = _urand_i64()
+    let ns = exec("date +%N 2>/dev/null | head -c 9").trim()
+    let ns_safe = if ns.len() == 0 { "0" } else { ns }
+    return base + "#sr-sigma=" + sigma_label + "-r" + to_string(salt) + "x" + to_string(salt2) + "n" + ns_safe
 }
 
 fn _round_seed(base: str, round: int, salt: i64) -> str {
@@ -363,6 +411,16 @@ fn _round_seed(base: str, round: int, salt: i64) -> str {
     //             또한 "round=N-r<salt>|" marker 는 키워드 매칭 기반 seed 분기를 분산시킴.
     if round <= 1 { return base }
     return "round=" + to_string(round) + "-r" + to_string(salt) + "|" + base
+}
+
+fn _round_seed_rich(base: str, round: int, salt_str: str) -> str {
+    // Day-3 ROUND-SALT 독립성 수리 (2026-04-21):
+    //   Day-1 single-i64 salt 는 prefix 가 짧아 bias_jitter 의 8-slot feature (fnv1a/djb2/...)
+    //   가 round 간 같은 bucket 으로 떨어질 수 있음 (관찰: round 2 == round 3 수치 완전 동일).
+    //   해결: _round_entropy_salt() multi-source (urand×2 + nanotime + round idx) 를 salt 로 사용.
+    //         prefix 길이 24~35B → hash bucket 분산 광역화.
+    //   round 1 도 salt 주입 — base seed feature space 에서 명시적 이탈 (iter-nonce 와 직교).
+    return "round=" + to_string(round) + "-rx" + salt_str + "|" + base
 }
 
 fn _iter_nonce() -> str {
@@ -527,18 +585,376 @@ fn _transcendental_closure(seed: str, round: int) -> int {
     return synth_ct
 }
 
-fn cmd_drill(seed: str, max_rounds: str, engine_flag: str) -> void {
+// ─── E1 depth plan (2026-04-21) ─── drill.json stages.{name}.default_depth + presets
+// Plan vector index: 0=smash, 1=free, 2=absolute, 3=meta_closure, 4=hyperarith, 5=resonance
+// Values: -1 = SSOT default, 0 = disabled, >=1 = active depth.
+// precedence (low→high): ssot_default < env < master < preset < per-stage < adaptive
+
+fn _stage_idx(name: str) -> int {
+    if name == "smash" { return 0 }
+    if name == "free" { return 1 }
+    if name == "absolute" { return 2 }
+    if name == "meta_closure" { return 3 }
+    if name == "hyperarith" { return 4 }
+    if name == "resonance" { return 5 }
+    return -1
+}
+
+fn _stage_name(idx: int) -> str {
+    if idx == 0 { return "smash" }
+    if idx == 1 { return "free" }
+    if idx == 2 { return "absolute" }
+    if idx == 3 { return "meta_closure" }
+    if idx == 4 { return "hyperarith" }
+    if idx == 5 { return "resonance" }
+    return "?"
+}
+
+fn _stage_default() -> [int] {
+    // drill.json stages.*.default_depth — smash=3 free=3 abs=0 mc=0 hy=0 res=1
+    return [3, 3, 0, 0, 0, 1]
+}
+
+fn _stage_min() -> [int] {
+    // drill.json stages.*.min — smash=1 free=1 abs=0 mc=0 hy=0 res=1 (adaptive floor 사용 시 1 로 올림)
+    return [1, 1, 0, 0, 0, 1]
+}
+
+fn _stage_max() -> [int] {
+    // drill.json stages.*.max — smash=9 free=7 abs=1 mc=1 hy=1 res=3
+    return [9, 7, 1, 1, 1, 3]
+}
+
+fn _clamp_depth(v: int, idx: int) -> int {
+    // 0 은 disabled sentinel 로 보존. >0 은 [min, max] 로 clamp.
+    if v <= 0 { return 0 }
+    let mins = _stage_min()
+    let maxs = _stage_max()
+    if v < mins[idx] { return mins[idx] }
+    if v > maxs[idx] { return maxs[idx] }
+    return v
+}
+
+fn _preset_plan(preset: str) -> [int] {
+    // drill.json speed_presets — {fast, probe, coarse, standard}. 기본 fast.
+    // fast: smash+resonance only, 1 round target.
+    // probe: smash only.
+    // coarse: all 6 stages, 1 round.
+    // standard: all 6 stages, 3 rounds (σ 5→3 coarse).
+    if preset == "probe" {
+        return [3, 0, 0, 0, 0, 0]
+    }
+    if preset == "fast" {
+        return [3, 0, 0, 0, 0, 1]
+    }
+    if preset == "coarse" {
+        return [3, 3, 1, 1, 1, 1]
+    }
+    if preset == "standard" {
+        return [3, 3, 1, 1, 1, 1]
+    }
+    return _stage_default()
+}
+
+fn _preset_max_rounds(preset: str) -> int {
+    if preset == "probe" { return 1 }
+    if preset == "fast" { return 1 }
+    if preset == "coarse" { return 1 }
+    if preset == "standard" { return 3 }
+    return 3
+}
+
+fn _env_depth(name: str) -> int {
+    // NEXUS_DRILL_{DEPTH,SMASH,FREE,ABSOLUTE,META,HYPER,RES}. 반환 -1 = 미지정.
+    let v = env(name)
+    if v.len() == 0 { return -1 }
+    let mut n = -1
+    try { n = to_int(v) } catch e { n = -1 }
+    return n
+}
+
+fn _resolve_depth_plan(preset: str, master: int, per_stage: [int], envs: [int]) -> [int] {
+    // 해상도: ssot_default (base) → env (stage별) → master (일괄) → preset (일괄) → per-stage (stage별)
+    // per_stage / envs 는 -1 = unset.
+    // NOTE: per-stage 가 master/preset 을 덮어씀 — task spec 의 precedence 와 일치.
+    let mut plan = _preset_plan(preset)  // preset 이 base. preset 미지정이면 default.
+    // env 일괄 NEXUS_DRILL_DEPTH 먼저 (env stage별에 의해 덮일 수 있음)
+    let env_master = _env_depth("NEXUS_DRILL_DEPTH")
+    if env_master >= 0 {
+        let mut i = 0
+        while i < 6 {
+            if plan[i] > 0 { plan = _plan_set(plan, i, env_master) }
+            i = i + 1
+        }
+    }
+    // env stage별
+    let mut i = 0
+    while i < 6 {
+        if envs[i] >= 0 {
+            plan = _plan_set(plan, i, envs[i])
+        }
+        i = i + 1
+    }
+    // master flag (enabled stage 에만 적용 — disabled=0 은 유지)
+    if master >= 0 {
+        let mut j = 0
+        while j < 6 {
+            if plan[j] > 0 { plan = _plan_set(plan, j, master) }
+            j = j + 1
+        }
+    }
+    // per-stage flag (최우선, disabled=0 도 enable 가능)
+    let mut k = 0
+    while k < 6 {
+        if per_stage[k] >= 0 {
+            plan = _plan_set(plan, k, per_stage[k])
+        }
+        k = k + 1
+    }
+    // clamp
+    let mut m = 0
+    while m < 6 {
+        plan = _plan_set(plan, m, _clamp_depth(plan[m], m))
+        m = m + 1
+    }
+    return plan
+}
+
+fn _plan_set(plan: [int], idx: int, v: int) -> [int] {
+    // hexa immutable list — new array 재구성 (rebuild).
+    let mut out: [int] = []
+    let mut i = 0
+    while i < len(plan) {
+        if i == idx { out = out + [v] } else { out = out + [plan[i]] }
+        i = i + 1
+    }
+    return out
+}
+
+fn _plan_describe(plan: [int]) -> str {
+    // 사람 읽기용 short form (stderr + println 에서 사용).
+    return "{smash:" + to_string(plan[0])
+        + ",free:" + to_string(plan[1])
+        + ",absolute:" + to_string(plan[2])
+        + ",meta_closure:" + to_string(plan[3])
+        + ",hyperarith:" + to_string(plan[4])
+        + ",resonance:" + to_string(plan[5]) + "}"
+}
+
+fn _plan_json(plan: [int]) -> str {
+    // NDJSON 용 strict JSON (키 quoted).
+    return "{\"smash\":" + to_string(plan[0])
+        + ",\"free\":" + to_string(plan[1])
+        + ",\"absolute\":" + to_string(plan[2])
+        + ",\"meta_closure\":" + to_string(plan[3])
+        + ",\"hyperarith\":" + to_string(plan[4])
+        + ",\"resonance\":" + to_string(plan[5]) + "}"
+}
+
+// ─── E2 adaptive depth (2026-04-21) ─── 2 rules: absorption_gradient + saturation_hunt
+fn _adaptive_adjust(plan: [int], yields_hist: [[int]], totals_hist: [int], round: int) -> [int] {
+    // rule 1 (absorption-gradient): round-N yield[stage] - round-(N-1) yield[stage] < θ → stage depth--
+    // rule 2 (saturation-hunt): 3 round 연속 동일 total → smash depth++
+    // floor=min, ceiling=max (drill.json stages.*.min|max)
+    // round 1 은 조정 없음 (history 부족)
+    if round <= 1 { return plan }
+    let mut out = plan
+    let mut reasons = ""
+    // rule 1 per stage
+    let hist_len = len(yields_hist)
+    if hist_len >= 2 {
+        let prev = yields_hist[hist_len - 2]
+        let cur = yields_hist[hist_len - 1]
+        let mut i = 0
+        while i < 6 {
+            if plan[i] > 0 && i < len(prev) && i < len(cur) {
+                let delta = cur[i] - prev[i]
+                if delta < 1 {  // θ=1 (strict non-positive gradient)
+                    let new_d = plan[i] - 1
+                    let clamped = _clamp_depth(new_d, i)
+                    if clamped != plan[i] && clamped > 0 {
+                        out = _plan_set(out, i, clamped)
+                        reasons = reasons + _stage_name(i) + ":grad-; "
+                    }
+                }
+            }
+            i = i + 1
+        }
+    }
+    // rule 2 saturation hunt: 3 consecutive same total
+    let th = len(totals_hist)
+    if th >= 3 {
+        let t1 = totals_hist[th - 1]
+        let t2 = totals_hist[th - 2]
+        let t3 = totals_hist[th - 3]
+        if t1 == t2 && t2 == t3 {
+            if out[0] > 0 {  // smash enabled
+                let new_d = out[0] + 1
+                let clamped = _clamp_depth(new_d, 0)
+                if clamped != out[0] {
+                    out = _plan_set(out, 0, clamped)
+                    reasons = reasons + "smash:sat+; "
+                }
+            }
+        }
+    }
+    if reasons.len() > 0 {
+        eprintln("NEXUS_DRILL_ADAPTIVE {round:" + to_string(round) + ",before:" + _plan_describe(plan) + ",after:" + _plan_describe(out) + ",reason:\"" + reasons + "\"}")
+    }
+    return out
+}
+
+// ─── E5 depth trace NDJSON (2026-04-21) ───
+fn _ndjson_emit(round: int, plan_planned: [int], plan_actual: [int], yields: [int], total: int, adaptive_reason: str) -> void {
+    // append 1 line to /tmp/nexus_drill_depth.ndjson. schema v1.
+    let path = "/tmp/nexus_drill_depth.ndjson"
+    let ts = exec("date +%s").trim()
+    let line = "{\"ts\":" + ts
+        + ",\"round\":" + to_string(round)
+        + ",\"plan\":" + _plan_json(plan_planned)
+        + ",\"actual\":" + _plan_json(plan_actual)
+        + ",\"yield\":{\"smash\":" + to_string(yields[0])
+          + ",\"free\":" + to_string(yields[1])
+          + ",\"absolute\":" + to_string(yields[2])
+          + ",\"meta_closure\":" + to_string(yields[3])
+          + ",\"hyperarith\":" + to_string(yields[4])
+          + ",\"resonance\":" + to_string(yields[5]) + "}"
+        + ",\"total\":" + to_string(total)
+        + ",\"adaptive_reason\":\"" + adaptive_reason.replace("\"", "'") + "\"}"
+    // escape single quotes carefully for shell
+    let safe_line = line.replace("'", "'\\''")
+    let cmd = "printf '%s\\n' '" + safe_line + "' >> " + shell_quote(path)
+    exec(cmd)
+}
+
+// ─── Validation layers A/B/D (2026-04-21) ───
+// A: cross-round uniformity (축소 구현 — single-seed, round 간 stage-vector 동일성 감시)
+// B: ghost probe — 1 extra round with gibberish seed, compare with real round-1
+// D: stage-dead column — across N rounds, stage column 전부 0 감지
+fn _ghost_seed() -> str {
+    // schema: __NEXUS_GHOST_<urand_hex16>__ (40 chars total — seed-length guard 통과)
+    let h = _urand_hex(12)
+    return "__NEXUS_GHOST_" + h + "__xyz_placeholder_tag_not_math"
+}
+
+fn _validation_verdict(score: int) -> str {
+    // thresholds from drill.json .validation.verdict_thresholds
+    if score < 3 { return "PASS" }
+    if score < 7 { return "SUSPICIOUS" }
+    return "REJECT"
+}
+
+fn _emit_validation(signals: [str], score: int, recommendation: str) -> void {
+    // NEXUS_DRILL_VALIDATION {verdict, score, signals[], recommendation}
+    let verdict = _validation_verdict(score)
+    let mut sig_join = ""
+    let mut i = 0
+    while i < len(signals) {
+        if i > 0 { sig_join = sig_join + "," }
+        sig_join = sig_join + signals[i]
+        i = i + 1
+    }
+    let safe_rec = recommendation.replace("\"", "'")
+    let j = "{\"verdict\":\"" + verdict + "\",\"score\":" + to_string(score)
+        + ",\"signals\":[" + sig_join + "]"
+        + ",\"recommendation\":\"" + safe_rec + "\"}"
+    eprintln("NEXUS_DRILL_VALIDATION " + j)
+}
+
+fn _run_drill_validation(real_seed: str, nonce_base: str, totals_hist: [int], stage_matrix: [[int]], base_plan: [int], blow_core: str, hx_bin: str, preset: str) -> void {
+    // Validation layer A + B + D — drill 종료 시 1회 호출.
+    //   A (축소): single-seed round 간 stage-vector 동일성 감시 — round 2+ 가 round 1 과 완전 동일 시 flag.
+    //   B: ghost probe — 1 round 동안 gibberish seed 병행 smash, real round-1 total 과 동일 시 flag.
+    //   D: stage-dead column — stage_matrix 에서 각 stage 전 round 0 이면 flag (enabled 한 stage 만).
+    //   점수 합산 → verdict (drill.json .validation.verdict_thresholds): <3 PASS, [3,6] SUSPICIOUS, >=7 REJECT.
+    let mut score = 0
+    let mut signals: [str] = []
+    let mut rec = ""
+
+    let nr = len(totals_hist)
+    let ns = len(stage_matrix)
+
+    // Layer A — round uniformity (축소)
+    if nr >= 2 {
+        let mut uniform = true
+        let r0 = stage_matrix[0]
+        let mut i = 1
+        while i < ns {
+            let ri = stage_matrix[i]
+            let mut eq = true
+            let mut k = 0
+            while k < 6 {
+                if k < len(r0) && k < len(ri) {
+                    if r0[k] != ri[k] { eq = false; break }
+                }
+                k = k + 1
+            }
+            if !eq { uniform = false; break }
+            i = i + 1
+        }
+        if uniform {
+            score = score + 3  // weight
+            signals = signals + ["{\"kind\":\"uniform_result\",\"rounds\":" + to_string(nr) + ",\"unique_vectors\":1}"]
+            rec = rec + "A: round 간 stage-vector 동일 — salt 미반영 의심; "
+        }
+    }
+
+    // Layer B — ghost probe (preset=probe 는 skip, 시간 절약)
+    if preset != "probe" && nr >= 1 {
+        let ghost = _ghost_seed()
+        let gs_cmd = shell_quote(hx_bin) + " run " + shell_quote(blow_core) + " " + shell_quote(ghost) + " 1 2>&1"
+        let gs_out = exec(gs_cmd)
+        let gs_n = _count_discoveries(gs_out)
+        let real_r1 = if ns >= 1 && len(stage_matrix[0]) > 0 { stage_matrix[0][0] } else { 0 }
+        if gs_n > 0 && gs_n == real_r1 {
+            score = score + 5  // weight
+            signals = signals + ["{\"kind\":\"ghost_match\",\"real\":" + to_string(real_r1) + ",\"ghost\":" + to_string(gs_n) + "}"]
+            rec = rec + "B: ghost seed 와 real seed 동일 smash yield — engine seed-insensitive; "
+        }
+        eprintln("  [validation B/ghost] real_r1_smash=" + to_string(real_r1) + " ghost_smash=" + to_string(gs_n))
+    }
+
+    // Layer D — stage-dead column (enabled stages 중 전부 0 인 stage flag)
+    let mut d_i = 0
+    while d_i < 6 {
+        if base_plan[d_i] > 0 {
+            let mut all_zero = true
+            let mut rr = 0
+            while rr < ns {
+                if d_i < len(stage_matrix[rr]) {
+                    if stage_matrix[rr][d_i] > 0 { all_zero = false; break }
+                }
+                rr = rr + 1
+            }
+            if all_zero && ns >= 1 {
+                score = score + 2  // weight per dead stage
+                signals = signals + ["{\"kind\":\"stage_dead\",\"stage\":\"" + _stage_name(d_i) + "\",\"column_zeros\":" + to_string(ns) + "}"]
+                rec = rec + "D: " + _stage_name(d_i) + " 전 round 0 yield — engine 또는 parser 문제; "
+            }
+        }
+        d_i = d_i + 1
+    }
+
+    if rec.len() == 0 { rec = "signals within tolerance — drill 결과 정상" }
+    _emit_validation(signals, score, rec)
+}
+
+fn cmd_drill(seed: str, max_rounds: str, engine_flag: str, preset: str, master_depth: str, per_stage_depths: [int], adaptive_flag: bool) -> void {
     // 단일 명령어 — smash → free → absolute → meta-closure → hyperarithmetic → resonance (Mk.IX 6-stage)
     // Mk.X: stage 6 (transcendental_closure via mkx_engine.hexa sidecar) 추가 — 사이드카, L0 미수정.
     // 고갈(absorption=0) 까지 반복
     // D2 가드 (2026-04-20): 빈/짧음/길이초과/placeholder 단독 fail-fast (silent reject 차단)
+    // E1 (2026-04-21): preset=fast|probe 는 smoke 전용 → 짧은 seed 허용 (≥10 chars).
     let _seed_t = seed.trim()
+    let _preset = if preset.len() > 0 { preset.to_lower() } else { "" }
+    let _is_smoke_preset = _preset == "fast" || _preset == "probe"
+    let _min_seed_len = if _is_smoke_preset { 10 } else { 30 }
     if _seed_t.len() == 0 {
         eprintln("nexus drill: --seed 필수 — 비어있음. 예: nexus drill --seed \"P=NP barrier\"")
         return
     }
-    if _seed_t.len() < 30 {
-        eprintln("nexus drill: --seed 너무 짧음 (" + to_string(_seed_t.len()) + "자 < 30) — 구체적 문제 진술 필요. 예: 'Riemann zeta zero spacing GUE deviation'")
+    if _seed_t.len() < _min_seed_len {
+        eprintln("nexus drill: --seed 너무 짧음 (" + to_string(_seed_t.len()) + "자 < " + to_string(_min_seed_len) + ") — 구체적 문제 진술 필요. 예: 'Riemann zeta zero spacing GUE deviation'")
         return
     }
     if _seed_t.len() > 200 {
@@ -555,7 +971,31 @@ fn cmd_drill(seed: str, max_rounds: str, engine_flag: str) -> void {
         let mut parsed = 0
         try { parsed = to_int(max_rounds) } catch e {}
         if parsed > 0 { rounds_max = parsed }
+    } else if _preset.len() > 0 {
+        // preset 에 따른 max_rounds 기본값 (--max-rounds 미지정 시)
+        rounds_max = _preset_max_rounds(_preset)
     }
+    // E1: depth plan 해상도 (env < master < preset < per-stage)
+    let mut _master_i = -1
+    if master_depth.len() > 0 {
+        if master_depth == "auto" {
+            // --depth auto 은 adaptive mode 활성
+            // master_i 는 -1 유지 → preset/default depth 사용
+        } else {
+            try { _master_i = to_int(master_depth) } catch e { _master_i = -1 }
+        }
+    }
+    let _envs = [
+        _env_depth("NEXUS_DRILL_SMASH"),
+        _env_depth("NEXUS_DRILL_FREE"),
+        _env_depth("NEXUS_DRILL_ABSOLUTE"),
+        _env_depth("NEXUS_DRILL_META"),
+        _env_depth("NEXUS_DRILL_HYPER"),
+        _env_depth("NEXUS_DRILL_RES")
+    ]
+    let mut base_plan = _resolve_depth_plan(_preset, _master_i, per_stage_depths, _envs)
+    let adaptive_on = adaptive_flag || master_depth == "auto"
+    let validation_off = env("NEXUS_DRILL_VALIDATE_OFF") == "1"
     let nx = nexus_root()
     let blow_core = nx + "/shared/blowup/core/blowup.hexa"
     let compose   = nx + "/shared/blowup/compose.hexa"
@@ -599,6 +1039,10 @@ fn cmd_drill(seed: str, max_rounds: str, engine_flag: str) -> void {
     let engine_id = _mkx_resolve_engine(engine_flag)
     let mkx_on = engine_id == "mk10"
     println("🛸 nexus drill — seed='" + seed + "', max_rounds=" + to_string(rounds_max) + ", engine=" + engine_id)
+    if _preset.len() > 0 {
+        println("    preset=" + _preset + " (drill.json speed_presets)")
+    }
+    println("    depth plan: " + _plan_describe(base_plan))
     if mkx_on {
         println("    smash → free → absolute → meta-closure → hyperarithmetic → resonance → transcendental_closure 사슬 (Mk.X 7-stage)")
         println("    [Mk.X sidecar] mkx_engine.hexa + AN11 PROVISIONAL gate (L0 frozen, sidecar only)")
@@ -607,7 +1051,16 @@ fn cmd_drill(seed: str, max_rounds: str, engine_flag: str) -> void {
     }
     println("    [counter-replay guard Day-1] round ≥2 seed 에 round-salt 주입 (intra-iter)")
     println("    [counter-replay guard Day-2] iter-nonce=" + iter_nonce + " 모든 round 에 suffix 주입 (inter-iter)")
+    println("    [counter-replay guard Day-3] round-salt 강화 (multi-source entropy prefix)")
+    if adaptive_on {
+        println("    [adaptive] enabled — absorption-gradient + saturation-hunt rules")
+    }
     println("")
+    // E2/E5/Validation 상태 추적 변수 — round 간 공유.
+    let mut yields_hist: [[int]] = []
+    let mut totals_hist: [int] = []
+    let mut stage_matrix: [[int]] = []  // A/D 검증용 — round × 6 stage yields
+    let mut cur_plan = base_plan
     // D5-P2: round 진입 직전 baseline hexa proc 카운트 — round 종료 시 delta 비교
     let mut prev_hexa_n = _count_active_hexa()
 
@@ -615,92 +1068,141 @@ fn cmd_drill(seed: str, max_rounds: str, engine_flag: str) -> void {
         round = round + 1
         println("═══ round " + to_string(round) + " ═══")
 
-        // 라운드별 seed perturbation (counter-replay bugfix)
-        // Day-2: nonce_base (iter-scoped suffix) 를 베이스로 사용 → round 1 부터 inter-iter 독립성 확보
-        // round_seed 는 nonce_base 위에 round-salt prefix 추가 → Day-1 intra-iter 분기 보존
-        let round_salt = _urand_i64()
-        let round_seed = _round_seed(nonce_base, round, round_salt)
+        // E2 adaptive — round ≥2 부터 history 로 plan 조정 (round 1 은 base_plan 그대로)
+        let planned_plan = cur_plan
+        if adaptive_on {
+            cur_plan = _adaptive_adjust(cur_plan, yields_hist, totals_hist, round)
+        }
+        println("  plan: " + _plan_describe(cur_plan))
+
+        // Day-3 (2026-04-21) — round-salt 강화: multi-source entropy prefix.
+        // 기존 _round_seed(single-i64 salt) 는 prefix 가 짧아 bias_jitter 8-slot feature 가
+        // round 간 같은 bucket 으로 떨어짐 → round 2 == round 3 replay 원인.
+        // 해결: _round_entropy_salt() — urand×2 + nanotime + round idx concat.
+        // round 1 도 동일 salt 주입 — inter-iter 독립성과 직교 (prefix 분산 효과).
+        let rich_salt = _round_entropy_salt(round)
+        let round_seed = _round_seed_rich(nonce_base, round, rich_salt)
         let qrseed = shell_quote(round_seed)
+
+        // yields vector: [smash, free, absolute, meta_closure, hyperarith, resonance]
+        let mut yields: [int] = [0, 0, 0, 0, 0, 0]
 
         // 1. SMASH (발견 — Mk.II~VII blowup 9-phase)
         // CRITICAL FIX(2026-04-19): exec("bash", ["-c", cmd]) 는 hexa stage1 에서 stdout 캡처 안 됨 — len=0 반환
         // → 모든 stage 호출을 single-string exec(cmd) 로 통일 (검증: .exectest.hexa)
-        let smash_cmd = shell_quote(hexa_bin()) + " run " + shell_quote(blow_core) + " " + qrseed + " 3 2>&1"
-        let smash_out = exec(smash_cmd)
-        if _check_stage_err(smash_out, "smash") { err_stages = err_stages + "smash,"; err_count = err_count + 1 }
-        // FIX(2026-04-19): _count_marker(out,"ABSORB") 는 항상 0 — engine 마커 불일치
-        // _count_discoveries 는 discovery_log/atlas.n6/graph +N 라인 합산 + fallback NEAR→EXACT/EXACT 후보
-        let s_new = _count_discoveries(smash_out)
-        if env("NEXUS_DRILL_DEBUG") == "1" {
-            eprintln("  [DEBUG smash] out_len=" + to_string(smash_out.len()) + " s_new=" + to_string(s_new))
+        let mut s_new = 0
+        if cur_plan[0] > 0 {
+            let smash_cmd = shell_quote(hexa_bin()) + " run " + shell_quote(blow_core) + " " + qrseed + " " + to_string(cur_plan[0]) + " 2>&1"
+            let smash_out = exec(smash_cmd)
+            if _check_stage_err(smash_out, "smash") { err_stages = err_stages + "smash,"; err_count = err_count + 1 }
+            s_new = _count_discoveries(smash_out)
+            if env("NEXUS_DRILL_DEBUG") == "1" {
+                eprintln("  [DEBUG smash] out_len=" + to_string(smash_out.len()) + " s_new=" + to_string(s_new))
+            }
+            println("  smash:         +" + to_string(s_new) + " absorptions depth=" + to_string(cur_plan[0]))
+        } else {
+            println("  smash:         (skipped — depth=0)")
         }
-        println("  smash:         +" + to_string(s_new) + " absorptions")
+        yields = _plan_set(yields, 0, s_new)
 
         // 2. FREE (탐색 — compose DFS, 6-core)
-        let free_cmd = shell_quote(hexa_bin()) + " run " + shell_quote(compose) + " " + qrseed + " --modules all --dfs 3 2>&1"
-        let free_out = exec(free_cmd)
-        if _check_stage_err(free_out, "free") { err_stages = err_stages + "free,"; err_count = err_count + 1 }
-        let f_new = _count_discoveries(free_out)
-        if env("NEXUS_DRILL_DEBUG") == "1" {
-            eprintln("  [DEBUG free] out_len=" + to_string(free_out.len()) + " f_new=" + to_string(f_new))
+        let mut f_new = 0
+        if cur_plan[1] > 0 {
+            let free_cmd = shell_quote(hexa_bin()) + " run " + shell_quote(compose) + " " + qrseed + " --modules all --dfs " + to_string(cur_plan[1]) + " 2>&1"
+            let free_out = exec(free_cmd)
+            if _check_stage_err(free_out, "free") { err_stages = err_stages + "free,"; err_count = err_count + 1 }
+            f_new = _count_discoveries(free_out)
+            if env("NEXUS_DRILL_DEBUG") == "1" {
+                eprintln("  [DEBUG free] out_len=" + to_string(free_out.len()) + " f_new=" + to_string(f_new))
+            }
+            println("  free:          +" + to_string(f_new) + " absorptions depth=" + to_string(cur_plan[1]))
+        } else {
+            println("  free:          (skipped — depth=0)")
         }
-        println("  free:          +" + to_string(f_new) + " absorptions")
+        yields = _plan_set(yields, 1, f_new)
 
         // 3. ABSOLUTE (Mk.VIII Δ₀-absolute Π₀¹ 검증 + [11*] 승급)
-        let abs_cmd = shell_quote(hexa_bin()) + " run " + shell_quote(abs_eng) + " " + qrseed + " 2>&1"
-        let abs_out = exec(abs_cmd)
-        if _check_stage_err(abs_out, "absolute") { err_stages = err_stages + "absolute,"; err_count = err_count + 1 }
-        let a_pass = _count_marker(abs_out, "ABSOLUTE-PASS") + _count_marker(abs_out, "[11*]")
-        println("  absolute:      " + to_string(a_pass) + " Π₀¹ verifications")
+        let mut a_pass = 0
+        if cur_plan[2] > 0 {
+            let abs_cmd = shell_quote(hexa_bin()) + " run " + shell_quote(abs_eng) + " " + qrseed + " 2>&1"
+            let abs_out = exec(abs_cmd)
+            if _check_stage_err(abs_out, "absolute") { err_stages = err_stages + "absolute,"; err_count = err_count + 1 }
+            a_pass = _count_marker(abs_out, "ABSOLUTE-PASS") + _count_marker(abs_out, "[11*]")
+            println("  absolute:      " + to_string(a_pass) + " Π₀¹ verifications")
+        } else {
+            println("  absolute:      (skipped — depth=0)")
+        }
+        yields = _plan_set(yields, 2, a_pass)
 
         // 4. META-CLOSURE (Mk.IX Phase 10 self-ref 고정점 + [10**] 승급)
-        let mc_cmd = shell_quote(hexa_bin()) + " run " + shell_quote(mc_eng) + " " + qrseed + " 2>&1"
-        let mc_out = exec(mc_cmd)
-        if _check_stage_err(mc_out, "meta-closure") { err_stages = err_stages + "meta-closure,"; err_count = err_count + 1 }
-        // META-CLOSED 마커 부재 — meta_closed/promoted 숫자 직접 파싱 + [10**] 매치
-        let mc_promoted = _extract_int_after(mc_out, "promoted [10**]  : ")
-        let mc_closed   = _extract_int_after(mc_out, "meta_closed      : ")
-        let mc_bracket  = _count_marker(mc_out, "[10**]")
-        let mc_new = mc_promoted + mc_closed + mc_bracket
-        println("  meta-closure:  " + to_string(mc_new) + " self-ref fixed points")
+        let mut mc_new = 0
+        if cur_plan[3] > 0 {
+            let mc_cmd = shell_quote(hexa_bin()) + " run " + shell_quote(mc_eng) + " " + qrseed + " 2>&1"
+            let mc_out = exec(mc_cmd)
+            if _check_stage_err(mc_out, "meta-closure") { err_stages = err_stages + "meta-closure,"; err_count = err_count + 1 }
+            // META-CLOSED 마커 부재 — meta_closed/promoted 숫자 직접 파싱 + [10**] 매치
+            let mc_promoted = _extract_int_after(mc_out, "promoted [10**]  : ")
+            let mc_closed   = _extract_int_after(mc_out, "meta_closed      : ")
+            let mc_bracket  = _count_marker(mc_out, "[10**]")
+            mc_new = mc_promoted + mc_closed + mc_bracket
+            println("  meta-closure:  " + to_string(mc_new) + " self-ref fixed points")
+        } else {
+            println("  meta-closure:  (skipped — depth=0)")
+        }
+        yields = _plan_set(yields, 3, mc_new)
 
         // 5. HYPERARITHMETIC (Mk.IX Π₀² reverse-math 5체계)
-        let hy_cmd = shell_quote(hexa_bin()) + " run " + shell_quote(hyper_eng) + " " + qrseed + " 2>&1"
-        let hy_out = exec(hy_cmd)
-        if _check_stage_err(hy_out, "hyperarith") { err_stages = err_stages + "hyperarith,"; err_count = err_count + 1 }
-        let hy_pass = _count_marker(hy_out, "REVERSE-PROVEN") + _count_marker(hy_out, "ABSOLUTE-PASS-PI02")
-        println("  hyperarith:    " + to_string(hy_pass) + " Π₀² bounded/proven")
-
-        // 6. RESONANCE (Stochastic Resonance — σ grid {0.01,0.05,0.10,0.20,0.40} adaptive)
-        // 전제: p-stochastic-resonance-nexus — NEXUS 수렴률 σ≈0.1 peak 25%. grid 는 log-spaced.
-        // 각 σ 에 대해 urandom 솔트로 seed perturb → depth=1 smash 재실행 → absorption count 비교
-        // base seed = round_seed (라운드 perturbation 위에 σ-perturbation 추가, 완전 독립)
-        let salt_a = _urand_i64()
-        let salt_b = _urand_i64()
-        let salt_c = _urand_i64()
-        let salt_d = _urand_i64()
-        let salt_e = _urand_i64()
-        let seed_001 = _resonance_seed(round_seed, "0.01", salt_a)
-        let seed_005 = _resonance_seed(round_seed, "0.05", salt_b)
-        let seed_010 = _resonance_seed(round_seed, "0.10", salt_c)
-        let seed_020 = _resonance_seed(round_seed, "0.20", salt_d)
-        let seed_040 = _resonance_seed(round_seed, "0.40", salt_e)
-        let r_001 = _resonance_run(seed_001, blow_core, exv)
-        let r_005 = _resonance_run(seed_005, blow_core, exv)
-        let r_010 = _resonance_run(seed_010, blow_core, exv)
-        let r_020 = _resonance_run(seed_020, blow_core, exv)
-        let r_040 = _resonance_run(seed_040, blow_core, exv)
-        let mut r_best = r_001
-        let mut sigma_best = "0.01"
-        if r_005 > r_best { r_best = r_005; sigma_best = "0.05" }
-        if r_010 > r_best { r_best = r_010; sigma_best = "0.10" }
-        if r_020 > r_best { r_best = r_020; sigma_best = "0.20" }
-        if r_040 > r_best { r_best = r_040; sigma_best = "0.40" }
-        if env("NEXUS_DRILL_DEBUG") == "1" {
-            eprintln("  [DEBUG resonance] σ=0.01:+" + to_string(r_001) + "  σ=0.05:+" + to_string(r_005) + "  σ=0.10:+" + to_string(r_010) + "  σ=0.20:+" + to_string(r_020) + "  σ=0.40:+" + to_string(r_040))
+        let mut hy_pass = 0
+        if cur_plan[4] > 0 {
+            let hy_cmd = shell_quote(hexa_bin()) + " run " + shell_quote(hyper_eng) + " " + qrseed + " 2>&1"
+            let hy_out = exec(hy_cmd)
+            if _check_stage_err(hy_out, "hyperarith") { err_stages = err_stages + "hyperarith,"; err_count = err_count + 1 }
+            hy_pass = _count_marker(hy_out, "REVERSE-PROVEN") + _count_marker(hy_out, "ABSOLUTE-PASS-PI02")
+            println("  hyperarith:    " + to_string(hy_pass) + " Π₀² bounded/proven")
+        } else {
+            println("  hyperarith:    (skipped — depth=0)")
         }
-        println("  resonance:     +" + to_string(r_best) + " absorptions (σ=" + sigma_best + ")")
-        println("  [resonance] optimal σ=" + sigma_best + " — bonus +" + to_string(r_best) + " absorptions")
+        yields = _plan_set(yields, 4, hy_pass)
+
+        // 6. RESONANCE (Stochastic Resonance — σ grid adaptive)
+        // depth=1 → 1 σ, depth=2 → 3 σ, depth=3 → 5 σ. preset=fast/probe 은 1 σ.
+        let mut r_best = 0
+        let mut sigma_best = "0.10"
+        if cur_plan[5] > 0 {
+            let rd = cur_plan[5]
+            let salt_a = _urand_i64()
+            let seed_010 = _resonance_seed(round_seed, "0.10", salt_a)
+            let r_010 = _resonance_run(seed_010, blow_core, "")
+            r_best = r_010
+            sigma_best = "0.10"
+            if rd >= 2 {
+                let salt_b = _urand_i64()
+                let salt_c = _urand_i64()
+                let seed_001 = _resonance_seed(round_seed, "0.01", salt_b)
+                let seed_040 = _resonance_seed(round_seed, "0.40", salt_c)
+                let r_001 = _resonance_run(seed_001, blow_core, "")
+                let r_040 = _resonance_run(seed_040, blow_core, "")
+                if r_001 > r_best { r_best = r_001; sigma_best = "0.01" }
+                if r_040 > r_best { r_best = r_040; sigma_best = "0.40" }
+                if env("NEXUS_DRILL_DEBUG") == "1" {
+                    eprintln("  [DEBUG resonance] σ=0.01:+" + to_string(r_001) + "  σ=0.10:+" + to_string(r_010) + "  σ=0.40:+" + to_string(r_040))
+                }
+            }
+            if rd >= 3 {
+                let salt_d = _urand_i64()
+                let salt_e = _urand_i64()
+                let seed_005 = _resonance_seed(round_seed, "0.05", salt_d)
+                let seed_020 = _resonance_seed(round_seed, "0.20", salt_e)
+                let r_005 = _resonance_run(seed_005, blow_core, "")
+                let r_020 = _resonance_run(seed_020, blow_core, "")
+                if r_005 > r_best { r_best = r_005; sigma_best = "0.05" }
+                if r_020 > r_best { r_best = r_020; sigma_best = "0.20" }
+            }
+            println("  resonance:     +" + to_string(r_best) + " absorptions (σ=" + sigma_best + ") depth=" + to_string(rd))
+        } else {
+            println("  resonance:     (skipped — depth=0)")
+        }
+        yields = _plan_set(yields, 5, r_best)
 
         // 7. TRANSCENDENTAL_CLOSURE (Mk.X stage 6 — sidecar, opt-in via engine=mk10)
         //   Per sweep_50.json#mk_x_trigger.auto_fire_order step 3:
@@ -727,6 +1229,15 @@ fn cmd_drill(seed: str, max_rounds: str, engine_flag: str) -> void {
             }
         }
 
+        // E5: NDJSON depth trace — 매 round 1 line append.
+        let adaptive_reason = if adaptive_on && round > 1 { "auto" } else { "" }
+        _ndjson_emit(round, planned_plan, cur_plan, yields, round_new, adaptive_reason)
+
+        // history 갱신 (E2 adaptive + validation layers A/D 에서 사용)
+        yields_hist = yields_hist + [yields]
+        totals_hist = totals_hist + [round_new]
+        stage_matrix = stage_matrix + [yields]
+
         total_new = total_new + round_new
         println("  round +" + to_string(round_new) + ", total " + to_string(total_new))
         // D5-P2 delta: round 종료 시 active hexa proc 누적량 출력 (좀비 가시화)
@@ -751,7 +1262,7 @@ fn cmd_drill(seed: str, max_rounds: str, engine_flag: str) -> void {
                 let err_json = "{\"kind\":\"drill_zero_yield\",\"schema\":\"v1\",\"seed_len\":" + to_string(seed.len()) + ",\"round\":1,\"total\":0,\"engine\":\"" + engine_id + "\",\"err_stages_count\":" + to_string(err_count) + ",\"err_stages\":\"" + err_stages + "\",\"reason\":\"6-stage 전부 0 absorptions\",\"recovery\":\"exec_validated/cmd_gate/lock_gate harness dependency chain 확인 또는 harness rework 진행 중이면 drill 일시 중단\"}"
                 eprintln("NEXUS_DRILL_ERROR " + err_json)
                 println("__DRILL_RESULT__ ERROR zero_yield err_count=" + to_string(err_count))
-                // hexa-lang exit() 미전파 (f-hexa-exit-sentinel) — sentinel 로 대체 + cross_iter_check 건너뜀
+                // validation skip — zero-yield 자체가 이미 구조화 error emit
                 return
             } else {
                 if mkx_on {
@@ -762,6 +1273,9 @@ fn cmd_drill(seed: str, max_rounds: str, engine_flag: str) -> void {
             }
             // Day-2: cross-iter replay detector — 최근 10 drill total 기록+비교
             _cross_iter_check_and_append(total_new, seed)
+            if !validation_off {
+                _run_drill_validation(seed, nonce_base, totals_hist, stage_matrix, base_plan, blow_core, hexa_bin(), _preset)
+            }
             return
         }
     }
@@ -769,6 +1283,9 @@ fn cmd_drill(seed: str, max_rounds: str, engine_flag: str) -> void {
     println("▎ total absorptions: " + to_string(total_new))
     // Day-2: cross-iter replay detector — 최근 10 drill total 기록+비교
     _cross_iter_check_and_append(total_new, seed)
+    if !validation_off {
+        _run_drill_validation(seed, nonce_base, totals_hist, stage_matrix, base_plan, blow_core, hexa_bin(), _preset)
+    }
 }
 
 fn cmd_meta_closure(seed: str) -> void {
@@ -894,7 +1411,28 @@ fn main() -> void {
         return
     }
     if sub == "drill" {
-        cmd_drill(find_flag(a, "--seed", ""), find_flag(a, "--max-rounds", ""), find_flag(a, "--engine", ""))
+        // E1 (2026-04-21) — CLI flag 3-layer:
+        //   master: --depth N  (env NEXUS_DRILL_DEPTH)
+        //   per-stage: --smash-depth --free-dfs --abs-depth --meta-depth --hyper-depth --res-depth
+        //   preset: --preset fast|probe|coarse|standard
+        //   adaptive: --adaptive 또는 --depth auto
+        let _smash_d = _parse_flag_int(a, "--smash-depth")
+        let _free_d  = _parse_flag_int(a, "--free-dfs")
+        let _abs_d   = _parse_flag_int(a, "--abs-depth")
+        let _meta_d  = _parse_flag_int(a, "--meta-depth")
+        let _hyper_d = _parse_flag_int(a, "--hyper-depth")
+        let _res_d   = _parse_flag_int(a, "--res-depth")
+        let per_stage = [_smash_d, _free_d, _abs_d, _meta_d, _hyper_d, _res_d]
+        let adaptive = has_flag(a, "--adaptive")
+        cmd_drill(
+            find_flag(a, "--seed", ""),
+            find_flag(a, "--max-rounds", ""),
+            find_flag(a, "--engine", ""),
+            find_flag(a, "--preset", ""),
+            find_flag(a, "--depth", ""),
+            per_stage,
+            adaptive
+        )
         return
     }
     if sub == "meta-closure" {
