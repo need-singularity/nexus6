@@ -1,0 +1,591 @@
+// ═══════════════════════════════════════════════════════════
+// atlas_coverage.hexa — atlas coverage gauge (AM, 2026-04-21)
+//
+// 목적:
+//   drill 이 atlas 탐색 공간의 몇 % 를 실제로 "터치" 했는지 측정.
+//   blowup 이 NEXUS_ATLAS_ACCESS_LOG=<path> 환경변수 설정 시
+//   match_name() hit 마다 {"ts":"...","name":"<id>","value":<f64>} 를
+//   append. 본 스크립트는 atlas.n6 (전체 공간) + access_log (방문 공간)
+//   대조 → 커버리지 분포 측정.
+//
+// 모드:
+//   (1) coverage <atlas_path> <access_log_path>
+//         one-shot: unique entries / buckets / 카테고리별 breakdown
+//         + bucket-hit 분포의 Shannon 엔트로피 (nat 단위)
+//         → stdout: JSON summary
+//
+//   (2) realtime <atlas_path>
+//         env NEXUS_ATLAS_ACCESS_LOG 경로를 읽어 30초 간격 tail + report
+//         → stdout: 각 tick 마다 JSON summary + 작은 text histogram
+//
+// 제약:
+//   - hexa parse clean 필수
+//   - `>=` / `<=` 금지 (본 파일 전부 `<` / `>` 만 사용)
+//   - 외부 의존: 최소 (wc, grep, sleep, stat)
+//
+// atlas.n6 라인 포맷 (see shared/n6/atlas.n6 헤더):
+//   @<T> <id> = <expr> :: <category> [grade]
+//
+// bucket 규칙 — atlas_zstd.hexa 와 일치시켜 "drill 이 터치한 zstd 버킷" 을
+// 바로 연결할 수 있게 한다:
+//   category 의 첫 '_' 이전 토큰. (예: n6atlas_foo → "n6atlas", math → "math")
+//   '@' 로 시작하지 않는 라인은 "_misc".
+// ═══════════════════════════════════════════════════════════
+
+// ─── util: shell-safe single-quote ───
+fn _shq(s: string) -> string {
+    let mut parts: [string] = []
+    parts.push("'")
+    let n = len(s)
+    let mut i: i64 = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "'" { parts.push("'\\''") } else { parts.push(c) }
+        i = i + 1
+    }
+    parts.push("'")
+    return parts.join("")
+}
+
+// ─── util: JSON string escape (basic) ───
+fn _jesc(s: string) -> string {
+    let n = len(s)
+    let mut out: [string] = []
+    let mut i: i64 = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "\"" { out.push("\\\"") }
+        else if c == "\\" { out.push("\\\\") }
+        else if c == "\n" { out.push("\\n") }
+        else if c == "\r" { out.push("\\r") }
+        else if c == "\t" { out.push("\\t") }
+        else { out.push(c) }
+        i = i + 1
+    }
+    return out.join("")
+}
+
+// ─── util: natural log via python-free approx (busybox 없음 허용) ───
+// 엄밀: entropy = - Σ p_i * ln(p_i). awk -v 로 계산을 위임 (math lib).
+fn _shannon_nats(counts: [i64], total: i64) -> f64 {
+    if total < 1 { return 0.0 }
+    // 빌드 awk 에 -M 이 없을 수 있으니 기본 awk 만 사용 (log = 자연로그).
+    let mut terms: [string] = []
+    let n = len(counts)
+    let mut i: i64 = 0
+    while i < n {
+        if counts[i] > 0 { terms.push(to_string(counts[i])) }
+        i = i + 1
+    }
+    if len(terms) < 1 { return 0.0 }
+    let csv = terms.join(" ")
+    let cmd = "awk 'BEGIN{T=" + to_string(total) + ";h=0;n=split(\""
+        + csv + "\",a,\" \");for(i=1;i<n+1;i++){p=a[i]/T;if(p>0)h-=p*log(p)}printf \"%.9f\",h}'"
+    let mut h: f64 = 0.0
+    try { h = to_float(to_string(exec(cmd)).trim()) } catch e {}  // @allow-silent-catch
+    return h
+}
+
+// ─── atlas parse: build (all_ids, id_to_bucket, id_to_category) in one pass ───
+// 반환: map with 3개 키
+//   "ids"        : list of string
+//   "buckets"    : list of string (id 와 동일 index)
+//   "categories" : list of string (id 와 동일 index)
+fn _parse_atlas(path: string) -> map {
+    let mut out: map = #{}
+    let mut ids: [string] = []
+    let mut buckets: [string] = []
+    let mut cats: [string] = []
+    let mut raw = ""
+    try { raw = read_file(path) } catch e {}  // @allow-silent-catch
+    if raw == "" {
+        out["ids"] = ids
+        out["buckets"] = buckets
+        out["categories"] = cats
+        return out
+    }
+    let lines = raw.split("\n")
+    let nl = len(lines)
+    let mut li: i64 = 0
+    while li < nl {
+        let ln = lines[li]
+        li = li + 1
+        let trimmed = ln.trim()
+        if trimmed == "" { continue }
+        if trimmed.substring(0, 1) != "@" { continue }
+        // id = trimmed 의 두번째 whitespace token (type 다음)
+        // 즉 "@P n = 6 :: foundation [11*]" → type "@P", id "n"
+        // split by " " + '\t' 가 없으므로 그냥 " " 기준.
+        let sp1 = trimmed.index_of(" ")
+        if sp1 < 1 { continue }
+        let after_type = trimmed.substring(sp1 + 1, len(trimmed)).trim()
+        let sp2 = after_type.index_of(" ")
+        let mut id_str = ""
+        if sp2 < 1 { id_str = after_type }
+        else { id_str = after_type.substring(0, sp2) }
+        if id_str == "" { continue }
+        // category = after "::"
+        let ci = trimmed.index_of("::")
+        let mut cat = ""
+        let mut pfx = "_misc"
+        if ci > 0 {
+            let rest = trimmed.substring(ci + 2, len(trimmed)).trim()
+            if rest != "" {
+                // token = rest 의 첫 단어 (space 또는 tab 전).
+                let sp = rest.index_of(" ")
+                let tb = rest.index_of("\t")
+                let mut dom = rest
+                if sp > 0 {
+                    if tb < 0 { dom = rest.substring(0, sp) }
+                    else if sp < tb { dom = rest.substring(0, sp) }
+                    else { dom = rest.substring(0, tb) }
+                } else if tb > 0 {
+                    dom = rest.substring(0, tb)
+                }
+                cat = dom
+                // bucket prefix = dom 에서 첫 '_' 이전 토큰 (atlas_zstd.hexa 와 동일)
+                let us = dom.index_of("_")
+                if us > 0 { pfx = dom.substring(0, us) } else { pfx = dom }
+                if pfx == "" { pfx = "_misc" }
+            }
+        }
+        ids.push(id_str)
+        buckets.push(pfx)
+        cats.push(cat)
+    }
+    out["ids"] = ids
+    out["buckets"] = buckets
+    out["categories"] = cats
+    return out
+}
+
+// ─── JSONL access log parse — returns list of name strings (id 만) ───
+// 라인 포맷 (blowup 측): {"ts":"...","name":"<id>","value":<f64>}
+// name 만 추출 — 커버리지는 id 단위 집계.
+fn _parse_access_log(path: string) -> [string] {
+    let mut out: [string] = []
+    if !file_exists(path) { return out }
+    let raw = read_file(path)
+    let lines = raw.split("\n")
+    let nl = len(lines)
+    let mut i: i64 = 0
+    let marker = "\"name\":\""
+    while i < nl {
+        let ln = lines[i]
+        i = i + 1
+        if ln == "" { continue }
+        let p = ln.index_of(marker)
+        if p < 0 { continue }
+        let rest = ln.substring(p + len(marker), len(ln))
+        let qe = rest.index_of("\"")
+        if qe < 1 { continue }
+        out.push(rest.substring(0, qe))
+    }
+    return out
+}
+
+// ─── metrics core — given atlas map + access list, build full report map ───
+// 반환 map:
+//   total_entries, total_buckets           : i64
+//   unique_entries_accessed, unique_buckets_accessed : i64
+//   access_events                          : i64
+//   entries_coverage, buckets_coverage     : f64 (0..1)
+//   entropy_nats                           : f64 (Shannon over bucket hit counts)
+//   categories                             : list of map {name, total, hit, coverage}
+//   buckets_hist                           : list of map {name, count}  (top-20 desc)
+fn _compute(atlas: map, access: [string]) -> map {
+    let mut rep: map = #{}
+    let ids = atlas["ids"]
+    let buckets = atlas["buckets"]
+    let cats = atlas["categories"]
+    let total_entries: i64 = len(ids)
+
+    // id → index (O(1) lookup)
+    let mut id_idx: map = #{}
+    let mut i: i64 = 0
+    while i < total_entries {
+        id_idx[ids[i]] = to_string(i)
+        i = i + 1
+    }
+
+    // bucket set + bucket → total_count (atlas side)
+    let mut bucket_totals: map = #{}
+    let mut bucket_order: [string] = []
+    i = 0
+    while i < total_entries {
+        let b = buckets[i]
+        let mut existing = ""
+        try { existing = bucket_totals[b] } catch e {}  // @allow-silent-catch
+        if existing == "" {
+            bucket_totals[b] = "1"
+            bucket_order.push(b)
+        } else {
+            bucket_totals[b] = to_string(to_int(existing) + 1)
+        }
+        i = i + 1
+    }
+    let total_buckets: i64 = len(bucket_order)
+
+    // category totals
+    let mut cat_totals: map = #{}
+    let mut cat_order: [string] = []
+    i = 0
+    while i < total_entries {
+        let c = cats[i]
+        if c == "" { i = i + 1; continue }
+        let mut existing = ""
+        try { existing = cat_totals[c] } catch e {}  // @allow-silent-catch
+        if existing == "" {
+            cat_totals[c] = "1"
+            cat_order.push(c)
+        } else {
+            cat_totals[c] = to_string(to_int(existing) + 1)
+        }
+        i = i + 1
+    }
+
+    // access aggregation
+    let na = len(access)
+    let mut seen_ids: map = #{}
+    let mut seen_buckets: map = #{}
+    let mut seen_cats: map = #{}
+    let mut bucket_hits: map = #{}   // bucket → hit_count (accesses, not unique)
+    let mut cat_hits: map = #{}      // category → hit_count
+    let mut cat_unique: map = #{}    // category → unique_id_count (via seen set)
+    let mut unique_entries: i64 = 0
+    let mut j: i64 = 0
+    while j < na {
+        let nm = access[j]
+        j = j + 1
+        if nm == "" { continue }
+        // map nm → atlas index
+        let mut idx_str = ""
+        try { idx_str = id_idx[nm] } catch e {}  // @allow-silent-catch
+        if idx_str == "" { continue }  // access id 가 atlas 에 없는 경우 skip
+        let idx: i64 = to_int(idx_str)
+        let b = buckets[idx]
+        let c = cats[idx]
+        // bucket hits (raw count, for entropy)
+        let mut bh = ""
+        try { bh = bucket_hits[b] } catch e {}  // @allow-silent-catch
+        if bh == "" { bucket_hits[b] = "1" } else { bucket_hits[b] = to_string(to_int(bh) + 1) }
+        // cat hits (raw)
+        if c != "" {
+            let mut ch = ""
+            try { ch = cat_hits[c] } catch e {}  // @allow-silent-catch
+            if ch == "" { cat_hits[c] = "1" } else { cat_hits[c] = to_string(to_int(ch) + 1) }
+        }
+        // unique id
+        let mut sm = ""
+        try { sm = seen_ids[nm] } catch e {}  // @allow-silent-catch
+        if sm == "" {
+            seen_ids[nm] = "1"
+            unique_entries = unique_entries + 1
+            seen_buckets[b] = "1"
+            if c != "" {
+                let mut cc = ""
+                try { cc = cat_unique[c] } catch e {}  // @allow-silent-catch
+                if cc == "" { cat_unique[c] = "1" } else { cat_unique[c] = to_string(to_int(cc) + 1) }
+                seen_cats[c] = "1"
+            }
+        }
+    }
+    let unique_buckets: i64 = len(seen_buckets)
+
+    // entropy over bucket hit counts
+    let mut counts: [i64] = []
+    let mut total_hits: i64 = 0
+    let nb = len(bucket_order)
+    let mut bi: i64 = 0
+    while bi < nb {
+        let b = bucket_order[bi]
+        bi = bi + 1
+        let mut v = ""
+        try { v = bucket_hits[b] } catch e {}  // @allow-silent-catch
+        if v == "" { continue }
+        let c = to_int(v)
+        counts.push(c)
+        total_hits = total_hits + c
+    }
+    let h_nats = _shannon_nats(counts, total_hits)
+
+    // category breakdown records
+    let mut cat_records: [map] = []
+    let nc = len(cat_order)
+    let mut ci: i64 = 0
+    while ci < nc {
+        let name = cat_order[ci]
+        ci = ci + 1
+        let mut tot_s = ""
+        try { tot_s = cat_totals[name] } catch e {}  // @allow-silent-catch
+        let tot = to_int(tot_s)
+        let mut hit_s = ""
+        try { hit_s = cat_unique[name] } catch e {}  // @allow-silent-catch
+        let mut hit: i64 = 0
+        if hit_s != "" { hit = to_int(hit_s) }
+        let mut cov: f64 = 0.0
+        if tot > 0 { cov = to_float(to_string(hit)) / to_float(to_string(tot)) }
+        let mut r: map = #{}
+        r["name"] = name
+        r["total"] = to_string(tot)
+        r["hit"] = to_string(hit)
+        r["coverage"] = to_string(cov)
+        cat_records.push(r)
+    }
+
+    // buckets_hist — top-20 by hit count (desc). 작은 insertion-sort (버킷 수 수백).
+    let mut hist_names: [string] = []
+    let mut hist_counts: [i64] = []
+    bi = 0
+    while bi < nb {
+        let b = bucket_order[bi]
+        bi = bi + 1
+        let mut v = ""
+        try { v = bucket_hits[b] } catch e {}  // @allow-silent-catch
+        if v == "" { continue }
+        let c = to_int(v)
+        // insert desc
+        let ln2 = len(hist_counts)
+        let mut ins = ln2
+        let mut k: i64 = 0
+        while k < ln2 {
+            if c > hist_counts[k] { ins = k; k = ln2 + 1 } else { k = k + 1 }
+        }
+        // splice — rebuild via new arrays (hexa list mutable 한정)
+        let mut new_names: [string] = []
+        let mut new_counts: [i64] = []
+        let mut m: i64 = 0
+        while m < ln2 + 1 {
+            if m < ins {
+                new_names.push(hist_names[m])
+                new_counts.push(hist_counts[m])
+            } else if m == ins {
+                new_names.push(b)
+                new_counts.push(c)
+            } else {
+                new_names.push(hist_names[m - 1])
+                new_counts.push(hist_counts[m - 1])
+            }
+            m = m + 1
+        }
+        hist_names = new_names
+        hist_counts = new_counts
+    }
+    let cap: i64 = 20
+    let mut top_names: [string] = []
+    let mut top_counts: [i64] = []
+    let nh = len(hist_names)
+    let limit: i64 = if nh < cap { nh } else { cap }
+    let mut t: i64 = 0
+    while t < limit {
+        top_names.push(hist_names[t])
+        top_counts.push(hist_counts[t])
+        t = t + 1
+    }
+
+    // ratios
+    let mut entries_cov: f64 = 0.0
+    if total_entries > 0 { entries_cov = to_float(to_string(unique_entries)) / to_float(to_string(total_entries)) }
+    let mut buckets_cov: f64 = 0.0
+    if total_buckets > 0 { buckets_cov = to_float(to_string(unique_buckets)) / to_float(to_string(total_buckets)) }
+
+    rep["total_entries"] = to_string(total_entries)
+    rep["total_buckets"] = to_string(total_buckets)
+    rep["unique_entries_accessed"] = to_string(unique_entries)
+    rep["unique_buckets_accessed"] = to_string(unique_buckets)
+    rep["access_events"] = to_string(na)
+    rep["entries_coverage"] = to_string(entries_cov)
+    rep["buckets_coverage"] = to_string(buckets_cov)
+    rep["entropy_nats"] = to_string(h_nats)
+    // stash category records + hist 을 별도 구조로
+    let mut agg: map = #{}
+    agg["report"] = rep
+    agg["categories"] = cat_records
+    agg["top_names"] = top_names
+    agg["top_counts"] = top_counts
+    return agg
+}
+
+// ─── render JSON summary ───
+fn _render_json(agg: map) -> string {
+    let rep = agg["report"]
+    let cats = agg["categories"]
+    let tnames = agg["top_names"]
+    let tcounts = agg["top_counts"]
+    let mut out: [string] = []
+    out.push("{\"total_entries\":")
+    out.push(rep["total_entries"])
+    out.push(",\"total_buckets\":")
+    out.push(rep["total_buckets"])
+    out.push(",\"unique_entries_accessed\":")
+    out.push(rep["unique_entries_accessed"])
+    out.push(",\"unique_buckets_accessed\":")
+    out.push(rep["unique_buckets_accessed"])
+    out.push(",\"access_events\":")
+    out.push(rep["access_events"])
+    out.push(",\"entries_coverage\":")
+    out.push(rep["entries_coverage"])
+    out.push(",\"buckets_coverage\":")
+    out.push(rep["buckets_coverage"])
+    out.push(",\"entropy_nats\":")
+    out.push(rep["entropy_nats"])
+    out.push(",\"coverage_by_category\":[")
+    let nc = len(cats)
+    let mut i: i64 = 0
+    while i < nc {
+        if i > 0 { out.push(",") }
+        let r = cats[i]
+        out.push("{\"name\":\"")
+        out.push(_jesc(r["name"]))
+        out.push("\",\"total\":")
+        out.push(r["total"])
+        out.push(",\"hit\":")
+        out.push(r["hit"])
+        out.push(",\"coverage\":")
+        out.push(r["coverage"])
+        out.push("}")
+        i = i + 1
+    }
+    out.push("],\"buckets_top\":[")
+    let nt = len(tnames)
+    i = 0
+    while i < nt {
+        if i > 0 { out.push(",") }
+        out.push("{\"name\":\"")
+        out.push(_jesc(tnames[i]))
+        out.push("\",\"count\":")
+        out.push(to_string(tcounts[i]))
+        out.push("}")
+        i = i + 1
+    }
+    out.push("]}")
+    return out.join("")
+}
+
+// ─── text histogram (realtime 용) ───
+fn _render_histogram(agg: map) -> string {
+    let tnames = agg["top_names"]
+    let tcounts = agg["top_counts"]
+    let n = len(tnames)
+    if n < 1 { return "(no accesses yet)" }
+    // max count
+    let mut mx: i64 = 1
+    let mut i: i64 = 0
+    while i < n {
+        if tcounts[i] > mx { mx = tcounts[i] }
+        i = i + 1
+    }
+    let bar_w: i64 = 40
+    let mut out: [string] = []
+    out.push("bucket                        count  bar\n")
+    i = 0
+    while i < n {
+        let nm = tnames[i]
+        let ct = tcounts[i]
+        // pad name to width 28
+        let mut pad_name = nm
+        let diff: i64 = 28 - len(nm)
+        if diff > 0 {
+            let mut pp: [string] = []
+            pp.push(nm)
+            let mut k: i64 = 0
+            while k < diff { pp.push(" "); k = k + 1 }
+            pad_name = pp.join("")
+        }
+        // bar length = bar_w * ct / mx
+        let bl: i64 = (bar_w * ct) / mx
+        let mut bar: [string] = []
+        let mut k2: i64 = 0
+        while k2 < bl { bar.push("#"); k2 = k2 + 1 }
+        // count pad (6 chars right-aligned)
+        let cs = to_string(ct)
+        let mut cpad: [string] = []
+        let cd: i64 = 6 - len(cs)
+        let mut kk: i64 = 0
+        while kk < cd { cpad.push(" "); kk = kk + 1 }
+        cpad.push(cs)
+        out.push(pad_name + "  " + cpad.join("") + "  " + bar.join("") + "\n")
+        i = i + 1
+    }
+    return out.join("")
+}
+
+// ═══════════════════════════════════════════════════════════
+// cmd: coverage <atlas_path> <access_log_path>
+// ═══════════════════════════════════════════════════════════
+fn cmd_coverage(atlas_path: string, log_path: string) -> i64 {
+    if !file_exists(atlas_path) {
+        eprintln("atlas_coverage: atlas not found: " + atlas_path)
+        return 1
+    }
+    if !file_exists(log_path) {
+        eprintln("atlas_coverage: access log not found: " + log_path)
+        return 1
+    }
+    let atlas = _parse_atlas(atlas_path)
+    let access = _parse_access_log(log_path)
+    let agg = _compute(atlas, access)
+    println(_render_json(agg))
+    return 0
+}
+
+// ═══════════════════════════════════════════════════════════
+// cmd: realtime <atlas_path>
+//   NEXUS_ATLAS_ACCESS_LOG 환경변수 경로를 tail, 30s 마다 report.
+// ═══════════════════════════════════════════════════════════
+fn cmd_realtime(atlas_path: string) -> i64 {
+    if !file_exists(atlas_path) {
+        eprintln("atlas_coverage: atlas not found: " + atlas_path)
+        return 1
+    }
+    let mut log_path = ""
+    try { log_path = env("NEXUS_ATLAS_ACCESS_LOG") } catch e {}  // @allow-silent-catch
+    if log_path == "" {
+        eprintln("atlas_coverage: NEXUS_ATLAS_ACCESS_LOG not set")
+        return 1
+    }
+    eprintln("atlas_coverage: realtime mode — atlas=" + atlas_path + " log=" + log_path + " tick=30s")
+    let atlas = _parse_atlas(atlas_path)
+    let mut tick: i64 = 0
+    let max_ticks: i64 = 1000000  // practically unbounded; Ctrl-C 또는 wrapper kill
+    while tick < max_ticks {
+        tick = tick + 1
+        let access = _parse_access_log(log_path)
+        let agg = _compute(atlas, access)
+        println("=== tick " + to_string(tick) + " ===")
+        println(_render_json(agg))
+        println(_render_histogram(agg))
+        let _ = exec("sleep 30")
+    }
+    return 0
+}
+
+// ═══════════════════════════════════════════════════════════
+// CLI dispatch
+// ═══════════════════════════════════════════════════════════
+let a = args()
+let mut sub = "help"
+if len(a) > 2 { sub = a[2] }
+
+if sub == "coverage" {
+    if len(a) < 5 {
+        println("usage: atlas_coverage.hexa coverage <atlas_path> <access_log_path>")
+        exit(1)  // @allow-silent-exit
+    }
+    let rc = cmd_coverage(a[3], a[4])
+    exit(rc)  // @allow-silent-exit
+} else if sub == "realtime" {
+    if len(a) < 4 {
+        println("usage: atlas_coverage.hexa realtime <atlas_path>")
+        exit(1)  // @allow-silent-exit
+    }
+    let rc = cmd_realtime(a[3])
+    exit(rc)  // @allow-silent-exit
+} else {
+    println("atlas_coverage.hexa — atlas coverage gauge (AM)")
+    println("usage:")
+    println("  hexa cli/scripts/atlas_coverage.hexa coverage <atlas_path> <access_log_path>")
+    println("  hexa cli/scripts/atlas_coverage.hexa realtime <atlas_path>")
+    println("    (realtime reads NEXUS_ATLAS_ACCESS_LOG env var as log path)")
+    exit(0)
+}
