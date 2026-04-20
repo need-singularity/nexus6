@@ -1216,13 +1216,12 @@ fn _progress_emit(round: int, stage: str, event: str, elapsed_ms: int) -> void {
 }
 
 fn _progress_now_ms() -> i64 {
-    // ms epoch — linux 는 %s%N (ns/1e6), macOS 는 %s*1000 fallback.
-    // macOS 는 %N 이 literal 로 남음 → 숫자 파싱 실패 시 %s*1000 경로로 폴백.
+    // ms epoch — linux 는 %s%N (ns), macOS 는 %s*1000 fallback.
+    // macOS 는 %N 이 literal 로 남음 → 길이 짧거나 파싱 실패 시 %s*1000 경로로 폴백.
     let raw = exec("date +%s%N").trim()
     let mut v: i64 = 0
-    let mut ok = false
-    try { v = to_int(raw); ok = true } catch e { ok = false }
-    if ok && v > 1000000000000000 {
+    try { v = to_int(raw) } catch e { v = 0 }
+    if v > 1000000000000000 {
         // ns precision (linux) — 16+ digits. ms 로 축소.
         return v / 1000000
     }
@@ -1860,6 +1859,7 @@ fn cmd_drill(seed: str, max_rounds: str, engine_flag: str, preset: str, master_d
     let engine_id = _mkx_resolve_engine(engine_flag)
     let mkx_on = engine_id == "mk10"
     println("🛸 nexus drill — seed='" + seed + "', max_rounds=" + to_string(rounds_max) + ", engine=" + engine_id)
+    _recovery_sigint_install()
     if _preset.len() > 0 {
         println("    preset=" + _preset + " (drill.json speed_presets)")
     }
@@ -1885,6 +1885,7 @@ fn cmd_drill(seed: str, max_rounds: str, engine_flag: str, preset: str, master_d
     let mut totals_hist: [int] = []
     let mut stage_matrix: [[int]] = []  // A/D 검증용 — round × 6 stage yields
     let mut cur_plan = base_plan
+    let mut _e6_plan_hist: [[int]] = []  // E6 recovery — per-round plan snapshot (runaway/oscillate)
     // D5-P2: round 진입 직전 baseline hexa proc 카운트 — round 종료 시 delta 비교
     let mut prev_hexa_n = _count_active_hexa()
 
@@ -2167,6 +2168,40 @@ fn cmd_drill(seed: str, max_rounds: str, engine_flag: str, preset: str, master_d
         let adaptive_reason = if adaptive_on && round > 1 { "auto" } else { "" }
         let _nd_seed_hash = _seed_batch_hash(seed)
         _ndjson_emit(round, planned_plan, cur_plan, yields, round_new, adaptive_reason, _nd_seed_hash)
+
+        // E6: failure-mode recovery — 5 check 순차 (round 종료 직후, 다음 round 에 영향).
+        _e6_plan_hist = _e6_plan_hist + [cur_plan]  // E6: 현 round 의 plan 을 history 에 기록 (recovery check 용)
+        if _recovery_adaptive_runaway(_e6_plan_hist) {
+            let halved = _recovery_halve_plan(cur_plan)
+            _recovery_emit("adaptive_runaway", "cap_halved:" + _plan_describe(halved), round)
+            cur_plan = halved
+        }
+        if _recovery_oscillate(_e6_plan_hist) {
+            _recovery_emit("oscillate", "hysteresis_3round_cooldown", round)
+        }
+        let _e6_imb_adj = _recovery_stage_imbalance(yields_hist)
+        let mut _e6_imb_any = false
+        let mut _e6_ii = 0
+        while _e6_ii < len(_e6_imb_adj) {
+            if _e6_imb_adj[_e6_ii] != 0 { _e6_imb_any = true }
+            _e6_ii = _e6_ii + 1
+        }
+        if _e6_imb_any {
+            let bumped = _recovery_apply_floor(cur_plan, _e6_imb_adj)
+            _recovery_emit("stage_imbalance", "floor2:" + _plan_describe(bumped), round)
+            cur_plan = bumped
+        }
+        if _recovery_oom_imminent() {
+            let dec = _recovery_oom_depth_decrement(cur_plan)
+            _recovery_ndjson_flush()
+            _recovery_emit("oom_imminent", "depth_dec+flush:" + _plan_describe(dec), round)
+            cur_plan = dec
+        }
+        if _recovery_sigint_handler() {
+            _recovery_emit("sigint", "graceful_abort_after_round", round)
+            _recovery_sigint_cleanup()
+            return
+        }
 
         // history 갱신 (E2 adaptive + validation layers A/D 에서 사용)
         yields_hist = yields_hist + [yields]
