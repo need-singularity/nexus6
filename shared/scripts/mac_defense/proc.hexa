@@ -1,0 +1,81 @@
+// nexus/shared/scripts/mac_defense/proc.hexa
+// 책임: ps/sysctl 기반 시스템 측정 + hexa_stage0 runaway 검출/처치.
+// 보호: claude/cl 본체 + HEXA_LOCAL=1 환경변수 spawn된 procs.
+
+// runaway 1건 표현. 외부에서 list 로 받음.
+struct Runaway {
+    pid: str,
+    cpu: int,
+    etime_sec: int,
+    comm: str,
+    protected: bool
+}
+
+fn ncpu() -> int {
+    let s = exec("sysctl -n hw.ncpu 2>/dev/null || echo 8").trim()
+    if s == "" { return 8 }
+    return to_int(s)
+}
+
+fn load1() -> float {
+    // sysctl -n vm.loadavg → "{ 1.23 4.56 7.89 }"
+    let s = exec("sysctl -n vm.loadavg 2>/dev/null | awk '{print $2}'").trim()
+    if s == "" { return 0.0 }
+    return to_float(s)
+}
+
+// ps "etime" 포맷 [[DD-]HH:]MM:SS → 초
+fn etime_to_sec(e: str) -> int {
+    let cmd = "echo " + e + " | awk -F- '{ if (NF==2) { d=$1; e=$2 } else { d=0; e=$1 } n=split(e,t,\":\"); if (n==3) print d*86400+t[1]*3600+t[2]*60+t[3]; else if (n==2) print d*86400+t[1]*60+t[2]; else print t[1] }'"
+    let s = exec(cmd).trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// HEXA_LOCAL=1 으로 spawn 된 프로세스 보호 — 사용자 의도적 local 실행
+fn is_protected_pid(pid: str) -> bool {
+    let s = exec("ps -p " + pid + " -E 2>/dev/null | grep -c 'HEXA_LOCAL=1'").trim()
+    if s == "" { return false }
+    return to_int(s) > 0
+}
+
+fn is_protected_comm(comm: str) -> bool {
+    if comm == "claude" { return true }
+    if comm == "cl" { return true }
+    return false
+}
+
+// hexa_stage0 폭주 candidates 수집 (etime ≥ etime_th & cpu ≥ cpu_th).
+// hexa-lang stage1: 함수 안에서 list 누적은 list = list + [x] 패턴 (push 버그 회피).
+fn scan_hexa_stage0_runaway(cpu_th: int, etime_th: int) -> [Runaway] {
+    let raw = exec("ps -Ao pid,pcpu,etime,comm,command 2>/dev/null | awk 'NR>1 && index($0, \"hexa_stage0\") > 0 {print $1\"|\"$2\"|\"$3\"|\"$4}'").trim()
+    let mut out = []
+    if raw == "" { return out }
+    let lines = raw.split("\n")
+    for line in lines {
+        let p = line.split("|")
+        if p.length < 4 { continue }
+        let pid = p[0]
+        let cpu_s = p[1]
+        let etime_s = p[2]
+        let comm = p[3]
+        let cpu_i = to_int(to_float(cpu_s))
+        let etime_sec = etime_to_sec(etime_s)
+        if etime_sec < etime_th { continue }
+        if cpu_i < cpu_th { continue }
+        let prot = is_protected_comm(comm) || is_protected_pid(pid)
+        out = out + [Runaway{ pid: pid, cpu: cpu_i, etime_sec: etime_sec, comm: comm, protected: prot }]
+    }
+    return out
+}
+
+fn kill_runaway(pid: str) {
+    exec("kill -STOP " + pid + " 2>/dev/null; sleep 1; kill -KILL " + pid + " 2>/dev/null")
+}
+
+// apfsd CPU% 정수 (없으면 0)
+fn apfsd_cpu() -> int {
+    let s = exec("ps -Ao pcpu,comm 2>/dev/null | awk '$2 ~ /apfsd$/ {print $1; exit}'").trim()
+    if s == "" { return 0 }
+    return to_int(to_float(s))
+}
