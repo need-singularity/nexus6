@@ -1,0 +1,139 @@
+// verify_L0_core.hexa — L0 core 파일 무결성 검증 (SHA256 pin drift 감지)
+// SSOT: shared/lockdown/L0_core.json
+//
+// usage:
+//   hexa shared/scripts/verify_L0_core.hexa          → 검증 (drift 있으면 exit 1)
+//   hexa shared/scripts/verify_L0_core.hexa --json   → 결과 JSON 으로만 출력
+//
+// bypass: NEXUS_CORE_EDIT_OK=1 → drift 있어도 exit 0 (warn only)
+//
+// 호출 위치 후보:
+//   - nexus self-check (run.hexa cmd_status)
+//   - pre-commit hook (.githooks/pre-commit, 별도 wrapper)
+//   - CI gate
+
+fn _nexus_root() -> str {
+    let n = env("NEXUS")
+    if n.len() > 0 { return n }
+    return env("HOME") + "/Dev/nexus"
+}
+
+fn _pin_path() -> str {
+    return _nexus_root() + "/shared/lockdown/L0_core.json"
+}
+
+fn _sha256_file(path: str) -> str {
+    // macOS/Linux 공통 — shasum -a 256 (macOS: /usr/bin/shasum, Linux: coreutils)
+    let full = _nexus_root() + "/" + path
+    let cmd = "shasum -a 256 '" + full + "' 2>/dev/null | awk '{print $1}'"
+    return exec(cmd).trim()
+}
+
+fn _file_exists(path: str) -> bool {
+    let full = _nexus_root() + "/" + path
+    let out = exec("[ -f '" + full + "' ] && echo y || echo n").trim()
+    return out == "y"
+}
+
+fn _count_lines(path: str) -> int {
+    let full = _nexus_root() + "/" + path
+    let out = exec("wc -l < '" + full + "' 2>/dev/null").trim()
+    let mut v = 0
+    try { v = to_int(out) } catch e {}
+    return v
+}
+
+fn main() {
+    let a = args()
+    let mut json_only = false
+    let mut i = 0
+    while i < len(a) {
+        if to_string(a[i]) == "--json" { json_only = true }
+        i = i + 1
+    }
+
+    let pin = _pin_path()
+    if _file_exists("shared/lockdown/L0_core.json") == false {
+        eprintln("NEXUS_CORE_TAMPERED {\"kind\":\"pin_missing\",\"path\":\"shared/lockdown/L0_core.json\"}")
+        exit(1)
+    }
+
+    // jq 로 pinned[] 파싱 (hexa JSON parser 의존 회피)
+    let paths_out = exec("jq -r '.pinned[].path' '" + pin + "' 2>&1").trim()
+    let sha_out   = exec("jq -r '.pinned[].sha256' '" + pin + "' 2>&1").trim()
+    let owner_out = exec("jq -r '.pinned[].owner // \"unknown\"' '" + pin + "' 2>&1").trim()
+
+    let paths = paths_out.split("\n")
+    let shas  = sha_out.split("\n")
+    let owners = owner_out.split("\n")
+
+    if len(paths) == 0 {
+        eprintln("NEXUS_CORE_TAMPERED {\"kind\":\"empty_pinned_list\"}")
+        exit(1)
+    }
+
+    let mut drift_count = 0
+    let mut missing_count = 0
+    let mut pending_count = 0
+    let mut ok_count = 0
+    let mut results = ""  // 간단 text buffer
+
+    let n = len(paths)
+    let mut j = 0
+    while j < n {
+        let p = paths[j].trim()
+        let exp_sha = if j < len(shas) { shas[j].trim() } else { "" }
+        let owner = if j < len(owners) { owners[j].trim() } else { "unknown" }
+
+        // SELF 는 자체 — sha 재계산 하되 pin 필드 제외하도록 jq 필요. 후속.
+        // PENDING 은 refresh 전 상태. drift 카운트 제외.
+        if exp_sha == "PENDING" || exp_sha == "SELF" {
+            pending_count = pending_count + 1
+            results = results + "PENDING " + p + "\n"
+            j = j + 1
+            continue
+        }
+
+        if _file_exists(p) == false {
+            missing_count = missing_count + 1
+            let msg = "NEXUS_CORE_MISSING {\"path\":\"" + p + "\",\"last_known_sha256\":\"" + exp_sha + "\",\"owner\":\"" + owner + "\"}"
+            eprintln(msg)
+            results = results + "MISSING " + p + "\n"
+            j = j + 1
+            continue
+        }
+
+        let actual = _sha256_file(p)
+        if actual != exp_sha {
+            drift_count = drift_count + 1
+            let msg = "NEXUS_CORE_DRIFT {\"path\":\"" + p + "\",\"expected_sha256\":\"" + exp_sha + "\",\"actual_sha256\":\"" + actual + "\",\"owner\":\"" + owner + "\"}"
+            eprintln(msg)
+            results = results + "DRIFT " + p + "\n"
+        } else {
+            ok_count = ok_count + 1
+            results = results + "OK " + p + "\n"
+        }
+        j = j + 1
+    }
+
+    let summary = "{\"kind\":\"L0_core_verify\",\"total\":" + to_string(n) + ",\"ok\":" + to_string(ok_count) + ",\"drift\":" + to_string(drift_count) + ",\"missing\":" + to_string(missing_count) + ",\"pending\":" + to_string(pending_count) + "}"
+
+    if json_only {
+        println("NEXUS_CORE_VERIFY " + summary)
+    } else {
+        println(results)
+        println("NEXUS_CORE_VERIFY " + summary)
+    }
+
+    if drift_count > 0 || missing_count > 0 {
+        if env("NEXUS_CORE_EDIT_OK") == "1" {
+            eprintln("NEXUS_CORE_EDIT_OK=1 — drift/missing warn only, exit 0")
+            return
+        }
+        println("__CORE_VERIFY_RESULT__ FAIL drift=" + to_string(drift_count) + " missing=" + to_string(missing_count))
+        exit(1)
+    }
+    println("__CORE_VERIFY_RESULT__ PASS ok=" + to_string(ok_count) + " pending=" + to_string(pending_count))
+}
+
+main()

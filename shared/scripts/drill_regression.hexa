@@ -1,0 +1,131 @@
+// drill_regression.hexa — drill 결과 A/B regression 비교 runner
+// SSOT: shared/config/drill.json (preset 정의), shared/state/drill_baseline.json (baseline)
+//
+// usage:
+//   hexa shared/scripts/drill_regression.hexa --seed "<seed>" --presets light,normal,deep
+//   hexa shared/scripts/drill_regression.hexa --baseline-only    → 현재 결과를 baseline 으로 저장
+//   hexa shared/scripts/drill_regression.hexa --compare           → 기존 baseline vs 현재 diff
+//
+// 출력:
+//   NEXUS_DRILL_REGRESSION {"seed":"...","preset":"...","total":N,"baseline":M,"diff":+-K,"verdict":"PASS|FAIL"}
+//
+// 주의 (2026-04-20): drill 결함 2종 수리 전에는 baseline 자체 가짜. 결함 수리 후 baseline 재수립 필요.
+
+fn _nexus_root() -> str {
+    let n = env("NEXUS")
+    if n.len() > 0 { return n }
+    return env("HOME") + "/Dev/nexus"
+}
+
+fn _baseline_path() -> str {
+    return _nexus_root() + "/shared/state/drill_baseline.json"
+}
+
+fn _run_drill(seed: str, preset: str) -> int {
+    // drill 실행 → total absorption 추출
+    let cmd = "nexus drill --seed '" + seed + "' --preset " + preset + " --max-rounds 3 2>&1 | grep -E '^▎ total' | tail -1 | awk '{print $NF}'"
+    let out = exec(cmd).trim()
+    let mut v = 0
+    try { v = to_int(out) } catch e {}
+    return v
+}
+
+fn _file_exists(path: str) -> bool {
+    let out = exec("[ -f '" + path + "' ] && echo y || echo n").trim()
+    return out == "y"
+}
+
+fn _get_baseline(seed: str, preset: str) -> int {
+    let bpath = _baseline_path()
+    if _file_exists(bpath) == false { return -1 }
+    let key = seed + "|" + preset
+    let cmd = "jq -r '.entries[] | select(.key == \"" + key + "\") | .total' '" + bpath + "' 2>/dev/null"
+    let out = exec(cmd).trim()
+    if out.len() == 0 || out == "null" { return -1 }
+    let mut v = -1
+    try { v = to_int(out) } catch e {}
+    return v
+}
+
+fn _save_baseline(seed: str, preset: str, total: int) -> void {
+    let bpath = _baseline_path()
+    let key = seed + "|" + preset
+    let ts = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+
+    if _file_exists(bpath) == false {
+        let init = "{\"kind\":\"drill_baseline\",\"schema\":\"v1\",\"updated\":\"" + ts + "\",\"entries\":[]}"
+        exec("mkdir -p " + _nexus_root() + "/shared/state && echo '" + init + "' | jq . > '" + bpath + "'")
+    }
+
+    // remove existing entry + append new
+    let jq1 = ".entries |= map(select(.key != \"" + key + "\"))"
+    let jq2 = ".entries += [{\"key\":\"" + key + "\",\"seed\":\"" + seed + "\",\"preset\":\"" + preset + "\",\"total\":" + to_string(total) + ",\"ts\":\"" + ts + "\"}]"
+    let jq3 = ".updated = \"" + ts + "\""
+    let tmp = bpath + ".tmp"
+    exec("jq '" + jq1 + " | " + jq2 + " | " + jq3 + "' '" + bpath + "' > '" + tmp + "' && mv '" + tmp + "' '" + bpath + "'")
+}
+
+fn main() {
+    let a = args()
+    let mut seed = ""
+    let mut presets_str = "light,normal,deep"
+    let mut baseline_only = false
+    let mut compare_only = false
+
+    let mut i = 0
+    while i < len(a) {
+        let t = to_string(a[i])
+        if t == "--seed" && i + 1 < len(a) { seed = to_string(a[i + 1]); i = i + 1 }
+        if t == "--presets" && i + 1 < len(a) { presets_str = to_string(a[i + 1]); i = i + 1 }
+        if t == "--baseline-only" { baseline_only = true }
+        if t == "--compare" { compare_only = true }
+        i = i + 1
+    }
+
+    if seed.len() < 10 {
+        eprintln("usage: drill_regression --seed \"<seed 10+ chars>\" [--presets light,normal,deep] [--baseline-only|--compare]")
+        exit(2)
+    }
+
+    let presets = presets_str.split(",")
+    let mut any_fail = false
+    let mut i2 = 0
+    while i2 < len(presets) {
+        let preset = presets[i2].trim()
+        if preset.len() == 0 { i2 = i2 + 1; continue }
+
+        let total = _run_drill(seed, preset)
+        let baseline = _get_baseline(seed, preset)
+
+        if baseline_only {
+            _save_baseline(seed, preset, total)
+            println("NEXUS_DRILL_REGRESSION {\"seed\":\"" + seed + "\",\"preset\":\"" + preset + "\",\"total\":" + to_string(total) + ",\"action\":\"baseline_saved\"}")
+        } else {
+            let mut verdict = "PASS"
+            let mut diff = 0
+            if baseline < 0 {
+                verdict = "NO_BASELINE"
+            } else {
+                diff = total - baseline
+                let abs_diff = if diff < 0 { 0 - diff } else { diff }
+                let threshold = if baseline > 10 { baseline / 4 } else { 5 }  // 25% or 5 abs
+                if abs_diff > threshold { verdict = "FAIL"; any_fail = true }
+            }
+            let msg = "{\"seed\":\"" + seed + "\",\"preset\":\"" + preset + "\",\"total\":" + to_string(total) + ",\"baseline\":" + to_string(baseline) + ",\"diff\":" + to_string(diff) + ",\"verdict\":\"" + verdict + "\"}"
+            println("NEXUS_DRILL_REGRESSION " + msg)
+            if compare_only == false && baseline >= 0 && verdict == "PASS" {
+                _save_baseline(seed, preset, total)
+            }
+        }
+
+        i2 = i2 + 1
+    }
+
+    if any_fail {
+        println("__DRILL_REGRESSION__ FAIL")
+        exit(1)
+    }
+    println("__DRILL_REGRESSION__ PASS")
+}
+
+main()

@@ -1,0 +1,131 @@
+// refresh_L0_core.hexa — L0 core pin 의 SHA256 필드를 현재 파일 상태로 갱신
+// SSOT: shared/lockdown/L0_core.json
+//
+// usage:
+//   hexa shared/scripts/refresh_L0_core.hexa                → 모든 PENDING → 실제 sha 로 fill
+//   hexa shared/scripts/refresh_L0_core.hexa --path <path>  → 단일 path 만 갱신
+//   hexa shared/scripts/refresh_L0_core.hexa --all          → PENDING 뿐만 아니라 기존 sha 도 전량 재계산
+//
+// ⚠ 사용 전 commit 필수 — refresh 는 무결성 baseline 이동이므로 감사 로그 남겨야 함.
+//    commit message 에 `L0-REFRESH: <reason>` 포함 권장.
+
+fn _nexus_root() -> str {
+    let n = env("NEXUS")
+    if n.len() > 0 { return n }
+    return env("HOME") + "/Dev/nexus"
+}
+
+fn _pin_path() -> str {
+    return _nexus_root() + "/shared/lockdown/L0_core.json"
+}
+
+fn _sha256_file(path: str) -> str {
+    let full = _nexus_root() + "/" + path
+    let cmd = "shasum -a 256 '" + full + "' 2>/dev/null | awk '{print $1}'"
+    return exec(cmd).trim()
+}
+
+fn _file_exists(path: str) -> bool {
+    let full = _nexus_root() + "/" + path
+    let out = exec("[ -f '" + full + "' ] && echo y || echo n").trim()
+    return out == "y"
+}
+
+fn main() {
+    let a = args()
+    let mut only_path = ""
+    let mut refresh_all = false
+    let mut i = 0
+    while i < len(a) {
+        let t = to_string(a[i])
+        if t == "--all" { refresh_all = true }
+        if t == "--path" && i + 1 < len(a) { only_path = to_string(a[i + 1]); i = i + 1 }
+        i = i + 1
+    }
+
+    let pin = _pin_path()
+    if _file_exists("shared/lockdown/L0_core.json") == false {
+        eprintln("NEXUS_REFRESH_ERROR {\"kind\":\"pin_missing\"}")
+        exit(1)
+    }
+
+    // git clean 확인 — dirty 면 경고 (강제 진행은 env NEXUS_CORE_EDIT_OK=1)
+    let dirty = exec("cd " + _nexus_root() + " && git diff --quiet shared/lockdown/L0_core.json; echo $?").trim()
+    if dirty != "0" && env("NEXUS_CORE_EDIT_OK") != "1" {
+        eprintln("NEXUS_REFRESH_WARN {\"kind\":\"pin_dirty\",\"hint\":\"commit 후 재실행 또는 NEXUS_CORE_EDIT_OK=1\"}")
+    }
+
+    // jq 로 pinned paths 읽기
+    let paths_out = exec("jq -r '.pinned[].path' '" + pin + "' 2>&1").trim()
+    let paths = paths_out.split("\n")
+
+    let n = len(paths)
+    let mut updated_count = 0
+    let mut skip_count = 0
+    let mut i2 = 0
+    while i2 < n {
+        let p = paths[i2].trim()
+
+        if only_path.len() > 0 && p != only_path {
+            i2 = i2 + 1
+            continue
+        }
+
+        // 현재 sha 읽기
+        let cur_cmd = "jq -r '.pinned[] | select(.path == \"" + p + "\") | .sha256' '" + pin + "'"
+        let cur_sha = exec(cur_cmd).trim()
+
+        // SELF 는 자체 pin — skip (후속: sha 제외 필드만 hash 하는 로직 필요)
+        if cur_sha == "SELF" {
+            skip_count = skip_count + 1
+            println("SKIP_SELF " + p)
+            i2 = i2 + 1
+            continue
+        }
+
+        // refresh_all=false 이면 PENDING 만
+        if refresh_all == false && cur_sha != "PENDING" {
+            skip_count = skip_count + 1
+            i2 = i2 + 1
+            continue
+        }
+
+        if _file_exists(p) == false {
+            println("SKIP_MISSING " + p)
+            skip_count = skip_count + 1
+            i2 = i2 + 1
+            continue
+        }
+
+        let new_sha = _sha256_file(p)
+        if new_sha.len() != 64 {
+            eprintln("NEXUS_REFRESH_WARN {\"kind\":\"bad_sha\",\"path\":\"" + p + "\",\"got\":\"" + new_sha + "\"}")
+            i2 = i2 + 1
+            continue
+        }
+
+        // jq 로 해당 path 의 sha256 필드 치환 (in-place)
+        let jq_expr = "(.pinned[] | select(.path == \"" + p + "\") | .sha256) = \"" + new_sha + "\""
+        let tmp = pin + ".tmp"
+        let rc = exec("jq '" + jq_expr + "' '" + pin + "' > '" + tmp + "' && mv '" + tmp + "' '" + pin + "'; echo $?").trim()
+        if rc == "0" {
+            updated_count = updated_count + 1
+            println("UPDATE " + p + " → " + new_sha.substring(0, 12) + "...")
+        } else {
+            eprintln("NEXUS_REFRESH_WARN {\"kind\":\"jq_fail\",\"path\":\"" + p + "\"}")
+        }
+
+        i2 = i2 + 1
+    }
+
+    // updated timestamp
+    let ts = exec("date -u +'%Y-%m-%d'").trim()
+    let tmp2 = pin + ".tmp"
+    exec("jq '.updated = \"" + ts + "\"' '" + pin + "' > '" + tmp2 + "' && mv '" + tmp2 + "' '" + pin + "'")
+
+    let summary = "{\"kind\":\"L0_core_refresh\",\"updated\":" + to_string(updated_count) + ",\"skipped\":" + to_string(skip_count) + ",\"total\":" + to_string(n) + "}"
+    println("NEXUS_REFRESH_DONE " + summary)
+    println("__L0_REFRESH_RESULT__ OK updated=" + to_string(updated_count))
+}
+
+main()
