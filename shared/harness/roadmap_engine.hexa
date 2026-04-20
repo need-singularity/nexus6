@@ -231,30 +231,35 @@ fn split_nodes(body: string) -> [string] {
     let mut in_str: bool = false
     while i < body.len() {
         let c = body.substring(i, i + 1)
+        // hexa stage0: nested `continue` under multi-level `if` can fall-through
+        // (observed: `if in_str { if c=="\"" {...continue} i=i+1 continue }` both fire).
+        // Workaround: if-elif chain + single i-advance tail.
+        let mut handled: bool = false
         if in_str {
-            if c == "\\" { i = i + 2; continue }
-            if c == "\"" { in_str = false; i = i + 1; continue }
-            i = i + 1
-            continue
+            if c == "\\" { i = i + 2; handled = true }
+            else if c == "\"" { in_str = false; i = i + 1; handled = true }
+            else { i = i + 1; handled = true }
         }
-        if c == "\"" { in_str = true; i = i + 1; continue }
-        if c == "{" {
-            if depth == 0 { start = i }
-            depth = depth + 1
-            i = i + 1
-            continue
-        }
-        if c == "}" {
-            depth = depth - 1
-            if depth == 0 && start >= 0 {
-                out = out.push(body.substring(start, i + 1))
-                start = -1
+        if handled == false {
+            if c == "\"" { in_str = true; i = i + 1; handled = true }
+            else if c == "{" {
+                if depth == 0 { start = i }
+                depth = depth + 1
+                i = i + 1
+                handled = true
             }
-            i = i + 1
-            continue
+            else if c == "}" {
+                depth = depth - 1
+                if depth == 0 && start >= 0 {
+                    out = out.push(body.substring(start, i + 1))
+                    start = -1
+                }
+                i = i + 1
+                handled = true
+            }
+            else if c == "]" && depth == 0 { break }
+            else { i = i + 1 }
         }
-        if c == "]" && depth == 0 { break }
-        i = i + 1
     }
     return out
 }
@@ -336,18 +341,26 @@ fn load_roadmap(path: string) -> Roadmap {
             let mut depth: i64 = 0
             let mut in_str: bool = false
             let mut end = mi
-            while end < body.len() {
+            let mut done_meta: bool = false
+            while end < body.len() && done_meta == false {
                 let c = body.substring(end, end + 1)
+                // hexa stage0 continue fall-through guard
+                let mut handled: bool = false
                 if in_str {
-                    if c == "\\" { end = end + 2; continue }
-                    if c == "\"" { in_str = false }
-                    end = end + 1
-                    continue
+                    if c == "\\" { end = end + 2; handled = true }
+                    else if c == "\"" { in_str = false; end = end + 1; handled = true }
+                    else { end = end + 1; handled = true }
                 }
-                if c == "\"" { in_str = true; end = end + 1; continue }
-                if c == "{" { depth = depth + 1 }
-                else if c == "}" { depth = depth - 1; if depth == 0 { end = end + 1; break } }
-                end = end + 1
+                if handled == false {
+                    if c == "\"" { in_str = true; end = end + 1 }
+                    else if c == "{" { depth = depth + 1; end = end + 1 }
+                    else if c == "}" {
+                        depth = depth - 1
+                        if depth == 0 { end = end + 1; done_meta = true }
+                        else { end = end + 1 }
+                    }
+                    else { end = end + 1 }
+                }
             }
             meta_body = body.substring(start, end)
         }
@@ -1079,26 +1092,14 @@ fn emit_schedule_events(rm: Roadmap, sched: ScheduleResult, out_path: string) {
 }
 
 // ── Blocking Min #12 hook: drain_while_wait ─────────────────────────────
-// Given in_progress (waiting) set, return ready nodes whose hard deps do NOT
-// intersect the in_progress dep-closure of any waiting node — i.e., safe to
-// execute concurrently without creating new waits. Invariant: |R(t)| ≥ 1.
-fn deps_intersect(a: [string], b: [string]) -> bool {
-    let mut i: i64 = 0
-    while i < a.len() {
-        let av = _str(a[i])
-        let mut j: i64 = 0
-        while j < b.len() {
-            if av == _str(b[j]) { return true }
-            j = j + 1
-        }
-        i = i + 1
-    }
-    return false
-}
-
+// T_wall* = Σ b(S_k) + Σ max(0, τ_wait_k − r_k)  (r_k = drain candidates)
+// Invariant: ∀t  |R(t)| ≥ 1  (ready or drain always non-empty while todo>0)
+//
+// Since schedule() only puts a node in ready_set when all its hard deps are
+// done, and in_progress nodes already had their deps done when started,
+// independence reduces to direct non-mutual-dependency: r ∉ w.deps ∧ w ∉ r.deps.
 fn try_drain_while_wait(nodes: [Node], waiting_ids: [string], ready_ids: [string]) -> [string] {
-    // independent if ready node's hard_deps ∩ waiting set = ∅ AND
-    // waiting node's deps ∩ {ready_id} = ∅ (waiting doesn't depend on ready)
+    if waiting_ids.len() == 0 { return ready_ids }
     let mut out: [string] = []
     let mut i: i64 = 0
     while i < ready_ids.len() {
@@ -1107,18 +1108,25 @@ fn try_drain_while_wait(nodes: [Node], waiting_ids: [string], ready_ids: [string
         if ri < 0 { i = i + 1; continue }
         let r = nodes[ri]
         let mut independent: bool = true
-        // ready.deps ∩ waiting
-        if deps_intersect(r.deps, waiting_ids) { independent = false }
-        // reverse: any waiting node depends on this ready? (shouldn't be ready then, but guard)
         let mut w: i64 = 0
         while w < waiting_ids.len() && independent {
-            let wi = idx_of(nodes, _str(waiting_ids[w]))
+            let wid = _str(waiting_ids[w])
+            let wi = idx_of(nodes, wid)
             if wi >= 0 {
                 let wn = nodes[wi]
+                // r depends on w?
                 let mut k: i64 = 0
-                while k < wn.deps.len() {
-                    if _str(wn.deps[k]) == rid { independent = false; break }
+                while k < r.deps.len() {
+                    if _str(r.deps[k]) == wid { independent = false; break }
                     k = k + 1
+                }
+                // w depends on r?
+                if independent {
+                    let mut kk: i64 = 0
+                    while kk < wn.deps.len() {
+                        if _str(wn.deps[kk]) == rid { independent = false; break }
+                        kk = kk + 1
+                    }
                 }
             }
             w = w + 1
