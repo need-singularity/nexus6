@@ -77,14 +77,39 @@ if [ "${1:-}" = "run" ] && [ -n "${2:-}" ]; then
 fi
 if [ -x "$REMOTE_WRAP" ] && remote_eligible "$@"; then
     # set -e would kill the script on a non-zero exit from the wrapper; use || to capture.
+    # Capture stderr so we can parse NEXUS_REMOTE_ERROR hosts_tried array.
     __rc=0
-    "$REMOTE_WRAP" "$@" || __rc=$?
+    __rstderr="$(mktemp -t hexa_remote_stderr.XXXXXX 2>/dev/null || echo /tmp/hexa_remote_stderr.$$)"
+    "$REMOTE_WRAP" "$@" 2> >(tee "$__rstderr" >&2) || __rc=$?
     # 64 = "fallback to local" signal; any other code is the remote script's real result.
     if [ "$__rc" != "64" ]; then
+        rm -f "$__rstderr"
         exit "$__rc"
     fi
-    if [ "$__is_heavy_compute" = "1" ] && [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+    # Extract hosts_tried from NEXUS_REMOTE_ERROR line (best-effort; empty if absent).
+    __hosts_json="$(grep -o 'NEXUS_REMOTE_ERROR {[^}]*}' "$__rstderr" 2>/dev/null | tail -n 1 | sed -n 's/.*"hosts_tried":\(\[[^]]*\]\).*/\1/p')"
+    [ -z "$__hosts_json" ] && __hosts_json='[]'
+    rm -f "$__rstderr"
+    __cmd_label="${3:-unknown}"
+    __is_darwin=0
+    [ "$(uname -s 2>/dev/null)" = "Darwin" ] && __is_darwin=1
+    # A3: JSON-structured downgrade event (heavy-compute only).
+    if [ "$__is_heavy_compute" = "1" ]; then
+        if [ "$__is_darwin" = "1" ] && [ "${HEXA_ALLOW_LOCAL_FALLBACK:-0}" != "1" ]; then
+            __fb="abort"
+        else
+            __fb="local"
+        fi
         echo "hexa resolver: ⚠ heavy-compute ($2 ${3:-}) remote dispatch failed (exit 64) — Mac 로컬 실행 시 stage0 SIGKILL 위험 (Gatekeeper + 4GB RSS cap)" >&2
+        printf 'NEXUS_REMOTE_DOWNGRADE {"heavy_compute":true,"cmd":"%s","hosts_tried":%s,"reason":"remote_unavailable","fallback":"%s"}\n' \
+            "$__cmd_label" "$__hosts_json" "$__fb" >&2
+    fi
+    # A2: Mac heavy-compute + all-hosts-fail → exit 74 (local fallback blocked unless override).
+    if [ "$__is_heavy_compute" = "1" ] && [ "$__is_darwin" = "1" ] && [ "${HEXA_ALLOW_LOCAL_FALLBACK:-0}" != "1" ]; then
+        printf 'NEXUS_REMOTE_ERROR {"cmd":"%s","hosts_tried":%s,"reason":"all_timeout","action":"abort_to_prevent_oom","override_env":"HEXA_ALLOW_LOCAL_FALLBACK=1","exit_code":74}\n' \
+            "$__cmd_label" "$__hosts_json" >&2
+        echo "hexa resolver: heavy-compute + Darwin + all-hosts-unreachable → abort (exit 74). 우회: HEXA_ALLOW_LOCAL_FALLBACK=1" >&2
+        exit 74
     fi
     echo "hexa resolver: remote dispatch returned 64, running locally" >&2
 elif [ "$__is_heavy_compute" = "1" ] && [ ! -x "$REMOTE_WRAP" ]; then

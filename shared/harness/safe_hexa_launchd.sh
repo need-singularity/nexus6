@@ -105,8 +105,29 @@ TAIL_ERR_PID=$!
 # macOS 15.6 커널이 setrlimit(RLIMIT_AS) 와 ulimit -v 모두 EINVAL 거부.
 # launchd ResidentSetSize cap 은 best-effort — 단독 프로세스 폭주 시 enforcement 실패.
 # → parent polling watchdog 이 유일한 hard cap 수단.
-# HEXA_STAGE0_RSS_CAP_KB 로 override (default 4GB=4194304 KB).
-RSS_CAP_KB="${HEXA_STAGE0_RSS_CAP_KB:-4194304}"
+#
+# RSS cap precedence (2026-04-21 B1):
+#   NEXUS_RSS_CAP_MB    (MB, nexus-prefix, preferred)  >
+#   HEXA_STAGE0_RSS_CAP_KB (KB, legacy alias, back-compat) >
+#   default 4194304 KB (4GB)
+if [ -n "${NEXUS_RSS_CAP_MB:-}" ]; then
+  RSS_CAP_KB="$((NEXUS_RSS_CAP_MB * 1024))"
+else
+  RSS_CAP_KB="${HEXA_STAGE0_RSS_CAP_KB:-4194304}"
+fi
+# B2: 2-phase graceful drain — SIGTERM at warn_ratio, SIGKILL after grace_sec.
+#   NEXUS_RSS_WARN_RATIO  (default 0.90) — ratio (0-1) of cap to trigger SIGTERM
+#   NEXUS_RSS_GRACE_SEC   (default 5)    — seconds between SIGTERM and SIGKILL
+# B3: child fanout advisory — warn when descendant count exceeds threshold.
+#   NEXUS_MAX_CHILD       (default 16, 0=disabled) — descendant count threshold
+RSS_WARN_RATIO="${NEXUS_RSS_WARN_RATIO:-0.90}"
+RSS_GRACE_SEC="${NEXUS_RSS_GRACE_SEC:-5}"
+MAX_CHILD="${NEXUS_MAX_CHILD:-16}"
+# Compute warn threshold (KB) via awk — bash can't do float math.
+RSS_WARN_KB="$(awk -v c="$RSS_CAP_KB" -v r="$RSS_WARN_RATIO" 'BEGIN{printf "%d", c*r}')"
+SIGTERM_SENT=0
+SIGTERM_TS=0
+FANOUT_WARNED=0
 EXIT_CODE=""
 
 # pid_tree <root> — echo root pid + all descendants (DFS, ps-based). macOS 호환.
@@ -166,13 +187,42 @@ while true; do
   if [ -n "$JOB_PID" ] && [ "$JOB_PID" != "0" ]; then
     TREE=$(pid_tree "$JOB_PID" | tr '\n' ' ')
     RSS_KB=$(sum_rss_kb $TREE)
+    # B3: fanout advisory — count descendants (excluding root JOB_PID) and warn once.
+    if [ "$MAX_CHILD" != "0" ] && [ "$FANOUT_WARNED" = "0" ]; then
+      _child_count=$(printf '%s\n' $TREE | grep -v "^${JOB_PID}$" 2>/dev/null | wc -l | tr -d ' ')
+      if [ -n "$_child_count" ] && [ "$_child_count" -gt "$MAX_CHILD" ]; then
+        printf 'NEXUS_FANOUT_WARN {"children":%s,"max":%s}\n' "$_child_count" "$MAX_CHILD" >&2
+        FANOUT_WARNED=1
+      fi
+    fi
     if [ -n "$RSS_KB" ] && [ "$RSS_KB" -gt "$RSS_CAP_KB" ]; then
+      # B2 phase 2: SIGKILL (either grace expired, or SIGTERM not-yet-sent but cap already blown).
+      _grace_exceeded="false"
+      if [ "$SIGTERM_SENT" = "1" ]; then
+        _now=$(date +%s)
+        _elapsed=$((_now - SIGTERM_TS))
+        if [ "$_elapsed" -ge "$RSS_GRACE_SEC" ]; then
+          _grace_exceeded="true"
+        else
+          # within grace window — keep polling; do NOT SIGKILL yet.
+          sleep 0.5
+          continue
+        fi
+      fi
       echo "safe_hexa_launchd: RSS watchdog — pid=$JOB_PID tree=[$TREE] rss=${RSS_KB}KB > cap=${RSS_CAP_KB}KB → SIGKILL" >&2
+      printf 'NEXUS_RSS_KILL {"rss_kb":%s,"cap_kb":%s,"grace_exceeded":%s}\n' "$RSS_KB" "$RSS_CAP_KB" "$_grace_exceeded" >&2
       # Kill descendants first so stage0 sees children die, then kill stage0.
       for p in $TREE; do kill -KILL "$p" 2>/dev/null || true; done
       launchctl kill KILL "gui/$UID_N/$LABEL" 2>/dev/null || true
       EXIT_CODE=137  # SIGKILL canonical
       break
+    elif [ -n "$RSS_KB" ] && [ "$RSS_KB" -gt "$RSS_WARN_KB" ] && [ "$SIGTERM_SENT" = "0" ]; then
+      # B2 phase 1: SIGTERM at warn threshold, start grace countdown.
+      echo "safe_hexa_launchd: RSS warn — pid=$JOB_PID rss=${RSS_KB}KB > warn=${RSS_WARN_KB}KB (cap=${RSS_CAP_KB}KB) → SIGTERM (grace ${RSS_GRACE_SEC}s)" >&2
+      printf 'NEXUS_RSS_WARN {"rss_kb":%s,"cap_kb":%s,"action":"SIGTERM","grace_sec":%s}\n' "$RSS_KB" "$RSS_CAP_KB" "$RSS_GRACE_SEC" >&2
+      for p in $TREE; do kill -TERM "$p" 2>/dev/null || true; done
+      SIGTERM_SENT=1
+      SIGTERM_TS=$(date +%s)
     fi
   fi
   EXIT_LINE=$(printf '%s' "$INFO" | awk -F'= ' '/last exit code/ {print $2; exit}')
