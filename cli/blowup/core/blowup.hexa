@@ -71,6 +71,256 @@ _trace("[01-HOME-ok] HOME=" + _HOME)
 // R14 SSOT: blowup의 모든 출력(log/graph/growth_bus)은 atlas.n6 단일 파일로 통합.
 // growth_bus.jsonl은 airgenome 소유 별개 파일 — blowup은 읽지/쓰지 않음.
 
+// ═══════════════════════════════════════════════════════════
+// ─── atlas_bloom.hexa.inc (copy-paste SSOT:
+// ───   cli/blowup/lib/atlas_bloom.hexa.inc — commit 6f64153c)
+// ───
+// ─── AI agent (2026-04-21): atlas prefix bloom filter — O(1) miss-rejection
+// ─── 앞에 두고 bucket index (Y, 19cd7076) 우회. NOT_PRESENT 시 short-circuit.
+// ═══════════════════════════════════════════════════════════
+
+// counters (세션 전역)
+let mut _bloom_hit: i64 = 0
+let mut _bloom_miss: i64 = 0
+let mut _bloom_skip_saves: i64 = 0
+let mut _bloom_ready: bool = false
+
+// tuning knobs (shared/config/n6_tuning.json 우선, fallback default)
+let mut _BLOOM_BITS_PER_ENTRY: i64 = 10
+let mut _BLOOM_HASH_COUNT: i64 = 4
+
+// global side-table — hexa 전역 상태 공유
+let mut _bloom_bits_g: [bool] = []
+let mut _bloom_m_g: i64 = 0
+let mut _bloom_k_g: i64 = 0
+let mut _bloom_inserts_g: i64 = 0
+
+fn _bloom_json_int(raw: string, key: string) -> i64 {
+    let mut v: i64 = 0
+    let marker = "\"" + key + "\":"
+    let idx = raw.index_of(marker)
+    if idx > -1 {
+        let after = raw.substring(idx + len(marker), len(raw))
+        let mut end = after.index_of(",")
+        let end2 = after.index_of("}")
+        let end3 = after.index_of("\n")
+        if end < 0 { end = end2 }
+        else if end2 > -1 && end2 < end { end = end2 }
+        if end < 0 { end = end3 }
+        else if end3 > -1 && end3 < end { end = end3 }
+        if end > 0 {
+            try { v = to_int(after.substring(0, end).trim()) } catch e {}
+        }
+    }
+    return v
+}
+
+fn _bloom_load_tuning() -> i64 {
+    let cfg = _NEXUS + "/shared/config/n6_tuning.json"
+    if !file_exists(cfg) { return 0 }
+    let mut raw = ""
+    try { raw = read_file(cfg) } catch e { return 0 }
+    if raw == "" { return 0 }
+    let bpe = _bloom_json_int(raw, "bloom_bits_per_entry")
+    let hc = _bloom_json_int(raw, "bloom_hash_count")
+    if bpe > 0 { _BLOOM_BITS_PER_ENTRY = bpe }
+    if hc > 0 { _BLOOM_HASH_COUNT = hc }
+    return 1
+}
+
+// prefix 추출 — atlas_scan_opt.hexa _bucket_domain_prefix 와 동일 rule
+fn _bloom_prefix_of(entry_line: string) -> string {
+    let t = entry_line.trim()
+    if t == "" { return "" }
+    if t.starts_with("#") { return "" }
+    if t.starts_with("//") { return "" }
+    if !t.starts_with("@") { return "" }
+    let ci = t.index_of("::")
+    if ci < 0 { return "" }
+    let rest = t.substring(ci + 2, len(t)).trim()
+    if rest == "" { return "" }
+    let mut dom = rest
+    let sp = rest.index_of(" ")
+    if sp > 0 { dom = rest.substring(0, sp) }
+    let tb = rest.index_of("\t")
+    if tb > 0 && tb < sp { dom = rest.substring(0, tb) }
+    if dom == "" { return "" }
+    let us = dom.index_of("_")
+    if us > 0 { return dom.substring(0, us) }
+    return dom
+}
+
+// djb2 (XOR-less, add/mul 변형)
+fn _bloom_djb2(s: string) -> i64 {
+    let mut h: i64 = 5381
+    let mut i: i64 = 0
+    let n = len(s)
+    while i < n {
+        let c = char_code(s, i)
+        h = (h * 33 + c) % 4294967296
+        i = i + 1
+    }
+    return h
+}
+
+// FNV-1 (XOR-less): h = (h + c) * 16777619
+fn _bloom_fnv1(s: string) -> i64 {
+    let mut h: i64 = 2166136261
+    let mut i: i64 = 0
+    let n = len(s)
+    while i < n {
+        let c = char_code(s, i)
+        h = ((h + c) * 16777619) % 4294967296
+        i = i + 1
+    }
+    return h
+}
+
+fn _bloom_set_bit(bits: [bool], idx: i64, m: i64) -> [bool] {
+    let mut out = bits
+    if idx > -1 && idx < m {
+        out[idx] = true
+    }
+    return out
+}
+
+fn _bloom_get_bit(bits: [bool], idx: i64, m: i64) -> bool {
+    if idx < 0 { return false }
+    if idx > m - 1 { return false }
+    return bits[idx]
+}
+
+fn _bloom_positions(key: string, m: i64, k: i64) -> [i64] {
+    let h1 = _bloom_djb2(key)
+    let mut h2 = _bloom_fnv1(key)
+    if h2 == 0 { h2 = 1 }
+    let mut pos: [i64] = []
+    let mut i: i64 = 0
+    while i < k {
+        let mut idx = (h1 + i * h2) % m
+        if idx < 0 { idx = idx + m }
+        pos.push(idx)
+        i = i + 1
+    }
+    return pos
+}
+
+fn bloom_build_from_content(atlas_content: string) -> [i64] {
+    let lines = atlas_content.split("\n")
+    let nlines = len(lines)
+    let mut seen: [string] = []
+    let mut i: i64 = 0
+    while i < nlines {
+        let pfx = _bloom_prefix_of(lines[i])
+        if pfx != "" {
+            let mut dup = false
+            let mut j: i64 = 0
+            let sn = len(seen)
+            while j < sn {
+                if seen[j] == pfx { dup = true; j = sn }
+                j = j + 1
+            }
+            if !dup { seen.push(pfx) }
+        }
+        i = i + 1
+    }
+    let inserts = len(seen)
+    let mut m: i64 = inserts * _BLOOM_BITS_PER_ENTRY
+    if m < 64 { m = 64 }
+    let k: i64 = _BLOOM_HASH_COUNT
+    let mut bits: [bool] = []
+    let mut z: i64 = 0
+    while z < m {
+        bits.push(false)
+        z = z + 1
+    }
+    let mut p: i64 = 0
+    let sn2 = len(seen)
+    while p < sn2 {
+        let key = seen[p]
+        let pos = _bloom_positions(key, m, k)
+        let np = len(pos)
+        let mut q: i64 = 0
+        while q < np {
+            bits = _bloom_set_bit(bits, pos[q], m)
+            q = q + 1
+        }
+        p = p + 1
+    }
+    _bloom_bits_g = bits
+    _bloom_m_g = m
+    _bloom_k_g = k
+    _bloom_inserts_g = inserts
+    _bloom_ready = true
+    let mut meta: [i64] = []
+    meta.push(inserts)
+    meta.push(m)
+    meta.push(k)
+    return meta
+}
+
+// bloom_check — "NOT_PRESENT" (definite miss) or "MAYBE" (fall-through to bucket)
+fn bloom_check(prefix: string) -> string {
+    if !_bloom_ready { return "MAYBE" }
+    if prefix == "" { return "MAYBE" }
+    let pos = _bloom_positions(prefix, _bloom_m_g, _bloom_k_g)
+    let np = len(pos)
+    let mut i: i64 = 0
+    while i < np {
+        if !_bloom_get_bit(_bloom_bits_g, pos[i], _bloom_m_g) {
+            _bloom_miss = _bloom_miss + 1
+            _bloom_skip_saves = _bloom_skip_saves + 1
+            return "NOT_PRESENT"
+        }
+        i = i + 1
+    }
+    _bloom_hit = _bloom_hit + 1
+    return "MAYBE"
+}
+
+fn bloom_load_from_atlas(atlas_content: string) -> i64 {
+    _bloom_load_tuning()
+    if atlas_content == "" { return 0 }
+    let meta = bloom_build_from_content(atlas_content)
+    if len(meta) < 3 { return 0 }
+    return meta[0]
+}
+
+fn bloom_emit_counters() -> i64 {
+    if !_bloom_ready { return 0 }
+    let mut parts: [string] = []
+    parts.push("NEXUS_ATLAS_BLOOM {\"ready\":true,\"inserts\":")
+    parts.push(to_string(_bloom_inserts_g))
+    parts.push(",\"bits\":")
+    parts.push(to_string(_bloom_m_g))
+    parts.push(",\"hashes\":")
+    parts.push(to_string(_bloom_k_g))
+    parts.push(",\"bits_per_entry\":")
+    parts.push(to_string(_BLOOM_BITS_PER_ENTRY))
+    parts.push(",\"bloom_hit\":")
+    parts.push(to_string(_bloom_hit))
+    parts.push(",\"bloom_miss\":")
+    parts.push(to_string(_bloom_miss))
+    parts.push(",\"bloom_skip_saves\":")
+    parts.push(to_string(_bloom_skip_saves))
+    parts.push("}")
+    eprintln(parts.join(""))
+    return _bloom_miss
+}
+
+// atlas_prefix_scan_bloom — bucket lookup 앞에 bloom short-circuit wrapper.
+// bloom miss 시 [] 반환 — 호출자는 bucket/grep 전체 skip. MAYBE 시 caller 가 기존 경로 진행.
+fn atlas_prefix_scan_bloom(prefix: string) -> [string] {
+    let mut out: [string] = []
+    let st = bloom_check(prefix)
+    if st == "NOT_PRESENT" { return out }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════
+// END atlas_bloom.hexa.inc
+// ═══════════════════════════════════════════════════════════
+
 // AG3/AG6 Mac 가드 제거 (2026-04-12). BLOWUP_LOCAL=1 모드 삭제 — 전 플랫폼 직접 실행.
 
 // ═══════════════════════════════════════════════════════════
@@ -3655,6 +3905,17 @@ if !skip_graph {
     println("  nodes (before)   :", graph_nodes_before)
     println("  edges (before)   :", graph_edges_before)
     println("  hubs (deg>=3)    :", graph_hubs_before)
+    // AI (2026-04-21): atlas prefix bloom filter — Phase 1 post-load init.
+    // graph_load() 가 atlas.blowup.jsonl (17MB JSON sidecar) 를 반환할 수 있어
+    // @-prefix 라벨 기반 prefix 추출은 무효 → atlas.n6 본체 재참조.
+    let mut _bloom_src = graph_content
+    if file_exists(_ATLAS_PATH) {
+        try { _bloom_src = read_file(_ATLAS_PATH) } catch e {}
+    }
+    let _bloom_n = bloom_load_from_atlas(_bloom_src)
+    if _bloom_n > 0 {
+        println("  bloom filter     : " + to_string(_bloom_n) + " prefixes, m=" + to_string(_bloom_m_g) + " bits, k=" + to_string(_bloom_k_g))
+    }
 } else {
     _trace("[phase-1-skip] start")
     println("--- Phase 1: Graph Load (skipped --no-graph) ---")
@@ -5366,6 +5627,9 @@ println("  meta fixed point  : 0.333... (target)")
 if fast_mode {
     println("  ** --fast mode    : evo_cycles=" + to_string(evo_max_cycles) + " shift_cap=8 comp_limit=10 tele_cap=100 recurse_max=" + to_string(recurse_max_rounds))
 }
+// AI (2026-04-21): atlas bloom counter emit — drill-end JSON stderr
+//   NEXUS_ATLAS_BLOOM {ready,inserts,bits,hashes,bits_per_entry,bloom_hit,bloom_miss,bloom_skip_saves}
+bloom_emit_counters()
 println("")
 
 // ── discovery_log append (append_file 사용 — 전체 읽기 제거) ──
