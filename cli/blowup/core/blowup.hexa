@@ -4669,6 +4669,8 @@ let mut tag_absorptions_cnts: list = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 // ROI#48c FIX(2026-04-20): intra-batch dedup 을 string.contains() O(N²) → hashmap O(1) 로.
 //   627 corollaries × avg_needle≈16B → 기존: concat+scan = ~6M char ops/round; 신규: hashset O(1).
 let mut _absorb_existing_log_set = #{}
+// AC Phase 6 streaming: concat-grow string → O(1) hashset (O(n²) OOM 제거)
+let mut _absorb_existing_ids = #{}
 
 // Read current graph for cross-ref — AI-native: 캐시 재사용 (디스크 재읽기 제거)
 let mut absorb_graph_content = ""
@@ -4684,6 +4686,11 @@ let mut _absorb_new_ids = #{}
 let mut _absorb_log_parts = []
 let mut _absorb_graph_parts = []
 let mut _absorb_bus_parts = []
+// AC Phase 6 streaming: str += str → parts.push + join("") — O(n²) → O(n)
+// (memo 49c20260 범위 밖, 101+ concats OOM 위험 제거)
+let mut absorb_log_parts = []
+let mut absorb_graph_parts = []
+let mut absorb_bus_parts = []
 
 // Process all corollaries from Phase 6.5 recursive rounds
 let mut ci: i64 = 0
@@ -4708,8 +4715,10 @@ while ci < len(recurse_all_corollaries) {
         if cor_grade == "EXACT" {
             let dup_needle = "\"blowup-" + cor_id + "\""
             // Cross-process dedup: grep 전체 log (tail -150 대체, per-ID O(1) short-circuit)
+            // AC Phase 6: string contains 누적 → O(1) hashset (OOM 제거)
             let mut _log_dup_found = false
             if hset_has(_absorb_existing_log_set, dup_needle) {
+            if hset_has(_absorb_existing_ids, dup_needle) {
                 _log_dup_found = true
             } else {
                 try {
@@ -4727,6 +4736,7 @@ while ci < len(recurse_all_corollaries) {
                 let log_entry = "{\"constant\":\"blowup-" + dn + "\",\"value\":\"" + to_string(cor_value) + "\",\"source\":\"hexa-blowup-mk2-recurse\",\"timestamp\":\"2026-04-06\",\"grade\":\"" + cor_grade + "\",\"processed\":true,\"alien_index\":{\"d\":" + to_string(ai_d) + ",\"r\":" + to_string(ai_r) + "},\"mk2\":{\"sector\":\"" + sector + "\",\"confidence\":" + to_string(cor_conf) + ",\"paths\":1,\"prime_set\":[],\"layer\":" + to_string(ai_d) + "},\"blowup\":{\"type\":\"" + cor_type + "\",\"src\":\"" + cor_src + "\"},\"phase\":\"6.7-auto-absorb\",\"recurse_round\":\"" + cor_id + "\"}"
                 // ROI#48c: parts.push instead of s = s + x (O(n²) hot-loop avoided)
                 _absorb_log_parts = _absorb_log_parts.push(log_entry)
+                absorb_log_parts = absorb_log_parts.push(log_entry + "\n")
                 absorb_logged = absorb_logged + 1
                 // S8 (2026-04-19): 12-class tag 카운터 증가 (parallel list, saturation AND 판정용).
                 let _tag_log = classify_absorption_tag(cor_grade, cor_conf, "", "verified")
@@ -4734,6 +4744,8 @@ while ci < len(recurse_all_corollaries) {
                 tag_absorptions_cnts = _tag_bump(tag_absorptions_cnts, _ti_log)
                 // ROI#48c: hashset membership → O(1), replaces O(N) string.contains on ever-growing buffer
                 _absorb_existing_log_set[dup_needle] = true
+                // Update existing-id set to prevent duplicates within this batch (O(1))
+                _absorb_existing_ids[dup_needle] = true
             }
         }
 
@@ -4757,6 +4769,9 @@ while ci < len(recurse_all_corollaries) {
                 let node_json = graph_append_node_d(g_node_id, "RecursiveDiscovery", cor_domain, cor_type, g_conf, 1)
                 // ROI#48c: parts.push — 3~4 concat/iter × 627 iter = 2500 O(n²) ops 제거
                 _absorb_graph_parts = _absorb_graph_parts.push(node_json)
+                // AC Phase 6 streaming: 이전 "str += \\n + json" 누적 → parts.push (O(n))
+                if len(absorb_graph_parts) > 0 { absorb_graph_parts = absorb_graph_parts.push("\n") }
+                absorb_graph_parts = absorb_graph_parts.push(node_json)
                 absorb_graph_nodes = absorb_graph_nodes + 1
                 _absorb_new_ids[g_node_id] = true
 
@@ -4764,6 +4779,8 @@ while ci < len(recurse_all_corollaries) {
                 let src_node = "n6-" + cor_src
                 let edge_json = graph_append_edge(src_node, g_node_id, "RecursiveDerivation", cor_conf)
                 _absorb_graph_parts = _absorb_graph_parts.push(edge_json)
+                absorb_graph_parts = absorb_graph_parts.push("\n")
+                absorb_graph_parts = absorb_graph_parts.push(edge_json)
                 absorb_graph_edges = absorb_graph_edges + 1
 
                 // C. Cross-reference: link to existing BT nodes in graph
@@ -4774,6 +4791,8 @@ while ci < len(recurse_all_corollaries) {
                     if absorb_graph_content.contains(bt_needle) {
                         let xref_edge = graph_append_edge(g_node_id, "bt-" + cor_domain, "CrossRef", cor_conf * 0.8)
                         _absorb_graph_parts = _absorb_graph_parts.push(xref_edge)
+                        absorb_graph_parts = absorb_graph_parts.push("\n")
+                        absorb_graph_parts = absorb_graph_parts.push(xref_edge)
                         absorb_graph_edges = absorb_graph_edges + 1
                     }
                 }
@@ -4783,6 +4802,7 @@ while ci < len(recurse_all_corollaries) {
         // D. Growth bus event
         let bus_event = "{\"type\":\"absorb\",\"phase\":\"6.7\",\"id\":\"" + cor_id + "\",\"value\":" + to_string(cor_value) + ",\"grade\":\"" + cor_grade + "\",\"confidence\":" + to_string(cor_conf) + ",\"domain\":\"" + cor_domain + "\",\"is_axiom\":" + cor_is_axiom + ",\"source\":\"blowup-recurse\",\"timestamp\":\"2026-04-06\"}"
         _absorb_bus_parts = _absorb_bus_parts.push(bus_event)
+        absorb_bus_parts = absorb_bus_parts.push(bus_event + "\n")
         absorb_bus_events = absorb_bus_events + 1
     }
     ci = ci + 1
@@ -4799,18 +4819,22 @@ let _scope_reset = to_string(0)
 let _absorb_summary = to_string(absorb_logged) + "/" + to_string(absorb_graph_nodes) + "/" + to_string(absorb_bus_events)
 println("  absorb pending : " + _absorb_summary + " (log/graph/bus)")
 
-// 조건부 쓰기 — 빈 문자열이면 스킵
-if len(absorb_log_entries) > 0 {
+// AC Phase 6 streaming: parts → single join (O(n), 이전 O(n²) concat 제거)
+// 조건부 쓰기 — 빈 배열이면 스킵 (byte-for-byte 동일 출력: 각 entry 이미 "\n" suffix 포함)
+if len(absorb_log_parts) > 0 {
+    let absorb_log_entries = "".join(absorb_log_parts)
     _guarded_append_atlas(log_path, absorb_log_entries)
     println("  discovery_log  : +" + to_string(absorb_logged) + " EXACT entries → " + log_path)
 }
 
-if len(absorb_graph_entries) > 0 {
+if len(absorb_graph_parts) > 0 {
+    let absorb_graph_entries = "".join(absorb_graph_parts)
     _guarded_append_atlas(graph_path, absorb_graph_entries)
     println("  graph          : +" + to_string(absorb_graph_nodes) + " nodes → " + graph_path)
 }
 
-if len(absorb_bus_entries) > 0 {
+if len(absorb_bus_parts) > 0 {
+    let absorb_bus_entries = "".join(absorb_bus_parts)
     _guarded_append_atlas(growth_bus_path, absorb_bus_entries)
     println("  growth_bus     : +" + to_string(absorb_bus_events) + " events → " + growth_bus_path)
 }
@@ -4889,6 +4913,9 @@ if file_exists(atlas_n6_path) {
     // ROI#48c FIX(2026-04-20): atlas_append 도 parts.push + join 으로 전환 (627회 × 3 concat 제거)
     let _atlas_header = "\n\n# ── 돌파 자동흡수 (" + domain + ") ──────────────────────────\n"
     let mut _atlas_parts = [_atlas_header]
+    // AC Phase 6 streaming: atlas_append str concat 누적 (3~4 concat × ~N iter = 101+) → parts.push
+    let mut atlas_append_parts = []
+    atlas_append_parts = atlas_append_parts.push("\n\n# ── 돌파 자동흡수 (" + domain + ") ──────────────────────────\n")
     let mut abt: i64 = atlas_last_bt + 1
     let mut aci: i64 = 0
     // Per-batch dedup: 같은 fingerprint 가 한 흡수 사이클 내 중복 append 되는 것 방지
@@ -4932,6 +4959,9 @@ if file_exists(atlas_n6_path) {
                     _atlas_parts = _atlas_parts.push("@" + ac_n6_type + " n6-bt-" + to_string(abt) + " = " + ac_summary + " :: " + a_cor_domain + " [0." + to_string(ar) + g_mark + "]\n")
                     _atlas_parts = _atlas_parts.push("  <- n\n")
                     _atlas_parts = _atlas_parts.push("  !! \"자동흡수 conf=" + to_string(a_cor_conf) + "\"\n")
+                    atlas_append_parts = atlas_append_parts.push("@" + ac_n6_type + " n6-bt-" + to_string(abt) + " = " + ac_summary + " :: " + a_cor_domain + " [0." + to_string(ar) + g_mark + "]\n")
+                    atlas_append_parts = atlas_append_parts.push("  <- n\n")
+                    atlas_append_parts = atlas_append_parts.push("  !! \"자동흡수 conf=" + to_string(a_cor_conf) + "\"\n")
                     absorb_atlas_count = absorb_atlas_count + 1
                     // S8 (2026-04-19): atlas.n6 emit 시점 12-class tag 카운터 (parallel list).
                     // ac_n6_type = F (formula) or R (rule) — classify_absorption_tag 로 정규화.
@@ -4953,6 +4983,10 @@ if file_exists(atlas_n6_path) {
     try {
         let _atlas_footer = "@X n6-bt-" + to_string(atlas_last_bt + 1) + "~" + to_string(abt - 1) + " = " + domain + "_자동흡수 :: " + domain + " [8!]\n  \"" + domain + " 자동흡수 " + to_string(absorb_atlas_count) + "건\"\n"
         atlas_append = atlas_append + _atlas_footer
+        atlas_append_parts = atlas_append_parts.push("@X n6-bt-" + to_string(atlas_last_bt + 1) + "~" + to_string(abt - 1) + " = " + domain + "_자동흡수 :: " + domain + " [8!]\n")
+        atlas_append_parts = atlas_append_parts.push("  \"" + domain + " 자동흡수 " + to_string(absorb_atlas_count) + "건\"\n")
+        // AC Phase 6 streaming: parts → single join (O(n), byte-for-byte 동일)
+        let atlas_append = "".join(atlas_append_parts)
         _guarded_append_atlas(atlas_n6_path, atlas_append)
         // AI-native: BT sidecar 갱신 — 다음 drill 이 O(1) read 로 fast-path 진입
         try { write_file(_bt_sidecar, to_string(abt - 1)) } catch e {}
