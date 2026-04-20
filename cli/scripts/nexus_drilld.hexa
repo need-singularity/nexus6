@@ -1,0 +1,330 @@
+// ═══════════════════════════════════════════════════════════
+// nexus_drilld.hexa — E11 Phase 1 MVP engine daemon
+//
+// Purpose:
+//   `nexus drill` cold-start (hexa interpreter + n6 atlas + engine registry
+//   load = ~12 s per invocation) 을 1 회 boot 에 amortize 한다.
+//
+// SSOT: shared/design/engine_daemon_design.md §3 (Phase 1).
+//
+// Phase 1 scope (MVP):
+//   - stdin-less long-running process, listens on UNIX FIFO (request FIFO).
+//   - line-delimited JSON protocol (§3 변형 — NDJSON).
+//   - request  : {"op":"drill","seed":"...","max_rounds":N,"reply":"<path>"}
+//                {"op":"ping","reply":"<path>"}
+//                {"op":"quit"}
+//   - response : {"status":"ok","absorptions":N,"wall_ms":M,"round":K}
+//                {"status":"err","reason":"<tag>"}
+//                {"status":"pong","served":N,"idle_s":S,"pid":P,"uptime_s":U}
+//   - reply path 는 client 가 생성한 per-request reply-FIFO 경로.
+//     (§3.2 "/tmp/nexus_blowup.ret.sock" 대신 per-request FIFO — 동시 다중
+//      client 에서도 응답 섞임 차단, Phase 2~3 에서 단일 ret-FIFO 로 승격 가능.)
+//   - boot 시 read-only pre-load: atlas.n6 mtime/size, hexa_bin path,
+//     engine_registry.json mtime — warm-up 확인용 (Phase 2 에서 실제 in-proc
+//     atlas 캐시로 확장).
+//   - drill dispatch 는 여전히 `hexa run cli/run.hexa drill ...` exec 호출
+//     (Phase 1 MVP — 실제 in-process dispatch 는 Phase 2. Phase 1 은 단지
+//      소켓 프로토콜 + 서비스 lifecycle 만 증명.)
+//   - graceful shutdown: SIGTERM → flag 파일 touch → 현 request 완료 후 exit.
+//   - no PID file GC, no systemd/launchd integration (Phase 3).
+//
+// Hard rules:
+//   - `>=` / `<=` 금지 — `<` / `>` 또는 `!(a<b)` 로 대체.
+//   - Phase 1 MVP — ≤ 300 lines. Phase 2 가 in-process dispatch 와 state reset
+//     (§4) 을 구현한다.
+//
+// Usage:
+//   # foreground
+//   hexa run cli/scripts/nexus_drilld.hexa
+//
+//   # backgrounded (nexus drill-daemon start 래퍼 권장)
+//   nohup hexa run cli/scripts/nexus_drilld.hexa > /tmp/nexus_drilld.log 2>&1 &
+// ═══════════════════════════════════════════════════════════
+
+let VERSION = "0.1.0-phase1-mvp"
+
+// ─── paths (SSOT) ───
+let REQ_FIFO = "/tmp/nexus_drilld.sock"
+let PID_FILE = "/tmp/nexus_drilld.pid"
+let TERM_FLAG = "/tmp/nexus_drilld.term"
+let LOG_FILE = "/tmp/nexus_drilld.log"
+
+// ─── util: shell-safe quote ───
+fn _shq(s: str) -> str {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+// ─── util: nexus root / hexa bin (reuse cli/run.hexa 로직 요약) ───
+fn _nexus_root() -> str {
+    let n = env("NEXUS")
+    if n.len() > 0 { return n }
+    return env("HOME") + "/Dev/nexus"
+}
+
+fn _hexa_bin() -> str {
+    let h = env("HEXA")
+    if h.len() > 0 { return h }
+    let cands = [
+        env("HOME") + "/Dev/hexa-lang/hexa",
+        env("HOME") + "/.hx/bin/hexa",
+        _nexus_root() + "/shared/bin/hexa"
+    ]
+    let mut i = 0
+    while i < len(cands) {
+        let c = cands[i]
+        let chk = exec("[ -x " + _shq(c) + " ] && echo y || echo n").trim()
+        if chk == "y" { return c }
+        i = i + 1
+    }
+    return "hexa"
+}
+
+// ─── util: epoch seconds + ms (shell fallback — hexa time() 없음) ───
+fn _now_s() -> int {
+    let v = exec("date +%s").trim()
+    let mut n = 0
+    try { n = to_int(v) } catch e {}  // @allow-silent-catch
+    return n
+}
+
+fn _now_ms() -> int {
+    // GNU: date +%s%3N (Linux). macOS: python3 fallback.
+    let v = exec("date +%s%3N 2>/dev/null || python3 -c 'import time; print(int(time.time()*1000))' 2>/dev/null").trim()
+    let mut n = 0
+    try { n = to_int(v) } catch e {}  // @allow-silent-catch
+    return n
+}
+
+// ─── util: log line (NDJSON to /tmp/nexus_drilld.log) ───
+fn _log(event: str, kv: str) -> void {
+    let ts = to_string(_now_s())
+    let line = "{\"ts\":" + ts + ",\"event\":\"" + event + "\"" + kv + "}\n"
+    exec("printf '%s' " + _shq(line) + " >> " + _shq(LOG_FILE) + " 2>/dev/null || true")
+}
+
+// ─── util: extract int/str JSON field (naive — Phase 1 is enough) ───
+// protocol 은 1-line flat JSON 만 지원: {"op":"drill","seed":"...","max_rounds":3,"reply":"/tmp/xxx"}
+fn _json_str(line: str, key: str) -> str {
+    let pat = "\"" + key + "\":\""
+    let i = line.indexof(pat)
+    if i < 0 { return "" }
+    let start = i + pat.len()
+    let mut j = start
+    let n = line.len()
+    while j < n {
+        let c = line.substring(j, j + 1)
+        if c == "\"" { return line.substring(start, j) }
+        if c == "\\" { j = j + 2; continue }  // naive escape skip
+        j = j + 1
+    }
+    return ""
+}
+
+fn _json_int(line: str, key: str) -> int {
+    let pat = "\"" + key + "\":"
+    let i = line.indexof(pat)
+    if i < 0 { return -1 }
+    let mut j = i + pat.len()
+    let n = line.len()
+    // skip ws
+    while j < n {
+        let c = line.substring(j, j + 1)
+        if c != " " && c != "\t" { break }
+        j = j + 1
+    }
+    let start = j
+    while j < n {
+        let c = line.substring(j, j + 1)
+        let is_digit = c == "0" || c == "1" || c == "2" || c == "3" || c == "4"
+            || c == "5" || c == "6" || c == "7" || c == "8" || c == "9" || c == "-"
+        if !is_digit { break }
+        j = j + 1
+    }
+    if j == start { return -1 }
+    let raw = line.substring(start, j)
+    let mut v = -1
+    try { v = to_int(raw) } catch e {}  // @allow-silent-catch
+    return v
+}
+
+// ─── util: write a single JSON line to reply path (blocking if FIFO) ───
+fn _reply(reply_path: str, payload: str) -> void {
+    if reply_path.len() == 0 { return }
+    let cmd = "printf '%s\\n' " + _shq(payload) + " > " + _shq(reply_path) + " 2>/dev/null || true"
+    exec(cmd)
+}
+
+// ─── boot phase: pre-load engine state (Phase 1 = stat-check warm-up) ───
+fn _preload_state() -> str {
+    // Phase 1 MVP: atlas.n6 mtime/size + engine registry mtime 확인 만 수행.
+    // 실제 in-process 캐싱은 Phase 2 (byte-identity test 후).
+    let root = _nexus_root()
+    let atlas = root + "/shared/n6/atlas.n6"
+    let reg = root + "/shared/config/engine_registry.json"
+    let mut parts: [str] = []
+    parts = parts + ["\"atlas\":\""]
+    if file_exists(atlas) {
+        let sz = exec("wc -c < " + _shq(atlas) + " 2>/dev/null || echo 0").trim()
+        parts = parts + [sz]
+    } else {
+        parts = parts + ["0"]
+    }
+    parts = parts + ["\",\"registry\":"]
+    parts = parts + [if file_exists(reg) { "true" } else { "false" }]
+    return parts.join("")
+}
+
+// ─── lifecycle: PID file, FIFO, TERM trap ───
+fn _setup_lifecycle() -> int {
+    // PID file
+    let pid_raw = exec("echo $$").trim()
+    let pid = if pid_raw.len() > 0 { pid_raw } else { "0" }
+    write_file(PID_FILE, pid + "\n")
+
+    // FIFO (mkfifo fails cleanly if exists — we unlink first)
+    exec("rm -f " + _shq(REQ_FIFO) + " 2>/dev/null || true")
+    let rc = exec("mkfifo -m 0600 " + _shq(REQ_FIFO) + " 2>&1; echo RC=$?").trim()
+    if !rc.contains("RC=0") {
+        eprintln("nexus_drilld: mkfifo failed: " + rc)
+        return 1
+    }
+
+    // SIGTERM trap — touch TERM_FLAG. (hexa exec subshell scope — drill pattern과 동일
+    // 외부에서 `kill -TERM $(cat /tmp/nexus_drilld.pid)` 시 user 가 직접 touch 해도 OK.)
+    exec("rm -f " + _shq(TERM_FLAG) + " 2>/dev/null || true")
+    exec("trap 'touch " + _shq(TERM_FLAG) + "' INT TERM 2>/dev/null || true")
+
+    let mut v = 0
+    try { v = to_int(pid) } catch e { v = 0 }  // @allow-silent-catch
+    return v
+}
+
+fn _cleanup_lifecycle() -> void {
+    exec("rm -f " + _shq(REQ_FIFO) + " " + _shq(PID_FILE) + " " + _shq(TERM_FLAG) + " 2>/dev/null || true")
+}
+
+fn _term_requested() -> bool {
+    let chk = exec("[ -f " + _shq(TERM_FLAG) + " ] && echo y || echo n").trim()
+    return chk == "y"
+}
+
+// ─── op handlers ───
+fn _handle_ping(reply: str, served: int, boot_s: int, last_req_s: int) -> void {
+    let now = _now_s()
+    let uptime = now - boot_s
+    let idle = now - last_req_s
+    let pid = exec("echo $$").trim()
+    let pid_safe = if pid.len() > 0 { pid } else { "0" }
+    let payload = "{\"status\":\"pong\",\"served\":" + to_string(served)
+        + ",\"idle_s\":" + to_string(idle)
+        + ",\"uptime_s\":" + to_string(uptime)
+        + ",\"pid\":" + pid_safe
+        + ",\"version\":\"" + VERSION + "\"}"
+    _reply(reply, payload)
+}
+
+fn _handle_drill(seed: str, max_rounds: int, reply: str) -> void {
+    if seed.len() == 0 {
+        _reply(reply, "{\"status\":\"err\",\"reason\":\"seed_empty\"}")
+        return
+    }
+    let mr = if max_rounds > 0 { max_rounds } else { 1 }
+    // Phase 1 MVP: dispatch by exec-ing `nexus drill` — still amortizes client-side hexa startup
+    // (daemon 프로세스는 이미 부팅 완료 = 클라이언트가 매번 hexa run 을 돌리지 않아도 됨).
+    // Phase 2 에서 in-process 호출로 치환.
+    let root = _nexus_root()
+    let run_hexa = root + "/cli/run.hexa"
+    let cmd = _hexa_bin() + " run " + _shq(run_hexa) + " drill"
+        + " --seed " + _shq(seed)
+        + " --max-rounds " + to_string(mr)
+        + " --preset fast 2>&1"
+    let t0 = _now_ms()
+    let out = exec(cmd)
+    let t1 = _now_ms()
+    let wall = t1 - t0
+
+    // naive absorption count — parse stdout for "ROUND <k>" lines or final absorption count.
+    // Phase 1 은 대충 round 수 만 추출 (실제 absorptions 은 Phase 2 에서 정확히).
+    let lines = out.split("\n")
+    let mut rounds = 0
+    let mut absorb = 0
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i]
+        if ln.contains("ROUND ") { rounds = rounds + 1 }
+        if ln.contains("absorption") || ln.contains("ABSORB") { absorb = absorb + 1 }
+        i = i + 1
+    }
+    let payload = "{\"status\":\"ok\""
+        + ",\"absorptions\":" + to_string(absorb)
+        + ",\"wall_ms\":" + to_string(wall)
+        + ",\"rounds\":" + to_string(rounds)
+        + ",\"seed\":\"" + seed.replace("\"", "\\\"") + "\"}"
+    _reply(reply, payload)
+}
+
+// ─── main loop ───
+fn _main_loop(boot_s: int) -> int {
+    let mut served = 0
+    let mut last_req_s = boot_s
+    let mut draining = false
+
+    _log("ready", ",\"version\":\"" + VERSION + "\",\"preload\":{" + _preload_state() + "}")
+
+    while true {
+        if _term_requested() {
+            draining = true
+            _log("sigterm_recv", ",\"served\":" + to_string(served))
+            break
+        }
+        // blocking read one line from FIFO (opening FIFO for read blocks until writer connects).
+        // IFS= 와 -r 로 escape/whitespace 보존. `|| true` 로 writer EOF 시 정상 리턴.
+        let raw = exec("IFS= read -r LINE < " + _shq(REQ_FIFO) + " && printf '%s' \"$LINE\" || true")
+        let line = raw.trim()
+        if line.len() == 0 { continue }
+
+        let op = _json_str(line, "op")
+        let reply = _json_str(line, "reply")
+        served = served + 1
+        last_req_s = _now_s()
+        _log("request", ",\"op\":\"" + op + "\",\"served\":" + to_string(served))
+
+        if op == "ping" {
+            _handle_ping(reply, served - 1, boot_s, last_req_s)
+            continue
+        }
+        if op == "quit" {
+            _log("quit_recv", ",\"served\":" + to_string(served))
+            _reply(reply, "{\"status\":\"ok\",\"msg\":\"bye\"}")
+            draining = true
+            break
+        }
+        if op == "drill" {
+            let seed = _json_str(line, "seed")
+            let mr = _json_int(line, "max_rounds")
+            _handle_drill(seed, mr, reply)
+            continue
+        }
+        _reply(reply, "{\"status\":\"err\",\"reason\":\"unknown_op\",\"op\":\"" + op + "\"}")
+    }
+
+    _log("shutdown", ",\"served\":" + to_string(served) + ",\"drain\":" + (if draining { "true" } else { "false" }))
+    return 0
+}
+
+// ─── entry ───
+fn main() -> void {
+    let boot_s = _now_s()
+    let pid = _setup_lifecycle()
+    if pid == 0 {
+        eprintln("nexus_drilld: lifecycle setup failed")
+        exit(1)  // @allow-silent-exit
+    }
+    _log("boot", ",\"pid\":" + to_string(pid) + ",\"req_fifo\":\"" + REQ_FIFO + "\"")
+    println("nexus_drilld: READY pid=" + to_string(pid) + " fifo=" + REQ_FIFO)
+    let rc = _main_loop(boot_s)
+    _cleanup_lifecycle()
+    exit(rc)  // @allow-silent-exit
+}
+
+main()

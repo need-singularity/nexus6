@@ -189,6 +189,8 @@ fn cmd_help() -> void {
     println("        [--speculate N]   E18 same-round N-way fork, best-keep (기본 1, 권장 cap 3, NEXUS_SPECULATE=0 강제 N=1)")
     println("        [--fresh | --no-resume]  E9 fast-resume opt-out (기본 resume ON — SIGKILL 후 재시작 시 seed-hash 매치로 즉시 복구)")
     println("        [--checkpoint-dir <path>]  state file dir (기본 /tmp/nexus_checkpoint, env NEXUS_CHECKPOINT_DIR)")
+    println("  drill-daemon <start|status|stop|send>   E11 Phase 1 MVP — long-running daemon (FIFO /tmp/nexus_drilld.sock)")
+    println("        send --req '<json>'               raw NDJSON request — ops: drill|ping|quit (reply field auto-injected)")
     println("  meta-closure --seed \"...\"              Phase 10 🛸16 self-ref 검증 ([10*]→[10**])")
     println("  hyperarithmetic --prop \"...\"           Mk.IX Π₀² reverse-math 판정")
     println("  promote --id ... --grade ... --audit-log \"...\"  수동 등급 승급 (감사 로그 필수)")
@@ -3400,6 +3402,120 @@ fn cmd_drill_batch(seeds: [str], max_rounds: str, engine_flag: str, preset: str,
     _batch_shared_cleanup()
 }
 
+// ═══════════════════════════════════════════════════════════
+// E11 Phase 1 — drill-daemon thin client
+// SSOT: shared/design/engine_daemon_design.md §3 (Phase 1 scope)
+// daemon entry: cli/scripts/nexus_drilld.hexa
+// protocol: line-delimited JSON over UNIX FIFO /tmp/nexus_drilld.sock
+// reply: per-request reply-FIFO (client creates + consumes, then unlinks).
+// ═══════════════════════════════════════════════════════════
+let DRILLD_FIFO = "/tmp/nexus_drilld.sock"
+let DRILLD_PID  = "/tmp/nexus_drilld.pid"
+let DRILLD_LOG  = "/tmp/nexus_drilld.log"
+
+fn _drilld_alive() -> bool {
+    let chk = exec("[ -p " + shell_quote(DRILLD_FIFO) + " ] && [ -f " + shell_quote(DRILLD_PID) + " ] && echo y || echo n").trim()
+    if chk != "y" { return false }
+    let pid = exec("cat " + shell_quote(DRILLD_PID) + " 2>/dev/null").trim()
+    if pid.len() == 0 { return false }
+    let alive = exec("kill -0 " + shell_quote(pid) + " 2>/dev/null && echo y || echo n").trim()
+    return alive == "y"
+}
+
+fn _drilld_send(request: str, want_reply: bool) -> str {
+    // 1. 선택적으로 reply-FIFO 생성 (per-request, 경합 회피)
+    let reply_path = if want_reply {
+        exec("mktemp -u /tmp/nexus_drilld_reply_XXXXXX").trim()
+    } else { "" }
+    let mut final_req = request
+    if want_reply && reply_path.len() > 0 {
+        exec("mkfifo -m 0600 " + shell_quote(reply_path) + " 2>/dev/null || true")
+        // inject "reply":"<path>" — 요청 JSON 끝 } 앞에 삽입
+        if final_req.ends_with("}") {
+            let cut = final_req.substring(0, final_req.len() - 1)
+            let sep = if cut.ends_with("{") { "" } else { "," }
+            final_req = cut + sep + "\"reply\":\"" + reply_path + "\"}"
+        }
+    }
+    // 2. write request 1 line
+    let wcmd = "printf '%s\\n' " + shell_quote(final_req) + " > " + shell_quote(DRILLD_FIFO)
+    exec(wcmd)
+    // 3. read reply (blocking) — want_reply=false 시 스킵
+    if !want_reply { return "" }
+    if reply_path.len() == 0 { return "" }
+    let rcmd = "IFS= read -r LINE < " + shell_quote(reply_path) + " && printf '%s' \"$LINE\" || true"
+    let resp = exec(rcmd)
+    exec("rm -f " + shell_quote(reply_path) + " 2>/dev/null || true")
+    return resp
+}
+
+fn cmd_drill_daemon(sub: str, a: [str]) -> void {
+    if sub == "start" {
+        if _drilld_alive() {
+            println("drill-daemon: already running (pid=" + exec("cat " + shell_quote(DRILLD_PID) + " 2>/dev/null").trim() + ")")
+            return
+        }
+        let root = nexus_root()
+        let script = root + "/cli/scripts/nexus_drilld.hexa"
+        let cmd = "nohup " + shell_quote(hexa_bin()) + " run " + shell_quote(script)
+            + " > " + shell_quote(DRILLD_LOG) + " 2>&1 &"
+        exec(cmd)
+        // give the daemon a short moment to mkfifo + write PID
+        exec("i=0; while [ $i -lt 20 ] && [ ! -p " + shell_quote(DRILLD_FIFO) + " ]; do sleep 0.1; i=$((i+1)); done")
+        if _drilld_alive() {
+            println("drill-daemon: started (pid=" + exec("cat " + shell_quote(DRILLD_PID) + " 2>/dev/null").trim()
+                + " fifo=" + DRILLD_FIFO + " log=" + DRILLD_LOG + ")")
+        } else {
+            eprintln("drill-daemon: start failed — check " + DRILLD_LOG)
+            exit(1)
+        }
+        return
+    }
+    if sub == "status" {
+        if !_drilld_alive() {
+            println("drill-daemon: not running")
+            exit(1)
+        }
+        let resp = _drilld_send("{\"op\":\"ping\"}", true)
+        println("drill-daemon: alive")
+        println(resp)
+        return
+    }
+    if sub == "stop" {
+        if !_drilld_alive() {
+            println("drill-daemon: not running")
+            return
+        }
+        // graceful — quit op 후 fallback SIGTERM
+        let _ = _drilld_send("{\"op\":\"quit\"}", false)
+        let pid = exec("cat " + shell_quote(DRILLD_PID) + " 2>/dev/null").trim()
+        if pid.len() > 0 {
+            exec("kill -TERM " + shell_quote(pid) + " 2>/dev/null || true")
+            // poll up to 2s
+            exec("i=0; while [ $i -lt 20 ] && kill -0 " + shell_quote(pid) + " 2>/dev/null; do sleep 0.1; i=$((i+1)); done")
+        }
+        println("drill-daemon: stopped")
+        return
+    }
+    if sub == "send" {
+        // raw JSON pass-through — user supplies `--req '{"op":"drill",...}'`
+        let req = find_flag(a, "--req", "")
+        if req.len() == 0 {
+            eprintln("drill-daemon send: --req '<json>' required")
+            exit(1)
+        }
+        if !_drilld_alive() {
+            eprintln("drill-daemon send: daemon not running — run `nexus drill-daemon start` first")
+            exit(1)
+        }
+        let resp = _drilld_send(req, true)
+        println(resp)
+        return
+    }
+    eprintln("drill-daemon: unknown sub '" + sub + "' — expected start|status|stop|send")
+    exit(1)
+}
+
 fn cmd_meta_closure(seed: str) -> void {
     let s = if seed.len() > 0 { seed } else { "atlas" }
     let engine = nexus_root() + "/cli/blowup/modules/blowup_meta_closure.hexa"
@@ -3861,6 +3977,16 @@ fn main() -> void {
     }
     if sub == "atlas" {
         cmd_atlas(a); return
+    }
+    if sub == "drill-daemon" {
+        // E11 Phase 1 — drill daemon control plane (start|status|stop|send).
+        let dsub = if n > 3 { a[3] } else { "" }
+        if dsub.len() == 0 {
+            eprintln("nexus drill-daemon: sub required — start|status|stop|send")
+            exit(1)
+        }
+        cmd_drill_daemon(dsub, a)
+        return
     }
     if sub == "roadmap" {
         cmd_roadmap(a); return
