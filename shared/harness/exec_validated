@@ -18,7 +18,7 @@ NEXUS_ROOT="${NEXUS:-$HOME_DIR/Dev/nexus}"
 HEXA="$NEXUS_ROOT/shared/bin/hexa"
 GATE="$NEXUS_ROOT/shared/harness/cmd_gate.hexa"
 LOCK_GATE="$NEXUS_ROOT/shared/harness/lock_gate.sh"
-HEXA_TIMEOUT="${NEXUS_HEXA_TIMEOUT:-60}"
+HEXA_TIMEOUT="${NEXUS_HEXA_TIMEOUT:-600}"
 
 if [ "$#" -lt 3 ]; then
     echo "usage: exec_validated <cmd> \"<seed>\" <engine.hexa> [args...]" >&2
@@ -43,31 +43,54 @@ run_hexa() {
     local base
     base=$(basename "$engine" .hexa)
 
-    # ── blowup 자동 slice 배치 (always-on, NEXUS_NO_SLICE=1 로 비활성) ──
-    # blowup*.hexa 는 airgenome-stress.slice (MemoryMax=50%, CPUWeight=10) 안에서 실행.
-    # 목적: 다수 claude 동시 blowup → OOM/swap thrash 로 ubu 전체 먹통 방지.
+    # ── drill/blowup 자동 slice 배치 (always-on, opt-out 으로 비활성) ──
+    # drill.slice (CPUQuota=400%, MemoryMax=12G, IOWeight=500) 우선 진입 → sshd 여유 확보.
+    # fallback: airgenome-stress.slice (legacy) → cgroup.procs 직접 write → bare exec.
+    # opt-out: NO_DRILL_SLICE=1 (사용자 스펙) 또는 NEXUS_NO_SLICE=1 (legacy 유지).
     # Mac (Darwin) 에서는 skip — slice 는 Linux systemd user 전제.
-    case "$engine" in
-        *blowup*)
-            if [ "$(uname)" = "Linux" ] && [ -z "${NEXUS_NO_SLICE:-}" ]; then
-                if command -v systemd-run >/dev/null 2>&1; then
-                    # claude bash tool env 에는 DBUS_SESSION_BUS_ADDRESS / XDG_RUNTIME_DIR 누락 →
-                    # systemd-run --user 가 조용히 실패 → slice 미적용 재현 경로. 명시 주입.
-                    : "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
-                    : "${DBUS_SESSION_BUS_ADDRESS:=unix:path=$XDG_RUNTIME_DIR/bus}"
-                    export XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
-                    # 적용 검증: 실패 시 cgroup.procs 직접 이관으로 fallback
-                    if systemd-run --user --scope --quiet \
-                        --slice=airgenome-stress.slice \
-                        "$HEXA" run "$engine" "$@" 2>/dev/null; then
-                        exit $?
-                    fi
-                    # fallback: cgroup.procs 직접 write + 그냥 exec
-                    CG=/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/airgenome.slice/airgenome-stress.slice/cgroup.procs
-                    [ -w "$CG" ] && echo $$ > "$CG" 2>/dev/null
-                    exec "$HEXA" run "$engine" "$@"
-                fi
+    # 대상: blowup*.hexa, compose.hexa (drill 사슬 — smash/free_dfs/absolute/meta-closure/hyperarithmetic 전원 통과).
+    _ng_slice_dispatch() {
+        # $1 = engine; rest = engine args. 성공 시 exit, 실패 시 return 1 로 caller 가 pass-through.
+        local _eng="$1"; shift
+        if [ "$(uname)" != "Linux" ]; then return 1; fi
+        if [ -n "${NO_DRILL_SLICE:-}" ] || [ -n "${NEXUS_NO_SLICE:-}" ]; then return 1; fi
+        command -v systemd-run >/dev/null 2>&1 || return 1
+
+        # claude bash tool env 에는 DBUS_SESSION_BUS_ADDRESS / XDG_RUNTIME_DIR 누락 →
+        # systemd-run --user 가 조용히 실패 → slice 미적용 재현 경로. 명시 주입.
+        : "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
+        : "${DBUS_SESSION_BUS_ADDRESS:=unix:path=$XDG_RUNTIME_DIR/bus}"
+        export XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
+
+        # 1순위: drill.slice (정의된 호스트에서만 — systemctl --user cat 로 확인)
+        if systemctl --user cat drill.slice >/dev/null 2>&1; then
+            if systemd-run --user --scope --quiet \
+                --unit="drill-$$-$(date +%s%N)" \
+                --slice=drill.slice \
+                "$HEXA" run "$_eng" "$@" 2>/dev/null; then
+                exit $?
             fi
+        fi
+
+        # 2순위: airgenome-stress.slice (legacy — airgenome.slice 계층)
+        if systemctl --user cat airgenome-stress.slice >/dev/null 2>&1; then
+            if systemd-run --user --scope --quiet \
+                --slice=airgenome-stress.slice \
+                "$HEXA" run "$_eng" "$@" 2>/dev/null; then
+                exit $?
+            fi
+        fi
+
+        # 3순위: cgroup.procs 직접 write (airgenome-stress)
+        local _cg=/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/airgenome.slice/airgenome-stress.slice/cgroup.procs
+        [ -w "$_cg" ] && echo $$ > "$_cg" 2>/dev/null
+        exec "$HEXA" run "$_eng" "$@"
+    }
+
+    case "$engine" in
+        *blowup*|*/compose.hexa)
+            # set -e + return 1 fallthrough: || true 로 pass-through 보장
+            _ng_slice_dispatch "$engine" "$@" || true
             ;;
     esac
 
@@ -94,41 +117,81 @@ run_hexa() {
         exec "$HEXA" run "$engine" "$@"
     fi
 
-    # lock acquire
+    # lock acquire — 병렬 시드 허용 (seed hash 별 lock name)
+    # WHY: blowup engine 병렬 실행 시 lock_gate 가 단일 'blowup' 으로 모든 시드 차단했던 문제.
+    # FIX (2026-04-20): seed 첫 인자에서 8자 hash → base+hash 로 lock name 분리.
+    # wait_s 5→60 으로 연장 (race 시 짧게 포기하지 않고 큐잉 동작).
+    # bypass: NEXUS_PARALLEL_LOCK=0 이면 기존 단일 lock 동작 (직렬 보장).
     if [ -z "$NEXUS_NO_LOCK" ] && [ -x "$LOCK_GATE" ]; then
-        if ! "$LOCK_GATE" acquire "$base" 5; then
-            echo "BLOCK: lock_gate — '$base' 이미 실행중 (5s 대기 후 포기)" >&2
+        local lock_name="$base"
+        if [ "${NEXUS_PARALLEL_LOCK:-1}" = "1" ] && [ -n "$1" ]; then
+            local _seed_hash
+            _seed_hash=$(printf %s "$1" | shasum 2>/dev/null | cut -c1-8)
+            [ -n "$_seed_hash" ] && lock_name="${base}_${_seed_hash}"
+        fi
+        if ! "$LOCK_GATE" acquire "$lock_name" 60; then
+            echo "BLOCK: lock_gate — '$lock_name' 이미 실행중 (60s 대기 후 포기)" >&2
             exit 75
         fi
         # shellcheck disable=SC2064
-        trap "\"$LOCK_GATE\" release \"$base\" 2>/dev/null" EXIT
+        trap "\"$LOCK_GATE\" release \"$lock_name\" 2>/dev/null" EXIT
     fi
 
     # timeout via perl alarm
-    perl -e '
-        use strict; use warnings;
-        my $t = shift; my @cmd = @ARGV;
-        my $pid = fork(); die "fork: $!" unless defined $pid;
-        if ($pid == 0) { exec @cmd; die "exec: $!"; }
-        my $timed_out = 0;
-        eval {
-            local $SIG{ALRM} = sub {
-                $timed_out = 1;
-                kill "TERM", $pid;
-                sleep 5;
-                kill "KILL", $pid;
-                die "timeout\n";
+    # PERF noise filter — hexa 인터프리터 자체의 string concat O(n²) 진단 메시지 필터.
+    # blowup engine (5396 라인) 의 광범위 concat 패턴 리팩터는 별도 작업.
+    # opt-out: NEXUS_PERF_VERBOSE=1 이면 PERF 경고 표시.
+    if [ "${NEXUS_PERF_VERBOSE:-0}" = "1" ]; then
+        perl -e '
+            use strict; use warnings;
+            my $t = shift; my @cmd = @ARGV;
+            my $pid = fork(); die "fork: $!" unless defined $pid;
+            if ($pid == 0) { exec @cmd; die "exec: $!"; }
+            my $timed_out = 0;
+            eval {
+                local $SIG{ALRM} = sub {
+                    $timed_out = 1;
+                    kill "TERM", $pid;
+                    sleep 5;
+                    kill "KILL", $pid;
+                    die "timeout\n";
+                };
+                alarm $t;
+                waitpid($pid, 0);
+                alarm 0;
             };
-            alarm $t;
-            waitpid($pid, 0);
-            alarm 0;
-        };
-        if ($timed_out || ($@ && $@ =~ /timeout/)) {
-            print STDERR "BLOCK: timeout ${t}s — process killed\n";
-            exit 124;
-        }
-        exit($? >> 8);
-    ' "$HEXA_TIMEOUT" "$HEXA" run "$engine" "$@"
+            if ($timed_out || ($@ && $@ =~ /timeout/)) {
+                print STDERR "BLOCK: timeout ${t}s — process killed\n";
+                exit 124;
+            }
+            exit($? >> 8);
+        ' "$HEXA_TIMEOUT" "$HEXA" run "$engine" "$@"
+    else
+        perl -e '
+            use strict; use warnings;
+            my $t = shift; my @cmd = @ARGV;
+            my $pid = fork(); die "fork: $!" unless defined $pid;
+            if ($pid == 0) { exec @cmd; die "exec: $!"; }
+            my $timed_out = 0;
+            eval {
+                local $SIG{ALRM} = sub {
+                    $timed_out = 1;
+                    kill "TERM", $pid;
+                    sleep 5;
+                    kill "KILL", $pid;
+                    die "timeout\n";
+                };
+                alarm $t;
+                waitpid($pid, 0);
+                alarm 0;
+            };
+            if ($timed_out || ($@ && $@ =~ /timeout/)) {
+                print STDERR "BLOCK: timeout ${t}s — process killed\n";
+                exit 124;
+            }
+            exit($? >> 8);
+        ' "$HEXA_TIMEOUT" "$HEXA" run "$engine" "$@" 2> >(grep -v "^PERF: .* string concatenations detected" >&2)
+    fi
 }
 
 # gate 호출 — set -e 가 cmd substitution 에 전파 안 되므로 exit code 명시 캡처
