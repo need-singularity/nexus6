@@ -51,6 +51,74 @@ let _MODULES_DIR = _NEXUS_DIR + "/shared/blowup/modules"
 let _HEALTH_HEXA = _NEXUS_DIR + "/shared/n6/atlas_health.hexa"
 let _BLOWUP_DIR  = _NEXUS_DIR + "/shared/blowup"
 let _N6_DIR      = _NEXUS_DIR + "/shared/n6"
+let _ATLAS_N6    = _NEXUS_DIR + "/shared/n6/atlas.n6"
+
+// ─── ai-native JSON emit helpers (stderr typed death signals) ───
+// NEXUS_ENGINE_{DEAD,ERROR,WARN} — engine 내부 silent-fail 차단용.
+// 외부 preflight 스크립트 대신 engine 진입부/에러 지점/의심 경로에서 직접 emit.
+fn _ce_json_esc(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", " ")
+    r = r.replace("\r", " ")
+    r = r.replace("\t", " ")
+    return r
+}
+
+// 간이 seed_hash (문자열 길이 + 앞 16자 prefix — 식별 추적용. 외부 해시 빌트인 비가용 환경 방어).
+fn _ce_seed_hash(seed: string) -> string {
+    let n = len(seed)
+    let mut head: string = ""
+    if n >= 16 {
+        head = seed[0..16]
+    } else {
+        head = seed
+    }
+    return "l" + to_string(n) + "_" + _ce_json_esc(head)
+}
+
+fn emit_engine_dead(engine_name: string, missing_path: string, stage: string, hint: string) {
+    eprintln("NEXUS_ENGINE_DEAD {\"engine\":\"" + _ce_json_esc(engine_name)
+        + "\",\"missing\":\"" + _ce_json_esc(missing_path)
+        + "\",\"stage\":\"" + _ce_json_esc(stage)
+        + "\",\"recovery_hint\":\"" + _ce_json_esc(hint) + "\"}")
+}
+
+fn emit_engine_error(engine_name: string, phase: string, code: string, msg: string,
+                     recoverable: bool, seed_hash: string) {
+    let mut rec = "false"
+    if recoverable { rec = "true" }
+    eprintln("NEXUS_ENGINE_ERROR {\"engine\":\"" + _ce_json_esc(engine_name)
+        + "\",\"phase\":\"" + _ce_json_esc(phase)
+        + "\",\"code\":\"" + _ce_json_esc(code)
+        + "\",\"msg\":\"" + _ce_json_esc(msg)
+        + "\",\"recoverable\":" + rec
+        + ",\"seed_hash\":\"" + _ce_json_esc(seed_hash) + "\"}")
+}
+
+fn emit_engine_warn(engine_name: string, reason: string, detail: string, seed_hash: string) {
+    eprintln("NEXUS_ENGINE_WARN {\"engine\":\"" + _ce_json_esc(engine_name)
+        + "\",\"reason\":\"" + _ce_json_esc(reason)
+        + "\",\"detail\":\"" + _ce_json_esc(detail)
+        + "\",\"seed_hash\":\"" + _ce_json_esc(seed_hash) + "\"}")
+}
+
+// ─── F1: engine self-check (compose 진입부) ───
+// atlas.n6 read 가능 + core blowup.hexa 존재 — 둘 중 하나라도 없으면 DEAD emit 후 exit(1).
+// 정상 경로는 빠르게 통과. file_exists 는 순수 경로 체크, IO 부하 수 μs.
+let mut _compose_selfcheck_ok = true
+if !file_exists(_ATLAS_N6) {
+    emit_engine_dead("compose", _ATLAS_N6, "init",
+        "run scan_math_atlas or restore shared/n6/atlas.n6 from backup")
+    _compose_selfcheck_ok = false
+}
+if _compose_selfcheck_ok && !file_exists(_BLOWUP_CORE) {
+    emit_engine_dead("compose", _BLOWUP_CORE, "init",
+        "verify shared/blowup/core/blowup.hexa exists — may have been moved/deleted")
+    _compose_selfcheck_ok = false
+}
+if !_compose_selfcheck_ok { exit(1) }  // @allow-silent-exit
 
 // ─── 확장 모듈 경로 해석 테이블 ───
 // 코어 6종(field,holographic,quantum,string,toe,absolute)은 blowup_<name>.hexa 규칙 유지.
@@ -241,6 +309,13 @@ if modules_csv == "core8" {
 if modules_csv == "sparse5" {
     modules_csv = "higher_category,topos,hott,motivic,derived_algebraic"
 }
+// F2/F3 추적 카운터 — 요청된 모듈 resolution 결과 타입화.
+let mut _mod_requested: i64 = 0
+let mut _mod_resolved:  i64 = 0
+let mut _mod_missing:   i64 = 0
+let mut _mod_unsafe:    i64 = 0
+let mut _mod_exec_err:  i64 = 0
+let _compose_seed_hash = _ce_seed_hash(domain)
 if modules_csv != "" {
     let mods = modules_csv.split(",")
     let mut mi: i64 = 0
@@ -249,6 +324,7 @@ if modules_csv != "" {
         let m_trim = m_raw.trim()
         mi = mi + 1
         if m_trim == "" { continue }
+        _mod_requested = _mod_requested + 1
         // 모듈 이름 sanitization: 영숫자 + underscore 만 허용 (path traversal/injection 차단)
         // gotcha-2 해소 완료: hexa String 대소비교(>=, <=) 미지원 → .contains() 화이트리스트로 교체
         // 이전 코드: _ch >= "a" && _ch <= "z" → error[Type]: unsupported binary operation: Str Ge Str
@@ -261,16 +337,27 @@ if modules_csv != "" {
             _ci = _ci + 1
         }
         if !_safe {
+            _mod_unsafe = _mod_unsafe + 1
+            // F2: 비안전 모듈 이름 — typed CONSTRAINT_VIOLATION
+            emit_engine_error("compose", "stage2", "CONSTRAINT_VIOLATION",
+                "module name contains non-alnum char: " + m_trim,
+                false, _compose_seed_hash)
             println("")
             println("--- STAGE: " + m_trim + " SKIP (비안전 문자 포함 — 영숫자+_만 허용)")
             continue
         }
         let mod_path = _resolve_module_path(m_trim)
         if !file_exists(mod_path) {
+            _mod_missing = _mod_missing + 1
+            // F2: 모듈 파일 부재 — typed DOMAIN_MISS
+            emit_engine_error("compose", "stage2", "DOMAIN_MISS",
+                "module file missing: " + mod_path,
+                false, _compose_seed_hash)
             println("")
             println("--- STAGE: " + m_trim + " SKIP (모듈 없음: " + mod_path + ")")
             continue
         }
+        _mod_resolved = _mod_resolved + 1
         println("")
         println("--- STAGE: " + m_trim + " ---")
         // 메모리 제한 2GB로 OOM/SIGKILL 완충
@@ -279,9 +366,24 @@ if modules_csv != "" {
             let _mout = exec("bash", ["-c", mod_cmd])
             println(to_string(_mout))
         } catch _me {  // @allow-silent-catch
+            _mod_exec_err = _mod_exec_err + 1
+            // F2: 모듈 실행 예외 — typed PHASE_FAIL
+            emit_engine_error("compose", "stage2", "PHASE_FAIL",
+                "module exec raised: " + m_trim,
+                true, _compose_seed_hash)
             println("  [" + m_trim + "] 실행 오류 (chain 계속): " + to_string(_me))
         }
     }
+}
+
+// F3: 요청 모듈 0/N resolved 는 의심 — 모든 모듈이 DOMAIN_MISS 인데 exit 1 은 깨지는
+// call site 호환성 훼손 → 경고만 emit (caller 가 연속 WARN 집계).
+if _mod_requested > 0 && _mod_resolved == 0 {
+    emit_engine_warn("compose", "zero_yield_suspicious",
+        "requested=" + to_string(_mod_requested)
+        + " resolved=0 missing=" + to_string(_mod_missing)
+        + " unsafe=" + to_string(_mod_unsafe),
+        _compose_seed_hash)
 }
 
 // ─── Stage 3: 조립 완료 + health ───
