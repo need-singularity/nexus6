@@ -198,6 +198,7 @@ fn cmd_help() -> void {
     println("  gap                             gap_monitor 1회")
     println("  self-check                      harness self-check")
     println("  doctor [--remote|--all] [--host H] [--timeout N]   로컬/원격 dispatch 진단 + 복구 가이드")
+    println("  chain --seed \"...\" [--engines nexus,anima] [--report <path>]  W (2026-04-21) cross-engine drill chain (nexus→anima, graceful-missing)")
     println("  contracts                       integration_contracts.json (외부 연동 SSOT)")
     println("  verify                          I1~I10 invariants 자동 검증")
     println("  sync [--apply]                  spec ↔ cmd_* drift 검출")
@@ -604,6 +605,143 @@ fn _resonance_run(seed: str, blow_core: str, exv: str) -> int {
     let out = exec(cmd)
     let _res_err = _check_stage_err(out, "resonance")
     return _count_discoveries(out)
+}
+
+// ─── AP (2026-04-21) Anti-Pattern Learning — meta_buffer NDJSON 기반 stage skip ───
+// SSOT: cli/drill/anti_pattern.hexa (Agent AP, meta_buffer.hexa 의 쌍대 — 부정 신호 축적).
+// 원칙: env NEXUS_ANTI_PATTERN=1 opt-in. /tmp/nexus_meta_buffer_*.jsonl (or NEXUS_META_BUFFER_DIR)
+//       스캔 → 같은 (stage, category-class, seed-bucket) 에서 최근 N drill 연속 0-yield 인
+//       조합을 blocklist fp 로 변환 → stage dispatch 직전 skip 판정.
+// fingerprint: djb2_hex8(stage + "@" + category + ":" + seed_hash4). seed_hash4 = _seed_batch_hash 앞 4자.
+// 출력: NEXUS_ANTI_PATTERN {"loaded":N,"skipped":M,"saves_wall_ms":T} (drill 종료 시 1회 emit).
+// 주의: hot-path 캐시 — blocklist 는 drill 당 1회 load (`_ap_loaded_set` flag).
+fn _ap_enabled() -> bool {
+    let v = env("NEXUS_ANTI_PATTERN")
+    if v == "1" { return true }
+    if v.to_lower() == "true" { return true }
+    return false
+}
+
+fn _ap_buffer_dir() -> str {
+    let d = env("NEXUS_META_BUFFER_DIR")
+    if d.len() > 0 { return d }
+    return "/tmp"
+}
+
+fn _ap_window_n() -> int {
+    let v = env("NEXUS_ANTI_PATTERN_N")
+    if v.len() == 0 { return 5 }
+    let mut n = 5
+    try { n = to_int(v) } catch e { n = 5 }
+    if n < 2 { return 2 }
+    return n
+}
+
+// drill-scope 캐시 — cmd_drill 1회 load, 반복 호출 저렴.
+let mut _ap_loaded_set: bool = false
+let mut _ap_blocklist: [str] = []
+let mut _ap_load_count: int = 0
+let mut _ap_skip_count: int = 0
+let mut _ap_saves_ms: int = 0
+// stage 이름 → 평균 wall(ms) 추정치 (saves_wall_ms 계산용 conservative estimate).
+// 실제 stage 당 시간은 seed 별 상이하나 skip 효과 추정에는 고정 상수로 충분.
+fn _ap_stage_cost_ms(stage: str) -> int {
+    if stage == "smash"        { return 1200 }
+    if stage == "free"         { return 1500 }
+    if stage == "absolute"     { return 800 }
+    if stage == "meta_closure" { return 900 }
+    if stage == "hyperarith"   { return 1000 }
+    if stage == "resonance"    { return 600 }
+    return 800
+}
+
+fn _ap_load_blocklist() -> void {
+    // drill 당 1회. env OFF 면 즉시 빈 리스트.
+    if _ap_loaded_set { return }
+    _ap_loaded_set = true
+    if !_ap_enabled() { return }
+    let ap_script = nexus_root() + "/cli/drill/anti_pattern.hexa"
+    let chk = exec("[ -f " + shell_quote(ap_script) + " ] && echo y || echo n").trim()
+    if chk != "y" { return }
+    let dir = _ap_buffer_dir()
+    // `hexa run anti_pattern.hexa scan <dir>` — stdout: LOADED N \n fp1 \n fp2 \n ...
+    let cmd = shell_quote(hexa_bin()) + " run " + shell_quote(ap_script) + " scan " + shell_quote(dir) + " 2>/dev/null"
+    let out = exec(cmd)
+    if out.len() == 0 { return }
+    let lines = out.split("\n")
+    let mut li = 0
+    while li < lines.len() {
+        let ln = lines[li].trim()
+        if ln.len() == 8 {
+            // 8-char hex fingerprint (숫자/abcdef)
+            _ap_blocklist = _ap_blocklist + [ln]
+        }
+        li = li + 1
+    }
+    _ap_load_count = _ap_blocklist.len()
+}
+
+fn _ap_fingerprint_local(stage: str, category: str, hash4: str) -> str {
+    // anti_pattern.hexa 와 동일 알고리즘. 매 stage 호출 시 sub-process 띄우면 비용 폭증 →
+    // djb2 를 run.hexa 내부에서 재현. (meta_buffer.mb_djb2 와 동일).
+    let cat = if category.len() > 0 { category } else { "ANY" }
+    let fh  = if hash4.len() > 0 { hash4 } else { "0000" }
+    let raw = stage + "@" + cat + ":" + fh
+    let mut h: i64 = 5381
+    let mut i = 0
+    let n = raw.len()
+    while i < n {
+        let c = char_code(raw, i)
+        h = (h * 33 + c) % 4294967296
+        i = i + 1
+    }
+    if h < 0 { h = -h }
+    let hex = "0123456789abcdef"
+    let mut out = ""
+    let mut x = h
+    let mut di = 0
+    while di < 8 {
+        let d = x % 16
+        let dc = to_int(to_string(d))
+        out = hex.substring(dc, dc + 1) + out
+        x = x / 16
+        di = di + 1
+    }
+    return out
+}
+
+fn _anti_pattern_should_skip_stage(seed_features: str, stage: str) -> bool {
+    // public hook — run.hexa stage dispatch 에서 호출.
+    // seed_features 포맷: "<category>|<seed_hash4>" (category-class + seed-bucket).
+    // 미지정/malformed → skip=false (안전 기본값).
+    if !_ap_enabled() { return false }
+    if !_ap_loaded_set { _ap_load_blocklist() }
+    if _ap_blocklist.len() == 0 { return false }
+    // parse "cat|h4"
+    let sep = str_find(seed_features, "|")
+    if sep < 0 { return false }
+    let cat = seed_features.substring(0, sep)
+    let h4  = seed_features.substring(sep + 1, seed_features.len())
+    let fp = _ap_fingerprint_local(stage, cat, h4)
+    let mut i = 0
+    while i < _ap_blocklist.len() {
+        if _ap_blocklist[i] == fp {
+            _ap_skip_count = _ap_skip_count + 1
+            _ap_saves_ms = _ap_saves_ms + _ap_stage_cost_ms(stage)
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn _ap_emit_summary() -> void {
+    // drill 종료 시 1 line stderr. env OFF 면 emit skip.
+    if !_ap_enabled() { return }
+    let j = "NEXUS_ANTI_PATTERN {\"loaded\":" + to_string(_ap_load_count)
+          + ",\"skipped\":" + to_string(_ap_skip_count)
+          + ",\"saves_wall_ms\":" + to_string(_ap_saves_ms) + "}"
+    eprintln(j)
 }
 
 // ─── E13 (2026-04-21 replay) Stage Pipelining — smash+free miss → abs/meta/hyper skip ───
@@ -3383,6 +3521,42 @@ fn cmd_doctor(remote_flag: bool, all_flag: bool, host_override: str, timeout_ove
     return 0
 }
 
+// ─── W (2026-04-21) — nexus→anima cross-engine drill chain ───
+// SSOT: cli/scripts/cross_chain.hexa — orchestrator (shim: no live exec).
+// nexus drill 이 쓴 /tmp/nexus_drill_last_total.txt sentinel 을 소비 →
+// anima 존재 시 shim consume → 통합 리포트 JSON.
+// anima 미발견 시: stderr 에 NEXUS_CROSS_CHAIN {"status":"anima_missing"} + rc=2.
+// 규칙: `>=`/`<=` 금지 — 본 블록 전부 `<`/`>` 만 사용.
+fn cmd_chain(seed: str, engines_csv: str, report_path: str) -> int {
+    let seed_t = seed.trim()
+    if seed_t.len() == 0 {
+        eprintln("nexus chain: --seed required — e.g. nexus chain --seed 'Riemann zeta zero spacing GUE deviation' --engines nexus,anima")
+        return 3
+    }
+    let script = nexus_root() + "/cli/scripts/cross_chain.hexa"
+    // script 존재 확인 — 미발견 시 fail-fast
+    let chk = exec("[ -f '" + script + "' ] && echo y || echo n").trim()
+    if chk != "y" {
+        eprintln("NEXUS_CROSS_CHAIN {\"status\":\"script_missing\",\"path\":\"" + script + "\"}")
+        return 4
+    }
+    let mut cmd = shell_quote(hexa_bin()) + " run " + shell_quote(script) + " run"
+    cmd = cmd + " --seed " + shell_quote(seed_t)
+    let engines = if engines_csv.len() > 0 { engines_csv } else { "nexus,anima" }
+    cmd = cmd + " --engines " + shell_quote(engines)
+    if report_path.len() > 0 {
+        cmd = cmd + " --report " + shell_quote(report_path)
+    }
+    // 2>&1 은 쓰지 않음 — stderr typed error 는 caller 에 분리 전달되도록.
+    let out = exec(cmd)
+    print(out)
+    // exit code 회수 — exec() 는 stdout 만 반환하므로 shell wrapper 로 rc 전달.
+    // 간이 체크: out 에 unified_abs_total 토큰이 있으면 성공으로 간주.
+    if out.contains("unified_abs_total") { return 0 }
+    if out.contains("anima_missing") { return 2 }
+    return 0
+}
+
 fn main() -> void {
     // argv 정규화: Mac=[hexa, script, user...] Linux-stage1=[hexa, "run", script, user...]
     // .hexa 앵커 스캔 → [hexa, script, user...] 로 재구성 (cc2ec688 argv.hexa.inc 패턴)
@@ -3536,6 +3710,17 @@ fn main() -> void {
     if sub == "sync" {
         let apply_flag = if n >= 4 { a[3] } else { "" }
         cmd_sync(apply_flag); return
+    }
+    if sub == "chain" {
+        // W (2026-04-21) — nexus→anima cross-engine drill chain.
+        // nexus chain --seed <seed> [--engines nexus,anima] [--report <path>]
+        let rc = cmd_chain(
+            find_flag(a, "--seed", ""),
+            find_flag(a, "--engines", "nexus,anima"),
+            find_flag(a, "--report", "")
+        )
+        if rc != 0 { exit(rc) }
+        return
     }
     eprintln("nexus: unknown subcommand '" + sub + "'")
     cmd_help()
