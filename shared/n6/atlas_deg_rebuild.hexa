@@ -1,0 +1,167 @@
+// ═══════════════════════════════════════════════════════════
+// atlas_deg_rebuild.hexa — atlas.n6.deg mtime-based auto-rebuild (ROI#47)
+// 용도: atlas.n6 또는 atlas.blowup.jsonl (edges SSOT) 이 deg 보다 최신이면
+//       deg 사이드카를 재빌드. edge_density_analyzer / blowup 진입 시 호출.
+// 사용:
+//   hexa atlas_deg_rebuild.hexa [--check|--rebuild] [--atlas PATH] [--deg PATH] [--verbose]
+//     --check    stale 여부만 exit code 로 반환 (0=fresh, 1=stale) — stdout 출력 X
+//     --rebuild  stale 인 경우 실제 rebuild (default)
+// 내부 로직:
+//   edge source 우선순위: atlas.blowup.jsonl (존재 시) > atlas.n6 edges
+//   rebuild: awk -F'"' 로 from/to 파싱 → id/degree TSV 생성 → .deg.tmp → mv atomic
+//   mtime 비교: source mtime > deg mtime  →  stale
+// ═══════════════════════════════════════════════════════════
+
+let a = args()
+let mut ATLAS_PATH = "shared/n6/atlas.n6"
+let mut BLOWUP_PATH = "shared/n6/atlas.blowup.jsonl"
+let mut DEG_PATH = "shared/n6/atlas.n6.deg"
+let mut verbose = false
+let mut check_only = false
+
+let mut ai: i64 = 2
+while ai < len(a) {
+    let tok = a[ai]
+    if tok == "--check" { check_only = true }
+    else if tok == "--rebuild" { check_only = false }
+    else if tok == "--verbose" || tok == "-v" { verbose = true }
+    else if tok == "--atlas" && ai + 1 < len(a) { ai = ai + 1; ATLAS_PATH = a[ai] }
+    else if tok == "--blowup" && ai + 1 < len(a) { ai = ai + 1; BLOWUP_PATH = a[ai] }
+    else if tok == "--deg" && ai + 1 < len(a) { ai = ai + 1; DEG_PATH = a[ai] }
+    else if tok == "--help" || tok == "-h" {
+        println("usage: hexa atlas_deg_rebuild.hexa [--check|--rebuild] [--atlas PATH] [--deg PATH] [--verbose]")
+        exit(0)
+    }
+    ai = ai + 1
+}
+
+// ─── stat helper (BSD+GNU) ───
+fn _last_numeric(raw: string) -> string {
+    let lines = raw.split("\n")
+    let mut i: i64 = len(lines) - 1
+    while i >= 0 {
+        let t = lines[i].trim()
+        if t != "" {
+            let mut all_d = true
+            let mut j: i64 = 0
+            while j < len(t) {
+                let c = t.substring(j, j + 1)
+                if c < "0" || c > "9" { all_d = false; j = len(t) }
+                j = j + 1
+            }
+            if all_d { return t }
+        }
+        i = i - 1
+    }
+    return ""
+}
+
+fn _mtime(path: string) -> i64 {
+    if !file_exists(path) { return 0 }
+    let mut r: i64 = 0
+    try {
+        let raw = to_string(exec("stat -c '%Y' '" + path + "' 2>/dev/null; stat -f '%m' '" + path + "' 2>/dev/null"))
+        let v = _last_numeric(raw)
+        if v != "" { r = to_int(v) }
+    } catch e {}  // @allow-silent-catch
+    return r
+}
+
+// ─── source 결정 ───
+// edges 가 atlas.blowup.jsonl 에 있으면 그게 진짜 SSOT.
+// blowup 부재 시 atlas.n6 내 edges (있다면).
+let mut source_path = ""
+if file_exists(BLOWUP_PATH) {
+    source_path = BLOWUP_PATH
+} else if file_exists(ATLAS_PATH) {
+    source_path = ATLAS_PATH
+}
+
+if source_path == "" {
+    if verbose { println("  atlas_deg_rebuild: no edge source — skip") }
+    exit(0)
+}
+
+let src_mtime = _mtime(source_path)
+let deg_mtime = _mtime(DEG_PATH)
+let atlas_mtime = _mtime(ATLAS_PATH)
+
+// Stale if deg missing OR source/atlas newer than deg
+let mut stale = false
+if !file_exists(DEG_PATH) { stale = true }
+if src_mtime > deg_mtime { stale = true }
+if atlas_mtime > deg_mtime { stale = true }
+
+if verbose {
+    println("═══ atlas_deg_rebuild ═══")
+    println("  atlas:   " + ATLAS_PATH + "  mtime=" + to_string(atlas_mtime))
+    println("  source:  " + source_path + "  mtime=" + to_string(src_mtime))
+    println("  deg:     " + DEG_PATH + "  mtime=" + to_string(deg_mtime))
+    println("  verdict: " + (if stale { "STALE" } else { "FRESH" }))
+}
+
+if !stale {
+    if verbose { println("▎ deg cache fresh — skip rebuild") }
+    // stdout sentinel — caller parses via grep/tail. exit() 미전파 우회.
+    println("__DEG_STATUS__=FRESH")
+    exit(0)
+}
+
+if check_only {
+    if verbose { println("▎ stale — check-only mode, no rebuild") }
+    println("__DEG_STATUS__=STALE")
+    exit(1)  // @allow-silent-exit  — non-zero = stale (caller decides)
+}
+
+// ─── rebuild ───
+// Compute degree TSV from edges in source_path.
+// Edge format: {"type":"edge","from":"X","to":"Y",...}
+// Output: "id\tdegree\n" (TSV).
+// Use awk single-pass + sort. atomic: .deg.tmp then mv.
+let tmp_path = DEG_PATH + ".tmp." + to_string(exec("echo $$").trim())
+
+let awk_cmd = "awk -F'\"' '/\"type\":\"edge\"/ {"
+    + " for(i=1;i<=NF;i++) {"
+    + "   if($i==\"from\" || $i==\"to\") {"
+    + "     if(i+2<=NF) { d[$(i+2)]++ }"
+    + "   }"
+    + " }"
+    + "} END { for(k in d) printf \"%s\\t%d\\n\", k, d[k] }' '"
+    + source_path + "' | sort > '" + tmp_path + "'"
+
+if verbose { println("  exec: " + awk_cmd.substring(0, if len(awk_cmd) < 120 { len(awk_cmd) } else { 120 }) + "...") }
+
+let mut rc_ok = false
+try {
+    let out = to_string(exec(awk_cmd + "; echo __RC_$?__")).trim()
+    rc_ok = out.contains("__RC_0__")
+} catch e {}  // @allow-silent-catch
+
+if !rc_ok {
+    println("error: deg rebuild awk failed")
+    try { exec("rm -f '" + tmp_path + "'") } catch e {}  // @allow-silent-catch
+    exit(2)  // @allow-silent-exit
+}
+
+// Validate tmp size > 0
+let tmp_size_raw = to_string(exec("stat -c '%s' '" + tmp_path + "' 2>/dev/null; stat -f '%z' '" + tmp_path + "' 2>/dev/null"))
+let tmp_size_str = _last_numeric(tmp_size_raw)
+let mut tmp_size: i64 = 0
+if tmp_size_str != "" { tmp_size = to_int(tmp_size_str) }
+
+if tmp_size == 0 {
+    println("error: deg rebuild produced empty file")
+    try { exec("rm -f '" + tmp_path + "'") } catch e {}  // @allow-silent-catch
+    exit(2)  // @allow-silent-exit
+}
+
+// Atomic mv
+try { exec("mv '" + tmp_path + "' '" + DEG_PATH + "'") } catch e {}  // @allow-silent-catch
+
+let new_mtime = _mtime(DEG_PATH)
+let new_size_raw = to_string(exec("stat -c '%s' '" + DEG_PATH + "' 2>/dev/null; stat -f '%z' '" + DEG_PATH + "' 2>/dev/null"))
+let new_size_str = _last_numeric(new_size_raw)
+
+println("▎ deg rebuilt: " + DEG_PATH + "  size=" + new_size_str + " mtime=" + to_string(new_mtime))
+println("__DEG_STATUS__=REBUILT")
+exit(0)
