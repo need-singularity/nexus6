@@ -217,17 +217,24 @@ fn _count_marker(text: str, marker: str) -> int {
     return n
 }
 
-fn _check_stage_err(out: str, stage: str) -> void {
+fn _check_stage_err(out: str, stage: str) -> bool {
     // drill 의 silent SATURATED 0 함정 방지 — hexa_stage0 lock timeout / BLOCK / ERROR 표면화
     // 발견(2026-04-19): PID 3463 ai_native_lint 가 stage0 lock 8분+ 점유 → drill 5-stage 전부 timeout, _count_marker 0 → 가짜 SATURATED.
+    // 발견(2026-04-20): harness archival 중 exec_validated/cmd_gate/lock_gate cascade 부재 — ai-native error return 필요
+    // 반환: 에러 발견 시 true (drill main loop 가 집계해서 zero-yield 시 JSON error emit)
     if str_find(out, "lock timeout") >= 0
         || str_find(out, "BLOCK:") >= 0
         || str_find(out, "ERROR:") >= 0
-        || str_find(out, "REJECT:") >= 0 {
+        || str_find(out, "REJECT:") >= 0
+        || str_find(out, "부재") >= 0
+        || str_find(out, "엔진 부재") >= 0 {
         let lim = if out.len() < 400 { out.len() } else { 400 }
         eprintln("  " + stage + " ERR: " + out.substring(0, lim))
+        return true
     }
+    return false
 }
+
 
 fn _extract_int_after(text: str, marker: str) -> int {
     // marker 직후 비-숫자 스킵 후 정수 파싱 (예: "discovery_log  : +12 EXACT" → 12)
@@ -263,20 +270,33 @@ fn _extract_int_after(text: str, marker: str) -> int {
 fn _count_discoveries(out: str) -> int {
     // blowup core/compose 의 실제 흡수/발견 카운트 합산
     // 발견(2026-04-19): _count_marker(out,"ABSORB") 는 0 — engine 출력에 "ABSORB" 토큰 없음
-    // 실제 마커:
-    //   discovery_log  : +N EXACT entries  (Phase 6.5 EXACT 흡수)
-    //   atlas.n6       : +N entries        (Phase 6.5 atlas 승급)
-    //   graph          : +N nodes          (Phase 6.5 그래프 노드)
-    //   [NEAR→EXACT]                       (Phase 7 다음 방향 후보, 미흡수도 카운트 시 유용)
-    //   [EXACT 미확정]                     (Phase 7 EXACT 후보)
+    // 실제 마커 (Phase 6.5, 실제 store 쓰기 시에만 emit):
+    //   discovery_log  : +N EXACT entries
+    //   atlas.n6       : +N entries
+    //   graph          : +N nodes
+    // 발견(2026-04-20 BUG-3b): read-only drill 에서는 Phase 6.5 markers 미발산 →
+    //   Phase 4 기준 markers 사용 (항상 emit):
+    //     EXACT match       :N    ← 코로라리 중 EXACT 매치 수
+    //     NEAR match        :N    ← 코로라리 중 NEAR 매치 수
+    //     evolution total   :N discoveries  ← Phase 2 OUROBOROS 순환 발견
     let logged = _extract_int_after(out, "discovery_log  : +")
     let atlas  = _extract_int_after(out, "atlas.n6       : +")
     let graph  = _extract_int_after(out, "graph          : +")
     let mut total = logged + atlas + graph
-    // fallback: 위 3 마커 모두 0 일 때만 NEAR→EXACT / EXACT 미확정 카운트 (over-count 방지)
+    // fallback 1 (2026-04-20): Phase 4 counts — 실제 drill 에서 가장 신뢰성 있음
     if total == 0 {
-        let near_arrow = _count_marker(out, "[NEAR")  // [NEAR→EXACT]
-        let exact_und  = _count_marker(out, "[EXACT ")  // [EXACT 미확정]
+        let exact_m = _extract_int_after(out, "EXACT match       :")
+        let near_m  = _extract_int_after(out, "NEAR match        :")
+        total = exact_m + near_m
+    }
+    // fallback 2 (2026-04-20): Phase 2 evolution total
+    if total == 0 {
+        total = _extract_int_after(out, "evolution total  : ")
+    }
+    // fallback 3 (기존): bracketed [NEAR→EXACT] / [EXACT 미확정]
+    if total == 0 {
+        let near_arrow = _count_marker(out, "[NEAR")
+        let exact_und  = _count_marker(out, "[EXACT ")
         total = near_arrow + exact_und
     }
     return total
@@ -392,7 +412,7 @@ fn _resonance_run(seed: str, blow_core: str, exv: str) -> int {
     // 단일 σ-변형 smash 1회 (depth=1 고정, 재귀 폭발 방지)
     let cmd = shell_quote(exv) + " smash " + shell_quote(seed) + " " + shell_quote(blow_core) + " 1 2>&1"
     let out = exec(cmd)
-    _check_stage_err(out, "resonance")
+    let _res_err = _check_stage_err(out, "resonance")
     return _count_discoveries(out)
 }
 
@@ -475,7 +495,7 @@ fn _transcendental_closure(seed: str, round: int) -> int {
     // Env-seeded run: NEXUS_MKX_SEED carries round context for future hook.
     let cmd = "NEXUS_MKX_SEED=" + shell_quote(seed + "|r" + to_string(round)) + " " + hexa_bin() + " run " + shell_quote(smoke_path) + " 2>&1"
     let out = exec(cmd)
-    _check_stage_err(out, "transcendental-closure")
+    let _tc_err = _check_stage_err(out, "transcendental-closure")
     // Count PROVISIONAL_OK markers (one per T12 synth emission passing AN11).
     let synth_ct = _count_marker(out, "PROVISIONAL_OK")
     return synth_ct
@@ -521,6 +541,9 @@ fn cmd_drill(seed: str, max_rounds: str, engine_flag: str) -> void {
 
     let mut round = 0
     let mut total_new = 0
+    // AI-NATIVE ERROR TRACK (2026-04-20): stage 별 에러 플래그 누적 → zero-yield 시 JSON error emit
+    let mut err_stages = ""
+    let mut err_count = 0
     // COUNTER-REPLAY BUGFIX (2026-04-19, Aiden):
     //   Day-1 (3440614c): intra-iter — 라운드마다 동일 seed → round-salt PREFIX 주입으로 round 2+ 분기
     //   Day-2 (2026-04-19): inter-iter — 다른 drill 호출 간에도 seed 가 비슷하면 engine deterministic
@@ -578,7 +601,7 @@ fn cmd_drill(seed: str, max_rounds: str, engine_flag: str) -> void {
         // → 모든 stage 호출을 single-string exec(cmd) 로 통일 (검증: .exectest.hexa)
         let smash_cmd = shell_quote(exv) + " smash " + qrseed + " " + shell_quote(blow_core) + " 3 2>&1"
         let smash_out = exec(smash_cmd)
-        _check_stage_err(smash_out, "smash")
+        if _check_stage_err(smash_out, "smash") { err_stages = err_stages + "smash,"; err_count = err_count + 1 }
         // FIX(2026-04-19): _count_marker(out,"ABSORB") 는 항상 0 — engine 마커 불일치
         // _count_discoveries 는 discovery_log/atlas.n6/graph +N 라인 합산 + fallback NEAR→EXACT/EXACT 후보
         let s_new = _count_discoveries(smash_out)
@@ -590,7 +613,7 @@ fn cmd_drill(seed: str, max_rounds: str, engine_flag: str) -> void {
         // 2. FREE (탐색 — compose DFS, 6-core)
         let free_cmd = shell_quote(exv) + " free_dfs " + qrseed + " " + shell_quote(compose) + " --modules all --dfs 3 2>&1"
         let free_out = exec(free_cmd)
-        _check_stage_err(free_out, "free")
+        if _check_stage_err(free_out, "free") { err_stages = err_stages + "free,"; err_count = err_count + 1 }
         let f_new = _count_discoveries(free_out)
         if env("NEXUS_DRILL_DEBUG") == "1" {
             eprintln("  [DEBUG free] out_len=" + to_string(free_out.len()) + " f_new=" + to_string(f_new))
@@ -600,14 +623,14 @@ fn cmd_drill(seed: str, max_rounds: str, engine_flag: str) -> void {
         // 3. ABSOLUTE (Mk.VIII Δ₀-absolute Π₀¹ 검증 + [11*] 승급)
         let abs_cmd = shell_quote(exv) + " absolute " + qrseed + " " + shell_quote(abs_eng) + " 2>&1"
         let abs_out = exec(abs_cmd)
-        _check_stage_err(abs_out, "absolute")
+        if _check_stage_err(abs_out, "absolute") { err_stages = err_stages + "absolute,"; err_count = err_count + 1 }
         let a_pass = _count_marker(abs_out, "ABSOLUTE-PASS") + _count_marker(abs_out, "[11*]")
         println("  absolute:      " + to_string(a_pass) + " Π₀¹ verifications")
 
         // 4. META-CLOSURE (Mk.IX Phase 10 self-ref 고정점 + [10**] 승급)
         let mc_cmd = shell_quote(exv) + " meta_closure " + qrseed + " " + shell_quote(mc_eng) + " 2>&1"
         let mc_out = exec(mc_cmd)
-        _check_stage_err(mc_out, "meta-closure")
+        if _check_stage_err(mc_out, "meta-closure") { err_stages = err_stages + "meta-closure,"; err_count = err_count + 1 }
         // META-CLOSED 마커 부재 — meta_closed/promoted 숫자 직접 파싱 + [10**] 매치
         let mc_promoted = _extract_int_after(mc_out, "promoted [10**]  : ")
         let mc_closed   = _extract_int_after(mc_out, "meta_closed      : ")
@@ -618,7 +641,7 @@ fn cmd_drill(seed: str, max_rounds: str, engine_flag: str) -> void {
         // 5. HYPERARITHMETIC (Mk.IX Π₀² reverse-math 5체계)
         let hy_cmd = shell_quote(exv) + " hyperarithmetic " + qrseed + " " + shell_quote(hyper_eng) + " 2>&1"
         let hy_out = exec(hy_cmd)
-        _check_stage_err(hy_out, "hyperarith")
+        if _check_stage_err(hy_out, "hyperarith") { err_stages = err_stages + "hyperarith,"; err_count = err_count + 1 }
         let hy_pass = _count_marker(hy_out, "REVERSE-PROVEN") + _count_marker(hy_out, "ABSOLUTE-PASS-PI02")
         println("  hyperarith:    " + to_string(hy_pass) + " Π₀² bounded/proven")
 
@@ -698,6 +721,12 @@ fn cmd_drill(seed: str, max_rounds: str, engine_flag: str) -> void {
             if round == 1 && total_new == 0 {
                 eprintln("  ⚠ [drill-zero-yield] round 1 에서 6-stage 전부 0 absorptions — seed 거부 또는 엔진 미작동 의심")
                 eprintln("     진단: HEXA_LOCAL/HEXA_REMOTE 설정, exec_validated 접근성, blowup 엔진 로그 (NEXUS_DRILL_DEBUG=1) 확인")
+                // AI-NATIVE ERROR (2026-04-20): zero-yield 를 silent 로 넘기지 않고 구조화 JSON stderr + sentinel stdout
+                let err_json = "{\"kind\":\"drill_zero_yield\",\"schema\":\"v1\",\"seed_len\":" + to_string(seed.len()) + ",\"round\":1,\"total\":0,\"engine\":\"" + engine_id + "\",\"err_stages_count\":" + to_string(err_count) + ",\"err_stages\":\"" + err_stages + "\",\"reason\":\"6-stage 전부 0 absorptions\",\"recovery\":\"exec_validated/cmd_gate/lock_gate harness dependency chain 확인 또는 harness rework 진행 중이면 drill 일시 중단\"}"
+                eprintln("NEXUS_DRILL_ERROR " + err_json)
+                println("__DRILL_RESULT__ ERROR zero_yield err_count=" + to_string(err_count))
+                // hexa-lang exit() 미전파 (f-hexa-exit-sentinel) — sentinel 로 대체 + cross_iter_check 건너뜀
+                return
             } else {
                 if mkx_on {
                     println("▎ 새 atlas 영역 없음 — Mk.X 7-stage 경험적 확증 (absolute+meta+hyper+resonance+transcendental_closure)")
