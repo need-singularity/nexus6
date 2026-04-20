@@ -1,0 +1,178 @@
+// topology_router.hexa — nexus drill topology-aware category routing (2026-04-21)
+//
+// AS (Atlas-Seed) topology-aware routing:
+//   seed 가 topology category 로 분류되면 (cli/run.hexa 의 _cat_classify)
+//   invariant keyword (genus, fundamental group, homotopy, fiber bundle,
+//   Euler characteristic, Betti number) 를 탐지 → stage 진행 우선순위를 조정.
+//
+//   기본 stage 순서: smash → free → absolute → meta_closure → hyper → resonance
+//   topology route: smash → hyper → free → absolute → meta_closure → resonance
+//     (위상 불변량 추출은 hyperarithmetic stage 에서 고밀도 얻어짐 — front-load)
+//
+//   또한 atlas.n6 에서 category=topology 로 태깅된 entry 를 미리 drill
+//   atlas preseed buffer 에 주입 (없을 경우 조용히 skip — zero overhead).
+//
+// Interface (cli/run.hexa inline 호출):
+//   fn _topology_route(seed, category) -> {stage_order: [int], preseed_atlas: [str]}
+//
+//   반환 포맷 (inline: 두 배열을 side-by-side 로 반환 대신 helper 두 개):
+//     _topology_stage_order(seed)    -> [int]   // 6-length permutation of 0..5
+//     _topology_preseed_atlas(seed)  -> [str]   // 최대 16 entry (topology category subset)
+//
+// 호출 시점 (run.hexa integration):
+//   category layer (line ~2300) 이후, round loop 진입 전.
+//   category == "topology" 일 때만 활성 — MIXED/UNKNOWN/기타 카테고리에서는 default.
+//   env: NEXUS_TOPOLOGY_ROUTE_OFF=1 로 비활성.
+//
+// Emit (stderr):
+//   NEXUS_TOPOLOGY_ROUTE {"detected_invariants":[...],"stage_order":[...],"preseed_count":N}
+//
+// 설계 주의:
+//   - hexa 에 `>=` / `<=` 미사용 (round-trip: `a > b - 1` / `a < b + 1`).
+//   - atlas.n6 부재/형식 변경 시 silent no-op (preseed_count=0).
+//   - stage_order 는 index permutation — 실제 stage dispatch 는 run.hexa 측에서
+//     이 순서에 맞춰 blowup engine 호출 순서를 재배치.
+
+fn _tr_contains(s: str, k: str) -> bool {
+    if k.len() == 0 { return false }
+    return s.contains(k)
+}
+
+fn _tr_invariant_keywords() -> [str] {
+    // 위상 불변량 — SPEC 명시 키워드 + 변형
+    return [
+        "genus",
+        "fundamental group",
+        "homotopy",
+        "fiber bundle",
+        "fibre bundle",
+        "euler characteristic",
+        "betti number",
+        "betti numbers"
+    ]
+}
+
+fn _tr_detect_invariants(seed: str) -> [str] {
+    // seed 소문자 스캔 → hit list 반환. 대소문자 무관.
+    let lo = seed.to_lower()
+    let kws = _tr_invariant_keywords()
+    let mut hits: [str] = []
+    let mut i = 0
+    while i < len(kws) {
+        if _tr_contains(lo, kws[i]) {
+            hits = hits + [kws[i]]
+        }
+        i = i + 1
+    }
+    return hits
+}
+
+fn _tr_default_stage_order() -> [int] {
+    // smash=0 free=1 absolute=2 meta_closure=3 hyper=4 resonance=5
+    return [0, 1, 2, 3, 4, 5]
+}
+
+fn _tr_topology_stage_order() -> [int] {
+    // smash → hyper → free → absolute → meta_closure → resonance
+    // 위상 불변량 추출은 hyperarithmetic 이 핵심 — smash 직후 배치.
+    return [0, 4, 1, 2, 3, 5]
+}
+
+fn _topology_stage_order(seed: str, category: str) -> [int] {
+    // category == "topology" 이고 invariant keyword 1개 이상 검출 시 reorder.
+    // 아니면 default (cost zero).
+    if category != "topology" { return _tr_default_stage_order() }
+    let hits = _tr_detect_invariants(seed)
+    if len(hits) == 0 { return _tr_default_stage_order() }
+    return _tr_topology_stage_order()
+}
+
+fn _tr_shell_quote(s: str) -> str {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _tr_preseed_limit() -> int {
+    // 최대 preseed entry 수 — atlas scan 비용 상한.
+    return 16
+}
+
+fn _topology_preseed_atlas(atlas_path: str) -> [str] {
+    // atlas.n6 에서 category=topology 태깅된 entry 추출.
+    // atlas.n6 format: awk 로 "category=topology" 토큰 포함 라인만 골라, 최대 limit 만큼.
+    // 파일 부재/read 실패 → 빈 배열 (silent).
+    let out: [str] = []
+    if atlas_path.len() == 0 { return out }
+    let qp = _tr_shell_quote(atlas_path)
+    let lim = _tr_preseed_limit()
+    let qlim = to_string(lim)
+    // awk: "category=topology" 문자열 포함 라인, 앞에서 lim 개 — atlas.n6 없을 때 조용히 빈 stdout.
+    let cmd = "awk 'BEGIN{n=0} /category=topology/ {print; n=n+1; if (n+0 > " + qlim + " - 1) exit} END{}' " + qp + " 2>/dev/null"
+    let raw = exec(cmd)
+    if raw.len() == 0 { return out }
+    let lines = raw.split("\n")
+    let mut entries: [str] = []
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln.len() > 0 { entries = entries + [ln] }
+        i = i + 1
+    }
+    return entries
+}
+
+fn _topology_route_emit(seed: str, category: str, atlas_path: str) -> str {
+    // stderr JSON emit payload 조립.
+    // NEXUS_TOPOLOGY_ROUTE {"detected_invariants":[...],"stage_order":[...],"preseed_count":N}
+    let hits = _tr_detect_invariants(seed)
+    let order = _topology_stage_order(seed, category)
+    let preseed = if category == "topology" { _topology_preseed_atlas(atlas_path) } else { [] }
+    let mut inv = "["
+    let mut i = 0
+    while i < len(hits) {
+        if i > 0 { inv = inv + "," }
+        inv = inv + "\"" + hits[i] + "\""
+        i = i + 1
+    }
+    inv = inv + "]"
+    let mut ord = "["
+    let mut j = 0
+    while j < len(order) {
+        if j > 0 { ord = ord + "," }
+        ord = ord + to_string(order[j])
+        j = j + 1
+    }
+    ord = ord + "]"
+    return "NEXUS_TOPOLOGY_ROUTE {\"detected_invariants\":" + inv
+        + ",\"stage_order\":" + ord
+        + ",\"preseed_count\":" + to_string(len(preseed)) + "}"
+}
+
+fn _tr_args_get(a: [any], flag: str, default_val: str) -> str {
+    let n = a.len()
+    let mut i = 0
+    while i < n {
+        let t = to_string(a[i])
+        if t == flag {
+            if i + 1 < n { return to_string(a[i + 1]) }
+        }
+        i = i + 1
+    }
+    return default_val
+}
+
+// standalone CLI — 검증용.
+//   hexa run cli/drill/topology_router.hexa --seed "genus 2 fiber bundle" --category topology [--atlas shared/n6/atlas.n6]
+fn main() {
+    let argv = args()
+    let seed = _tr_args_get(argv, "--seed", "")
+    let cat  = _tr_args_get(argv, "--category", "topology")
+    let atlas_path = _tr_args_get(argv, "--atlas", "shared/n6/atlas.n6")
+    if seed.len() == 0 {
+        eprintln("topology_router: --seed \"...\" 필수")
+        return
+    }
+    let payload = _topology_route_emit(seed, cat, atlas_path)
+    println(payload)
+}
+
+main()
