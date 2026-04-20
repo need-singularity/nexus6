@@ -1098,6 +1098,139 @@ fn _transcendental_closure(seed: str, round: int) -> int {
     return synth_ct
 }
 
+// ─── E16 round parallel replay — cli/run.hexa (2026-04-21, re-implementation) ───
+//
+// Re-implementation of e16-pending (0519e480) on the new `cli/run.hexa` path
+// (original targeted old root `run.hexa`; cherry-pick failed after the
+// 079bc12d refactor). 모든 식별자는 `_round_parallel_` prefix (namespace
+// safety — 다른 agent 가 동시에 run.hexa 에 손댈 때 충돌 회피).
+//
+// SSOT gate: env NEXUS_ROUND_PARALLEL=1 (opt-in, 기본 off).
+// Atlas mutex path: /tmp/nexus_atlas.lock (mkdir-atomic → single-writer).
+//
+// Emit (stderr, JSON-lines, prefix `NEXUS_ROUND_PARALLEL`):
+//   - round_start    {"round":K}
+//   - round_end      {"round":K,"absorb":N,"duration_ms":T}
+//   - atlas_wait_ms  {"round":K,"ms":W}
+//   - atlas_hold_ms  {"round":K,"ms":H}
+//
+// Grammar constraint (hexa v0.1.0): `>=` / `<=` 미사용 — strict `>` / `<` / `==` 만.
+
+fn _round_parallel_atlas_lock() -> int {
+    // mkdir-atomic mutex entry. spin 100 회 × 50ms (5s cap), stale 시 rmdir 복구.
+    // 반환값: 대기한 밀리초 (atlas_wait_ms 집계용).
+    let lockd = "/tmp/nexus_atlas.lock"
+    let q = shell_quote(lockd)
+    let t0 = exec("date +%s%N 2>/dev/null || echo 0").trim()
+    let mut tries = 0
+    let mut acquired = false
+    while tries < 100 {
+        let rc = exec("mkdir " + q + " 2>/dev/null && echo ok || echo busy").trim()
+        if rc == "ok" {
+            acquired = true
+            tries = 100
+        } else {
+            exec("sleep 0.05")
+            tries = tries + 1
+        }
+    }
+    if !acquired {
+        // stale recover — 5s 초과 대기는 직전 holder 가 crash 한 것으로 간주.
+        exec("rm -rf " + q + " 2>/dev/null ; mkdir " + q + " 2>/dev/null")
+    }
+    let t1 = exec("date +%s%N 2>/dev/null || echo 0").trim()
+    let mut wait_ms = 0
+    try {
+        let a = to_int(t0)
+        let b = to_int(t1)
+        if b > a { wait_ms = (b - a) / 1000000 }
+    } catch e {}
+    if wait_ms < 0 { wait_ms = 0 }
+    return wait_ms
+}
+
+fn _round_parallel_atlas_unlock() -> void {
+    // rmdir cleanup. trap 없이 명시 호출 — lock_hold 범위 짧게 유지.
+    let lockd = "/tmp/nexus_atlas.lock"
+    exec("rmdir " + shell_quote(lockd) + " 2>/dev/null || rm -rf " + shell_quote(lockd) + " 2>/dev/null")
+}
+
+fn _round_parallel_should_run(mode_str: str) -> bool {
+    // env gate. mode_str 은 호출자 context 식별자 (로그용) — 값 무관, 항상 env 확인.
+    let _ctx = if mode_str.len() > 0 { mode_str } else { "drill" }
+    let v = env("NEXUS_ROUND_PARALLEL")
+    if v == "1" { return true }
+    return false
+}
+
+fn _round_parallel_fork_exec(round: int, seeds: [str]) -> [int] {
+    // fork-style 병렬 round: seeds 배열의 각 element 를 per-round subseed 로 사용,
+    // atlas lock 구간 분리 실행. 반환: 각 round absorption count 배열 (best-keep 은 호출측 max()).
+    //
+    // E16 MVP subset — atlas.n6 write 가 집중되는 smash + free 2-stage 만 실행.
+    // 나머지 stage 는 read-only 이거나 sidecar (mkx_engine.hexa) 로 race 영향 낮음.
+    let n = len(seeds)
+    let mut results: [int] = []
+    if n == 0 { return results }
+    let nx = nexus_root()
+    let blow_core = nx + "/cli/blowup/core/blowup.hexa"
+    let compose   = nx + "/cli/blowup/compose.hexa"
+    let exv_bin   = hexa_bin()
+    let mut k = 0
+    while k < n {
+        let rk = round + k
+        eprintln("NEXUS_ROUND_PARALLEL {\"event\":\"round_start\",\"round\":" + to_string(rk) + "}")
+        let sseed = seeds[k]
+        let qseed = shell_quote(sseed)
+        let qbc   = shell_quote(blow_core)
+        let qcp   = shell_quote(compose)
+        let qexv  = shell_quote(exv_bin)
+        let t0 = exec("date +%s%N 2>/dev/null || echo 0").trim()
+        // atlas lock 획득 (대기 시간 집계) — smash write surface 진입 전.
+        let wait_smash = _round_parallel_atlas_lock()
+        eprintln("NEXUS_ROUND_PARALLEL {\"event\":\"atlas_wait_ms\",\"round\":" + to_string(rk) + ",\"ms\":" + to_string(wait_smash) + "}")
+        let hold_t0 = exec("date +%s%N 2>/dev/null || echo 0").trim()
+        let out_smash = exec(qexv + " run " + qbc + " smash " + qseed + " 3 2>&1")
+        let hold_t1 = exec("date +%s%N 2>/dev/null || echo 0").trim()
+        _round_parallel_atlas_unlock()
+        let mut hold_ms_a = 0
+        try {
+            let ha = to_int(hold_t0)
+            let hb = to_int(hold_t1)
+            if hb > ha { hold_ms_a = (hb - ha) / 1000000 }
+        } catch e {}
+        eprintln("NEXUS_ROUND_PARALLEL {\"event\":\"atlas_hold_ms\",\"round\":" + to_string(rk) + ",\"ms\":" + to_string(hold_ms_a) + "}")
+        let smash_ct = _count_discoveries(out_smash)
+        // free_dfs — compose 도 atlas write surface → lock 재획득.
+        let wait_free = _round_parallel_atlas_lock()
+        eprintln("NEXUS_ROUND_PARALLEL {\"event\":\"atlas_wait_ms\",\"round\":" + to_string(rk) + ",\"ms\":" + to_string(wait_free) + "}")
+        let hold2_t0 = exec("date +%s%N 2>/dev/null || echo 0").trim()
+        let out_free = exec(qexv + " run " + qcp + " free_dfs " + qseed + " --modules all --dfs 3 2>&1")
+        let hold2_t1 = exec("date +%s%N 2>/dev/null || echo 0").trim()
+        _round_parallel_atlas_unlock()
+        let mut hold_ms_b = 0
+        try {
+            let ha2 = to_int(hold2_t0)
+            let hb2 = to_int(hold2_t1)
+            if hb2 > ha2 { hold_ms_b = (hb2 - ha2) / 1000000 }
+        } catch e {}
+        eprintln("NEXUS_ROUND_PARALLEL {\"event\":\"atlas_hold_ms\",\"round\":" + to_string(rk) + ",\"ms\":" + to_string(hold_ms_b) + "}")
+        let free_ct = _count_discoveries(out_free)
+        let round_ct = smash_ct + free_ct
+        let t1 = exec("date +%s%N 2>/dev/null || echo 0").trim()
+        let mut dur_ms = 0
+        try {
+            let aa = to_int(t0)
+            let bb = to_int(t1)
+            if bb > aa { dur_ms = (bb - aa) / 1000000 }
+        } catch e {}
+        eprintln("NEXUS_ROUND_PARALLEL {\"event\":\"round_end\",\"round\":" + to_string(rk) + ",\"absorb\":" + to_string(round_ct) + ",\"duration_ms\":" + to_string(dur_ms) + "}")
+        results = results + [round_ct]
+        k = k + 1
+    }
+    return results
+}
+
 // ─── E1 depth plan (2026-04-21) ─── drill.json stages.{name}.default_depth + presets
 // Plan vector index: 0=smash, 1=free, 2=absolute, 3=meta_closure, 4=hyperarith, 5=resonance
 // Values: -1 = SSOT default, 0 = disabled, >=1 = active depth.
@@ -2602,6 +2735,37 @@ fn cmd_drill(seed: str, max_rounds: str, engine_flag: str, preset: str, master_d
             println("▎ [resume] seed_hash=" + seed_hash + " — round " + to_string(round) + " 까지 완료, round " + to_string(round + 1) + " 부터 재개 (total=" + to_string(total_new) + ", skipped_rounds=" + to_string(round) + ")")
             println("")
         }
+    }
+
+    // E16 round parallel replay (2026-04-21) — opt-in via NEXUS_ROUND_PARALLEL=1.
+    //   pre-launch: seeds 배열을 per-round salt 로 생성 → _round_parallel_fork_exec 호출.
+    //   best-keep: 각 round absorption 중 max 선택 후 total 에 합산, sequential loop 생략.
+    //   assumption: inter-round 독립 (race 방지는 /tmp/nexus_atlas.lock mkdir mutex).
+    if _round_parallel_should_run("drill") {
+        eprintln("NEXUS_ROUND_PARALLEL {\"event\":\"dispatch\",\"mode\":\"fork_exec\",\"rounds\":" + to_string(rounds_max) + "}")
+        let mut _rp_seeds: [str] = []
+        let mut _rp_k = 1
+        while _rp_k < rounds_max + 1 {
+            let _rp_salt = _urand_i64()
+            let _rp_seed = _round_seed(nonce_base, _rp_k, _rp_salt)
+            _rp_seeds = _rp_seeds + [_rp_seed]
+            _rp_k = _rp_k + 1
+        }
+        let _rp_results = _round_parallel_fork_exec(round + 1, _rp_seeds)
+        let mut _rp_sum = 0
+        let mut _rp_best = 0
+        let mut _rp_i = 0
+        while _rp_i < len(_rp_results) {
+            let _rp_v = _rp_results[_rp_i]
+            _rp_sum = _rp_sum + _rp_v
+            if _rp_v > _rp_best { _rp_best = _rp_v }
+            _rp_i = _rp_i + 1
+        }
+        total_new = total_new + _rp_sum
+        eprintln("NEXUS_ROUND_PARALLEL {\"event\":\"summary\",\"rounds\":" + to_string(len(_rp_results)) + ",\"sum\":" + to_string(_rp_sum) + ",\"best\":" + to_string(_rp_best) + ",\"total\":" + to_string(total_new) + "}")
+        println("▎ [E16 parallel] rounds=" + to_string(len(_rp_results)) + " sum=" + to_string(_rp_sum) + " best=" + to_string(_rp_best) + " total=" + to_string(total_new))
+        _cross_iter_check_and_append(total_new, seed)
+        return
     }
 
     while round < rounds_max {
