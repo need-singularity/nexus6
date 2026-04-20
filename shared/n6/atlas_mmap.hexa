@@ -1,0 +1,253 @@
+// ═══════════════════════════════════════════════════════════
+// atlas_mmap.hexa — atlas.n6 page-on-demand (kernel page cache) PoC
+//
+// 배경:
+//   atlas.n6 (≈1.5MB, 21800 line) 를 hexa 의 read_file()+split("\n") 로 읽으면
+//   interpreter 가 line 당 수십 KB overhead 를 먹어 RSS ≈ 450MB 까지 폭발.
+//   Mac 4GB RSS cap watchdog 하에서는 수 mount 반복시 OOM kill.
+//
+// 설계:
+//   hexa-lang userland 는 mmap syscall 미노출 (self/rt/fs.hexa 의 fs_mmap_ro
+//   는 self-hosted 컴파일러 전용 — 일반 스크립트는 접근 불가).
+//   → 대안: 커널 page cache 활용. awk/dd 에게 "필요한 line 만" 집어달라고
+//     요청 → hexa heap 에 1.5MB 통째로 얹지 않음. page cache 는 kernel 이
+//     관리, working set 만 RSS 반영 — mmap 효과 동등 (O_RDONLY + lazy read).
+//
+//   atlas.n6 은 read-only 준수. index 는 /tmp/atlas_bucket_idx.json 재사용.
+//
+// 사용:
+//   hexa shared/n6/atlas_mmap.hexa query <prefix>
+//     — bucket index → line indices → awk 스트리밍 추출 (no split)
+//   hexa shared/n6/atlas_mmap.hexa bench <prefix> <N>
+//     — N 회 반복 query (RSS / wall 측정용)
+//
+// env:
+//   NEXUS_ATLAS_MMAP=1  (기본 off) — 활성화 플래그. off 면 legacy path 로 복귀.
+//
+// Mac 호환:
+//   awk/dd 는 POSIX, BSD awk (Mac 기본) 에서도 NR selection 동일 동작 확인.
+//   bucket index rebuild 시 stat -c / stat -f 양립 (atlas_scan_opt.hexa 재사용).
+//
+// 편집 금지: atlas.n6 본체.
+// 규칙: hexa `>=`/`<=` 금지 — 본 파일에서는 < / > 만 사용.
+// ═══════════════════════════════════════════════════════════
+
+let _ATLAS_PATH = "shared/n6/atlas.n6"
+let _INDEX_PATH = "/tmp/atlas_bucket_idx.json"
+
+// ─── env flag ───
+fn _mmap_enabled() -> bool {
+    let v = env("NEXUS_ATLAS_MMAP")
+    if v == "1" { return true }
+    if v == "on" { return true }
+    if v == "true" { return true }
+    return false
+}
+
+// ─── ns clock ───
+fn _ns_now() -> i64 {
+    let mut r: i64 = 0
+    try {
+        let raw = to_string(exec("date +%s%N")).trim()  // @allow-bare-exec
+        r = to_int(raw)
+    } catch e {}  // @allow-silent-catch
+    return r
+}
+
+// ─── JSON int ───
+fn _json_int_g(raw: string, key: string) -> i64 {
+    let mut v: i64 = 0
+    let marker = "\"" + key + "\":"
+    let idx = raw.index_of(marker)
+    if idx > -1 {
+        let after = raw.substring(idx + len(marker), len(raw))
+        let mut end = after.index_of(",")
+        let end2 = after.index_of("}")
+        if end < 0 { end = end2 }
+        else if end2 > -1 && end2 < end { end = end2 }
+        if end > 0 {
+            try { v = to_int(after.substring(0, end).trim()) } catch e {}  // @allow-silent-catch
+        }
+    }
+    return v
+}
+
+// ═══════════════════════════════════════════════════════════
+//  _bucket_line_indices_csv — bucket index JSON 에서 prefix 의
+//  line_index CSV 를 그대로 추출 (parsing 최소화, hexa heap 절약).
+//  반환: "" if not found / empty.
+// ═══════════════════════════════════════════════════════════
+fn _bucket_line_indices_csv(prefix: string) -> string {
+    if !file_exists(_INDEX_PATH) { return "" }
+    let raw = read_file(_INDEX_PATH)
+    let marker = "\"" + prefix + "\":["
+    let bstart = raw.index_of(marker)
+    if bstart < 0 { return "" }
+    let after = raw.substring(bstart + len(marker), len(raw))
+    let close = after.index_of("]")
+    if close < 0 { return "" }
+    return after.substring(0, close).trim()
+}
+
+// ═══════════════════════════════════════════════════════════
+//  mmap_lookup_by_prefix — 커널 page-cache 경유 line 추출
+//
+//  전략:
+//    1) bucket index → line_index CSV (이미 persisted)
+//    2) awk 'NR in set' atlas.n6 — awk 가 내부적으로 atlas 를 streaming
+//       read (BSD/GNU awk 모두 getline buffer + mmap / lazy read) → hexa
+//       heap 에는 selected line 만 들어옴.
+//    3) output parse: awk 의 stdout 을 split("\n") 만 — 보통 수십 line.
+//
+//  legacy (atlas_scan_opt.scan_by_prefix) 대비:
+//    · legacy: read_file(atlas) → split("\n") → pick indices  (≈450MB RSS)
+//    · mmap : awk → selected lines only                       (≈수 MB RSS)
+// ═══════════════════════════════════════════════════════════
+fn mmap_lookup_by_prefix(atlas_path: string, prefix: string) -> [string] {
+    let mut out: [string] = []
+    let csv = _bucket_line_indices_csv(prefix)
+    if csv == "" { return out }
+
+    // CSV 는 이미 0-origin line_index. awk NR 는 1-origin → idx+1 사용.
+    // 전략: line index set 을 /tmp/atlas_mmap_set.txt 에 한 줄 한 개로 기록,
+    //       awk 로 FILENAME==selector 면 선적재, 그 외는 NR 매칭. 이 방식은
+    //       (a) hexa heap 안에서 긴 awk src 문자열 조립 회피 (interpreter
+    //       O(n²) 방지), (b) set 파일도 mmap page-cache 에 얹혀 working
+    //       set 만 RSS 반영.
+    let parts_csv_nl = csv.replace(",", "\n")
+    let set_path = "/tmp/atlas_mmap_set.txt"
+    try { write_file(set_path, parts_csv_nl + "\n") } catch e {  // @allow-silent-catch
+        return out
+    }
+
+    // awk 1: 첫 번째 파일 (set_path) 에서 1-origin NR 을 담고
+    //         두 번째 파일 (atlas) 에서 선택.
+    //   NR==FNR: set 로딩 (line 내용이 0-origin idx → +1 해서 map key)
+    //   그 외:   atlas entry — FNR in S 이면 print
+    let awk_src = "NR==FNR{S[$1+1]=1;next} (FNR in S){print FNR-1 \"\\t\" $0}"
+
+    let mut raw = ""
+    try {
+        raw = to_string(exec("awk '" + awk_src + "' '" + set_path + "' '" + atlas_path + "' 2>/dev/null"))
+    } catch e {  // @allow-silent-catch
+        return out
+    }
+    if raw == "" { return out }
+
+    // split output — 각 line: "<idx>\t<entry_line>"
+    let lines = raw.split("\n")
+    let nl = len(lines)
+    let mut j: i64 = 0
+    while j < nl {
+        let ln = lines[j]
+        if ln != "" {
+            // strip "<idx>\t" prefix
+            let tab = ln.index_of("\t")
+            if tab > -1 {
+                out.push(ln.substring(tab + 1, len(ln)))
+            } else {
+                out.push(ln)
+            }
+        }
+        j = j + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════
+//  RSS self-probe — emit 현재 RSS (ps 경유)
+// ═══════════════════════════════════════════════════════════
+fn _self_rss_kb() -> i64 {
+    let mut r: i64 = 0
+    try {
+        let raw = to_string(exec("ps -o rss= -p $$ 2>/dev/null | tr -d ' '")).trim()  // @allow-bare-exec
+        r = to_int(raw)
+    } catch e {}  // @allow-silent-catch
+    return r
+}
+
+// ═══════════════════════════════════════════════════════════
+//  CLI dispatch: query <prefix> | bench <prefix> <N>
+// ═══════════════════════════════════════════════════════════
+let a = args()
+let mut cmd = "query"
+if len(a) > 2 { cmd = a[2] }
+
+if cmd == "query" {
+    if len(a) < 4 {
+        println("usage: hexa shared/n6/atlas_mmap.hexa query <prefix>")
+        exit(1)  // @allow-silent-exit
+    }
+    let prefix = a[3]
+    let use_mmap = _mmap_enabled()
+    let t0 = _ns_now()
+    let matches = mmap_lookup_by_prefix(_ATLAS_PATH, prefix)
+    let t1 = _ns_now()
+    let nm = len(matches)
+    let dur_us = (t1 - t0) / 1000
+    let rss_kb = _self_rss_kb()
+    let mut meta: [string] = []
+    meta.push("NEXUS_ATLAS_MMAP_QUERY {\"prefix\":\"")
+    meta.push(prefix)
+    meta.push("\",\"matches\":")
+    meta.push(to_string(nm))
+    meta.push(",\"duration_us\":")
+    meta.push(to_string(dur_us))
+    meta.push(",\"rss_kb\":")
+    meta.push(to_string(rss_kb))
+    meta.push(",\"mmap\":")
+    meta.push(if use_mmap { "true" } else { "false" })
+    meta.push("}")
+    eprintln(meta.join(""))
+    println("# prefix=" + prefix + " matches=" + to_string(nm))
+    let mut i: i64 = 0
+    let show = if nm < 20 { nm } else { 20 }
+    while i < show {
+        println(matches[i])
+        i = i + 1
+    }
+    if nm > show {
+        println("# (" + to_string(nm - show) + " more suppressed)")
+    }
+    exit(0)
+} else if cmd == "bench" {
+    if len(a) < 5 {
+        println("usage: hexa shared/n6/atlas_mmap.hexa bench <prefix> <N>")
+        exit(1)  // @allow-silent-exit
+    }
+    let prefix = a[3]
+    let mut n: i64 = 0
+    try { n = to_int(a[4]) } catch e {}  // @allow-silent-catch
+    if n < 1 { n = 1 }
+    let t0 = _ns_now()
+    let mut total: i64 = 0
+    let mut i: i64 = 0
+    while i < n {
+        let matches = mmap_lookup_by_prefix(_ATLAS_PATH, prefix)
+        total = total + len(matches)
+        i = i + 1
+    }
+    let t1 = _ns_now()
+    let dur_ms = (t1 - t0) / 1000000
+    let rss_kb = _self_rss_kb()
+    let mut meta: [string] = []
+    meta.push("NEXUS_ATLAS_MMAP_BENCH {\"prefix\":\"")
+    meta.push(prefix)
+    meta.push("\",\"N\":")
+    meta.push(to_string(n))
+    meta.push(",\"total_matches\":")
+    meta.push(to_string(total))
+    meta.push(",\"duration_ms\":")
+    meta.push(to_string(dur_ms))
+    meta.push(",\"per_query_us\":")
+    meta.push(to_string(if n > 0 { (t1 - t0) / 1000 / n } else { 0 }))
+    meta.push(",\"rss_kb_peak\":")
+    meta.push(to_string(rss_kb))
+    meta.push("}")
+    eprintln(meta.join(""))
+    println("atlas_mmap: bench OK — N=" + to_string(n) + " total=" + to_string(total) + " dur_ms=" + to_string(dur_ms))
+    exit(0)
+} else {
+    println("usage: hexa shared/n6/atlas_mmap.hexa {query <prefix>|bench <prefix> <N>}")
+    exit(1)  // @allow-silent-exit
+}

@@ -1,0 +1,397 @@
+// shared/drill/validation_h_session_drift.hexa — Validation Layer H (2026-04-21)
+//
+// Role (선행 layer A/B/D 연장):
+//   A: cross-round uniformity (round-내 stage-vector 동일성)
+//   B: ghost probe (seed-insensitivity 탐지)
+//   D: stage-dead column (구조적 zero 탐지)
+//   H: cross-SESSION drift — 어제 drill 과 오늘 drill 의 stage-sum profile 이
+//      catastrophic 변화 없이 안정 drift 하는지 검증.
+//
+// 입력: /tmp/nexus_drill_depth.ndjson (E5 emit, round-level NDJSON v1)
+//   schema: {"ts":..,"round":N,"plan":[..],"actual":[..],"yield":{...},
+//            "total":T,"parallel":bool,"seed_hash":"..","adaptive_reason":".."}
+//   yield keys: smash, free, absolute, meta_closure, hyperarith, resonance
+//
+// 알고리즘:
+//   1) NDJSON 전체 라인 읽기 → (ts, stage_vec[6]) 튜플 리스트.
+//      stage_vec = yield 의 6 key 를 [smash, free, absolute, meta_closure, hyperarith, resonance] 순서로.
+//   2) session 경계: ts gap ≥ SESSION_GAP_SEC (기본 1800s = 30min) → 새 session.
+//      같은 session 내 round 들의 stage_vec 를 element-wise 합 → session-vector.
+//   3) 최근 N sessions (기본 7) 중 "current = 마지막 session",
+//      "baseline = 그 이전 min(N-1, 보유) sessions 의 element-wise 평균".
+//   4) verdict: cosine(current, baseline)
+//        ≥ 0.85 → STABLE (PASS)
+//        ≥ 0.70 → DRIFTING (WARN)
+//        <  0.70 → REGRESSION (REJECT) + NEXUS_DRIFT_REGRESSION JSON stderr emit
+//
+// hexa-lang 함정 메모:
+//   - undef var → "void" string coerce: optional NDJSON 키 접근 시 명시 존재 확인 후 parse.
+//   - void 혼입 방지: 모든 비교 전에 len() == 0 체크 또는 trim() 으로 공백화.
+//   - NDJSON 없으면 graceful no-op (첫 세션 대응).
+//
+// 사용:
+//   hexa run shared/drill/validation_h_session_drift.hexa
+//   hexa run shared/drill/validation_h_session_drift.hexa --ndjson /path/to/drill.ndjson
+//   hexa run shared/drill/validation_h_session_drift.hexa --window 7 --gap 1800
+//
+// 출력:
+//   stderr: NEXUS_DRILL_VALIDATION_H {verdict, cosine, window, current_sum, baseline_sum, ...}
+//   REGRESSION 시 추가: NEXUS_DRIFT_REGRESSION (ai-native error channel)
+
+// ───────────────── helpers ──────────────────
+fn _sh_quote(s: str) -> str {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn str_find(s: str, needle: str) -> i64 {
+    let n = s.len()
+    let m = needle.len()
+    if m == 0 { return 0 }
+    if m > n { return -1 }
+    if !s.contains(needle) { return -1 }
+    let mut i: i64 = 0
+    let end = n - m
+    while i <= end {
+        if s.substring(i, i + m) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn abs_f(x: float) -> float {
+    if x < 0.0 { return 0.0 - x } else { return x }
+}
+
+fn sqrt_f(x: float) -> float {
+    // Newton 25 iter — h3_core6_cross_seed.hexa mirror.
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 0.000001 { g = 0.001 }
+    let mut i: i64 = 0
+    while i < 25 {
+        if g > 0.0 { g = (g + x / g) / 2.0 }
+        i = i + 1
+    }
+    return g
+}
+
+// ───────────────── JSON primitive slicers ──────────────────
+// NDJSON 1 line 에서 필요한 int 필드만 추출. 실패 시 0 반환 + ok=false 플래그.
+
+fn _find_key_int(line: str, key: str) -> int {
+    // `"key":NUMBER` 패턴 → NUMBER. 없으면 0.
+    let needle = "\"" + key + "\":"
+    let idx = str_find(line, needle)
+    if idx < 0 { return 0 }
+    let start = idx + needle.len()
+    // skip whitespace
+    let mut j = start
+    while j < line.len() {
+        let ch = line.substring(j, j + 1)
+        if ch != " " && ch != "\t" { break }
+        j = j + 1
+    }
+    // collect digits (+ sign)
+    let mut buf = ""
+    if j < line.len() && line.substring(j, j + 1) == "-" {
+        buf = buf + "-"
+        j = j + 1
+    }
+    while j < line.len() {
+        let ch = line.substring(j, j + 1)
+        if ch == "0" || ch == "1" || ch == "2" || ch == "3" || ch == "4"
+            || ch == "5" || ch == "6" || ch == "7" || ch == "8" || ch == "9" {
+            buf = buf + ch
+            j = j + 1
+        } else { break }
+    }
+    if buf.len() == 0 { return 0 }
+    if buf == "-" { return 0 }
+    let mut v = 0
+    try { v = to_int(buf) } catch e { v = 0 }
+    return v
+}
+
+fn _extract_yield_block(line: str) -> str {
+    // `"yield":{ ... }` 내부 추출 (중괄호 균형 1 depth 가정).
+    let needle = "\"yield\":{"
+    let idx = str_find(line, needle)
+    if idx < 0 { return "" }
+    let start = idx + needle.len()
+    // find matching `}` — assume no nested objects inside yield.
+    let end_rel = str_find(line.substring(start, line.len()), "}")
+    if end_rel < 0 { return "" }
+    return line.substring(start, start + end_rel)
+}
+
+// ───────────────── NDJSON parse ──────────────────
+// parse 결과: parallel 배열 ts[], stage_matrix[ [6] ... ]
+// invalid line 은 skip (graceful).
+
+fn _parse_ndjson(raw: str) -> [[int]] {
+    // returns rows: [ts, s0, s1, s2, s3, s4, s5] per valid line. hexa-lang 의
+    // 튜플 부재 → 7-width int row 로 구성.
+    let mut rows: [[int]] = []
+    if raw.len() == 0 { return rows }
+    let lines = raw.split("\n")
+    let mut li = 0
+    while li < lines.len() {
+        let line = lines[li].trim()
+        li = li + 1
+        if line.len() == 0 { continue }
+        if line.substring(0, 1) != "{" { continue }
+        let ts = _find_key_int(line, "ts")
+        if ts <= 0 { continue }
+        let yb = _extract_yield_block(line)
+        if yb.len() == 0 { continue }
+        // yield 내부에서 stage 별 추출
+        let s0 = _find_key_int(yb, "smash")
+        let s1 = _find_key_int(yb, "free")
+        let s2 = _find_key_int(yb, "absolute")
+        let s3 = _find_key_int(yb, "meta_closure")
+        let s4 = _find_key_int(yb, "hyperarith")
+        let s5 = _find_key_int(yb, "resonance")
+        rows = rows + [[ts, s0, s1, s2, s3, s4, s5]]
+    }
+    return rows
+}
+
+// ───────────────── session bucketing ──────────────────
+// ts gap ≥ gap_sec → 새 session. 각 session 의 stage-sum [6] 반환.
+
+fn _bucket_sessions(rows: [[int]], gap_sec: int) -> [[int]] {
+    // hexa-lang 함정: [mutable_array] literal 로 push 하면 append 후 접근이 0 으로 reset.
+    // 우회: push 시 [[c0,c1,c2,c3,c4,c5]] element literal 로 snapshot.
+    let mut sessions: [[int]] = []
+    let n = len(rows)
+    if n == 0 { return sessions }
+    let mut c0 = 0
+    let mut c1 = 0
+    let mut c2 = 0
+    let mut c3 = 0
+    let mut c4 = 0
+    let mut c5 = 0
+    let mut prev_ts = rows[0][0]
+    let mut ri = 0
+    while ri < n {
+        let r = rows[ri]
+        if ri > 0 {
+            let gap = r[0] - prev_ts
+            if gap >= gap_sec {
+                sessions = sessions + [[c0, c1, c2, c3, c4, c5]]
+                c0 = 0
+                c1 = 0
+                c2 = 0
+                c3 = 0
+                c4 = 0
+                c5 = 0
+            }
+        }
+        c0 = c0 + r[1]
+        c1 = c1 + r[2]
+        c2 = c2 + r[3]
+        c3 = c3 + r[4]
+        c4 = c4 + r[5]
+        c5 = c5 + r[6]
+        prev_ts = r[0]
+        ri = ri + 1
+    }
+    sessions = sessions + [[c0, c1, c2, c3, c4, c5]]
+    return sessions
+}
+
+// ───────────────── cosine similarity ──────────────────
+fn _cosine_6(a: [int], b: [int]) -> float {
+    let mut dot = 0.0
+    let mut na = 0.0
+    let mut nb = 0.0
+    let mut i = 0
+    while i < 6 {
+        let av = to_float(a[i])
+        let bv = to_float(b[i])
+        dot = dot + av * bv
+        na = na + av * av
+        nb = nb + bv * bv
+        i = i + 1
+    }
+    let denom = sqrt_f(na) * sqrt_f(nb)
+    if denom <= 0.0 { return 0.0 }
+    return dot / denom
+}
+
+// ───────────────── baseline average ──────────────────
+// 이전 K sessions 의 element-wise 평균 (정수 → float, 정수 round).
+
+fn _baseline_avg(sessions: [[int]], start_idx: int, end_idx: int) -> [int] {
+    // inclusive start_idx, exclusive end_idx
+    let mut t0 = 0
+    let mut t1 = 0
+    let mut t2 = 0
+    let mut t3 = 0
+    let mut t4 = 0
+    let mut t5 = 0
+    let mut count = 0
+    let mut si = start_idx
+    while si < end_idx {
+        let s = sessions[si]
+        t0 = t0 + s[0]
+        t1 = t1 + s[1]
+        t2 = t2 + s[2]
+        t3 = t3 + s[3]
+        t4 = t4 + s[4]
+        t5 = t5 + s[5]
+        count = count + 1
+        si = si + 1
+    }
+    if count <= 0 { return [t0, t1, t2, t3, t4, t5] }
+    return [t0 / count, t1 / count, t2 / count, t3 / count, t4 / count, t5 / count]
+}
+
+// ───────────────── JSON formatters ──────────────────
+fn _vec_json(v: [int]) -> str {
+    let mut out = "["
+    let mut i = 0
+    while i < len(v) {
+        if i > 0 { out = out + "," }
+        out = out + to_string(v[i])
+        i = i + 1
+    }
+    out = out + "]"
+    return out
+}
+
+fn _fmt_cos(c: float) -> str {
+    // float → "0.nnnn" (4 decimal digits, non-negative clamped).
+    let mut x = c
+    if x < 0.0 { x = 0.0 }
+    if x > 1.0 { x = 1.0 }
+    let scaled = x * 10000.0
+    let mut iv = 0
+    try { iv = to_int(to_string(scaled)) } catch e { iv = 0 }
+    // hexa 의 to_int("0.1234") → 0 이므로 우회: floor 를 수동 구현.
+    // 위 try 가 대개 실패 → 아래 fallback 사용.
+    if iv == 0 && scaled > 0.5 {
+        // 정수부 추출: scaled 의 int truncate 를 to_string slicing 으로.
+        let s = to_string(scaled)
+        let dot = str_find(s, ".")
+        let whole = if dot < 0 { s } else { s.substring(0, dot) }
+        try { iv = to_int(whole) } catch e { iv = 0 }
+    }
+    let int_part = iv / 10000
+    let frac_part = iv - int_part * 10000
+    let mut fp = to_string(frac_part)
+    while fp.len() < 4 { fp = "0" + fp }
+    return to_string(int_part) + "." + fp
+}
+
+// ───────────────── verdict + emit ──────────────────
+fn _emit_regression(cosine_s: str, window_used: int, current_vec: [int], baseline_vec: [int]) -> void {
+    // ai-native error channel — NEXUS_DRIFT_REGRESSION JSON stderr.
+    let err = "{\"kind\":\"drift_regression\",\"schema\":\"h/v1\""
+        + ",\"cosine\":" + cosine_s
+        + ",\"threshold_regress\":0.70"
+        + ",\"window\":" + to_string(window_used)
+        + ",\"current\":" + _vec_json(current_vec)
+        + ",\"baseline\":" + _vec_json(baseline_vec)
+        + ",\"reason\":\"current session stage-sum vector cosine similarity < 0.70 vs baseline moving avg\""
+        + ",\"recovery\":\"drill 엔진/seed 파라미터 회귀 의심 — 직전 commit 기반 git bisect, 또는 blowup modules.json drift 점검\"}"
+    eprintln("NEXUS_DRIFT_REGRESSION " + err)
+}
+
+fn _emit_result(verdict: str, cosine_s: str, window_used: int, total_sessions: int,
+                current_vec: [int], baseline_vec: [int], note: str) -> void {
+    let safe_note = note.replace("\"", "'")
+    let j = "{\"layer\":\"H\",\"verdict\":\"" + verdict + "\""
+        + ",\"cosine\":" + cosine_s
+        + ",\"window\":" + to_string(window_used)
+        + ",\"sessions_total\":" + to_string(total_sessions)
+        + ",\"current\":" + _vec_json(current_vec)
+        + ",\"baseline\":" + _vec_json(baseline_vec)
+        + ",\"note\":\"" + safe_note + "\"}"
+    eprintln("NEXUS_DRILL_VALIDATION_H " + j)
+}
+
+// ───────────────── core pipeline ──────────────────
+fn run_validation_h(ndjson_path: str, window: int, gap_sec: int) -> str {
+    // 반환: verdict string ("STABLE"|"DRIFTING"|"REGRESSION"|"NOOP"|"INSUFFICIENT").
+    // 소비자 (run.hexa 훅) 가 exit code 결정할 수 있도록.
+    let exists = exec("test -f " + _sh_quote(ndjson_path) + " && echo yes || echo no").trim()
+    if exists != "yes" {
+        eprintln("NEXUS_DRILL_VALIDATION_H {\"layer\":\"H\",\"verdict\":\"NOOP\",\"reason\":\"ndjson_absent\",\"path\":\"" + ndjson_path + "\"}")
+        return "NOOP"
+    }
+    let raw = read_file(ndjson_path)
+    if raw.len() == 0 {
+        eprintln("NEXUS_DRILL_VALIDATION_H {\"layer\":\"H\",\"verdict\":\"NOOP\",\"reason\":\"ndjson_empty\"}")
+        return "NOOP"
+    }
+    let rows = _parse_ndjson(raw)
+    if len(rows) == 0 {
+        eprintln("NEXUS_DRILL_VALIDATION_H {\"layer\":\"H\",\"verdict\":\"NOOP\",\"reason\":\"no_valid_rows\"}")
+        return "NOOP"
+    }
+    let sessions = _bucket_sessions(rows, gap_sec)
+    let ns = len(sessions)
+    if ns < 2 {
+        // 첫 세션 → baseline 없음. graceful no-op.
+        let cur0 = if ns >= 1 { sessions[0] } else { [0, 0, 0, 0, 0, 0] }
+        eprintln("NEXUS_DRILL_VALIDATION_H {\"layer\":\"H\",\"verdict\":\"INSUFFICIENT\",\"sessions_total\":"
+            + to_string(ns) + ",\"current\":" + _vec_json(cur0) + ",\"note\":\"baseline 부재 (session<2)\"}")
+        return "INSUFFICIENT"
+    }
+
+    let current = sessions[ns - 1]
+    let take = if window - 1 < ns - 1 { window - 1 } else { ns - 1 }
+    let base_start = ns - 1 - take
+    let baseline = _baseline_avg(sessions, base_start, ns - 1)
+    let cos = _cosine_6(current, baseline)
+    let cos_s = _fmt_cos(cos)
+
+    let mut verdict = "STABLE"
+    let mut note = "stage-sum vector stable across sessions"
+    if cos < 0.70 {
+        verdict = "REGRESSION"
+        note = "cosine < 0.70 — catastrophic drift"
+    } else if cos < 0.85 {
+        verdict = "DRIFTING"
+        note = "0.70 ≤ cosine < 0.85 — soft drift (WARN)"
+    }
+
+    _emit_result(verdict, cos_s, take, ns, current, baseline, note)
+    if verdict == "REGRESSION" {
+        _emit_regression(cos_s, take, current, baseline)
+    }
+    return verdict
+}
+
+// ───────────────── main ──────────────────
+fn main() {
+    let a = args()
+    let mut ndjson_path = "/tmp/nexus_drill_depth.ndjson"
+    let mut window = 7
+    let mut gap_sec = 1800
+    let mut i = 0
+    while i < a.len() {
+        let t = to_string(a[i])
+        if t == "--ndjson" && i + 1 < a.len() {
+            ndjson_path = to_string(a[i + 1])
+            i = i + 1
+        } else if t == "--window" && i + 1 < a.len() {
+            let v = to_string(a[i + 1])
+            try { window = to_int(v) } catch e { window = 7 }
+            i = i + 1
+        } else if t == "--gap" && i + 1 < a.len() {
+            let v = to_string(a[i + 1])
+            try { gap_sec = to_int(v) } catch e { gap_sec = 1800 }
+            i = i + 1
+        }
+        i = i + 1
+    }
+    if window < 2 { window = 2 }
+    if gap_sec < 1 { gap_sec = 1800 }
+
+    let verdict = run_validation_h(ndjson_path, window, gap_sec)
+    println("__VALIDATION_H__ " + verdict)
+}
+
+main()

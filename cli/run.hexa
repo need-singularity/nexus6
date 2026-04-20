@@ -32,6 +32,19 @@
 
 let VERSION = "0.1.0-hive-hub"
 
+// ─── E12-B (2026-04-21) — batch-shared Phase-1 init caches ───
+// SSOT: shared/config/drill.json .seed_batch (field "share_init" pending).
+// 배치 모드 --seeds 에서 seed 간 반복되는 Phase-1 init (hexa_bin lookup, engine 경로 resolve,
+// sigint trap install) 을 1회로 amortize 한다. 단일-seed drill 은 영향 없음 (cache miss → 기존 경로).
+// 모듈 범위 mutable — hexa-lang 탑레벨 `let mut` 허용 (smoke: /tmp/globtest.hexa 검증).
+// bypass: env NEXUS_BATCH_SHARE_INIT=0 → batch 진입 시 shared_init 건너뜀 (cache 도 primed 되지 않음).
+let mut _hexa_bin_cache: str = ""
+let mut _hexa_bin_cache_set: bool = false
+let mut _nexus_root_cache: str = ""
+let mut _nexus_root_cache_set: bool = false
+let mut _sigint_installed: bool = false
+let mut _batch_share_active: bool = false
+
 // ─── Linux stage1 hexa polyfill (cli/blowup/lib/str_compat.hexa.inc) ───
 // @include cli/blowup/lib/str_compat.hexa.inc (str_find) — inlined below
 fn str_find(s: str, needle: str) -> i64 {
@@ -60,12 +73,18 @@ fn str_find_from(s: str, needle: str, start: i64) -> i64 {
 }
 
 fn nexus_root() -> str {
+    // E12-B: 배치 모드에서 shared_init 으로 primed 될 경우 cache 히트 (env lookup 회피).
+    if _nexus_root_cache_set { return _nexus_root_cache }
     let n = env("NEXUS")
     if n.len() > 0 { return n }
     return env("HOME") + "/Dev/nexus"
 }
 
 fn hexa_bin() -> str {
+    // E12-B: 배치 모드에서 shared_init 으로 primed 될 경우 cache 히트.
+    // 단일 drill 에서도 여러 stage 호출마다 cand 스캔 반복 회피 가능하지만 기존 동작 유지를 위해
+    // cache 갱신은 shared_init 경로에서만 수행 (단일-seed 경로 변경 최소화 원칙).
+    if _hexa_bin_cache_set { return _hexa_bin_cache }
     let h = env("HEXA")
     if h.len() > 0 { return h }
     let cands = [env("HOME") + "/Dev/hexa-lang/hexa", env("HOME") + "/.hx/bin/hexa", nexus_root() + "/shared/bin/hexa"]
@@ -165,7 +184,11 @@ fn cmd_help() -> void {
     println("  absolute --seed \"...\"           Mk.VIII Δ₀-absolute 검증 ([10*]→[11*])")
     println("  drill --seed \"...\" [--max-rounds N] [--engine mk9|mk10] [--preset fast|probe|coarse|standard]")
     println("        [--problem riemann|bsd|hodge|navier|pnp|poincare|yangmills]   per-millennium preset (drill.json .problem_presets)")
+    println("        category layer: seed → analysis|number|algebra|topology|logic|geometry auto-detect (NEXUS_CATEGORY_OFF=1 비활성)")
     println("        [--depth N|auto] [--smash-depth N] [--free-dfs N] [--abs-depth N] [--meta-depth N] [--hyper-depth N] [--res-depth N] [--adaptive]")
+    println("        [--speculate N]   E18 same-round N-way fork, best-keep (기본 1, 권장 cap 3, NEXUS_SPECULATE=0 강제 N=1)")
+    println("        [--fresh | --no-resume]  E9 fast-resume opt-out (기본 resume ON — SIGKILL 후 재시작 시 seed-hash 매치로 즉시 복구)")
+    println("        [--checkpoint-dir <path>]  state file dir (기본 /tmp/nexus_checkpoint, env NEXUS_CHECKPOINT_DIR)")
     println("  meta-closure --seed \"...\"              Phase 10 🛸16 self-ref 검증 ([10*]→[10**])")
     println("  hyperarithmetic --prop \"...\"           Mk.IX Π₀² reverse-math 판정")
     println("  promote --id ... --grade ... --audit-log \"...\"  수동 등급 승급 (감사 로그 필수)")
@@ -735,6 +758,106 @@ fn _run_stage_parallel_stages(round: int, qrseed: str, plan: [int], hexa_b: str,
     return [s_new, f_new, a_pass, mc_new, hy_pass, err_count, duration_ms]
 }
 
+// ─── E18 (2026-04-21) Speculative branches — same-round N-way fork / best-keep ───
+// SSOT: flag --speculate N (default 1, cap 3 권장), env NEXUS_SPECULATE=0 force N=1 (legacy),
+//       env NEXUS_SPECULATE_CPU_CAP 상한 (default 12, stage_parallel 과 곱해졌을 때 한계).
+//
+// 배경: 현재 drill 은 deterministic seed + round_salt 1 개만 사용 → 엔진의 hash feature 가
+//       같은 round 에서 단일 bucket 에 고정. speculative 는 같은 round 에서 seed_variation N 개를
+//       (salt 다른 3 개 등) 순차 실행하여 yield 가장 높은 branch 만 채택, 나머지는 discard.
+//       seed quality 가 높을수록 N>1 speculative 수율이 커짐 (엔트로피 영역 탐색 확장).
+//
+// 설계 축:
+//   - E15 stage_parallel (round 내 5-stage 동시) 과는 직교: speculative 는 round 내 branch 차원.
+//   - E16 round_parallel (미완) 과도 직교: speculative 는 1 round 내부의 시도 수.
+//   - speculative 는 deterministic 이 아님 (urandom salt 사용) — NEXUS_SPECULATE=0 이면 N=1 강제.
+//   - stage_parallel 과 상호작용: N × 5 stages → CPU 부하 폭증 → NEXUS_SPECULATE_CPU_CAP 로 제한.
+//     cap = effective_cap / (stage_parallel ? 5 : 1). N > cap → N = cap (stderr WARN emit).
+//
+// 구현: 각 branch 마다 새 _round_entropy_salt(round) 를 _speculate_branch_mix() 로 추가 perturb
+//       → _round_seed_rich() 로 round_seed 생성 → 기존 stage pipeline 호출.
+//       각 branch 의 yields_vector/round_new 저장, 최고 점수 branch 만 채택.
+//       NEXUS_DRILL_SPECULATE JSON 1 line/round stderr — scores + kept_idx + discard_reasons.
+fn _speculate_default_cap() -> int {
+    // default 전체 CPU cap — N × (stage_parallel ? 5 : 1) ≤ cap. 권장 12 = 3 speculative × 4 H-agent + spare.
+    return 12
+}
+
+fn _speculate_cap() -> int {
+    // env NEXUS_SPECULATE_CPU_CAP override. 0/empty → default 12.
+    let v = env("NEXUS_SPECULATE_CPU_CAP").trim()
+    if v.len() == 0 { return _speculate_default_cap() }
+    let mut n = 0
+    try { n = to_int(v) } catch e { n = 0 }
+    if n <= 0 { return _speculate_default_cap() }
+    return n
+}
+
+fn _speculate_resolve(flag_val: str) -> int {
+    // speculate count 해석 — precedence:
+    //   1. NEXUS_SPECULATE=0 → 1 강제 (legacy deterministic)
+    //   2. --speculate N flag (정수, N ≥ 1)
+    //   3. env NEXUS_SPECULATE_N (정수, N ≥ 1) — batch / test 용
+    //   4. default 1
+    //   cap: NEXUS_SPECULATE_CPU_CAP (stage_parallel on 이면 /5, off 면 /1)
+    //        + 권장 상한 3 (cap3 — diminishing returns 관찰값)
+    let off = env("NEXUS_SPECULATE").trim()
+    if off == "0" || off.to_lower() == "false" { return 1 }
+    let mut n = -1
+    let fv = flag_val.trim()
+    if fv.len() > 0 {
+        try { n = to_int(fv) } catch e { n = -1 }
+    }
+    if n < 1 {
+        let ev = env("NEXUS_SPECULATE_N").trim()
+        if ev.len() > 0 {
+            try { n = to_int(ev) } catch e { n = -1 }
+        }
+    }
+    if n < 1 { n = 1 }
+    // cap: CPU 부하 — stage_parallel 과 결합 시 N × 5.
+    let cap_total = _speculate_cap()
+    let per_branch = if _stage_parallel_enabled() { 5 } else { 1 }
+    let mut cap = cap_total / per_branch
+    if cap < 1 { cap = 1 }
+    // 권장 상한 3 — diminishing returns. env NEXUS_SPECULATE_ALLOW_HIGH=1 이면 해제.
+    let high_ok = env("NEXUS_SPECULATE_ALLOW_HIGH").trim() == "1"
+    if !high_ok && cap > 3 { cap = 3 }
+    if n > cap {
+        eprintln("NEXUS_DRILL_SPECULATE_WARN {\"requested\":" + to_string(n)
+            + ",\"cap\":" + to_string(cap)
+            + ",\"stage_parallel\":" + (if _stage_parallel_enabled() { "true" } else { "false" })
+            + ",\"cpu_cap\":" + to_string(cap_total)
+            + ",\"action\":\"clamp\"}")
+        n = cap
+    }
+    return n
+}
+
+fn _speculate_branch_mix(base_salt: str, branch_idx: int, round: int) -> str {
+    // FNV-1a 32-bit prefix mix + nonce — branch 간 변별력 확보.
+    //   base_salt 에 branch_idx + urand_nonce 를 concat → salt 공간 분산.
+    //   prefix 는 _round_entropy_salt() 위에 추가 레이어 (bias_jitter 8-slot feature 변화).
+    // seed quality 높을수록 branch 간 yield 편차 커짐 (speculative 이득 증가).
+    if branch_idx == 0 { return base_salt }  // branch 0 = 기본 salt 유지 (기존 동작 호환)
+    let nonce = _urand_i64()
+    // FNV-1a 32-bit on (branch_idx + round) — prefix perturbation 용 hex tag.
+    let mut h: i64 = 2166136261
+    let mix_in = to_string(branch_idx * 1000 + round)
+    let mut ci = 0
+    while ci < mix_in.len() {
+        let ch = mix_in.substring(ci, ci + 1)
+        let cv: i64 = ch.len()  // char value proxy — substring length 은 1, 실제 char code 접근 제약으로 idx 기반 mix
+        h = (h ^ (cv + ci * 31)) * 16777619
+        // overflow mask: i64 에서 32-bit wrap 위해 하위 32-bit 만 유지
+        h = h % 4294967296
+        if h < 0 { h = h + 4294967296 }
+        ci = ci + 1
+    }
+    let fnv_tag = to_string(h)
+    return base_salt + "b" + to_string(branch_idx) + "f" + fnv_tag + "n" + to_string(nonce)
+}
+
 // ─── Mk.X sidecar dispatch (SWEEP P5 mk_x_trigger auto-fire) ───
 // Per anima/docs/sweep_50.json#mk_x_trigger.auto_fire_order step 3:
 //   "append transcendental_closure() stage 6 + slot 8-15 accessor bank"
@@ -940,6 +1063,165 @@ fn _problem_preset_known(problem: str) -> bool {
     return false
 }
 
+// ─── topology-aware category layer (2026-04-21) ─── shared/drill/category_classifier.hexa SSOT
+// 규칙 기반 — seed 의 keyword/symbol → top-1 category → problem_preset 위에 depth delta.
+// precedence: ssot < env < master < speed < problem < CATEGORY < per-stage (category 는 problem 위).
+// 비활성: NEXUS_CATEGORY_OFF=1 env 또는 --no-category flag.
+// 분류기 규칙은 shared/drill/category_classifier.hexa 와 동일해야 함 (SSOT 동기 유지).
+fn _cat_hit(s: str, k: str) -> int {
+    if k.len() == 0 { return 0 }
+    if s.contains(k) { return 1 }
+    return 0
+}
+
+fn _cat_score_analysis(lo: str, raw: str) -> int {
+    let mut s = 0
+    s = s + _cat_hit(lo, "integral")   + _cat_hit(lo, "derivative") + _cat_hit(lo, "limit")
+    s = s + _cat_hit(lo, "epsilon")    + _cat_hit(lo, "delta")      + _cat_hit(lo, "smooth")
+    s = s + _cat_hit(lo, "continuous") + _cat_hit(lo, "measure")    + _cat_hit(lo, "fourier")
+    s = s + _cat_hit(lo, "laplace")    + _cat_hit(lo, "pde")        + _cat_hit(lo, "ode")
+    s = s + _cat_hit(lo, "sobolev")    + _cat_hit(lo, "banach")     + _cat_hit(lo, "hilbert")
+    s = s + _cat_hit(lo, "navier")     + _cat_hit(lo, "convergence")+ _cat_hit(lo, "asymptotic")
+    s = s + 3 * _cat_hit(raw, "∫")    + 3 * _cat_hit(raw, "∂")    + 3 * _cat_hit(raw, "∇")
+    s = s + 3 * _cat_hit(raw, "∮")    + _cat_hit(lo, "dx")          + _cat_hit(lo, "lim")
+    return s
+}
+
+fn _cat_score_number(lo: str, raw: str) -> int {
+    let mut s = 0
+    s = s + _cat_hit(lo, "prime")    + _cat_hit(lo, "mod ")       + _cat_hit(lo, " mod")
+    s = s + _cat_hit(lo, "gcd")      + _cat_hit(lo, "lcm")         + _cat_hit(lo, "zeta")
+    s = s + _cat_hit(lo, "dirichlet")+ _cat_hit(lo, "diophant")    + _cat_hit(lo, "congruence")
+    s = s + _cat_hit(lo, "p-adic")   + _cat_hit(lo, "padic")       + _cat_hit(lo, "modular form")
+    s = s + _cat_hit(lo, "elliptic curve") + _cat_hit(lo, "bsd")   + _cat_hit(lo, "l-function")
+    s = s + _cat_hit(lo, "class number")
+    s = s + 3 * _cat_hit(raw, "ℤ") + 3 * _cat_hit(raw, "ℚ") + 3 * _cat_hit(raw, "ℙ") + 3 * _cat_hit(raw, "ζ")
+    return s
+}
+
+fn _cat_score_algebra(lo: str, raw: str) -> int {
+    let mut s = 0
+    s = s + _cat_hit(lo, "group")    + _cat_hit(lo, "ring")        + _cat_hit(lo, "field")
+    s = s + _cat_hit(lo, "module")   + _cat_hit(lo, "ideal")       + _cat_hit(lo, "galois")
+    s = s + _cat_hit(lo, "polynomial")+ _cat_hit(lo, "matrix")     + _cat_hit(lo, "vector space")
+    s = s + _cat_hit(lo, "tensor")   + _cat_hit(lo, "homomorphism")+ _cat_hit(lo, "automorphism")
+    s = s + _cat_hit(lo, "category") + _cat_hit(lo, "functor")     + _cat_hit(lo, "lie algebra")
+    s = s + _cat_hit(lo, "representation")
+    s = s + 3 * _cat_hit(raw, "Σ") + 3 * _cat_hit(raw, "∏") + 3 * _cat_hit(raw, "⊗") + 3 * _cat_hit(raw, "⊕")
+    return s
+}
+
+fn _cat_score_topology(lo: str, raw: str) -> int {
+    let mut s = 0
+    s = s + _cat_hit(lo, "manifold") + _cat_hit(lo, "homotopy")    + _cat_hit(lo, "homology")
+    s = s + _cat_hit(lo, "cohomology")+ _cat_hit(lo, "fundamental group") + _cat_hit(lo, "fibre")
+    s = s + _cat_hit(lo, "fiber bundle") + _cat_hit(lo, "sheaf")   + _cat_hit(lo, "open cover")
+    s = s + _cat_hit(lo, "compact")  + _cat_hit(lo, "connected")   + _cat_hit(lo, "hausdorff")
+    s = s + _cat_hit(lo, "poincare") + _cat_hit(lo, "cw complex")  + _cat_hit(lo, "simplicial")
+    s = s + _cat_hit(lo, "topolog")
+    s = s + 3 * _cat_hit(raw, "π₁") + 3 * _cat_hit(raw, "π_1")
+    return s
+}
+
+fn _cat_score_logic(lo: str, raw: str) -> int {
+    let mut s = 0
+    s = s + _cat_hit(lo, "axiom")    + _cat_hit(lo, "theorem")     + _cat_hit(lo, "predicate")
+    s = s + _cat_hit(lo, "quantifier")+ _cat_hit(lo, "godel")      + _cat_hit(lo, "gödel")
+    s = s + _cat_hit(lo, "undecidable") + _cat_hit(lo, "recursive")+ _cat_hit(lo, "consistency")
+    s = s + _cat_hit(lo, "completeness") + _cat_hit(lo, "zfc")     + _cat_hit(lo, "peano")
+    s = s + _cat_hit(lo, "forcing") + _cat_hit(lo, "ordinal")      + _cat_hit(lo, "cardinal")
+    s = s + _cat_hit(lo, "reverse math")
+    s = s + 3 * _cat_hit(raw, "∀") + 3 * _cat_hit(raw, "∃") + 3 * _cat_hit(raw, "⊢") + 3 * _cat_hit(raw, "⊨") + 3 * _cat_hit(raw, "¬")
+    return s
+}
+
+fn _cat_score_geometry(lo: str, raw: str) -> int {
+    let mut s = 0
+    s = s + _cat_hit(lo, "sphere")   + _cat_hit(lo, "curvature")   + _cat_hit(lo, "geodesic")
+    s = s + _cat_hit(lo, "metric")   + _cat_hit(lo, "euclidean")   + _cat_hit(lo, "riemannian")
+    s = s + _cat_hit(lo, "volume")   + _cat_hit(lo, "polytope")    + _cat_hit(lo, "triangle")
+    s = s + _cat_hit(lo, "angle")    + _cat_hit(lo, "isoperimetric") + _cat_hit(lo, "convex")
+    s = s + _cat_hit(lo, "hyperbolic") + _cat_hit(lo, "projective") + _cat_hit(lo, "affine")
+    s = s + _cat_hit(lo, "symplectic")
+    s = s + 3 * _cat_hit(raw, "π") + 3 * _cat_hit(raw, "θ") + 3 * _cat_hit(raw, "∠")
+    return s
+}
+
+fn _cat_classify(seed: str) -> str {
+    // top-1 category: analysis|number|algebra|topology|logic|geometry|MIXED|UNKNOWN
+    if seed.len() == 0 { return "UNKNOWN" }
+    let lo = seed.to_lower()
+    let s_an = _cat_score_analysis(lo, seed)
+    let s_nu = _cat_score_number(lo, seed)
+    let s_al = _cat_score_algebra(lo, seed)
+    let s_to = _cat_score_topology(lo, seed)
+    let s_lo = _cat_score_logic(lo, seed)
+    let s_ge = _cat_score_geometry(lo, seed)
+    let scores = [s_an, s_nu, s_al, s_to, s_lo, s_ge]
+    let names = ["analysis", "number", "algebra", "topology", "logic", "geometry"]
+    let mut ts = 0
+    let mut rs = 0
+    let mut ti = -1
+    let mut i = 0
+    while i < 6 {
+        let v = scores[i]
+        if v > ts { rs = ts; ts = v; ti = i } else if v > rs { rs = v }
+        i = i + 1
+    }
+    if ti < 0 || ts == 0 { return "UNKNOWN" }
+    if rs > 0 && rs * 100 >= ts * 85 { return "MIXED" }
+    return names[ti]
+}
+
+fn _cat_scores_json(seed: str) -> str {
+    let lo = seed.to_lower()
+    return "{\"analysis\":" + to_string(_cat_score_analysis(lo, seed))
+        + ",\"number\":" + to_string(_cat_score_number(lo, seed))
+        + ",\"algebra\":" + to_string(_cat_score_algebra(lo, seed))
+        + ",\"topology\":" + to_string(_cat_score_topology(lo, seed))
+        + ",\"logic\":" + to_string(_cat_score_logic(lo, seed))
+        + ",\"geometry\":" + to_string(_cat_score_geometry(lo, seed)) + "}"
+}
+
+fn _category_plan_delta(cat: str) -> [int] {
+    // per-stage delta [smash, free, absolute, meta_closure, hyper, resonance]
+    if cat == "analysis"  { return [1, 1, 1, 1, 2, 1] }
+    if cat == "number"    { return [0, 0, 1, 0, 0, 0] }
+    if cat == "algebra"   { return [0, 1, 0, 0, 0, 0] }
+    if cat == "topology"  { return [-1, -1, -1, 0, -1, -1] }
+    if cat == "logic"     { return [0, 0, 0, 1, 1, 0] }
+    if cat == "geometry"  { return [1, 2, 1, 1, 1, 1] }
+    return [0, 0, 0, 0, 0, 0]
+}
+
+fn _category_apply(plan: [int], delta: [int]) -> [int] {
+    let mut out: [int] = []
+    let mut i = 0
+    while i < len(plan) {
+        let v = plan[i] + delta[i]
+        let lifted = if v < 0 { 0 } else { _clamp_depth(v, i) }
+        out = out + [lifted]
+        i = i + 1
+    }
+    return out
+}
+
+fn _category_delta_describe(d: [int]) -> str {
+    let mut out = "["
+    let mut i = 0
+    while i < len(d) {
+        if i > 0 { out = out + "," }
+        let v = d[i]
+        if v > 0 { out = out + "+" + to_string(v) } else { out = out + to_string(v) }
+        i = i + 1
+    }
+    return out + "]"
+}
+
+fn _category_enabled() -> bool {
+    return env("NEXUS_CATEGORY_OFF") != "1"
+}
+
 fn _env_depth(name: str) -> int {
     // NEXUS_DRILL_{DEPTH,SMASH,FREE,ABSOLUTE,META,HYPER,RES}. 반환 -1 = 미지정.
     let v = env(name)
@@ -1086,6 +1368,131 @@ fn _adaptive_adjust(plan: [int], yields_hist: [[int]], totals_hist: [int], round
         eprintln("NEXUS_DRILL_ADAPTIVE {round:" + to_string(round) + ",before:" + _plan_describe(plan) + ",after:" + _plan_describe(out) + ",reason:\"" + reasons + "\"}")
     }
     return out
+}
+
+// ─── E17 adaptive trend depth (2026-04-21) ─── yield-delta 기반 전역 depth 승강
+// 보완 (E2 와 직교): E2 는 stage-wise gradient + total-saturation 규칙,
+//                    E17 은 round total (stage-sum) 의 "상대 delta" 추세를 보고 전역 +/-1.
+// 규칙:
+//   delta = totals_hist[N-1] - totals_hist[N-2]      (단, N>=2)
+//   prev  = totals_hist[N-2]  (baseline)
+//   tau_high = prev * HIGH_PCT / 100   (기본 80%)
+//   tau_low  = prev * LOW_PCT  / 100   (기본 20%)
+//   delta > tau_high  → vote=+1
+//   delta < tau_low   → vote=-1
+//   그 외            → vote=0
+// Hysteresis: 최근 2 round vote 동일 signed 방향일 때만 전환.
+// 적용: enabled stage (plan[i]>0) 전체에 +/-1 (stage floor/ceil clamp). disabled(0) 유지.
+// Env override: NEXUS_ADAPTIVE_DEPTH=0/1 (기본 1),
+//               NEXUS_DEPTH_HIGH_THRESHOLD=<pct int 0-1000>  (기본 80),
+//               NEXUS_DEPTH_LOW_THRESHOLD =<pct int 0-1000>  (기본 20).
+//   pct 는 정수 % — hexa-lang float 회피. 1 소수점 필요 시 10 의 배수 사용 (예 85 = 0.85).
+//   HIGH <= LOW 이면 E17 비활성 (invalid config → noop, stderr 경고 1회는 round 1 에서 emit 생략).
+
+fn _adaptive_trend_enabled() -> bool {
+    let v = env("NEXUS_ADAPTIVE_DEPTH")
+    if v.len() == 0 { return true }  // 기본 on
+    return v != "0"
+}
+
+fn _adaptive_trend_high_pct() -> int {
+    let v = env("NEXUS_DEPTH_HIGH_THRESHOLD")
+    if v.len() == 0 { return 80 }
+    let mut n = 80
+    try { n = to_int(v) } catch e { n = 80 }
+    if n < 0 { return 80 }
+    return n
+}
+
+fn _adaptive_trend_low_pct() -> int {
+    let v = env("NEXUS_DEPTH_LOW_THRESHOLD")
+    if v.len() == 0 { return 20 }
+    let mut n = 20
+    try { n = to_int(v) } catch e { n = 20 }
+    if n < 0 { return 20 }
+    return n
+}
+
+fn _adaptive_trend_vote(totals_hist: [int]) -> int {
+    // 반환: +1 promote, -1 demote, 0 hold.
+    // totals_hist 가 < 2 이면 vote 불가 → 0.
+    let n = len(totals_hist)
+    if n < 2 { return 0 }
+    let prev = totals_hist[n - 2]
+    let cur  = totals_hist[n - 1]
+    let delta = cur - prev
+    // prev == 0 특수: delta > 0 이면 promote 후보, delta <=0 이면 demote.
+    if prev <= 0 {
+        if delta > 0 { return 1 }
+        return -1
+    }
+    let hi = _adaptive_trend_high_pct()
+    let lo = _adaptive_trend_low_pct()
+    if hi <= lo { return 0 }  // invalid config → hold
+    // delta * 100 vs prev * hi  (정수 비교 — float 회피)
+    let d100 = delta * 100
+    if d100 > prev * hi { return 1 }
+    if d100 < prev * lo { return -1 }
+    return 0
+}
+
+fn _adaptive_trend_apply(plan: [int], direction: int) -> [int] {
+    // direction: +1 → enabled stage depth +1, -1 → -1, 0 → no-op. floor/ceil clamp.
+    if direction == 0 { return plan }
+    let mut out: [int] = []
+    let mut i = 0
+    while i < len(plan) {
+        let v = plan[i]
+        if v > 0 {
+            let nv = v + direction
+            let cv = _clamp_depth(if nv < 1 { 1 } else { nv }, i)
+            out = out + [cv]
+        } else {
+            out = out + [0]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _adaptive_trend_adjust(plan: [int], totals_hist: [int], vote_hist: [int], round: int) -> [int] {
+    // 진입점 — cmd_drill round loop 에서 호출.
+    //   plan        : 현재 cur_plan (E2 adjust 직후)
+    //   totals_hist : 과거 round 의 total (이번 round 아직 미 append — 즉 N-1 길이)
+    //   vote_hist   : 과거 round 의 vote (마찬가지로 N-1)
+    //   round       : 현재 round idx (1-based)
+    // 반환: 조정된 plan.
+    //
+    // Hysteresis 정의: vote_hist 의 "마지막 2 vote" 가 동일 방향(+1 or -1) 일 때만 전환.
+    //   round N 진입 시점에 vote_hist 는 r2..r(N-1) 의 vote (총 N-2 entries).
+    //   → hysteresis-2 충족 최소 조건 N-2 >= 2 → round >= 4.
+    //   round 2/3 는 history 부족 → no-op.
+    //
+    //   주의 (설계 pitfall): cur-round 에서 새 vote 를 계산해 vote_hist[-1] 와 비교하면,
+    //   두 값 모두 동일 totals_hist 로부터 계산되어 hysteresis 가 무력화됨 (유효 윈도우=1).
+    //   따라서 전환 조건은 반드시 "이미 기록된 2 votes 의 일치" 여야 함.
+    if !_adaptive_trend_enabled() { return plan }
+    if round <= 3 { return plan }
+    let vh = len(vote_hist)
+    if vh < 2 { return plan }
+    let v_last = vote_hist[vh - 1]
+    let v_prev = vote_hist[vh - 2]
+    if v_last == 0 { return plan }
+    if v_last != v_prev { return plan }
+    let adjusted = _adaptive_trend_apply(plan, v_last)
+    let dir_str = if v_last > 0 { "promote+1" } else { "demote-1" }
+    eprintln("NEXUS_DRILL_TREND {\"round\":" + to_string(round)
+        + ",\"vote\":" + to_string(v_last)
+        + ",\"dir\":\"" + dir_str + "\""
+        + ",\"before\":" + _plan_json(plan)
+        + ",\"after\":" + _plan_json(adjusted) + "}")
+    return adjusted
+}
+
+fn _adaptive_trend_record_vote(vote_hist: [int], totals_hist: [int]) -> [int] {
+    // 매 round 끝에서 vote 계산 결과를 append — hysteresis 윈도우 유지.
+    let v = _adaptive_trend_vote(totals_hist)
+    return vote_hist + [v]
 }
 
 // ─── E12 seed-batch helpers (2026-04-21) ───
@@ -1365,11 +1772,15 @@ fn _run_drill_validation(real_seed: str, nonce_base: str, totals_hist: [int], st
     _emit_validation(signals, score, rec)
 }
 
-// ─── E9 drill checkpoint / resume (2026-04-21) ───
-// round N 종료 시 state JSON flush → `--resume` 로 중단 복귀.
-// state file: <dir>/nexus_drill_cp_<seed_hash12>.json  (기본 dir=/tmp, ephemeral)
-// schema: {"seed":"...","round_done":N,"total":M,"yields_hist":[[...]],"plan":[...],"ts":T}
-// Mac jetsam / SIGTERM 복구 시 long-run drill 재개용.
+// ─── E9 drill checkpoint / resume (2026-04-21, fast-resume 2026-04-21) ───
+// round N 종료 시 state JSON flush → 다음 실행 시 seed-hash 매치로 fast-resume.
+// state file: <dir>/nexus_drill_cp_<seed_hash12>.json  (기본 dir=/tmp/nexus_checkpoint)
+// schema: {"seed":"...","seed_hash":"...","round_done":N,"total":M,"yields_hist":[[...]],"plan":[...],"ts":T}
+// 기본 동작: --resume ON (SIGKILL/OOM/jetsam/kill -9 후 재시작 → round 0 중복 회피).
+// opt-out: --fresh — checkpoint 무시 + 기존 파일 삭제 후 legacy fresh-run.
+// stale: ts 가 현재 시각 기준 7일 (604800 s) 이상이면 자동 무시 (stale skip emit).
+// seed-hash 충돌 회피: 12-hex dual-FNV1a (정/역방향 salt) = 2^48 (≈281 T) space.
+// resume 성공 시 NEXUS_RESUME {seed_hash, skipped_rounds, resumed_from, total} 1 line stderr.
 fn _checkpoint_hex8(v: i64) -> str {
     // i64 → 8-char lowercase hex (low 32 bits).
     let digits = "0123456789abcdef"
@@ -1408,10 +1819,36 @@ fn _checkpoint_fnv_hex12(seed: str) -> str {
     return hx1.substring(2, 8) + hx2.substring(2, 8)
 }
 
+fn _checkpoint_dir_default() -> str {
+    // 기본 체크포인트 디렉터리 — env NEXUS_CHECKPOINT_DIR 우선, 없으면 /tmp/nexus_checkpoint.
+    // /tmp 하위 서브디렉터리는 fast-resume 파일이 OS tmp-sweep 과 함께 사라지지만,
+    // 7일 stale 정책과 round-level save 주기를 고려하면 실용상 충분하다.
+    let e = env("NEXUS_CHECKPOINT_DIR")
+    if e.len() > 0 { return e }
+    return "/tmp/nexus_checkpoint"
+}
+
+fn _checkpoint_ensure_dir(dir: str) -> void {
+    // mkdir -p — 존재 시 no-op. 경로 미존재 시 save 가 조용히 실패하는 것을 방지.
+    let q = shell_quote(dir)
+    exec("mkdir -p " + q + " 2>/dev/null")
+}
+
 fn _checkpoint_path(seed: str, dir: str) -> str {
-    let d = if dir.len() > 0 { dir } else { "/tmp" }
+    let d = if dir.len() > 0 { dir } else { _checkpoint_dir_default() }
     let h = _checkpoint_fnv_hex12(seed)
     return d + "/nexus_drill_cp_" + h + ".json"
+}
+
+fn _checkpoint_stale_age_sec() -> i64 {
+    // 7일 — env NEXUS_CHECKPOINT_STALE_SEC 로 오버라이드 가능 (테스트용).
+    let e = env("NEXUS_CHECKPOINT_STALE_SEC")
+    if e.len() > 0 {
+        let mut v: i64 = 0
+        try { v = to_int(e) } catch e2 {}
+        if v > 0 { return v }
+    }
+    return 604800
 }
 
 fn _checkpoint_yields_json(yields_hist: [[int]]) -> str {
@@ -1446,11 +1883,15 @@ fn _checkpoint_plan_flat_json(plan: [int]) -> str {
 }
 
 fn _checkpoint_save(seed: str, round: int, total: int, yields_hist: [[int]], plan: [int], dir: str) -> void {
-    // atomic write: tmpfile + mv -f. 같은 seed → 같은 path.
-    let path = _checkpoint_path(seed, dir)
+    // atomic write: tmpfile + mv -f. 같은 seed → 같은 path. 디렉터리 자동 생성.
+    let d = if dir.len() > 0 { dir } else { _checkpoint_dir_default() }
+    _checkpoint_ensure_dir(d)
+    let path = _checkpoint_path(seed, d)
     let seed_esc = seed.replace("\\", "\\\\").replace("\"", "\\\"")
     let ts = exec("date +%s").trim()
+    let seed_hash = _checkpoint_fnv_hex12(seed)
     let json = "{\"seed\":\"" + seed_esc + "\""
+        + ",\"seed_hash\":\"" + seed_hash + "\""
         + ",\"round_done\":" + to_string(round)
         + ",\"total\":" + to_string(total)
         + ",\"yields_hist\":" + _checkpoint_yields_json(yields_hist)
@@ -1461,13 +1902,15 @@ fn _checkpoint_save(seed: str, round: int, total: int, yields_hist: [[int]], pla
     let q_tmp  = shell_quote(path + ".tmp")
     let cmd = "printf '%s\\n' '" + safe + "' > " + q_tmp + " && mv -f " + q_tmp + " " + q_path
     exec(cmd)
-    let seed_hash = _checkpoint_fnv_hex12(seed)
     eprintln("NEXUS_DRILL_CHECKPOINT {\"op\":\"save\",\"seed_hash\":\"" + seed_hash + "\",\"round\":" + to_string(round) + ",\"path\":\"" + path + "\"}")
 }
 
 fn _checkpoint_load(seed: str, dir: str) -> [int] {
-    // 반환: [round_done, total, y00..y05, y10..y15, ...] flat. empty = null (not found / corrupt).
-    let path = _checkpoint_path(seed, dir)
+    // 반환: [round_done, total, y00..y05, y10..y15, ...] flat. empty = null (not found / corrupt / stale / hash-mismatch).
+    // stale: ts 가 _checkpoint_stale_age_sec() 이상 오래됨 → skip + NEXUS_DRILL_CHECKPOINT stale emit.
+    // hash-mismatch: 내부 seed_hash 필드가 path 기반 계산값과 다르면 skip (충돌 방어).
+    let d = if dir.len() > 0 { dir } else { _checkpoint_dir_default() }
+    let path = _checkpoint_path(seed, d)
     let q_path = shell_quote(path)
     let exists = exec("[ -f " + q_path + " ] && echo y || echo n").trim()
     if exists != "y" { return [] }
@@ -1476,6 +1919,42 @@ fn _checkpoint_load(seed: str, dir: str) -> [int] {
     let r_done = _extract_int_after(raw, "\"round_done\":")
     let tot = _extract_int_after(raw, "\"total\":")
     if r_done <= 0 { return [] }
+    // stale 검사 — ts 필드 기반. ts 0/누락이면 legacy (과거 저장분) 으로 간주하여 fresh 처리.
+    let ts = _extract_int_after(raw, "\"ts\":")
+    let now_s = exec("date +%s").trim()
+    let mut now_i: i64 = 0
+    try { now_i = to_int(now_s) } catch e {}
+    let stale_age = _checkpoint_stale_age_sec()
+    let expected_hash = _checkpoint_fnv_hex12(seed)
+    if ts > 0 && now_i > 0 && (now_i - ts) > stale_age {
+        eprintln("NEXUS_DRILL_CHECKPOINT {\"op\":\"stale\",\"seed_hash\":\"" + expected_hash
+            + "\",\"age_sec\":" + to_string(now_i - ts) + ",\"threshold_sec\":" + to_string(stale_age)
+            + ",\"path\":\"" + path + "\",\"action\":\"skip_fresh\"}")
+        // stale 파일은 자동 제거하여 다음 실행 시 누적 방지.
+        exec("rm -f " + q_path)
+        return []
+    }
+    // seed_hash 교차검증 — 필드 존재 시 path 계산값과 일치해야 함.
+    let hash_marker = "\"seed_hash\":\""
+    let hi = str_find(raw, hash_marker)
+    if hi >= 0 {
+        let hstart = hi + hash_marker.len()
+        let mut he = hstart
+        let nraw = raw.len()
+        while he < nraw {
+            let cc = char_code(raw, he)
+            if cc == 34 { break }
+            he = he + 1
+        }
+        if he > hstart {
+            let stored = raw.substring(hstart, he)
+            if stored != expected_hash {
+                eprintln("NEXUS_DRILL_CHECKPOINT {\"op\":\"hash_mismatch\",\"expected\":\"" + expected_hash
+                    + "\",\"stored\":\"" + stored + "\",\"path\":\"" + path + "\",\"action\":\"skip_fresh\"}")
+                return []
+            }
+        }
+    }
     let mut out: [int] = [r_done, tot]
     // yields_hist flat 파싱 — 외부 `[` 시작부터 depth=0 복귀까지 digit 누적.
     let yh_marker = "\"yields_hist\":"
@@ -1517,7 +1996,8 @@ fn _checkpoint_load(seed: str, dir: str) -> [int] {
 }
 
 fn _checkpoint_clear(seed: str, dir: str) -> void {
-    let path = _checkpoint_path(seed, dir)
+    let d = if dir.len() > 0 { dir } else { _checkpoint_dir_default() }
+    let path = _checkpoint_path(seed, d)
     let q_path = shell_quote(path)
     exec("rm -f " + q_path + " " + shell_quote(path + ".tmp"))
 }
@@ -1723,9 +2203,12 @@ fn _recovery_sigint_install() -> void {
     // hexa 에는 signal() 빌트인이 없음 — shell trap 으로 flag 파일 touch.
     // drill 은 매 round 종료 후 flag 파일을 검사하여 graceful exit. drill 시작 1회 호출.
     // (exec() subshell 은 휘발성이므로 user 가 직접 touch 해도 동일하게 동작 — 이중 경로.)
+    // E12-B (2026-04-21): 배치 모드에서 이미 install 완료이면 중복 exec 생략.
+    if _sigint_installed { return }
     let flag = _recovery_sigint_flag_path()
     let cmd = "trap 'touch " + shell_quote(flag) + "' INT TERM 2>/dev/null || true"
     exec(cmd)
+    _sigint_installed = true
 }
 
 fn _recovery_sigint_handler() -> bool {
@@ -1746,7 +2229,7 @@ fn _recovery_emit(mode: str, action: str, round: int) -> void {
     eprintln("NEXUS_DRILL_RECOVERY {\"mode\":\"" + mode + "\",\"action\":\"" + action + "\",\"round\":" + to_string(round) + "}")
 }
 
-fn cmd_drill(seed: str, max_rounds: str, engine_flag: str, preset: str, master_depth: str, per_stage_depths: [int], adaptive_flag: bool, resume_flag: bool, checkpoint_dir: str, problem: str) -> void {
+fn cmd_drill(seed: str, max_rounds: str, engine_flag: str, preset: str, master_depth: str, per_stage_depths: [int], adaptive_flag: bool, resume_flag: bool, checkpoint_dir: str, problem: str, speculate_flag: str) -> void {
     // 단일 명령어 — smash → free → absolute → meta-closure → hyperarithmetic → resonance (Mk.IX 6-stage)
     // Mk.X: stage 6 (transcendental_closure via mkx_engine.hexa sidecar) 추가 — 사이드카, L0 미수정.
     // 고갈(absorption=0) 까지 반복
@@ -1814,6 +2297,27 @@ fn cmd_drill(seed: str, max_rounds: str, engine_flag: str, preset: str, master_d
         _env_depth("NEXUS_DRILL_RES")
     ]
     let mut base_plan = _resolve_depth_plan(_preset, _master_i, per_stage_depths, _envs, _problem_plan)
+    // ─── topology-aware category layer (2026-04-21) ───
+    // problem_preset 위 — seed category 에 따른 depth delta, per-stage flag 은 여전히 최우선 유지.
+    // precedence: ... < problem < CATEGORY < per-stage.
+    let _cat_on = _category_enabled()
+    let mut _cat_name = "OFF"
+    let mut _cat_delta: [int] = [0, 0, 0, 0, 0, 0]
+    let mut _cat_plan_before: [int] = base_plan
+    if _cat_on {
+        _cat_name = _cat_classify(seed)
+        _cat_delta = _category_plan_delta(_cat_name)
+        let _with_cat = _category_apply(base_plan, _cat_delta)
+        // 재적용 per-stage override — category 는 per-stage 아래 precedence.
+        let mut _pi = 0
+        let mut _final: [int] = []
+        while _pi < len(_with_cat) {
+            let v = if per_stage_depths[_pi] >= 0 { _clamp_depth(per_stage_depths[_pi], _pi) } else { _with_cat[_pi] }
+            _final = _final + [v]
+            _pi = _pi + 1
+        }
+        base_plan = _final
+    }
     let adaptive_on = adaptive_flag || master_depth == "auto"
     let validation_off = env("NEXUS_DRILL_VALIDATE_OFF") == "1"
     let nx = nexus_root()
@@ -1868,6 +2372,14 @@ fn cmd_drill(seed: str, max_rounds: str, engine_flag: str, preset: str, master_d
     if _problem.len() > 0 {
         println("    problem=" + _problem + " (drill.json problem_presets, max_rounds=" + to_string(rounds_max) + ")")
     }
+    // ─── category layer log (2026-04-21) ───
+    if _cat_on && _cat_name != "OFF" && _cat_name != "UNKNOWN" && _cat_name != "MIXED" {
+        println("    category=" + _cat_name + " (shared/drill/category_classifier.hexa) delta=" + _category_delta_describe(_cat_delta))
+        println("      plan before: " + _plan_describe(_cat_plan_before))
+    } else if _cat_on {
+        println("    category=" + _cat_name + " — no plan adjustment")
+    }
+    eprintln("NEXUS_CATEGORY {\"seed_hash\":\"" + _seed_batch_hash(seed) + "\",\"top\":\"" + _cat_name + "\",\"scores\":" + _cat_scores_json(seed) + ",\"delta\":" + _category_delta_describe(_cat_delta) + ",\"plan_before\":" + _plan_json(_cat_plan_before) + ",\"plan_after\":" + _plan_json(base_plan) + "}")
     println("    depth plan: " + _plan_describe(base_plan))
     if mkx_on {
         println("    smash → free → absolute → meta-closure → hyperarithmetic → resonance → transcendental_closure 사슬 (Mk.X 7-stage)")
@@ -1881,6 +2393,9 @@ fn cmd_drill(seed: str, max_rounds: str, engine_flag: str, preset: str, master_d
     if adaptive_on {
         println("    [adaptive] enabled — absorption-gradient + saturation-hunt rules")
     }
+    if _adaptive_trend_enabled() {
+        println("    [adaptive-trend E17] enabled — yield-delta 전역 승강 (high=" + to_string(_adaptive_trend_high_pct()) + "%, low=" + to_string(_adaptive_trend_low_pct()) + "%, hysteresis=2)")
+    }
     println("")
     // E2/E5/Validation 상태 추적 변수 — round 간 공유.
     let mut yields_hist: [[int]] = []
@@ -1888,12 +2403,18 @@ fn cmd_drill(seed: str, max_rounds: str, engine_flag: str, preset: str, master_d
     let mut stage_matrix: [[int]] = []  // A/D 검증용 — round × 6 stage yields
     let mut cur_plan = base_plan
     let mut _e6_plan_hist: [[int]] = []  // E6 recovery — per-round plan snapshot (runaway/oscillate)
+    let mut _e17_vote_hist: [int] = []   // E17 adaptive-trend — round vote (+1/-1/0), hysteresis window
     // D5-P2: round 진입 직전 baseline hexa proc 카운트 — round 종료 시 delta 비교
     let mut prev_hexa_n = _count_active_hexa()
 
-    // E9 (2026-04-21) — checkpoint resume. --resume 이면 prior state load → round/total/history 복원.
-    //   seed 해시 기반 path 로 동일 seed 를 다시 호출하면 자동 매칭.
-    //   not found → fresh start. corrupt → silent fresh start (load 는 empty list 반환).
+    // E9 (2026-04-21) — fast-resume (기본 ON). --fresh 로 opt-out, 또는 resume_flag=false.
+    //   동일 seed → path 매칭 → stale(7d) / hash 검증 통과 시 즉시 round/total/history 복원.
+    //   not found / stale / corrupt / hash-mismatch → silent fresh start.
+    //   emit: NEXUS_RESUME {seed_hash, skipped_rounds, resumed_from, total}  (성공 시 1 line stderr).
+    if !resume_flag {
+        // --fresh / --no-resume: 기존 checkpoint 파일을 즉시 제거하여 완전한 round 0 start 보장.
+        _checkpoint_clear(seed, checkpoint_dir)
+    }
     if resume_flag {
         let cp = _checkpoint_load(seed, checkpoint_dir)
         if len(cp) >= 2 {
@@ -1917,8 +2438,13 @@ fn cmd_drill(seed: str, max_rounds: str, engine_flag: str, preset: str, master_d
                 totals_hist = totals_hist + [rs]
                 ri = ri + 1
             }
+            let seed_hash = _checkpoint_fnv_hex12(seed)
+            // legacy event (backwards-compat)
             eprintln("NEXUS_DRILL_CHECKPOINT {\"op\":\"resume\",\"from_round\":" + to_string(round) + ",\"total\":" + to_string(total_new) + "}")
-            println("▎ [resume] round " + to_string(round) + " 까지 완료 — round " + to_string(round + 1) + " 부터 재개 (total=" + to_string(total_new) + ")")
+            // fast-resume spec event (설계서 §3):
+            eprintln("NEXUS_RESUME {\"seed_hash\":\"" + seed_hash + "\",\"skipped_rounds\":" + to_string(round)
+                + ",\"resumed_from\":" + to_string(round) + ",\"total\":" + to_string(total_new) + "}")
+            println("▎ [resume] seed_hash=" + seed_hash + " — round " + to_string(round) + " 까지 완료, round " + to_string(round + 1) + " 부터 재개 (total=" + to_string(total_new) + ", skipped_rounds=" + to_string(round) + ")")
             println("")
         }
     }
@@ -1953,30 +2479,80 @@ fn cmd_drill(seed: str, max_rounds: str, engine_flag: str, preset: str, master_d
         if adaptive_on {
             cur_plan = _adaptive_adjust(cur_plan, yields_hist, totals_hist, round)
         }
+        // E17 adaptive-trend — yield-delta 전역 승강 (hysteresis 2-round).
+        //   E2 와 독립적으로 enabled (NEXUS_ADAPTIVE_DEPTH=0 으로 off).
+        //   --adaptive 플래그 없어도 기본 on — 쉬운 seed 단축/어려운 seed 확장 목표.
+        cur_plan = _adaptive_trend_adjust(cur_plan, totals_hist, _e17_vote_hist, round)
         println("  plan: " + _plan_describe(cur_plan))
+
+        // E18 (2026-04-21) speculative N-way fork — resolve + log.
+        //   --speculate flag / NEXUS_SPECULATE env → N. N=1 이면 기존 경로와 동일.
+        //   NEXUS_SPECULATE_CPU_CAP 와 stage_parallel 결합은 _speculate_resolve() 내부 처리.
+        let spec_n_total = _speculate_resolve(speculate_flag)
+        let mut spec_scores: [int] = []
+        let mut spec_s: [int] = []
+        let mut spec_f: [int] = []
+        let mut spec_a: [int] = []
+        let mut spec_mc: [int] = []
+        let mut spec_hy: [int] = []
+        let mut spec_r: [int] = []
+        let mut spec_tc: [int] = []
+        let mut spec_sigma: [str] = []
+        let mut spec_salt_tag: [str] = []
+        let mut spec_rseed: [str] = []
+        let mut spec_wall_ms: [i64] = []
+        let mut spec_err_delta: [int] = []
+        let spec_base_salt = _round_entropy_salt(round)
+        if spec_n_total > 1 {
+            println("  [E18 speculate] N=" + to_string(spec_n_total) + " branches — best-keep (cap=" + to_string(_speculate_cap()) + ", stage_parallel=" + (if _stage_parallel_enabled() { "on" } else { "off" }) + ")")
+        }
 
         // Day-3 (2026-04-21) — round-salt 강화: multi-source entropy prefix.
         // 기존 _round_seed(single-i64 salt) 는 prefix 가 짧아 bias_jitter 8-slot feature 가
         // round 간 같은 bucket 으로 떨어짐 → round 2 == round 3 replay 원인.
         // 해결: _round_entropy_salt() — urand×2 + nanotime + round idx concat.
         // round 1 도 동일 salt 주입 — inter-iter 독립성과 직교 (prefix 분산 효과).
-        let rich_salt = _round_entropy_salt(round)
-        let round_seed = _round_seed_rich(nonce_base, round, rich_salt)
-        let qrseed = shell_quote(round_seed)
-
-        // yields vector: [smash, free, absolute, meta_closure, hyperarith, resonance]
+        //
+        // E18 wrap: speculative branch 마다 rich_salt 를 _speculate_branch_mix 로 추가 perturb.
+        //   branch 0 = base salt (기존 동작 호환), branch 1+ = FNV/nonce prefix mix.
+        let mut rich_salt = spec_base_salt
+        let mut round_seed = _round_seed_rich(nonce_base, round, rich_salt)
+        let mut qrseed = shell_quote(round_seed)
+        let mut _spec_branch = 0
+        let mut s_new = 0
+        let mut f_new = 0
+        let mut a_pass = 0
+        let mut mc_new = 0
+        let mut hy_pass = 0
+        let mut r_best = 0
+        let mut sigma_best = "0.10"
+        let mut tc_new = 0
         let mut yields: [int] = [0, 0, 0, 0, 0, 0]
+        while _spec_branch < spec_n_total {
+        let _spec_t0 = _progress_now_ms()
+        let _spec_err0 = err_count
+        rich_salt = _speculate_branch_mix(spec_base_salt, _spec_branch, round)
+        round_seed = _round_seed_rich(nonce_base, round, rich_salt)
+        qrseed = shell_quote(round_seed)
+        if spec_n_total > 1 {
+            let _tag_lim = if rich_salt.len() < 24 { rich_salt.len() } else { 24 }
+            println("  [E18 branch " + to_string(_spec_branch + 1) + "/" + to_string(spec_n_total) + "] salt=" + rich_salt.substring(0, _tag_lim) + "...")
+        }
+
+        // yields reset for this branch
+        yields = [0, 0, 0, 0, 0, 0]
 
         // E15 (2026-04-21) — stage parallel dispatch hook.
         //   env NEXUS_DRILL_STAGE_PARALLEL=1 → 5 stage (smash/free/abs/meta/hyper) 를 background shell + wait 로 동시 실행.
         //   resonance 는 smash 결과 기반 → 이 hook 뒤에 serial 유지 (parallel_group 제외).
         //   failure mode: 병렬 stage 1개 실패 → 나머지도 wait 완료 (kill 하지 않음). NEXUS_DRILL_PARALLEL JSON 1 line/round emit.
         let stage_par_on = _stage_parallel_enabled()
-        let mut s_new = 0
-        let mut f_new = 0
-        let mut a_pass = 0
-        let mut mc_new = 0
-        let mut hy_pass = 0
+        // E18: s_new/f_new/a_pass/mc_new/hy_pass 은 branch loop 바깥에서 선언 — 여기서는 reset 만.
+        s_new = 0
+        f_new = 0
+        a_pass = 0
+        mc_new = 0
+        hy_pass = 0
         if stage_par_on {
             // N (2026-04-21) progress: parallel 5-way 는 start-only 5회 + 묶음 end 5회 emit.
             let _pg_t0_par = _progress_now_ms()
@@ -2099,8 +2675,9 @@ fn cmd_drill(seed: str, max_rounds: str, engine_flag: str, preset: str, master_d
 
         // 6. RESONANCE (Stochastic Resonance — σ grid adaptive)
         // depth=1 → 1 σ, depth=2 → 3 σ, depth=3 → 5 σ. preset=fast/probe 은 1 σ.
-        let mut r_best = 0
-        let mut sigma_best = "0.10"
+        // E18: r_best/sigma_best 은 branch loop 바깥에서 선언 — 여기서는 reset 만.
+        r_best = 0
+        sigma_best = "0.10"
         if cur_plan[5] > 0 {
             let _pg_t0_r = _progress_now_ms()
             _progress_emit(round, "resonance", "start", 0)
@@ -2145,7 +2722,8 @@ fn cmd_drill(seed: str, max_rounds: str, engine_flag: str, preset: str, master_d
         //     "append transcendental_closure() stage 6 + slot 8-15 accessor bank"
         //   Sidecar: shared/engine/mkx_engine.hexa (30 atoms T10-T13) + mkx_smoke.hexa (synth emission signal).
         //   Emissions enter Path B stage-1 PROVISIONAL only (no stable/ossified promotion here).
-        let mut tc_new = 0
+        // E18: tc_new 은 branch loop 바깥에서 선언 — 여기서는 reset 만.
+        tc_new = 0
         if mkx_on {
             tc_new = _transcendental_closure(round_seed, round)
             println("  transcend:     +" + to_string(tc_new) + " T12 synth emissions (AN11 PROVISIONAL_OK)")
@@ -2153,7 +2731,80 @@ fn cmd_drill(seed: str, max_rounds: str, engine_flag: str, preset: str, master_d
 
         // BUGFIX: round_new 는 6-stage 전원 합산 (a_pass + hy_pass 누락 수정)
         // Mk.X: stage 6 (tc_new) 도 round_new 에 합산 — Mk.IX 에서는 tc_new=0 으로 back-compat 유지
-        let round_new = s_new + f_new + a_pass + mc_new + hy_pass + r_best + tc_new
+        // E18 branch local score — round_new 는 이 branch 의 전 stage 합. 가장 높은 branch 만 채택.
+        let _branch_score = s_new + f_new + a_pass + mc_new + hy_pass + r_best + tc_new
+
+        // E18 — 이 branch 의 wall_ms 기록 + per-branch score 저장.
+        let _spec_wall = _progress_now_ms() - _spec_t0
+        let _spec_err_d = err_count - _spec_err0
+        spec_scores = spec_scores + [_branch_score]
+        spec_s = spec_s + [s_new]
+        spec_f = spec_f + [f_new]
+        spec_a = spec_a + [a_pass]
+        spec_mc = spec_mc + [mc_new]
+        spec_hy = spec_hy + [hy_pass]
+        spec_r = spec_r + [r_best]
+        spec_tc = spec_tc + [tc_new]
+        spec_sigma = spec_sigma + [sigma_best]
+        spec_salt_tag = spec_salt_tag + [rich_salt]
+        spec_rseed = spec_rseed + [round_seed]
+        spec_wall_ms = spec_wall_ms + [_spec_wall]
+        spec_err_delta = spec_err_delta + [_spec_err_d]
+        if spec_n_total > 1 {
+            println("  [E18 branch " + to_string(_spec_branch + 1) + "/" + to_string(spec_n_total) + "] score=" + to_string(_branch_score) + " wall_ms=" + to_string(_spec_wall) + " err_delta=" + to_string(_spec_err_d))
+        }
+        _spec_branch = _spec_branch + 1
+        }
+        // E18 — best-keep selection: 최고 _branch_score 를 가진 branch idx.
+        //   동점: 낮은 idx 우선 (first-win, 재현성). score==0 도 정상 (saturation).
+        //   나머지 branch 는 discard — 이미 다 돌았지만 yields/absorption 은 채택 것만 기록.
+        let mut spec_best_idx = 0
+        let mut spec_bi = 1
+        while spec_bi < spec_n_total {
+            if spec_scores[spec_bi] > spec_scores[spec_best_idx] {
+                spec_best_idx = spec_bi
+            }
+            spec_bi = spec_bi + 1
+        }
+        // commit best branch values back to round-scoped vars.
+        s_new = spec_s[spec_best_idx]
+        f_new = spec_f[spec_best_idx]
+        a_pass = spec_a[spec_best_idx]
+        mc_new = spec_mc[spec_best_idx]
+        hy_pass = spec_hy[spec_best_idx]
+        r_best = spec_r[spec_best_idx]
+        tc_new = spec_tc[spec_best_idx]
+        sigma_best = spec_sigma[spec_best_idx]
+        rich_salt = spec_salt_tag[spec_best_idx]
+        round_seed = spec_rseed[spec_best_idx]
+        qrseed = shell_quote(round_seed)
+        yields = [s_new, f_new, a_pass, mc_new, hy_pass, r_best]
+        let round_new = spec_scores[spec_best_idx]
+        if spec_n_total > 1 {
+            // NEXUS_DRILL_SPECULATE JSON 1 line/round stderr emit.
+            let mut scores_json = "["
+            let mut walls_json = "["
+            let mut sbi = 0
+            while sbi < spec_n_total {
+                if sbi > 0 { scores_json = scores_json + ","; walls_json = walls_json + "," }
+                scores_json = scores_json + to_string(spec_scores[sbi])
+                walls_json = walls_json + to_string(spec_wall_ms[sbi])
+                sbi = sbi + 1
+            }
+            scores_json = scores_json + "]"
+            walls_json = walls_json + "]"
+            let discard_count = spec_n_total - 1
+            let jline = "{\"round\":" + to_string(round)
+                + ",\"speculate_n\":" + to_string(spec_n_total)
+                + ",\"scores\":" + scores_json
+                + ",\"wall_ms\":" + walls_json
+                + ",\"kept_idx\":" + to_string(spec_best_idx)
+                + ",\"kept_score\":" + to_string(spec_scores[spec_best_idx])
+                + ",\"discarded\":" + to_string(discard_count)
+                + ",\"discard_reason\":\"lower_yield\"}"
+            eprintln("NEXUS_DRILL_SPECULATE " + jline)
+            println("  [E18 keep] branch " + to_string(spec_best_idx + 1) + "/" + to_string(spec_n_total) + " score=" + to_string(spec_scores[spec_best_idx]) + " (discard " + to_string(discard_count) + " branches · reason=lower_yield)")
+        }
 
         // Counter-replay 감지: round ≥2 에서 round-1 수치와 정확히 동일한지 체크
         if round == 1 {
@@ -2209,6 +2860,11 @@ fn cmd_drill(seed: str, max_rounds: str, engine_flag: str, preset: str, master_d
         yields_hist = yields_hist + [yields]
         totals_hist = totals_hist + [round_new]
         stage_matrix = stage_matrix + [yields]
+        // E17 adaptive-trend — vote 계산 (this round) 은 totals_hist 갱신 후 수행.
+        //   vote_hist 길이 = round 번호 - 1 (첫 round 는 history 부족으로 0, 기록 skip).
+        if round >= 2 {
+            _e17_vote_hist = _adaptive_trend_record_vote(_e17_vote_hist, totals_hist)
+        }
 
         total_new = total_new + round_new
         println("  round +" + to_string(round_new) + ", total " + to_string(total_new))
@@ -2278,17 +2934,96 @@ fn cmd_drill(seed: str, max_rounds: str, engine_flag: str, preset: str, master_d
     _progress_summary(total_new, _progress_now_ms() - _pg_drill_t0)
 }
 
+// ─── E12-B (2026-04-21) — batch-shared Phase-1 init helpers ───
+// seed 간 공유 가능 아이템을 1회 resolve:
+//   (1) hexa_bin() — env("HEXA") + 3 후보 [ -x ] 스캔 결과.
+//   (2) nexus_root() — env lookup.
+//   (3) engine_id — _mkx_resolve_engine(flag) = 2~3 exec (file 존재 + grep).
+//   (4) sigint trap — _recovery_sigint_install() 1회 install (_sigint_installed flag).
+// 공유 불가 (seed 별 fresh):
+//   - _iter_nonce / _nonce_seed (seed 입력 의존 + round 1 부터 independence 보장 필요)
+//   - round_entropy_salt (round 별 fresh urand)
+//   - checkpoint / LRU hash / ndjson / cross-iter log (seed-specific state)
+// bypass: env NEXUS_BATCH_SHARE_INIT=0 → _batch_shared_init no-op.
+fn _batch_share_bypass() -> bool {
+    return env("NEXUS_BATCH_SHARE_INIT") == "0"
+}
+
+fn _batch_shared_init(engine_flag: str) -> void {
+    // idempotent — 같은 배치 내 재호출 무해.
+    if _batch_share_bypass() {
+        eprintln("NEXUS_DRILL_BATCH_INIT {\"op\":\"bypass\",\"reason\":\"NEXUS_BATCH_SHARE_INIT=0\"}")
+        return
+    }
+    if _batch_share_active { return }
+    let t0 = _progress_now_ms()
+    // (2) nexus_root prime — env 경로 resolve 고정 (1회 env lookup).
+    let nr_env = env("NEXUS")
+    let nr_val = if nr_env.len() > 0 { nr_env } else { env("HOME") + "/Dev/nexus" }
+    _nexus_root_cache = nr_val
+    _nexus_root_cache_set = true
+    // (1) hexa_bin prime — candidate 스캔 1회.
+    let h_env = env("HEXA")
+    let mut hb = ""
+    if h_env.len() > 0 {
+        hb = h_env
+    } else {
+        let cands = [env("HOME") + "/Dev/hexa-lang/hexa", env("HOME") + "/.hx/bin/hexa", _nexus_root_cache + "/shared/bin/hexa"]
+        let mut i = 0
+        while i < len(cands) {
+            let c = cands[i]
+            let chk = exec("[ -x '" + c + "' ] && echo y || echo n").trim()
+            if chk == "y" { hb = c; break }
+            i = i + 1
+        }
+        if hb.len() == 0 { hb = "hexa" }
+    }
+    _hexa_bin_cache = hb
+    _hexa_bin_cache_set = true
+    // (3) engine_id — 로그용 resolve (cmd_drill 은 flag/env 기반 재호출하지만 동일 입력 → 동일 결과).
+    let eid = _mkx_resolve_engine(engine_flag)
+    // (4) sigint install — 이후 per-seed drill 은 _sigint_installed flag 로 skip.
+    _recovery_sigint_install()
+    _batch_share_active = true
+    let t1 = _progress_now_ms()
+    let dt = _progress_ms_diff(t0, t1)
+    eprintln("NEXUS_DRILL_BATCH_INIT {\"op\":\"shared\",\"hexa_bin\":\"" + _hexa_bin_cache
+        + "\",\"nexus_root\":\"" + _nexus_root_cache
+        + "\",\"engine\":\"" + eid
+        + "\",\"sigint_installed\":" + (if _sigint_installed { "true" } else { "false" })
+        + ",\"init_ms\":" + to_string(dt) + "}")
+}
+
+fn _batch_shared_cleanup() -> void {
+    if _batch_share_bypass() { return }
+    if !_batch_share_active { return }
+    // sigint in-process flag 해제 — 다음 단일 drill 이 다시 install 하도록.
+    // (cache 는 process 생애 동안 재사용 가능하므로 유지.)
+    _batch_share_active = false
+    _sigint_installed = false
+    eprintln("NEXUS_DRILL_BATCH_INIT {\"op\":\"cleanup\"}")
+}
+
 // ─── E12 batch drill wrapper (2026-04-21) ───
 // SSOT: shared/config/drill.json .seed_batch
 // Sequential iterate — seed N 개를 순차 cmd_drill 호출. engine_daemon 미구현 시 naive 반복.
 // 각 seed 별 stdout 구간 분리, per-seed duration 측정, 전체 NEXUS_DRILL_BATCH JSON stderr emit.
-fn cmd_drill_batch(seeds: [str], max_rounds: str, engine_flag: str, preset: str, master_depth: str, per_stage_depths: [int], adaptive_flag: bool, resume_flag: bool, checkpoint_dir: str, problem: str) -> void {
+fn cmd_drill_batch(seeds: [str], max_rounds: str, engine_flag: str, preset: str, master_depth: str, per_stage_depths: [int], adaptive_flag: bool, resume_flag: bool, checkpoint_dir: str, problem: str, speculate_flag: str) -> void {
     let n = len(seeds)
     if n == 0 {
         eprintln("nexus drill: --seeds/--seeds-file 에 유효한 seed 없음")
         return
     }
+    // E12-B (2026-04-21): Phase-1 init 공유 — hexa_bin / nexus_root / engine_id / sigint trap 1회.
+    //   bypass: NEXUS_BATCH_SHARE_INIT=0.
+    _batch_shared_init(engine_flag)
+    let batch_t0 = _progress_now_ms()
     println("🛸 nexus drill — batch mode (sequential), seed_count=" + to_string(n))
+    if _batch_share_active {
+        println("    [E12-B] Phase-1 init shared — hexa_bin/nexus_root/sigint cached (env NEXUS_BATCH_SHARE_INIT=0 로 bypass)")
+    } else {
+        println("    [E12-B] Phase-1 init share bypassed (NEXUS_BATCH_SHARE_INIT=0)")
+    }
     println("")
     let mut durations: [i64] = []
     let mut grand_total = 0
@@ -2303,7 +3038,7 @@ fn cmd_drill_batch(seeds: [str], max_rounds: str, engine_flag: str, preset: str,
         // sentinel 초기화 (이전 값 오염 방지)
         exec("printf '%s' '0' > /tmp/nexus_drill_last_total.txt")
         let t0 = _progress_now_ms()
-        cmd_drill(sd, max_rounds, engine_flag, preset, master_depth, per_stage_depths, adaptive_flag, resume_flag, checkpoint_dir, problem)
+        cmd_drill(sd, max_rounds, engine_flag, preset, master_depth, per_stage_depths, adaptive_flag, resume_flag, checkpoint_dir, problem, speculate_flag)
         let t1 = _progress_now_ms()
         let dur = t1 - t0
         durations = durations + [dur]
@@ -2317,10 +3052,19 @@ fn cmd_drill_batch(seeds: [str], max_rounds: str, engine_flag: str, preset: str,
         println("")
         idx = idx + 1
     }
+    let batch_t1 = _progress_now_ms()
+    let batch_wall_ms = batch_t1 - batch_t0
+    // sum_ms — 개별 seed duration 합. batch_wall_ms 와 근사해야 함 (wrapper 오버헤드만 차이).
+    let mut sum_ms: i64 = 0
+    let mut k = 0
+    while k < len(durations) { sum_ms = sum_ms + durations[k]; k = k + 1 }
     println("═══════════════════════════════════════════════════════════════")
     println("▎ BATCH DONE — seed_count=" + to_string(n) + " grand_total=" + to_string(grand_total))
+    println("▎ wall_ms(batch)=" + to_string(batch_wall_ms) + " sum_ms(per-seed)=" + to_string(sum_ms)
+        + " share_active=" + (if _batch_share_active { "1" } else { "0" }))
     println("═══════════════════════════════════════════════════════════════")
     _seed_batch_emit_summary(n, grand_total, durations)
+    _batch_shared_cleanup()
 }
 
 fn cmd_meta_closure(seed: str) -> void {
@@ -2672,9 +3416,11 @@ fn main() -> void {
         //   per-stage: --smash-depth --free-dfs --abs-depth --meta-depth --hyper-depth --res-depth
         //   preset: --preset fast|probe|coarse|standard
         //   adaptive: --adaptive 또는 --depth auto
-        // E9 (2026-04-21) — checkpoint/resume flags:
-        //   --resume        → 동일 seed 의 이전 checkpoint 로드 (없으면 fresh)
-        //   --checkpoint-dir <path>  → state file 디렉토리 (기본 /tmp)
+        // E9 (2026-04-21, fast-resume 2026-04-21) — checkpoint/resume flags:
+        //   --resume        → 명시적 on (기본값이 이미 on 이므로 사실상 no-op)
+        //   --fresh         → opt-out (legacy 동작): checkpoint 무시 + 기존 파일 삭제 후 round 0 시작
+        //   --no-resume     → --fresh 의 별칭
+        //   --checkpoint-dir <path>  → state file 디렉토리 (기본 /tmp/nexus_checkpoint 또는 env NEXUS_CHECKPOINT_DIR)
         let _smash_d = _parse_flag_int(a, "--smash-depth")
         let _free_d  = _parse_flag_int(a, "--free-dfs")
         let _abs_d   = _parse_flag_int(a, "--abs-depth")
@@ -2683,14 +3429,23 @@ fn main() -> void {
         let _res_d   = _parse_flag_int(a, "--res-depth")
         let per_stage = [_smash_d, _free_d, _abs_d, _meta_d, _hyper_d, _res_d]
         let adaptive = has_flag(a, "--adaptive")
-        let resume_flag = has_flag(a, "--resume")
+        let fresh_flag = has_flag(a, "--fresh") || has_flag(a, "--no-resume")
+        let resume_flag = !fresh_flag  // 기본 ON; --fresh / --no-resume 로 OFF.
         let checkpoint_dir = find_flag(a, "--checkpoint-dir", "")
+        if fresh_flag {
+            // --fresh 는 기존 checkpoint 파일을 즉시 제거하여 완전한 legacy fresh-run 보장.
+            // seed 는 아직 파싱 전이므로 여기서 할 수 없음 — cmd_drill 내부에서 resume_flag=false 분기가 처리.
+            // 다만 기록용으로 stderr 한 줄 emit.
+            eprintln("NEXUS_DRILL_CHECKPOINT {\"op\":\"fresh\",\"reason\":\"--fresh/--no-resume flag\",\"action\":\"ignore_and_clear\"}")
+        }
         // E8 (2026-04-21) — --problem <name> per-millennium preset (drill.json .problem_presets)
         let problem_flag = find_flag(a, "--problem", "")
         // E12 (2026-04-21) — seed batch: --seeds "a,b,c" 또는 --seeds-file path (sequential).
         //   단일 --seed 공존 — --seeds/--seeds-file 지정 시 우선.
         let seeds_flag = find_flag(a, "--seeds", "")
         let seeds_file = find_flag(a, "--seeds-file", "")
+        // E17 (2026-04-21) — --speculate N: same-round N-way fork + best-keep.
+        let speculate_flag = find_flag(a, "--speculate", "")
         if seeds_flag.len() > 0 || seeds_file.len() > 0 {
             let batch_seeds = _seed_batch_load(seeds_flag, seeds_file)
             cmd_drill_batch(
@@ -2703,7 +3458,8 @@ fn main() -> void {
                 adaptive,
                 resume_flag,
                 checkpoint_dir,
-                problem_flag
+                problem_flag,
+                speculate_flag
             )
             return
         }
@@ -2717,7 +3473,8 @@ fn main() -> void {
             adaptive,
             resume_flag,
             checkpoint_dir,
-            problem_flag
+            problem_flag,
+            speculate_flag
         )
         return
     }

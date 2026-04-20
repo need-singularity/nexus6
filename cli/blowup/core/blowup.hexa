@@ -83,6 +83,16 @@ let mut _node_id_set_built = false
 let mut _n6d_cache = #{}
 let mut _n6d_cache_hits: i64 = 0
 
+// ─── Lens Cache (Lazy+LRU) — SSOT: cli/blowup/lens/lens_cache.hexa.inc ───
+// telescope_verify 진입점 캐시. key = FNV1a-64(val_csv)+threshold 핀.
+// cap=8, evict head on overflow, hit/miss/evict JSON emit (NEXUS_LENS_CACHE).
+// bypass: NEXUS_LENS_CACHE_OFF=1
+let mut _lens_cache_map: map = #{}
+let mut _lens_cache_order: list = []
+let mut _lens_cache_hits: i64 = 0
+let mut _lens_cache_misses: i64 = 0
+let mut _lens_cache_evicts: i64 = 0
+
 // hexa 바이너리 1회 탐색 캐시 — HEXA_BIN 환경변수 우선
 // AI-native: env() + file_exists() 네이티브 fn — 쉘 exec 완전 회피
 let mut _HEXA_BIN = ""
@@ -217,6 +227,37 @@ _trace("[03-bucket-ok] n6 hash bucket built")
 //   순서만 섞임 → "첫 매치" 가 round 마다 다른 이름을 고르게 됨. 결정론 유지 (same seed → same offset).
 // _match_scan_offset: Phase 2 진입 시 (_verify_seed_bias 와 동시에) set. 0 이면 레거시 동작.
 let mut _match_scan_offset: i64 = 0
+
+// ─── ROI#48e (2026-04-21): bias_jitter self-tuning ───
+// D1 고정 0.10 은 난이도별 적응 불가. 최근 M round 의 match_grade 분포(std)를 관찰,
+// 너무 일관(std↓)이면 jitter 확대, 너무 발산(std↑)이면 축소. target_std=0.15 기본.
+// 히스토리 파일: /tmp/.blowup_jitter_history.<wave_session>.jsonl
+//   각 line: {"round":N,"domain":"x","jitter":0.xx,"grade_mean":0.xx,"grade_std":0.yy}
+// env:
+//   NEXUS_BIAS_JITTER_AUTO=0        → 튜닝 비활성, legacy 0.10 고정
+//   NEXUS_BIAS_JITTER_TARGET_STD=0.15 → target std 오버라이드
+// grade→score: EXACT=3, NEAR=2, CLOSE=1, MISS=0 (ordinal, mean/std 산출용)
+let mut _jitter_grade_sum: f64 = 0.0
+let mut _jitter_grade_sq_sum: f64 = 0.0
+let mut _jitter_grade_n: i64 = 0
+let mut _jitter_ceiling: f64 = 0.10
+let mut _jitter_auto_on: bool = true
+let mut _jitter_target_std: f64 = 0.15
+let mut _jitter_reason: string = "init"
+
+fn _grade_score(gr: string) -> f64 {
+    if gr == "EXACT" { return 3.0 }
+    if gr == "NEAR"  { return 2.0 }
+    if gr == "CLOSE" { return 1.0 }
+    return 0.0
+}
+
+fn _tally_grade(gr: string) {
+    let _sc = _grade_score(gr)
+    _jitter_grade_sum = _jitter_grade_sum + _sc
+    _jitter_grade_sq_sum = _jitter_grade_sq_sum + _sc * _sc
+    _jitter_grade_n = _jitter_grade_n + 1
+}
 
 // 버킷 탐색 헬퍼: 해당 버킷의 인덱스 리스트 반환
 fn _bucket_indices(bucket: map, key: string) -> list {
@@ -2732,6 +2773,165 @@ fn lens_thermo(fv: list, n: i64) -> f64 {
     return 0.0
 }
 
+// ─── Lens Cache fns (SSOT: cli/blowup/lens/lens_cache.hexa.inc — E14 LRU 패턴 재사용) ───
+// cap=8. miss → compute+store. hit → return cached. cap overflow → evict head (rebuild map).
+// void-coerce 가드: _lens_cache_order.contains() 선검사 후 _lens_cache_map[k] 읽기.
+
+comptime const _LENS_CACHE_CAP = 8
+
+// POSIX sh single-quote escape. blowup.hexa 에는 shell_quote 미정의 — 로컬 정의.
+fn _lens_shell_quote(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _lens_cache_enabled() -> bool {
+    let v = env("NEXUS_LENS_CACHE_OFF")
+    if v == "1" { return false }
+    if v.to_lower() == "true" { return false }
+    return true
+}
+
+fn _lens_cache_key(vals: string, threshold: f64) -> string {
+    // FNV1a-64 (python3) + threshold pin. fallback: md5sum. 실패 시 len+prefix degraded key.
+    let pin = to_string(threshold)
+    let py = "python3 -c 'import sys"
+        + "\nh=0xcbf29ce484222325"
+        + "\np=0x100000001b3"
+        + "\nmask=(1<<64)-1"
+        + "\nfor c in sys.stdin.buffer.read():\n h^=c; h=(h*p)&mask"
+        + "\nprint(\"%016x\"%h)'"
+    let q_vals = _lens_shell_quote(vals)
+    let cmd = "printf %s " + q_vals + " | " + py + " 2>/dev/null"
+    let out = exec(cmd).trim()
+    if out.len() == 16 { return out + "_" + pin }
+    let md5_cmd = "printf %s " + q_vals + " | md5sum 2>/dev/null | cut -d' ' -f1 | head -c 16"
+    let md5_out = exec(md5_cmd).trim()
+    if md5_out.len() == 16 { return md5_out + "_" + pin }
+    let vlen = to_string(vals.len())
+    let vprefix = if vals.len() >= 8 { vals.substring(0, 8) } else { vals }
+    return "L" + vlen + "P" + vprefix + "_" + pin
+}
+
+fn _lens_cache_emit(op: string) -> void {
+    let sz = len(_lens_cache_order)
+    let j = "NEXUS_LENS_CACHE {\"op\":\"" + op
+        + "\",\"hit\":" + to_string(_lens_cache_hits)
+        + ",\"miss\":" + to_string(_lens_cache_misses)
+        + ",\"evict\":" + to_string(_lens_cache_evicts)
+        + ",\"size\":" + to_string(sz)
+        + ",\"cap\":" + to_string(_LENS_CACHE_CAP)
+        + "}"
+    eprintln(j)
+}
+
+fn _lens_cache_disk_path() -> string {
+    return "/tmp/nexus_lens_lru.jsonl"
+}
+
+// 디스크 lookup: 최근 128 entry 내 key match → val JSON field 반환. 미스면 "".
+// cross-process cache (E14 패턴 재사용).
+fn _lens_cache_disk_lookup(key: string) -> string {
+    let path = _lens_cache_disk_path()
+    let q_path = _lens_shell_quote(path)
+    let q_key = _lens_shell_quote(key)
+    let cmd = "{ [ -f " + q_path + " ] && tail -n 128 " + q_path + " || true; } "
+        + "| { grep -F " + q_key + " 2>/dev/null | tail -n 1 || true; }"
+    let line = exec(cmd).trim()
+    if line == "" { return "" }
+    let tag = "\"val\":\""
+    if !line.contains(tag) { return "" }
+    let after = line.split(tag)
+    if len(after) < 2 { return "" }
+    let rest = after[1]
+    let endp = rest.split("\"")
+    if len(endp) < 1 { return "" }
+    return endp[0]
+}
+
+fn _lens_cache_disk_append(key: string, val: string) -> void {
+    let path = _lens_cache_disk_path()
+    let q_path = _lens_shell_quote(path)
+    let q_key = _lens_shell_quote(key)
+    let q_val = _lens_shell_quote(val)
+    let block = "TS=$(date +%s); "
+        + "printf '{\"ts\":%s,\"key\":\"%s\",\"val\":\"%s\"}\\n' \"$TS\" "
+        + q_key + " " + q_val + " >> " + q_path + " 2>/dev/null; "
+        + "LN=$(wc -l < " + q_path + " 2>/dev/null || echo 0); "
+        + "if [ \"$LN\" -gt 256 ]; then tail -n 128 " + q_path + " > " + q_path + ".tmp && mv " + q_path + ".tmp " + q_path + "; fi"
+    let _ = exec(block)
+}
+
+// in-memory 전용 store (디스크 append 안함 — 이미 디스크에서 로드된 경우용).
+fn _lens_cache_store_in_mem_only(key: string, val: string) -> void {
+    if _lens_cache_order.contains(key) {
+        _lens_cache_map[key] = val
+        return
+    }
+    if len(_lens_cache_order) >= _LENS_CACHE_CAP {
+        let victim = _lens_cache_order[0]
+        let mut new_map: map = #{}
+        for k in _lens_cache_order {
+            if k != victim { new_map[k] = _lens_cache_map[k] }
+        }
+        _lens_cache_map = new_map
+        let mut new_order: list = []
+        let mut i: i64 = 1
+        while i < len(_lens_cache_order) {
+            new_order = new_order.push(_lens_cache_order[i])
+            i = i + 1
+        }
+        _lens_cache_order = new_order
+        _lens_cache_evicts = _lens_cache_evicts + 1
+        _lens_cache_emit("evict")
+    }
+    _lens_cache_map[key] = val
+    _lens_cache_order = _lens_cache_order.push(key)
+}
+
+fn _lens_cache_lookup(key: string) -> string {
+    // 1차: in-process map
+    if _lens_cache_order.contains(key) {
+        let mut new_order: list = []
+        for k in _lens_cache_order {
+            if k != key { new_order = new_order.push(k) }
+        }
+        new_order = new_order.push(key)
+        _lens_cache_order = new_order
+        _lens_cache_hits = _lens_cache_hits + 1
+        let result = _lens_cache_map[key]
+        _lens_cache_emit("hit")
+        return result
+    }
+    // 2차: 디스크 — cross-process warm path.
+    let disk_val = _lens_cache_disk_lookup(key)
+    if disk_val != "" {
+        _lens_cache_hits = _lens_cache_hits + 1
+        _lens_cache_emit("hit_disk")
+        _lens_cache_store_in_mem_only(key, disk_val)
+        return disk_val
+    }
+    _lens_cache_misses = _lens_cache_misses + 1
+    _lens_cache_emit("miss")
+    return ""
+}
+
+fn _lens_cache_store(key: string, val: string) -> void {
+    _lens_cache_store_in_mem_only(key, val)
+    _lens_cache_disk_append(key, val)
+}
+
+fn telescope_verify_cached(vals: string, threshold: f64) -> string {
+    if !_lens_cache_enabled() {
+        return telescope_verify(vals, threshold)
+    }
+    let key = _lens_cache_key(vals, threshold)
+    let hit = _lens_cache_lookup(key)
+    if hit != "" { return hit }
+    let res = telescope_verify(vals, threshold)
+    _lens_cache_store(key, res)
+    return res
+}
+
 // Run all 5 lenses and return consensus count (how many report signal > threshold)
 // Also returns boosted confidence multiplier
 fn telescope_verify(vals: string, threshold: f64) -> string {
@@ -2827,6 +3027,13 @@ if len(a) >= 3 && a[2] == "help" {
     println("    --round N          현재 라운드 (내부 자기호출용)")
     println("    --no-meta-closure  Phase 10 Meta-Closure Check 비활성화")
     println("                       (env: NEXUS_NO_META_CLOSURE=1 동일 효과)")
+    println("    --wave-session ID  라운드 체인 세션 (jitter 히스토리 공유, 루트 PID)")
+    println("")
+    println("  bias_jitter self-tuning (ROI#48e, 2026-04-21):")
+    println("    기본 ceiling=0.10. 최근 3 라운드 grade_std 관찰 → 자동 확대/축소.")
+    println("    env NEXUS_BIAS_JITTER_AUTO=0        : 튜닝 비활성, legacy 고정 0.10")
+    println("    env NEXUS_BIAS_JITTER_TARGET_STD=X  : target std 오버라이드 (기본 0.15)")
+    println("    log: stdout 'NEXUS_BIAS_JITTER_TUNE {...}' JSON (old/new/reason)")
     println("")
     exit(0)
 }
@@ -2915,6 +3122,7 @@ let mut wave_max_rounds: i64 = 6
 let mut dfs_max_depth: i64 = 0
 let mut dfs_current: i64 = 0
 let mut dfs_session: string = ""
+let mut wave_session: string = ""
 let mut no_meta_closure_flag: bool = false
 let mut ai: i64 = 2
 while ai < len(a) {
@@ -2948,8 +3156,16 @@ while ai < len(a) {
         dfs_session = a[ai + 1]
         ai = ai + 1
     }
+    if a[ai] == "--wave-session" && ai + 1 < len(a) {
+        wave_session = a[ai + 1]
+        ai = ai + 1
+    }
     if a[ai] == "--no-meta-closure" { no_meta_closure_flag = true }
     ai = ai + 1
+}
+// ROI#48e: wave_session 루트 PID fallback — 라운드 체인 간 jitter 히스토리 공유용.
+if wave_session == "" {
+    wave_session = if _BU_PID.len() > 0 { _BU_PID } else { "0" }
 }
 // env NEXUS_NO_META_CLOSURE=1 → --no-meta-closure 와 동일 효과 (CI/우회용)
 try {
@@ -3284,6 +3500,121 @@ let mut ax_n: i64 = 0
 // O(1) dedup: .contains() O(n) 선형탐색 → hashmap O(1) 전환
 let mut ax_name_set = #{}
 
+// ─── ROI#48e (2026-04-21): bias_jitter self-tuning ───
+// env 로드
+try {
+    let _auto_env = env("NEXUS_BIAS_JITTER_AUTO")
+    if _auto_env == "0" { _jitter_auto_on = false }
+} catch e {}
+try {
+    let _ts_env = env("NEXUS_BIAS_JITTER_TARGET_STD")
+    if _ts_env != "" {
+        let _ts_v = to_float(_ts_env)
+        if _ts_v > 0.0 { _jitter_target_std = _ts_v }
+    }
+} catch e {}
+
+// 히스토리 파일 (wave_session 공유)
+let _jitter_hist_path = "/tmp/.blowup_jitter_history." + wave_session + ".jsonl"
+let mut _prev_jitter: f64 = 0.10
+let mut _prev_std: f64 = 0.0
+let mut _prev_has: bool = false
+let mut _prev_lines_n: i64 = 0
+if _jitter_auto_on && file_exists(_jitter_hist_path) {
+    let mut _hist_raw = ""
+    try { _hist_raw = read_file(_jitter_hist_path) } catch e {}
+    let _hist_lines = _hist_raw.split("\n")
+    // 최근 M=3 entry 평균 std
+    let _M: i64 = 3
+    let mut _collected: [string] = []
+    let mut _hi: i64 = len(_hist_lines) - 1
+    while _hi >= 0 && len(_collected) < _M {
+        let _hl = _hist_lines[_hi].trim()
+        if _hl != "" { _collected = _collected.push(_hl) }
+        _hi = _hi - 1
+    }
+    _prev_lines_n = len(_collected)
+    if _prev_lines_n > 0 {
+        // 가장 최근 line 파싱 (마지막 write 된 jitter + 평균 std 도 별도 산출)
+        let _last = _collected[0]
+        if _last.contains("\"jitter\":") {
+            let _jp = _last.split("\"jitter\":")
+            if len(_jp) >= 2 {
+                let _jv = _jp[1].split(",")[0].split("}")[0].trim()
+                try { _prev_jitter = to_float(_jv) } catch e {}
+            }
+        }
+        let mut _std_sum: f64 = 0.0
+        let mut _std_n: i64 = 0
+        let mut _ci: i64 = 0
+        while _ci < len(_collected) {
+            let _cl = _collected[_ci]
+            if _cl.contains("\"grade_std\":") {
+                let _sp = _cl.split("\"grade_std\":")
+                if len(_sp) >= 2 {
+                    let _sv_str = _sp[1].split(",")[0].split("}")[0].trim()
+                    let mut _sv: f64 = 0.0
+                    try { _sv = to_float(_sv_str) } catch e {}
+                    _std_sum = _std_sum + _sv
+                    _std_n = _std_n + 1
+                }
+            }
+            _ci = _ci + 1
+        }
+        if _std_n > 0 {
+            _prev_std = _std_sum / to_float(_std_n)
+            _prev_has = true
+        }
+    }
+}
+
+// 업데이트 룰
+let _old_jitter = _prev_jitter
+let mut _new_jitter = _prev_jitter
+if !_jitter_auto_on {
+    _new_jitter = 0.10
+    _jitter_reason = "auto_off_fixed_0.10"
+} else if !_prev_has {
+    _new_jitter = 0.10
+    _jitter_reason = "bootstrap_no_history"
+} else {
+    let _lo = _jitter_target_std * 0.5
+    let _hi = _jitter_target_std * 2.0
+    if _prev_std < _lo {
+        _new_jitter = _prev_jitter * 1.25
+        _jitter_reason = "std_low_expand"
+    } else if _prev_std > _hi {
+        _new_jitter = _prev_jitter * 0.8
+        _jitter_reason = "std_high_shrink"
+    } else {
+        _new_jitter = _prev_jitter
+        _jitter_reason = "std_in_band"
+    }
+    // clamp [0.02, 0.30]
+    if _new_jitter < 0.02 {
+        _new_jitter = 0.02
+        _jitter_reason = _jitter_reason + "_clamp_lo"
+    }
+    if _new_jitter > 0.30 {
+        _new_jitter = 0.30
+        _jitter_reason = _jitter_reason + "_clamp_hi"
+    }
+}
+_jitter_ceiling = _new_jitter
+
+// log: round 당 NEXUS_BIAS_JITTER_TUNE JSON emit
+let _tune_log = "NEXUS_BIAS_JITTER_TUNE " + "{\"round\":" + to_string(wave_round)
+    + ",\"domain\":\"" + domain + "\""
+    + ",\"wave_session\":\"" + wave_session + "\""
+    + ",\"old\":" + to_string(_old_jitter)
+    + ",\"new\":" + to_string(_new_jitter)
+    + ",\"prev_std\":" + to_string(_prev_std)
+    + ",\"target_std\":" + to_string(_jitter_target_std)
+    + ",\"hist_n\":" + to_string(_prev_lines_n)
+    + ",\"auto\":" + (if _jitter_auto_on { "true" } else { "false" })
+    + ",\"reason\":\"" + _jitter_reason + "\"}"
+println(_tune_log)
+
 if ext_seeds.len() > 0 {
     // --seeds 모드: seed_engine 출력 사용 (구분자: , 또는 |)
     // AI-native: 텍스트 시드도 hash 인코딩으로 비-zero 수치 (safe_float 0 함정 우회)
@@ -3337,7 +3668,8 @@ if ext_seeds.len() > 0 {
         let _jitter_unit = _slot_v * 2.0 - 1.0
         let mut _abs_v = _base_val
         if _abs_v < 0.0 { _abs_v = 0.0 - _abs_v }
-        let _perturb = _jitter_unit * 0.10 * (_abs_v + 0.1)
+        // ROI#48e: hardcoded 0.10 → _jitter_ceiling (자기튜닝, NEXUS_BIAS_JITTER_AUTO=0 이면 0.10 고정)
+        let _perturb = _jitter_unit * _jitter_ceiling * (_abs_v + 0.1)
         ax_val_arr = ax_val_arr.push(_base_val + _perturb)
         ax_n = ax_n + 1
         init_i = init_i + 1
@@ -3440,6 +3772,7 @@ while depth < max_depth {
                 if gr == "EXACT" { exact_count = exact_count + 1 }
                 if gr == "NEAR" { near_count = near_count + 1 }
                 if conf >= 0.7 { high_conf_count = high_conf_count + 1 }
+                _tally_grade(gr)
                 if is_ax {
                     axiom_count = axiom_count + 1
                     let cand_label = if _matched_name != "" { _matched_name } else { nm }
@@ -3491,6 +3824,7 @@ while depth < max_depth {
                 if gr == "EXACT" { exact_count = exact_count + 1 }
                 if gr == "NEAR" { near_count = near_count + 1 }
                 if conf >= 0.7 { high_conf_count = high_conf_count + 1 }
+                _tally_grade(gr)
             }
             di = di + 1
         }
@@ -3536,6 +3870,7 @@ while depth < max_depth {
             if gr == "EXACT" { exact_count = exact_count + 1 }
             if gr == "NEAR" { near_count = near_count + 1 }
             if conf >= 0.7 { high_conf_count = high_conf_count + 1 }
+            _tally_grade(gr)
             if is_ax {
                 axiom_count = axiom_count + 1
                 let cand_label = if _mn3 != "" { _mn3 } else { nm }
@@ -3583,6 +3918,7 @@ while depth < max_depth {
                 if gr == "EXACT" { exact_count = exact_count + 1 }
                 if gr == "NEAR" { near_count = near_count + 1 }
                 if conf >= 0.7 { high_conf_count = high_conf_count + 1 }
+                _tally_grade(gr)
             }
             k = k + 1
         }
@@ -3618,6 +3954,7 @@ while depth < max_depth {
                 if gr == "EXACT" { exact_count = exact_count + 1 }
                 if gr == "NEAR" { near_count = near_count + 1 }
                 if conf >= 0.7 { high_conf_count = high_conf_count + 1 }
+                _tally_grade(gr)
             }
             j = j + 1
         }
@@ -3650,6 +3987,7 @@ while depth < max_depth {
                 if gr == "EXACT" { exact_count = exact_count + 1 }
                 if gr == "NEAR" { near_count = near_count + 1 }
                 if conf >= 0.7 { high_conf_count = high_conf_count + 1 }
+                _tally_grade(gr)
             }
         }
         i = i + 1
@@ -3703,6 +4041,7 @@ while depth < max_depth {
                     if gr == "EXACT" { exact_count = exact_count + 1 }
                     if gr == "NEAR" { near_count = near_count + 1 }
                     if conf >= 0.7 { high_conf_count = high_conf_count + 1 }
+                    _tally_grade(gr)
                     if is_ax {
                         axiom_count = axiom_count + 1
                         let cand_label = if _mn4 != "" { _mn4 } else { nm }
@@ -3794,6 +4133,26 @@ println("  high conf >= 0.7  :", high_conf_count)
 println("  axiom candidates  :", axiom_count)
 println("  final pool size   :", ax_n)
 println("")
+
+// ─── ROI#48e (2026-04-21): jitter 히스토리 append ───
+// Phase 4 완료 시점에 grade_mean/grade_std 를 계산, 다음 라운드가 읽도록 기록.
+if _jitter_grade_n > 0 {
+    let _gmean = _jitter_grade_sum / to_float(_jitter_grade_n)
+    let _gvar = _jitter_grade_sq_sum / to_float(_jitter_grade_n) - _gmean * _gmean
+    let mut _gstd = 0.0
+    if _gvar > 0.0 { _gstd = sqrt_f(_gvar) }
+    let _hist_entry = "{\"round\":" + to_string(wave_round)
+        + ",\"domain\":\"" + domain + "\""
+        + ",\"jitter\":" + to_string(_jitter_ceiling)
+        + ",\"grade_mean\":" + to_string(_gmean)
+        + ",\"grade_std\":" + to_string(_gstd)
+        + ",\"n\":" + to_string(_jitter_grade_n)
+        + ",\"auto\":" + (if _jitter_auto_on { "true" } else { "false" })
+        + "}\n"
+    try { append_file(_jitter_hist_path, _hist_entry) } catch e {}
+    println("  [JITTER] grade_mean=" + to_string(_gmean) + " grade_std=" + to_string(_gstd) + " (n=" + to_string(_jitter_grade_n) + ", jitter=" + to_string(_jitter_ceiling) + ") → " + _jitter_hist_path)
+}
+println("")
 try { arena_reset() } catch e {}  // AI-native: Phase 4 임시 메모리 해제 (최대 페이즈)
 
 // STREAM FILTER: 전 depth compact 파일에서 buf_lines 복원 (Phase 5/6 에서 필요)
@@ -3843,7 +4202,8 @@ let _tele_vals = if fast_mode && len(val_arr) > 100 {
     _tv
 } else { val_arr }
 let val_csv = "|".join(_tele_vals)
-let tele_result = telescope_verify(val_csv, 0.15)
+// Lazy+LRU cache wrapper (hit → 5 렌즈 compute skip). bypass: NEXUS_LENS_CACHE_OFF=1
+let tele_result = telescope_verify_cached(val_csv, 0.15)
 let tparts = tele_result.split("|")
 let mut tele_agree: i64 = 0
 let mut tele_level = "None"
@@ -5369,6 +5729,8 @@ if wave_round < wave_max_rounds {
         let mut w5_cmd = w5_hexa + " " + w5_dir + "/blowup.hexa " + next_domain + " " + to_string(max_depth)
         w5_cmd = w5_cmd + " --round " + to_string(wave_round + 1)
         w5_cmd = w5_cmd + " --max-rounds " + to_string(wave_max_rounds)
+        // ROI#48e: wave-session 전파 — 다음 라운드가 jitter 히스토리 읽어 자기튜닝 계속.
+        w5_cmd = w5_cmd + " --wave-session " + wave_session
         if cascade_seeds != "" {
             w5_cmd = w5_cmd + " --seeds \"" + cascade_seeds + "\""
         }
