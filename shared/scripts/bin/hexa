@@ -144,16 +144,70 @@ esac
 [ -x "$WRAP" ] || USE_LAUNCHD=0                      # wrap missing → fall through
 [ "${HEXA_FORCE_LAUNCHD:-0}" = "1" ] && USE_LAUNCHD=1   # CI/test override: re-enable wrap regardless
 
+# F4: NEXUS_ENGINE_CRASH envelope.
+# Why: engine 바이너리가 exit!=0 + stderr 에 NEXUS_* ai-native JSON 을 하나도
+# 남기지 않고 조용히 죽으면 caller (drill, nexus shim) 는 "정상 0-yield" 로
+# 오해한다. 여기서 stderr 를 tee 로 포착 → 종료 후 envelope 판별.
+# 비용: tee + fork 1회, signal 전달 손실 없음(wait 반환코드 그대로 exit).
+# 정상 경로 (rc=0 또는 stderr 에 NEXUS_* 존재): envelope 없음.
+_emit_engine_crash() {
+    local err_tmp="$1"; local rc="$2"; shift 2
+    local cmd_label="$*"
+    # stderr 에 NEXUS_* ai-native JSON 이 이미 있으면 envelope 생략 (중복 차단).
+    if [ -s "$err_tmp" ] && grep -q -E 'NEXUS_(ENGINE|DRILL|CMD|REMOTE|RSS|FANOUT|CORE|REFRESH)_' "$err_tmp" 2>/dev/null; then
+        return 0
+    fi
+    # 최근 stderr 3 lines (empty 허용, JSON escape 최소화).
+    local tail3
+    tail3="$(tail -n 3 "$err_tmp" 2>/dev/null | tr '\n' ' ' | tr '\r' ' ' | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/ /g' | cut -c 1-200)"
+    local sig_label="-1"
+    if [ "$rc" -ge 128 ] 2>/dev/null; then
+        local sig_num=$((rc - 128))
+        sig_label="SIG${sig_num}"
+    fi
+    printf 'NEXUS_ENGINE_CRASH {"cmd":"%s","rc":%s,"signal":"%s","reason":"no_json_stderr","tail_3":"%s"}\n' \
+        "$(printf '%s' "$cmd_label" | sed 's/\\/\\\\/g; s/"/\\"/g' | cut -c 1-240)" \
+        "$rc" "$sig_label" "$tail3" >&2
+}
+
 resolve_and_exec() {
     local cand="$1"; shift
-    if [ "$USE_LAUNCHD" = "1" ]; then
-        # HEXA_NO_LAUNCHD=1 is also injected into the launchd job's
-        # EnvironmentVariables (in safe_hexa_launchd.sh), so any nested
-        # `hexa` calls from inside the wrapped process bypass the wrap.
-        HEXA_BIN="$cand" exec "$WRAP" "$@"
-    else
-        exec "$cand" "$@"
+    local __skip_envelope=0
+    # cheap/interactive subcommands: envelope 우회 (REPL/version 등 stderr 사용 패턴 보호).
+    case "${1:-}" in
+        ""|version|--version|-V|help|--help|-h|status|lsp) __skip_envelope=1 ;;
+    esac
+    # tty stdin 인 경우 wrapping 하면 REPL 깨짐. piped/redirected 만 envelope 적용.
+    [ -t 0 ] && __skip_envelope=1
+    # HEXA_CRASH_ENVELOPE=0 : opt-out (디버그).
+    [ "${HEXA_CRASH_ENVELOPE:-1}" = "0" ] && __skip_envelope=1
+
+    if [ "$__skip_envelope" = "1" ]; then
+        if [ "$USE_LAUNCHD" = "1" ]; then
+            HEXA_BIN="$cand" exec "$WRAP" "$@"
+        else
+            exec "$cand" "$@"
+        fi
+        # exec 는 돌아오지 않음
+        return 0
     fi
+
+    local __err_tmp __rc=0
+    __err_tmp="$(mktemp -t hexa_crash_stderr.XXXXXX 2>/dev/null || echo "/tmp/hexa_crash_stderr.$$")"
+    # tee stderr → 정상 stderr 는 그대로 전달하고 tmpfile 에도 복사.
+    # set -e 환경이라 rc 캡처는 '|| __rc=$?' 필요.
+    if [ "$USE_LAUNCHD" = "1" ]; then
+        HEXA_BIN="$cand" "$WRAP" "$@" 2> >(tee -- "$__err_tmp" >&2) || __rc=$?
+    else
+        "$cand" "$@" 2> >(tee -- "$__err_tmp" >&2) || __rc=$?
+    fi
+    # tee 자식 flush 대기 (파일 참조 안전성).
+    wait 2>/dev/null || true
+    if [ "$__rc" != "0" ]; then
+        _emit_engine_crash "$__err_tmp" "$__rc" "$cand" "$@"
+    fi
+    rm -f "$__err_tmp" 2>/dev/null || true
+    exit "$__rc"
 }
 
 # 1. HEXA_BIN env var override (테스트/디버깅)
