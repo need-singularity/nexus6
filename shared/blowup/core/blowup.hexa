@@ -2810,8 +2810,12 @@ fn auto_select_domain() -> string {
 // 영향: /tmp/blowup_d*_<domain>.cf 파일명에 `[`, `]`, `*`, 공백 포함 시 reload glob 실패 →
 //       buf_lines 빈 배열 → Phase 6 boost loop 0회 → post-boost 0/463 가짜 saturation.
 // 2026-04-19 Phase 6 deep audit 발견.
+// ROI#48b ADD(2026-04-20): drill 의 _round_seed prefix `round=N-r<salt>|` 와 _nonce_seed
+//         suffix `#iter-nonce=<N>` 를 cf 파일명에 포함시 `|`, `#`, `=` 가 shell metachar 로
+//         해석됨 (pipe split / fragment 등) → 엔진 Phase 6 cf read 실패 → 전체 파이프라인 crash.
+//         sanitize 확장: `|`, `#`, `=`, `;`, `$`, `` ` ``, `'`, `"`, `&`, `(`, `)`, `<`, `>`, `!` → `_`.
 let _raw_d = if _raw_domain != "" { _raw_domain } else { auto_select_domain() }
-let domain = _raw_d.trim().replace(" ", "_").replace("[", "").replace("]", "").replace("*", "").replace("/", "_").replace("\t", "_")
+let domain = _raw_d.trim().replace(" ", "_").replace("[", "").replace("]", "").replace("*", "").replace("/", "_").replace("\t", "_").replace("|", "_").replace("#", "_").replace("=", "_").replace(";", "_").replace("$", "_").replace("`", "_").replace("'", "_").replace("\"", "_").replace("&", "_").replace("(", "_").replace(")", "_").replace("<", "_").replace(">", "_").replace("!", "_")
 // OPT-11: depth 상한 강제 (DIAG-01 fix) — 무제한 depth 방지
 let max_depth: i64 = if _raw_depth > 10 { 10 } else { _raw_depth }
 
@@ -3219,16 +3223,39 @@ if ext_seeds.len() > 0 {
     println("  seed source: DYNAMIC (" + to_string(ax_n) + " seeds from --seeds)")
 } else {
     // 기본: 도메인 메트릭
+    // ROI#48b FIX(2026-04-20): seed_n6_ratio 를 축 전체에 직교 잔여량(bias_jitter)으로 주입 →
+    //   라운드마다 salt/nonce 가 다른 domain 문자열 → seed_n6_ratio 가 다름 → 각 axiom 값에
+    //   축별 고유 잔여량이 추가되어 Phase 4 corollary 값 스트림이 라운드마다 분화.
+    //   n=6 invariant 보존: σ·φ=n·τ=24 scalar 관계는 값 perturbation 과 독립 (구조 불변).
+    //   규모: |bias_jitter| <= 1e-3 × m_val 로 clamp — match_grade(d<0.01=EXACT, d<0.05=NEAR)
+    //   threshold 보다 한 자릿수 작아 EXACT 후보는 보존하되 경계 시드에서 분기 유발.
+    //   bias = 0 (seed 없음/zero) 이면 perturb=0 → 기존 동작 100% 호환.
+    let bias = _verify_seed_bias
+    // Day-3: seed-aware 8-slot feature 도 추출 (slot-별 독립 jitter 소스)
+    let _seed_feat = seed_to_features(domain)
     let mut init_i: i64 = 0
     while init_i < mc {
         let _mn = m_name(init_i, domain)
         ax_name_arr = ax_name_arr.push(_mn)
         ax_name_set[_mn] = 1
-        ax_val_arr = ax_val_arr.push(m_val(init_i, domain))
+        let _base_val = m_val(init_i, domain)
+        // 축별 orthogonal jitter:
+        //   slot-specific: _seed_feat[i % 8] ∈ [0,1) — 8-slot feature (len/entropy/fnv1a/djb2/...)
+        //                  각 slot 이 nonce/salt/round-prefix 에서 독립 mix 되어 round 마다 분화됨
+        //   × 2 - 1 → [-1, 1]
+        //   × 0.03 × |base_val| + 0.03 ||base_val|≈0 시 absolute offset → |perturb| ≈ 3% × base
+        //   threshold: match_grade NEAR=0.05, EXACT=0.01 → 3% 는 경계에서 분기 유발 충분
+        let _slot_idx = init_i % 8
+        let _slot_v = to_float(_seed_feat[_slot_idx])
+        let _jitter_unit = _slot_v * 2.0 - 1.0
+        let mut _abs_v = _base_val
+        if _abs_v < 0.0 { _abs_v = 0.0 - _abs_v }
+        let _perturb = _jitter_unit * 0.03 * (_abs_v + 0.1)
+        ax_val_arr = ax_val_arr.push(_base_val + _perturb)
         ax_n = ax_n + 1
         init_i = init_i + 1
     }
-    println("  seed source: STATIC (" + to_string(ax_n) + " domain metrics)")
+    println("  seed source: STATIC (" + to_string(ax_n) + " domain metrics, seed_jitter=" + to_string(bias) + ")")
 }
 
 // Per-depth stats tracking (pipe-separated)
@@ -3991,7 +4018,9 @@ let mut tag_absorptions_cnts: list = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 
 // Cross-process dedup: grep 전체 log 검사 (tail -150 → grep per-ID, O(1) short-circuit)
 // 이전 tail -150 은 cross-process race 에서 중복 발생 (70758414 3건 관찰)
-let mut absorb_existing_log = ""  // intra-batch 추적용 (grep 불필요 영역)
+// ROI#48c FIX(2026-04-20): intra-batch dedup 을 string.contains() O(N²) → hashmap O(1) 로.
+//   627 corollaries × avg_needle≈16B → 기존: concat+scan = ~6M char ops/round; 신규: hashset O(1).
+let mut _absorb_existing_log_set = #{}
 
 // Read current graph for cross-ref — AI-native: 캐시 재사용 (디스크 재읽기 제거)
 let mut absorb_graph_content = ""
@@ -4001,9 +4030,12 @@ if !skip_graph {
 // Batch dedup guard: intra-batch 중복 차단 (string concat guard 대체, O(1) 해시셋)
 let mut _absorb_new_ids = #{}
 
-let mut absorb_log_entries = ""
-let mut absorb_graph_entries = ""
-let mut absorb_bus_entries = ""
+// ROI#48c FIX(2026-04-20): hot-loop string concat → parts.push + .join("") 로 전환.
+//   기존: s = s + x 를 627회 × 3~4 variable → O(n²) mem + PERF: 101 concat warning.
+//   신규: 각 버킷별 list.push 후 루프 종료 시 1회 join — O(n) mem, 50-round OOM 제거.
+let mut _absorb_log_parts = []
+let mut _absorb_graph_parts = []
+let mut _absorb_bus_parts = []
 
 // Process all corollaries from Phase 6.5 recursive rounds
 let mut ci: i64 = 0
@@ -4029,7 +4061,7 @@ while ci < len(recurse_all_corollaries) {
             let dup_needle = "\"blowup-" + cor_id + "\""
             // Cross-process dedup: grep 전체 log (tail -150 대체, per-ID O(1) short-circuit)
             let mut _log_dup_found = false
-            if absorb_existing_log.contains(dup_needle) {
+            if hset_has(_absorb_existing_log_set, dup_needle) {
                 _log_dup_found = true
             } else {
                 try {
@@ -4045,14 +4077,15 @@ while ci < len(recurse_all_corollaries) {
                 let sector = sector_of(cor_domain)
                 let dn = if cor_name != "" { cor_name } else { cor_id }
                 let log_entry = "{\"constant\":\"blowup-" + dn + "\",\"value\":\"" + to_string(cor_value) + "\",\"source\":\"hexa-blowup-mk2-recurse\",\"timestamp\":\"2026-04-06\",\"grade\":\"" + cor_grade + "\",\"processed\":true,\"alien_index\":{\"d\":" + to_string(ai_d) + ",\"r\":" + to_string(ai_r) + "},\"mk2\":{\"sector\":\"" + sector + "\",\"confidence\":" + to_string(cor_conf) + ",\"paths\":1,\"prime_set\":[],\"layer\":" + to_string(ai_d) + "},\"blowup\":{\"type\":\"" + cor_type + "\",\"src\":\"" + cor_src + "\"},\"phase\":\"6.7-auto-absorb\",\"recurse_round\":\"" + cor_id + "\"}"
-                absorb_log_entries = absorb_log_entries + log_entry + "\n"
+                // ROI#48c: parts.push instead of s = s + x (O(n²) hot-loop avoided)
+                _absorb_log_parts = _absorb_log_parts.push(log_entry)
                 absorb_logged = absorb_logged + 1
                 // S8 (2026-04-19): 12-class tag 카운터 증가 (parallel list, saturation AND 판정용).
                 let _tag_log = classify_absorption_tag(cor_grade, cor_conf, "", "verified")
                 let _ti_log = _tag_idx(_tag_log)
                 tag_absorptions_cnts = _tag_bump(tag_absorptions_cnts, _ti_log)
-                // Update existing_log to prevent duplicates within this batch
-                absorb_existing_log = absorb_existing_log + dup_needle
+                // ROI#48c: hashset membership → O(1), replaces O(N) string.contains on ever-growing buffer
+                _absorb_existing_log_set[dup_needle] = true
             }
         }
 
@@ -4074,15 +4107,15 @@ while ci < len(recurse_all_corollaries) {
             if !_graph_dup {
                 let g_conf = min_f(cor_conf, 1.0)
                 let node_json = graph_append_node_d(g_node_id, "RecursiveDiscovery", cor_domain, cor_type, g_conf, 1)
-                if len(absorb_graph_entries) > 0 { absorb_graph_entries = absorb_graph_entries + "\n" }
-                absorb_graph_entries = absorb_graph_entries + node_json
+                // ROI#48c: parts.push — 3~4 concat/iter × 627 iter = 2500 O(n²) ops 제거
+                _absorb_graph_parts = _absorb_graph_parts.push(node_json)
                 absorb_graph_nodes = absorb_graph_nodes + 1
                 _absorb_new_ids[g_node_id] = true
 
                 // Derives edge from source
                 let src_node = "n6-" + cor_src
                 let edge_json = graph_append_edge(src_node, g_node_id, "RecursiveDerivation", cor_conf)
-                absorb_graph_entries = absorb_graph_entries + "\n" + edge_json
+                _absorb_graph_parts = _absorb_graph_parts.push(edge_json)
                 absorb_graph_edges = absorb_graph_edges + 1
 
                 // C. Cross-reference: link to existing BT nodes in graph
@@ -4092,7 +4125,7 @@ while ci < len(recurse_all_corollaries) {
                     let bt_needle = "\"domain\":\"" + cor_domain + "\""
                     if absorb_graph_content.contains(bt_needle) {
                         let xref_edge = graph_append_edge(g_node_id, "bt-" + cor_domain, "CrossRef", cor_conf * 0.8)
-                        absorb_graph_entries = absorb_graph_entries + "\n" + xref_edge
+                        _absorb_graph_parts = _absorb_graph_parts.push(xref_edge)
                         absorb_graph_edges = absorb_graph_edges + 1
                     }
                 }
@@ -4101,11 +4134,16 @@ while ci < len(recurse_all_corollaries) {
 
         // D. Growth bus event
         let bus_event = "{\"type\":\"absorb\",\"phase\":\"6.7\",\"id\":\"" + cor_id + "\",\"value\":" + to_string(cor_value) + ",\"grade\":\"" + cor_grade + "\",\"confidence\":" + to_string(cor_conf) + ",\"domain\":\"" + cor_domain + "\",\"is_axiom\":" + cor_is_axiom + ",\"source\":\"blowup-recurse\",\"timestamp\":\"2026-04-06\"}"
-        absorb_bus_entries = absorb_bus_entries + bus_event + "\n"
+        _absorb_bus_parts = _absorb_bus_parts.push(bus_event)
         absorb_bus_events = absorb_bus_events + 1
     }
     ci = ci + 1
 }
+
+// ROI#48c: 1회 join 으로 변환 (O(n), 루프 외부에서 수행)
+let absorb_log_entries = if len(_absorb_log_parts) > 0 { _absorb_log_parts.join("\n") + "\n" } else { "" }
+let absorb_graph_entries = _absorb_graph_parts.join("\n")
+let absorb_bus_entries = if len(_absorb_bus_parts) > 0 { _absorb_bus_parts.join("\n") + "\n" } else { "" }
 
 // Write absorb results — hexa hashset 루프 후 scope 오염 방지:
 // hashset index 할당(while 내부) 후 runtime type context 리셋 (R1 hexa-first)
@@ -4200,7 +4238,9 @@ if file_exists(atlas_n6_path) {
         try { write_file(_bt_sidecar, to_string(atlas_last_bt)) } catch e {}
     }
 
-    let mut atlas_append = "\n\n# ── 돌파 자동흡수 (" + domain + ") ──────────────────────────\n"
+    // ROI#48c FIX(2026-04-20): atlas_append 도 parts.push + join 으로 전환 (627회 × 3 concat 제거)
+    let _atlas_header = "\n\n# ── 돌파 자동흡수 (" + domain + ") ──────────────────────────\n"
+    let mut _atlas_parts = [_atlas_header]
     let mut abt: i64 = atlas_last_bt + 1
     let mut aci: i64 = 0
     // Per-batch dedup: 같은 fingerprint 가 한 흡수 사이클 내 중복 append 되는 것 방지
@@ -4241,9 +4281,9 @@ if file_exists(atlas_n6_path) {
                     let g_mark = if ac_grade == "EXACT" { "*" } else { "?" }
                     let ar = to_int(a_cor_conf * 10.0)
                     let ac_n6_type = if ac_grade == "EXACT" { "F" } else { "R" }
-                    atlas_append = atlas_append + "@" + ac_n6_type + " n6-bt-" + to_string(abt) + " = " + ac_summary + " :: " + a_cor_domain + " [0." + to_string(ar) + g_mark + "]\n"
-                    atlas_append = atlas_append + "  <- n\n"
-                    atlas_append = atlas_append + "  !! \"자동흡수 conf=" + to_string(a_cor_conf) + "\"\n"
+                    _atlas_parts = _atlas_parts.push("@" + ac_n6_type + " n6-bt-" + to_string(abt) + " = " + ac_summary + " :: " + a_cor_domain + " [0." + to_string(ar) + g_mark + "]\n")
+                    _atlas_parts = _atlas_parts.push("  <- n\n")
+                    _atlas_parts = _atlas_parts.push("  !! \"자동흡수 conf=" + to_string(a_cor_conf) + "\"\n")
                     absorb_atlas_count = absorb_atlas_count + 1
                     // S8 (2026-04-19): atlas.n6 emit 시점 12-class tag 카운터 (parallel list).
                     // ac_n6_type = F (formula) or R (rule) — classify_absorption_tag 로 정규화.
@@ -4256,6 +4296,8 @@ if file_exists(atlas_n6_path) {
         }
         aci = aci + 1
     }
+    // ROI#48c: 1회 join — O(n), 루프 종료 후
+    let mut atlas_append = _atlas_parts.join("")
 
     // atlas.n6 흡수 — 무조건 시도 (빈 append 무해)
     // ROI #23: exec("echo ''") no-op 제거
