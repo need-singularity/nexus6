@@ -1,0 +1,444 @@
+// ═══════════════════════════════════════════════════════════
+// atlas_scan_opt.hexa — atlas.n6 domain-prefix bucket index (opt-in)
+//
+// 배경:
+//   atlas.n6 는 수 만 entry linear scan (atlas_health / blowup corollary).
+//   O(N) → O(1+k) 로 개선: domain prefix (math_/physics_/logic_/...) bucket 으로
+//   entry line 묶음 pre-index.
+//
+// 설계:
+//   · atlas.n6 은 read-only (편집 금지)
+//   · index JSON 은 /tmp/atlas_bucket_idx.json 에 persist
+//   · index 값은 line_index (line number, 0-origin) — file offset seek 비효율 회피
+//   · query 는 full read + filter (atlas ≈ 1.5MB, 허용)
+//   · staleness: atlas.n6 mtime 비교
+//
+// 사용:
+//   hexa shared/n6/atlas_scan_opt.hexa build      — index 재빌드 + persist
+//   hexa shared/n6/atlas_scan_opt.hexa query <prefix>   — prefix 매칭 entry list
+//   hexa shared/n6/atlas_scan_opt.hexa stats      — top 10 prefix cardinality
+//
+// 편집 금지: atlas.n6 본체, blowup/compose/run.hexa
+// 규칙: hexa `>=`/`<=` 금지 — 본 파일에서는 < / > 만 사용
+// ═══════════════════════════════════════════════════════════
+
+let _ATLAS_PATH = "shared/n6/atlas.n6"
+let _INDEX_PATH = "/tmp/atlas_bucket_idx.json"
+
+// ─── util: stat mtime (BSD/GNU 양립, 마지막 numeric line 반환) ───
+fn _last_numeric_line(raw: string) -> string {
+    let lines = raw.split("\n")
+    let mut i: i64 = len(lines) - 1
+    while i > -1 {
+        let t = lines[i].trim()
+        if t != "" {
+            let mut all_digit = true
+            let mut j: i64 = 0
+            while j < len(t) {
+                let c = t.substring(j, j + 1)
+                if c < "0" { all_digit = false; j = len(t) }
+                else if c > "9" { all_digit = false; j = len(t) }
+                j = j + 1
+            }
+            if all_digit { return t }
+        }
+        i = i - 1
+    }
+    return ""
+}
+
+fn _mtime_of(path: string) -> string {
+    let mut r = ""
+    try {
+        let raw = to_string(exec("stat -c '%Y' '" + path + "' 2>/dev/null; stat -f '%m' '" + path + "' 2>/dev/null"))
+        r = _last_numeric_line(raw)
+    } catch e {}  // @allow-silent-catch
+    return r
+}
+
+// ─── util: ms clock (duration_ms 측정) ───
+fn _ns_now() -> i64 {
+    let mut r: i64 = 0
+    try {
+        let raw = to_string(exec("date +%s%N")).trim()  // @allow-bare-exec
+        r = to_int(raw)
+    } catch e {}  // @allow-silent-catch
+    return r
+}
+
+// ─── util: 간단 JSON int/str 추출 ───
+fn _json_int_g(raw: string, key: string) -> i64 {
+    let mut v: i64 = 0
+    let marker = "\"" + key + "\":"
+    let idx = raw.index_of(marker)
+    if idx > -1 {
+        let after = raw.substring(idx + len(marker), len(raw))
+        let mut end = after.index_of(",")
+        let end2 = after.index_of("}")
+        if end < 0 { end = end2 }
+        else if end2 > -1 && end2 < end { end = end2 }
+        if end > 0 {
+            try { v = to_int(after.substring(0, end).trim()) } catch e {}  // @allow-silent-catch
+        }
+    }
+    return v
+}
+
+fn _json_str_g(raw: string, key: string) -> string {
+    let marker = "\"" + key + "\":\""
+    let idx = raw.index_of(marker)
+    if idx < 0 { return "" }
+    let start = idx + len(marker)
+    let after = raw.substring(start, len(raw))
+    let end = after.index_of("\"")
+    if end < 0 { return "" }
+    return after.substring(0, end)
+}
+
+// ═══════════════════════════════════════════════════════════
+//  function 1 — _bucket_domain_prefix(entry_line) -> str
+//
+//  atlas.n6 entry line 의 domain token 의 prefix 를 반환.
+//  포맷:   @<type> <id> ... :: <domain> [<grade>]
+//  domain 예: "math_analysis" → prefix "math"
+//             "physics"       → prefix "physics"
+//             "bt"            → prefix "bt"
+//  매칭 실패 ("", # 주석, 들여쓰기 line, @ 가 아닌 line) → "" 반환
+// ═══════════════════════════════════════════════════════════
+fn _bucket_domain_prefix(entry_line: string) -> string {
+    let t = entry_line.trim()
+    if t == "" { return "" }
+    if t.starts_with("#") { return "" }
+    if t.starts_with("//") { return "" }
+    if !t.starts_with("@") { return "" }
+    // "::" 토큰 탐색
+    let ci = t.index_of("::")
+    if ci < 0 { return "" }
+    let rest = t.substring(ci + 2, len(t)).trim()
+    if rest == "" { return "" }
+    // 첫 whitespace 토큰 취득
+    let mut dom = rest
+    let sp = rest.index_of(" ")
+    if sp > 0 { dom = rest.substring(0, sp) }
+    let tb = rest.index_of("\t")
+    if tb > 0 && tb < sp { dom = rest.substring(0, tb) }
+    if dom == "" { return "" }
+    // prefix = '_' 앞부분. '_' 없으면 dom 그대로.
+    let us = dom.index_of("_")
+    if us > 0 { return dom.substring(0, us) }
+    return dom
+}
+
+// ═══════════════════════════════════════════════════════════
+//  function 2 — _bucket_index_build(atlas_path) -> persist
+//
+//  1-pass scan. prefix → [line_index,...] 수집 후 /tmp/atlas_bucket_idx.json 기록.
+//  stderr emit: NEXUS_ATLAS_INDEX_BUILD {"prefixes":N,"entries":M,"duration_ms":T}
+//  parallel arrays (hexa has no for-in-map): pkeys / pvals_csv
+// ═══════════════════════════════════════════════════════════
+fn _bucket_index_build(atlas_path: string) -> i64 {
+    let t0 = _ns_now()
+    if !file_exists(atlas_path) {
+        eprintln("atlas_scan_opt: atlas not found: " + atlas_path)
+        return 0
+    }
+    // hexa interpreter 의 [string].push() 는 수천 수준에서 O(n²) 악화 → awk 경유 스캔.
+    //   awk 는 atlas.n6 1-pass 로 prefix→line_indices 집계, 각 prefix 라인 한 줄씩 출력:
+    //     "<prefix>\t<idx1>,<idx2>,..."
+    //   prefix rule = entry_line.trim() starts with '@' AND contains "::" → 첫 domain token
+    //                의 '_' 앞 prefix. 주석/들여쓰기/blank 는 skip.
+    //   NR 는 1-origin, line_index 는 0-origin → idx = NR-1.
+    let awk_src = "BEGIN{FS=\"\"} "
+        + "{ line=$0; "
+        + "  s=line; sub(/^[ \\t]+/,\"\",s); sub(/[ \\t]+$/,\"\",s); "
+        + "  if (s==\"\" || substr(s,1,1)==\"#\" || substr(s,1,2)==\"//\") next; "
+        + "  if (substr(s,1,1) != \"@\") next; "
+        + "  ci = index(s, \"::\"); "
+        + "  if (ci == 0) next; "
+        + "  rest = substr(s, ci+2); sub(/^[ \\t]+/,\"\",rest); "
+        + "  if (rest==\"\") next; "
+        + "  sp = index(rest, \" \"); tb = index(rest, \"\\t\"); "
+        + "  dom = rest; "
+        + "  if (sp>0 && (tb==0 || sp<tb)) dom = substr(rest, 1, sp-1); "
+        + "  else if (tb>0) dom = substr(rest, 1, tb-1); "
+        + "  us = index(dom, \"_\"); "
+        + "  if (us>0) pfx = substr(dom, 1, us-1); else pfx = dom; "
+        + "  if (pfx==\"\") next; "
+        + "  idx = NR - 1; "
+        + "  if (pfx in B) B[pfx] = B[pfx] \",\" idx; else { B[pfx] = idx; K[++KN] = pfx } "
+        + "  E++ "
+        + "} "
+        + "END{ printf \"#META\\t%d\\t%d\\n\", KN+0, E+0; "
+        + "     for (i=1; i<=KN; i++) { k=K[i]; printf \"%s\\t%s\\n\", k, B[k] } }"
+    // awk 호출 — atlas.n6 을 직접 읽어 위 규칙 적용
+    let mut awk_out = ""
+    try {
+        awk_out = to_string(exec("awk '" + awk_src + "' '" + atlas_path + "' 2>/dev/null"))
+    } catch e {  // @allow-silent-catch
+        eprintln("atlas_scan_opt: awk exec failed")
+        return 0
+    }
+    if awk_out == "" {
+        eprintln("atlas_scan_opt: awk produced empty output")
+        return 0
+    }
+    // 첫 줄 = "#META\tprefixes\tentries"
+    let nl1 = awk_out.index_of("\n")
+    if nl1 < 0 {
+        eprintln("atlas_scan_opt: awk output malformed (no newline)")
+        return 0
+    }
+    let meta_line = awk_out.substring(0, nl1)
+    let bucket_block = awk_out.substring(nl1 + 1, len(awk_out))
+    let mut prefixes: i64 = 0
+    let mut entries: i64 = 0
+    if meta_line.starts_with("#META") {
+        let mp = meta_line.split("\t")
+        if len(mp) > 2 {
+            try { prefixes = to_int(mp[1].trim()) } catch e {}  // @allow-silent-catch
+            try { entries = to_int(mp[2].trim()) } catch e {}   // @allow-silent-catch
+        }
+    }
+    let t1 = _ns_now()
+    let dur_ms = (t1 - t0) / 1000000
+    let src_mtime = _mtime_of(atlas_path)
+
+    // JSON 직렬화 — parts + join (PERF lint 회피)
+    let mut parts: [string] = []
+    parts.push("{\"_meta\":{\"source\":\"")
+    parts.push(atlas_path)
+    parts.push("\",\"mtime\":")
+    parts.push(if src_mtime == "" { "0" } else { src_mtime })
+    parts.push(",\"prefixes\":")
+    parts.push(to_string(prefixes))
+    parts.push(",\"entries\":")
+    parts.push(to_string(entries))
+    parts.push(",\"duration_ms\":")
+    parts.push(to_string(dur_ms))
+    parts.push(",\"schema\":1},\"buckets\":{")
+    let rows = bucket_block.split("\n")
+    let mut first = true
+    for row in rows {
+        if row == "" { continue }
+        let tab = row.index_of("\t")
+        if tab < 0 { continue }
+        let name = row.substring(0, tab)
+        let csv = row.substring(tab + 1, len(row))
+        if first { first = false } else { parts.push(",") }
+        parts.push("\"")
+        parts.push(name)
+        parts.push("\":[")
+        parts.push(csv)
+        parts.push("]")
+    }
+    parts.push("}}\n")
+    let out = parts.join("")
+    try { write_file(_INDEX_PATH, out) } catch e {  // @allow-silent-catch
+        eprintln("atlas_scan_opt: write failed: " + _INDEX_PATH)
+        return 0
+    }
+    let mut log_parts: [string] = []
+    log_parts.push("NEXUS_ATLAS_INDEX_BUILD {\"prefixes\":")
+    log_parts.push(to_string(prefixes))
+    log_parts.push(",\"entries\":")
+    log_parts.push(to_string(entries))
+    log_parts.push(",\"duration_ms\":")
+    log_parts.push(to_string(dur_ms))
+    log_parts.push("}")
+    eprintln(log_parts.join(""))
+    return entries
+}
+
+// ═══════════════════════════════════════════════════════════
+//  function 3 — _bucket_index_load(atlas_path) -> string (raw JSON) or ""
+//
+//  stat mtime 비교. stale 이면 "" 반환. fresh 면 JSON 원문 반환.
+//  (반환값이 ""가 아니면 fresh, ""이면 null 의미)
+// ═══════════════════════════════════════════════════════════
+fn _bucket_index_load(atlas_path: string) -> string {
+    if !file_exists(_INDEX_PATH) { return "" }
+    let mut raw = ""
+    try { raw = read_file(_INDEX_PATH).trim() } catch e { return "" }  // @allow-silent-catch
+    if raw == "" { return "" }
+    let cached_mtime = to_string(_json_int_g(raw, "mtime"))
+    let cur_mtime = _mtime_of(atlas_path)
+    if cur_mtime == "" { return "" }
+    if cached_mtime != cur_mtime { return "" }   // stale
+    return raw
+}
+
+// ═══════════════════════════════════════════════════════════
+//  function 4 — scan_by_prefix(atlas_path, prefix) -> [entry_line]
+//
+//  index lookup → 해당 line_index set 만 filter.
+//  (file offset seek 대신 full read + indexed filter — atlas ≈ 1.5MB, 허용)
+//  fallback: index null 이면 on-the-fly 빌드 후 재시도.
+// ═══════════════════════════════════════════════════════════
+fn scan_by_prefix(atlas_path: string, prefix: string) -> [string] {
+    let mut out: [string] = []
+    let mut idx_raw = _bucket_index_load(atlas_path)
+    if idx_raw == "" {
+        let _n = _bucket_index_build(atlas_path)
+        idx_raw = _bucket_index_load(atlas_path)
+    }
+    if idx_raw == "" { return out }
+    // bucket JSON: "buckets":{"math":[1,2,3],...}
+    let marker = "\"" + prefix + "\":["
+    let bstart = idx_raw.index_of(marker)
+    if bstart < 0 { return out }
+    let after = idx_raw.substring(bstart + len(marker), len(idx_raw))
+    let close = after.index_of("]")
+    if close < 0 { return out }
+    let csv = after.substring(0, close).trim()
+    if csv == "" { return out }
+    // parse CSV of line indices
+    let parts = csv.split(",")
+    let mut want: [i64] = []
+    for p in parts {
+        let pt = p.trim()
+        if pt != "" {
+            try { want.push(to_int(pt)) } catch e {}  // @allow-silent-catch
+        }
+    }
+    if len(want) < 1 { return out }
+    // full read + index pick (seek 회피)
+    let content = read_file(atlas_path)
+    let lines = content.split("\n")
+    let nlines = len(lines)
+    let nwant = len(want)
+    let mut i: i64 = 0
+    while i < nwant {
+        let li = want[i]
+        if li > -1 && li < nlines {
+            out.push(lines[li])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════
+//  CLI dispatch: build | query <prefix> | stats
+// ═══════════════════════════════════════════════════════════
+let a = args()
+let mut cmd = "stats"
+if len(a) > 2 { cmd = a[2] }
+
+if cmd == "build" {
+    let n = _bucket_index_build(_ATLAS_PATH)
+    if n < 1 {
+        println("atlas_scan_opt: build produced 0 entries (check atlas path / perms)")
+        exit(1)  // @allow-silent-exit
+    }
+    if !file_exists(_INDEX_PATH) {
+        println("atlas_scan_opt: build succeeded but index file missing: " + _INDEX_PATH)
+        exit(1)  // @allow-silent-exit
+    }
+    println("atlas_scan_opt: build OK — index = " + _INDEX_PATH + " (entries=" + to_string(n) + ")")
+    exit(0)
+} else if cmd == "query" {
+    if len(a) < 4 {
+        println("usage: hexa atlas_scan_opt.hexa query <prefix>")
+        exit(1)  // @allow-silent-exit
+    }
+    let prefix = a[3]
+    let matches = scan_by_prefix(_ATLAS_PATH, prefix)
+    let nm = len(matches)
+    println("# prefix=" + prefix + " matches=" + to_string(nm))
+    let mut i: i64 = 0
+    while i < nm {
+        println(matches[i])
+        i = i + 1
+    }
+    exit(0)
+} else if cmd == "stats" {
+    let mut raw = _bucket_index_load(_ATLAS_PATH)
+    if raw == "" {
+        // fresh index 필요 — 자동 빌드
+        let _n = _bucket_index_build(_ATLAS_PATH)
+        raw = _bucket_index_load(_ATLAS_PATH)
+    }
+    if raw == "" {
+        println("atlas_scan_opt: stats — index unavailable")
+        exit(1)  // @allow-silent-exit
+    }
+    let prefixes = _json_int_g(raw, "prefixes")
+    let entries = _json_int_g(raw, "entries")
+    let dur_ms = _json_int_g(raw, "duration_ms")
+    let mtime = _json_int_g(raw, "mtime")
+    println("atlas_scan_opt: stats")
+    println("  index:       " + _INDEX_PATH)
+    println("  source:      " + _ATLAS_PATH)
+    println("  mtime:       " + to_string(mtime))
+    println("  prefixes:    " + to_string(prefixes))
+    println("  entries:     " + to_string(entries))
+    println("  duration_ms: " + to_string(dur_ms))
+    // top 10 prefix count 계산 — buckets 섹션 파싱
+    let bstart = raw.index_of("\"buckets\":{")
+    if bstart < 0 { exit(0) }
+    let bafter = raw.substring(bstart + 11, len(raw))
+    // bucket entry 반복: "<name>":[<csv>],
+    // parallel arrays
+    let mut nkeys: [string] = []
+    let mut ncounts: [i64] = []
+    let mut cur = bafter
+    let mut gcnt: i64 = 0
+    while gcnt < 10000 {
+        gcnt = gcnt + 1
+        let q1 = cur.index_of("\"")
+        if q1 < 0 { gcnt = 10001 }
+        else {
+            let after_q = cur.substring(q1 + 1, len(cur))
+            let q2 = after_q.index_of("\"")
+            if q2 < 0 { gcnt = 10001 }
+            else {
+                let name = after_q.substring(0, q2)
+                let rest = after_q.substring(q2 + 1, len(after_q))
+                let lb = rest.index_of("[")
+                let rb = rest.index_of("]")
+                if lb < 0 { gcnt = 10001 }
+                else if rb < 0 { gcnt = 10001 }
+                else {
+                    let csv = rest.substring(lb + 1, rb).trim()
+                    let mut cnt: i64 = 0
+                    if csv != "" {
+                        let parts = csv.split(",")
+                        cnt = len(parts)
+                    }
+                    nkeys.push(name)
+                    ncounts.push(cnt)
+                    cur = rest.substring(rb + 1, len(rest))
+                    // 다음 " 가 없으면 종료
+                    if cur.index_of("\"") < 0 { gcnt = 10001 }
+                }
+            }
+        }
+    }
+    // sort desc by count (selection sort, N ≤ 200 가정)
+    let nn = len(nkeys)
+    let mut i: i64 = 0
+    while i < nn {
+        let mut best = i
+        let mut j: i64 = i + 1
+        while j < nn {
+            if ncounts[j] > ncounts[best] { best = j }
+            j = j + 1
+        }
+        if best != i {
+            let tk = nkeys[i]; nkeys[i] = nkeys[best]; nkeys[best] = tk
+            let tc = ncounts[i]; ncounts[i] = ncounts[best]; ncounts[best] = tc
+        }
+        i = i + 1
+    }
+    println("  top 10:")
+    let mut k: i64 = 0
+    let top = if len(nkeys) < 10 { len(nkeys) } else { 10 }
+    while k < top {
+        println("    " + nkeys[k] + ": " + to_string(ncounts[k]))
+        k = k + 1
+    }
+    exit(0)
+} else {
+    println("usage: hexa atlas_scan_opt.hexa {build|query <prefix>|stats}")
+    exit(1)  // @allow-silent-exit
+}
