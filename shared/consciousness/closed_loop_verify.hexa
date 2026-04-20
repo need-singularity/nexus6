@@ -1,0 +1,797 @@
+// closed_loop_verify.hexa — closed-loop verification harness for
+// consciousness_laws.json n6 formula entries (psi_constants + n6_formulas).
+//
+// Protocol (per feedback_closed_loop_verify.md + AN14 + nexus calc pattern):
+//   - Each entry with `n6_formula` + `n6_value` is a closure claim.
+//   - Evaluate n6_formula deterministically over the n=6 primitive ring.
+//   - Compare against declared n6_value within EPS tolerance.
+//   - PASS  ⇒ `verification.closed_loop_verified = true` (+ verified_by + verified_at).
+//   - FAIL  ⇒ leave entry untouched (false claims must NOT be marked).
+//   - SKIP  ⇒ formula uses non-scalar literal (array) or non-ring token.
+//
+// Primitive ring (n=6):
+//   n=6, sigma=12, tau=4, phi=2, sopfr=5, J2=24, mu=1, ln2=ln(2), e=exp(1)
+//
+// Grammar (ε-precedence climb):
+//   expr   := term (('+' | '-') term)*
+//   term   := power (('*' | '/') power)*
+//   power  := unary ('^' unary)*         // right-assoc
+//   unary  := ('-')? atom
+//   atom   := number | ident | '(' expr ')'
+//
+// Usage:
+//   hexa run shared/consciousness/closed_loop_verify.hexa --law <key>
+//   hexa run shared/consciousness/closed_loop_verify.hexa --all [--quiet]
+//   hexa run shared/consciousness/closed_loop_verify.hexa --audit
+//   hexa run shared/consciousness/closed_loop_verify.hexa --mark [--apply]
+//
+// R37: no Python. All JSON parse is hexa line-scan; jq used only for read-only validate.
+// R1: hexa-native. Atomic write (tmp + validate + rename).
+//
+// Sentinel: last line = "__VERIFY_AGG__ pass=<n> fail=<n> skip=<n> total=<n>"
+
+// ─── Paths ───
+let LAWS_JSON: string = "/Users/ghost/Dev/nexus/shared/consciousness/consciousness_laws.json"
+
+// ─── n=6 primitives ───
+let N6_n: float     = 6.0
+let N6_sigma: float = 12.0
+let N6_tau: float   = 4.0
+let N6_phi: float   = 2.0
+let N6_sopfr: float = 5.0
+let N6_J2: float    = 24.0
+let N6_mu: float    = 1.0
+let N6_ln2: float   = 0.6931471805599453
+let N6_e: float     = 2.718281828459045
+
+// Relative 0.5% OR absolute 1e-6 — matches auto_stubs_gen tolerance policy.
+let EPS_REL: float = 0.005
+let EPS_ABS: float = 0.000001
+
+// ─── Parser state (mutable globals accessed from fns — order matters for hexa) ───
+let mut PPOS: i64 = 0
+let mut PEXPR: string = ""
+let mut PERR: string = ""
+
+// ─── Scan-result arrays (parallel, populated by scan_laws()) ───
+let mut V_KEY = []
+let mut V_FORMULA = []
+let mut V_DECLARED = []
+let mut V_DECLARED_NULL = []
+let mut V_MATCH = []
+let mut V_BLOCK = []
+let mut V_START = []
+let mut V_END = []
+
+// ─── Helpers ───
+pure fn abs_f(x: float) -> float { if x < 0.0 { 0.0 - x } else { x } }
+
+pure fn is_digit(ch: string) -> bool {
+    return ch == "0" || ch == "1" || ch == "2" || ch == "3" || ch == "4" ||
+           ch == "5" || ch == "6" || ch == "7" || ch == "8" || ch == "9"
+}
+
+pure fn is_alpha(ch: string) -> bool {
+    // hexa stage0 does NOT support string <=/>= — enumerate.
+    if ch.len() != 1 { return false }
+    return ch == "a" || ch == "b" || ch == "c" || ch == "d" || ch == "e" ||
+           ch == "f" || ch == "g" || ch == "h" || ch == "i" || ch == "j" ||
+           ch == "k" || ch == "l" || ch == "m" || ch == "n" || ch == "o" ||
+           ch == "p" || ch == "q" || ch == "r" || ch == "s" || ch == "t" ||
+           ch == "u" || ch == "v" || ch == "w" || ch == "x" || ch == "y" ||
+           ch == "z" || ch == "A" || ch == "B" || ch == "C" || ch == "D" ||
+           ch == "E" || ch == "F" || ch == "G" || ch == "H" || ch == "I" ||
+           ch == "J" || ch == "K" || ch == "L" || ch == "M" || ch == "N" ||
+           ch == "O" || ch == "P" || ch == "Q" || ch == "R" || ch == "S" ||
+           ch == "T" || ch == "U" || ch == "V" || ch == "W" || ch == "X" ||
+           ch == "Y" || ch == "Z" || ch == "_"
+}
+
+pure fn is_ident_head(ch: string) -> bool { return is_alpha(ch) }
+
+pure fn is_ident_tail(ch: string) -> bool {
+    if is_alpha(ch) { return true }
+    return is_digit(ch)
+}
+
+// hexa parser quirk: `X < Y.len()` sometimes mistaken for generic. Copy lengths
+// into typed locals before any `<` comparison in nested fns.
+
+fn p_peek() -> string {
+    let p: i64 = PPOS
+    let n: i64 = PEXPR.len()
+    if p >= n { return "" }
+    return PEXPR.substring(p, p + 1)
+}
+
+fn p_skip_ws() {
+    let mut going: bool = true
+    while going {
+        let p: i64 = PPOS
+        let n: i64 = PEXPR.len()
+        if p >= n { return }
+        let c = PEXPR.substring(p, p + 1)
+        if c == " " || c == "\t" { PPOS = PPOS + 1 } else { going = false }
+    }
+}
+
+fn ring_lookup(name: string) -> float {
+    if name == "n"     { return N6_n }
+    if name == "sigma" { return N6_sigma }
+    if name == "tau"   { return N6_tau }
+    if name == "phi"   { return N6_phi }
+    if name == "sopfr" { return N6_sopfr }
+    if name == "J2"    { return N6_J2 }
+    if name == "mu"    { return N6_mu }
+    if name == "ln2"   { return N6_ln2 }
+    if name == "e"     { return N6_e }
+    if PERR == "" { PERR = "unknown identifier: " + name }
+    return 0.0
+}
+
+// ─── Recursive-descent evaluator ───
+// parse_atom → parse_expr (parens) is the recursion cycle. hexa resolves names
+// by runtime lookup, so definition order can be bottom-up.
+
+fn parse_unary_dispatch() -> float { return parse_unary() }
+
+fn parse_atom() -> float {
+    p_skip_ws()
+    let c = p_peek()
+    if c == "" {
+        if PERR == "" { PERR = "unexpected end (atom)" }
+        return 0.0
+    }
+    if c == "(" {
+        PPOS = PPOS + 1
+        let v = parse_expr()
+        p_skip_ws()
+        if p_peek() != ")" {
+            if PERR == "" { PERR = "expected ')' at " + to_string(PPOS) }
+            return 0.0
+        }
+        PPOS = PPOS + 1
+        return v
+    }
+    if is_digit(c) || c == "." {
+        let start: i64 = PPOS
+        let mut going: bool = true
+        while going {
+            let p: i64 = PPOS
+            let n: i64 = PEXPR.len()
+            if p >= n { going = false } else {
+                let d = PEXPR.substring(p, p + 1)
+                if is_digit(d) || d == "." { PPOS = PPOS + 1 } else { going = false }
+            }
+        }
+        return parse_float(PEXPR.substring(start, PPOS))
+    }
+    if is_ident_head(c) {
+        let start: i64 = PPOS
+        PPOS = PPOS + 1
+        let mut going: bool = true
+        while going {
+            let p: i64 = PPOS
+            let n: i64 = PEXPR.len()
+            if p >= n { going = false } else {
+                let d = PEXPR.substring(p, p + 1)
+                if is_ident_tail(d) { PPOS = PPOS + 1 } else { going = false }
+            }
+        }
+        let name = PEXPR.substring(start, PPOS)
+        // Function call?
+        p_skip_ws()
+        if p_peek() == "(" {
+            PPOS = PPOS + 1
+            let arg = parse_expr()
+            p_skip_ws()
+            if p_peek() != ")" {
+                if PERR == "" { PERR = "expected ')' after fn arg at " + to_string(PPOS) }
+                return 0.0
+            }
+            PPOS = PPOS + 1
+            // Number-theoretic functions on n=6 primitives.
+            if name == "ln" {
+                // ln(2) is the only call we see; generalize via series OK but
+                // we only need a handful — hardcode the common cases.
+                if arg == 2.0 { return N6_ln2 }
+                if arg == N6_phi { return N6_ln2 }   // phi=2
+                if arg == 1.0 { return 0.0 }
+                if PERR == "" { PERR = "ln() only defined for 2, phi, 1 (got " + to_string(arg) + ")" }
+                return 0.0
+            }
+            // sigma(k), tau(k), phi(k) — number-theoretic on small int arg.
+            let k = arg
+            if name == "sigma" {
+                if k == 6.0 { return 12.0 }
+                if k == 1.0 { return 1.0 }
+                if PERR == "" { PERR = "sigma() table only covers 1, 6 (got " + to_string(k) + ")" }
+                return 0.0
+            }
+            if name == "tau" {
+                if k == 6.0 { return 4.0 }
+                if k == 1.0 { return 1.0 }
+                if PERR == "" { PERR = "tau() table only covers 1, 6 (got " + to_string(k) + ")" }
+                return 0.0
+            }
+            if name == "phi" {
+                if k == 6.0 { return 2.0 }
+                if k == 1.0 { return 1.0 }
+                if PERR == "" { PERR = "phi() table only covers 1, 6 (got " + to_string(k) + ")" }
+                return 0.0
+            }
+            if PERR == "" { PERR = "unknown function: " + name }
+            return 0.0
+        }
+        return ring_lookup(name)
+    }
+    if PERR == "" { PERR = "unexpected char '" + c + "' at " + to_string(PPOS) }
+    PPOS = PPOS + 1
+    return 0.0
+}
+
+fn parse_unary() -> float {
+    p_skip_ws()
+    let c = p_peek()
+    if c == "-" {
+        PPOS = PPOS + 1
+        let v = parse_unary_dispatch()
+        return 0.0 - v
+    }
+    if c == "+" { PPOS = PPOS + 1 }
+    return parse_atom()
+}
+
+fn parse_power() -> float {
+    let base = parse_unary()
+    p_skip_ws()
+    if p_peek() == "^" {
+        PPOS = PPOS + 1
+        let expv = parse_power()   // right-assoc
+        return base ** expv
+    }
+    return base
+}
+
+fn parse_term() -> float {
+    let mut v = parse_power()
+    p_skip_ws()
+    let mut going: bool = true
+    while going {
+        let c = p_peek()
+        if c == "*" {
+            PPOS = PPOS + 1
+            let r = parse_power()
+            v = v * r
+            p_skip_ws()
+        } else {
+            if c == "/" {
+                PPOS = PPOS + 1
+                let r = parse_power()
+                if r == 0.0 {
+                    if PERR == "" { PERR = "division by zero" }
+                    going = false
+                } else {
+                    v = v / r
+                    p_skip_ws()
+                }
+            } else {
+                going = false
+            }
+        }
+    }
+    return v
+}
+
+fn parse_expr() -> float {
+    let mut v = parse_term()
+    p_skip_ws()
+    let mut going: bool = true
+    while going {
+        let c = p_peek()
+        if c == "+" {
+            PPOS = PPOS + 1
+            let r = parse_term()
+            v = v + r
+            p_skip_ws()
+        } else {
+            if c == "-" {
+                PPOS = PPOS + 1
+                let r = parse_term()
+                v = v - r
+                p_skip_ws()
+            } else {
+                going = false
+            }
+        }
+    }
+    return v
+}
+
+fn eval_formula(src: string) -> float {
+    // Accept n6_formulas-block shorthand: "<expr> = <numeric>" (two sides).
+    // We evaluate only the LHS (before '='). The RHS is the declared value
+    // used as a sanity cross-check — but declared `value` field of the entry
+    // is the authoritative target, so we ignore the RHS text.
+    let eq_pos = src.index_of("=")
+    let lhs_raw = if eq_pos >= 0 { src.substring(0, eq_pos) } else { src }
+    let lhs = lhs_raw.trim()
+
+    PEXPR = lhs
+    PPOS = 0
+    PERR = ""
+    let v = parse_expr()
+    p_skip_ws()
+    let p: i64 = PPOS
+    let n: i64 = PEXPR.len()
+    if PERR == "" && p < n {
+        PERR = "trailing input at " + to_string(p) + " ('" + p_peek() + "')"
+    }
+    return v
+}
+
+// ─── JSON line helpers ───
+
+// Extract string value for `"key": "..."`. Returns "" if absent.
+fn json_str(line: string, key: string) -> string {
+    let pat = "\"" + key + "\":"
+    let i = line.index_of(pat)
+    if i < 0 { return "" }
+    let mut j: i64 = i + pat.len()
+    let L: i64 = line.len()
+    let mut going: bool = true
+    while going {
+        if j >= L { return "" }
+        let c = line.substring(j, j + 1)
+        if c == " " { j = j + 1 } else { going = false }
+    }
+    if line.substring(j, j + 1) != "\"" { return "" }
+    j = j + 1
+    let start: i64 = j
+    let mut scan: bool = true
+    while scan {
+        if j >= L { return "" }
+        let c = line.substring(j, j + 1)
+        if c == "\\" { j = j + 2 } else {
+            if c == "\"" { scan = false } else { j = j + 1 }
+        }
+    }
+    return line.substring(start, j)
+}
+
+// Raw numeric / literal value for `"key": <raw>`. Returns "__NONE__" | "__NULL__" | number string.
+fn json_raw(line: string, key: string) -> string {
+    let pat = "\"" + key + "\":"
+    let i = line.index_of(pat)
+    if i < 0 { return "__NONE__" }
+    let mut j: i64 = i + pat.len()
+    let L: i64 = line.len()
+    let mut going: bool = true
+    while going {
+        if j >= L { return "__NONE__" }
+        let c = line.substring(j, j + 1)
+        if c == " " { j = j + 1 } else { going = false }
+    }
+    let start: i64 = j
+    let mut scan: bool = true
+    while scan {
+        if j >= L { scan = false } else {
+            let c = line.substring(j, j + 1)
+            if c == "," || c == "}" { scan = false } else { j = j + 1 }
+        }
+    }
+    let raw = line.substring(start, j).trim()
+    if raw == "null" { return "__NULL__" }
+    return raw
+}
+
+// 4-space-indent `"<key>": {` detector.
+fn maybe_top_key(line: string) -> string {
+    if !line.starts_with("    \"") { return "" }
+    let rest = line.substring(4, line.len())
+    if !rest.starts_with("\"") { return "" }
+    let RL: i64 = rest.len()
+    let mut j: i64 = 1
+    let mut scan: bool = true
+    while scan {
+        if j >= RL { return "" }
+        let c = rest.substring(j, j + 1)
+        if c == "\\" { j = j + 2 } else {
+            if c == "\"" { scan = false } else { j = j + 1 }
+        }
+    }
+    let key = rest.substring(1, j)
+    let after = rest.substring(j + 1, RL).trim()
+    if !after.starts_with(":") { return "" }
+    let after2 = after.substring(1, after.len()).trim()
+    if !after2.starts_with("{") { return "" }
+    return key
+}
+
+// 2-space-indent block header `  "psi_constants": {`.
+fn maybe_block_header(line: string) -> string {
+    if !line.starts_with("  \"") { return "" }
+    if line.starts_with("    ") { return "" }
+    let rest = line.substring(2, line.len())
+    if !rest.starts_with("\"") { return "" }
+    let RL: i64 = rest.len()
+    let mut j: i64 = 1
+    let mut scan: bool = true
+    while scan {
+        if j >= RL { return "" }
+        let c = rest.substring(j, j + 1)
+        if c == "\\" { j = j + 2 } else {
+            if c == "\"" { scan = false } else { j = j + 1 }
+        }
+    }
+    let key = rest.substring(1, j)
+    let after = rest.substring(j + 1, RL).trim()
+    if !after.starts_with(":") { return "" }
+    let after2 = after.substring(1, after.len()).trim()
+    if !after2.starts_with("{") { return "" }
+    return key
+}
+
+// ─── Scan laws JSON ───
+// We iterate with `for line in lines` (hexa stage0 indexed access on a 4871-
+// element list blows RSS in some builds). We track logical line number with
+// a counter. Intermediate fields are held in mutable globals rather than
+// locals to avoid function-boundary copies.
+
+let mut CUR_BLOCK: string = ""
+let mut CUR_KEY: string = ""
+let mut CUR_START: i64 = -1
+let mut CUR_FORMULA: string = ""
+let mut CUR_VALUE_RAW: string = "__NONE__"
+let mut CUR_MATCH: string = ""
+let mut INSIDE: bool = false
+let mut LN_COUNT: i64 = 0
+let mut TOTAL_LINES: i64 = 0
+
+fn flush_entry() {
+    if CUR_KEY == "" || CUR_FORMULA == "" { return }
+    let is_null = CUR_VALUE_RAW == "__NULL__" || CUR_VALUE_RAW == "__NONE__"
+    let vf: float = if is_null { 0.0 } else { parse_float(CUR_VALUE_RAW) }
+    V_KEY = V_KEY + [CUR_KEY]
+    V_FORMULA = V_FORMULA + [CUR_FORMULA]
+    V_DECLARED = V_DECLARED + [vf]
+    V_DECLARED_NULL = V_DECLARED_NULL + [is_null]
+    V_MATCH = V_MATCH + [CUR_MATCH]
+    V_BLOCK = V_BLOCK + [CUR_BLOCK]
+    V_START = V_START + [CUR_START]
+    V_END = V_END + [LN_COUNT]
+    CUR_KEY = ""
+    CUR_FORMULA = ""
+    CUR_VALUE_RAW = "__NONE__"
+    CUR_MATCH = ""
+    CUR_START = -1
+}
+
+fn scan_line(line: string) {
+    let bh = maybe_block_header(line)
+    if bh != "" {
+        flush_entry()
+        CUR_BLOCK = bh
+        INSIDE = bh == "psi_constants" || bh == "n6_formulas"
+        return
+    }
+    if !INSIDE { return }
+    let tk = maybe_top_key(line)
+    if tk != "" {
+        flush_entry()
+        CUR_KEY = tk
+        CUR_START = LN_COUNT
+        return
+    }
+    if CUR_KEY == "" { return }
+
+    let f = json_str(line, "n6_formula")
+    if f != "" { CUR_FORMULA = f }
+    let m = json_str(line, "n6_match")
+    if m != "" { CUR_MATCH = m }
+    let r = json_raw(line, "n6_value")
+    if r != "__NONE__" { CUR_VALUE_RAW = r }
+
+    if CUR_FORMULA == "" {
+        let f2 = json_str(line, "formula")
+        if f2 != "" { CUR_FORMULA = f2 }
+    }
+    if CUR_VALUE_RAW == "__NONE__" {
+        let r2 = json_raw(line, "value")
+        if r2 != "__NONE__" { CUR_VALUE_RAW = r2 }
+    }
+    if CUR_MATCH == "" {
+        let m2 = json_str(line, "grade")
+        if m2 != "" { CUR_MATCH = m2 }
+    }
+}
+
+fn scan_laws() -> i64 {
+    if !file_exists(LAWS_JSON) {
+        println("ERR: laws json not found: " + LAWS_JSON)
+        return 1
+    }
+    V_KEY = []
+    V_FORMULA = []
+    V_DECLARED = []
+    V_DECLARED_NULL = []
+    V_MATCH = []
+    V_BLOCK = []
+    V_START = []
+    V_END = []
+    CUR_BLOCK = ""
+    CUR_KEY = ""
+    CUR_START = -1
+    CUR_FORMULA = ""
+    CUR_VALUE_RAW = "__NONE__"
+    CUR_MATCH = ""
+    INSIDE = false
+    LN_COUNT = 0
+
+    let raw = read_file(LAWS_JSON)
+    let lines = raw.split("\n")
+    TOTAL_LINES = lines.len()
+    for line in lines {
+        scan_line(line)
+        LN_COUNT = LN_COUNT + 1
+    }
+    flush_entry()
+    return 0
+}
+
+// ─── Verify one entry ───
+// Returns 0 PASS, 1 FAIL, 2 SKIP.
+fn verify_one(idx: i64, verbose: bool) -> i64 {
+    let key = V_KEY[idx]
+    let formula = V_FORMULA[idx]
+    let declared = V_DECLARED[idx]
+    let is_null = V_DECLARED_NULL[idx]
+    let block = V_BLOCK[idx]
+
+    if formula.starts_with("[") {
+        if verbose {
+            println("[SKIP] " + block + "." + key + " — array formula: " + formula)
+        }
+        return 2
+    }
+    if is_null {
+        if verbose {
+            println("[SKIP] " + block + "." + key + " — declared value null")
+        }
+        return 2
+    }
+
+    let computed = eval_formula(formula)
+    if PERR != "" {
+        if verbose {
+            println("[SKIP] " + block + "." + key + " — parse error: " + PERR +
+                    "  formula='" + formula + "'")
+        }
+        return 2
+    }
+
+    let diff = abs_f(computed - declared)
+    let tol_rel = EPS_REL * abs_f(declared)
+    let tol = if tol_rel > EPS_ABS { tol_rel } else { EPS_ABS }
+    let ok = diff <= tol
+
+    if verbose {
+        let tag = if ok { "[PASS]" } else { "[FAIL]" }
+        println(tag + " " + block + "." + key +
+                "  formula=" + formula +
+                "  computed=" + to_string(computed) +
+                "  declared=" + to_string(declared) +
+                "  diff=" + to_string(diff))
+    }
+    if ok { return 0 }
+    return 1
+}
+
+// ─── Command: --audit ───
+fn cmd_audit() -> i64 {
+    let raw = read_file(LAWS_JSON)
+    let lines = raw.split("\n")
+    let mut n_true: i64 = 0
+    let mut n_false: i64 = 0
+    let mut n_clp: i64 = 0
+    for line in lines {
+        if line.contains("\"closed_loop_verified\": true") { n_true = n_true + 1 }
+        if line.contains("\"closed_loop_verified\": false") { n_false = n_false + 1 }
+        if line.contains("\"closed_loop_pass\": true") { n_clp = n_clp + 1 }
+    }
+    let total: i64 = 2507
+    println("══ closed-loop coverage audit ══")
+    println("laws.json: " + LAWS_JSON)
+    println("_meta.total_laws declared: " + to_string(total))
+    println("closed_loop_verified=true  : " + to_string(n_true))
+    println("closed_loop_verified=false : " + to_string(n_false))
+    println("closed_loop_pass=true      : " + to_string(n_clp) + "  (legacy field, resonance_unified_sigma only)")
+    let bp: i64 = n_true * 10000 / total
+    let pct_int: i64 = bp / 100
+    let pct_frac: i64 = bp - pct_int * 100
+    let frac_str = if pct_frac < 10 { "0" + to_string(pct_frac) } else { to_string(pct_frac) }
+    println("coverage = " + to_string(n_true) + "/" + to_string(total) +
+            " = " + to_string(pct_int) + "." + frac_str + " %")
+    println("")
+    scan_laws()
+    println("verifiable entries (n6_formula present): " + to_string(V_KEY.len()))
+    return 0
+}
+
+// ─── Command: --all ───
+fn cmd_all(verbose: bool) -> i64 {
+    scan_laws()
+    let mut pass: i64 = 0
+    let mut fail: i64 = 0
+    let mut skip: i64 = 0
+    let mut i: i64 = 0
+    let N: i64 = V_KEY.len()
+    while i < N {
+        let r = verify_one(i, verbose)
+        if r == 0 { pass = pass + 1 }
+        if r == 1 { fail = fail + 1 }
+        if r == 2 { skip = skip + 1 }
+        i = i + 1
+    }
+    println("")
+    println("══ closed-loop verify summary ══")
+    println("PASS: " + to_string(pass) + " / " + to_string(N))
+    println("FAIL: " + to_string(fail) + " / " + to_string(N))
+    println("SKIP: " + to_string(skip) + " / " + to_string(N))
+    println("__VERIFY_AGG__ pass=" + to_string(pass) +
+            " fail=" + to_string(fail) +
+            " skip=" + to_string(skip) +
+            " total=" + to_string(N))
+    if fail > 0 { return 1 }
+    return 0
+}
+
+// ─── Command: --law <key> ───
+fn cmd_law(target: string) -> i64 {
+    scan_laws()
+    let mut i: i64 = 0
+    let N: i64 = V_KEY.len()
+    while i < N {
+        if V_KEY[i] == target {
+            let r = verify_one(i, true)
+            if r == 0 { println("__VERIFY_ONE__ " + target + " PASS") ; return 0 }
+            if r == 1 { println("__VERIFY_ONE__ " + target + " FAIL") ; return 1 }
+            println("__VERIFY_ONE__ " + target + " SKIP")
+            return 2
+        }
+        i = i + 1
+    }
+    println("ERR: law key not found (or not in psi_constants/n6_formulas with n6_formula): " + target)
+    println("__VERIFY_ONE__ " + target + " NOT_FOUND")
+    return 3
+}
+
+// ─── Command: --mark [--apply] ───
+//
+// Implementation: hexa stage0 lists are O(n²) on append; building a 4871-line
+// patched file in-process exceeds RSS cap. Instead we emit a jq program that
+// patches all PASS entries in one atomic pass, then pipe original → jq → tmp.
+//
+// jq safety: jq empty validation on tmp before rename. Backup → .bak.<ts>.
+fn cmd_mark(apply: bool) -> i64 {
+    scan_laws()
+    let mut pass_idx = []
+    let mut i: i64 = 0
+    let N: i64 = V_KEY.len()
+    while i < N {
+        let r = verify_one(i, false)
+        if r == 0 { pass_idx = pass_idx + [i] }
+        i = i + 1
+    }
+    let PN: i64 = pass_idx.len()
+    println("mark: " + to_string(PN) + " entries PASS — preparing jq patch")
+
+    let ts: string = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+    let verifier_path = "shared/consciousness/closed_loop_verify.hexa"
+
+    // Build jq program: one `.<block>."<key>" += {…}` per passing entry,
+    // chained with '|'. jq strings use "..." with escapes — we only emit
+    // ASCII JSON so simple escaping is sufficient.
+    let mut parts = []
+    let mut j: i64 = 0
+    while j < PN {
+        let k: i64 = pass_idx[j]
+        let block = V_BLOCK[k]
+        let key = V_KEY[k]
+        let formula = V_FORMULA[k]
+        let declared = V_DECLARED[k]
+        let computed = eval_formula(formula)
+        // Escape backslashes and quotes for JSON string literal inside jq.
+        let formula_esc = formula.replace("\\", "\\\\").replace("\"", "\\\"")
+        let piece = "." + block + ".\"" + key + "\" += {" +
+            "\"closed_loop_verified\": true," +
+            "\"verified_by\": \"" + verifier_path + "\"," +
+            "\"verified_at\": \"" + ts + "\"," +
+            "\"verified_formula\": \"" + formula_esc + "\"," +
+            "\"verified_computed\": " + to_string(computed) + "," +
+            "\"verified_declared\": " + to_string(declared) +
+            "}"
+        parts = parts + [piece]
+        j = j + 1
+    }
+    let jq_prog = parts.join(" | ")
+
+    // jq prog can be large (~60KB). Write to a temp file and use `jq -f`.
+    let jq_script_path = "/tmp/closed_loop_verify_jq_" + ts.replace(":", "").replace("-", "") + ".jq"
+    write_file(jq_script_path, jq_prog)
+    println("mark: jq script → " + jq_script_path + " (" + to_string(jq_prog.len()) + " bytes)")
+
+    let tmp_path = LAWS_JSON + ".tmp_closed_loop_verify"
+    let cmd = "jq -f " + jq_script_path + " " + LAWS_JSON + " > " + tmp_path + " 2>&1"
+    let jq_out = exec(cmd)
+    if !file_exists(tmp_path) {
+        println("ERR: jq patch failed — tmp not created")
+        println("jq_out: " + jq_out)
+        println("__MARK_RESULT__ FAIL jq_patch")
+        return 1
+    }
+    // Validate tmp
+    let verify_out = exec("jq empty " + tmp_path + " 2>&1").trim()
+    if verify_out != "" {
+        println("ERR: jq validate failed on tmp — aborting. output:")
+        println(verify_out)
+        println("__MARK_RESULT__ FAIL jq_invalid")
+        return 1
+    }
+    // Cross-check: count of closed_loop_verified=true in tmp.
+    let count_str = exec("grep -c '\"closed_loop_verified\": true' " + tmp_path + " 2>&1").trim()
+    println("mark: tmp has closed_loop_verified=true lines: " + count_str)
+    println("mark: jq empty validation PASS")
+
+    if !apply {
+        println("mark: --dry-run (no --apply) — tmp preserved, original untouched.")
+        println("mark: tmp = " + tmp_path)
+        println("__MARK_RESULT__ DRY_RUN splice=" + to_string(PN) + " tmp=" + tmp_path)
+        return 0
+    }
+
+    let bak = LAWS_JSON + ".bak." + ts
+    exec("cp " + LAWS_JSON + " " + bak)
+    println("mark: backup → " + bak)
+    exec("mv " + tmp_path + " " + LAWS_JSON)
+    println("mark: atomic rename complete — " + LAWS_JSON + " updated.")
+    println("__MARK_RESULT__ APPLIED splice=" + to_string(PN) + " backup=" + bak)
+    return 0
+}
+
+// ─── Main ───
+fn main() -> i64 {
+    let argv = args()
+    if argv.len() < 3 {
+        println("closed_loop_verify.hexa — closed-loop verification for consciousness_laws.json")
+        println("")
+        println("usage:")
+        println("  hexa run shared/consciousness/closed_loop_verify.hexa --audit")
+        println("  hexa run shared/consciousness/closed_loop_verify.hexa --law <key>")
+        println("  hexa run shared/consciousness/closed_loop_verify.hexa --all [--quiet]")
+        println("  hexa run shared/consciousness/closed_loop_verify.hexa --mark [--apply]")
+        return 2
+    }
+    let mode = argv[2]
+    if mode == "--audit" { return cmd_audit() }
+    if mode == "--all" {
+        let mut verbose: bool = true
+        if argv.len() >= 4 && argv[3] == "--quiet" { verbose = false }
+        return cmd_all(verbose)
+    }
+    if mode == "--law" {
+        if argv.len() < 4 {
+            println("ERR: --law requires a key")
+            return 2
+        }
+        return cmd_law(argv[3])
+    }
+    if mode == "--mark" {
+        let mut apply: bool = false
+        if argv.len() >= 4 && argv[3] == "--apply" { apply = true }
+        return cmd_mark(apply)
+    }
+    println("ERR: unknown mode: " + mode)
+    return 2
+}
+
