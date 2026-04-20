@@ -818,181 +818,933 @@ fn _transcendental_closure(seed: str, round: int) -> int {
     return synth_ct
 }
 
-// ─── E16 round parallel — drill round 간 병렬 실행 (2026-04-21) ─────────────
-//
-// SSOT: shared/config/drill.json .parallelism.round_parallel
-//   - enabled_default: false (opt-in via NEXUS_DRILL_ROUND_PARALLEL=1)
-//   - max_rounds:      3
-//   - assumption:      inter-round 독립 (검증 필요 — _round_parallel_verify_independence)
-//   - risk:            atlas.n6 동시 write race → mkdir-atomic mutex (_round_parallel_atlas_lock)
-//
-// 설계 포인트:
-//   - 다른 run.hexa agent 와의 충돌 회피: 모든 공개 식별자에 `_round_parallel_` prefix
-//   - hexa stage1 는 background job 을 직접 못 돌림 → bash single-string 에 `&` + `wait` 로 위임
-//   - 각 round subshell 은 결과를 /tmp/nexus_drill_rp_<pid>.round<K>.out 에 dump, parent 가 수거
-//   - atlas mutex: subshell 은 write 구간 진입 전 `mkdir /tmp/nexus_atlas.lock` (atomic) spin-wait
-//                  smash/free 만 atlas.n6 write surface — 나머지 stage 는 read-only
-//
-// stderr emit (per drill):
-//   NEXUS_DRILL_ROUND_PARALLEL {"rounds":N,"concurrency":M,"duration_ms":T,"atlas_waits_ms":W}
+// ─── E1 depth plan (2026-04-21) ─── drill.json stages.{name}.default_depth + presets
+// Plan vector index: 0=smash, 1=free, 2=absolute, 3=meta_closure, 4=hyperarith, 5=resonance
+// Values: -1 = SSOT default, 0 = disabled, >=1 = active depth.
+// precedence (low→high): ssot_default < env < master < preset < per-stage < adaptive
 
-fn _round_parallel_atlas_lock() -> str {
-    // atlas.n6 write 경쟁 방지용 mkdir-atomic mutex.
-    //   - POSIX mkdir 는 atomic → race-free 단일 writer 보장
-    //   - 반환: subshell 에서 source/eval 할 수 있는 bash 블록. trap 으로 EXIT/INT/TERM cleanup.
-    //   - busy-wait 100 회 (5s 상한) → 초과 시 stale 으로 간주하고 강제 복구
-    //   - atlas_waits_ms 집계: 진입 전후 date +%s%N 차이를 $NEXUS_ATLAS_WAIT_FILE 에 append
-    let lockd = "/tmp/nexus_atlas.lock"
-    let q = shell_quote(lockd)
-    return "i=0; T0=$(date +%s%N 2>/dev/null || echo 0); "
-        + "while ! mkdir " + q + " 2>/dev/null; do "
-        + "i=$((i+1)); if [ $i -gt 100 ]; then rm -rf " + q + "; continue; fi; sleep 0.05; "
-        + "done; T1=$(date +%s%N 2>/dev/null || echo 0); "
-        + "if [ -n \"$NEXUS_ATLAS_WAIT_FILE\" ]; then "
-        + "  DELTA=$(( (T1 - T0) / 1000000 )); "
-        + "  [ $DELTA -lt 0 ] && DELTA=0; "
-        + "  echo $DELTA >> \"$NEXUS_ATLAS_WAIT_FILE\"; "
-        + "fi; "
-        + "trap 'rm -rf " + q + "' EXIT INT TERM; "
+fn _stage_idx(name: str) -> int {
+    if name == "smash" { return 0 }
+    if name == "free" { return 1 }
+    if name == "absolute" { return 2 }
+    if name == "meta_closure" { return 3 }
+    if name == "hyperarith" { return 4 }
+    if name == "resonance" { return 5 }
+    return -1
 }
 
-fn _round_parallel_single_round_script(round: int, round_seed: str, blow_core: str, compose: str, exv: str, out_path: str) -> str {
-    // 1개 round 를 background 로 실행할 bash 블록 생성.
-    // E16 MVP: smash + free 만 실행 (atlas.n6 write surface 가 여기 집중) — 경쟁 검증 목적.
-    //          풀 stage chain 은 향후 enable. verify_independence 는 동일 subset 으로 비교.
-    let qseed = shell_quote(round_seed)
-    let qbc   = shell_quote(blow_core)
-    let qcp   = shell_quote(compose)
-    let qexv  = shell_quote(exv)
-    let qout  = shell_quote(out_path)
-    let r_str = to_string(round)
-    let atlas_lock = _round_parallel_atlas_lock()
-    return "( "
-        + "echo '=== round " + r_str + " start' ts=$(date +%s%N) > " + qout + "; "
-        // smash — atlas write 필요 → atlas lock 잠근 뒤 실행 → 결과 수거 → 해제
-        + "( " + atlas_lock
-        + "  " + qexv + " smash " + qseed + " " + qbc + " 3 2>&1 ; "
-        + ") >> " + qout + " 2>&1 ; "
-        // free — compose 도 atlas write surface → lock 재획득
-        + "( " + atlas_lock
-        + "  " + qexv + " free_dfs " + qseed + " " + qcp + " --modules all --dfs 3 2>&1 ; "
-        + ") >> " + qout + " 2>&1 ; "
-        + "echo '=== round " + r_str + " end' ts=$(date +%s%N) >> " + qout + "; "
-        + ") &"
+fn _stage_name(idx: int) -> str {
+    if idx == 0 { return "smash" }
+    if idx == 1 { return "free" }
+    if idx == 2 { return "absolute" }
+    if idx == 3 { return "meta_closure" }
+    if idx == 4 { return "hyperarith" }
+    if idx == 5 { return "resonance" }
+    return "?"
 }
 
-fn _round_parallel_tally(out_path: str) -> int {
-    // 수거한 round output 에서 _count_discoveries 등가 카운트 추출.
-    let chk = exec("[ -f " + shell_quote(out_path) + " ] && echo y || echo n").trim()
-    if chk != "y" { return 0 }
-    let raw = exec("cat " + shell_quote(out_path) + " 2>/dev/null")
-    return _count_discoveries(raw)
+fn _stage_default() -> [int] {
+    // drill.json stages.*.default_depth — smash=3 free=3 abs=0 mc=0 hy=0 res=1
+    return [3, 3, 0, 0, 0, 1]
 }
 
-fn _round_parallel_verify_independence(blow_core: str, compose: str, exv: str) -> bool {
-    // inter-round 독립성 dry-run 검증:
-    //   동일 seed 2회 run — sequential vs parallel pair.
-    //   결과 absorption count 이 "비슷한 magnitude" 면 독립 판정 (정확한 byte-identical 은 engine 비결정성 때문에 과도한 기대).
-    //   기준: both > 0 AND |a - b| / max(a,b) < 0.5 (50% 편차 허용, race 붕괴는 수십배 차이로 나타남)
-    let test_seed = "__NEXUS_RP_VERIFY__ independence smoke test seed for round parallel"
-    let pid = exec("echo $$").trim()
-    let a_path = "/tmp/nexus_drill_rp_" + pid + ".verifyA.out"
-    let b_path = "/tmp/nexus_drill_rp_" + pid + ".verifyB.out"
-    exec("rm -f " + shell_quote(a_path) + " " + shell_quote(b_path))
-    let script_a = _round_parallel_single_round_script(901, test_seed + "#r901", blow_core, compose, exv, a_path)
-    let script_b = _round_parallel_single_round_script(902, test_seed + "#r902", blow_core, compose, exv, b_path)
-    let block = script_a + " " + script_b + " wait"
-    exec(block)
-    let a_ct = _round_parallel_tally(a_path)
-    let b_ct = _round_parallel_tally(b_path)
-    exec("rm -f " + shell_quote(a_path) + " " + shell_quote(b_path))
-    // 독립 판정: 둘 다 > 0 이고 편차 50% 미만
-    if a_ct == 0 && b_ct == 0 { return false }
-    let hi = if a_ct > b_ct { a_ct } else { b_ct }
-    let lo = if a_ct > b_ct { b_ct } else { a_ct }
-    if hi == 0 { return false }
-    let diff = hi - lo
-    // diff / hi < 0.5  ⇔  diff * 2 < hi   (정수 연산, 나눗셈 회피)
-    if diff * 2 < hi {
-        eprintln("  [E16 verify] a=" + to_string(a_ct) + " b=" + to_string(b_ct) + " diff=" + to_string(diff) + " hi=" + to_string(hi) + " lo=" + to_string(lo) + " → INDEPENDENT")
-        return true
+fn _stage_min() -> [int] {
+    // drill.json stages.*.min — smash=1 free=1 abs=0 mc=0 hy=0 res=1 (adaptive floor 사용 시 1 로 올림)
+    return [1, 1, 0, 0, 0, 1]
+}
+
+fn _stage_max() -> [int] {
+    // drill.json stages.*.max — smash=9 free=7 abs=1 mc=1 hy=1 res=3
+    return [9, 7, 1, 1, 1, 3]
+}
+
+fn _clamp_depth(v: int, idx: int) -> int {
+    // 0 은 disabled sentinel 로 보존. >0 은 [min, max] 로 clamp.
+    if v <= 0 { return 0 }
+    let mins = _stage_min()
+    let maxs = _stage_max()
+    if v < mins[idx] { return mins[idx] }
+    if v > maxs[idx] { return maxs[idx] }
+    return v
+}
+
+fn _preset_plan(preset: str) -> [int] {
+    // drill.json speed_presets — {fast, probe, coarse, standard}. 기본 fast.
+    // fast: smash+resonance only, 1 round target.
+    // probe: smash only.
+    // coarse: all 6 stages, 1 round.
+    // standard: all 6 stages, 3 rounds (σ 5→3 coarse).
+    if preset == "probe" {
+        return [3, 0, 0, 0, 0, 0]
     }
-    eprintln("  [E16 verify] a=" + to_string(a_ct) + " b=" + to_string(b_ct) + " diff=" + to_string(diff) + " hi=" + to_string(hi) + " lo=" + to_string(lo) + " → NOT INDEPENDENT (race suspicion)")
+    if preset == "fast" {
+        return [3, 0, 0, 0, 0, 1]
+    }
+    if preset == "coarse" {
+        return [3, 3, 1, 1, 1, 1]
+    }
+    if preset == "standard" {
+        return [3, 3, 1, 1, 1, 1]
+    }
+    return _stage_default()
+}
+
+fn _preset_max_rounds(preset: str) -> int {
+    if preset == "probe" { return 1 }
+    if preset == "fast" { return 1 }
+    if preset == "coarse" { return 1 }
+    if preset == "standard" { return 3 }
+    return 3
+}
+
+// ─── E8 per-millennium preset (2026-04-21) ─── drill.json .problem_presets SSOT
+// 7 난제별 depth/max_rounds 튜닝. precedence: env < master < speed_preset < problem_preset < per-stage.
+// 미지정 시 빈 문자열 → 기존 동작 (problem_preset 비활성).
+fn _problem_preset_plan(problem: str) -> [int] {
+    // 반환: [smash, free, abs, mc, hyper, res]. 미매치는 [-1]*6 (plan 덮어쓰지 않음).
+    let p = problem.to_lower()
+    if p == "riemann"   { return [4, 3, 1, 1, 1, 2] }
+    if p == "bsd"       { return [3, 3, 1, 0, 0, 1] }
+    if p == "hodge"     { return [3, 3, 0, 1, 0, 2] }
+    if p == "navier"    { return [4, 4, 1, 0, 0, 3] }
+    if p == "pnp"       { return [3, 4, 1, 1, 1, 1] }
+    if p == "poincare"  { return [3, 3, 0, 1, 0, 2] }
+    if p == "yangmills" { return [4, 3, 1, 0, 1, 3] }
+    return [-1, -1, -1, -1, -1, -1]
+}
+
+fn _problem_preset_max_rounds(problem: str) -> int {
+    // 미매치는 -1 (덮어쓰지 않음).
+    let p = problem.to_lower()
+    if p == "riemann"   { return 5 }
+    if p == "bsd"       { return 3 }
+    if p == "hodge"     { return 3 }
+    if p == "navier"    { return 5 }
+    if p == "pnp"       { return 3 }
+    if p == "poincare"  { return 3 }
+    if p == "yangmills" { return 5 }
+    return -1
+}
+
+fn _problem_preset_known(problem: str) -> bool {
+    let p = problem.to_lower()
+    if p == "riemann" { return true }
+    if p == "bsd" { return true }
+    if p == "hodge" { return true }
+    if p == "navier" { return true }
+    if p == "pnp" { return true }
+    if p == "poincare" { return true }
+    if p == "yangmills" { return true }
     return false
 }
 
-fn _round_parallel_run(seed: str, rounds_max: int, blow_core: str, compose: str, exv: str, nonce_base: str) -> int {
-    // 최대 max_rounds (default 3, drill.json SSOT) round 를 bash background 로 발사 + wait.
-    // 반환: total_new absorption 합계.
-    // E16 MVP — smash/free 2-stage subset (atlas write surface 집중). 완전한 6-stage parallel 은 후속 ROI.
-    let cap_ssot = 3
-    let mut cap = cap_ssot
-    if rounds_max < cap { cap = rounds_max }
-    if cap < 1 { cap = 1 }
-    let seed_head = if seed.len() < 60 { seed } else { seed.substring(0, 60) }
-    eprintln("  [E16 run] launching " + to_string(cap) + " rounds in parallel — seed_head='" + seed_head + "'")
-    let pid = exec("echo $$").trim()
-    let wait_file = "/tmp/nexus_drill_rp_" + pid + ".atlas_waits"
-    exec("rm -f " + shell_quote(wait_file))
-    exec("touch " + shell_quote(wait_file))
-    let t_start = exec("date +%s%N 2>/dev/null || echo 0").trim()
-    let mut block = "export NEXUS_ATLAS_WAIT_FILE=" + shell_quote(wait_file) + "; "
-    let mut out_paths: [str] = []
-    let mut r = 1
-    while r < cap + 1 {
-        let salt = _urand_i64()
-        let rseed = _round_seed(nonce_base, r, salt)
-        let op = "/tmp/nexus_drill_rp_" + pid + ".round" + to_string(r) + ".out"
-        out_paths = out_paths + [op]
-        block = block + _round_parallel_single_round_script(r, rseed, blow_core, compose, exv, op) + " "
-        r = r + 1
-    }
-    block = block + " wait"
-    exec(block)
-    let t_end = exec("date +%s%N 2>/dev/null || echo 0").trim()
-    // 집계
-    let mut total = 0
-    let mut i = 0
-    while i < len(out_paths) {
-        total = total + _round_parallel_tally(out_paths[i])
-        i = i + 1
-    }
-    // atlas_waits 합계 (ms)
-    let waits_ms_s = exec("awk '{s+=$1} END {print s+0}' " + shell_quote(wait_file) + " 2>/dev/null").trim()
-    let mut waits_ms = 0
-    try { waits_ms = to_int(waits_ms_s) } catch e {}
-    // wall-time ms
-    let mut dur_ms = 0
-    try {
-        let t0 = to_int(t_start)
-        let t1 = to_int(t_end)
-        if t1 > t0 { dur_ms = (t1 - t0) / 1000000 }
-    } catch e {}
-    // stderr emit
-    let emit = "NEXUS_DRILL_ROUND_PARALLEL {\"rounds\":" + to_string(cap)
-        + ",\"concurrency\":" + to_string(cap)
-        + ",\"duration_ms\":" + to_string(dur_ms)
-        + ",\"atlas_waits_ms\":" + to_string(waits_ms)
-        + ",\"total\":" + to_string(total) + "}"
-    eprintln(emit)
-    // round 별 요약 stdout
-    let mut k = 0
-    while k < len(out_paths) {
-        let ct = _round_parallel_tally(out_paths[k])
-        println("  [parallel] round " + to_string(k + 1) + ": +" + to_string(ct) + " absorptions")
-        k = k + 1
-    }
-    // cleanup
-    let mut j = 0
-    while j < len(out_paths) {
-        exec("rm -f " + shell_quote(out_paths[j]))
-        j = j + 1
-    }
-    exec("rm -f " + shell_quote(wait_file))
-    return total
+fn _env_depth(name: str) -> int {
+    // NEXUS_DRILL_{DEPTH,SMASH,FREE,ABSOLUTE,META,HYPER,RES}. 반환 -1 = 미지정.
+    let v = env(name)
+    if v.len() == 0 { return -1 }
+    let mut n = -1
+    try { n = to_int(v) } catch e { n = -1 }
+    return n
 }
 
-fn cmd_drill(seed: str, max_rounds: str, engine_flag: str) -> void {
+fn _resolve_depth_plan(preset: str, master: int, per_stage: [int], envs: [int], problem_plan: [int]) -> [int] {
+    // 해상도: ssot_default (base) → env (stage별) → master (일괄) → speed_preset → problem_preset → per-stage (stage별)
+    // per_stage / envs / problem_plan 는 -1 = unset.
+    // E8 (2026-04-21): problem_plan 추가 — per-millennium preset (drill.json .problem_presets), speed_preset 위 덮어씀.
+    let mut plan = _preset_plan(preset)  // speed_preset 이 base. 미지정이면 default.
+    // env 일괄 NEXUS_DRILL_DEPTH 먼저 (env stage별에 의해 덮일 수 있음)
+    let env_master = _env_depth("NEXUS_DRILL_DEPTH")
+    if env_master >= 0 {
+        let mut i = 0
+        while i < 6 {
+            if plan[i] > 0 { plan = _plan_set(plan, i, env_master) }
+            i = i + 1
+        }
+    }
+    // env stage별
+    let mut i = 0
+    while i < 6 {
+        if envs[i] >= 0 {
+            plan = _plan_set(plan, i, envs[i])
+        }
+        i = i + 1
+    }
+    // master flag (enabled stage 에만 적용 — disabled=0 은 유지)
+    if master >= 0 {
+        let mut j = 0
+        while j < 6 {
+            if plan[j] > 0 { plan = _plan_set(plan, j, master) }
+            j = j + 1
+        }
+    }
+    // problem_preset (E8) — stage별 덮어쓰기 (disabled=0 도 enable 가능)
+    let mut pi = 0
+    while pi < 6 {
+        if problem_plan[pi] >= 0 {
+            plan = _plan_set(plan, pi, problem_plan[pi])
+        }
+        pi = pi + 1
+    }
+    // per-stage flag (최우선, disabled=0 도 enable 가능)
+    let mut k = 0
+    while k < 6 {
+        if per_stage[k] >= 0 {
+            plan = _plan_set(plan, k, per_stage[k])
+        }
+        k = k + 1
+    }
+    // clamp
+    let mut m = 0
+    while m < 6 {
+        plan = _plan_set(plan, m, _clamp_depth(plan[m], m))
+        m = m + 1
+    }
+    return plan
+}
+
+fn _plan_set(plan: [int], idx: int, v: int) -> [int] {
+    // hexa immutable list — new array 재구성 (rebuild).
+    let mut out: [int] = []
+    let mut i = 0
+    while i < len(plan) {
+        if i == idx { out = out + [v] } else { out = out + [plan[i]] }
+        i = i + 1
+    }
+    return out
+}
+
+fn _plan_describe(plan: [int]) -> str {
+    // 사람 읽기용 short form (stderr + println 에서 사용).
+    return "{smash:" + to_string(plan[0])
+        + ",free:" + to_string(plan[1])
+        + ",absolute:" + to_string(plan[2])
+        + ",meta_closure:" + to_string(plan[3])
+        + ",hyperarith:" + to_string(plan[4])
+        + ",resonance:" + to_string(plan[5]) + "}"
+}
+
+fn _plan_json(plan: [int]) -> str {
+    // NDJSON 용 strict JSON (키 quoted).
+    return "{\"smash\":" + to_string(plan[0])
+        + ",\"free\":" + to_string(plan[1])
+        + ",\"absolute\":" + to_string(plan[2])
+        + ",\"meta_closure\":" + to_string(plan[3])
+        + ",\"hyperarith\":" + to_string(plan[4])
+        + ",\"resonance\":" + to_string(plan[5]) + "}"
+}
+
+// ─── E2 adaptive depth (2026-04-21) ─── 2 rules: absorption_gradient + saturation_hunt
+fn _adaptive_adjust(plan: [int], yields_hist: [[int]], totals_hist: [int], round: int) -> [int] {
+    // rule 1 (absorption-gradient): round-N yield[stage] - round-(N-1) yield[stage] < θ → stage depth--
+    // rule 2 (saturation-hunt): 3 round 연속 동일 total → smash depth++
+    // floor=min, ceiling=max (drill.json stages.*.min|max)
+    // round 1 은 조정 없음 (history 부족)
+    if round <= 1 { return plan }
+    let mut out = plan
+    let mut reasons = ""
+    // rule 1 per stage
+    let hist_len = len(yields_hist)
+    if hist_len >= 2 {
+        let prev = yields_hist[hist_len - 2]
+        let cur = yields_hist[hist_len - 1]
+        let mut i = 0
+        while i < 6 {
+            if plan[i] > 0 && i < len(prev) && i < len(cur) {
+                let delta = cur[i] - prev[i]
+                if delta < 1 {  // θ=1 (strict non-positive gradient)
+                    let new_d = plan[i] - 1
+                    let clamped = _clamp_depth(new_d, i)
+                    if clamped != plan[i] && clamped > 0 {
+                        out = _plan_set(out, i, clamped)
+                        reasons = reasons + _stage_name(i) + ":grad-; "
+                    }
+                }
+            }
+            i = i + 1
+        }
+    }
+    // rule 2 saturation hunt: 3 consecutive same total
+    let th = len(totals_hist)
+    if th >= 3 {
+        let t1 = totals_hist[th - 1]
+        let t2 = totals_hist[th - 2]
+        let t3 = totals_hist[th - 3]
+        if t1 == t2 && t2 == t3 {
+            if out[0] > 0 {  // smash enabled
+                let new_d = out[0] + 1
+                let clamped = _clamp_depth(new_d, 0)
+                if clamped != out[0] {
+                    out = _plan_set(out, 0, clamped)
+                    reasons = reasons + "smash:sat+; "
+                }
+            }
+        }
+    }
+    if reasons.len() > 0 {
+        eprintln("NEXUS_DRILL_ADAPTIVE {round:" + to_string(round) + ",before:" + _plan_describe(plan) + ",after:" + _plan_describe(out) + ",reason:\"" + reasons + "\"}")
+    }
+    return out
+}
+
+// ─── E12 seed-batch helpers (2026-04-21) ───
+// SSOT: shared/config/drill.json .seed_batch
+// Sequential (parallel 은 engine_daemon 의존 — E12 범위 밖).
+// CLI: --seeds seed1,seed2 또는 --seeds-file path.txt (1 seed/line, '#' 주석 허용).
+fn _seed_batch_hash(seed: str) -> str {
+    // 가벼운 deterministic 8-char hex — ndjson seed_hash 필드용.
+    // openssl/sha256/sha1 중 접근 가능한 것 사용. 전부 실패 시 length 기반 fallback.
+    let q = shell_quote(seed)
+    let h1 = exec("printf '%s' " + q + " | openssl dgst -sha1 2>/dev/null | awk '{print $NF}' | cut -c1-8").trim()
+    if h1.len() == 8 { return h1 }
+    let h2 = exec("printf '%s' " + q + " | shasum 2>/dev/null | cut -c1-8").trim()
+    if h2.len() == 8 { return h2 }
+    // fallback: seed length + first 4 char codes (매우 약한 해시지만 non-empty 보장)
+    let n = seed.len()
+    return "l" + to_string(n) + "x"
+}
+
+fn _seed_batch_load(flag_val: str, file_path: str) -> [str] {
+    // flag_val: "seed1,seed2,seed3" comma-separated (우선)
+    // file_path: 1 seed per line (# 주석 및 빈 줄 무시)
+    // 둘 다 비어있으면 [] 반환.
+    let mut out: [str] = []
+    if flag_val.len() > 0 {
+        // comma split (수동 — hexa .split 부재)
+        let mut buf = ""
+        let mut i = 0
+        let n = flag_val.len()
+        while i < n {
+            let ch = flag_val.substring(i, i + 1)
+            if ch == "," {
+                let t = buf.trim()
+                if t.len() > 0 { out = out + [t] }
+                buf = ""
+            } else {
+                buf = buf + ch
+            }
+            i = i + 1
+        }
+        let tail = buf.trim()
+        if tail.len() > 0 { out = out + [tail] }
+        return out
+    }
+    if file_path.len() > 0 {
+        // exec cat + line split on \n (수동)
+        let raw = exec("cat " + shell_quote(file_path) + " 2>/dev/null")
+        let mut buf2 = ""
+        let mut j = 0
+        let m = raw.len()
+        while j < m {
+            let c = raw.substring(j, j + 1)
+            if c == "\n" {
+                let ln = buf2.trim()
+                if ln.len() > 0 && ln.substring(0, 1) != "#" { out = out + [ln] }
+                buf2 = ""
+            } else {
+                buf2 = buf2 + c
+            }
+            j = j + 1
+        }
+        let tail2 = buf2.trim()
+        if tail2.len() > 0 && tail2.substring(0, 1) != "#" { out = out + [tail2] }
+        return out
+    }
+    return out
+}
+
+fn _seed_batch_emit_summary(seed_count: int, total_abs: int, durations_ms: [i64]) -> void {
+    // stderr JSON 1 line — batch 전체 summary.
+    let mut ds = "["
+    let mut i = 0
+    while i < len(durations_ms) {
+        if i > 0 { ds = ds + "," }
+        ds = ds + to_string(durations_ms[i])
+        i = i + 1
+    }
+    ds = ds + "]"
+    let ts = exec("date +%s").trim()
+    let line = "NEXUS_DRILL_BATCH {\"seed_count\":" + to_string(seed_count)
+        + ",\"total_abs\":" + to_string(total_abs)
+        + ",\"durations_ms\":" + ds
+        + ",\"ts\":" + ts + "}"
+    eprintln(line)
+}
+
+// ─── E5 depth trace NDJSON (2026-04-21) ───
+fn _ndjson_emit(round: int, plan_planned: [int], plan_actual: [int], yields: [int], total: int, adaptive_reason: str, seed_hash: str) -> void {
+    // append 1 line to /tmp/nexus_drill_depth.ndjson. schema v1.
+    // E15 (2026-04-21): "parallel" field 추가 — env NEXUS_DRILL_STAGE_PARALLEL 활성 여부. schema backward-compat (optional key).
+    // E12 (2026-04-21): "seed_hash" field 추가 — batch drill 에서 seed 별 분리 식별.
+    let path = "/tmp/nexus_drill_depth.ndjson"
+    let ts = exec("date +%s").trim()
+    let par_flag = if _stage_parallel_enabled() { "true" } else { "false" }
+    let sh = if seed_hash.len() > 0 { seed_hash } else { "-" }
+    let line = "{\"ts\":" + ts
+        + ",\"round\":" + to_string(round)
+        + ",\"plan\":" + _plan_json(plan_planned)
+        + ",\"actual\":" + _plan_json(plan_actual)
+        + ",\"yield\":{\"smash\":" + to_string(yields[0])
+          + ",\"free\":" + to_string(yields[1])
+          + ",\"absolute\":" + to_string(yields[2])
+          + ",\"meta_closure\":" + to_string(yields[3])
+          + ",\"hyperarith\":" + to_string(yields[4])
+          + ",\"resonance\":" + to_string(yields[5]) + "}"
+        + ",\"total\":" + to_string(total)
+        + ",\"parallel\":" + par_flag
+        + ",\"seed_hash\":\"" + sh + "\""
+        + ",\"adaptive_reason\":\"" + adaptive_reason.replace("\"", "'") + "\"}"
+    // escape single quotes carefully for shell
+    let safe_line = line.replace("'", "'\\''")
+    let cmd = "printf '%s\\n' '" + safe_line + "' >> " + shell_quote(path)
+    exec(cmd)
+}
+
+// ─── N (2026-04-21) Live Progress — NEXUS_DRILL_PROGRESS stage start/end JSON ───
+// 긴 drill (수 분+) 에서 stage 진행 즉시성 확보. stderr JSON 1 line / event.
+// event ∈ {start, end, abort}. stdout 불변 (stderr only).
+// bypass: env NEXUS_DRILL_PROGRESS_OFF=1 → 아무것도 emit 하지 않음 (CI noise off).
+// 총 cost: stage 당 2 JSON + 종료 summary 1 JSON.
+fn _progress_emit(round: int, stage: str, event: str, elapsed_ms: int) -> void {
+    if env("NEXUS_DRILL_PROGRESS_OFF") == "1" { return }
+    let ts = exec("date +%s").trim()
+    let line = "NEXUS_DRILL_PROGRESS {\"round\":" + to_string(round)
+        + ",\"stage\":\"" + stage + "\""
+        + ",\"event\":\"" + event + "\""
+        + ",\"elapsed_ms\":" + to_string(elapsed_ms)
+        + ",\"ts\":" + ts + "}"
+    eprintln(line)
+}
+
+fn _progress_now_ms() -> i64 {
+    // ms epoch — linux 는 %s%N (ns), macOS 는 %s*1000 fallback.
+    // macOS 는 %N 이 literal 로 남음 → 길이 짧거나 파싱 실패 시 %s*1000 경로로 폴백.
+    let raw = exec("date +%s%N").trim()
+    let mut v: i64 = 0
+    try { v = to_int(raw) } catch e { v = 0 }
+    if v > 1000000000000000 {
+        // ns precision (linux) — 16+ digits. ms 로 축소.
+        return v / 1000000
+    }
+    // macOS 또는 파싱 실패 — seconds * 1000
+    let sec = exec("date +%s").trim()
+    let mut s: i64 = 0
+    try { s = to_int(sec) } catch e { s = 0 }
+    return s * 1000
+}
+
+fn _progress_ms_diff(t0: i64, t1: i64) -> int {
+    // i64 ms diff → int (음수/overflow 는 0 으로 clamp).
+    let d = t1 - t0
+    if d < 0 { return 0 }
+    let mut out = 0
+    try { out = to_int(to_string(d)) } catch e { out = 0 }
+    return out
+}
+
+fn _progress_summary(total_abs: int, total_ms: i64) -> void {
+    if env("NEXUS_DRILL_PROGRESS_OFF") == "1" { return }
+    let ts = exec("date +%s").trim()
+    let line = "NEXUS_DRILL_PROGRESS {\"round\":-1,\"stage\":\"drill\",\"event\":\"end\""
+        + ",\"total_abs\":" + to_string(total_abs)
+        + ",\"total_ms\":" + to_string(total_ms)
+        + ",\"ts\":" + ts + "}"
+    eprintln(line)
+}
+
+// ─── Validation layers A/B/D (2026-04-21) ───
+// A: cross-round uniformity (축소 구현 — single-seed, round 간 stage-vector 동일성 감시)
+// B: ghost probe — 1 extra round with gibberish seed, compare with real round-1
+// D: stage-dead column — across N rounds, stage column 전부 0 감지
+fn _ghost_seed() -> str {
+    // schema: __NEXUS_GHOST_<urand_hex16>__ (40 chars total — seed-length guard 통과)
+    let h = _urand_hex(12)
+    return "__NEXUS_GHOST_" + h + "__xyz_placeholder_tag_not_math"
+}
+
+fn _validation_verdict(score: int) -> str {
+    // thresholds from drill.json .validation.verdict_thresholds
+    if score < 3 { return "PASS" }
+    if score < 7 { return "SUSPICIOUS" }
+    return "REJECT"
+}
+
+fn _emit_validation(signals: [str], score: int, recommendation: str) -> void {
+    // NEXUS_DRILL_VALIDATION {verdict, score, signals[], recommendation}
+    let verdict = _validation_verdict(score)
+    let mut sig_join = ""
+    let mut i = 0
+    while i < len(signals) {
+        if i > 0 { sig_join = sig_join + "," }
+        sig_join = sig_join + signals[i]
+        i = i + 1
+    }
+    let safe_rec = recommendation.replace("\"", "'")
+    let j = "{\"verdict\":\"" + verdict + "\",\"score\":" + to_string(score)
+        + ",\"signals\":[" + sig_join + "]"
+        + ",\"recommendation\":\"" + safe_rec + "\"}"
+    eprintln("NEXUS_DRILL_VALIDATION " + j)
+}
+
+fn _run_drill_validation(real_seed: str, nonce_base: str, totals_hist: [int], stage_matrix: [[int]], base_plan: [int], blow_core: str, hx_bin: str, preset: str) -> void {
+    // Validation layer A + B + D — drill 종료 시 1회 호출.
+    //   A (축소): single-seed round 간 stage-vector 동일성 감시 — round 2+ 가 round 1 과 완전 동일 시 flag.
+    //   B: ghost probe — 1 round 동안 gibberish seed 병행 smash, real round-1 total 과 동일 시 flag.
+    //   D: stage-dead column — stage_matrix 에서 각 stage 전 round 0 이면 flag (enabled 한 stage 만).
+    //   점수 합산 → verdict (drill.json .validation.verdict_thresholds): <3 PASS, [3,6] SUSPICIOUS, >=7 REJECT.
+    let mut score = 0
+    let mut signals: [str] = []
+    let mut rec = ""
+
+    let nr = len(totals_hist)
+    let ns = len(stage_matrix)
+
+    // Layer A — round uniformity (축소)
+    if nr >= 2 {
+        let mut uniform = true
+        let r0 = stage_matrix[0]
+        let mut i = 1
+        while i < ns {
+            let ri = stage_matrix[i]
+            let mut eq = true
+            let mut k = 0
+            while k < 6 {
+                if k < len(r0) && k < len(ri) {
+                    if r0[k] != ri[k] { eq = false; break }
+                }
+                k = k + 1
+            }
+            if !eq { uniform = false; break }
+            i = i + 1
+        }
+        if uniform {
+            score = score + 3  // weight
+            signals = signals + ["{\"kind\":\"uniform_result\",\"rounds\":" + to_string(nr) + ",\"unique_vectors\":1}"]
+            rec = rec + "A: round 간 stage-vector 동일 — salt 미반영 의심; "
+        }
+    }
+
+    // Layer B — ghost probe (preset=probe 는 skip, 시간 절약)
+    if preset != "probe" && nr >= 1 {
+        let ghost = _ghost_seed()
+        let gs_cmd = shell_quote(hx_bin) + " run " + shell_quote(blow_core) + " " + shell_quote(ghost) + " 1 2>&1"
+        let gs_out = exec(gs_cmd)
+        let gs_n = _count_discoveries(gs_out)
+        let real_r1 = if ns >= 1 && len(stage_matrix[0]) > 0 { stage_matrix[0][0] } else { 0 }
+        if gs_n > 0 && gs_n == real_r1 {
+            score = score + 5  // weight
+            signals = signals + ["{\"kind\":\"ghost_match\",\"real\":" + to_string(real_r1) + ",\"ghost\":" + to_string(gs_n) + "}"]
+            rec = rec + "B: ghost seed 와 real seed 동일 smash yield — engine seed-insensitive; "
+        }
+        eprintln("  [validation B/ghost] real_r1_smash=" + to_string(real_r1) + " ghost_smash=" + to_string(gs_n))
+    }
+
+    // Layer D — stage-dead column (enabled stages 중 전부 0 인 stage flag)
+    let mut d_i = 0
+    while d_i < 6 {
+        if base_plan[d_i] > 0 {
+            let mut all_zero = true
+            let mut rr = 0
+            while rr < ns {
+                if d_i < len(stage_matrix[rr]) {
+                    if stage_matrix[rr][d_i] > 0 { all_zero = false; break }
+                }
+                rr = rr + 1
+            }
+            if all_zero && ns >= 1 {
+                score = score + 2  // weight per dead stage
+                signals = signals + ["{\"kind\":\"stage_dead\",\"stage\":\"" + _stage_name(d_i) + "\",\"column_zeros\":" + to_string(ns) + "}"]
+                rec = rec + "D: " + _stage_name(d_i) + " 전 round 0 yield — engine 또는 parser 문제; "
+            }
+        }
+        d_i = d_i + 1
+    }
+
+    if rec.len() == 0 { rec = "signals within tolerance — drill 결과 정상" }
+    _emit_validation(signals, score, rec)
+}
+
+// ─── E9 drill checkpoint / resume (2026-04-21) ───
+// round N 종료 시 state JSON flush → `--resume` 로 중단 복귀.
+// state file: <dir>/nexus_drill_cp_<seed_hash12>.json  (기본 dir=/tmp, ephemeral)
+// schema: {"seed":"...","round_done":N,"total":M,"yields_hist":[[...]],"plan":[...],"ts":T}
+// Mac jetsam / SIGTERM 복구 시 long-run drill 재개용.
+fn _checkpoint_hex8(v: i64) -> str {
+    // i64 → 8-char lowercase hex (low 32 bits).
+    let digits = "0123456789abcdef"
+    let mut x = v & 4294967295
+    let mut out = ""
+    let mut i = 0
+    while i < 8 {
+        let nib = x & 15
+        out = digits.substring(nib, nib + 1) + out
+        x = x / 16
+        i = i + 1
+    }
+    return out
+}
+
+fn _checkpoint_fnv_hex12(seed: str) -> str {
+    // FNV-1a 32-bit 2회 (정방향/역방향) 혼합 → 12-hex prefix. i64 mask 로 u32 semantics.
+    // hexa-lang u64 부재 — 64-bit FNV 오버플로우 회피. 충돌 공간 은 12-hex = 2^48.
+    let n = seed.len()
+    let mut h1: i64 = 2166136261
+    let mut h2: i64 = 2166136261
+    let prime: i64 = 16777619
+    let mask: i64 = 4294967295
+    let mut i = 0
+    while i < n {
+        let cc = char_code(seed, i)
+        h1 = (h1 ^ cc) * prime
+        h1 = h1 & mask
+        let cc2 = char_code(seed, n - 1 - i)
+        h2 = (h2 ^ cc2) * prime
+        h2 = h2 & mask
+        i = i + 1
+    }
+    let hx1 = _checkpoint_hex8(h1)
+    let hx2 = _checkpoint_hex8(h2)
+    return hx1.substring(2, 8) + hx2.substring(2, 8)
+}
+
+fn _checkpoint_path(seed: str, dir: str) -> str {
+    let d = if dir.len() > 0 { dir } else { "/tmp" }
+    let h = _checkpoint_fnv_hex12(seed)
+    return d + "/nexus_drill_cp_" + h + ".json"
+}
+
+fn _checkpoint_yields_json(yields_hist: [[int]]) -> str {
+    let mut out = "["
+    let mut i = 0
+    while i < len(yields_hist) {
+        if i > 0 { out = out + "," }
+        let r = yields_hist[i]
+        let mut inner = "["
+        let mut k = 0
+        while k < len(r) {
+            if k > 0 { inner = inner + "," }
+            inner = inner + to_string(r[k])
+            k = k + 1
+        }
+        inner = inner + "]"
+        out = out + inner
+        i = i + 1
+    }
+    return out + "]"
+}
+
+fn _checkpoint_plan_flat_json(plan: [int]) -> str {
+    let mut out = "["
+    let mut i = 0
+    while i < len(plan) {
+        if i > 0 { out = out + "," }
+        out = out + to_string(plan[i])
+        i = i + 1
+    }
+    return out + "]"
+}
+
+fn _checkpoint_save(seed: str, round: int, total: int, yields_hist: [[int]], plan: [int], dir: str) -> void {
+    // atomic write: tmpfile + mv -f. 같은 seed → 같은 path.
+    let path = _checkpoint_path(seed, dir)
+    let seed_esc = seed.replace("\\", "\\\\").replace("\"", "\\\"")
+    let ts = exec("date +%s").trim()
+    let json = "{\"seed\":\"" + seed_esc + "\""
+        + ",\"round_done\":" + to_string(round)
+        + ",\"total\":" + to_string(total)
+        + ",\"yields_hist\":" + _checkpoint_yields_json(yields_hist)
+        + ",\"plan\":" + _checkpoint_plan_flat_json(plan)
+        + ",\"ts\":" + ts + "}"
+    let safe = json.replace("'", "'\\''")
+    let q_path = shell_quote(path)
+    let q_tmp  = shell_quote(path + ".tmp")
+    let cmd = "printf '%s\\n' '" + safe + "' > " + q_tmp + " && mv -f " + q_tmp + " " + q_path
+    exec(cmd)
+    let seed_hash = _checkpoint_fnv_hex12(seed)
+    eprintln("NEXUS_DRILL_CHECKPOINT {\"op\":\"save\",\"seed_hash\":\"" + seed_hash + "\",\"round\":" + to_string(round) + ",\"path\":\"" + path + "\"}")
+}
+
+fn _checkpoint_load(seed: str, dir: str) -> [int] {
+    // 반환: [round_done, total, y00..y05, y10..y15, ...] flat. empty = null (not found / corrupt).
+    let path = _checkpoint_path(seed, dir)
+    let q_path = shell_quote(path)
+    let exists = exec("[ -f " + q_path + " ] && echo y || echo n").trim()
+    if exists != "y" { return [] }
+    let raw = exec("cat " + q_path + " 2>/dev/null").trim()
+    if raw.len() == 0 { return [] }
+    let r_done = _extract_int_after(raw, "\"round_done\":")
+    let tot = _extract_int_after(raw, "\"total\":")
+    if r_done <= 0 { return [] }
+    let mut out: [int] = [r_done, tot]
+    // yields_hist flat 파싱 — 외부 `[` 시작부터 depth=0 복귀까지 digit 누적.
+    let yh_marker = "\"yields_hist\":"
+    let idx0 = str_find(raw, yh_marker)
+    if idx0 < 0 { return out }
+    let start = idx0 + yh_marker.len()
+    let n = raw.len()
+    let mut i = start
+    let mut depth = 0
+    let mut cur_num = ""
+    while i < n {
+        let cc = char_code(raw, i)
+        if cc == 91 {
+            depth = depth + 1
+        } else if cc == 93 {
+            if cur_num.len() > 0 {
+                let mut v = 0
+                try { v = to_int(cur_num) } catch e {}
+                out = out + [v]
+                cur_num = ""
+            }
+            depth = depth - 1
+            if depth == 0 { break }
+        } else if cc == 44 {
+            if cur_num.len() > 0 {
+                let mut v = 0
+                try { v = to_int(cur_num) } catch e {}
+                out = out + [v]
+                cur_num = ""
+            }
+        } else if cc >= 48 && cc <= 57 {
+            cur_num = cur_num + raw.substring(i, i + 1)
+        } else if cc == 45 {
+            cur_num = cur_num + "-"
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _checkpoint_clear(seed: str, dir: str) -> void {
+    let path = _checkpoint_path(seed, dir)
+    let q_path = shell_quote(path)
+    exec("rm -f " + q_path + " " + shell_quote(path + ".tmp"))
+}
+
+
+// ─── E6 failure-mode recovery (2026-04-21) ─── 5 modes: runaway / oscillate / imbalance / OOM / SIGINT
+// SSOT: shared/convergence/drill_stability.convergence C3 failure modes
+//   - adaptive 폭주 (depth=max 3 round 연속) → cap 절반
+//   - oscillate (high-freq +/-1) → hysteresis gate 3 round cooldown
+//   - stage-imbalance (1 stage 점유 과도) → floor 보장
+//   - OOM-imminent (RSS > cap * 0.80) → depth-- + NDJSON flush
+//   - SIGINT → 현 round 완주 후 graceful abort flag
+// 충돌 회피: prefix _recovery_*, 기존 _stage_pipeline_* / _anti_replay_lru_* / _run_stage_parallel* 건드리지 않음.
+// hook: cmd_drill round loop 말미 (NDJSON emit 이후) 5 check 순차 수행. 다음 round 에 영향.
+
+fn _recovery_adaptive_runaway(depth_hist: [[int]]) -> bool {
+    // adaptive 폭주: plan 이 _stage_max() 의 enabled stage 전체에서 max 값과 같은 round 가 3 연속.
+    // depth_hist[i] = round i 의 cur_plan (6-slot). 마지막 3 원소 검사.
+    let h = len(depth_hist)
+    if h < 3 { return false }
+    let maxs = _stage_max()
+    let mut all_max_count = 0
+    let mut k = h - 3
+    while k < h {
+        let p = depth_hist[k]
+        if len(p) < 6 { return false }
+        let mut at_max = true
+        let mut i = 0
+        while i < 6 {
+            // enabled stage (plan[i] > 0) 만 max 비교. disabled(0) 은 skip.
+            if p[i] > 0 {
+                if p[i] < maxs[i] { at_max = false }
+            }
+            i = i + 1
+        }
+        if at_max { all_max_count = all_max_count + 1 }
+        k = k + 1
+    }
+    return all_max_count == 3
+}
+
+fn _recovery_halve_plan(plan: [int]) -> [int] {
+    // cap 절반 — enabled stage 의 depth 를 /2, min 으로 clamp.
+    let mut out: [int] = []
+    let mut i = 0
+    while i < len(plan) {
+        let v = plan[i]
+        if v > 0 {
+            let hv = v / 2
+            out = out + [_clamp_depth(if hv < 1 { 1 } else { hv }, i)]
+        } else {
+            out = out + [0]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _recovery_oscillate(depth_hist: [[int]]) -> bool {
+    // 최근 5 round smash slot 이 +/-1 진동 (a,b,a,b,a with |a-b|==1).
+    // smash (stage 0) 가 adaptive 조정 주 대상 — 진동 감지 핵심 slot.
+    let h = len(depth_hist)
+    if h < 5 { return false }
+    let mut seq: [int] = []
+    let mut k = h - 5
+    while k < h {
+        let p = depth_hist[k]
+        if len(p) < 1 { return false }
+        seq = seq + [p[0]]
+        k = k + 1
+    }
+    // 패턴: seq[0]==seq[2]==seq[4], seq[1]==seq[3], |seq[0]-seq[1]|==1
+    if seq[0] != seq[2] { return false }
+    if seq[2] != seq[4] { return false }
+    if seq[1] != seq[3] { return false }
+    let diff = if seq[0] > seq[1] { seq[0] - seq[1] } else { seq[1] - seq[0] }
+    return diff == 1
+}
+
+fn _recovery_stage_imbalance(yield_hist: [[int]]) -> [int] {
+    // 직전 round yields 에서 1 stage 가 total 의 >80% 점유면 adj (floor-bump mask) 반환.
+    // imbalance 없으면 [0,0,0,0,0,0].
+    let h = len(yield_hist)
+    let mut adj: [int] = [0, 0, 0, 0, 0, 0]
+    if h < 1 { return adj }
+    let y = yield_hist[h - 1]
+    if len(y) < 6 { return adj }
+    let mut total = 0
+    let mut i = 0
+    while i < 6 {
+        total = total + y[i]
+        i = i + 1
+    }
+    if total < 10 { return adj }  // 너무 작으면 의미 없음
+    // imbalance: yield[i] * 100 > total * 80 (정수 비교 — string 경계 회피)
+    let mut j = 0
+    let mut dominant = -1
+    while j < 6 {
+        if y[j] * 100 > total * 80 { dominant = j }
+        j = j + 1
+    }
+    if dominant < 0 { return adj }
+    // adj: dominant 외 slot 을 1(bump-marker) 로 mark — floor=2 로 올림.
+    let mut k = 0
+    while k < 6 {
+        if k != dominant { adj = _plan_set(adj, k, 1) }
+        k = k + 1
+    }
+    return adj
+}
+
+fn _recovery_apply_floor(plan: [int], adj: [int]) -> [int] {
+    // adj[i]==1 인 slot 을 floor=2 로 bump (plan[i]==1 만 올림; disabled=0 유지; 2 이상 유지).
+    let mut out: [int] = []
+    let mut i = 0
+    while i < len(plan) {
+        let v = plan[i]
+        let a = if i < len(adj) { adj[i] } else { 0 }
+        if a == 1 && v > 0 && v < 2 {
+            out = out + [_clamp_depth(2, i)]
+        } else {
+            out = out + [v]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _recovery_rss_cap_mb() -> int {
+    // NEXUS_RSS_CAP_MB env 우선, 없으면 HEXA_STAGE0_RSS_CAP_KB (KB→MB), 없으면 4096 default.
+    let v = env("NEXUS_RSS_CAP_MB")
+    if v.len() > 0 {
+        let mut n = 0
+        try { n = to_int(v) } catch e { n = 0 }
+        if n > 0 { return n }
+    }
+    let vk = env("HEXA_STAGE0_RSS_CAP_KB")
+    if vk.len() > 0 {
+        let mut k = 0
+        try { k = to_int(vk) } catch e { k = 0 }
+        if k > 0 { return k / 1024 }
+    }
+    return 4096
+}
+
+fn _recovery_current_rss_mb() -> int {
+    // Linux: /proc/self/status VmRSS (kB) → MB. Darwin: ps -o rss= -p $$ (kB) → MB.
+    // 두 경로 모두 실패 시 0 반환 (false negative — recovery 미발동).
+    let linux_cmd = "awk '/^VmRSS:/ {print $2; exit}' /proc/self/status 2>/dev/null"
+    let mut kb = 0
+    let raw_linux = exec(linux_cmd).trim()
+    if raw_linux.len() > 0 {
+        try { kb = to_int(raw_linux) } catch e { kb = 0 }
+    }
+    if kb <= 0 {
+        let raw_mac = exec("ps -o rss= -p $$ 2>/dev/null").trim()
+        if raw_mac.len() > 0 {
+            try { kb = to_int(raw_mac) } catch e { kb = 0 }
+        }
+    }
+    if kb <= 0 { return 0 }
+    return kb / 1024
+}
+
+fn _recovery_oom_imminent() -> bool {
+    // RSS > cap * 0.80 판정. 정수 연산 (cap*80)/100.
+    let cap = _recovery_rss_cap_mb()
+    if cap <= 0 { return false }
+    let cur = _recovery_current_rss_mb()
+    if cur <= 0 { return false }
+    let threshold = (cap * 80) / 100
+    return cur > threshold
+}
+
+fn _recovery_oom_depth_decrement(plan: [int]) -> [int] {
+    // depth-- per enabled stage (floor=min).
+    let mut out: [int] = []
+    let mut i = 0
+    while i < len(plan) {
+        let v = plan[i]
+        if v > 1 { out = out + [_clamp_depth(v - 1, i)] }
+        else { out = out + [v] }
+        i = i + 1
+    }
+    return out
+}
+
+fn _recovery_ndjson_flush() -> void {
+    // checkpoint flush — /tmp/nexus_drill_depth.ndjson 에 sync marker 추가.
+    // hexa fs sync 빌트인 없음 → shell sync 실행 (OOM 임박 시 disk 손실 방어).
+    exec("sync 2>/dev/null || true")
+}
+
+fn _recovery_sigint_flag_path() -> str {
+    // 외부 handler (shell wrapper 또는 user) 가 touch 할 수 있는 flag 파일.
+    // SSOT: /tmp/nexus_drill_sigint_<pid>.flag
+    let pid = exec("echo $$").trim()
+    let safe_pid = if pid.len() == 0 { "0" } else { pid }
+    return "/tmp/nexus_drill_sigint_" + safe_pid + ".flag"
+}
+
+fn _recovery_sigint_install() -> void {
+    // hexa 에는 signal() 빌트인이 없음 — shell trap 으로 flag 파일 touch.
+    // drill 은 매 round 종료 후 flag 파일을 검사하여 graceful exit. drill 시작 1회 호출.
+    // (exec() subshell 은 휘발성이므로 user 가 직접 touch 해도 동일하게 동작 — 이중 경로.)
+    let flag = _recovery_sigint_flag_path()
+    let cmd = "trap 'touch " + shell_quote(flag) + "' INT TERM 2>/dev/null || true"
+    exec(cmd)
+}
+
+fn _recovery_sigint_handler() -> bool {
+    // flag 파일 존재 여부 — drill 시작 시 install. 외부 SIGINT 로 touch 되면 true.
+    let flag = _recovery_sigint_flag_path()
+    let chk = exec("[ -f " + shell_quote(flag) + " ] && echo y || echo n").trim()
+    return chk == "y"
+}
+
+fn _recovery_sigint_cleanup() -> void {
+    // 종료 시 flag 파일 제거 (남겨두면 다음 drill 이 즉시 abort).
+    let flag = _recovery_sigint_flag_path()
+    exec("rm -f " + shell_quote(flag) + " 2>/dev/null || true")
+}
+
+fn _recovery_emit(mode: str, action: str, round: int) -> void {
+    // 단일 stderr NEXUS_DRILL_RECOVERY JSON emit.
+    eprintln("NEXUS_DRILL_RECOVERY {\"mode\":\"" + mode + "\",\"action\":\"" + action + "\",\"round\":" + to_string(round) + "}")
+}
+
+fn cmd_drill(seed: str, max_rounds: str, engine_flag: str, preset: str, master_depth: str, per_stage_depths: [int], adaptive_flag: bool, resume_flag: bool, checkpoint_dir: str, problem: str) -> void {
     // 단일 명령어 — smash → free → absolute → meta-closure → hyperarithmetic → resonance (Mk.IX 6-stage)
     // Mk.X: stage 6 (transcendental_closure via mkx_engine.hexa sidecar) 추가 — 사이드카, L0 미수정.
     // 고갈(absorption=0) 까지 반복
@@ -1128,24 +1880,12 @@ fn cmd_drill(seed: str, max_rounds: str, engine_flag: str) -> void {
         println("    [adaptive] enabled — absorption-gradient + saturation-hunt rules")
     }
     println("")
-
-    // E16 — round parallel opt-in (NEXUS_DRILL_ROUND_PARALLEL=1)
-    //   assumption: inter-round 독립 (verify 먼저, 실패 시 sequential fallback)
-    //   atlas.n6 동시 write race 는 _round_parallel_atlas_lock mkdir mutex 로 제어
-    if env("NEXUS_DRILL_ROUND_PARALLEL") == "1" {
-        eprintln("  [E16] round_parallel enabled — pre-flight independence verify")
-        let indep = _round_parallel_verify_independence(blow_core, compose, exv)
-        if !indep {
-            eprintln("  [E16] independence verify FAILED — falling back to sequential")
-        } else {
-            eprintln("  [E16] independence verify PASS — launching parallel rounds")
-            let tot = _round_parallel_run(seed, rounds_max, blow_core, compose, exv, nonce_base)
-            println("▎ [parallel] total absorptions: " + to_string(tot))
-            _cross_iter_check_and_append(tot, seed)
-            return
-        }
-    }
-
+    // E2/E5/Validation 상태 추적 변수 — round 간 공유.
+    let mut yields_hist: [[int]] = []
+    let mut totals_hist: [int] = []
+    let mut stage_matrix: [[int]] = []  // A/D 검증용 — round × 6 stage yields
+    let mut cur_plan = base_plan
+    let mut _e6_plan_hist: [[int]] = []  // E6 recovery — per-round plan snapshot (runaway/oscillate)
     // D5-P2: round 진입 직전 baseline hexa proc 카운트 — round 종료 시 delta 비교
     let mut prev_hexa_n = _count_active_hexa()
 
