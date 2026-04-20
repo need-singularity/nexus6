@@ -1,0 +1,441 @@
+// ═══════════════════════════════════════════════════════════
+// atlas_cluster.hexa — AT atlas semantic clustering (shingle + Jaccard)
+//
+// Mode: offline batch — reads atlas.n6, produces cluster assignments.
+// Algo:
+//   * entry text normalization (lowercase, strip tags/grades)
+//   * k-shingle (k=3) over the normalized text → sorted unique shingle set
+//   * pairwise Jaccard = |A ∩ B| / |A ∪ B|
+//   * threshold-triggered union-find → connected-components clustering
+//     (equivalent to single-link agglomerative at fixed cut)
+//   * output [{cluster_id,entries:[idx,...],rep:"first entry text",size:M}, ...]
+//
+// Usage:
+//   hexa cli/scripts/atlas_cluster.hexa build <atlas.n6> <out.json> [threshold=0.3]
+//
+// Downstream (design note — not implemented here):
+//   drill can use cluster_id for neighbor exploration instead of prefix-only
+//   (bucket index = prefix shard; cluster index = semantic shard).
+//
+// Complexity:
+//   9600 entries × pairwise = 92 M Jaccard calls. Shingle sets are sorted vecs
+//   so intersection is linear in size. For larger atlases prefer min-hash LSH
+//   (k=16 hashes, 4 bands × 4 rows) — future opt; keep simple version first.
+//
+// Rules:
+//   - hexa `>=`/`<=` 금지 — `<` / `>` + `==` 조합만 사용
+//   - no external ML deps; pure text math
+//   - read-only over atlas.n6, writes only <out.json>
+// ═══════════════════════════════════════════════════════════
+
+// ─── CLI parsing ───
+let _a = args()
+let mut _cmd = ""
+let mut _src = ""
+let mut _out = ""
+let mut _thr_str = "0.3"
+let mut _ai: i64 = 2
+while _ai < len(_a) {
+    let tok = _a[_ai]
+    if tok == "--help" || tok == "-h" {
+        println("usage: hexa cli/scripts/atlas_cluster.hexa build <atlas.n6> <out.json> [threshold=0.3]")
+        exit(0)  // @allow-silent-exit
+    }
+    else if _cmd == "" && !tok.starts_with("-") { _cmd = tok }
+    else if _src == "" && !tok.starts_with("-") { _src = tok }
+    else if _out == "" && !tok.starts_with("-") { _out = tok }
+    else if !tok.starts_with("-") { _thr_str = tok }
+    _ai = _ai + 1
+}
+
+if _cmd != "build" {
+    println("error: unknown or missing command (want 'build')")
+    println("usage: hexa cli/scripts/atlas_cluster.hexa build <atlas.n6> <out.json> [threshold=0.3]")
+    exit(1)  // @allow-silent-exit
+}
+if _src == "" || _out == "" {
+    println("error: missing <atlas.n6> or <out.json>")
+    exit(1)  // @allow-silent-exit
+}
+if !file_exists(_src) {
+    println("error: source not found: " + _src)
+    exit(1)  // @allow-silent-exit
+}
+
+let mut _thr: f64 = 0.3
+try { _thr = to_float(_thr_str) } catch e {}  // @allow-silent-catch
+// sanitize — 0 < thr < 1 (strict, no `<=`/`>=`)
+if !(_thr > 0.0) { _thr = 0.3 }
+if _thr > 1.0 { _thr = 1.0 }
+
+// ─── util: char classification + normalization ───
+// hexa stage0 string `<`/`>` broken (TS-20260416-STAGE0-STRCMP) — use char_code.
+// Also per task constraint: no `>=`/`<=` — use strict `<`/`>` + `==` only.
+fn _is_alnum_cc(cc: i64) -> bool {
+    if cc > 96 && cc < 123 { return true }   // a..z : 97..122
+    if cc > 64 && cc < 91 { return true }    // A..Z : 65..90
+    if cc > 47 && cc < 58 { return true }    // 0..9 : 48..57
+    return false
+}
+
+fn _lower_cc(cc: i64) -> i64 {
+    if cc > 64 && cc < 91 { return cc + 32 }
+    return cc
+}
+
+// String compare using char_code (stage0 string `<`/`>` returns void).
+// Returns -1 if a<b, 0 if a==b, +1 if a>b. ASCII / byte-level.
+fn _strcmp(a: string, b: string) -> i64 {
+    if a == b { return 0 }
+    let la = len(a)
+    let lb = len(b)
+    let lm = if la < lb { la } else { lb }
+    let mut i: i64 = 0
+    while i < lm {
+        let ca = char_code(a.substring(i, i + 1), 0)
+        let cb = char_code(b.substring(i, i + 1), 0)
+        if ca < cb { return -1 }
+        if ca > cb { return 1 }
+        i = i + 1
+    }
+    if la < lb { return -1 }
+    if la > lb { return 1 }
+    return 0
+}
+
+// lowercase ascii table for fast lookup (index 97..122 = "a..z")
+let _LOWER_TAB = "0000000000000000000000000000000000000000000000000123456789000000000abcdefghijklmnopqrstuvwxyz000000_0abcdefghijklmnopqrstuvwxyz00000"
+
+// Normalize an entry text into a compact token-joined lowercase string
+// (keeps ascii alnum; runs of non-alnum collapse to single space).
+fn _normalize(s: string) -> string {
+    let n = len(s)
+    let mut buf: [string] = []
+    let mut last_sp = true
+    let mut i: i64 = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        let cc = char_code(c, 0)
+        if _is_alnum_cc(cc) {
+            let lc = _lower_cc(cc)
+            // reconstruct 1-char via table lookup (ASCII only)
+            if lc > 47 && lc < 58 {
+                buf.push(c)  // digits — original is fine
+            } else if cc > 64 && cc < 91 {
+                // A..Z → a..z via lookup table
+                buf.push(_LOWER_TAB.substring(cc, cc + 1))
+            } else {
+                buf.push(c)  // already a..z
+            }
+            last_sp = false
+        } else {
+            if !last_sp {
+                buf.push(" ")
+                last_sp = true
+            }
+        }
+        i = i + 1
+    }
+    let joined = buf.join("")
+    return joined.trim()
+}
+
+// ─── extract atlas entry texts ───
+// An "entry" = one line starting with '@' plus any contiguous indented
+// continuation lines until the next non-indented line. We record the line
+// index of the '@' header as the entry idx.
+fn _read_entries(path: string) -> [string] {
+    let raw = read_file(path)
+    let lines = raw.split("\n")
+    let n = len(lines)
+    let mut out: [string] = []
+    let mut cur = ""
+    let mut have = false
+    let mut i: i64 = 0
+    while i < n {
+        let ln = lines[i]
+        if ln.starts_with("@") {
+            if have { out.push(cur) }
+            cur = ln
+            have = true
+        } else if have && (ln.starts_with(" ") || ln.starts_with("\t")) {
+            cur = cur + " " + ln
+        } else {
+            if have { out.push(cur); have = false; cur = "" }
+        }
+        i = i + 1
+    }
+    if have { out.push(cur) }
+    return out
+}
+
+// ─── k-shingle (k=3) over normalized text ───
+// produces a sorted unique [string] (acts as a small set).
+fn _shingles(norm: string, k: i64) -> [string] {
+    let n = len(norm)
+    let mut out: [string] = []
+    if n < k { if n > 0 { out.push(norm) } ; return out }
+    // collect raw windows
+    let mut raw: [string] = []
+    let mut i: i64 = 0
+    let end = n - k + 1
+    while i < end {
+        raw.push(norm.substring(i, i + k))
+        i = i + 1
+    }
+    // sort (insertion sort — window count is moderate per entry)
+    let m = len(raw)
+    let mut j: i64 = 1
+    while j < m {
+        let key = raw[j]
+        let mut t: i64 = j - 1
+        while t > -1 && _strcmp(raw[t], key) > 0 {
+            raw[t + 1] = raw[t]
+            t = t - 1
+        }
+        raw[t + 1] = key
+        j = j + 1
+    }
+    // unique
+    let mut prev = ""
+    let mut first = true
+    let mut u: i64 = 0
+    while u < m {
+        let s = raw[u]
+        if first || s != prev {
+            out.push(s)
+            prev = s
+            first = false
+        }
+        u = u + 1
+    }
+    return out
+}
+
+// ─── Jaccard over two sorted unique [string] ───
+fn _jaccard(a: [string], b: [string]) -> f64 {
+    let la = len(a)
+    let lb = len(b)
+    if la == 0 && lb == 0 { return 0.0 }
+    let mut i: i64 = 0
+    let mut j: i64 = 0
+    let mut inter: i64 = 0
+    while i < la && j < lb {
+        let x = a[i]
+        let y = b[j]
+        if x == y { inter = inter + 1; i = i + 1; j = j + 1 }
+        else {
+            let d = _strcmp(x, y)
+            if d < 0 { i = i + 1 }
+            else { j = j + 1 }
+        }
+    }
+    let uni = la + lb - inter
+    if uni == 0 { return 0.0 }
+    return to_float(inter) / to_float(uni)
+}
+
+// ─── Union-Find (path-compressed) ───
+fn _uf_find(parent: [i64], x: i64) -> i64 {
+    let mut cur = x
+    while parent[cur] != cur { cur = parent[cur] }
+    // path compression (tail loop)
+    let mut k = x
+    while parent[k] != cur {
+        let nxt = parent[k]
+        parent[k] = cur
+        k = nxt
+    }
+    return cur
+}
+
+fn _uf_union(parent: [i64], rank: [i64], a: i64, b: i64) {
+    let ra = _uf_find(parent, a)
+    let rb = _uf_find(parent, b)
+    if ra == rb { return }
+    if rank[ra] < rank[rb] { parent[ra] = rb }
+    else if rank[rb] < rank[ra] { parent[rb] = ra }
+    else { parent[rb] = ra; rank[ra] = rank[ra] + 1 }
+}
+
+// ─── JSON string escape ───
+fn _jesc(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", "\\n")
+    r = r.replace("\r", "\\r")
+    r = r.replace("\t", "\\t")
+    return r
+}
+
+// ═══════════════════════════════════════════════════════════
+//  MAIN
+// ═══════════════════════════════════════════════════════════
+println("atlas_cluster.build src=" + _src + " out=" + _out + " thr=" + to_string(_thr))
+
+let entries = _read_entries(_src)
+let n = len(entries)
+println("  entries: " + to_string(n))
+if n == 0 {
+    write_file(_out, "{\"source\":\"" + _jesc(_src) + "\",\"entries\":0,\"threshold\":" + to_string(_thr) + ",\"clusters\":[]}\n")
+    println("  wrote empty clusters (no entries)")
+    exit(0)
+}
+
+// precompute shingle sets
+let mut shingle_sets: [[string]] = []
+let mut idx: i64 = 0
+while idx < n {
+    let norm = _normalize(entries[idx])
+    let sh = _shingles(norm, 3)
+    shingle_sets.push(sh)
+    idx = idx + 1
+}
+
+// union-find init
+let mut parent: [i64] = []
+let mut rank: [i64] = []
+let mut pi: i64 = 0
+while pi < n {
+    parent.push(pi)
+    rank.push(0)
+    pi = pi + 1
+}
+
+// pairwise O(n²) — simple version. LSH is a future optimization.
+let mut ii: i64 = 0
+let mut pair_cmp: i64 = 0
+let mut pair_merged: i64 = 0
+while ii < n {
+    let a = shingle_sets[ii]
+    if len(a) > 0 {
+        let mut jj: i64 = ii + 1
+        while jj < n {
+            let b = shingle_sets[jj]
+            if len(b) > 0 {
+                // cheap pre-filter: if sizes differ so much that
+                // max Jaccard = min/max < thr, skip.
+                let la = len(a)
+                let lb = len(b)
+                let mn = if la < lb { la } else { lb }
+                let mx = if la > lb { la } else { lb }
+                let ratio = to_float(mn) / to_float(mx)
+                if ratio > _thr - 0.0001 {
+                    let sim = _jaccard(a, b)
+                    pair_cmp = pair_cmp + 1
+                    if sim > _thr || sim == _thr {
+                        _uf_union(parent, rank, ii, jj)
+                        pair_merged = pair_merged + 1
+                    }
+                }
+            }
+            jj = jj + 1
+        }
+    }
+    ii = ii + 1
+}
+
+// collect clusters by root → [idx,...]
+// two-pass: find roots, then bucket.
+let mut roots: [i64] = []
+let mut k: i64 = 0
+while k < n {
+    roots.push(_uf_find(parent, k))
+    k = k + 1
+}
+
+// map root → cluster_id via parallel arrays (no assoc containers assumed).
+let mut root_ids: [i64] = []
+let mut cluster_cid: [i64] = []   // parallel: root_ids[i] → cluster cid i
+let mut cluster_members: [[i64]] = []
+let mut cluster_rep: [string] = []
+
+let mut mi: i64 = 0
+while mi < n {
+    let r = roots[mi]
+    // linear lookup — cluster count is usually << n
+    let mut found: i64 = -1
+    let rn = len(root_ids)
+    let mut li: i64 = 0
+    while li < rn {
+        if root_ids[li] == r { found = li; li = rn }
+        li = li + 1
+    }
+    if found == -1 {
+        root_ids.push(r)
+        cluster_cid.push(len(cluster_cid))
+        let mut fresh: [i64] = []
+        fresh.push(mi)
+        cluster_members.push(fresh)
+        cluster_rep.push(_normalize(entries[mi]))
+    } else {
+        cluster_members[found].push(mi)
+    }
+    mi = mi + 1
+}
+
+// sort clusters by size desc (selection-sort on small cluster count).
+let cc = len(cluster_members)
+let mut order: [i64] = []
+let mut oi: i64 = 0
+while oi < cc { order.push(oi); oi = oi + 1 }
+let mut si: i64 = 0
+while si < cc {
+    let mut best = si
+    let mut sj: i64 = si + 1
+    while sj < cc {
+        if len(cluster_members[order[sj]]) > len(cluster_members[order[best]]) { best = sj }
+        sj = sj + 1
+    }
+    if best != si {
+        let tmp = order[si]
+        order[si] = order[best]
+        order[best] = tmp
+    }
+    si = si + 1
+}
+
+// ─── emit JSON ───
+let mut out_buf: [string] = []
+out_buf.push("{\"source\":\"" + _jesc(_src) + "\",\"entries\":" + to_string(n) + ",\"threshold\":" + to_string(_thr) + ",\"clusters\":[")
+let mut wi: i64 = 0
+let mut big_cnt: i64 = 0
+let mut singleton_cnt: i64 = 0
+while wi < cc {
+    let cid = order[wi]
+    let mem = cluster_members[cid]
+    let sz = len(mem)
+    if sz == 1 { singleton_cnt = singleton_cnt + 1 } else { big_cnt = big_cnt + 1 }
+    // rep: first 120 chars of normalized first-entry text
+    let mut rep = cluster_rep[cid]
+    if len(rep) > 120 { rep = rep.substring(0, 120) }
+    let mut seg: [string] = []
+    seg.push("{\"cluster_id\":")
+    seg.push(to_string(wi))
+    seg.push(",\"size\":")
+    seg.push(to_string(sz))
+    seg.push(",\"rep\":\"")
+    seg.push(_jesc(rep))
+    seg.push("\",\"entries\":[")
+    let mut ei: i64 = 0
+    while ei < sz {
+        if ei > 0 { seg.push(",") }
+        seg.push(to_string(mem[ei]))
+        ei = ei + 1
+    }
+    seg.push("]}")
+    if wi > 0 { out_buf.push(",") }
+    out_buf.push(seg.join(""))
+    wi = wi + 1
+}
+out_buf.push("]}\n")
+
+let json = out_buf.join("")
+write_file(_out, json)
+
+println("  pair_cmp:    " + to_string(pair_cmp))
+println("  pair_merged: " + to_string(pair_merged))
+println("  clusters:    " + to_string(cc) + " (multi=" + to_string(big_cnt) + " singleton=" + to_string(singleton_cnt) + ")")
+println("  wrote:       " + _out)
+exit(0)
