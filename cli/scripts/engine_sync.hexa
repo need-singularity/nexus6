@@ -1,0 +1,667 @@
+// ═══════════════════════════════════════════════════════════
+// engine_sync.hexa — AW cross-engine consistency check (Mk.IX / Mk.X / Mk.XI)
+//
+// 배경:
+//   nexus drill 은 여러 engine tier 를 동시에 지원한다:
+//     Mk.IX  = cli/blowup/modules/blowup_hyperarithmetic.hexa (Π₀² hyperarithmetic)
+//     Mk.X   = cli/blowup/modules/blowup_transcendental.hexa  (transcendental closure)
+//              + 사이드카 shared/engine/mkx_engine.hexa (synthesizer/AN11)
+//     Mk.XI  = [14*] 로드맵 (mk10_13star_first_candidates.md §5/§6) — 현재 엔진 파일 부재.
+//              본 도구는 "declared-but-possibly-absent" 로 취급, 경로 probe 후 absent 보고.
+//
+// 목적 (AW):
+//   동일 seed 에 대해 Mk.IX/Mk.X/Mk.XI 를 각각 실행 → 출력 수집 →
+//   (1) axiom count 동의 (small delta 이내)
+//   (2) top-N key absorption 교집합
+//   을 비교하여 AGREE / PARTIAL / DIVERGENT verdict 를 낸다.
+//
+// CLI:
+//   hexa cli/scripts/engine_sync.hexa check --seed <s> [--engines mk9,mk10,mkxi]
+//       [--top-n N]        key absorption 매칭 범위 (default 5)
+//       [--delta D]        axiom count small delta 허용치 (default 3)
+//       [--dry-run]        실제 engine 실행 skip — stub stdout/stderr 로 로직 검증 (default ON in Mac stage0)
+//       [--report <path>]  JSON 파일 저장 (없으면 stdout)
+//
+// 리포트 (JSON):
+//   { "seed": "...",
+//     "top_n": N, "delta": D,
+//     "engines": [
+//        { "id":"mk9",  "path":"...", "present":true, "ran":true,
+//          "axiom_count":K, "top_absorptions":["...", ...], "raw_tail":"..." },
+//        { "id":"mk10", ... },
+//        { "id":"mkxi", "present":false, "reason":"engine_not_found", "ran":false, ... }
+//     ],
+//     "axiom_delta": {"max":d, "pairs":[["mk9","mk10",d1], ...]},
+//     "absorption_intersection": { "pairs":[["mk9","mk10",k], ...], "size_min":k },
+//     "divergent_items": [ {"engine":"mk10","absorption":"..."}, ... ],
+//     "verdict": "AGREE" | "PARTIAL" | "DIVERGENT" | "INSUFFICIENT" }
+//
+// Mac stage0 lock:
+//   실제 engine live-exec 을 금지 — 본 도구는 기본적으로 dry-run.
+//   각 engine 의 존재 (path+perm) 확인 + stub output parser 경로는 100% 실행.
+//   NEXUS_ENGINE_SYNC_LIVE=1 환경변수가 설정된 경우에만 실제 exec 수행.
+//
+// 규칙 (L0 hygiene):
+//   - hexa `>=`/`<=` 금지 — `<`/`>` 만 사용.
+//   - atlas.n6 쓰기 없음 (read-only tool).
+//   - 신규 파일 only — 기존 engine 수정 없음.
+// ═══════════════════════════════════════════════════════════
+
+// ─── util: shell-safe single-quote ───
+fn _shq(s: string) -> string {
+    let mut parts: [string] = []
+    parts.push("'")
+    let n = len(s)
+    let mut i: i64 = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "'" { parts.push("'\\''") } else { parts.push(c) }
+        i = i + 1
+    }
+    parts.push("'")
+    return parts.join("")
+}
+
+// ─── util: JSON string escape ───
+fn _jesc(s: string) -> string {
+    let mut out: [string] = []
+    let n = len(s)
+    let mut i: i64 = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "\\" { out.push("\\\\") }
+        else if c == "\"" { out.push("\\\"") }
+        else if c == "\n" { out.push("\\n") }
+        else if c == "\r" { out.push("\\r") }
+        else if c == "\t" { out.push("\\t") }
+        else { out.push(c) }
+        i = i + 1
+    }
+    return out.join("")
+}
+
+// ─── util: path exists ───
+fn _file_exists(p: string) -> bool {
+    let raw = to_string(exec("[ -f " + _shq(p) + " ] && echo y || echo n")).trim()
+    return raw == "y"
+}
+
+// ─── util: nexus root ───
+fn _nexus_root() -> string {
+    let n = env("NEXUS")
+    if n.len() > 0 { return n }
+    let c = env("HOME") + "/core/nexus"
+    if _file_exists(c + "/cli/run.hexa") { return c }
+    return env("HOME") + "/Dev/nexus"
+}
+
+// ─── util: abs (no >=) ───
+fn _abs_i(x: i64) -> i64 {
+    if x < 0 { return 0 - x }
+    return x
+}
+
+fn _max_i(a: i64, b: i64) -> i64 {
+    if a > b { return a }
+    return b
+}
+
+// ─── engine registry ───
+// id → [path, marker_for_absorptions, name]
+// marker_for_absorptions: stdout 에서 count 로 해석할 라벨.
+//   mk9  → "HYPERARITHMETIC-PASS" / "[12*]"   (blowup_hyperarithmetic.hexa H5)
+//   mk10 → "TRANSCENDENTAL-PASS" / "[TC*]"    (blowup_transcendental.hexa)
+//   mkxi → "[14*]" / "MKXI-PASS"              (roadmap — absent 허용)
+fn _engine_path(id: string) -> string {
+    let root = _nexus_root()
+    if id == "mk9" {
+        return root + "/cli/blowup/modules/blowup_hyperarithmetic.hexa"
+    }
+    if id == "mk10" {
+        return root + "/cli/blowup/modules/blowup_transcendental.hexa"
+    }
+    if id == "mkxi" {
+        // primary 후보 — 없어도 OK (roadmap).
+        let primary = root + "/cli/blowup/modules/blowup_mkxi.hexa"
+        if _file_exists(primary) { return primary }
+        let alt1 = root + "/shared/engine/mkxi_engine.hexa"
+        if _file_exists(alt1) { return alt1 }
+        let alt2 = root + "/cli/blowup/modules/blowup_omega_hyperarithmetic.hexa"
+        if _file_exists(alt2) { return alt2 }
+        return ""  // declared-but-absent
+    }
+    // alias: mkx === mk10
+    if id == "mkx" {
+        return root + "/cli/blowup/modules/blowup_transcendental.hexa"
+    }
+    return ""
+}
+
+fn _engine_pass_marker(id: string) -> string {
+    if id == "mk9"  { return "HYPERARITHMETIC-PASS" }
+    if id == "mk10" { return "TRANSCENDENTAL-PASS" }
+    if id == "mkx"  { return "TRANSCENDENTAL-PASS" }
+    if id == "mkxi" { return "MKXI-PASS" }
+    return ""
+}
+
+// ─── dry-run stub output per engine ───
+// engine 실행을 안 해도 consistency-check 로직을 end-to-end 검증하기 위한
+// seed-deterministic 합성 stdout. 실제 engine 이 온라인 되면 NEXUS_ENGINE_SYNC_LIVE=1
+// 로 real exec 경로 활성화.
+fn _stub_output(id: string, seed: string) -> string {
+    let slen = seed.len()
+    // pseudo axiom count: seed 길이 기반, engine 별 small delta 부여.
+    let mut axi: i64 = 0
+    if id == "mk9"  { axi = slen + 3 }
+    if id == "mk10" { axi = slen + 4 }   // delta 1 vs mk9
+    if id == "mkx"  { axi = slen + 4 }
+    if id == "mkxi" { axi = slen + 3 }   // delta 0 vs mk9
+    let marker = _engine_pass_marker(id)
+    let mut sb: [string] = []
+    sb.push("🛸 " + id + " stub output for seed='" + seed + "'\n")
+    // top-N absorption 라인: "+ABSORB::<key>" 형식.
+    // seed 토큰 2~3 + engine-specific 추가 1.
+    let toks = seed.replace("/", "_").replace(" ", "_").split("_")
+    let mut ti: i64 = 0
+    let mut n: i64 = 0
+    while ti < len(toks) {
+        let t = toks[ti].trim()
+        if t.len() > 0 {
+            sb.push("+ABSORB::" + t + "\n")
+            n = n + 1
+        }
+        ti = ti + 1
+    }
+    // engine-specific extra absorption — PARTIAL 시나리오용.
+    if id == "mk9"  { sb.push("+ABSORB::pi02_witness\n"); n = n + 1 }
+    if id == "mk10" { sb.push("+ABSORB::transcendental_extension\n"); n = n + 1 }
+    if id == "mkx"  { sb.push("+ABSORB::transcendental_extension\n"); n = n + 1 }
+    if id == "mkxi" { sb.push("+ABSORB::omega_ordinal\n"); n = n + 1 }
+    sb.push("+" + to_string(n) + " absorptions\n")
+    sb.push("axiom_count: " + to_string(axi) + "\n")
+    sb.push(id + ": " + to_string(axi) + " " + marker + "\n")
+    return sb.join("")
+}
+
+// ─── 실제 engine exec (NEXUS_ENGINE_SYNC_LIVE=1 시에만) ───
+fn _run_engine(path: string, seed: string) -> string {
+    let hx = env("HEXA")
+    let mut hexa_cmd = "hexa"
+    if hx.len() > 0 { hexa_cmd = hx }
+    // run + seed 를 positional arg 로 전달 (blowup_transcendental.hexa 헤더 Usage)
+    let cmd = hexa_cmd + " run " + _shq(path) + " " + _shq(seed) + " 2>&1"
+    return to_string(exec(cmd))
+}
+
+// ─── parse: axiom count ───
+// 출력 형식 후보:
+//   "axiom_count: N"
+//   "<id>: N <MARKER>"   ← 예: "transcendental: 3 TRANSCENDENTAL-PASS"
+//   marker 카운트 (fallback)
+fn _parse_axiom_count(out: string, marker: string) -> i64 {
+    // try "axiom_count: N"
+    let key = "axiom_count:"
+    let i = out.index_of(key)
+    if i > -1 {
+        let after = out.substring(i + key.len(), out.len())
+        let mut j: i64 = 0
+        let mut num: [string] = []
+        // skip whitespace
+        while j < after.len() {
+            let c = after.substring(j, j + 1)
+            if c != " " && c != "\t" { break }
+            j = j + 1
+        }
+        while j < after.len() {
+            let c = after.substring(j, j + 1)
+            // digit detection via to_int try
+            let mut ok: bool = false
+            try { let _ = to_int(c); ok = true } catch e { ok = false }  // @allow-silent-catch
+            if !ok { break }
+            num.push(c)
+            j = j + 1
+        }
+        if num.len() > 0 {
+            let mut v: i64 = 0
+            try { v = to_int(num.join("")) } catch e {}  // @allow-silent-catch
+            return v
+        }
+    }
+    // fallback: count marker occurrences
+    if marker.len() == 0 { return 0 }
+    let lines = out.split("\n")
+    let mut cnt: i64 = 0
+    let mut k: i64 = 0
+    while k < len(lines) {
+        if lines[k].contains(marker) { cnt = cnt + 1 }
+        k = k + 1
+    }
+    return cnt
+}
+
+// ─── parse: top-N absorption keys ───
+// 형식: "+ABSORB::<key>" 또는 "absorb: <key>" — prefix 매칭.
+fn _parse_absorptions(out: string, top_n: i64) -> [string] {
+    let mut r: [string] = []
+    let lines = out.split("\n")
+    let mut i: i64 = 0
+    while i < len(lines) {
+        if r.len() == top_n { return r }  // strict less-than equivalent via count-compare
+        if (r.len() < top_n) == false { return r }
+        let raw = lines[i].trim()
+        i = i + 1
+        let mut key: string = ""
+        if raw.index_of("+ABSORB::") == 0 {
+            key = raw.substring(9, raw.len()).trim()
+        } else if raw.index_of("absorb::") == 0 {
+            key = raw.substring(8, raw.len()).trim()
+        } else if raw.index_of("absorb: ") == 0 {
+            key = raw.substring(8, raw.len()).trim()
+        }
+        if key.len() > 0 {
+            // dedup
+            let mut dup: bool = false
+            let mut j: i64 = 0
+            while j < r.len() {
+                if r[j] == key { dup = true }
+                j = j + 1
+            }
+            if !dup { r.push(key) }
+        }
+    }
+    return r
+}
+
+// ─── set intersection size ───
+fn _intersect(a: [string], b: [string]) -> [string] {
+    let mut out: [string] = []
+    let mut i: i64 = 0
+    while i < a.len() {
+        let x = a[i]
+        let mut j: i64 = 0
+        let mut hit: bool = false
+        while j < b.len() {
+            if b[j] == x { hit = true }
+            j = j + 1
+        }
+        if hit {
+            // dedup in out
+            let mut k: i64 = 0
+            let mut dup: bool = false
+            while k < out.len() {
+                if out[k] == x { dup = true }
+                k = k + 1
+            }
+            if !dup { out.push(x) }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── engine run collector (real or stub) ───
+// 반환: [id, path, present("true"|"false"), ran("true"|"false"),
+//        axiom_count_str, abs_csv, raw_tail_short]
+fn _collect_engine(id: string, seed: string, top_n: i64, live: bool) -> [string] {
+    let path = _engine_path(id)
+    let present = path.len() > 0 && _file_exists(path)
+    let marker = _engine_pass_marker(id)
+    let mut raw = ""
+    let mut ran: bool = false
+    if present {
+        if live {
+            raw = _run_engine(path, seed)
+            ran = true
+        } else {
+            raw = _stub_output(id, seed)
+            ran = true
+        }
+    } else {
+        // declared-but-absent (Mk.XI 전형) — stub 도 만들지 않는다.
+        raw = ""
+        ran = false
+    }
+    let axi = _parse_axiom_count(raw, marker)
+    let abs_list = _parse_absorptions(raw, top_n)
+    // raw tail: 마지막 200 chars
+    let mut tail = raw
+    if tail.len() > 200 {
+        tail = tail.substring(tail.len() - 200, tail.len())
+    }
+    let mut abs_csv_parts: [string] = []
+    let mut ci: i64 = 0
+    while ci < abs_list.len() {
+        if ci > 0 { abs_csv_parts.push("|") }
+        abs_csv_parts.push(abs_list[ci])
+        ci = ci + 1
+    }
+    let abs_csv = abs_csv_parts.join("")
+    let p_str = if present { "true" } else { "false" }
+    let r_str = if ran { "true" } else { "false" }
+    return [id, path, p_str, r_str, to_string(axi), abs_csv, tail]
+}
+
+// ─── verdict ───
+fn _verdict(axiom_delta_max: i64, pair_inter_min: i64, top_n: i64, ran_count: i64, declared_count: i64, delta_tol: i64) -> string {
+    if ran_count < 2 { return "INSUFFICIENT" }
+    // axiom agreement: max pairwise delta 가 허용치 이내?
+    let axiom_ok = axiom_delta_max < delta_tol + 1   // ≤ delta_tol (no >=/<=)
+    // absorption agreement: 최소 교집합 크기가 top_n 과 "일치" (교집합 == top_n).
+    let abs_full = pair_inter_min == top_n
+    if axiom_ok && abs_full { return "AGREE" }
+    if axiom_ok || pair_inter_min > 0 { return "PARTIAL" }
+    return "DIVERGENT"
+}
+
+// ─── JSON report build ───
+fn _build_report(seed: string, top_n: i64, delta_tol: i64, engines: [string], collected: [[string]], live: bool) -> string {
+    let mut sb: [string] = []
+    sb.push("{")
+    sb.push("\"seed\":\"")
+    sb.push(_jesc(seed))
+    sb.push("\",\"top_n\":")
+    sb.push(to_string(top_n))
+    sb.push(",\"delta\":")
+    sb.push(to_string(delta_tol))
+    sb.push(",\"mode\":\"")
+    sb.push(if live { "live" } else { "dry-run" })
+    sb.push("\",\"engines\":[")
+    let mut i: i64 = 0
+    while i < engines.len() {
+        if i > 0 { sb.push(",") }
+        let rec = collected[i]
+        sb.push("{\"id\":\"")
+        sb.push(_jesc(rec[0]))
+        sb.push("\",\"path\":\"")
+        sb.push(_jesc(rec[1]))
+        sb.push("\",\"present\":")
+        sb.push(rec[2])
+        sb.push(",\"ran\":")
+        sb.push(rec[3])
+        sb.push(",\"axiom_count\":")
+        sb.push(rec[4])
+        sb.push(",\"top_absorptions\":[")
+        let abs_csv = rec[5]
+        if abs_csv.len() > 0 {
+            let parts = abs_csv.split("|")
+            let mut j: i64 = 0
+            while j < len(parts) {
+                if j > 0 { sb.push(",") }
+                sb.push("\"")
+                sb.push(_jesc(parts[j]))
+                sb.push("\"")
+                j = j + 1
+            }
+        }
+        sb.push("],\"raw_tail\":\"")
+        sb.push(_jesc(rec[6]))
+        sb.push("\"}")
+        i = i + 1
+    }
+    sb.push("],")
+
+    // axiom delta pairs
+    let mut max_delta: i64 = 0
+    sb.push("\"axiom_delta\":{\"pairs\":[")
+    let mut first: bool = true
+    let mut a: i64 = 0
+    while a < engines.len() {
+        let ra = collected[a]
+        if ra[3] == "true" {
+            let mut b: i64 = a + 1
+            while b < engines.len() {
+                let rb = collected[b]
+                if rb[3] == "true" {
+                    let ax_a = to_int(ra[4])
+                    let ax_b = to_int(rb[4])
+                    let d = _abs_i(ax_a - ax_b)
+                    if d > max_delta { max_delta = d }
+                    if first { first = false } else { sb.push(",") }
+                    sb.push("[\"")
+                    sb.push(_jesc(ra[0]))
+                    sb.push("\",\"")
+                    sb.push(_jesc(rb[0]))
+                    sb.push("\",")
+                    sb.push(to_string(d))
+                    sb.push("]")
+                }
+                b = b + 1
+            }
+        }
+        a = a + 1
+    }
+    sb.push("],\"max\":")
+    sb.push(to_string(max_delta))
+    sb.push("},")
+
+    // absorption intersection pairs + divergent items
+    let mut size_min: i64 = top_n  // start pessimistic downward
+    let mut any_pair: bool = false
+    sb.push("\"absorption_intersection\":{\"pairs\":[")
+    let mut first2: bool = true
+    let mut divergents: [string] = []  // "engine::key"
+    let mut x: i64 = 0
+    while x < engines.len() {
+        let rx = collected[x]
+        if rx[3] == "true" {
+            let mut y: i64 = x + 1
+            while y < engines.len() {
+                let ry = collected[y]
+                if ry[3] == "true" {
+                    let ax_abs_csv = rx[5]
+                    let by_abs_csv = ry[5]
+                    let ax_abs = if ax_abs_csv.len() > 0 { ax_abs_csv.split("|") } else { [] }
+                    let by_abs = if by_abs_csv.len() > 0 { by_abs_csv.split("|") } else { [] }
+                    let inter = _intersect(ax_abs, by_abs)
+                    let isz = inter.len()
+                    if !any_pair { size_min = isz; any_pair = true }
+                    else if isz < size_min { size_min = isz }
+                    if first2 { first2 = false } else { sb.push(",") }
+                    sb.push("[\"")
+                    sb.push(_jesc(rx[0]))
+                    sb.push("\",\"")
+                    sb.push(_jesc(ry[0]))
+                    sb.push("\",")
+                    sb.push(to_string(isz))
+                    sb.push("]")
+                    // divergent: ax_abs 중 inter 에 없는 항목
+                    let mut ai: i64 = 0
+                    while ai < ax_abs.len() {
+                        let k = ax_abs[ai]
+                        let mut in_inter: bool = false
+                        let mut ii: i64 = 0
+                        while ii < inter.len() {
+                            if inter[ii] == k { in_inter = true }
+                            ii = ii + 1
+                        }
+                        if !in_inter { divergents.push(rx[0] + "::" + k) }
+                        ai = ai + 1
+                    }
+                    let mut bi: i64 = 0
+                    while bi < by_abs.len() {
+                        let k = by_abs[bi]
+                        let mut in_inter2: bool = false
+                        let mut jj: i64 = 0
+                        while jj < inter.len() {
+                            if inter[jj] == k { in_inter2 = true }
+                            jj = jj + 1
+                        }
+                        if !in_inter2 { divergents.push(ry[0] + "::" + k) }
+                        bi = bi + 1
+                    }
+                }
+                y = y + 1
+            }
+        }
+        x = x + 1
+    }
+    if !any_pair { size_min = 0 }
+    sb.push("],\"size_min\":")
+    sb.push(to_string(size_min))
+    sb.push("},")
+
+    // divergent items list (dedup)
+    sb.push("\"divergent_items\":[")
+    let mut seen: [string] = []
+    let mut di: i64 = 0
+    let mut firstd: bool = true
+    while di < divergents.len() {
+        let it = divergents[di]
+        let mut dup: bool = false
+        let mut si: i64 = 0
+        while si < seen.len() {
+            if seen[si] == it { dup = true }
+            si = si + 1
+        }
+        if !dup {
+            seen.push(it)
+            let sp = it.index_of("::")
+            if sp > 0 {
+                let eng_id = it.substring(0, sp)
+                let key = it.substring(sp + 2, it.len())
+                if firstd { firstd = false } else { sb.push(",") }
+                sb.push("{\"engine\":\"")
+                sb.push(_jesc(eng_id))
+                sb.push("\",\"absorption\":\"")
+                sb.push(_jesc(key))
+                sb.push("\"}")
+            }
+        }
+        di = di + 1
+    }
+    sb.push("],")
+
+    // verdict
+    let mut ran_count: i64 = 0
+    let mut ri: i64 = 0
+    while ri < collected.len() {
+        if collected[ri][3] == "true" { ran_count = ran_count + 1 }
+        ri = ri + 1
+    }
+    let v = _verdict(max_delta, size_min, top_n, ran_count, engines.len(), delta_tol)
+    sb.push("\"verdict\":\"")
+    sb.push(v)
+    sb.push("\"}")
+    return sb.join("")
+}
+
+// ─── CLI arg helpers ───
+fn _arg_value(a: [string], flag: string, dflt: string) -> string {
+    let n = len(a)
+    let mut i: i64 = 0
+    while i < n {
+        if a[i] == flag {
+            if i + 1 < n { return a[i + 1] }
+        }
+        i = i + 1
+    }
+    return dflt
+}
+
+fn _arg_has(a: [string], flag: string) -> bool {
+    let n = len(a)
+    let mut i: i64 = 0
+    while i < n {
+        if a[i] == flag { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _parse_engines(s: string) -> [string] {
+    if s.len() == 0 { return ["mk9", "mk10", "mkxi"] }
+    let parts = s.split(",")
+    let mut out: [string] = []
+    let mut i: i64 = 0
+    while i < len(parts) {
+        let p = parts[i].trim().to_lower()
+        if p.len() > 0 { out.push(p) }
+        i = i + 1
+    }
+    if len(out) == 0 { return ["mk9", "mk10", "mkxi"] }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════
+//  CLI dispatch
+// ═══════════════════════════════════════════════════════════
+let _a = args()
+let mut _sub = "help"
+if len(_a) > 2 { _sub = _a[2] }
+
+if _sub == "check" {
+    let seed = _arg_value(_a, "--seed", "")
+    if seed.trim().len() == 0 {
+        eprintln("engine_sync: --seed required")
+        exit(3)  // @allow-silent-exit
+    }
+    let engines_csv = _arg_value(_a, "--engines", "mk9,mk10,mkxi")
+    let top_n_s = _arg_value(_a, "--top-n", "5")
+    let delta_s = _arg_value(_a, "--delta", "3")
+    let report_path = _arg_value(_a, "--report", "")
+    // live only if explicit flag or env. Mac stage0 → default dry-run.
+    let mut live: bool = false
+    if _arg_has(_a, "--live") { live = true }
+    if env("NEXUS_ENGINE_SYNC_LIVE") == "1" { live = true }
+    if _arg_has(_a, "--dry-run") { live = false }
+
+    let mut top_n: i64 = 5
+    try { top_n = to_int(top_n_s) } catch e {}   // @allow-silent-catch
+    if top_n < 1 { top_n = 1 }
+    let mut delta_tol: i64 = 3
+    try { delta_tol = to_int(delta_s) } catch e {}   // @allow-silent-catch
+    if delta_tol < 0 { delta_tol = 0 }
+
+    let engines = _parse_engines(engines_csv)
+    let mut collected: [[string]] = []
+    let mut i: i64 = 0
+    while i < engines.len() {
+        let rec = _collect_engine(engines[i], seed, top_n, live)
+        collected.push(rec)
+        i = i + 1
+    }
+    let report = _build_report(seed, top_n, delta_tol, engines, collected, live)
+    if report_path.len() > 0 {
+        write_file(report_path, report + "\n")
+        eprintln("NEXUS_ENGINE_SYNC {\"status\":\"ok\",\"report\":\"" + _jesc(report_path) + "\"}")
+    } else {
+        println(report)
+    }
+    exit(0)  // @allow-silent-exit
+} else if _sub == "discover" {
+    // diagnostic: engine paths + presence flags
+    let engines = ["mk9", "mk10", "mkxi", "mkx"]
+    let mut sb: [string] = []
+    sb.push("{\"engines\":[")
+    let mut i: i64 = 0
+    while i < engines.len() {
+        if i > 0 { sb.push(",") }
+        let id = engines[i]
+        let p = _engine_path(id)
+        let present = p.len() > 0 && _file_exists(p)
+        sb.push("{\"id\":\"")
+        sb.push(id)
+        sb.push("\",\"path\":\"")
+        sb.push(_jesc(p))
+        sb.push("\",\"present\":")
+        sb.push(if present { "true" } else { "false" })
+        sb.push("}")
+        i = i + 1
+    }
+    sb.push("]}")
+    println(sb.join(""))
+    exit(0)  // @allow-silent-exit
+} else {
+    println("engine_sync.hexa — AW cross-engine consistency check (Mk.IX / Mk.X / Mk.XI)")
+    println("usage:")
+    println("  hexa cli/scripts/engine_sync.hexa check --seed <s> [--engines mk9,mk10,mkxi]")
+    println("        [--top-n N] [--delta D] [--live] [--dry-run] [--report <path>]")
+    println("  hexa cli/scripts/engine_sync.hexa discover")
+    println("")
+    println("invocation pattern (future live mode, NEXUS_ENGINE_SYNC_LIVE=1):")
+    println("  mk9  → hexa run cli/blowup/modules/blowup_hyperarithmetic.hexa '<seed>'")
+    println("  mk10 → hexa run cli/blowup/modules/blowup_transcendental.hexa  '<seed>'")
+    println("  mkxi → hexa run cli/blowup/modules/blowup_mkxi.hexa            '<seed>'  (roadmap)")
+    exit(0)
+}

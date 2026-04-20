@@ -1,0 +1,356 @@
+// scripts/atlas_reconcile.hexa — AW: nexus/anima/n6 atlas 3-way cross-engine sync
+//
+// Role (W 와 차별점):
+//   W agent  : 실시간 drill-chain handoff (stage-level, in-flight)
+//   AW (여기) : 누적 atlas entry 3-way 교차 참조 (post-hoc convergence)
+//
+// 3 Atlas sources (2026-04-21 repo 조사):
+//   nexus : $ROOT/nexus/docs/_mirror_atlas.n6            (엔진이 읽는 mirror snapshot)
+//   n6    : $ROOT/data/n6/atlas.n6                       (n6-arch canonical live)
+//   anima : $ROOT/data/n6/atlas.signals.n6               (3-repo signal SSOT, @S)
+//   ※ ROOT 기본: /home/summer/mac_home/core
+//
+// 출력: shared/convergence/atlas_cross_ref.ndjson (append-only)
+// 라인 스키마:
+//   {"ts","entry_id","entry_type","entry_hash",
+//    "nexus":bool|null,"anima":bool|null,"n6":bool|null,
+//    "verdict":"CONSENSUS|WARN_ONE_SIDED|PARTIAL|ORPHAN|SPEC_ONLY",
+//    "source_of_truth":"all|nexus|n6|anima|none",
+//    "session":"..."}
+//
+// verdict 규칙:
+//   3 slot 모두 true       → CONSENSUS     (고신뢰)
+//   nexus true & anima false → WARN_ONE_SIDED (one-sided discovery 경보)
+//   true 개수 == 2          → PARTIAL
+//   true 개수 == 1 & !nexus-only-anima-missing → ORPHAN
+//   slot 에 null 포함       → SPEC_ONLY
+//
+// 사용:
+//   hexa run scripts/atlas_reconcile.hexa
+//   hexa run scripts/atlas_reconcile.hexa --sample 10
+//   hexa run scripts/atlas_reconcile.hexa --session <tag>
+//   hexa run scripts/atlas_reconcile.hexa --dry-run
+
+fn _sh_quote(s: str) -> str {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _json_str(s: str) -> str {
+    // 최소 JSON string escape (간단: \ 와 " 만).
+    let mut r = s.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    return "\"" + r + "\""
+}
+
+fn _exists(path: str) -> bool {
+    let r = exec("test -f " + _sh_quote(path) + " && echo yes || echo no").trim()
+    return r == "yes"
+}
+
+fn _ensure_dir(path: str) -> void {
+    exec("mkdir -p " + _sh_quote(path))
+}
+
+fn _now_ts() -> int {
+    let r = exec("date +%s").trim()
+    let mut v = 0
+    try { v = to_int(r) } catch e { v = 0 }
+    return v
+}
+
+fn _sha1_12(s: str) -> str {
+    let cmd = "printf %s " + _sh_quote(s) + " | sha1sum | awk '{print substr($1,1,12)}'"
+    return exec(cmd).trim()
+}
+
+// ── id 추출 (grep + awk 위임, stdin stream 회피) ───────────────────────
+fn _extract_typed_ids(path: str) -> [[str]] {
+    // returns rows of [type_char, id] for @P/@C/@L/@F/@R/@S/@X/@? lines.
+    let mut out: [[str]] = []
+    if !_exists(path) { return out }
+    let cmd = "awk '/^@[PCLFRSX?] / { t=substr($1,2,1); id=$2; sub(/[,=]$/,\"\",id); if(id!=\"\" && id!=\"=\") print t\"\\t\"id }' "
+        + _sh_quote(path) + " | sort -u"
+    let raw = exec(cmd)
+    let lines = raw.split("\n")
+    let mut i = 0
+    while i < lines.len() {
+        let ln = lines[i].trim()
+        i = i + 1
+        if ln.len() == 0 { continue }
+        let parts = ln.split("\t")
+        if parts.len() < 2 { continue }
+        out = out + [[parts[0], parts[1]]]
+    }
+    return out
+}
+
+fn _extract_signal_ids(path: str) -> [[str]] {
+    // returns rows of ["S", id] for @S lines only.
+    let mut out: [[str]] = []
+    if !_exists(path) { return out }
+    let cmd = "awk '/^@S / { id=$2; sub(/[,=]$/,\"\",id); if(id!=\"\") print \"S\\t\"id }' "
+        + _sh_quote(path) + " | sort -u"
+    let raw = exec(cmd)
+    let lines = raw.split("\n")
+    let mut i = 0
+    while i < lines.len() {
+        let ln = lines[i].trim()
+        i = i + 1
+        if ln.len() == 0 { continue }
+        let parts = ln.split("\t")
+        if parts.len() < 2 { continue }
+        out = out + [[parts[0], parts[1]]]
+    }
+    return out
+}
+
+// anima signal 한 줄에서 repo tag 추출 → "NX"|"N6"|"AN"|"CROSS" 조합.
+// 리턴: [has_nx, has_n6, has_an, has_cross] (0/1 int).
+fn _signal_repo_tags(anima_path: str, sig_id: str) -> [int] {
+    let mut r = [0, 0, 0, 0]
+    if !_exists(anima_path) { return r }
+    // :: signal [TAGS] 첫 블록만 파싱.
+    let cmd = "awk -v id=" + _sh_quote(sig_id)
+        + " '$1==\"@S\" && $2==id { if (match($0, /:: +signal +\\[[^]]+\\]/)) { print substr($0, RSTART, RLENGTH) } exit }' "
+        + _sh_quote(anima_path)
+    let line = exec(cmd)
+    if line.len() == 0 { return r }
+    if line.contains("NX") { r[0] = 1 }
+    if line.contains("N6") { r[1] = 1 }
+    if line.contains("AN") { r[2] = 1 }
+    if line.contains("CROSS") { r[3] = 1 }
+    return r
+}
+
+// typed entry grep (일치: "^@T id " 또는 "^@T id=").
+fn _grep_typed(path: str, t: str, id: str) -> bool {
+    if !_exists(path) { return false }
+    let pat = "^@" + t + "[[:space:]]\\+" + id + "\\($\\|[[:space:]=]\\)"
+    let cmd = "grep -q " + _sh_quote(pat) + " " + _sh_quote(path) + " && echo yes || echo no"
+    return exec(cmd).trim() == "yes"
+}
+
+// 자유 grep (id 토큰 검색) — anima signal refs / n6 atlas 에서 typed id 참조 여부.
+fn _grep_token(path: str, id: str) -> bool {
+    if !_exists(path) { return false }
+    let pat = "[^A-Za-z0-9_]" + id + "[^A-Za-z0-9_]"
+    let cmd = "grep -q " + _sh_quote(pat) + " " + _sh_quote(path) + " && echo yes || echo no"
+    return exec(cmd).trim() == "yes"
+}
+
+// ── main ────────────────────────────────────────────────────────────
+fn main() {
+    let home_root = env("HOME")
+    // ROOT 기본값: /home/summer/mac_home/core.  env ATLAS_ROOT 우선.
+    let env_root = env("ATLAS_ROOT")
+    let root = if env_root.len() > 0 { env_root } else { "/home/summer/mac_home/core" }
+
+    let nexus_atlas = root + "/nexus/docs/_mirror_atlas.n6"
+    let n6_atlas    = root + "/data/n6/atlas.n6"
+    let anima_atlas = root + "/data/n6/atlas.signals.n6"
+    let out_path    = root + "/nexus/shared/convergence/atlas_cross_ref.ndjson"
+
+    let a = args()
+    let mut sample = 0
+    let mut session = ""
+    let mut dry = false
+    let mut i = 0
+    while i < a.len() {
+        let t = to_string(a[i])
+        if t == "--sample" && i + 1 < a.len() {
+            let v = to_string(a[i + 1])
+            try { sample = to_int(v) } catch e { sample = 0 }
+            i = i + 1
+        } else if t == "--session" && i + 1 < a.len() {
+            session = to_string(a[i + 1])
+            i = i + 1
+        } else if t == "--dry-run" {
+            dry = true
+        } else if t == "--root" && i + 1 < a.len() {
+            // allow override
+            i = i + 1
+        }
+        i = i + 1
+    }
+
+    _ensure_dir(root + "/nexus/shared/convergence")
+
+    let nx_ok = _exists(nexus_atlas)
+    let n6_ok = _exists(n6_atlas)
+    let an_ok = _exists(anima_atlas)
+
+    // 1) union entries — typed 는 nexus + n6 에서, signal 은 anima 에서
+    let typed_nx = _extract_typed_ids(nexus_atlas)
+    let typed_n6 = _extract_typed_ids(n6_atlas)
+    let sig_an   = _extract_signal_ids(anima_atlas)
+
+    // typed 는 type!=S 만 취함 (anima atlas 의 @S 섞이면 중복).
+    // union 을 (type|id) 키로 합침. 순서: nexus 우선 → n6 → signal.
+    let mut seen: [str] = []
+    let mut union_rows: [[str]] = []
+
+    let mut ui = 0
+    while ui < typed_nx.len() {
+        let row = typed_nx[ui]
+        ui = ui + 1
+        if row[0] == "S" { continue }
+        let key = row[0] + "|" + row[1]
+        let mut dup = false
+        let mut s = 0
+        while s < seen.len() { if seen[s] == key { dup = true; break } s = s + 1 }
+        if !dup { seen = seen + [key]; union_rows = union_rows + [row] }
+    }
+    let mut vi = 0
+    while vi < typed_n6.len() {
+        let row = typed_n6[vi]
+        vi = vi + 1
+        if row[0] == "S" { continue }
+        let key = row[0] + "|" + row[1]
+        let mut dup = false
+        let mut s = 0
+        while s < seen.len() { if seen[s] == key { dup = true; break } s = s + 1 }
+        if !dup { seen = seen + [key]; union_rows = union_rows + [row] }
+    }
+    let mut wi = 0
+    while wi < sig_an.len() {
+        let row = sig_an[wi]
+        wi = wi + 1
+        let key = row[0] + "|" + row[1]
+        let mut dup = false
+        let mut s = 0
+        while s < seen.len() { if seen[s] == key { dup = true; break } s = s + 1 }
+        if !dup { seen = seen + [key]; union_rows = union_rows + [row] }
+    }
+
+    let ts = _now_ts()
+    let session_fld = if session.len() > 0 { ",\"session\":" + _json_str(session) } else { "" }
+
+    // 2) 각 entry 의 3-way presence 계산 + emit
+    let mut emitted: [str] = []
+    let mut n_con = 0
+    let mut n_warn = 0
+    let mut n_part = 0
+    let mut n_orp = 0
+    let mut n_spec = 0
+
+    let limit = if sample > 0 { sample } else { union_rows.len() }
+    let mut r = 0
+    while r < union_rows.len() && r < limit {
+        let row = union_rows[r]
+        r = r + 1
+        let t = row[0]
+        let id = row[1]
+        let hash = _sha1_12(t + "|" + id)
+
+        // presence 계산
+        let mut nex = false
+        let mut n6p = false
+        let mut anm = false
+
+        if t == "S" {
+            // signal: anima atlas 가 정의 원천. repo-tag 로 3-way 해석.
+            if an_ok {
+                let tags = _signal_repo_tags(anima_atlas, id)
+                anm = true
+                if tags[3] == 1 { nex = true; n6p = true; anm = true }
+                else {
+                    if tags[0] == 1 { nex = true }
+                    if tags[1] == 1 { n6p = true }
+                    if tags[2] == 1 { anm = true }
+                }
+            }
+        } else {
+            // typed: 각 파일에서 직접 grep
+            if nx_ok { nex = _grep_typed(nexus_atlas, t, id) }
+            if n6_ok { n6p = _grep_typed(n6_atlas, t, id) }
+            if an_ok { anm = _grep_token(anima_atlas, id) }
+        }
+
+        // slot null (경로 부재) 반영
+        let nex_s = if !nx_ok { "null" } else { if nex { "true" } else { "false" } }
+        let n6_s  = if !n6_ok { "null" } else { if n6p { "true" } else { "false" } }
+        let an_s  = if !an_ok { "null" } else { if anm { "true" } else { "false" } }
+
+        // verdict
+        let mut verdict = "ORPHAN"
+        let mut sot = "none"
+        if !nx_ok || !n6_ok || !an_ok {
+            verdict = "SPEC_ONLY"
+        } else {
+            let mut tcnt = 0
+            if nex { tcnt = tcnt + 1 }
+            if n6p { tcnt = tcnt + 1 }
+            if anm { tcnt = tcnt + 1 }
+            if tcnt == 3 { verdict = "CONSENSUS"; sot = "all" }
+            else if tcnt == 2 { verdict = "PARTIAL" }
+            else if tcnt == 1 {
+                if nex && !anm { verdict = "WARN_ONE_SIDED"; sot = "nexus" }
+                else {
+                    verdict = "ORPHAN"
+                    if nex { sot = "nexus" }
+                    if n6p { sot = "n6" }
+                    if anm { sot = "anima" }
+                }
+            } else { verdict = "ORPHAN"; sot = "none" }
+        }
+
+        if verdict == "CONSENSUS"       { n_con  = n_con  + 1 }
+        if verdict == "WARN_ONE_SIDED"  { n_warn = n_warn + 1 }
+        if verdict == "PARTIAL"         { n_part = n_part + 1 }
+        if verdict == "ORPHAN"          { n_orp  = n_orp  + 1 }
+        if verdict == "SPEC_ONLY"       { n_spec = n_spec + 1 }
+
+        let line = "{\"ts\":" + to_string(ts)
+            + ",\"entry_id\":" + _json_str(id)
+            + ",\"entry_type\":\"" + t + "\""
+            + ",\"entry_hash\":\"" + hash + "\""
+            + ",\"nexus\":" + nex_s
+            + ",\"anima\":" + an_s
+            + ",\"n6\":" + n6_s
+            + ",\"verdict\":\"" + verdict + "\""
+            + ",\"source_of_truth\":\"" + sot + "\""
+            + session_fld + "}"
+        emitted = emitted + [line]
+    }
+
+    // 3) emit: append-only or stdout
+    if dry {
+        let mut k = 0
+        while k < emitted.len() { println(emitted[k]); k = k + 1 }
+    } else {
+        // atomic append via shell
+        let mut payload = ""
+        let mut k = 0
+        while k < emitted.len() { payload = payload + emitted[k] + "\n"; k = k + 1 }
+        // printf-fed append (대용량 시 주의 — 파일 write_file 헬퍼 없을 경우 exec 경로 사용).
+        // 회피: tmp 에 쓰고 cat >> 로 append.
+        let tmp = "/tmp/atlas_cross_ref_batch_" + to_string(ts) + ".ndjson"
+        write_file(tmp, payload)
+        exec("cat " + _sh_quote(tmp) + " >> " + _sh_quote(out_path))
+        exec("rm -f " + _sh_quote(tmp))
+    }
+
+    // 4) summary on stderr (ai-native channel)
+    let summary = "{\"ts\":" + to_string(ts)
+        + ",\"emitted\":" + to_string(emitted.len())
+        + ",\"consensus\":" + to_string(n_con)
+        + ",\"warn_one_sided\":" + to_string(n_warn)
+        + ",\"partial\":" + to_string(n_part)
+        + ",\"orphan\":" + to_string(n_orp)
+        + ",\"spec_only\":" + to_string(n_spec)
+        + ",\"out\":" + _json_str(out_path)
+        + ",\"session\":" + _json_str(session)
+        + ",\"sources\":{\"nexus\":" + (if nx_ok { "true" } else { "false" })
+        + ",\"n6\":" + (if n6_ok { "true" } else { "false" })
+        + ",\"anima\":" + (if an_ok { "true" } else { "false" }) + "}"
+        + "}"
+    eprintln("NEXUS_ATLAS_RECONCILE " + summary)
+    println("__ATLAS_RECONCILE__ emitted=" + to_string(emitted.len())
+        + " CONSENSUS=" + to_string(n_con)
+        + " WARN=" + to_string(n_warn)
+        + " PARTIAL=" + to_string(n_part)
+        + " ORPHAN=" + to_string(n_orp)
+        + " SPEC_ONLY=" + to_string(n_spec))
+}
+
+main()
