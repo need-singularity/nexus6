@@ -1,0 +1,500 @@
+// ═══════════════════════════════════════════════════════════
+// run_all.hexa — CLM deterministic verifier orchestrator
+//
+// 역할: manifest.jsonl + verify_*.hexa 을 전수 실행, __VERIFY_RESULT__
+//       sentinel 을 수집 → gate-level aggregate + SSOT 리포트 emit.
+//
+// SSOT design: /Users/ghost/Dev/anima/docs/alm_clm_verifier_design_20260420.md §7
+//
+// 원칙:
+//   - LLM judge 금지 (sentinel 은 각 stub 이 deterministic 계산).
+//   - stub 이 없는 manifest 라인 = SKIP (미구현).
+//   - manifest 에 없는 stub = ORPHAN (경고).
+//   - exit code 0 = 모두 PASS (또는 SKIP), 1 = 1건 이상 FAIL.
+//
+// Usage:
+//   hexa run shared/calc/clm_verify/run_all.hexa
+//   hexa run shared/calc/clm_verify/run_all.hexa --gate G_INPUT
+//   hexa run shared/calc/clm_verify/run_all.hexa --round r5
+//   hexa run shared/calc/clm_verify/run_all.hexa --json
+//
+// SSOT out: shared/state/clm_r{N}_verify_report.json
+// ═══════════════════════════════════════════════════════════
+
+let TRACK = "clm"
+
+let REPO_ROOT = exec("git rev-parse --show-toplevel 2>/dev/null").trim()
+let VERIFY_DIR = REPO_ROOT + "/shared/calc/" + TRACK + "_verify"
+let MANIFEST = VERIFY_DIR + "/manifest.jsonl"
+let STATE_DIR = REPO_ROOT + "/shared/state"
+
+// Resolve hexa binary for nested stub runs. PATH may have an older brew
+// `hexa` (no `run` subcmd) ahead of the stage1 one. Prefer HEXA_LANG,
+// then ~/.hx/bin/hexa, then fallback to bare "hexa".
+fn resolve_hexa_bin() -> string {
+    let hl = env("HEXA_LANG")
+    if hl != "" {
+        let cand = hl + "/hexa"
+        if file_exists(cand) { return cand }
+    }
+    let home = env("HOME")
+    if home != "" {
+        let cand = home + "/.hx/bin/hexa"
+        if file_exists(cand) { return cand }
+    }
+    return "hexa"
+}
+
+let HEXA_BIN = resolve_hexa_bin()
+
+// ─── helpers (stage1 hexa-lang 함정 회피) ───
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn safe_read(path: string) -> string {
+    // read_file on missing file returns Error type, not "".
+    // Probe via .split("\n") which coerces Error to [""].
+    let raw = read_file(path)
+    let parts = raw.split("\n")
+    if parts.len() == 1 && parts[0] == "" { return "" }
+    return raw
+}
+
+fn json_escape(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", "\\n")
+    r = r.replace("\r", "")
+    r = r.replace("\t", " ")
+    return r
+}
+
+// Flat key:value JSON extractor (manifest 은 우리가 emit 이라 안전).
+fn jget(line: string, key: string) -> string {
+    let pat = "\"" + key + "\":\""
+    let i = line.index_of(pat)
+    if i < 0 { return "" }
+    let start = i + len(pat)
+    let mut j: i64 = start
+    let n = len(line)
+    while j < n {
+        let ch = line.substring(j, j + 1)
+        if ch == "\\" { j = j + 2; continue }
+        if ch == "\"" { break }
+        j = j + 1
+    }
+    if j >= n { return "" }
+    return line.substring(start, j).replace("\\\"", "\"").replace("\\\\", "\\")
+}
+
+// Sentinel line: "__VERIFY_RESULT__ <id> PASS|FAIL <actual> vs <target>"
+fn find_sentinel(stdout: string) -> string {
+    let lines = stdout.split("\n")
+    let mut found = ""
+    for raw in lines {
+        let l = _str(raw).trim()
+        if l.starts_with("__VERIFY_RESULT__ ") {
+            found = l
+        }
+    }
+    return found
+}
+
+fn parse_sentinel_status(sentinel: string) -> string {
+    if sentinel == "" { return "" }
+    let rest = sentinel.substring(len("__VERIFY_RESULT__ "), len(sentinel))
+    let parts = rest.split(" ")
+    if parts.len() < 2 { return "" }
+    return _str(parts[1])
+}
+
+fn parse_sentinel_actual(sentinel: string) -> string {
+    if sentinel == "" { return "" }
+    let rest = sentinel.substring(len("__VERIFY_RESULT__ "), len(sentinel))
+    let parts = rest.split(" ")
+    if parts.len() < 3 { return "" }
+    let vs_idx = rest.index_of(" vs ")
+    if vs_idx < 0 { return _str(parts[2]) }
+    let prefix_len = len(_str(parts[0])) + 1 + len(_str(parts[1])) + 1
+    if prefix_len >= vs_idx { return "" }
+    return rest.substring(prefix_len, vs_idx)
+}
+
+fn parse_sentinel_target(sentinel: string) -> string {
+    if sentinel == "" { return "" }
+    let vs_idx = sentinel.index_of(" vs ")
+    if vs_idx < 0 { return "" }
+    return sentinel.substring(vs_idx + 4, len(sentinel)).trim()
+}
+
+fn gate_order(g: string) -> i64 {
+    if g == "G_INPUT" { return 1 }
+    if g == "G_SUBSTRATE" { return 2 }
+    if g == "G_TRAIN" { return 3 }
+    if g == "G_EVAL" { return 4 }
+    if g == "G_VALIDITY" { return 5 }
+    if g == "G_ARTIFACT" { return 6 }
+    if g == "G_DECISION" { return 7 }
+    return 99
+}
+
+fn gate_label(g: string) -> string {
+    let pad = "            "
+    let combined = g + pad
+    return combined.substring(0, 12)
+}
+
+// ─── main ───
+
+fn main() {
+    let argv = args()
+    let mut filter_gate = ""
+    let mut filter_round = ""
+    let mut json_only = false
+
+    let mut i: i64 = 2
+    while i < argv.len() {
+        let a = _str(argv[i])
+        if a == "--gate" && i + 1 < argv.len() {
+            filter_gate = _str(argv[i + 1])
+            i = i + 2
+            continue
+        }
+        if a == "--round" && i + 1 < argv.len() {
+            filter_round = _str(argv[i + 1])
+            i = i + 2
+            continue
+        }
+        if a == "--json" {
+            json_only = true
+            i = i + 1
+            continue
+        }
+        i = i + 1
+    }
+
+    if !file_exists(MANIFEST) {
+        eprintln("ERR: manifest not found: " + MANIFEST)
+        exit(2)
+    }
+
+    let raw = safe_read(MANIFEST)
+    if raw == "" {
+        eprintln("ERR: manifest empty")
+        exit(2)
+    }
+
+    let manifest_lines = raw.split("\n")
+    let mut manifest_count: i64 = 0
+    for raw_l in manifest_lines {
+        let l = _str(raw_l).trim()
+        if l != "" && l.starts_with("{") { manifest_count = manifest_count + 1 }
+    }
+
+    let listing = _str(exec("ls " + VERIFY_DIR + "/verify_*.hexa 2>/dev/null")).trim()
+    let mut stub_count: i64 = 0
+    for raw_p in listing.split("\n") {
+        let p = _str(raw_p).trim()
+        if p != "" { stub_count = stub_count + 1 }
+    }
+
+    let now_ts = _str(exec("date '+%Y-%m-%d %H:%M:%S' 2>/dev/null")).trim()
+    let now_iso = _str(exec("date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null")).trim()
+
+    let mut primary_round = filter_round
+    if primary_round == "" {
+        for raw_l in manifest_lines {
+            let l = _str(raw_l).trim()
+            if l == "" || !l.starts_with("{") { continue }
+            let r = jget(l, "round")
+            if r != "" { primary_round = r; break }
+        }
+    }
+    if primary_round == "" { primary_round = "unknown" }
+
+    if !json_only {
+        println("=== CLM Verifier Run (round=" + primary_round + ", date=" + now_ts + ") ===")
+        println("manifest: " + MANIFEST + " (" + to_string(manifest_count) + " claims)")
+        println("stubs:    " + VERIFY_DIR + "/verify_*.hexa (" + to_string(stub_count) + " files)")
+        println("")
+    }
+
+    let mut ids: [string] = []
+    let mut gates: [string] = []
+    let mut rounds: [string] = []
+    let mut hyps: [string] = []
+    let mut statuses: [string] = []
+    let mut actuals: [string] = []
+    let mut targets: [string] = []
+    let mut reasons: [string] = []
+
+    let mut total: i64 = 0
+    let mut n_pass: i64 = 0
+    let mut n_fail: i64 = 0
+    let mut n_skip: i64 = 0
+
+    for raw_l in manifest_lines {
+        let l = _str(raw_l).trim()
+        if l == "" || !l.starts_with("{") { continue }
+
+        let id = jget(l, "id")
+        let gate = jget(l, "gate")
+        let round = jget(l, "round")
+        let hyp = jget(l, "hyp")
+        let target = jget(l, "target")
+        let deprecated = jget(l, "deprecated")
+
+        if id == "" { continue }
+        if deprecated == "true" { continue }
+
+        if filter_gate != "" && gate != filter_gate { continue }
+        if filter_round != "" && round != filter_round { continue }
+
+        total = total + 1
+
+        let stub_path = VERIFY_DIR + "/verify_" + id + ".hexa"
+        let mut status = ""
+        let mut actual = ""
+        let mut observed_target = target
+        let mut reason = ""
+
+        if !file_exists(stub_path) {
+            status = "SKIP"
+            reason = "stub missing: verify_" + id + ".hexa"
+            n_skip = n_skip + 1
+        } else {
+            let cmd = HEXA_BIN + " run " + stub_path + " 2>&1"
+            let out = _str(exec(cmd))
+            let sentinel = find_sentinel(out)
+            if sentinel == "" {
+                status = "FAIL"
+                actual = "no sentinel"
+                reason = "stub did not emit __VERIFY_RESULT__"
+                n_fail = n_fail + 1
+            } else {
+                let s = parse_sentinel_status(sentinel)
+                let a = parse_sentinel_actual(sentinel)
+                let t = parse_sentinel_target(sentinel)
+                status = s
+                actual = a
+                if t != "" { observed_target = t }
+                if status == "PASS" {
+                    n_pass = n_pass + 1
+                } else if status == "FAIL" {
+                    n_fail = n_fail + 1
+                    reason = "closure violated (" + gate + ")"
+                } else {
+                    status = "FAIL"
+                    actual = "unknown status: " + s
+                    reason = "stub sentinel malformed"
+                    n_fail = n_fail + 1
+                }
+            }
+        }
+
+        if !json_only {
+            let tag = "[" + status + "]"
+            let line_out = tag + " " + id + "  —  " + actual + " vs " + observed_target
+            if status == "FAIL" && reason != "" {
+                println(line_out + "  (gate=" + gate + ", " + reason + ")")
+            } else if status == "SKIP" {
+                println(line_out + "  (" + reason + ")")
+            } else {
+                println(line_out)
+            }
+        }
+
+        ids.push(id)
+        gates.push(gate)
+        rounds.push(round)
+        hyps.push(hyp)
+        statuses.push(status)
+        actuals.push(actual)
+        targets.push(observed_target)
+        reasons.push(reason)
+    }
+
+    let mut uniq_gates: [string] = []
+    let mut k: i64 = 0
+    while k < gates.len() {
+        let g = _str(gates[k])
+        let mut seen = false
+        let mut u: i64 = 0
+        while u < uniq_gates.len() {
+            if _str(uniq_gates[u]) == g { seen = true; break }
+            u = u + 1
+        }
+        if !seen && g != "" { uniq_gates.push(g) }
+        k = k + 1
+    }
+
+    let mut sorted_gates: [string] = []
+    let mut u: i64 = 0
+    while u < uniq_gates.len() {
+        sorted_gates.push(_str(uniq_gates[u]))
+        u = u + 1
+    }
+    let mut a: i64 = 0
+    while a < sorted_gates.len() {
+        let mut b: i64 = a + 1
+        while b < sorted_gates.len() {
+            if gate_order(_str(sorted_gates[a])) > gate_order(_str(sorted_gates[b])) {
+                let tmp = _str(sorted_gates[a])
+                sorted_gates[a] = _str(sorted_gates[b])
+                sorted_gates[b] = tmp
+            }
+            b = b + 1
+        }
+        a = a + 1
+    }
+
+    if !json_only {
+        println("")
+        println("=== Summary ===")
+        let pct = if total > 0 { (n_pass * 100) / total } else { 0 }
+        println("Total: " + to_string(total) + "   PASS: " + to_string(n_pass) + " (" + to_string(pct) + "%)   FAIL: " + to_string(n_fail) + "   SKIP: " + to_string(n_skip))
+        println("")
+        println("Gate-level:")
+    }
+
+    let mut gate_json = ""
+    let mut gi: i64 = 0
+    while gi < sorted_gates.len() {
+        let g = _str(sorted_gates[gi])
+        let mut g_pass: i64 = 0
+        let mut g_fail: i64 = 0
+        let mut g_skip: i64 = 0
+        let mut g_total: i64 = 0
+        let mut x: i64 = 0
+        while x < gates.len() {
+            if _str(gates[x]) == g {
+                g_total = g_total + 1
+                let st = _str(statuses[x])
+                if st == "PASS" { g_pass = g_pass + 1 }
+                else if st == "FAIL" { g_fail = g_fail + 1 }
+                else if st == "SKIP" { g_skip = g_skip + 1 }
+            }
+            x = x + 1
+        }
+        // Marker precedence:
+        //   FAIL     — any fail in gate (blocking)
+        //   PENDING  — no fail, but skips remain (stubs missing)
+        //   PASS     — all pass
+        let marker = if g_fail > 0 { "FAIL" }
+                     else if g_skip > 0 && g_pass == 0 { "PENDING" }
+                     else if g_skip > 0 { "PARTIAL" }
+                     else { "PASS" }
+
+        if !json_only {
+            let label = gate_label(g)
+            println("  " + label + ": " + to_string(g_pass) + "/" + to_string(g_total) + " PASS  " + marker)
+        }
+
+        if gate_json != "" { gate_json = gate_json + "," }
+        gate_json = gate_json + "\"" + g + "\":{"
+        gate_json = gate_json + "\"total\":" + to_string(g_total)
+        gate_json = gate_json + ",\"pass\":" + to_string(g_pass)
+        gate_json = gate_json + ",\"fail\":" + to_string(g_fail)
+        gate_json = gate_json + ",\"skip\":" + to_string(g_skip)
+        gate_json = gate_json + ",\"marker\":\"" + marker + "\"}"
+
+        gi = gi + 1
+    }
+
+    let mut decision = "PENDING"
+    let mut reason_text = ""
+    if n_fail > 0 {
+        decision = "DISCARD"
+        let mut blockers = ""
+        let mut gj: i64 = 0
+        while gj < sorted_gates.len() {
+            let g = _str(sorted_gates[gj])
+            let mut g_fail: i64 = 0
+            let mut y: i64 = 0
+            while y < gates.len() {
+                if _str(gates[y]) == g && _str(statuses[y]) == "FAIL" { g_fail = g_fail + 1 }
+                y = y + 1
+            }
+            if g_fail > 0 {
+                if blockers != "" { blockers = blockers + " + " }
+                blockers = blockers + g + "(" + to_string(g_fail) + ")"
+            }
+            gj = gj + 1
+        }
+        reason_text = blockers + " failed — cannot deploy checkpoint."
+    } else if n_skip > 0 {
+        decision = "PENDING"
+        reason_text = to_string(n_skip) + " claims lack stubs — complete generator.hexa --emit first."
+    } else if total > 0 {
+        decision = "KEEP"
+        reason_text = "all " + to_string(total) + " deterministic gates PASS."
+    } else {
+        decision = "PENDING"
+        reason_text = "no claims matched filter."
+    }
+
+    if !json_only {
+        println("")
+        println("=== Decision ===")
+        println("Overall: " + decision)
+        println("reason: " + reason_text)
+    }
+
+    let out_path = STATE_DIR + "/clm_" + primary_round + "_verify_report.json"
+
+    let mut individual_json = ""
+    let mut ri: i64 = 0
+    while ri < ids.len() {
+        if individual_json != "" { individual_json = individual_json + "," }
+        individual_json = individual_json + "{"
+        individual_json = individual_json + "\"id\":\"" + json_escape(_str(ids[ri])) + "\""
+        individual_json = individual_json + ",\"gate\":\"" + json_escape(_str(gates[ri])) + "\""
+        individual_json = individual_json + ",\"round\":\"" + json_escape(_str(rounds[ri])) + "\""
+        individual_json = individual_json + ",\"hyp\":\"" + json_escape(_str(hyps[ri])) + "\""
+        individual_json = individual_json + ",\"status\":\"" + json_escape(_str(statuses[ri])) + "\""
+        individual_json = individual_json + ",\"actual\":\"" + json_escape(_str(actuals[ri])) + "\""
+        individual_json = individual_json + ",\"target\":\"" + json_escape(_str(targets[ri])) + "\""
+        individual_json = individual_json + ",\"reason\":\"" + json_escape(_str(reasons[ri])) + "\""
+        individual_json = individual_json + "}"
+        ri = ri + 1
+    }
+
+    let mut report = "{"
+    report = report + "\"track\":\"clm\""
+    report = report + ",\"round\":\"" + primary_round + "\""
+    report = report + ",\"run_ts\":\"" + now_iso + "\""
+    report = report + ",\"filter_gate\":\"" + filter_gate + "\""
+    report = report + ",\"filter_round\":\"" + filter_round + "\""
+    report = report + ",\"total\":" + to_string(total)
+    report = report + ",\"pass\":" + to_string(n_pass)
+    report = report + ",\"fail\":" + to_string(n_fail)
+    report = report + ",\"skip\":" + to_string(n_skip)
+    report = report + ",\"manifest_count\":" + to_string(manifest_count)
+    report = report + ",\"stub_count\":" + to_string(stub_count)
+    report = report + ",\"gate_breakdown\":{" + gate_json + "}"
+    report = report + ",\"individual_results\":[" + individual_json + "]"
+    report = report + ",\"overall_decision\":\"" + decision + "\""
+    report = report + ",\"decision_reason\":\"" + json_escape(reason_text) + "\""
+    report = report + "}\n"
+
+    try { write_file(out_path, report) } catch e {
+        eprintln("ERR: SSOT write failed: " + out_path)
+    }
+
+    if json_only {
+        print(report)
+    } else {
+        println("")
+        println("=== SSOT 저장 ===")
+        println(out_path)
+    }
+
+    if n_fail > 0 { exit(1) }
+}
+
+main()
