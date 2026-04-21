@@ -10,6 +10,6 @@
 >
 > **[💎 HEXA-LANG](https://github.com/need-singularity/hexa-lang)** — The Perfect Number Programming Language. Working compiler + REPL.
 >
-> **[📄 Papers](https://github.com/need-singularity/papers)** — Complete paper collection (92 papers, Zenodo DOIs).
+> **[📄 Papers](https://github.com/need-singularity/papers)** — Complete paper collection (87 papers, Zenodo DOIs).
 
 <!-- private repos는 projects.json의 private_repos 필드에 저장됨 (노출 금지) -->
