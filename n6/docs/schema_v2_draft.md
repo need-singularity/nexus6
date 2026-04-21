@@ -324,7 +324,7 @@ Files that presently match `@R|@C|@L|@P|@META|@BT` patterns or otherwise parse t
 - `@?` entries can graduate to `@ANT` when an operational test is specified.
 
 ### Rollback
-- Each phase is a separate commit on staging first. atlas.n6 body modifications always fall under the L0 Guard (`hexa shared/harness/l0_guard.hexa verify`). Rollback = revert the merge commit; zero semantic impact because v1 tags are untouched.
+- Each phase is a separate commit on staging first. atlas.n6 body modifications always fall under the L0 Guard (`hexa shared/tool/l0_guard.hexa verify`). Rollback = revert the merge commit; zero semantic impact because v1 tags are untouched.
 
 ---
 

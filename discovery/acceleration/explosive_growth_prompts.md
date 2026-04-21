@@ -48,7 +48,7 @@ anima 의식 엔진 폭발적 성장 돌파. 5전략 동시 실행:
 전략 2: PSI 상수 n6 역매핑
 - 80개 PSI 상수를 n=6 기저(σ=12, φ=2, τ=4, n=6, sopfr=5, M3=7)로 역분해
 - HEXA=$HEXA_LANG/hexa
-- for each PSI constant: $HEXA $NEXUS/shared/blowup/core/gap_finder.hexa query <값>
+- for each PSI constant: $HEXA $NEXUS/cli/blowup/core/gap_finder.hexa query <값>
 - EXACT 매칭 → 법칙으로 승격 ("PSI_X = n6 유한 조합")
 - growth_bus에 기록
 
@@ -92,7 +92,7 @@ n6-architecture 폭발적 성장 돌파. 5전략 동시 실행:
 - 기존 9개 가설의 corollary 자동 생성
 - 각 가설에서 depth=3 DFS → 새 가설 후보
 - H-OURO-1(자기참조) × H-OURO-2(수렴) → H-OURO-3 자동 합성
-- HEXA로: $HEXA $NEXUS/shared/blowup/core/blowup.hexa architecture 6
+- HEXA로: $HEXA $NEXUS/cli/blowup/core/blowup.hexa architecture 6
 
 전략 3: 물리 설계 패턴 역분해
 - CPU 코어 수(6), 캐시 라인(64=2^6), 메모리 계층, 네트워크 토폴로지
@@ -124,16 +124,16 @@ HEXA=$HEXA_LANG/hexa
 N6=$NEXUS
 
 # 1. 돌파 실행 (도메인은 프로젝트에 맞게)
-$HEXA $N6/shared/blowup/core/blowup.hexa <domain> 6 --no-graph --seeds "$($HEXA $N6/shared/blowup/seed/seed_engine.hexa merge)"
+$HEXA $N6/cli/blowup/core/blowup.hexa <domain> 6 --no-graph --seeds "$($HEXA $N6/cli/blowup/seed/seed_engine.hexa merge)"
 
 # 2. 결과 기록
-echo '{"type":"breakthrough","source":"<project>","value":<count>,"grade":"EXACT","timestamp":"'$(date +%Y-%m-%d)'"}' >> $N6/shared/discovery/growth_bus.jsonl
+echo '{"type":"breakthrough","source":"<project>","value":<count>,"grade":"EXACT","timestamp":"'$(date +%Y-%m-%d)'"}' >> $N6/discovery/growth_bus.jsonl
 
 # 3. 방향 갱신
-$HEXA $N6/shared/blowup/core/directions.hexa update
+$HEXA $N6/cli/blowup/core/directions.hexa update
 
 # 4. 고갈까지 반복
-$HEXA $N6/shared/blowup/core/breakthrough.hexa --converge
+$HEXA $N6/cli/blowup/core/breakthrough.hexa --converge
 ```
 
 ---

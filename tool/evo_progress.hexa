@@ -1,0 +1,510 @@
+// @no-sandbox       — 읽기 집계 + JSON writer, launchd sandbox 불필요
+// @no-lock-needed   — 단발 실행 (aggregate → write), 동시 호출 안전
+// evo_progress.hexa — EVO-P7-1 nexus 자기진화 로그 집계 → 2087 target 진척 (N6ARCH cross-ref)
+//
+// 역할: nexus harness 진화 로그 N종 → row count / 시간범위 / 7d·30d delta 집계
+//        + n6-architecture 연결 (edges 2087 target, nodes 515 target) closure 계산
+//        + N6ARCH 관련 log 필터 count
+//
+// 2087 target 정의:
+//   shared/bisociation/unified/ouroboros_unified.hexa:22
+//   -> comptime const N6ARCH_EDGE_TARGET = 2087
+//   authoritative graph: ~/dev/n6-architecture/n6shared/discovery_graph.json (meta.total_edges)
+//   rosetta: shared/bisociation/unified/rosetta_ouroboros.jsonl:49 (edges_target:2087,closure)
+//
+// SSOT out:
+//   shared/reports/evo_progress_<YYYYMMDD>.json   (통계 스냅샷)
+//   shared/reports/evo_progress_latest.json       (항상 최신 복사본)
+//
+// usage:
+//   hexa run shared/tool/evo_progress.hexa              — 전체 집계 + JSON 갱신
+//   hexa run shared/tool/evo_progress.hexa json         — stdout JSON 만 (write skip)
+//   hexa run shared/tool/evo_progress.hexa smoke        — 요약 1줄 + 경로
+//
+// 성공 조용: 정상 시 산출 파일 경로만 stdout, 에러만 stderr.
+
+let HOME = env("HOME")
+let NEXUS_ENV = env("NEXUS")
+let NEXUS = if NEXUS_ENV == "" { HOME + "/Dev/nexus" } else { NEXUS_ENV }
+let HARNESS = NEXUS + "/harness"
+let REPORTS = NEXUS + "/reports"
+
+// 로그 소스 (nexus harness SSOT) — single-line (hexa parser multi-line array 미지원)
+let LOG_FILES = ["growth_tick_log.jsonl", "mistakes.jsonl", "roadmap_sync.jsonl", "broadcast.jsonl", "bt_metacog_log.jsonl", "evolve_history.jsonl", "work_registry.jsonl", "commit_log.jsonl", "thinking_log.jsonl", "loop_state.jsonl"]
+
+// n6-architecture authoritative graph (목표 state 소스)
+// TBD: 향후 ~/dev/n6-architecture 경로가 이동되면 shared/config/projects.json 참조로 전환
+let N6ARCH_GRAPH_CANDIDATES = [HOME + "/Dev/n6-architecture/n6shared/discovery_graph.json", HOME + "/dev/n6-architecture/n6shared/discovery_graph.json"]
+
+// 2087 target (N6ARCH_EDGE_TARGET), 515 secondary (N6ARCH_NODE_TARGET)
+let EDGE_TARGET: i64 = 2087
+let NODE_TARGET: i64 = 515
+
+let JSON_LATEST = REPORTS + "/evo_progress_latest.json"
+
+// ─── void-safe helpers ───
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _to_int0(s: string) -> i64 {
+    if s == "" { return 0 }
+    let first = _str(s.split("\n")[0]).trim()
+    if first == "" { return 0 }
+    return to_int(first)
+}
+
+fn now_unix() -> i64 {
+    return _to_int0(_str(exec("date +%s")).trim())
+}
+
+fn iso_now() -> string {
+    return _str(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()
+}
+
+fn ymd_today() -> string {
+    return _str(exec("date +%Y%m%d")).trim()
+}
+
+fn json_escape(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", " ")
+    r = r.replace("\r", " ")
+    r = r.replace("\t", " ")
+    return r
+}
+
+fn ensure_reports() {
+    let _ = exec("mkdir -p '" + REPORTS + "' 2>/dev/null")  // @allow-bare-exec
+}
+
+// ─── JSON 단순 필드 추출 (ledger_bi.hexa 패턴 재사용) ───
+fn json_field(line: string, key: string) -> string {
+    let tag = "\"" + key + "\""
+    if line.contains(tag) == false { return "" }
+    let after = line.split(tag)[1]
+    let parts = after.split(":")
+    if parts.len() < 2 { return "" }
+    let mut rest = parts[1]
+    let mut i = 2
+    while i < parts.len() {
+        rest = rest + ":" + parts[i]
+        i = i + 1
+    }
+    let s = rest.trim()
+    if s.len() == 0 { return "" }
+    if s.substring(0, 1) == "\"" {
+        let inner = s.substring(1, s.len())
+        let end = inner.index_of("\"")
+        if end < 0 { return "" }
+        return inner.substring(0, end)
+    }
+    let mut v = ""
+    let mut j = 0
+    while j < s.len() {
+        let ch = s.substring(j, j + 1)
+        if ch == "," || ch == "}" || ch == " " { break }
+        v = v + ch
+        j = j + 1
+    }
+    return v
+}
+
+// ─── timestamp 파싱: int unix 또는 ISO 8601 (날짜 성분만, 빠른 경로) ───
+// ISO 는 YYYY-MM-DDTHH:MM:SSZ — shell date 호출 없이 month/day 성분 파싱하여 unix 근사
+// (1-day 해상도면 7d/30d bucket 충분; 이 엔진 목적은 delta count, 정밀 시각 아님)
+// 2026-01-01 = unix 1767225600 (base anchor)
+// day offset = (YYYY-2026)*365 + month_cumulative[mm] + dd-1
+// month_cumulative: [0,31,59,90,120,151,181,212,243,273,304,334]  (non-leap 2026)
+
+let MONTH_CUMUL = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+let ANCHOR_UNIX_2026 = 1767225600  // 2026-01-01T00:00:00Z
+
+fn parse_iso_fast(s: string) -> i64 {
+    // expect YYYY-MM-DDTHH:MM:SSZ (len >= 20)
+    if s.len() < 10 { return 0 }
+    let ys = s.substring(0, 4)
+    let ms = s.substring(5, 7)
+    let ds = s.substring(8, 10)
+    let y = _to_int0(ys)
+    let mo = _to_int0(ms)
+    let d = _to_int0(ds)
+    if y < 2000 || y > 2100 { return 0 }
+    if mo < 1 || mo > 12 { return 0 }
+    if d < 1 || d > 31 { return 0 }
+    // days since 2026-01-01
+    let year_diff: i64 = y - 2026
+    let month_idx: i64 = mo - 1
+    let days: i64 = year_diff * 365 + MONTH_CUMUL[month_idx] + d - 1
+    // add HH:MM:SS if present (14=T, 16=MM, 19=SS)
+    let mut sec_of_day: i64 = 0
+    if s.len() >= 19 {
+        let hh = _to_int0(s.substring(11, 13))
+        let mm = _to_int0(s.substring(14, 16))
+        let ss = _to_int0(s.substring(17, 19))
+        sec_of_day = hh * 3600 + mm * 60 + ss
+    }
+    return ANCHOR_UNIX_2026 + days * 86400 + sec_of_day
+}
+
+fn is_digit(ch: string) -> bool {
+    // hexa-lang: string >=/<= 비교 미지원 → 10개 리터럴 매칭으로 우회
+    if ch == "0" { return true }
+    if ch == "1" { return true }
+    if ch == "2" { return true }
+    if ch == "3" { return true }
+    if ch == "4" { return true }
+    if ch == "5" { return true }
+    if ch == "6" { return true }
+    if ch == "7" { return true }
+    if ch == "8" { return true }
+    if ch == "9" { return true }
+    return false
+}
+
+fn parse_ts(raw: string) -> i64 {
+    let s = raw.trim()
+    if s.len() == 0 { return 0 }
+    let first = s.substring(0, 1)
+    // 숫자만(ISO 가 아니면) → unix
+    if is_digit(first) && s.contains("-") == false && s.contains("T") == false {
+        let n = _to_int0(s)
+        if n > 20000000000 { return n / 1000 }  // ms → s
+        return n
+    }
+    // ISO 8601 (fast path, no shell)
+    if s.len() >= 10 && s.substring(4, 5) == "-" { return parse_iso_fast(s) }
+    return 0
+}
+
+// ─── JSONL 라인에서 ts 추출 (여러 필드명 시도) ───
+// hot path — ts 필드가 가장 흔함, 그것만 fastpath 후 fallback
+// work_registry.jsonl 은 ts_start 사용
+fn extract_ts(line: string) -> i64 {
+    let v1 = json_field(line, "ts")
+    if v1.len() > 0 && v1 != "null" {
+        let p = parse_ts(v1)
+        if p > 0 { return p }
+    }
+    let v2 = json_field(line, "timestamp")
+    if v2.len() > 0 && v2 != "null" {
+        let p = parse_ts(v2)
+        if p > 0 { return p }
+    }
+    let v3 = json_field(line, "time")
+    if v3.len() > 0 && v3 != "null" {
+        let p = parse_ts(v3)
+        if p > 0 { return p }
+    }
+    let v4 = json_field(line, "ts_start")
+    if v4.len() > 0 && v4 != "null" {
+        let p = parse_ts(v4)
+        if p > 0 { return p }
+    }
+    return 0
+}
+
+// ─── N6ARCH 관련 라인 판정 ───
+fn is_n6_related(line: string) -> bool {
+    let l = line.to_lower()
+    if l.contains("n6-arch") { return true }
+    if l.contains("n6_arch") { return true }
+    if l.contains("n6arch") { return true }
+    if l.contains("\"n6\"") { return true }
+    if l.contains("n6-architecture") { return true }
+    if l.contains("2087") { return true }
+    if l.contains("ouroboros") { return true }
+    if l.contains("discovery_graph") { return true }
+    return false
+}
+
+// ─── log 1건 집계 ───
+struct LogStat {
+    name: string,
+    path: string,
+    exists: bool,
+    rows: i64,
+    rows_7d: i64,
+    rows_30d: i64,
+    n6_related: i64,
+    ts_min: i64,
+    ts_max: i64
+}
+
+fn aggregate_log(name: string, path: string, now: i64) -> LogStat {
+    let cutoff_7d = now - 7 * 86400
+    let cutoff_30d = now - 30 * 86400
+
+    let mut rows: i64 = 0
+    let mut rows_7d: i64 = 0
+    let mut rows_30d: i64 = 0
+    let mut n6_rel: i64 = 0
+    let mut ts_min: i64 = 0
+    let mut ts_max: i64 = 0
+
+    let mut raw = ""
+    let mut exists = false
+    try {
+        raw = _str(read_file(path))
+        exists = true
+    } catch e {
+        // 파일 부재 — 전부 0
+        return LogStat { name: name, path: path, exists: false, rows: 0, rows_7d: 0, rows_30d: 0, n6_related: 0, ts_min: 0, ts_max: 0 }
+    }
+    if raw.len() == 0 {
+        return LogStat { name: name, path: path, exists: exists, rows: 0, rows_7d: 0, rows_30d: 0, n6_related: 0, ts_min: 0, ts_max: 0 }
+    }
+
+    let lines = raw.split("\n")
+    for line in lines {
+        let s = _str(line).trim()
+        if s.len() < 2 { continue }
+        if s.substring(0, 1) != "{" { continue }
+        rows = rows + 1
+
+        let ts = extract_ts(s)
+        if ts > 0 {
+            if ts_min == 0 || ts < ts_min { ts_min = ts }
+            if ts > ts_max { ts_max = ts }
+            if ts >= cutoff_7d { rows_7d = rows_7d + 1 }
+            if ts >= cutoff_30d { rows_30d = rows_30d + 1 }
+        }
+
+        if is_n6_related(s) { n6_rel = n6_rel + 1 }
+    }
+
+    return LogStat { name: name, path: path, exists: exists, rows: rows, rows_7d: rows_7d, rows_30d: rows_30d, n6_related: n6_rel, ts_min: ts_min, ts_max: ts_max }
+}
+
+// ─── n6-architecture 그래프 현 상태 추출 ───
+struct N6State {
+    graph_path: string,
+    graph_found: bool,
+    total_nodes: i64,
+    total_edges: i64,
+    last_updated: string,
+    version: string
+}
+
+fn read_n6_state() -> N6State {
+    let mut path = ""
+    for cand in N6ARCH_GRAPH_CANDIDATES {
+        // file_exists 는 hexa builtin (entry.hexa 에서 사용 중)
+        if file_exists(cand) {
+            path = cand
+            break
+        }
+    }
+    if path == "" {
+        return N6State { graph_path: "", graph_found: false, total_nodes: 0, total_edges: 0, last_updated: "", version: "" }
+    }
+
+    // 대형 JSON (수 MB) — jq/grep 없이 hexa read_file + 간단 파싱
+    // meta.total_nodes / meta.total_edges 만 필요 (최상위 아님 주의 — 중첩 meta 아래)
+    let mut raw = ""
+    try { raw = _str(read_file(path)) } catch e {
+        return N6State { graph_path: path, graph_found: false, total_nodes: 0, total_edges: 0, last_updated: "", version: "" }
+    }
+    if raw.len() == 0 {
+        return N6State { graph_path: path, graph_found: false, total_nodes: 0, total_edges: 0, last_updated: "", version: "" }
+    }
+
+    // meta 블록 찾기 (첫 1000자 내 존재 예상)
+    // "meta": { ... } 추출 후 내부 필드 추출
+    let meta_tag = "\"meta\""
+    let idx = raw.index_of(meta_tag)
+    if idx < 0 {
+        return N6State { graph_path: path, graph_found: true, total_nodes: 0, total_edges: 0, last_updated: "", version: "" }
+    }
+    // meta { 뒤 4000자 윈도우 (notes 제외 상위 필드용)
+    let after = raw.substring(idx, idx + 4000)
+
+    let total_nodes = _to_int0(json_field(after, "total_nodes"))
+    let total_edges = _to_int0(json_field(after, "total_edges"))
+    let last_updated = json_field(after, "last_updated")
+    let version = json_field(after, "version")
+
+    return N6State { graph_path: path, graph_found: true, total_nodes: total_nodes, total_edges: total_edges, last_updated: last_updated, version: version }
+}
+
+// ─── 출력 직렬화 ───
+fn logstat_to_json(s: LogStat) -> string {
+    let mut range = "null"
+    if s.ts_min > 0 && s.ts_max > 0 {
+        range = "{\"min\":" + to_string(s.ts_min) + ",\"max\":" + to_string(s.ts_max) + ",\"span_days\":" + to_string((s.ts_max - s.ts_min) / 86400) + "}"
+    }
+    let mut exists_str = "false"
+    if s.exists { exists_str = "true" }
+    let mut out = "{\"name\":\"" + s.name + "\","
+    out = out + "\"path\":\"" + json_escape(s.path) + "\","
+    out = out + "\"exists\":" + exists_str + ","
+    out = out + "\"rows\":" + to_string(s.rows) + ","
+    out = out + "\"rows_7d\":" + to_string(s.rows_7d) + ","
+    out = out + "\"rows_30d\":" + to_string(s.rows_30d) + ","
+    out = out + "\"n6_related\":" + to_string(s.n6_related) + ","
+    out = out + "\"ts_range\":" + range + "}"
+    return out
+}
+
+fn build_stats() -> string {
+    let now = now_unix()
+    let ts_iso = iso_now()
+
+    // 각 로그 집계
+    let mut stats = []
+    let mut total_rows: i64 = 0
+    let mut total_rows_7d: i64 = 0
+    let mut total_rows_30d: i64 = 0
+    let mut total_n6: i64 = 0
+    let mut active_logs: i64 = 0
+
+    for name in LOG_FILES {
+        let path = HARNESS + "/" + name
+        let st = aggregate_log(name, path, now)
+        stats = stats + [st]
+        total_rows = total_rows + st.rows
+        total_rows_7d = total_rows_7d + st.rows_7d
+        total_rows_30d = total_rows_30d + st.rows_30d
+        total_n6 = total_n6 + st.n6_related
+        if st.exists && st.rows > 0 { active_logs = active_logs + 1 }
+    }
+
+    // n6-arch 현재 state
+    let n6 = read_n6_state()
+
+    // 2087 target 진척 (edges 기준)
+    let edge_pct = if EDGE_TARGET > 0 { (n6.total_edges * 10000) / EDGE_TARGET } else { 0 }  // basis points
+    let node_pct = if NODE_TARGET > 0 { (n6.total_nodes * 10000) / NODE_TARGET } else { 0 }
+    let target_met = n6.total_edges >= EDGE_TARGET && n6.total_nodes >= NODE_TARGET
+
+    // evo-proxy metric (n6-arch graph 부재 시 fallback)
+    // proxy = growth_tick 활발성 × n6 cross-ref 비율
+    let first_stat = stats[0]  // growth_tick_log
+    let proxy_score = if total_rows > 0 { (total_n6 * 100) / total_rows } else { 0 }
+
+    // stats array 직렬화
+    let mut logs_json = "["
+    let mut i = 0
+    while i < stats.len() {
+        if i > 0 { logs_json = logs_json + "," }
+        logs_json = logs_json + logstat_to_json(stats[i])
+        i = i + 1
+    }
+    logs_json = logs_json + "]"
+
+    // n6 state
+    let mut graph_found_str = "false"
+    if n6.graph_found { graph_found_str = "true" }
+    let mut n6_json = "{\"graph_path\":\"" + json_escape(n6.graph_path) + "\","
+    n6_json = n6_json + "\"graph_found\":" + graph_found_str + ","
+    n6_json = n6_json + "\"total_nodes\":" + to_string(n6.total_nodes) + ","
+    n6_json = n6_json + "\"total_edges\":" + to_string(n6.total_edges) + ","
+    n6_json = n6_json + "\"version\":\"" + json_escape(n6.version) + "\","
+    n6_json = n6_json + "\"last_updated\":\"" + json_escape(n6.last_updated) + "\"}"
+
+    // target 진척
+    let mut target_met_str = "false"
+    if target_met { target_met_str = "true" }
+    let mut target_json = "{\"edge_target\":" + to_string(EDGE_TARGET) + ","
+    target_json = target_json + "\"node_target\":" + to_string(NODE_TARGET) + ","
+    target_json = target_json + "\"edges_current\":" + to_string(n6.total_edges) + ","
+    target_json = target_json + "\"nodes_current\":" + to_string(n6.total_nodes) + ","
+    target_json = target_json + "\"edges_pct_bp\":" + to_string(edge_pct) + ","
+    target_json = target_json + "\"nodes_pct_bp\":" + to_string(node_pct) + ","
+    target_json = target_json + "\"target_met\":" + target_met_str + ","
+    target_json = target_json + "\"source\":\"shared/bisociation/unified/ouroboros_unified.hexa:22 N6ARCH_EDGE_TARGET=2087\"}"
+
+    let mut summary_json = "{\"total_rows\":" + to_string(total_rows) + ","
+    summary_json = summary_json + "\"total_rows_7d\":" + to_string(total_rows_7d) + ","
+    summary_json = summary_json + "\"total_rows_30d\":" + to_string(total_rows_30d) + ","
+    summary_json = summary_json + "\"total_n6_related\":" + to_string(total_n6) + ","
+    summary_json = summary_json + "\"n6_ratio_pct\":" + to_string(proxy_score) + ","
+    summary_json = summary_json + "\"active_logs\":" + to_string(active_logs) + ","
+    summary_json = summary_json + "\"total_logs\":" + to_string(stats.len()) + "}"
+
+    let mut out = "{\"schema\":\"evo_progress/v1\","
+    out = out + "\"generated_at\":\"" + ts_iso + "\","
+    out = out + "\"generated_unix\":" + to_string(now) + ","
+    out = out + "\"roadmap_task\":\"EVO-P7-1\","
+    out = out + "\"target\":" + target_json + ","
+    out = out + "\"n6_state\":" + n6_json + ","
+    out = out + "\"summary\":" + summary_json + ","
+    out = out + "\"logs\":" + logs_json + "}"
+    return out
+}
+
+fn write_outputs(json: string) -> string {
+    ensure_reports()
+    let dated = REPORTS + "/evo_progress_" + ymd_today() + ".json"
+    try { write_file(dated, json) } catch e {
+        eprintln("FAIL: write_file " + dated + " — " + to_string(e))
+        return ""
+    }
+    try { write_file(JSON_LATEST, json) } catch e {
+        eprintln("FAIL: write_file " + JSON_LATEST + " — " + to_string(e))
+    }
+    return dated
+}
+
+fn main() {
+    // argv 정규화 (2026-04-19): Mac=[hexa, script, user...] Linux-stage1=[hexa, "run", script, user...]
+    // 이전까지 Mac-only argv[2] 가정 → Linux 에서 argv[2] = script path 로 dispatch 실패.
+    let _raw_argv = args()
+    let mut _script_idx = -1
+    let mut _scan_i = 0
+    while _scan_i < _raw_argv.len() {
+        if _raw_argv[_scan_i].ends_with(".hexa") { _script_idx = _scan_i; break }
+        _scan_i = _scan_i + 1
+    }
+    let mut _user_start = 2
+    let mut _script_token = ""
+    if _script_idx >= 0 {
+        _user_start = _script_idx + 1
+        _script_token = _raw_argv[_script_idx]
+    } else {
+        if _raw_argv.len() >= 3 {
+            if _raw_argv[1] == "run" { _user_start = 3 }
+            if _raw_argv[1] == "eval" { _user_start = 3 }
+        }
+    }
+    let mut argv: [str] = [_raw_argv[0], _script_token]
+    let mut _ua_i = _user_start
+    while _ua_i < _raw_argv.len() {
+        argv = argv + [_raw_argv[_ua_i]]
+        _ua_i = _ua_i + 1
+    }
+    if _script_token.len() > 0 && argv.len() >= 3 {
+        if argv[2] == _script_token {
+            let mut _a2: [str] = [_raw_argv[0], _script_token]
+            let mut _j2 = 3
+            while _j2 < argv.len() {
+                _a2 = _a2 + [argv[_j2]]
+                _j2 = _j2 + 1
+            }
+            argv = _a2
+        }
+    }
+    let mut mode = "full"
+    if argv.len() >= 3 { mode = argv[2].trim() }
+
+    let json = build_stats()
+
+    if mode == "json" {
+        println(json)
+        return
+    }
+
+    let dated = write_outputs(json)
+    if dated == "" { exit(1) }
+
+    println("json: " + dated)
+    println("latest: " + JSON_LATEST)
+
+    if mode == "smoke" {
+        eprintln("smoke ok — evo_progress_latest.json generated (EVO-P7-1)")
+    }
+}

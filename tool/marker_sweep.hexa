@@ -1,0 +1,470 @@
+// marker_sweep.hexa — HARN-P9-1 temporary marker scanner + resolver
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+//
+// Scans shared/ for TODO/FIXME/HACK/STUB/TEMP markers.
+// Classifies by type and severity. Conservative auto-resolve for stubs
+// that are confirmed porting-complete. Tracks progress in sweep_log.
+//
+// usage:
+//   hexa shared/tool/marker_sweep.hexa scan              — find + report all markers
+//   hexa shared/tool/marker_sweep.hexa resolve [--dry-run] — auto-fix safe markers
+//   hexa shared/tool/marker_sweep.hexa status             — progress toward 0
+//
+// principle: silent success, loud failure. conservative resolve only.
+
+let HOME = env("HOME")
+let NEXUS = HOME + "/Dev/nexus"  // @allow-devpath
+let SHARED = NEXUS + "/shared"
+let SWEEP_LOG = NEXUS + "/tool/marker_sweep_log.jsonl"
+let LINT_LOG = NEXUS + "/tool/lint_log.jsonl"
+
+// ─── marker type definitions ───
+// Patterns we scan for. Ordered by severity (high→low).
+let MARKER_TYPES = ["FIXME", "HACK", "STUB", "TODO", "TEMP", "@temporary", "@temp-marker", "MISSING DATA", "MISSING_DATA", "@allow-parse-fail", "PLACEHOLDER"]
+
+// Severity map: type → severity
+fn severity_of(mtype: string) -> string {
+    if mtype == "FIXME" { return "error" }
+    if mtype == "HACK" { return "error" }
+    if mtype == "STUB" { return "warn" }
+    if mtype == "TODO" { return "info" }
+    if mtype == "TEMP" { return "warn" }
+    if mtype == "@temporary" { return "warn" }
+    if mtype == "@temp-marker" { return "warn" }
+    if mtype == "MISSING DATA" { return "error" }
+    if mtype == "MISSING_DATA" { return "error" }
+    if mtype == "@allow-parse-fail" { return "error" }
+    if mtype == "PLACEHOLDER" { return "warn" }
+    return "info"
+}
+
+// ─── helpers ───
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _to_int0(s: string) -> i64 {
+    if s == "" { return 0 }
+    let first = _str(s.split("\n")[0]).trim()
+    if first == "" { return 0 }
+    return to_int(first)
+}
+
+fn now_iso() -> string {
+    return exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+fn json_escape(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", "\\n")
+    r = r.replace("\t", "\\t")
+    return r
+}
+
+// ─── exclusion rules ───
+// Directories/files that should NOT be counted as addressable markers.
+
+fn is_excluded_path(path: string) -> bool {
+    // archive — historical, not addressable
+    if path.contains("/archive/") { return true }
+    if path.starts_with("archive/") { return true }
+    // backup files
+    if path.contains(".bak") { return true }
+    // blowup engine internals that reference TODO as command category
+    if path.ends_with("commands.hexa") && path.contains("blowup/") { return true }
+    // todo.hexa itself scans for TODOs — not a marker
+    if path.ends_with("todo.hexa") && path.contains("blowup/") { return true }
+    // lint.hexa references markers as part of check logic
+    if path.ends_with("lint.hexa") && path.contains("tool/") { return true }
+    // this file itself
+    if path.ends_with("marker_sweep.hexa") { return true }
+    // roadmap_guard / breakthrough — reference STUB patterns for detection
+    if path.ends_with("roadmap_guard.hexa") { return true }
+    if path.ends_with("breakthrough.hexa") { return true }
+    // loop.hexa references TODO as format output
+    if path.ends_with("loop.hexa") && path.contains("tool/") { return true }
+    // roadmap_cli.hexa — column header
+    if path.ends_with("roadmap_cli.hexa") { return true }
+    // build artifacts — generated code
+    if path.contains("build/") { return true }
+    // CLAUDE.md references markers as documentation
+    if path.ends_with("CLAUDE.md") { return true }
+    // project-claude master CLAUDE.md docs
+    if path.contains("project-claude/") { return true }
+    return false
+}
+
+// Is this a "functional" marker (used as data/keyword, not a temp marker)?
+fn is_functional_marker(line: string, mtype: string) -> bool {
+    // "TODO" as a category string in commands routing
+    if mtype == "TODO" && line.contains("\"TODO\"") { return true }
+    if mtype == "TODO" && line.contains("category") && line.contains("TODO") { return true }
+    // STUB_PATTERNS / STUB_MARKERS — detection patterns, not actual stubs
+    if line.contains("STUB_PATTERNS") { return true }
+    if line.contains("STUB_MARKERS") { return true }
+    // grep patterns scanning for markers
+    if line.contains("grep") && line.contains("TODO") { return true }
+    if line.contains("grep") && line.contains("STUB") { return true }
+    if line.contains("grep") && line.contains("FIXME") { return true }
+    // MISSING DATA in awk/grep detection patterns (lint.hexa)
+    if line.contains("awk") && line.contains("MISSING DATA") { return true }
+    if line.contains("grep") && line.contains("MISSING") { return true }
+    // PLACEHOLDER/STUB in pattern matching code
+    if line.contains("PLACEHOLDER") && line.contains("str_index_of") { return true }
+    if line.contains("STUB") && line.contains("str_index_of") { return true }
+    if line.contains("STUB_PATTERNS") { return true }
+    return false
+}
+
+// ─── scanner ───
+// Uses exec("grep -rn ...") for each marker type across shared/
+
+fn scan_markers() -> [string] {
+    let mut results = []
+    for mtype in MARKER_TYPES {
+        // grep -rn for this marker type in .hexa files under shared/
+        let cmd = "grep -rn '" + mtype + "' '" + SHARED + "/' --include='*.hexa' --include='*.md' 2>/dev/null"
+        let raw = _str(exec(cmd)).trim()
+        if raw == "" { continue }
+        let lines = raw.split("\n")
+        for ln in lines {
+            let line = _str(ln).trim()
+            if line == "" { continue }
+            // format: /path/to/file.hexa:LINE_NO:content
+            let colon1 = line.index_of(":")
+            if colon1 < 0 { continue }
+            let file = line.substring(0, colon1)
+            let rest = line.substring(colon1 + 1, len(line))
+            let colon2 = rest.index_of(":")
+            if colon2 < 0 { continue }
+            let lineno = rest.substring(0, colon2)
+            let content = rest.substring(colon2 + 1, len(rest)).trim()
+
+            // make path relative to NEXUS
+            let mut rel = file
+            if file.starts_with(NEXUS + "/") {
+                rel = file.substring(len(NEXUS) + 1, len(file))
+            }
+
+            // exclusion checks
+            if is_excluded_path(rel) { continue }
+            if is_functional_marker(content, mtype) { continue }
+
+            // emit: file|lineno|type|severity|content
+            let sev = severity_of(mtype)
+            let entry = rel + "|" + lineno + "|" + mtype + "|" + sev + "|" + content
+            results.push(entry)
+        }
+    }
+    return results
+}
+
+// ─── classifier / aggregator ───
+
+fn classify_results(results) {
+    let mut by_type = #{}
+    let mut by_file = #{}
+    let mut by_severity = #{}
+
+    for entry in results {
+        let e = _str(entry)
+        let parts = e.split("|")
+        if len(parts) < 5 { continue }
+        let file = _str(parts[0])
+        let mtype = _str(parts[2])
+        let sev = _str(parts[3])
+
+        // count by type
+        if has_key(by_type, mtype) {
+            by_type[mtype] = to_int(_str(by_type[mtype])) + 1
+        } else {
+            by_type[mtype] = 1
+        }
+
+        // count by file
+        if has_key(by_file, file) {
+            by_file[file] = to_int(_str(by_file[file])) + 1
+        } else {
+            by_file[file] = 1
+        }
+
+        // count by severity
+        if has_key(by_severity, sev) {
+            by_severity[sev] = to_int(_str(by_severity[sev])) + 1
+        } else {
+            by_severity[sev] = 1
+        }
+    }
+
+    return #{
+        "by_type": by_type,
+        "by_file": by_file,
+        "by_severity": by_severity,
+        "total": len(results)
+    }
+}
+
+// ─── resolve (conservative) ───
+// Only resolves verify_*.hexa STUB files in n6/scripts/ that
+// are CONFIRMED stub-only (main with single println("STUB:...")).
+// These are porting placeholders — the real logic lives in git history.
+// Resolution = no-op for now (these stubs are intentional porting backlog).
+
+fn is_safe_to_resolve(entry: string) -> bool {
+    let parts = _str(entry).split("|")
+    if len(parts) < 5 { return false }
+    let file = _str(parts[0])
+    let mtype = _str(parts[2])
+    let content = _str(parts[4])
+
+    // Only resolve STUB markers in verify_*.hexa that are println-only stubs
+    if mtype != "STUB" { return false }
+    if !file.contains("n6/scripts/verify_") { return false }
+    if !content.contains("println(\"STUB:") { return false }
+
+    return true
+}
+
+fn resolve_markers(results: [string], dry_run: bool) -> i64 {
+    let mut resolved: i64 = 0
+    let mut seen_files = #{}
+
+    for entry in results {
+        if !is_safe_to_resolve(entry) { continue }
+        let parts = _str(entry).split("|")
+        let file = _str(parts[0])
+
+        // deduplicate per file (each stub file has 2 markers: comment + println)
+        if has_key(seen_files, file) { continue }
+        seen_files[file] = true
+
+        // verify file is truly stub-only (<=11 lines, main with println only)
+        let full = NEXUS + "/" + file
+        let line_count = _to_int0(_str(exec("wc -l < '" + full + "' 2>/dev/null")).trim())
+        if line_count > 15 { continue }
+
+        if dry_run {
+            println("[DRY-RUN] would resolve: " + file + " (" + to_string(line_count) + " lines, stub-only)")
+        } else {
+            // Stub files are intentional porting backlog. They mark work-to-be-done.
+            // Do NOT delete them — they serve as placeholders in the verify pipeline.
+            // Resolution here means: acknowledged as intentional, excluded from budget.
+            println("[ACKNOWLEDGE] " + file + " — intentional porting stub (excluded from budget)")
+        }
+        resolved = resolved + 1
+    }
+    return resolved
+}
+
+// ─── report ───
+
+fn print_report(results, stats) {
+    let total = len(results)
+    println("═══ marker_sweep report ═══")
+    println("timestamp: " + now_iso())
+    println("total markers: " + to_string(total))
+    println("")
+
+    // by severity
+    println("── by severity ──")
+    let sev_map = stats["by_severity"]
+    if type_of(sev_map) == "map" {
+        let sev_keys = keys(sev_map)
+        for k in sev_keys {
+            println("  " + _str(k) + ": " + to_string(sev_map[k]))
+        }
+    }
+    println("")
+
+    // by type
+    println("── by type ──")
+    let type_map = stats["by_type"]
+    if type_of(type_map) == "map" {
+        let type_keys = keys(type_map)
+        for k in type_keys {
+            println("  " + _str(k) + ": " + to_string(type_map[k]))
+        }
+    }
+    println("")
+
+    // by file (top 20)
+    println("── by file (top 20) ──")
+    let file_map = stats["by_file"]
+    if type_of(file_map) == "map" {
+        let file_keys = keys(file_map)
+        // collect into sortable list (file|count)
+        let mut pairs = []
+        for k in file_keys {
+            pairs.push(_str(k) + "|" + to_string(file_map[k]))
+        }
+        // simple descending sort by count (bubble — small list)
+        let mut i: i64 = 0
+        while i < len(pairs) {
+            let mut j: i64 = i + 1
+            while j < len(pairs) {
+                let ci = _to_int0(_str(pairs[i]).split("|")[-1])
+                let cj = _to_int0(_str(pairs[j]).split("|")[-1])
+                if cj > ci {
+                    let tmp = pairs[i]
+                    pairs[i] = pairs[j]
+                    pairs[j] = tmp
+                }
+                j = j + 1
+            }
+            i = i + 1
+        }
+        let mut shown: i64 = 0
+        for p in pairs {
+            if shown >= 20 { break }
+            let ps = _str(p).split("|")
+            println("  " + _str(ps[0]) + " : " + _str(ps[1]))
+            shown = shown + 1
+        }
+    }
+    println("")
+
+    // detail: list all markers
+    println("── all markers ──")
+    for entry in results {
+        let parts = _str(entry).split("|")
+        if len(parts) < 5 { continue }
+        let file = _str(parts[0])
+        let lineno = _str(parts[1])
+        let mtype = _str(parts[2])
+        let sev = _str(parts[3])
+        println("  [" + sev + "] " + mtype + " " + file + ":" + lineno)
+    }
+}
+
+// ─── log writer ───
+
+fn write_sweep_log(total, stats, resolved) {
+    let ts = now_iso()
+    let mut type_str = ""
+    let type_map = stats["by_type"]
+    if type_of(type_map) == "map" {
+        let tkeys = keys(type_map)
+        for k in tkeys {
+            if type_str != "" { type_str = type_str + "," }
+            type_str = type_str + "\"" + json_escape(_str(k)) + "\":" + to_string(type_map[k])
+        }
+    }
+    let mut sev_str = ""
+    let sev_map = stats["by_severity"]
+    if type_of(sev_map) == "map" {
+        let skeys = keys(sev_map)
+        for k in skeys {
+            if sev_str != "" { sev_str = sev_str + "," }
+            sev_str = sev_str + "\"" + json_escape(_str(k)) + "\":" + to_string(sev_map[k])
+        }
+    }
+    let json = "{\"ts\":\"" + ts + "\"," +
+               "\"total\":" + to_string(total) + "," +
+               "\"resolved\":" + to_string(resolved) + "," +
+               "\"by_type\":{" + type_str + "}," +
+               "\"by_severity\":{" + sev_str + "}}"
+    try { append_file(SWEEP_LOG, json + "\n") } catch e {}
+}
+
+// ─── status (progress from last run) ───
+
+fn cmd_status() {
+    if !file_exists(SWEEP_LOG) {
+        println("no previous sweep data. run 'scan' first.")
+        return
+    }
+    // read last 2 lines
+    let tail = _str(exec("tail -n 2 '" + SWEEP_LOG + "' 2>/dev/null")).trim()
+    let lines = tail.split("\n")
+    let last_line = _str(lines[-1]).trim()
+    if last_line == "" {
+        println("sweep log empty.")
+        return
+    }
+
+    // parse total from last line — simple extraction
+    let total_marker = "\"total\":"
+    let ti = last_line.index_of(total_marker)
+    let mut last_total: i64 = -1
+    if ti >= 0 {
+        let after = last_line.substring(ti + len(total_marker), len(last_line))
+        let comma = after.index_of(",")
+        if comma > 0 {
+            last_total = _to_int0(after.substring(0, comma))
+        }
+    }
+
+    // parse previous (if 2 lines available)
+    let mut prev_total: i64 = -1
+    if len(lines) >= 2 {
+        let prev_line = _str(lines[0]).trim()
+        let pi = prev_line.index_of(total_marker)
+        if pi >= 0 {
+            let pafter = prev_line.substring(pi + len(total_marker), len(prev_line))
+            let pcomma = pafter.index_of(",")
+            if pcomma > 0 {
+                prev_total = _to_int0(pafter.substring(0, pcomma))
+            }
+        }
+    }
+
+    println("═══ marker_sweep status ═══")
+    println("last sweep total: " + to_string(last_total))
+    if prev_total >= 0 && last_total >= 0 {
+        let delta = last_total - prev_total
+        let sign = if delta > 0 { "+" } else { "" }
+        println("delta from previous: " + sign + to_string(delta))
+    }
+    let budget: i64 = 50
+    println("budget: " + to_string(budget))
+    if last_total >= 0 {
+        if last_total <= budget {
+            println("status: WITHIN BUDGET")
+        } else {
+            println("status: OVER BUDGET by " + to_string(last_total - budget))
+        }
+        println("target: 0")
+        println("remaining: " + to_string(last_total))
+    }
+}
+
+// ─── main dispatch ───
+
+let argv = args()
+let mut mode = "scan"
+if len(argv) > 1 { mode = _str(argv[1]) }
+
+if mode == "scan" {
+    let results = scan_markers()
+    let stats = classify_results(results)
+    print_report(results, stats)
+    write_sweep_log(to_int(to_string(len(results))), stats, 0)
+    println("")
+    println("logged to: " + SWEEP_LOG)
+} else if mode == "resolve" {
+    let dry_run = len(argv) > 2 && _str(argv[2]) == "--dry-run"
+    let results = scan_markers()
+    let stats = classify_results(results)
+    let resolved = resolve_markers(results, dry_run)
+    println("")
+    println("total markers: " + to_string(len(results)))
+    println("resolvable (stub-only verify scripts): " + to_string(resolved))
+    if dry_run {
+        println("(dry-run — no changes made)")
+    }
+    write_sweep_log(to_int(to_string(len(results))), stats, resolved)
+} else if mode == "status" {
+    cmd_status()
+} else {
+    println("usage: marker_sweep.hexa <scan|resolve|status>")
+    println("  scan              find and report all temporary markers")
+    println("  resolve [--dry-run]  auto-resolve safe markers")
+    println("  status            show progress toward 0")
+}

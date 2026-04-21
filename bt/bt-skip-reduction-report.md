@@ -73,6 +73,6 @@ expression 셀이 사실 숫자값(단위 포함)일 때도 그 값으로 평가
 
 ## 파일
 
-- `$NEXUS/shared/bt/bt_audit.py` (수정)
-- `$NEXUS/shared/bt/bt_audit_result.json` (갱신)
-- `$NEXUS/shared/bt/bt-skip-reduction-report.md` (이 보고서)
+- `$NEXUS/bt/bt_audit.py` (수정)
+- `$NEXUS/bt/bt_audit_result.json` (갱신)
+- `$NEXUS/bt/bt-skip-reduction-report.md` (이 보고서)

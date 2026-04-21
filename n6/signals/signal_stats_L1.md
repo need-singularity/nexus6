@@ -1,7 +1,7 @@
 # L1 — 258 signal 재기록 vs 진짜 발견 통계
 
 - 생성: 2026-04-15 (M1 fusion 3건 append 이후 + session_scraper 제외)
-- 원본: `/Users/ghost/Dev/nexus/shared/n6/atlas.signals.n6`
+- 원본: `/Users/ghost/Dev/nexus/n6/atlas.signals.n6`
 - 총 signal 수: **262**
 
 ## 분류 규칙

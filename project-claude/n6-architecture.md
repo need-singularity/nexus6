@@ -9,7 +9,7 @@
 # @convergence state=ossified id=PRODUCTS_118 value="118/125 제품 🛸10" threshold="천장 도달"
 # @convergence state=ossified id=UNIQUENESS_PROOF value="z=4.02 (큰 수 Monte Carlo)" threshold=p<0.0001
 # @convergence state=ossified id=N28_CONTROL value="n=28 z=-2.35 (무작위 이하)" threshold="n=6 유일성 대조 확인"
-# @convergence state=ossified id=BT_134_PERIODIC_TABLE value="BT-134 주기열 {2,8,8,18,18,32,32} + Evidence 4 (2^sopfr=32) 교정" threshold="2200건 산술 정합 스캔 통과" note="2026-04-08 수정, $NEXUS/shared/bt/bt-consistency-report.md"
+# @convergence state=ossified id=BT_134_PERIODIC_TABLE value="BT-134 주기열 {2,8,8,18,18,32,32} + Evidence 4 (2^sopfr=32) 교정" threshold="2200건 산술 정합 스캔 통과" note="2026-04-08 수정, $NEXUS/bt/bt-consistency-report.md"
 # @convergence state=ossified id=PAPERS_39 value="39편 Zenodo DOI 발행" note="내용 갱신 가능, 신규 추가 중" ossified_at=2026-04-10 promoted_from=go_loop_auto
 # @convergence state=ossified id=LENS_2161_TESTS value="397종 렌즈, causal_chain + faction_debate 포함 cargo test 2161 PASS" threshold="전체 테스트 100%" note="2026-04-08 빌드캐시 재생성 후 재확인" ossified_at=2026-04-10 promoted_from=go_loop_auto
 # @convergence state=ossified id=PRODUCTS_7_REMAINING value="7개 잔여 🛸7→10 승격 진행중" note="바이러스학/곤충학/나노봇 Mk.I~V 완료 (products.json 동기화 확인)" ossified_at=2026-04-10 promoted_from=go_loop_auto
@@ -27,10 +27,10 @@
 
 commands: shared/config/commands.json — autonomous 블록으로 Claude Code가 작업 중 smash/free/todo/go/keep 자율 판단·실행
 rules: shared/rules/common.json (R0~R27) + shared/rules/n6-architecture.json (N61~N65)
-L0 Guard: `hexa $NEXUS/shared/harness/lockdown_gate.hexa <verify|status|watch|repair|safe-merge|log>`
+L0 Guard: `hexa $NEXUS/tool/lockdown_gate.hexa <verify|status|watch|repair|safe-merge|log>`
 
 atlas.n6 — 현실지도 SSOT:
-  경로: $NEXUS/shared/n6/atlas.n6 (단일 파일, 60K+ 줄)
+  경로: $NEXUS/n6/atlas.n6 (단일 파일, 60K+ 줄)
   구 구조 폐기: reality_map_live.json / L6_n6atlas.json / 별도 level 파일 없음. 전부 atlas.n6 흡수
   포맷: `@TAG {id} = {expr} :: {domain} [등급]`
   활성 태그 v1 (실측 8종): @R(5920)·@X(1496)·@F(1240)·@C(357)·@P(326)·@L(254)·@?(12)·@S(2)

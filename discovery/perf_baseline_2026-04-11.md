@@ -53,8 +53,8 @@
 ### 세션 footprint
 ```
 2.5G  $HEXA_LANG/target
-6.2M  $NEXUS/shared/n6/atlas.n6
-279M  $NEXUS/shared/discovery_log.jsonl
+6.2M  $NEXUS/n6/atlas.n6
+279M  $NEXUS/discovery_log.jsonl
 ```
 **총 세션 메모리: ~2.79GB** (지배적으로 Rust target/ debug+release 아티팩트)
 

@@ -2317,7 +2317,7 @@ fn cmd_experiment_e1() {
     println("\n--- Real Data Profiling ---")
 
     // discovery_log 분석 (n=6 상수 출현 빈도)
-    let log_path = env("HOME") + "/Dev/nexus/shared/discovery/discovery_log.jsonl"
+    let log_path = env("HOME") + "/Dev/nexus/discovery/discovery_log.jsonl"
     let line_count = shell("wc -l < " + log_path + " 2>/dev/null")
     println("  discovery_log entries: " + line_count)
 

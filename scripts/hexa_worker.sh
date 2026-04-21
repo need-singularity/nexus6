@@ -17,7 +17,7 @@ set -u
 NEXUS="${NEXUS:-$HOME/Dev/nexus}"
 Q="${HOME}/.airgenome/hexa_actions.jsonl"
 WORKER_LOG="${HOME}/.airgenome/hexa_worker.jsonl"
-ACTIONS_BIN="$NEXUS/shared/scripts/hexa_actions.sh"
+ACTIONS_BIN="$NEXUS/scripts/hexa_actions.sh"
 mkdir -p "$(dirname "$WORKER_LOG")"
 touch "$Q"
 
@@ -26,9 +26,9 @@ now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 # WHITELIST: "pattern|command" — rec 에 pattern 포함 시 command 실행
 # pattern 은 substring, command 는 bash 로 exec 됨 (rec 자체를 eval 하지 않음)
 WHITELIST=(
-    "hexa_janitor report|$NEXUS/shared/scripts/hexa_janitor.sh report"
-    "hexa_dispatch_check|$NEXUS/shared/scripts/hexa_dispatch_check.sh --human"
-    "hexa_patterns|$NEXUS/shared/scripts/hexa_patterns.sh report"
+    "hexa_janitor report|$NEXUS/scripts/hexa_janitor.sh report"
+    "hexa_dispatch_check|$NEXUS/scripts/hexa_dispatch_check.sh --human"
+    "hexa_patterns|$NEXUS/scripts/hexa_patterns.sh report"
 )
 
 # BLACKLIST: 이 토큰이 rec 에 있으면 WHITELIST 매칭돼도 실행 X

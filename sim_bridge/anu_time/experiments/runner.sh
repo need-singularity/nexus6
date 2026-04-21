@@ -12,7 +12,7 @@ NEXUS_ROOT="${NEXUS_ROOT:-$HOME/Dev/nexus}"
 cd "$NEXUS_ROOT" || exit 1
 
 TS="$(date +%s)"
-BASE="$NEXUS_ROOT/shared/sim_bridge/anu_time/experiments/runs/64tick_deepdive_${TS}"
+BASE="$NEXUS_ROOT/sim_bridge/anu_time/experiments/runs/64tick_deepdive_${TS}"
 mkdir -p "$BASE"
 
 echo "[dd] base=$BASE"

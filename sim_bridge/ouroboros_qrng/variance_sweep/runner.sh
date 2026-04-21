@@ -12,7 +12,7 @@ set -u
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
-HEXA=/Users/ghost/Dev/nexus/shared/bin/hexa
+HEXA=/Users/ghost/Dev/nexus/bin/hexa
 # Force local exec so write_file/read_file target local FS (avoid remote dispatch
 # which would write to ubu/hetzner and lose the log/stats for analyze).
 export HEXA_LOCAL=1

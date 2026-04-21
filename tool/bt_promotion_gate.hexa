@@ -1,0 +1,550 @@
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+// bt_promotion_gate.hexa — CONSN-P7-1 (A17_CONSENSUS P7)
+// 역할: consensus_candidate (shared/discovery_log.jsonl) 를 BT 승격 자격 검증.
+// SSOT spec: shared/engine/bt_promotion_gate_spec.json
+// audit log: shared/logs/bt_promotion.jsonl (append-only)
+//
+// modes:
+//   check <id>                       단일 candidate_id 평가
+//   check --domain <d> --name <n>    (domain,name) 튜플 평가
+//   scan                             전체 스캔 + audit_log append
+//   dry-scan                         전체 스캔, append 없음 (stdout only)
+//   status [N=20]                    최근 N 이벤트 dump
+//
+// 성공 조용, 실패 시끄럽게 (H1).
+
+// ─── safe_exec inc copy-paste (stage1 native include 미지원) ───
+let _SE_HOME = env("HOME")
+let _SE_WRAPPER = _SE_HOME + "/Dev/nexus/tool/perl_timeout.sh"
+
+fn _se_str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _se_shq(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _se_wrapper_ok() -> bool {
+    let r = _se_str(exec("test -x '" + _SE_WRAPPER + "' && echo y || echo n")).trim()
+    return r == "y"
+}
+
+fn _se_wrap(cmd: string, timeout_sec: i64) -> string {
+    if !_se_wrapper_ok() { return cmd }
+    return "'" + _SE_WRAPPER + "' " + to_string(timeout_sec) + " bash -c " + _se_shq(cmd)
+}
+
+fn safe_exec(cmd: string, timeout_sec: i64) -> string {
+    let wrapped = _se_wrap(cmd, timeout_sec)
+    return _se_str(exec(wrapped + " 2>&1"))  // @allow-bare-exec — wrapped
+}
+
+// ─── paths ───
+let HOME = env("HOME")
+let NEXUS_ENV = env("NEXUS")
+let NEXUS = if NEXUS_ENV != "" { NEXUS_ENV } else { HOME + "/Dev/nexus" }
+let SHARED = NEXUS + "/shared"
+let SPEC = SHARED + "/engine/bt_promotion_gate_spec.json"
+let DISC_LOG = SHARED + "/discovery_log.jsonl"
+let BT_DOMAINS = SHARED + "/bt/bt_domains.jsonl"
+let BT_AUDIT = SHARED + "/bt/bt_audit_result.json"
+let AUDIT_LOG = SHARED + "/logs/bt_promotion.jsonl"
+
+// ─── thresholds (spec SSOT, inline fallback) ───
+let TH_MIN_SCORE = 0.70
+let TH_MIN_CROSS = 3
+let TH_N6_MIN_TIER = "STRONG"   // EXACT|STRONG|WEAK|NONE
+let TH_NOVELTY = true
+let TH_INDEP = "distinct_pipeline_seed"
+
+// ─── helpers ───
+fn now_iso() -> string {
+    return safe_exec("date -u +%Y-%m-%dT%H:%M:%SZ", 5).trim()
+}
+
+fn json_escape(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", " ")
+    r = r.replace("\r", " ")
+    r = r.replace("\t", " ")
+    return r
+}
+
+// "field":"value" 또는 "field": "value" 둘 다 수용
+fn json_str(line: string, field: string) -> string {
+    let m1 = "\"" + field + "\":\""
+    let m2 = "\"" + field + "\": \""
+    let mut parts = line.split(m1)
+    if parts.len() < 2 { parts = line.split(m2) }
+    if parts.len() < 2 { return "" }
+    let end = _se_str(parts[1]).split("\"")
+    if end.len() < 1 { return "" }
+    return _se_str(end[0])
+}
+
+fn json_num(line: string, field: string) -> f64 {
+    let marker = "\"" + field + "\":"
+    let parts = line.split(marker)
+    if parts.len() < 2 { return 0.0 }
+    let rest = _se_str(parts[1])
+    let mut buf = ""
+    let n = len(rest)
+    let mut i: i64 = 0
+    while i < n {
+        let ch = rest.substring(i, i + 1)
+        if ch == " " { i = i + 1; continue }
+        if ch == "," || ch == "}" || ch == "\n" { break }
+        buf = buf + ch
+        i = i + 1
+    }
+    buf = buf.trim()
+    if buf == "" { return 0.0 }
+    let mut v = 0.0
+    try { v = to_float(buf) } catch e { v = 0.0 }
+    return v
+}
+
+fn json_int(line: string, field: string) -> i64 {
+    let v = json_num(line, field)
+    return to_int(to_string(v).split(".")[0])
+}
+
+fn load_lines(path: string) -> [string] {
+    let mut out: [string] = []
+    if !file_exists(path) { return out }
+    let lines = _se_str(read_file(path)).split("\n")
+    let n = len(lines)
+    let mut i: i64 = 0
+    while i < n {
+        let ln = _se_str(lines[i]).trim()
+        if len(ln) > 0 { out = out.push(ln) }
+        i = i + 1
+    }
+    return out
+}
+
+// score -> tier enum
+fn tier_of(score: f64) -> string {
+    if score >= 0.95 { return "EXACT" }
+    if score >= 0.80 { return "STRONG" }
+    if score >= 0.60 { return "WEAK" }
+    return "NONE"
+}
+
+fn tier_rank(tier: string) -> i64 {
+    if tier == "EXACT"  { return 3 }
+    if tier == "STRONG" { return 2 }
+    if tier == "WEAK"   { return 1 }
+    return 0
+}
+
+fn tier_ok(tier: string, min_tier: string) -> bool {
+    return tier_rank(tier) >= tier_rank(min_tier)
+}
+
+// sha1 12-hex of "domain|name|min_idx"
+fn derive_id(domain: string, name: string, min_idx: i64) -> string {
+    let seed = domain + "|" + name + "|" + to_string(min_idx)
+    let cmd = "printf '%s' " + _se_shq(seed) + " | /usr/bin/shasum -a 1 2>/dev/null | cut -c1-12"
+    let out = _se_str(exec(cmd)).trim()  // @allow-bare-exec — shasum wrapper
+    if out == "" { return "badid" + to_string(min_idx) }
+    return out
+}
+
+// list contains
+fn list_contains(xs: [string], y: string) -> bool {
+    let n = len(xs)
+    let mut i: i64 = 0
+    while i < n {
+        if _se_str(xs[i]) == y { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── domain registry ───
+fn load_bt_domains() -> [string] {
+    let mut out: [string] = []
+    let lines = load_lines(BT_DOMAINS)
+    let n = len(lines)
+    let mut i: i64 = 0
+    while i < n {
+        let d = json_str(_se_str(lines[i]), "domain")
+        if d != "" && !list_contains(out, d) { out = out.push(d) }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── novelty check — bt_audit_result.json 에 (domain,name) 100% MATCH 존재 여부 ───
+// 단순 substring 기반. 엄격한 파싱은 bt_audit 재실행으로 CONSN-P7-2 에서 강화.
+fn is_already_bt(domain: string, name: string) -> bool {
+    if !file_exists(BT_AUDIT) { return false }
+    let needle = "\"" + json_escape(name) + "\""
+    let body = _se_str(read_file(BT_AUDIT))
+    if body == "" { return false }
+    // domain match + name match + "MATCH" 출현 → duplicate 로 간주 (보수적)
+    let has_name = body.split(needle).len() >= 2
+    let has_domain = body.split("\"" + json_escape(domain) + "\"").len() >= 2
+    if !has_name { return false }
+    if !has_domain { return false }
+    // MATCH 토큰 존재 여부 — 전체 파일 내 단 한 번이라도 등장하면 true (보수적)
+    return body.split("\"MATCH\"").len() >= 2 || body.split("\"status\": \"MATCH\"").len() >= 2
+}
+
+// ─── candidate tuple record (hexa hashmap 우회: parallel lists) ───
+// 각 튜플(key = domain + "|" + name)마다 누적 집계.
+struct Tuple {
+    key: string,
+    domain: string,
+    name: string,
+    value: f64,
+    score_max: f64,
+    min_pipeline_idx: i64,
+    pipeline_idxs: [i64],
+    pipeline_seeds: [string],
+    pipeline_path_heads: [string]
+}
+
+fn tuple_find(tuples: [Tuple], key: string) -> i64 {
+    let n = len(tuples)
+    let mut i: i64 = 0
+    while i < n {
+        if tuples[i].key == key { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn path_head(path: string) -> string {
+    let parts = path.split(" -> ")
+    if parts.len() < 1 { return path }
+    return _se_str(parts[0]).trim()
+}
+
+fn pushi_unique(xs: [i64], v: i64) -> [i64] {
+    let n = len(xs)
+    let mut i: i64 = 0
+    while i < n {
+        if xs[i] == v { return xs }
+        i = i + 1
+    }
+    return xs.push(v)
+}
+
+fn pushs_unique(xs: [string], v: string) -> [string] {
+    if list_contains(xs, v) { return xs }
+    return xs.push(v)
+}
+
+fn aggregate_discovery_log() -> [Tuple] {
+    let mut tuples: [Tuple] = []
+    let lines = load_lines(DISC_LOG)
+    let n = len(lines)
+    let mut i: i64 = 0
+    while i < n {
+        let line = _se_str(lines[i])
+        i = i + 1
+        let kind = json_str(line, "kind")
+        if kind != "consensus_candidate" { continue }
+        let domain = json_str(line, "domain")
+        let name = json_str(line, "name")
+        if domain == "" || name == "" { continue }
+        let value = json_num(line, "value")
+        let score = json_num(line, "score")
+        let pidx = json_int(line, "pipeline_idx")
+        let pseed = json_str(line, "pipeline_seed")
+        let ppath = json_str(line, "pipeline_path")
+        let key = domain + "|" + name
+        let idx = tuple_find(tuples, key)
+        if idx < 0 {
+            let mut t = Tuple{
+                key: key,
+                domain: domain,
+                name: name,
+                value: value,
+                score_max: score,
+                min_pipeline_idx: pidx,
+                pipeline_idxs: [pidx],
+                pipeline_seeds: if pseed == "" { [] } else { [pseed] },
+                pipeline_path_heads: if ppath == "" { [] } else { [path_head(ppath)] }
+            }
+            tuples = tuples.push(t)
+        } else {
+            let mut t = tuples[idx]
+            if score > t.score_max { t.score_max = score }
+            if pidx < t.min_pipeline_idx { t.min_pipeline_idx = pidx }
+            t.pipeline_idxs = pushi_unique(t.pipeline_idxs, pidx)
+            if pseed != "" { t.pipeline_seeds = pushs_unique(t.pipeline_seeds, pseed) }
+            if ppath != "" { t.pipeline_path_heads = pushs_unique(t.pipeline_path_heads, path_head(ppath)) }
+            tuples[idx] = t
+        }
+    }
+    return tuples
+}
+
+// ─── gate decision ───
+struct Verdict {
+    candidate_id: string,
+    domain: string,
+    name: string,
+    value: f64,
+    score: f64,
+    cross_confirms: i64,
+    distinct_seeds: i64,
+    tier: string,
+    verdict: string,     // PROMOTE | DENY
+    reasons: [string]
+}
+
+fn evaluate(t: Tuple, domains: [string]) -> Verdict {
+    let id = derive_id(t.domain, t.name, t.min_pipeline_idx)
+    let cross = len(t.pipeline_idxs)
+    let seeds_n = len(t.pipeline_seeds)
+    let tier = tier_of(t.score_max)
+    let mut reasons: [string] = []
+
+    if t.score_max < TH_MIN_SCORE { reasons = reasons.push("score_low") }
+    if cross < TH_MIN_CROSS { reasons = reasons.push("insufficient_cross") }
+    if !tier_ok(tier, TH_N6_MIN_TIER) { reasons = reasons.push("n6_weak") }
+    if TH_NOVELTY && is_already_bt(t.domain, t.name) { reasons = reasons.push("duplicate") }
+    if !list_contains(domains, t.domain) { reasons = reasons.push("domain_unknown") }
+    if TH_INDEP == "distinct_pipeline_seed" && seeds_n < TH_MIN_CROSS {
+        reasons = reasons.push("independence_fail")
+    }
+
+    let verdict_str = if len(reasons) == 0 { "PROMOTE" } else { "DENY" }
+
+    return Verdict{
+        candidate_id: id,
+        domain: t.domain,
+        name: t.name,
+        value: t.value,
+        score: t.score_max,
+        cross_confirms: cross,
+        distinct_seeds: seeds_n,
+        tier: tier,
+        verdict: verdict_str,
+        reasons: reasons
+    }
+}
+
+fn reasons_json(rs: [string]) -> string {
+    let n = len(rs)
+    if n == 0 { return "[]" }
+    let mut out = "["
+    let mut i: i64 = 0
+    while i < n {
+        if i > 0 { out = out + "," }
+        out = out + "\"" + json_escape(_se_str(rs[i])) + "\""
+        i = i + 1
+    }
+    out = out + "]"
+    return out
+}
+
+fn verdict_line(v: Verdict, ts: string) -> string {
+    let out = "{\"ts\":\"" + ts + "\"" +
+        ",\"kind\":\"bt_promotion_event\"" +
+        ",\"candidate_id\":\"" + v.candidate_id + "\"" +
+        ",\"domain\":\"" + json_escape(v.domain) + "\"" +
+        ",\"name\":\"" + json_escape(v.name) + "\"" +
+        ",\"value\":" + to_string(v.value) +
+        ",\"score\":" + to_string(v.score) +
+        ",\"cross_confirms\":" + to_string(v.cross_confirms) +
+        ",\"distinct_seeds\":" + to_string(v.distinct_seeds) +
+        ",\"tier\":\"" + v.tier + "\"" +
+        ",\"verdict\":\"" + v.verdict + "\"" +
+        ",\"denial_reasons\":" + reasons_json(v.reasons) +
+        ",\"thresholds_snapshot\":{\"min_score\":" + to_string(TH_MIN_SCORE) +
+            ",\"min_cross_confirms\":" + to_string(TH_MIN_CROSS) +
+            ",\"n6_match_min\":\"" + TH_N6_MIN_TIER + "\"}" +
+        "}"
+    return out
+}
+
+fn stdout_line(v: Verdict) -> string {
+    return v.candidate_id + " " + v.verdict +
+        " tier=" + v.tier +
+        " score=" + to_string(v.score) +
+        " cross=" + to_string(v.cross_confirms) +
+        " seeds=" + to_string(v.distinct_seeds) +
+        " domain=" + v.domain +
+        " name=" + v.name +
+        " reasons=" + reasons_json(v.reasons)
+}
+
+// ─── audit log append ───
+fn append_audit_log(body: string) {
+    // ensure dir
+    let logdir = SHARED + "/logs"
+    let _ = safe_exec("mkdir -p '" + logdir + "'", 5)
+    // ensure file
+    if !file_exists(AUDIT_LOG) { try { write_file(AUDIT_LOG, "") } catch e {} }
+    let _ = safe_exec("printf '%s' '" + body.replace("'", "'\\''") + "' >> '" + AUDIT_LOG + "'", 10)
+}
+
+// ─── args ───
+// hexa argv convention: [0]=binary, [1]=script, [2..]=user args
+let _argv_all = args()
+let _argv_all_n = len(_argv_all)
+let ARG_OFFSET: i64 = 2
+let mut a: [string] = []
+let mut _ai: i64 = ARG_OFFSET
+while _ai < _argv_all_n {
+    a = a.push(_se_str(_argv_all[_ai]))
+    _ai = _ai + 1
+}
+let argc = len(a)
+
+fn print_usage() {
+    println("bt_promotion_gate — CONSN-P7-1 gate engine")
+    println("")
+    println("  check <id>                       단일 candidate_id 평가")
+    println("  check --domain <d> --name <n>    (domain,name) 튜플 평가")
+    println("  scan                             전체 스캔 + audit_log append")
+    println("  dry-scan                         전체 스캔, append 없음")
+    println("  status [N=20]                    최근 N 이벤트 dump")
+    println("")
+    println("spec:  " + SPEC)
+    println("input: " + DISC_LOG)
+    println("log:   " + AUDIT_LOG)
+}
+
+if argc == 0 {
+    print_usage()
+    exit(0)
+}
+
+let mode = _se_str(a[0])
+
+if mode == "--help" || mode == "-h" || mode == "help" {
+    print_usage()
+    exit(0)
+}
+
+// ─── mode: status ───
+if mode == "status" {
+    let mut n_last: i64 = 20
+    if argc >= 2 {
+        let s = _se_str(a[1]).trim()
+        if s != "" { try { n_last = to_int(s) } catch e { n_last = 20 } }
+    }
+    if !file_exists(AUDIT_LOG) {
+        println("[bt_promotion_gate] audit_log 비어있음 — " + AUDIT_LOG)
+        exit(0)
+    }
+    let out = _se_str(exec("tail -n " + to_string(n_last) + " '" + AUDIT_LOG + "' 2>&1"))  // @allow-bare-exec
+    print(out)
+    if !out.ends_with("\n") { println("") }
+    exit(0)
+}
+
+// ─── aggregation (scan/dry-scan/check) ───
+let domains = load_bt_domains()
+let tuples = aggregate_discovery_log()
+let tn = len(tuples)
+
+if tn == 0 {
+    eprintln("[bt_promotion_gate] 후보 없음 — discovery_log 비어있거나 consensus_candidate 라인 0")
+    exit(0)
+}
+
+// ─── mode: check ───
+if mode == "check" {
+    if argc < 2 {
+        eprintln("REJECT: check 에는 <id> 또는 --domain <d> --name <n> 필요")
+        exit(2)
+    }
+    let mut target_id = ""
+    let mut target_domain = ""
+    let mut target_name = ""
+    let mut i: i64 = 1
+    while i < argc {
+        let t = _se_str(a[i])
+        if t == "--domain" && i + 1 < argc { target_domain = _se_str(a[i + 1]); i = i + 2; continue }
+        if t == "--name" && i + 1 < argc { target_name = _se_str(a[i + 1]); i = i + 2; continue }
+        if target_id == "" { target_id = t }
+        i = i + 1
+    }
+    let ts = now_iso()
+    let mut found = false
+    let mut j: i64 = 0
+    while j < tn {
+        let tup = tuples[j]
+        let v = evaluate(tup, domains)
+        let match_by_id = target_id != "" && v.candidate_id == target_id
+        let match_by_tuple = target_domain != "" && target_name != "" &&
+                             tup.domain == target_domain && tup.name == target_name
+        if match_by_id || match_by_tuple {
+            println(stdout_line(v))
+            append_audit_log(verdict_line(v, ts) + "\n")
+            found = true
+            break
+        }
+        j = j + 1
+    }
+    if !found {
+        eprintln("REJECT: candidate 미발견 — id=" + target_id + " domain=" + target_domain + " name=" + target_name)
+        exit(3)
+    }
+    exit(0)
+}
+
+// ─── mode: scan | dry-scan ───
+let do_append = (mode == "scan")
+
+if mode != "scan" && mode != "dry-scan" {
+    eprintln("REJECT: unknown mode '" + mode + "' — modes: check|scan|dry-scan|status")
+    exit(2)
+}
+
+let ts = now_iso()
+let mut promoted: i64 = 0
+let mut denied: i64 = 0
+let mut r_score_low: i64 = 0
+let mut r_cross: i64 = 0
+let mut r_tier: i64 = 0
+let mut r_dup: i64 = 0
+let mut r_dom: i64 = 0
+let mut r_indep: i64 = 0
+
+let mut body = ""
+let mut k: i64 = 0
+while k < tn {
+    let tup = tuples[k]
+    let v = evaluate(tup, domains)
+    if v.verdict == "PROMOTE" { promoted = promoted + 1 } else { denied = denied + 1 }
+    if list_contains(v.reasons, "score_low") { r_score_low = r_score_low + 1 }
+    if list_contains(v.reasons, "insufficient_cross") { r_cross = r_cross + 1 }
+    if list_contains(v.reasons, "n6_weak") { r_tier = r_tier + 1 }
+    if list_contains(v.reasons, "duplicate") { r_dup = r_dup + 1 }
+    if list_contains(v.reasons, "domain_unknown") { r_dom = r_dom + 1 }
+    if list_contains(v.reasons, "independence_fail") { r_indep = r_indep + 1 }
+    body = body + verdict_line(v, ts) + "\n"
+    println(stdout_line(v))
+    k = k + 1
+}
+
+if do_append && body != "" { append_audit_log(body) }
+
+println("")
+println("[bt_promotion_gate] scanned=" + to_string(tn) +
+        " promoted=" + to_string(promoted) +
+        " denied=" + to_string(denied) +
+        " | score_low=" + to_string(r_score_low) +
+        " cross=" + to_string(r_cross) +
+        " tier=" + to_string(r_tier) +
+        " dup=" + to_string(r_dup) +
+        " dom=" + to_string(r_dom) +
+        " indep=" + to_string(r_indep) +
+        (if do_append { " -> appended to audit_log" } else { " (dry)" }))
+
+exit(0)

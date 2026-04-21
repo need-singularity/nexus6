@@ -12,7 +12,7 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HEXA="${HOME}/Dev/nexus/shared/bin/hexa"
+HEXA="${HOME}/Dev/nexus/bin/hexa"
 DAEMON="${HERE}/stream_daemon.hexa"
 CHACHA="${HERE}/chacha20.hexa"
 

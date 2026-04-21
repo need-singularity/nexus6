@@ -1,0 +1,177 @@
+{
+  "schema": "nexus.harness.plan.v1",
+  "title": "하네스 실제 설계 — nexus 실행 스펙",
+  "created": "2026-04-13",
+  "status": "approved",
+  "plan_ref": "~/.claude/plans/lucky-baking-cocoa.md",
+  "context": {
+    "ssot_exists": true,
+    "ssot_path": "shared/tool/",
+    "gap": "실행 파일(.hexa) 부재. P2 partial, P2.loop partial, P3 done(단 drift/dead/violation 스캔 없음)",
+    "state": {
+      "P1_map": "done",
+      "P2_auto_enforce": "partial",
+      "P2_loop_self_correct": "partial",
+      "P3_garbage_collect": "done"
+    },
+    "guiding_quote": {
+      "text": "한 번에 완벽하게 하려고 하지 마세요 — 실제로 실패한 경우에만 조금씩 개선",
+      "source": "Mitchell Hashimoto"
+    },
+    "strategy": "L1(1~2h 설정) 최소 골조 먼저, 실패 누적되면 L2(autofix)로 진화"
+  },
+  "constraints": [
+    {"id": "C1", "rule": "hooks-config.json 수정 금지 (v3.0-FINAL lockdown). 신규 훅 등록은 사용자 명시 승인"},
+    {"id": "C2", "rule": ".sh/.py 생성 금지. 로직은 .hexa only, 시스템콜만 C helper", "memory": "f-hexa-only-logic"},
+    {"id": "C3", "rule": "AI-native — 결과는 JSONL, 산문 X", "memory": "f-ai-native-no-prose"},
+    {"id": "C4", "rule": "성공 조용/실패 시끄럽게 — lint pass 시 무출력, fail 시 violations JSONL + exit 1"}
+  ],
+  "architecture": {
+    "pre_commit_chain": {
+      "file": ".git/hooks/pre-commit",
+      "scope": "local (shared lockdown 영향 X)",
+      "steps": [
+        {"order": 1, "action": "기존 loop-guard 유지 (30s 타임아웃)"},
+        {"order": 2, "action": "신규 harness-lint 체인 — shared/tool/lint.hexa --staged", "blocking": true, "fail_behavior": "exit 1, commit 차단"}
+      ]
+    },
+    "lint_pipeline": {
+      "entry": "shared/tool/lint.hexa",
+      "input": "git diff --cached --name-only",
+      "rule_db": ["shared/rules/common.json", "shared/rules/nexus.json"],
+      "pitfall_db": "shared/hexa_pitfalls_log.jsonl",
+      "output_log": "shared/tool/lint_log.jsonl",
+      "fail_log": "shared/tool/mistakes.jsonl"
+    },
+    "gc_pipeline": {
+      "entry": "shared/tool/gc.hexa",
+      "trigger": "수동 먼저 → 안정화 후 growth-tick 체인 (approval 별도)",
+      "scans": ["drift", "dead", "violation"],
+      "output_log": "shared/tool/gc_log.jsonl"
+    }
+  },
+  "files_to_create": [
+    {
+      "id": "F1",
+      "path": "shared/tool/lint.hexa",
+      "lines_estimate": 150,
+      "entry": "hexa shared/tool/lint.hexa [--staged | --all | --file PATH]",
+      "loads": ["shared/rules/common.json", "shared/rules/nexus.json"],
+      "checkers": [
+        {"name": "check_hexa_only", "desc": ".hexa 신규 파일에 shebang으로 python/bash 호출 탐지 (R1)"},
+        {"name": "check_pitfalls", "desc": "hexa_pitfalls_log.jsonl affected 패턴과 grep 비교"},
+        {"name": "check_l0_lockdown", "desc": "L0 보호 영역 수정 시 lockdown_gate.hexa verify 호출"},
+        {"name": "check_ai_native", "desc": "신규 .md 파일이 rules/config 위치에 생기면 경고 (R14)"}
+      ],
+      "output": {
+        "pass": "stdout 침묵, exit 0",
+        "fail": "stderr {file, line, rule, severity, fix_hint} JSON 라인 + exit 1",
+        "always_log": "shared/tool/lint_log.jsonl append {ts, files, pass, violations[]}"
+      },
+      "reuses": ["shared/blowup/lib/atlas_guard.hexa.inc helper 패턴", "nexus-engine.hexa stdin→JSON emit 스타일"]
+    },
+    {
+      "id": "F2",
+      "path": "shared/tool/gc.hexa",
+      "lines_estimate": 120,
+      "entry": "hexa shared/tool/gc.hexa [--scan | --report]",
+      "scans": [
+        {"name": "scan_drift", "desc": "CLAUDE.md/CLAUDE.md/*/CLAUDE.md 언급 파일 경로 추출 → [ -e ] 검증"},
+        {"name": "scan_dead", "desc": "shared/ 트리 90일 미변경 + 어떤 .hexa/.json 에서도 grep 미참조인 파일"},
+        {"name": "scan_violations", "desc": "R1(.py/.sh 신규), R14(prose in rules), R28(외부 discovery JSON) grep"}
+      ],
+      "output": "shared/tool/gc_log.jsonl {ts, scan_type, findings[]}",
+      "frequency": "수동 트리거 먼저. 안정화 후 growth-tick.hexa 주 1회 체인 (approval 별도)"
+    },
+    {
+      "id": "F3",
+      "path": "shared/tool/mistakes.jsonl",
+      "initial": "빈 파일",
+      "schema": "{ts, kind, file, rule, fix, resolved?}",
+      "kind_enum": ["lint_fail", "gc_drift", "gc_dead", "gc_violation"],
+      "purpose": "실수 기록 (Hashimoto P1 지도 핵심). append-only 누적 → harness.evolution 에서 새 규칙으로 승격"
+    }
+  ],
+  "files_to_modify": [
+    {
+      "id": "M1",
+      "path": ".git/hooks/pre-commit",
+      "scope": "로컬, git 자동 무시",
+      "change": "기존 loop-guard 블록 뒤에 harness-lint 체인 삽입 (실패 시 exit 1)",
+      "snippet": [
+        "LINT=\"$R/tool/lint.hexa\"",
+        "if [ -f \"$LINT\" ] && [ -x \"$HEXA\" ]; then",
+        "    \"$HEXA\" \"$LINT\" --staged",
+        "    LINT_RC=$?",
+        "    if [ $LINT_RC -ne 0 ]; then",
+        "        echo \"❌ harness-lint 실패 — shared/tool/lint_log.jsonl 참조\"",
+        "        exit 1",
+        "    fi",
+        "fi"
+      ]
+    },
+    {
+      "id": "M2",
+      "path": "shared/tool/convergence.json",
+      "change": "L1 완료 후 P2_auto_enforce.status partial→done, missing 에서 pre-commit wiring / hexa linter 제거"
+    }
+  ],
+  "reuse_assets": [
+    {"path": "shared/rules/common.json", "role": "린트 규칙 DB (R0~R32)"},
+    {"path": "shared/hexa_pitfalls_log.jsonl", "role": "린트 패턴 피드 (P-*)"},
+    {"path": "shared/tool/lockdown_gate.hexa", "role": "L0/L1/L2 보호 영역 검증"},
+    {"path": "shared/n6/atlas_health.hexa", "role": "health 스캔 스타일 참조"},
+    {"path": "shared/blowup/lib/atlas_guard.hexa.inc", "role": "공통 헬퍼"},
+    {"path": "shared/hooks/hook-entry.hexa", "role": "추후 gc 주기 훅 엮을 때 디스패치 참조"}
+  ],
+  "scenarios": {
+    "commit_pass": {
+      "steps": [
+        "git commit -m 'feat: ...' 실행",
+        ".git/hooks/pre-commit → loop-guard 30s 백그라운드",
+        ".git/hooks/pre-commit → hexa lint.hexa --staged",
+        "규칙 로드 → staged files 스캔 → 위반 0 → exit 0",
+        "lint_log.jsonl append {pass: true, violations: []}",
+        "commit 통과, 아무 출력 없음 — 성공은 조용히"
+      ]
+    },
+    "commit_block": {
+      "steps": [
+        "새 .py 파일을 shared/ 아래에 커밋 시도 (R1 위반)",
+        "린트가 {file, rule:R1, severity:error, fix_hint:convert to .hexa} stderr 출력",
+        ".git/hooks/pre-commit exit 1 → commit 차단 — 실패는 시끄럽게",
+        "lint_log.jsonl + mistakes.jsonl 기록",
+        "사용자는 .hexa 변환 후 재시도 또는 규칙 개정 approval"
+      ]
+    },
+    "gc_manual": {
+      "steps": [
+        "hexa shared/tool/gc.hexa --scan",
+        "drift/dead/violation → gc_log.jsonl findings append",
+        "사용자 검토 → 삭제/통합/규칙 신규 추가 결정"
+      ]
+    }
+  },
+  "verification": [
+    {"step": "lint.hexa dry-run", "action": "--file shared/tool/lint.hexa 로 자기 자신 스캔", "expect": "0 violations"},
+    {"step": "negative case", "action": "임시 shared/foo.py 생성 후 stage", "expect": "R1 탐지 + exit 1, 이후 삭제"},
+    {"step": "gc scan", "action": "hexa gc.hexa --scan", "expect": "findings JSONL 생성, 파일에 영향 없음 (read-only)"},
+    {"step": "pre-commit chain", "action": "정상 커밋 1 + 의도적 위반 1", "expect": "첫째 통과, 둘째 차단"},
+    {"step": "log schema", "action": "lint_log/gc_log/mistakes jsonl 검사", "expect": "1줄/JSON 오브젝트"}
+  ],
+  "approval_matrix": [
+    {"item": ".git/hooks/pre-commit 수정", "scope": "로컬, git 무시", "approval": "불필요"},
+    {"item": "shared/tool/*.hexa 신규 생성", "scope": "신규 파일, L0 외", "approval": "불필요"},
+    {"item": "hooks-config.json 등록", "scope": "lockdown v3.0-FINAL", "approval": "이번 플랜 제외. 안정화 후 별도 PR"}
+  ],
+  "post_state_expected": {
+    "P1_map": "done",
+    "P2_auto_enforce": "done",
+    "P2_loop_self_correct": "partial (autofix L2 미룸)",
+    "P3_garbage_collect": "done (gc.hexa 추가로 강화)"
+  },
+  "out_of_scope": [
+    "L2 autofix 에이전트 — lint 실패 로그 누적 후 패턴 보이면 autofix.hexa 로 승격",
+    "hooks-config.json 정식 등록 — 수동 CLI 안정화 후 별도 승인"
+  ]
+}

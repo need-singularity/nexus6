@@ -1,0 +1,259 @@
+// ═══════════════════════════════════════════════════════════
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+// autofix.hexa — 하네스 L2 자동 교정 루프 (제안 기반)
+// 원칙: mistakes.jsonl 반복 패턴 감지 → 제안만 기록. 코드 자동 수정 X
+//       반복 = (file × rule) count >= threshold (기본 3)
+// Usage:
+//   hexa shared/tool/autofix.hexa --analyze        (최근 N개 mistake 분석)
+//   hexa shared/tool/autofix.hexa --threshold 5    (반복 기준 조정)
+//   hexa shared/tool/autofix.hexa --window 200     (분석 대상 최근 N줄)
+//   hexa shared/tool/autofix.hexa --report         (최근 제안 요약)
+// 출력: shared/tool/autofix_proposals.jsonl
+// ═══════════════════════════════════════════════════════════
+
+let REPO_ROOT = exec("git rev-parse --show-toplevel 2>/dev/null").trim()  // @allow-bare-exec
+let SHARED_DIR = REPO_ROOT + "/shared"
+let MISTAKES = SHARED_DIR + "/tool/mistakes.jsonl"
+let PROPOSALS = SHARED_DIR + "/tool/autofix_proposals.jsonl"
+
+fn now_iso() -> string {
+    return exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()  // @allow-bare-exec
+}
+
+fn json_escape(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", "\\n")
+    return r
+}
+
+// void-safe coercion ("".split() 첫 원소 void 이슈 우회)
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+// last_index_of 미지원 우회 — 수동 스캔
+fn _rfind(s: string, ch: string) -> i64 {
+    let n = len(s)
+    let mut i: i64 = n - 1
+    while i >= 0 {
+        if s.substring(i, i + 1) == ch { return i }
+        i = i - 1
+    }
+    return -1
+}
+
+// ─── JSONL key extractor (간이) ───
+fn extract_field(line: string, key: string) -> string {
+    let marker = "\"" + key + "\":\""
+    let idx = line.index_of(marker)
+    if idx < 0 { return "" }
+    let after = line.substring(idx + len(marker), len(line))
+    let end = after.index_of("\"")
+    if end < 0 { return "" }
+    return after.substring(0, end)
+}
+
+// ─── Known fix templates (rule → suggestion) ───
+fn fix_template(rule: string) -> string {
+    if rule == "R1" { return "rename to .hexa; wrap original in exec() if bootstrap-required; or move to shared/scripts/ (exception)" }  // @allow-bare-exec
+    if rule == "R14" { return "convert .md body to JSON/JSONL; or merge into CLAUDE.md if it's a map/index" }
+    if rule == "L0" { return "add 'chore(lockdown):' or 'L0-approved' marker to commit message" }
+    if rule == "P-PY-HEAVY" { return "extract python3 -c calls to a reusable hexa helper; or consider whole-file rewrite in hexa" }
+    if rule.starts_with("P-") { return "check shared/hexa_pitfalls_log.jsonl for canonical fix" }
+    return "review rule definition; consider exception or tuning"
+}
+
+// ─── auto-bitter 모드 — 반복 mistakes 패턴 → bitter-gate 통과 후 룰 등록 제안 ───
+// 실제 룰 등록은 사용자 승인 필요 (stdout 만). severity=warn 만, 자동 등록 금지.
+fn run_auto_bitter(threshold: i64, window: i64) -> i64 {
+    if !file_exists(MISTAKES) {
+        println("auto-bitter: mistakes.jsonl 없음")
+        return 0
+    }
+    let recent_raw = exec("tail -" + to_string(window) + " '" + MISTAKES + "' 2>/dev/null").trim()  // @allow-bare-exec
+    if recent_raw == "" {
+        println("auto-bitter: mistakes 비어있음")
+        return 0
+    }
+    let lines = recent_raw.split("\n")
+    let mut keys: [string] = []
+    let mut counts: [i64] = []
+    for ln in lines {
+        let l = _str(ln).trim()
+        if l == "" { continue }
+        let rule = extract_field(l, "rule")
+        if rule == "" { continue }
+        let mut idx: i64 = -1
+        let mut i: i64 = 0
+        while i < len(keys) {
+            if keys[i] == rule { idx = i; break }
+            i = i + 1
+        }
+        if idx < 0 {
+            keys = keys.push(rule)
+            counts = counts.push(1)
+        } else {
+            let mut new_counts: [i64] = []
+            let mut j: i64 = 0
+            while j < len(counts) {
+                if j == idx { new_counts = new_counts.push(counts[j] + 1) }
+                else { new_counts = new_counts.push(counts[j]) }
+                j = j + 1
+            }
+            counts = new_counts
+        }
+    }
+
+    // bitter-gate 호출 — 기존 rules_usage 업데이트 (별도 프로세스)
+    let bgate = SHARED_DIR + "/tool/bitter-gate.hexa"
+    let hexa_bin = REPO_ROOT + "/bin/hexa"
+    if file_exists(bgate) {
+        exec(hexa_bin + " run '" + bgate + "' --audit 2>&1 > /dev/null")  // @allow-bare-exec
+    }
+
+    // rules_usage.jsonl tail 에서 active/dormant 조회 (간이)
+    let usage = SHARED_DIR + "/tool/rules_usage.jsonl"
+    let mut emitted: i64 = 0
+    let now = now_iso()
+    let mut i: i64 = 0
+    while i < len(keys) {
+        if counts[i] >= threshold {
+            let rule = _str(keys[i])
+            // bitter-gate status lookup
+            let cmd = "grep '\"rule\":\"" + rule + "\"' '" + usage + "' 2>/dev/null | tail -1"
+            let line = _str(exec(cmd)).trim()  // @allow-bare-exec
+            let status = extract_field(line, "status")
+            // dormant/insufficient/not_implemented 규칙은 auto-promote 제안. active 는 제외
+            if status == "dormant" || status == "not_implemented" || status == "" {
+                let proposal = "{\"ts\":\"" + now + "\",\"rule\":\"" + json_escape(rule) + "\",\"count\":" + to_string(counts[i]) + ",\"bitter_status\":\"" + json_escape(status) + "\",\"proposal\":\"promote-to-harness\",\"auto_register\":false,\"status\":\"pending_approval\"}"
+                try { exec("echo '" + proposal.replace("'", "'\\''") + "' >> '" + PROPOSALS + "'") } catch e {}  // @allow-bare-exec
+                println("auto-bitter: " + rule + " count=" + to_string(counts[i]) + " status=" + status + " → pending_approval")
+                emitted = emitted + 1
+            }
+        }
+        i = i + 1
+    }
+    println("auto-bitter: proposed=" + to_string(emitted) + " (승인 필요, 자동 등록 X)")
+    return emitted
+}
+
+// ─── Main ───
+let a = args()
+let mut mode = "analyze"
+let mut threshold: i64 = 3
+let mut window: i64 = 500
+let mut ai: i64 = 2
+while ai < len(a) {
+    let t = a[ai]
+    if t == "--analyze" { mode = "analyze" }
+    else if t == "--report" { mode = "report" }
+    else if t == "--auto-bitter" { mode = "auto-bitter" }
+    else if t == "--threshold" {
+        if ai + 1 < len(a) { try { threshold = to_int(a[ai + 1]) } catch e {}; ai = ai + 1 }
+    }
+    else if t == "--window" {
+        if ai + 1 < len(a) { try { window = to_int(a[ai + 1]) } catch e {}; ai = ai + 1 }
+    }
+    ai = ai + 1
+}
+
+if mode == "auto-bitter" {
+    let _ = run_auto_bitter(threshold, window)
+    exit(0)
+}
+
+if mode == "report" {
+    let last = exec("tail -5 '" + PROPOSALS + "' 2>/dev/null").trim()  // @allow-bare-exec
+    if last == "" { println("(autofix_proposals.jsonl empty)") } else { println(last) }
+    exit(0)
+}
+
+if !file_exists(MISTAKES) {
+    println("mistakes.jsonl 없음 — 아직 실패 누적 없음")
+    exit(0)
+}
+
+// 최근 window 줄 읽기
+let recent_raw = exec("tail -" + to_string(window) + " '" + MISTAKES + "' 2>/dev/null").trim()  // @allow-bare-exec
+if recent_raw == "" {
+    println("mistakes.jsonl 비어있음")
+    exit(0)
+}
+
+// (file|rule) → count 집계 — 문자열 배열로 단순 카운팅
+let lines = recent_raw.split("\n")
+let mut keys: [string] = []
+let mut counts: [i64] = []
+let mut last_seen: [string] = []
+
+for ln in lines {
+    let l = _str(ln).trim()
+    if l == "" { continue }
+    let file = extract_field(l, "file")
+    let rule = extract_field(l, "rule")
+    let ts = extract_field(l, "ts")
+    if file == "" || rule == "" { continue }
+    let key = file + "|" + rule
+
+    let mut found_idx: i64 = -1
+    let mut i: i64 = 0
+    while i < len(keys) {
+        if keys[i] == key {
+            found_idx = i
+            break
+        }
+        i = i + 1
+    }
+    if found_idx < 0 {
+        keys = keys.push(key)
+        counts = counts.push(1)
+        last_seen = last_seen.push(ts)
+    } else {
+        // Lists are pass-by-value; index assignment is a no-op.
+        // Rebuild the numeric/ts lists with the updated slot.
+        let mut new_counts: [i64] = []
+        let mut new_last: [string] = []
+        let mut j: i64 = 0
+        while j < len(counts) {
+            if j == found_idx {
+                new_counts = new_counts.push(counts[j] + 1)
+                new_last = new_last.push(ts)
+            } else {
+                new_counts = new_counts.push(counts[j])
+                new_last = new_last.push(last_seen[j])
+            }
+            j = j + 1
+        }
+        counts = new_counts
+        last_seen = new_last
+    }
+}
+
+// 임계값 초과 패턴 → 제안 append
+let mut emitted: i64 = 0
+let now = now_iso()
+let mut i: i64 = 0
+while i < len(keys) {
+    if counts[i] >= threshold {
+        let parts = keys[i].split("|")
+        if len(parts) < 2 { i = i + 1; continue }
+        let file = _str(parts[0])
+        let rule = _str(parts[1])
+        let fix = fix_template(rule)
+        let line = "{\"ts\":\"" + now + "\",\"file\":\"" + json_escape(file) + "\",\"rule\":\"" + rule + "\",\"count\":" + to_string(counts[i]) + ",\"last_seen\":\"" + json_escape(last_seen[i]) + "\",\"fix_template\":\"" + json_escape(fix) + "\",\"status\":\"proposed\"}"
+        try { exec("echo '" + line.replace("'", "'\\''") + "' >> '" + PROPOSALS + "'") } catch e {}  // @allow-bare-exec
+        println("proposal: " + file + " × " + rule + " (count=" + to_string(counts[i]) + ")")
+        emitted = emitted + 1
+    }
+    i = i + 1
+}
+
+println("analyzed: " + to_string(len(keys)) + " unique (file×rule), threshold=" + to_string(threshold))
+println("proposed: " + to_string(emitted))
+exit(0)

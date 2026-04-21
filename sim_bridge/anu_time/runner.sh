@@ -13,7 +13,7 @@ cd "$NEXUS_ROOT" || exit 1
 
 MAX_TICKS="${1:-300}"
 LABEL="${2:-run_$(date +%s)}"
-RUN_DIR="$NEXUS_ROOT/shared/sim_bridge/anu_time/runs/$LABEL"
+RUN_DIR="$NEXUS_ROOT/sim_bridge/anu_time/runs/$LABEL"
 
 mkdir -p "$RUN_DIR"
 

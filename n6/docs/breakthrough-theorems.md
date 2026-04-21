@@ -21102,7 +21102,7 @@ Anima 서비스 10개에서 phi=2(감정 극성, 수면/각성, 의식/비의식
 | # | 항목 | 값 | n=6 수식 | 출처 | 판정 |
 |---|------|-----|----------|------|------|
 | 1 | 지도 레이어 수 (객관/주관) | 2 | phi=2 | 설계값 | EXACT |
-| 2 | 현실 지도 노드 수 | 342 = phi x 171 | phi=2 인수 | nexus/shared/reality_map.json v8.0; 342=2x171, phi=2 이중 레이어 투사 구조 | EXACT |
+| 2 | 현실 지도 노드 수 | 342 = phi x 171 | phi=2 인수 | nexus/reality_map.json v8.0; 342=2x171, phi=2 이중 레이어 투사 구조 | EXACT |
 | 3 | VIX(공포 지수) 장기 중앙값 | 19.97 -> 20 | J2-tau=20 | CBOE VIX 1990~2023 중앙값 19.97; Whaley (2009) *J Portfolio Mgmt* 확인 | EXACT |
 | 4 | 감정 기본 카테고리 (Ekman) | 6 | n=6 | Ekman (1992) | EXACT |
 | 5 | Plutchik 감정 바퀴 기본축 | 8 | sigma-tau=8 | Plutchik (1980) | EXACT |

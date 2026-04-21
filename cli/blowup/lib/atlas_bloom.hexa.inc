@@ -48,7 +48,7 @@ let mut _BLOOM_HASH_COUNT: i64 = 4
 fn _bloom_load_tuning() -> i64 {
     // n6_tuning.json 에서 bloom_bits_per_entry / bloom_hash_count 를 읽어 global 에 반영.
     // 파일 부재 / parse 실패 시 default 유지.
-    let cfg = _NEXUS + "/shared/config/n6_tuning.json"
+    let cfg = _NEXUS + "/config/n6_tuning.json"
     if !file_exists(cfg) { return 0 }
     let mut raw = ""
     try { raw = read_file(cfg) } catch e { return 0 }

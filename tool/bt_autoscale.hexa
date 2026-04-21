@@ -1,0 +1,354 @@
+// bt_autoscale.hexa — EF-P8-1 BT auto-scaling (BT-541..547)
+// @no-lock-needed  @allow-bare-exec  @enforce-sandbox
+// SSOT: bt_autoscale_state.jsonl (append). usage/difficulty/compute -> scaled params
+// CLI: hexa run bt_autoscale.hexa <scale|scale_all|profile|status> [bt_id]
+
+let HOME = env("HOME")
+let NEXUS = HOME + "/Dev/nexus"
+let HARNESS = NEXUS + "/harness"
+let USAGE = HARNESS + "/engines_usage.jsonl"
+let SWEEP = NEXUS + "/dse/domains/bt-millennium-sweep.jsonl"
+let ALLOC = NEXUS + "/engine/bt_compute_allocation.json"
+let STATE = HARNESS + "/bt_autoscale_state.jsonl"
+let BASE_DEPTH: i64 = 3
+let BASE_WIDTH: i64 = 5
+let BASE_ITER: i64 = 6
+let MAX_DEPTH: i64 = 8
+let MAX_WIDTH: i64 = 15
+let MAX_ITER: i64 = 20
+let BT_IDS: [string] = ["BT-541", "BT-542", "BT-543", "BT-544", "BT-545", "BT-546", "BT-547"]
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+fn _to_int0(s: string) -> i64 {
+    if s == "" { return 0 }
+    let first = _str(s.split("\n")[0]).trim()
+    if first == "" { return 0 }
+    return to_int(first)
+}
+fn now_unix() -> i64 { return _to_int0(_str(exec("date +%s")).trim()) }  // @allow-bare-exec
+fn json_escape(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", " ").replace("\r", " ").replace("\t", " ")
+}
+fn json_field(line: string, key: string) -> string {
+    let tag = "\"" + key + "\""
+    if line.contains(tag) == false { return "" }
+    let after = line.split(tag)[1]
+    let parts = after.split(":")
+    if parts.len() < 2 { return "" }
+    let mut rest = parts[1]
+    let mut i = 2
+    while i < parts.len() { rest = rest + ":" + parts[i]; i = i + 1 }
+    let s = rest.trim()
+    if s.len() == 0 { return "" }
+    if s.substring(0, 1) == "\"" {
+        let ep = s.substring(1, s.len()).split("\"")
+        if ep.len() < 1 { return "" }
+        return ep[0]
+    }
+    let mut end = 0
+    while end < s.len() {
+        let c = s.substring(end, end + 1)
+        if c == "," || c == "}" || c == "\n" || c == " " { break }
+        end = end + 1
+    }
+    return s.substring(0, end).trim()
+}
+fn file_append_line(path: string, line: string) {
+    let esc = line.replace("'", "'\\''")
+    try { exec("printf '%s\\n' '" + esc + "' >> '" + path + "'") } catch e {}  // @allow-bare-exec
+}
+fn clamp(val: i64, lo: i64, hi: i64) -> i64 {
+    if val < lo { return lo }
+    if val > hi { return hi }
+    return val
+}
+fn is_valid_bt_id(id: string) -> bool {
+    let mut i = 0
+    while i < BT_IDS.len() { if _str(BT_IDS[i]) == id { return true }; i = i + 1 }
+    return false
+}
+
+// ─── usage aggregation: 7d window bench/discovery events ───
+// returns [total_events, avg_score, max_score, discovery_hits]
+fn load_bt_usage(bt_id: string) -> [i64] {
+    let mut total: i64 = 0
+    let mut score_sum: i64 = 0
+    let mut score_cnt: i64 = 0
+    let mut max_score: i64 = 0
+    let mut disc_hits: i64 = 0
+    let cutoff = now_unix() - 604800
+    if file_exists(USAGE) == false { return [0, 0, 0, 0] }
+    let raw = _str(exec("grep '\"" + bt_id + "_engine\"' '" + USAGE + "' 2>/dev/null | tail -200")).trim()  // @allow-bare-exec
+    if raw == "" { return [0, 0, 0, 0] }
+    let lines = raw.split("\n")
+    let mut i = 0
+    while i < lines.len() {
+        let line = _str(lines[i]).trim()
+        if line == "" { i = i + 1; continue }
+        let ts = _to_int0(json_field(line, "ts"))
+        if ts < cutoff { i = i + 1; continue }
+        total = total + 1
+        let kind = json_field(line, "kind")
+        if kind == "bench" || kind == "bt_discovery" {
+            let sc = _to_int0(json_field(line, "score"))
+            score_sum = score_sum + sc
+            score_cnt = score_cnt + 1
+            if sc > max_score { max_score = sc }
+        }
+        if kind == "bt_discovery" { disc_hits = disc_hits + _to_int0(json_field(line, "hits")) }
+        i = i + 1
+    }
+    return [total, (if score_cnt > 0 { score_sum / score_cnt } else { 0 }), max_score, disc_hits]
+}
+
+// ─── difficulty from DSE sweep — [score_str, rank_str, status, atlas_count_str] ───
+fn load_difficulty(bt_id: string) -> [string] {
+    if file_exists(SWEEP) == false { return ["0.5", "4", "unknown", "0"] }
+    let lines = _str(read_file(SWEEP)).split("\n")
+    let mut i = 0
+    while i < lines.len() {
+        let line = _str(lines[i]).trim()
+        if line != "" && json_field(line, "bt_id") == bt_id {
+            let s = json_field(line, "score")
+            let r = json_field(line, "priority_rank")
+            return [(if s != "" { s } else { "0.5" }), (if r != "" { r } else { "4" }), json_field(line, "status"), json_field(line, "atlas_count")]
+        }
+        i = i + 1
+    }
+    return ["0.5", "4", "unknown", "0"]
+}
+
+// ─── compute budget (cents) + primary slot from allocation JSON ───
+fn load_budget_cap(bt_id: string) -> i64 {
+    if file_exists(ALLOC) == false { return 2000 }
+    let raw = _str(read_file(ALLOC))
+    let tag = "\"" + bt_id + "\":"
+    if raw.contains("\"budget_cap_per_bt\"") == false { return 2000 }
+    let after = raw.split("\"budget_cap_per_bt\"")[1]
+    if after.contains(tag) == false { return 2000 }
+    let trimmed = after.split(tag)[1].trim()
+    let mut end = 0
+    while end < trimmed.len() {
+        let c = trimmed.substring(end, end + 1)
+        if c == "," || c == "}" || c == "\n" { break }
+        end = end + 1
+    }
+    let mut val: i64 = 0
+    try { val = to_int(to_string(to_float(trimmed.substring(0, end).trim()) * 100.0)) } catch e {}
+    return if val > 0 { val } else { 2000 }
+}
+
+fn load_primary_slot(bt_id: string) -> string {
+    if file_exists(ALLOC) == false { return "hetzner" }
+    let raw = _str(read_file(ALLOC))
+    if raw.contains("\"" + bt_id + "\"") == false { return "hetzner" }
+    let after = raw.split("\"" + bt_id + "\"")[1]
+    if after.contains("\"primary_slot\"") == false { return "hetzner" }
+    let parts = after.split("\"primary_slot\"")[1].split("\"")
+    if parts.len() >= 3 { return _str(parts[1]) }
+    return "hetzner"
+}
+
+// ─── core: compute scaling parameters ───
+fn compute_scale(bt_id: string) -> map {
+    let usage = load_bt_usage(bt_id)
+    let total_events: i64 = usage[0]
+    let disc_hits: i64 = usage[3]
+    let diff = load_difficulty(bt_id)
+    let diff_score_str = _str(diff[0])
+    let rank = _to_int0(_str(diff[1]))
+    let atlas_count = _to_int0(_str(diff[3]))
+    let budget_cents = load_budget_cap(bt_id)
+    let slot = load_primary_slot(bt_id)
+
+    // difficulty multiplier (0..1 DSE score): high = closer to solution = scale UP
+    let mut diff_mult: i64 = 100
+    try {
+        let ds = to_float(diff_score_str)
+        if ds >= 0.75 { diff_mult = 180 }
+        else if ds >= 0.6 { diff_mult = 140 }
+        else if ds >= 0.4 { diff_mult = 110 }
+        else { diff_mult = 90 }
+    } catch e {}
+
+    // usage momentum: active engines with discoveries scale up
+    let mut usage_mult: i64 = 100
+    if disc_hits >= 20 { usage_mult = 160 }
+    else if disc_hits >= 10 { usage_mult = 130 }
+    else if disc_hits >= 3 { usage_mult = 115 }
+    else if total_events == 0 { usage_mult = 80 }
+
+    // atlas density: more atlas nodes = deeper exploration warranted
+    let mut atlas_mult: i64 = 100
+    if atlas_count >= 8 { atlas_mult = 140 }
+    else if atlas_count >= 4 { atlas_mult = 120 }
+    else if atlas_count >= 1 { atlas_mult = 105 }
+
+    // composite multiplier (avg of three signals)
+    let composite = (diff_mult + usage_mult + atlas_mult) / 3
+    let mut depth = BASE_DEPTH * composite / 100
+    let mut width = BASE_WIDTH * composite / 100
+    let mut iter = BASE_ITER * composite / 100
+
+    // resource cap by slot type
+    if slot.contains("runpod") {
+        depth = clamp(depth, BASE_DEPTH, MAX_DEPTH)
+        width = clamp(width, BASE_WIDTH, 10)
+        iter = clamp(iter, BASE_ITER, MAX_ITER)
+    } else if slot.contains("ubu") {
+        depth = clamp(depth, BASE_DEPTH, 6)
+        width = clamp(width, BASE_WIDTH, 8)
+        iter = clamp(iter, BASE_ITER, 12)
+    } else {
+        depth = clamp(depth, BASE_DEPTH, MAX_DEPTH)
+        width = clamp(width, BASE_WIDTH, MAX_WIDTH)
+        iter = clamp(iter, BASE_ITER, 15)
+    }
+    // budget pressure: cap < $20/mo => reduce 20%
+    if budget_cents < 2000 {
+        depth = clamp(depth * 80 / 100, BASE_DEPTH, MAX_DEPTH)
+        iter = clamp(iter * 80 / 100, BASE_ITER, MAX_ITER)
+    }
+    // priority boost: rank 1-2 get +1 depth
+    if rank <= 2 { depth = clamp(depth + 1, BASE_DEPTH, MAX_DEPTH) }
+
+    let mut r: map = #{}
+    r["bt_id"] = bt_id
+    r["depth"] = to_string(depth)
+    r["width"] = to_string(width)
+    r["iterations"] = to_string(iter)
+    r["diff_score"] = diff_score_str
+    r["rank"] = to_string(rank)
+    r["status"] = _str(diff[2])
+    r["slot"] = slot
+    r["usage_events"] = to_string(total_events)
+    r["avg_score"] = to_string(usage[1])
+    r["disc_hits"] = to_string(disc_hits)
+    r["composite"] = to_string(composite)
+    return r
+}
+
+// ─── bt_autoscale: harness-callable entry point ───
+fn bt_autoscale(bt_id: string) -> map {
+    if is_valid_bt_id(bt_id) == false {
+        eprintln("REJECT: invalid bt_id '" + bt_id + "' — expected BT-541..BT-547")
+        return #{}
+    }
+    let params = compute_scale(bt_id)
+    let ts = now_unix()
+    let row = "{\"ts\":" + to_string(ts) + ",\"bt_id\":\"" + json_escape(bt_id)
+        + "\",\"kind\":\"autoscale\",\"depth\":" + _str(params["depth"])
+        + ",\"width\":" + _str(params["width"]) + ",\"iterations\":" + _str(params["iterations"])
+        + ",\"diff_score\":\"" + json_escape(_str(params["diff_score"]))
+        + "\",\"rank\":" + _str(params["rank"]) + ",\"slot\":\"" + json_escape(_str(params["slot"]))
+        + "\",\"composite\":" + _str(params["composite"]) + ",\"disc_hits\":" + _str(params["disc_hits"]) + "}"
+    file_append_line(STATE, row)
+    return params
+}
+
+// ─── CLI commands ───
+fn cmd_scale(argv: [string]) {
+    if argv.len() < 4 { eprintln("usage: bt_autoscale scale <bt_id>"); exit(2) }
+    let params = bt_autoscale(_str(argv[3]).trim())
+    let ks = keys(params)
+    let mut i = 0
+    while i < ks.len() { let k = _str(ks[i]); println(k + "=" + _str(params[k])); i = i + 1 }
+}
+
+fn cmd_scale_all(argv: [string]) {
+    println("bt_id       depth width iter  diff  rank slot              composite")
+    println("----------- ----- ----- ----- ----- ---- ----------------- ---------")
+    let mut i = 0
+    while i < BT_IDS.len() {
+        let p = bt_autoscale(_str(BT_IDS[i]))
+        println(_str(p["bt_id"]) + "     " + _str(p["depth"]) + "     " + _str(p["width"]) + "     "
+            + _str(p["iterations"]) + "     " + _str(p["diff_score"]) + " " + _str(p["rank"])
+            + "    " + _str(p["slot"]) + "  " + _str(p["composite"]))
+        i = i + 1
+    }
+}
+
+fn cmd_profile(argv: [string]) {
+    if argv.len() < 4 { eprintln("usage: bt_autoscale profile <bt_id>"); exit(2) }
+    let bt_id = _str(argv[3]).trim()
+    if is_valid_bt_id(bt_id) == false { eprintln("REJECT: invalid bt_id"); exit(2) }
+    let u = load_bt_usage(bt_id)
+    let d = load_difficulty(bt_id)
+    let p = compute_scale(bt_id)
+    println("=== " + bt_id + " profile ===")
+    println("difficulty: score=" + _str(d[0]) + " rank=" + _str(d[1]) + " status=" + _str(d[2]) + " atlas=" + _str(d[3]))
+    println("usage_7d: events=" + to_string(u[0]) + " avg=" + to_string(u[1]) + " max=" + to_string(u[2]) + " disc_hits=" + to_string(u[3]))
+    println("compute: slot=" + load_primary_slot(bt_id) + " budget=$" + to_string(load_budget_cap(bt_id) / 100) + "/mo")
+    println("scaled: depth=" + _str(p["depth"]) + " width=" + _str(p["width"]) + " iter=" + _str(p["iterations"]) + " composite=" + _str(p["composite"]))
+}
+
+fn cmd_status(argv: [string]) {
+    let mut active: i64 = 0
+    let mut cold: i64 = 0
+    let mut events: i64 = 0
+    let mut i = 0
+    while i < BT_IDS.len() {
+        let u = load_bt_usage(_str(BT_IDS[i]))
+        events = events + u[0]
+        if u[0] > 0 { active = active + 1 } else { cold = cold + 1 }
+        i = i + 1
+    }
+    if file_exists(STATE) {
+        let cnt = _to_int0(_str(exec("wc -l < '" + STATE + "' 2>/dev/null")).trim())  // @allow-bare-exec
+        println("state_log=" + to_string(cnt))
+    }
+    println("bt_engines=7 active=" + to_string(active) + " cold=" + to_string(cold) + " usage_events_7d=" + to_string(events))
+}
+
+fn main() {
+    // argv 정규화 (2026-04-19): Mac=[hexa, script, user...] Linux-stage1=[hexa, "run", script, user...]
+    // 이전까지 Mac-only argv[2] 가정 → Linux 에서 argv[2] = script path 로 dispatch 실패.
+    let _raw_argv = args()
+    let mut _script_idx = -1
+    let mut _scan_i = 0
+    while _scan_i < _raw_argv.len() {
+        if _raw_argv[_scan_i].ends_with(".hexa") { _script_idx = _scan_i; break }
+        _scan_i = _scan_i + 1
+    }
+    let mut _user_start = 2
+    let mut _script_token = ""
+    if _script_idx >= 0 {
+        _user_start = _script_idx + 1
+        _script_token = _raw_argv[_script_idx]
+    } else {
+        if _raw_argv.len() >= 3 {
+            if _raw_argv[1] == "run" { _user_start = 3 }
+            if _raw_argv[1] == "eval" { _user_start = 3 }
+        }
+    }
+    let mut argv: [str] = [_raw_argv[0], _script_token]
+    let mut _ua_i = _user_start
+    while _ua_i < _raw_argv.len() {
+        argv = argv + [_raw_argv[_ua_i]]
+        _ua_i = _ua_i + 1
+    }
+    if _script_token.len() > 0 && argv.len() >= 3 {
+        if argv[2] == _script_token {
+            let mut _a2: [str] = [_raw_argv[0], _script_token]
+            let mut _j2 = 3
+            while _j2 < argv.len() {
+                _a2 = _a2 + [argv[_j2]]
+                _j2 = _j2 + 1
+            }
+            argv = _a2
+        }
+    }
+    if argv.len() < 3 { eprintln("usage: bt_autoscale <scale|scale_all|profile|status> [bt_id]"); exit(2) }
+    let mode = _str(argv[2]).trim()
+    if mode == "scale" { cmd_scale(argv) }
+    else if mode == "scale_all" { cmd_scale_all(argv) }
+    else if mode == "profile" { cmd_profile(argv) }
+    else if mode == "status" { cmd_status(argv) }
+    else { eprintln("REJECT: unknown '" + mode + "' — scale|scale_all|profile|status"); exit(2) }
+}
+
+main()

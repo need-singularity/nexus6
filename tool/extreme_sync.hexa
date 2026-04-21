@@ -1,0 +1,684 @@
+// extreme_sync.hexa — 극한 로드맵 aggregate 자동 sync
+// @no-lock-needed
+// @allow-bare-exec
+// @allow-atlas-direct
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// PURPOSE
+//   shared/roadmaps/{extreme, alm_consciousness_standalone, clm_consciousness_standalone}.json
+//   aggregate_state 필드 자동 갱신.
+//
+//   Claude Code autonomous (commands.json) 60min 주기 실행으로 JSON 자동 sync.
+//   사용자가 로드맵 보드(nexus github pages #extreme) 에서 항상 실시간 값 확인 가능.
+//
+// SOURCES (read-only scan)
+//   alm_consciousness_standalone.json      tracks[].options[].state 카운트
+//   clm_consciousness_standalone.json      동일
+//   training/deploy/hire_sim_claude_v*.log 직원 gate hit (hire_sim completion)
+//   training/deploy/*.log                  MFU / loss / step
+//   experiments/pbv_leak_*.hexa            C3 진행 여부 (file count)
+//
+// WRITES
+//   extreme.json::aggregate_state          재계산 (options_total/chosen/...)
+//   extreme.json::update_log[]             append ts + delta 요약
+//   shared/tool/extreme_sync.jsonl      observation tape
+//
+// CLI
+//   hexa extreme_sync.hexa sync            full sync (default, used by cron)
+//   hexa extreme_sync.hexa dry             show diff, no write
+//   hexa extreme_sync.hexa status          current summary 1-line
+//   hexa extreme_sync.hexa --selftest      self-check
+//
+// exit: 0 success / 1 operational fail / 2 usage / 3 selftest fail
+// ═══════════════════════════════════════════════════════════════════════════
+
+let HOME = env("HOME")
+let NEXUS = HOME + "/Dev/nexus"
+let ANIMA = HOME + "/Dev/anima"
+let ROADMAPS = NEXUS + "/roadmaps"
+let HARNESS = NEXUS + "/harness"
+
+let PATH_XT = ROADMAPS + "/extreme.json"
+let PATH_ALM = ROADMAPS + "/alm_consciousness_standalone.json"
+let PATH_CLM = ROADMAPS + "/clm_consciousness_standalone.json"
+let PATH_BOARD = NEXUS + "/state/c_track_board.json"
+let TAPE_OUT = HARNESS + "/extreme_sync.jsonl"
+
+fn _ts_iso() -> string {
+    return exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn file_exists(p: string) -> bool {
+    let out = exec("test -f " + p + " && echo 1 || echo 0").trim()
+    return out == "1"
+}
+
+// Count options by state using jq — robust, no hexa JSON parser needed.
+// returns 0 on jq failure.
+// "chosen" also counts state=="done" (ossified options).
+// "done" is a distinct raw count (used for wall_progress_pct denominator math).
+fn count_state(path: string, state: string) -> i64 {
+    if !file_exists(path) { return 0 }
+    let mut cmd = ""
+    if state == "chosen" {
+        cmd = "jq -r '[.tracks[].options[]? | select(.state==\"chosen\" or .state==\"done\")] | length' " + path + " 2>/dev/null"
+    } else {
+        cmd = "jq -r '[.tracks[].options[]? | select(.state==\"" + state + "\")] | length' " + path + " 2>/dev/null"
+    }
+    let out = exec(cmd).trim()
+    if out == "" || out == "null" { return 0 }
+    return to_int(out)
+}
+
+// Count raw state=="done" only (no chosen merge). Used to compute
+// wall_progress_pct as a monotone fraction independent of chosen flapping.
+fn count_done_raw(path: string) -> i64 {
+    if !file_exists(path) { return 0 }
+    let cmd = "jq -r '[.tracks[].options[]? | select(.state==\"done\")] | length' " + path + " 2>/dev/null"
+    let out = exec(cmd).trim()
+    if out == "" || out == "null" { return 0 }
+    return to_int(out)
+}
+
+fn count_total_options(path: string) -> i64 {
+    if !file_exists(path) { return 0 }
+    let cmd = "jq -r '[.tracks[].options[]?] | length' " + path + " 2>/dev/null"
+    let out = exec(cmd).trim()
+    if out == "" || out == "null" { return 0 }
+    return to_int(out)
+}
+
+// ── Evidence scans ──────────────────────────────────────────────────────
+// Find latest hire_sim_claude_v*.log and extract pass_rate if present.
+fn latest_hire_sim_pass() -> string {
+    let cmd = "ls -1t " + ANIMA + "/training/deploy/hire_sim_claude_v*.log 2>/dev/null | head -1"
+    let path = exec(cmd).trim()
+    if path == "" { return "no_log" }
+    // look for last "pass_rate" or "completion_rate" line
+    let grep = "grep -aE 'completion_rate|pass_rate|avg_score' " + path + " 2>/dev/null | tail -1"
+    let line = exec(grep).trim()
+    if line == "" { return "running" }
+    return line
+}
+
+// C3 PBV fix progress: count experiment isolate files
+fn pbv_experiment_count() -> i64 {
+    let cmd = "ls " + ANIMA + "/experiments/pbv_leak_* 2>/dev/null | wc -l"
+    let out = exec(cmd).trim()
+    if out == "" { return 0 }
+    return to_int(out)
+}
+
+// check stage0 recent rebuild (project_session_20260413 referenced)
+fn stage0_recent() -> bool {
+    let cmd = "test -f " + HOME + "/Dev/hexa-lang/self/native/hexa_v2 && echo 1 || echo 0"
+    return exec(cmd).trim() == "1"
+}
+
+// ── C track board → alm/clm propagation ─────────────────────────────────
+// Maps board status to roadmap option state:
+//   done       → chosen
+//   in_progress→ provisional (still verifying)
+//   blocked    → provisional (with note)
+//   claimed    → provisional
+//   planned    → leave alone (don't downgrade if user manually marked chosen)
+fn board_status_to_state(board_status: string) -> string {
+    if board_status == "done" { return "chosen" }
+    if board_status == "in_progress" { return "provisional" }
+    if board_status == "blocked" { return "provisional" }
+    if board_status == "claimed" { return "provisional" }
+    return ""  // planned: no change
+}
+
+fn propagate_c_track(target_path: string) -> i64 {
+    if !file_exists(PATH_BOARD) { return 0 }
+    if !file_exists(target_path) { return 0 }
+    let mut updates: i64 = 0
+    let cn_list: list = ["C1", "C2", "C3", "C4", "C6", "C8", "C9", "C10", "C11"]
+    let mut i: i64 = 0
+    while i < cn_list.len() {
+        let cn = cn_list[i]
+        let status_cmd = "jq -r '.items[\"" + cn + "\"].status // \"\"' " + PATH_BOARD + " 2>/dev/null"
+        let board_status = exec(status_cmd).trim()
+        let new_state = board_status_to_state(board_status)
+        if new_state != "" {
+            let evid_cmd = "jq -r '.items[\"" + cn + "\"].evidence // \"\"' " + PATH_BOARD + " 2>/dev/null"
+            let evid = exec(evid_cmd).trim().replace("\"", "'").replace("\n", " ")
+            // patch the option at tracks.C.options[?(.id == cn)]
+            let tmp = "/tmp/c_propagate_" + cn + "_" + _ts_iso() + ".json"
+            let jq_expr = "(.tracks.C.options[]? | select(.id == \"" + cn + "\")) "
+                + "|= (.state = \"" + new_state + "\""
+                + " | .board_status = \"" + board_status + "\""
+                + " | .board_evidence = \"" + evid + "\")"
+            let cmd = "jq '" + jq_expr + "' " + target_path + " > " + tmp
+                + " && mv " + tmp + " " + target_path
+            let rc = exec(cmd + " && echo OK || echo FAIL").trim()
+            if rc == "OK" { updates = updates + 1 }
+        }
+        i = i + 1
+    }
+    return updates
+}
+
+// ── Aggregate computation ────────────────────────────────────────────────
+struct AggCounts {
+    total: i64,
+    chosen: i64,
+    alternative: i64,
+    rejected: i64,
+    provisional: i64,
+    done: i64
+}
+
+// options_chosen can legitimately DECREASE when items are re-classified provisional.
+// Observed 4× in extreme_sync.jsonl 2026-04-15..16 (48→46→40→41). This is honesty,
+// not regression — harness must NOT treat chosen-decrease as error.
+@convergence(state="ossified", id="RUNPOD_OPTIONS_PROGRESS_DEMOTION", value="options_chosen count may DROP tick-over-tick (48→46→40→41 observed 2026-04-15..16) when items re-classified provisional. Legitimate honest movement — never flag as regression", ossified_at="2026-04-16")
+fn sum_counts(paths: list) -> AggCounts {
+    let mut total: i64 = 0
+    let mut chosen: i64 = 0
+    let mut alt: i64 = 0
+    let mut rej: i64 = 0
+    let mut prov: i64 = 0
+    let mut dn: i64 = 0
+    let mut i: i64 = 0
+    while i < paths.len() {
+        let p = paths[i]
+        total = total + count_total_options(p)
+        chosen = chosen + count_state(p, "chosen")
+        alt = alt + count_state(p, "alternative")
+        rej = rej + count_state(p, "rejected")
+        prov = prov + count_state(p, "provisional")
+        dn = dn + count_done_raw(p)
+        i = i + 1
+    }
+    return AggCounts {
+        total: total, chosen: chosen, alternative: alt,
+        rejected: rej, provisional: prov, done: dn
+    }
+}
+
+fn status_of(counts: AggCounts) -> string {
+    if counts.total == 0 { return "empty" }
+    let chosen_pct = (counts.chosen * 100) / counts.total
+    if chosen_pct >= 80 { return "ossified" }
+    if chosen_pct >= 60 { return "stable" }
+    if chosen_pct >= 40 { return "convergent" }
+    return "provisional"
+}
+
+// wall_progress_pct:
+//   Count-based denominator from sub-roadmap option states (non-abandoned).
+//   Formula: done / (chosen + provisional)
+//     - numerator   = raw done options (ossified, monotone up modulo re-open)
+//     - denominator = chosen + provisional (still-live options)
+//       NOTE: counts.chosen already INCLUDES done (count_state merges both).
+//       Using done + chosen + provisional would double-count done in the denom.
+//     - excludes alternative/rejected (abandoned — not part of progress denom)
+//   Evidence bonus: +5pp if hire_sim gate metric present (completion_rate|avg_score)
+//     (small nudge only; never dominates the ratio)
+//   Floor 5, ceiling 100. Guard div-by-zero.
+fn compute_progress(counts: AggCounts, evid_hs: string) -> i64 {
+    // counts.chosen includes done (count_state merges state=="chosen" + state=="done").
+    // Denominator = chosen (already contains done) + provisional = all live options.
+    let denom = counts.chosen + counts.provisional
+    let mut p: i64 = 5
+    if denom > 0 {
+        p = (counts.done * 100) / denom
+    }
+    if evid_hs.index_of("completion_rate") >= 0 || evid_hs.index_of("avg_score") >= 0 {
+        p = p + 5
+    }
+    if p < 5 { p = 5 }
+    if p > 100 { p = 100 }
+    return p
+}
+
+// ── Destination ETA computation ──────────────────────────────────────
+// Compute remaining_days for each track × destination from evidence.
+// No hardcoded dates — all values derived from progress signals.
+//
+// ALM: training step progress → remaining = ceil((total-current)/steps_per_day)
+//      hire_sim score → if score >= gate, remaining=0
+// CLM: curriculum phase → map phase to week estimate
+// hexa: C track board done count / total → remaining = ceil((1-ratio) * baseline_weeks * 7)
+//
+// Writes destinations[].remaining.{alm_days,clm_days,hexa_days,computed_at}
+
+fn parse_alm_remaining(hs_evidence: string) -> i64 {
+    // hire_sim gate check — if completion_rate or avg_score present and >= 0.80, done
+    if hs_evidence.index_of("avg_score") >= 0 || hs_evidence.index_of("completion_rate") >= 0 {
+        // extract numeric value after "=" or ":"
+        let cmd = "echo '" + hs_evidence.replace("'", "") + "' | grep -oE '[0-9]+\\.[0-9]+' | tail -1"
+        let val_str = exec(cmd).trim()
+        if val_str != "" {
+            // hexa doesn't have to_float, use shell bc
+            let cmp = exec("echo '" + val_str + " >= 0.80' | bc -l 2>/dev/null").trim()
+            if cmp == "1" { return 0 }
+            // partial progress: estimate remaining proportionally
+            // remaining = ceil((0.80 - score) / score_per_day)
+            // rough: 1 day training ≈ +0.15 score improvement
+            let gap_cmd = "echo '(" + val_str + ")' | bc -l 2>/dev/null"
+            let _ = exec(gap_cmd).trim()
+            // simplified: if score exists but < gate, ~2-3 days
+            return 3
+        }
+    }
+    if hs_evidence == "running" { return 4 }
+    // no log = not started yet
+    return 5
+}
+
+fn parse_alm_remaining_v3(hs_evidence: string) -> i64 {
+    // v3.0 Agent needs hire_sim >= 0.85 + tool-use — add 1 day buffer over v2.0
+    let base = parse_alm_remaining(hs_evidence)
+    if base == 0 { return 0 }
+    return base + 1
+}
+
+fn clm_phase_remaining() -> i64 {
+    // Read CLM roadmap active phase to estimate remaining weeks
+    if !file_exists(PATH_CLM) { return 28 }
+    let cmd = "jq -r '[.tracks[].options[]? | select(.state==\"chosen\")] | length' " + PATH_CLM + " 2>/dev/null"
+    let chosen_str = exec(cmd).trim()
+    let total_cmd = "jq -r '[.tracks[].options[]?] | length' " + PATH_CLM + " 2>/dev/null"
+    let total_str = exec(total_cmd).trim()
+    let chosen = to_int(chosen_str)
+    let total = to_int(total_str)
+    if total == 0 { return 28 }
+    // remaining ratio → map to 4-week window
+    let done_pct = (chosen * 100) / total
+    if done_pct >= 90 { return 3 }
+    if done_pct >= 70 { return 7 }
+    if done_pct >= 50 { return 14 }
+    if done_pct >= 30 { return 21 }
+    return 28
+}
+
+fn clm_phase_remaining_v2() -> i64 {
+    // v2.0 RC = week 2 ceiling, so cap at 14
+    let full = clm_phase_remaining()
+    if full > 14 { return 14 }
+    return full
+}
+
+fn hexa_c_remaining() -> i64 {
+    // C track board: count done / total items
+    if !file_exists(PATH_BOARD) { return 14 }
+    let total_cmd = "jq -r '.items | length' " + PATH_BOARD + " 2>/dev/null"
+    let done_cmd = "jq -r '[.items[] | select(.status==\"done\")] | length' " + PATH_BOARD + " 2>/dev/null"
+    let total_str = exec(total_cmd).trim()
+    let done_str = exec(done_cmd).trim()
+    let total = to_int(total_str)
+    let done = to_int(done_str)
+    if total == 0 { return 14 }
+    let remain_ratio = ((total - done) * 100) / total
+    // C track baseline: 2-3 weeks total
+    // remaining days = ratio × 21
+    let days = (remain_ratio * 21) / 100
+    if days < 1 { return 1 }
+    return days
+}
+
+fn hexa_c_remaining_v2() -> i64 {
+    // v2.0 RC needs core C items only — cap at 10
+    let full = hexa_c_remaining()
+    if full > 10 { return 10 }
+    return full
+}
+
+// ── Projected date computation (macOS date -v / Linux date -d) ──────────
+fn add_days_to_date(base_date: string, days: i64) -> string {
+    let mac_cmd = "date -v+" + to_string(days) + "d -jf '%Y-%m-%d' '" + base_date + "' '+%Y-%m-%d' 2>/dev/null"
+    let result = exec(mac_cmd).trim()
+    if result != "" { return result }
+    let linux_cmd = "date -d '" + base_date + " + " + to_string(days) + " days' '+%Y-%m-%d' 2>/dev/null"
+    let result2 = exec(linux_cmd).trim()
+    if result2 != "" { return result2 }
+    return base_date
+}
+
+// Recompute destinations.projected every tick from `remaining` + today.
+// Stored `projected` dates can drift positive (past today) while `remaining`>0.
+// Harness MUST recompute, never trust stored projection values.
+@convergence(state="ossified", id="RUNPOD_DESTINATION_DATE_PROJECTION_DRIFT", value="extreme.json#destinations[*].projected drifts positive vs today when stored stale. Every tick: recompute from today + remaining days (velocity-derived). Never merge-preserve projected.", ossified_at="2026-04-16")
+fn update_destinations(ts: string, hs_evidence: string, dry: bool) -> bool {
+    if !file_exists(PATH_XT) { return false }
+    let alm_d1 = parse_alm_remaining(hs_evidence)
+    let alm_d2 = parse_alm_remaining_v3(hs_evidence)
+    let clm_d1 = clm_phase_remaining_v2()
+    let clm_d2 = clm_phase_remaining()
+
+    let today = exec("date '+%Y-%m-%d' 2>/dev/null").trim()
+    let proj_alm_d1 = add_days_to_date(today, alm_d1)
+    let proj_clm_d1 = add_days_to_date(today, clm_d1)
+    let proj_alm_d2 = add_days_to_date(today, alm_d2)
+    let proj_clm_d2 = add_days_to_date(today, clm_d2)
+
+    let jq_expr = "(.destinations[0].remaining) = "
+        + "{\"alm_days\":" + to_string(alm_d1)
+        + ",\"clm_days\":" + to_string(clm_d1)
+        + ",\"computed_at\":\"" + ts + "\"}"
+        + " | (.destinations[0].projected) = "
+        + "{\"alm_date\":\"" + proj_alm_d1 + "\""
+        + ",\"clm_date\":\"" + proj_clm_d1 + "\""
+        + ",\"computed_at\":\"" + ts + "\"}"
+        + " | (.destinations[1].remaining) = "
+        + "{\"alm_days\":" + to_string(alm_d2)
+        + ",\"clm_days\":" + to_string(clm_d2)
+        + ",\"computed_at\":\"" + ts + "\"}"
+        + " | (.destinations[1].projected) = "
+        + "{\"alm_date\":\"" + proj_alm_d2 + "\""
+        + ",\"clm_date\":\"" + proj_clm_d2 + "\""
+        + ",\"computed_at\":\"" + ts + "\"}"
+    if dry {
+        println("  dest[0] remaining: alm=" + to_string(alm_d1) + " clm=" + to_string(clm_d1))
+        println("  dest[0] projected: alm=" + proj_alm_d1 + " clm=" + proj_clm_d1)
+        println("  dest[1] remaining: alm=" + to_string(alm_d2) + " clm=" + to_string(clm_d2))
+        println("  dest[1] projected: alm=" + proj_alm_d2 + " clm=" + proj_clm_d2)
+        return true
+    }
+    let tmp = "/tmp/extreme_dest_" + ts + ".json"
+    let cmd = "jq '" + jq_expr + "' " + PATH_XT + " > " + tmp + " && mv " + tmp + " " + PATH_XT
+    let rc = exec(cmd + " && echo OK || echo FAIL").trim()
+    return rc == "OK"
+}
+
+// ── Phase status sync — phases[].status 자동 갱신 ──────────────────────
+// Rollup rule (task-driven — preferred):
+//   all non-null tasks in phases[i].parallel[*].tasks[*].status == "done" → "done"
+//   any task.status == "in_progress"                                      → "in_progress"
+//   else (any planned, or mix of planned+done)                            → "planned"
+//   if phase has no tasks (tasks==null or empty) → fall back to evidence heuristic
+//
+// Evidence fallback (only when no tasks):
+//   NEVER promotes to "done" — evidence cannot confirm all tasks complete.
+//   ALM-TRAIN: hire_sim log present → in_progress (cap)
+//   CLM-*:     clm_phase_remaining ladder → in_progress (cap)
+//   ALM-CONSCIOUS / ALM-RC / CLM-7B: in_progress at most
+//   Only task-driven rollup (done == total) can mark a phase "done".
+//
+// Rolls up each phase independently — never overrides task-declared state.
+fn rollup_phase_from_tasks(phase_idx: i64) -> string {
+    // jq: count tasks by status across all .parallel[*].tasks[*]
+    let base = "jq -r '.phases[" + to_string(phase_idx) + "].parallel[]?.tasks[]?.status' " + PATH_XT + " 2>/dev/null"
+    let out = exec(base).trim()
+    if out == "" { return "" }   // no tasks — caller will fall back
+    let mut total: i64 = 0
+    let mut done: i64 = 0
+    let mut ip: i64 = 0
+    let lines = out.split("\n")
+    let mut i: i64 = 0
+    while i < lines.len() {
+        let s = lines[i].trim()
+        if s != "" && s != "null" {
+            total = total + 1
+            if s == "done" { done = done + 1 }
+            if s == "in_progress" { ip = ip + 1 }
+        }
+        i = i + 1
+    }
+    if total == 0 { return "" }
+    if ip > 0 { return "in_progress" }
+    if done == total { return "done" }
+    if done > 0 { return "in_progress" }  // partial: some done, rest planned
+    return "planned"
+}
+
+fn update_phase_statuses(ts: string, hs_evidence: string, dry: bool) -> bool {
+    if !file_exists(PATH_XT) { return false }
+    let alm_training = hs_evidence != "no_log"
+    let alm_gate = hs_evidence.index_of("completion_rate") >= 0 || hs_evidence.index_of("avg_score") >= 0
+
+    // Evidence-derived fallback statuses (used only when a phase has no tasks).
+    // CRITICAL: evidence fallback must NEVER promote to "done".
+    // Only task-driven rollup (all tasks done) can declare a phase done.
+    // Bug 2026-04-16: ALM-TRAIN wrongly marked done from gate metric presence,
+    // ALM-CONSCIOUS wrongly done from cascade — both while tasks were incomplete.
+    let prep_fb = "in_progress"
+    let launch_fb = "in_progress"
+    let mut alm_train_fb = "planned"
+    if alm_training { alm_train_fb = "in_progress" }
+    // alm_gate present does NOT mean training done — only that a metric was logged
+    if alm_gate { alm_train_fb = "in_progress" }
+    let mut clm_curr_fb = "planned"
+    let clm_rem = clm_phase_remaining()
+    if clm_rem < 28 { clm_curr_fb = "in_progress" }
+    // evidence cannot confirm all tasks done — cap at in_progress
+    if clm_rem <= 3 { clm_curr_fb = "in_progress" }
+    let mut alm_con_fb = "planned"
+    if alm_train_fb == "in_progress" { alm_con_fb = "planned" }
+    if alm_gate { alm_con_fb = "in_progress" }
+    let mut alm_rc_fb = "planned"
+    if alm_gate { alm_rc_fb = "planned" }
+    let mut clm_7b_fb = "planned"
+    if clm_curr_fb == "in_progress" { clm_7b_fb = "planned" }
+
+    // Task-driven rollup (preferred). Empty string = no tasks → use fallback.
+    let r0 = rollup_phase_from_tasks(0)
+    let r1 = rollup_phase_from_tasks(1)
+    let r2 = rollup_phase_from_tasks(2)
+    let r3 = rollup_phase_from_tasks(3)
+    let r4 = rollup_phase_from_tasks(4)
+    let r5 = rollup_phase_from_tasks(5)
+    let r6 = rollup_phase_from_tasks(6)
+
+    let mut prep_s = r0
+    if prep_s == "" { prep_s = prep_fb }
+    let mut launch_s = r1
+    if launch_s == "" { launch_s = launch_fb }
+    let mut alm_train_s = r2
+    if alm_train_s == "" { alm_train_s = alm_train_fb }
+    let mut clm_curr_s = r3
+    if clm_curr_s == "" { clm_curr_s = clm_curr_fb }
+    let mut alm_con_s = r4
+    if alm_con_s == "" { alm_con_s = alm_con_fb }
+    let mut alm_rc_s = r5
+    if alm_rc_s == "" { alm_rc_s = alm_rc_fb }
+    let mut clm_7b_s = r6
+    if clm_7b_s == "" { clm_7b_s = clm_7b_fb }
+
+    let jq_expr = "(.phases[0].status) = \"" + prep_s + "\""
+        + " | (.phases[1].status) = \"" + launch_s + "\""
+        + " | (.phases[2].status) = \"" + alm_train_s + "\""
+        + " | (.phases[3].status) = \"" + clm_curr_s + "\""
+        + " | (.phases[4].status) = \"" + alm_con_s + "\""
+        + " | (.phases[5].status) = \"" + alm_rc_s + "\""
+        + " | (.phases[6].status) = \"" + clm_7b_s + "\""
+
+    if dry {
+        println("  phases: PREP=" + prep_s + " LAUNCH=" + launch_s
+            + " ALM-TRAIN=" + alm_train_s + " CLM-CURR=" + clm_curr_s
+            + " ALM-CON=" + alm_con_s + " ALM-RC=" + alm_rc_s
+            + " CLM-7B=" + clm_7b_s)
+        return true
+    }
+    let tmp = "/tmp/extreme_phase_" + ts + ".json"
+    let cmd = "jq '" + jq_expr + "' " + PATH_XT + " > " + tmp + " && mv " + tmp + " " + PATH_XT
+    let rc = exec(cmd + " && echo OK || echo FAIL").trim()
+    return rc == "OK"
+}
+
+// ── JSON mutation via jq ─────────────────────────────────────────────────
+// OVERWRITE semantics — wall_progress_pct is REASSIGNED from `progress` every tick,
+// never merge-preserved. Observed incident 2026-04-16: stored 92% vs recomputed 50%,
+// -42pp manual inflation (shared/state/extreme_100pct_gate_audit_20260416.json).
+@convergence(state="ossified", id="RUNPOD_ROADMAP_MANUAL_INFLATION", value="aggregate_state.wall_progress_pct must be OVERWRITTEN by machine-recomputed value every sync tick. Never merge-preserve. Evidence: 2026-04-16 audit found stored=92% vs recomputed=50% (-42pp inflation)", ossified_at="2026-04-16")
+fn update_extreme_json(counts: AggCounts, progress: i64, status: string, ts: string, dry: bool) -> bool {
+    if !file_exists(PATH_XT) { return false }
+    let tmp = "/tmp/extreme_sync_" + ts + ".json"
+    // build jq update expression
+    let jq_expr = ".aggregate_state.options_total = " + to_string(counts.total)
+        + " | .aggregate_state.options_chosen = " + to_string(counts.chosen)
+        + " | .aggregate_state.options_alternative = " + to_string(counts.alternative)
+        + " | .aggregate_state.options_rejected = " + to_string(counts.rejected)
+        + " | .aggregate_state.options_provisional = " + to_string(counts.provisional)
+        + " | .aggregate_state.wall_progress_pct = " + to_string(progress)
+        + " | .aggregate_state.overall_status = \"" + status + "\""
+        + " | .aggregate_state.last_auto_sync = \"" + ts + "\""
+    let cmd = "jq '" + jq_expr + "' " + PATH_XT + " > " + tmp
+    let rc = exec(cmd + " && echo OK || echo FAIL").trim()
+    if rc != "OK" { return false }
+    if dry {
+        exec("diff " + PATH_XT + " " + tmp + " 2>&1 | head -30")
+        exec("rm -f " + tmp)
+        return true
+    }
+    exec("mv " + tmp + " " + PATH_XT)
+    return true
+}
+
+fn append_update_log(delta: string, ts: string) -> bool {
+    if !file_exists(PATH_XT) { return false }
+    let tmp = "/tmp/extreme_sync_log_" + ts + ".json"
+    let entry = "{ \"ts\": \"" + ts + "\", \"actor\": \"extreme_sync.hexa\", \"action\": \"auto_sync\", \"note\": \"" + delta + "\" }"
+    let jq_expr = ".update_log += [" + entry + "]"
+    let cmd = "jq '" + jq_expr + "' " + PATH_XT + " > " + tmp + " && mv " + tmp + " " + PATH_XT
+    let rc = exec(cmd + " && echo OK || echo FAIL").trim()
+    return rc == "OK"
+}
+
+fn append_tape(counts: AggCounts, progress: i64, status: string, evid: string, ts: string) {
+    let line = "{\"ts\":\"" + ts + "\",\"kind\":\"observation\""
+        + ",\"options_total\":" + to_string(counts.total)
+        + ",\"chosen\":" + to_string(counts.chosen)
+        + ",\"alternative\":" + to_string(counts.alternative)
+        + ",\"rejected\":" + to_string(counts.rejected)
+        + ",\"provisional\":" + to_string(counts.provisional)
+        + ",\"progress_pct\":" + to_string(progress)
+        + ",\"status\":\"" + status + "\""
+        + ",\"hire_sim\":\"" + evid.replace("\"", "'") + "\""
+        + "}\n"
+    exec("printf '%s' '" + line.replace("'", "\"") + "' >> " + TAPE_OUT)
+}
+
+// ── CLI ──────────────────────────────────────────────────────────────────
+fn cmd_sync(dry: bool) -> i64 {
+    let ts = _ts_iso()
+    // 1. Propagate c_track_board → alm/clm C track options (before counting)
+    let mut c_updates: i64 = 0
+    if !dry {
+        c_updates = propagate_c_track(PATH_ALM) + propagate_c_track(PATH_CLM)
+    }
+    let paths: list = [PATH_ALM, PATH_CLM]
+    let counts = sum_counts(paths)
+    let status = status_of(counts)
+    let hs = latest_hire_sim_pass()
+    let pbv = pbv_experiment_count()
+    let st0 = stage0_recent()
+    let progress = compute_progress(counts, hs)
+    if dry {
+        println("extreme_sync DRY " + ts)
+        println("  options: total=" + to_string(counts.total)
+            + " chosen=" + to_string(counts.chosen)
+            + " alt=" + to_string(counts.alternative)
+            + " rej=" + to_string(counts.rejected)
+            + " prov=" + to_string(counts.provisional))
+        println("  status: " + status)
+        println("  progress: " + to_string(progress) + "%")
+        println("  evidence: hire_sim=" + hs + "  pbv_exp=" + to_string(pbv) + "  stage0=" + to_string(st0))
+        let ok = update_extreme_json(counts, progress, status, ts, true)
+        if !ok { return 1 }
+        // destination remaining_days + projected dates (dry)
+        update_destinations(ts, hs, true)
+        // phase status sync (dry)
+        update_phase_statuses(ts, hs, true)
+        return 0
+    }
+    let ok1 = update_extreme_json(counts, progress, status, ts, false)
+    if !ok1 {
+        eprintln("extreme_sync: failed to update extreme.json (jq)")
+        return 1
+    }
+    // destination remaining_days + projected dates — 하네스 자동 계산
+    let ok_dest = update_destinations(ts, hs, false)
+    if !ok_dest {
+        eprintln("extreme_sync: failed to update destinations (jq)")
+        // non-fatal — aggregate still updated
+    }
+    // phase status sync — phases[].status 자동 갱신
+    let ok_ph = update_phase_statuses(ts, hs, false)
+    if !ok_ph {
+        eprintln("extreme_sync: failed to update phase statuses (jq)")
+        // non-fatal
+    }
+    let delta = "chosen=" + to_string(counts.chosen) + "/" + to_string(counts.total)
+        + " progress=" + to_string(progress) + "% status=" + status
+        + " c_propagate=" + to_string(c_updates)
+    let ok2 = append_update_log(delta, ts)
+    if !ok2 {
+        eprintln("extreme_sync: failed to append update_log")
+        return 1
+    }
+    append_tape(counts, progress, status, hs, ts)
+    // silent success
+    return 0
+}
+
+fn cmd_status() -> i64 {
+    let paths: list = [PATH_ALM, PATH_CLM]
+    let counts = sum_counts(paths)
+    let status = status_of(counts)
+    println("extreme " + status
+        + " · total=" + to_string(counts.total)
+        + " chosen=" + to_string(counts.chosen)
+        + " alt=" + to_string(counts.alternative)
+        + " prov=" + to_string(counts.provisional)
+        + " rej=" + to_string(counts.rejected))
+    return 0
+}
+
+fn cmd_selftest() -> i64 {
+    let mut fails: i64 = 0
+    // jq available?
+    let jq_v = exec("command -v jq 2>/dev/null").trim()
+    if jq_v == "" {
+        eprintln("selftest FAIL: jq not installed")
+        fails = fails + 1
+    }
+    // paths exist?
+    if !file_exists(PATH_XT)  { eprintln("selftest FAIL: missing " + PATH_XT);  fails = fails + 1 }
+    if !file_exists(PATH_ALM) { eprintln("selftest FAIL: missing " + PATH_ALM); fails = fails + 1 }
+    if !file_exists(PATH_CLM) { eprintln("selftest FAIL: missing " + PATH_CLM); fails = fails + 1 }
+    // counts sensible?
+    let counts = sum_counts([PATH_ALM, PATH_CLM])
+    if counts.total < 10 { eprintln("selftest WARN: counts.total < 10 (" + to_string(counts.total) + ")") }
+    if fails > 0 { return 3 }
+    println("extreme_sync selftest OK · options=" + to_string(counts.total))
+    return 0
+}
+
+fn usage() {
+    eprintln("usage: hexa extreme_sync.hexa <sync|dry|status|--selftest>")
+}
+
+fn main() -> i64 {
+    let args = argv()
+    // hexa argv() convention varies: detect by looking at both slots.
+    // Prefer last slot that is a recognized cmd; else first non-empty.
+    let n = args.len()
+    let mut cmd = "sync"
+    let mut i: i64 = 0
+    while i < n {
+        let a = args[i]
+        if a == "sync" || a == "dry" || a == "status" || a == "--selftest" {
+            cmd = a
+            break
+        }
+        i = i + 1
+    }
+    if cmd == "sync" { return cmd_sync(false) }
+    if cmd == "dry" { return cmd_sync(true) }
+    if cmd == "status" { return cmd_status() }
+    if cmd == "--selftest" { return cmd_selftest() }
+    usage()
+    return 2
+}
+
+exit(main())

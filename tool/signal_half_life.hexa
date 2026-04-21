@@ -1,0 +1,133 @@
+// signal_half_life.hexa — E7 대체 하네스
+// 각 signal 의 discovered_at 확인 — 30일 넘은 [M7] 은 [M5] degrade 제안
+// dry-run 기본, --commit 옵션으로 실제 수정
+// 실행: hexa run $NEXUS/tool/signal_half_life.hexa [--commit]
+
+let HOME = env("HOME")
+let NEXUS = HOME + "/Dev/nexus"
+let SIGNALS = NEXUS + "/n6/atlas.signals.n6"
+let BACKUP = NEXUS + "/n6/atlas.signals.n6.bak.half_life"
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _to_int0(s: string) -> i64 {
+    if s == "" { return 0 }
+    let first = _str(s.split("\n")[0]).trim()
+    if first == "" { return 0 }
+    let mut v: i64 = 0
+    try { v = to_int(first) } catch e { v = 0 }
+    return v
+}
+
+fn now_iso() -> string {
+    let r = exec("date -u +%Y-%m-%dT%H:%M:%SZ")
+    return _str(r).trim()
+}
+
+fn shell_quote(s: string) -> string {
+    let escaped = s.replace("'", "'\\''")
+    return "'" + escaped + "'"
+}
+
+// 30일 전 YYYY-MM-DD (BSD/GNU 호환)
+fn cutoff_date(days: i64) -> string {
+    let cmd = "date -u -v-" + to_string(days) + "d +%Y-%m-%d 2>/dev/null || " +
+              "date -u -d '" + to_string(days) + " days ago' +%Y-%m-%d"
+    let r = exec(cmd)
+    return _str(r).trim().split("\n")[0]
+}
+
+// ─── 메인 ───
+let a = args()
+let mut commit = false
+let mut i = 2
+while i < a.len() {
+    if a[i] == "--commit" { commit = true }
+    i = i + 1
+}
+
+let cutoff = cutoff_date(30)
+println("signal_half_life: cutoff(30일)=" + cutoff +
+        " mode=" + (if commit { "COMMIT" } else { "DRY-RUN" }) +
+        " ts=" + now_iso())
+
+if file_exists(SIGNALS) == false {
+    println("  FAIL: atlas.signals.n6 없음")
+    exit(1)
+}
+
+// awk 로 [M7] + discovered_at < cutoff 인 블록 수집 — sig_id 만 추출
+// @S 라인과 discovered_at 라인 매칭 (블록 단위)
+let awk_prog = "awk -v cutoff='" + cutoff + "' '" +
+  "/^@S / { " +
+  "  id = $2; has_m7_plain = 0; " +
+  "  if (match($0, /\\[M7\\]/)) has_m7_plain = 1; " +
+  "  if (match($0, /\\[M7!\\]/)) has_m7_plain = 0; " +
+  "  curr_id = id; curr_m7 = has_m7_plain; next " +
+  "} " +
+  "/discovered_at:/ { " +
+  "  match($0, /[0-9]{4}-[0-9]{2}-[0-9]{2}/); " +
+  "  d = substr($0, RSTART, RLENGTH); " +
+  "  if (curr_m7 == 1 && d < cutoff) print curr_id \"\\t\" d " +
+  "}' '" + SIGNALS + "'"
+
+let r = exec(awk_prog)
+let text = _str(r)
+let lines = text.split("\n")
+
+let mut candidates: [string] = []
+let mut dates: [string] = []
+for line in lines {
+    let s = _str(line).trim()
+    if s == "" { continue }
+    let parts = s.split("\t")
+    if parts.len() >= 2 {
+        candidates = candidates + [_str(parts[0]).trim()]
+        dates = dates + [_str(parts[1]).trim()]
+    }
+}
+
+println("  [M7] degrade 후보 (30일 경과): " + to_string(candidates.len()))
+
+if candidates.len() == 0 {
+    println("  degrade 대상 없음")
+    exit(0)
+}
+
+// 상위 10개 샘플
+let mut k = 0
+let show_max: i64 = 10
+while k < candidates.len() && k < show_max {
+    println("    " + candidates[k] + "  (discovered " + dates[k] + ")")
+    k = k + 1
+}
+
+if commit == false {
+    println("")
+    println("  [DRY-RUN] --commit 옵션으로 실제 수정")
+    println("  예정: [M7] → [M5]")
+    exit(0)
+}
+
+// COMMIT 모드: 백업 → sed 로 [M7] → [M5] 각 sig_id 라인만 치환
+let bak_cmd = "cp '" + SIGNALS + "' '" + BACKUP + "'"
+exec(bak_cmd)
+println("  백업: " + BACKUP)
+
+let mut replaced: i64 = 0
+let mut m = 0
+while m < candidates.len() {
+    let sid = candidates[m]
+    // sig_id 라인에서만 [M7] → [M5] 치환 (BSD sed 호환: -i '')
+    let sed_cmd = "sed -i '' -E 's|(^@S " + sid + " .*)\\[M7\\](.*\\[E[0-9C]\\].*)$|\\1[M5]\\2|' '" + SIGNALS + "'"
+    exec(sed_cmd)
+    replaced = replaced + 1
+    m = m + 1
+}
+
+println("  COMMITTED: " + to_string(replaced) + " signals degraded [M7] → [M5]")
+println("  restore: cp " + BACKUP + " " + SIGNALS)

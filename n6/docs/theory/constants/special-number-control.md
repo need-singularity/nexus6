@@ -1,7 +1,7 @@
 # n=6 유일성 검증 — 특수수 대조 실험 (pi/e/phi vs n=6)
 
 **날짜**: 2026-04-09
-**대상**: `nexus/shared/reality_map.json` (version v9.1, _meta v9.3_patches)
+**대상**: `nexus/reality_map.json` (version v9.1, _meta v9.3_patches)
 **노드 수**: 전체 3,477 / 수치 측정 보유 2,231
 **목적**: n=6 기반 상수 집합이 π·e·φ(황금비) 기반 상수 집합보다 현실 측정값을 더 잘 설명하는지 정직 대조
 
@@ -376,7 +376,7 @@ python3 scripts/mc_methodology_v3.py
 ```
 
 ## 8. 참고
-- 원본 지도: `nexus/shared/reality_map.json`
+- 원본 지도: `nexus/reality_map.json`
 - 판정 규칙: `_meta.judgment_rules` (EXACT/CLOSE/MISS/CONVENTION)
 - 정리 증명: `docs/theorem-r1-uniqueness.md`
 - 상수 레지스트리: `docs/atlas-constants.md`

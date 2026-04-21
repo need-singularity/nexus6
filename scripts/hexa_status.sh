@@ -50,28 +50,28 @@ fi
 
 # 5) queue
 printf '\nqueue\n'
-if [[ -x "$NEXUS/shared/scripts/hexa_actions.sh" ]]; then
-    "$NEXUS/shared/scripts/hexa_actions.sh" count | sed 's/^/  /'
+if [[ -x "$NEXUS/scripts/hexa_actions.sh" ]]; then
+    "$NEXUS/scripts/hexa_actions.sh" count | sed 's/^/  /'
 fi
 
 # 6) dispatch policy
 printf '\ndispatch policy\n'
-if [[ -x "$NEXUS/shared/scripts/hexa_dispatch_check.sh" ]]; then
-    "$NEXUS/shared/scripts/hexa_dispatch_check.sh" --human 2>/dev/null \
+if [[ -x "$NEXUS/scripts/hexa_dispatch_check.sh" ]]; then
+    "$NEXUS/scripts/hexa_dispatch_check.sh" --human 2>/dev/null \
         | grep -E "heavy|compute|gpu|ag6_gate|VIOLATION|✓" | sed 's/^/  /'
 fi
 
 # 7) patterns
 printf '\npatterns (24h)\n'
-if [[ -x "$NEXUS/shared/scripts/hexa_patterns.sh" ]]; then
-    "$NEXUS/shared/scripts/hexa_patterns.sh" brain-hint 2>/dev/null | sed 's/^/  /'
+if [[ -x "$NEXUS/scripts/hexa_patterns.sh" ]]; then
+    "$NEXUS/scripts/hexa_patterns.sh" brain-hint 2>/dev/null | sed 's/^/  /'
 fi
 
 # 8) pending queue snapshot
 printf '\npending items\n'
-if [[ -x "$NEXUS/shared/scripts/hexa_actions.sh" ]]; then
-    "$NEXUS/shared/scripts/hexa_actions.sh" list pending 2>/dev/null | head -5 | sed 's/^/  /'
-    [[ -z "$(${NEXUS}/shared/scripts/hexa_actions.sh list pending 2>/dev/null)" ]] && printf '  (none)\n'
+if [[ -x "$NEXUS/scripts/hexa_actions.sh" ]]; then
+    "$NEXUS/scripts/hexa_actions.sh" list pending 2>/dev/null | head -5 | sed 's/^/  /'
+    [[ -z "$(${NEXUS}/scripts/hexa_actions.sh list pending 2>/dev/null)" ]] && printf '  (none)\n'
 fi
 
 echo

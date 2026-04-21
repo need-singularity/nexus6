@@ -1,0 +1,548 @@
+// thinking_engine_exp12.hexa — 12-phase thinking 실험 엔진 (THINK-P8-1)
+// @no-lock-needed
+// @no-sandbox
+// @experiment=true
+// 역할: thinking_engine.hexa 6-phase 의 품질 향상 실험판. 6 phase 는 원본 유지,
+//      사이사이에 6 개 신규 phase (meta_check / cross_ref / counter_argue / ablate /
+//      consolidate / report) 를 삽입해 12-phase 로 확장.
+// 원본 파괴적 수정 금지 — 별도 파일로 비교 실험만 수행.
+// SSOT:
+//   shared/reports/thinking_6v12_experiment.json  — 10 query × 2 mode × 5 metric
+//   shared/tool/thinking_log_exp12.jsonl       — 실험 세션 로그 (원본 log 오염 방지)
+//
+// subcommands:
+//   query6 <prompt>    6-phase 원본 로직 재현. 결과 JSON stdout.
+//   query12 <prompt>   12-phase 확장 로직. 결과 JSON stdout.
+//   sweep              10 실험 query (BT-541..547 + 3 추가) 에 6 vs 12 실행, 매트릭스 작성.
+//
+// 메트릭 5종 (query 당):
+//   depth        phase 수 기반 최종 depth (6 or 12 또는 rejected 축소)
+//   touches      atlas hub 교집합 count
+//   quality      laws_refs + pitfalls_refs + touches (proxy)
+//   duration_ms  측정 경과 (실패 시 0)
+//   rejected     boolean (destructive/counter 걸림)
+
+// stage0 string >= broken (TS-20260416-STAGE0-STRCMP) — use char_code
+fn _is_digit_cc(ch: string) -> bool { let c = char_code(ch, 0); return c >= 48 && c <= 57 }
+
+let HOME = env("HOME")
+let NEXUS = "/Users/ghost/Dev/nexus"
+let HARNESS = NEXUS + "/harness"
+let BT_DIR = NEXUS + "/bt"
+let REPORTS = NEXUS + "/reports"
+
+let ATLAS_DEG = NEXUS + "/n6/atlas.n6.deg"
+let EXP_LOG = HARNESS + "/thinking_log_exp12.jsonl"
+let EXP_REPORT = REPORTS + "/thinking_6v12_experiment.json"
+
+// ─── void-safe coercion ───
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _to_int0(s: string) -> i64 {
+    if s == "" { return 0 }
+    let first = _str(s.split("\n")[0]).trim()
+    if first == "" { return 0 }
+    return to_int(first)
+}
+
+fn now_unix() -> i64 {
+    return _to_int0(_str(exec("date +%s")).trim())
+}
+
+fn now_ms() -> i64 {
+    // date +%s%3N 은 BSD date 미지원 → perl fallback
+    let raw = _str(exec("perl -MTime::HiRes=time -e 'printf \"%d\\n\", time()*1000'")).trim()
+    return _to_int0(raw)
+}
+
+fn json_escape(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", " ")
+    r = r.replace("\r", " ")
+    r = r.replace("\t", " ")
+    return r
+}
+
+fn json_field(line: string, key: string) -> string {
+    let tag = "\"" + key + "\""
+    if line.contains(tag) == false { return "" }
+    let after = line.split(tag)[1]
+    let parts = after.split(":")
+    if parts.len() < 2 { return "" }
+    let mut rest = parts[1]
+    let mut i = 2
+    while i < parts.len() {
+        rest = rest + ":" + parts[i]
+        i = i + 1
+    }
+    let s = rest.trim()
+    if s.len() == 0 { return "" }
+    if s.substring(0, 1) == "\"" {
+        let inner = s.substring(1, s.len())
+        let ep = inner.split("\"")
+        if ep.len() < 1 { return "" }
+        return ep[0]
+    }
+    let mut end = 0
+    while end < s.len() {
+        let c = s.substring(end, end + 1)
+        if c == "," || c == "}" || c == "\n" || c == " " { break }
+        end = end + 1
+    }
+    return s.substring(0, end).trim()
+}
+
+// ─── atlas hubs 상위 20 ───
+fn load_atlas_hubs() -> [string] {
+    if file_exists(ATLAS_DEG) == false { return [] }
+    let raw = _str(exec("head -20 '" + ATLAS_DEG + "'"))
+    let lines = raw.split("\n")
+    let mut hubs: [string] = []
+    let mut i = 0
+    while i < lines.len() {
+        let line = _str(lines[i]).trim()
+        if line.len() > 0 {
+            let cols = line.split("\t")
+            if cols.len() >= 1 {
+                let node = _str(cols[0]).trim()
+                if node.len() > 0 { hubs = hubs.push(node) }
+            }
+        }
+        i = i + 1
+    }
+    return hubs
+}
+
+// ─── metacog refs count (laws + pitfalls) ───
+// BT-5xx 토큰 추출 → metacog_BT-XXX.json 의 laws_refs/pitfalls_refs 배열 요소 수 합.
+// 없으면 0.
+fn metacog_refs_count(prompt: string) -> i64 {
+    let lower = prompt.to_lower()
+    // bt-5xx 형태 탐색 (숫자 3자리)
+    let mut bt_id = ""
+    let marker = "bt-"
+    if lower.contains(marker) {
+        let after = lower.split(marker)[1]
+        if after.len() >= 3 {
+            let digits = after.substring(0, 3)
+            // 숫자 3자리 검증
+            let mut ok = true
+            let mut i = 0
+            while i < 3 {
+                let c = digits.substring(i, i + 1)
+                if !_is_digit_cc(c) { ok = false ; break }  // stage0 string >= broken (TS-20260416-STAGE0-STRCMP) — use char_code
+                i = i + 1
+            }
+            if ok { bt_id = "BT-" + digits }
+        }
+    }
+    if bt_id == "" { return 0 }
+    let path = BT_DIR + "/metacog_" + bt_id + ".json"
+    if file_exists(path) == false { return 0 }
+    let raw = _str(read_file(path))
+    if raw.trim() == "" { return 0 }
+    // laws_refs 배열 요소 수 세기 (콤마 + 1)
+    let mut count: i64 = 0
+    if raw.contains("\"laws_refs\"") {
+        let after = raw.split("\"laws_refs\"")[1]
+        let bracket_open = after.split("[")
+        if bracket_open.len() >= 2 {
+            let inner = bracket_open[1].split("]")[0]
+            if inner.trim().len() > 0 {
+                let items = inner.split(",")
+                count = count + items.len()
+            }
+        }
+    }
+    if raw.contains("\"pitfalls_refs\"") {
+        let after = raw.split("\"pitfalls_refs\"")[1]
+        let bracket_open = after.split("[")
+        if bracket_open.len() >= 2 {
+            let inner = bracket_open[1].split("]")[0]
+            if inner.trim().len() > 0 {
+                let items = inner.split(",")
+                count = count + items.len()
+            }
+        }
+    }
+    return count
+}
+
+// ─── 원본 6-phase 재현 ───
+fn phase_preparse(prompt: string) -> [string] {
+    let lower = prompt.to_lower()
+    let raw = lower.split(" ")
+    let mut tokens: [string] = []
+    let mut i = 0
+    let cap: i64 = 20
+    while i < raw.len() {
+        if tokens.len() >= cap { break }
+        let tk = _str(raw[i]).trim()
+        if tk.len() > 0 { tokens = tokens.push(tk) }
+        i = i + 1
+    }
+    return tokens
+}
+
+fn phase_reason(tokens: [string], hubs: [string]) -> i64 {
+    let mut touches: i64 = 0
+    let mut i = 0
+    while i < hubs.len() {
+        let hub = hubs[i].to_lower()
+        let mut j = 0
+        while j < tokens.len() {
+            let tk = tokens[j]
+            if tk.len() >= 3 {
+                if hub.contains(tk) { touches = touches + 1 ; break }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return touches
+}
+
+fn phase_synthesize(tokens: [string], hubs: [string]) -> string {
+    let mut pattern = ""
+    let mut took: i64 = 0
+    let cap: i64 = 3
+    let mut i = 0
+    while i < hubs.len() {
+        if took >= cap { break }
+        if pattern.len() > 0 { pattern = pattern + "|" }
+        pattern = pattern + hubs[i]
+        took = took + 1
+        i = i + 1
+    }
+    pattern = pattern + "::"
+    let mut tok_took: i64 = 0
+    let tcap: i64 = 2
+    let mut k = 0
+    while k < tokens.len() {
+        if tok_took >= tcap { break }
+        if tok_took > 0 { pattern = pattern + "," }
+        pattern = pattern + tokens[k]
+        tok_took = tok_took + 1
+        k = k + 1
+    }
+    return pattern
+}
+
+fn phase_verify(prompt: string) -> bool {
+    let lower = prompt.to_lower()
+    if lower.contains("drop ") { return true }
+    if lower.contains("force") { return true }
+    if lower.contains("kill ") { return true }
+    if lower.contains("rm -rf") { return true }
+    return false
+}
+
+// ─── 신규 6 phase ───
+
+// phase 2 (신규): meta_check — 복잡도 score
+// token 수 + hub 이후 예상 교집합. 0 또는 1 반환 (gate).
+fn phase_meta_check(tokens: [string]) -> i64 {
+    if tokens.len() < 2 { return 0 }
+    return 1
+}
+
+// phase 4 (신규): cross_ref — metacog refs 수 (laws + pitfalls)
+fn phase_cross_ref(prompt: string) -> i64 {
+    return metacog_refs_count(prompt)
+}
+
+// phase 6 (신규): counter_argue — 비파괴 REJECT 패턴 (의문형 "왜" 없이 단정문)
+// 추가 검증: "never" / "impossible" 단어 → 반론 여지 경고
+fn phase_counter_argue(prompt: string) -> i64 {
+    let lower = prompt.to_lower()
+    let mut flags: i64 = 0
+    if lower.contains("never") { flags = flags + 1 }
+    if lower.contains("impossible") { flags = flags + 1 }
+    if lower.contains("always") { flags = flags + 1 }
+    return flags
+}
+
+// phase 8 (신규): ablate — 상위 hub 1개 제거 후 재합성, pattern 차이 측정
+fn phase_ablate(tokens: [string], hubs: [string]) -> i64 {
+    if hubs.len() < 2 { return 0 }
+    // hubs[1..] 으로 재합성
+    let mut trimmed: [string] = []
+    let mut i = 1
+    while i < hubs.len() {
+        trimmed = trimmed.push(hubs[i])
+        i = i + 1
+    }
+    let orig = phase_synthesize(tokens, hubs)
+    let abl = phase_synthesize(tokens, trimmed)
+    if orig == abl { return 0 }
+    return 1
+}
+
+// phase 10 (신규): consolidate — pattern + metacog refs 합쳐 최종 품질 bonus
+fn phase_consolidate(pattern: string, refs_count: i64, touches: i64) -> i64 {
+    let mut score: i64 = 0
+    if pattern.len() > 0 { score = score + 1 }
+    score = score + refs_count
+    score = score + touches
+    return score
+}
+
+// phase 12 (신규): report — quality 등급 문자열
+fn phase_report(quality: i64) -> string {
+    if quality >= 10 { return "A" }
+    if quality >= 5 { return "B" }
+    if quality >= 2 { return "C" }
+    return "D"
+}
+
+// ─── query 실행 공통 ───
+// return [depth, touches, quality, duration_ms, rejected_int]
+fn run6(prompt: string) -> [i64] {
+    let t0 = now_ms()
+    let tokens = phase_preparse(prompt)
+    let hubs = load_atlas_hubs()
+    let touches = phase_reason(tokens, hubs)
+    let pattern = phase_synthesize(tokens, hubs)
+    let rejected = phase_verify(prompt)
+    let mut depth: i64 = 6
+    if rejected { depth = 2 }
+    // quality proxy: laws+pitfalls refs(0 in 6-phase) + touches. 6-phase 는 metacog 참조 없음.
+    let quality = touches
+    let t1 = now_ms()
+    let mut rej_i: i64 = 0
+    if rejected { rej_i = 1 }
+    return [depth, touches, quality, t1 - t0, rej_i]
+}
+
+fn run12(prompt: string) -> [i64] {
+    let t0 = now_ms()
+    let tokens = phase_preparse(prompt)            // 1
+    let mc = phase_meta_check(tokens)              // 2
+    let hubs = load_atlas_hubs()
+    // phase 3 (lookup 생략 — log 필터 비용 높음. 실험은 동일 모드로 제외)
+    let cross = phase_cross_ref(prompt)            // 4
+    let touches = phase_reason(tokens, hubs)       // 5
+    let counter = phase_counter_argue(prompt)      // 6
+    let pattern = phase_synthesize(tokens, hubs)   // 7
+    let abl = phase_ablate(tokens, hubs)           // 8
+    let rejected = phase_verify(prompt)            // 9
+    let quality = phase_consolidate(pattern, cross, touches) // 10
+    let mut depth: i64 = 12
+    if rejected { depth = 3 }
+    if mc == 0 { depth = depth - 2 }
+    // counter argue warning 만 — reject 로 승격하지 않음
+    let grade = phase_report(quality)              // 12
+    let t1 = now_ms()
+    let mut rej_i: i64 = 0
+    if rejected { rej_i = 1 }
+    // quality 에 abl bonus 합산
+    let q = quality + abl
+    return [depth, touches, q, t1 - t0, rej_i]
+}
+
+// ─── 실험 sweep ───
+fn exp_queries() -> [string] {
+    return [
+        "bt-541 riemann hypothesis zeta n=6 convergence",
+        "bt-542 p-np natural proof bypass",
+        "bt-543 yang-mills mass gap",
+        "bt-544 navier-stokes smoothness",
+        "bt-545 hodge conjecture",
+        "bt-546 birch swinnerton-dyer rank",
+        "bt-547 poincare extended four-sphere",
+        "anima reflect on phi tau s33",
+        "destructive drop table cascade",
+        "evolve atlas hub degree top 20"
+    ]
+}
+
+fn cmd_sweep(argv: [string]) {
+    let qs = exp_queries()
+    let ts = now_unix()
+    let mut body = "{\"schema\":1"
+    body = body + ",\"generated\":" + to_string(ts)
+    body = body + ",\"experiment\":\"THINK-P8-1\""
+    body = body + ",\"experiment_flag\":true"
+    body = body + ",\"metrics\":[\"depth\",\"touches\",\"quality\",\"duration_ms\",\"rejected\"]"
+    body = body + ",\"queries\":["
+    let mut i = 0
+    // aggregates
+    let mut sum_d6: i64 = 0
+    let mut sum_t6: i64 = 0
+    let mut sum_q6: i64 = 0
+    let mut sum_ms6: i64 = 0
+    let mut sum_r6: i64 = 0
+    let mut sum_d12: i64 = 0
+    let mut sum_t12: i64 = 0
+    let mut sum_q12: i64 = 0
+    let mut sum_ms12: i64 = 0
+    let mut sum_r12: i64 = 0
+    while i < qs.len() {
+        let q = qs[i]
+        let r6 = run6(q)
+        let r12 = run12(q)
+        if i > 0 { body = body + "," }
+        body = body + "{\"idx\":" + to_string(i)
+        body = body + ",\"prompt\":\"" + json_escape(q) + "\""
+        body = body + ",\"mode6\":{\"depth\":" + to_string(r6[0])
+        body = body + ",\"touches\":" + to_string(r6[1])
+        body = body + ",\"quality\":" + to_string(r6[2])
+        body = body + ",\"duration_ms\":" + to_string(r6[3])
+        body = body + ",\"rejected\":" + to_string(r6[4]) + "}"
+        body = body + ",\"mode12\":{\"depth\":" + to_string(r12[0])
+        body = body + ",\"touches\":" + to_string(r12[1])
+        body = body + ",\"quality\":" + to_string(r12[2])
+        body = body + ",\"duration_ms\":" + to_string(r12[3])
+        body = body + ",\"rejected\":" + to_string(r12[4]) + "}"
+        body = body + "}"
+        sum_d6 = sum_d6 + r6[0]
+        sum_t6 = sum_t6 + r6[1]
+        sum_q6 = sum_q6 + r6[2]
+        sum_ms6 = sum_ms6 + r6[3]
+        sum_r6 = sum_r6 + r6[4]
+        sum_d12 = sum_d12 + r12[0]
+        sum_t12 = sum_t12 + r12[1]
+        sum_q12 = sum_q12 + r12[2]
+        sum_ms12 = sum_ms12 + r12[3]
+        sum_r12 = sum_r12 + r12[4]
+
+        // log append
+        let row = "{\"ts\":" + to_string(ts)
+                + ",\"kind\":\"exp_sweep\""
+                + ",\"prompt\":\"" + json_escape(q) + "\""
+                + ",\"mode6_depth\":" + to_string(r6[0])
+                + ",\"mode6_touches\":" + to_string(r6[1])
+                + ",\"mode6_quality\":" + to_string(r6[2])
+                + ",\"mode6_ms\":" + to_string(r6[3])
+                + ",\"mode12_depth\":" + to_string(r12[0])
+                + ",\"mode12_touches\":" + to_string(r12[1])
+                + ",\"mode12_quality\":" + to_string(r12[2])
+                + ",\"mode12_ms\":" + to_string(r12[3])
+                + "}\n"
+        if file_exists(EXP_LOG) == false { try { write_file(EXP_LOG, "") } catch e {} }
+        try { append_file(EXP_LOG, row) } catch e {}
+        i = i + 1
+    }
+    body = body + "]"
+    let n = qs.len()
+    body = body + ",\"avg_mode6\":{\"depth\":" + to_string(sum_d6 / n)
+         + ",\"touches\":" + to_string(sum_t6 / n)
+         + ",\"quality\":" + to_string(sum_q6 / n)
+         + ",\"duration_ms\":" + to_string(sum_ms6 / n)
+         + ",\"rejected\":" + to_string(sum_r6) + "}"
+    body = body + ",\"avg_mode12\":{\"depth\":" + to_string(sum_d12 / n)
+         + ",\"touches\":" + to_string(sum_t12 / n)
+         + ",\"quality\":" + to_string(sum_q12 / n)
+         + ",\"duration_ms\":" + to_string(sum_ms12 / n)
+         + ",\"rejected\":" + to_string(sum_r12) + "}"
+    // 비교: 12 quality 우위 + 시간 배수
+    let q6_avg = sum_q6 / n
+    let q12_avg = sum_q12 / n
+    let ms6_avg = sum_ms6 / n
+    let ms12_avg = sum_ms12 / n
+    let mut quality_up = 0
+    if q12_avg > q6_avg { quality_up = 1 }
+    // time_ratio_x100 = ms12 / ms6 * 100 ; ms6 0 회피
+    let mut time_ratio_x100: i64 = 100
+    if ms6_avg > 0 { time_ratio_x100 = (ms12_avg * 100) / ms6_avg }
+    let mut recommend = false
+    if quality_up == 1 && time_ratio_x100 <= 200 { recommend = true }
+    body = body + ",\"quality_up\":" + to_string(quality_up)
+    body = body + ",\"time_ratio_x100\":" + to_string(time_ratio_x100)
+    body = body + ",\"recommend_12phase\":" + to_string(recommend)
+    let mut note = "not-recommended"
+    if recommend { note = "recommended: 12-phase quality>6-phase AND time<=2x" }
+    body = body + ",\"note\":\"" + note + "\""
+    body = body + "}\n"
+    try { write_file(EXP_REPORT, body) } catch e {
+        eprintln("FAIL: write report")
+        exit(1)
+    }
+    println(body)
+}
+
+fn cmd_query6(argv: [string]) {
+    if argv.len() < 4 { eprintln("usage: query6 <prompt>") ; exit(2) }
+    let mut p = argv[3]
+    let mut i = 4
+    while i < argv.len() { p = p + " " + argv[i] ; i = i + 1 }
+    let r = run6(p)
+    println("{\"mode\":6,\"depth\":" + to_string(r[0])
+          + ",\"touches\":" + to_string(r[1])
+          + ",\"quality\":" + to_string(r[2])
+          + ",\"duration_ms\":" + to_string(r[3])
+          + ",\"rejected\":" + to_string(r[4]) + "}")
+}
+
+fn cmd_query12(argv: [string]) {
+    if argv.len() < 4 { eprintln("usage: query12 <prompt>") ; exit(2) }
+    let mut p = argv[3]
+    let mut i = 4
+    while i < argv.len() { p = p + " " + argv[i] ; i = i + 1 }
+    let r = run12(p)
+    println("{\"mode\":12,\"depth\":" + to_string(r[0])
+          + ",\"touches\":" + to_string(r[1])
+          + ",\"quality\":" + to_string(r[2])
+          + ",\"duration_ms\":" + to_string(r[3])
+          + ",\"rejected\":" + to_string(r[4]) + "}")
+}
+
+fn main() {
+    // argv 정규화 (2026-04-19): Mac=[hexa, script, user...] Linux-stage1=[hexa, "run", script, user...]
+    // 이전까지 Mac-only argv[2] 가정 → Linux 에서 argv[2] = script path 로 dispatch 실패.
+    let _raw_argv = args()
+    let mut _script_idx = -1
+    let mut _scan_i = 0
+    while _scan_i < _raw_argv.len() {
+        if _raw_argv[_scan_i].ends_with(".hexa") { _script_idx = _scan_i; break }
+        _scan_i = _scan_i + 1
+    }
+    let mut _user_start = 2
+    let mut _script_token = ""
+    if _script_idx >= 0 {
+        _user_start = _script_idx + 1
+        _script_token = _raw_argv[_script_idx]
+    } else {
+        if _raw_argv.len() >= 3 {
+            if _raw_argv[1] == "run" { _user_start = 3 }
+            if _raw_argv[1] == "eval" { _user_start = 3 }
+        }
+    }
+    let mut argv: [str] = [_raw_argv[0], _script_token]
+    let mut _ua_i = _user_start
+    while _ua_i < _raw_argv.len() {
+        argv = argv + [_raw_argv[_ua_i]]
+        _ua_i = _ua_i + 1
+    }
+    if _script_token.len() > 0 && argv.len() >= 3 {
+        if argv[2] == _script_token {
+            let mut _a2: [str] = [_raw_argv[0], _script_token]
+            let mut _j2 = 3
+            while _j2 < argv.len() {
+                _a2 = _a2 + [argv[_j2]]
+                _j2 = _j2 + 1
+            }
+            argv = _a2
+        }
+    }
+    if argv.len() < 3 {
+        eprintln("usage: thinking_engine_exp12 <query6|query12|sweep> [args...]")
+        exit(2)
+    }
+    let mode = argv[2].trim()
+    if mode == "query6" { cmd_query6(argv) }
+    else if mode == "query12" { cmd_query12(argv) }
+    else if mode == "sweep" { cmd_sweep(argv) }
+    else {
+        eprintln("REJECT: unknown mode '" + mode + "' — modes: query6|query12|sweep")
+        exit(2)
+    }
+}
+
+main()

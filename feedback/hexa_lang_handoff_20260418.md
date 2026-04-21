@@ -160,7 +160,7 @@ module-level `let mut` 을 "shared mutable state" 용도로 사용.
 
 ## Self-hosting 상태 (Rust-surpass roadmap 연동)
 
-참조: `$ANIMA/shared/roadmaps/hexa-lang.json`
+참조: `$ANIMA/config/roadmaps/hexa-lang.json`
 (`roadmap_rust_surpass.json` → `hexa-lang.json` 으로 통합됨)
 
 - **P0–P2** (spec, IR, build_c): **DONE** (ossified)

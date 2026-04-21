@@ -1,0 +1,524 @@
+// agent_race.hexa — AGL-P8-1 분산 레이싱 엔진
+// @no-lock-needed
+// @no-sandbox
+// 역할: 동일 독립 task 를 N agent 에 fan-out → 첫 완료 pick, 나머지 cancel.
+//       짧은 (< 5min 예상) idempotent task 에 한정. fg agent fan-out 금지.
+// SSOT config: shared/config/agent_capacity.json (race.default_fanout, max_expected_duration_sec 등)
+// Audit log:    shared/logs/agent_race.jsonl (append-only)
+// Deps: agent_ledger.hexa (register/complete)
+//
+// modes:
+//   plan <task_id> [N]                          — 레이싱 가능성 판단 + race_id 발행 + audit row (status=planned)
+//   start <race_id> <task_id> <N> <area_prefix> — N agent 후보 등록 (mock — 실제 Agent 호출 주체는 상위)
+//                                                 agent_ledger.register 를 N 회 호출 → agent_ids stdout
+//   finish <race_id> <winner_agent_id> <elapsed_sec>
+//                                               — winner 확정 + 다른 agent_id 수집하여 loser 로 cancel
+//                                                 agent_ledger.complete winner / cancel losers
+//   status <race_id>                            — 현재 race 상태 JSON 출력
+//   simulate <N_tasks> <N_per_task>             — smoke 용 mock race 시뮬레이션 (실제 Agent 미호출)
+//   list                                        — 활성 race 목록
+//
+// 우회: NEXUS_RACE_OK=1 (skip 전부) / NEXUS_NO_BUDGET_OK=1 (budget guard skip)
+//
+// 성공 조용 / 실패 시끄럽게 (H1)
+
+let HOME = env("HOME")
+let NEXUS_ENV = env("NEXUS")
+let NEXUS = if NEXUS_ENV == "" { HOME + "/Dev/nexus" } else { NEXUS_ENV }
+let HARNESS = NEXUS + "/harness"
+let LEDGER = HARNESS + "/agent_ledger.hexa"
+let RACE_LOG = NEXUS + "/logs/agent_race.jsonl"
+let CAPACITY_JSON = NEXUS + "/config/agent_capacity.json"
+
+// ─── void-safe coercion ───
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _to_int0(s: string) -> i64 {
+    if s == "" { return 0 }
+    let first = _str(s.split("\n")[0]).trim()
+    if first == "" { return 0 }
+    return to_int(first)
+}
+
+fn now_unix() -> i64 {
+    return _to_int0(_str(exec("date +%s")).trim())
+}
+
+fn json_escape(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", " ")
+    r = r.replace("\r", " ")
+    r = r.replace("\t", " ")
+    return r
+}
+
+fn _ensure_log() {
+    let dir_cmd = "mkdir -p '" + NEXUS + "/logs' 2>/dev/null"
+    exec(dir_cmd)
+    if file_exists(RACE_LOG) == false {
+        try { write_file(RACE_LOG, "") } catch e {}
+    }
+}
+
+// ─── capacity config 로드 (얇은 파서) ───
+// JSON 중 필요한 스칼라만 pluck: race.default_fanout / race.max_fanout / race.min_fanout /
+//                                race.eligibility.max_expected_duration_sec / guards.race_budget_per_hour
+fn cfg_pick(key: string, defval: i64) -> i64 {
+    let mut raw = ""
+    try { raw = _str(read_file(CAPACITY_JSON)) } catch e {}
+    if raw.len() == 0 { return defval }
+    let tag = "\"" + key + "\""
+    if raw.contains(tag) == false { return defval }
+    let after = raw.split(tag)[1]
+    let parts = after.split(":")
+    if parts.len() < 2 { return defval }
+    let s = _str(parts[1]).trim()
+    if s.len() == 0 { return defval }
+    let mut v = ""
+    let mut j = 0
+    while j < s.len() {
+        let ch = s.substring(j, j + 1)
+        if ch == "," || ch == "}" || ch == " " || ch == "\n" { break }
+        v = v + ch
+        j = j + 1
+    }
+    if v == "" { return defval }
+    return _to_int0(v)
+}
+
+// ─── race_id 생성: r + sha8(ts|pid|task) ───
+fn make_race_id(task_id: string) -> string {
+    let ts = to_string(now_unix())
+    let pid = _str(exec("echo $$")).trim()
+    let esc = (ts + "|" + pid + "|" + task_id).replace("'", "")
+    let cmd = "printf '%s' '" + esc + "' | /usr/bin/shasum -a 256 2>/dev/null | cut -c1-8"
+    let r = _str(exec(cmd)).trim()
+    if r == "" { return "r" + ts }
+    return "r" + r
+}
+
+// ─── audit row ───
+fn audit_append(row: string) {
+    _ensure_log()
+    try { append_file(RACE_LOG, row + "\n") } catch e {
+        eprintln("FAIL: append_file " + RACE_LOG)
+    }
+}
+
+// ─── budget guard: 최근 1h race 수 ≤ race_budget_per_hour ───
+fn budget_ok() -> bool {
+    if env("NEXUS_NO_BUDGET_OK") == "1" { return true }
+    let limit = cfg_pick("race_budget_per_hour", 30)
+    if limit <= 0 { return true }
+    let cutoff = now_unix() - 3600
+    let cmd = "awk -v c=" + to_string(cutoff) +
+              " -F'[,:]' '/\"ts_unix\"/ { " +
+              "   for(i=1;i<=NF;i++){ " +
+              "     if($i ~ /\"ts_unix\"/){ gsub(/[^0-9]/,\"\",$(i+1)); t=$(i+1)+0; if(t>=c) n=n+1 } " +
+              "   } " +
+              " } END{ print n+0 }' '" + RACE_LOG + "' 2>/dev/null"
+    let n = _to_int0(_str(exec(cmd)).trim())
+    if n >= limit {
+        eprintln("[H-RACE-BUDGET] 최근 1h race " + to_string(n) + " / limit " + to_string(limit) + " — budget 초과. 우회: NEXUS_NO_BUDGET_OK=1")
+        return false
+    }
+    return true
+}
+
+// ─── 가상 agent_id 등록 (mock) — 실제 Agent API 호출 없이 ledger 만 갱신 ───
+fn register_via_ledger(area: string, prompt_hash: string, model: string, tokens: i64) -> string {
+    let tok_str = to_string(tokens)
+    let cmd = "hexa '" + LEDGER + "' register --model '" + model + "' --tokens " + tok_str +
+              " '" + json_escape(area) + "' '" + json_escape(prompt_hash) + "' 2>/dev/null"
+    let out = _str(exec(cmd)).trim()
+    // agent_ledger.register 는 stdout 마지막 라인 = agent_id
+    if out == "" { return "" }
+    let lines = out.split("\n")
+    return _str(lines[lines.len() - 1]).trim()
+}
+
+fn complete_via_ledger(agent_id: string) {
+    let cmd = "hexa '" + LEDGER + "' complete '" + json_escape(agent_id) + "' 2>/dev/null"
+    exec(cmd)
+}
+
+// loser agent 는 cancel 상태로 표시 — agent_ledger 는 status=done 만 쓰지만
+// audit log 에서 "status":"cancelled" 로 기록 (ledger 쪽은 complete 로 정리)
+fn cancel_via_ledger(agent_id: string) {
+    // best_effort: ledger 쪽 상태는 "done" 으로 마감 — race 패널에서 loser 구분은 audit log 로
+    complete_via_ledger(agent_id)
+}
+
+// ─── plan ───
+// usage: agent_race plan <task_id> [N]
+fn cmd_plan(argv: [string]) {
+    if env("NEXUS_RACE_OK") == "1" { return }
+    if argv.len() < 4 {
+        eprintln("usage: plan <task_id> [N]")
+        exit(2)
+    }
+    let task_id = _str(argv[3]).trim()
+    if task_id == "" {
+        eprintln("REJECT: empty task_id")
+        exit(2)
+    }
+    let default_n = cfg_pick("default_fanout", 3)
+    let min_n = cfg_pick("min_fanout", 2)
+    let max_n = cfg_pick("max_fanout", 5)
+
+    let mut n: i64 = default_n
+    if argv.len() >= 5 {
+        n = _to_int0(_str(argv[4]).trim())
+        if n <= 0 { n = default_n }
+    }
+    if n < min_n { n = min_n }
+    if n > max_n { n = max_n }
+
+    if budget_ok() == false {
+        exit(3)
+    }
+
+    let race_id = make_race_id(task_id)
+    let ts = now_unix()
+    let row = "{\"race_id\":\"" + race_id + "\"," +
+              "\"task_id\":\"" + json_escape(task_id) + "\"," +
+              "\"fanout\":" + to_string(n) + "," +
+              "\"status\":\"planned\"," +
+              "\"ts_unix\":" + to_string(ts) + "}"
+    audit_append(row)
+    println(race_id + " " + to_string(n))
+}
+
+// ─── start ───
+// usage: start <race_id> <task_id> <N> <area_prefix>
+// area 는 area_prefix + ".race." + race_id + ".aN" 식으로 생성.
+fn cmd_start(argv: [string]) {
+    if env("NEXUS_RACE_OK") == "1" { return }
+    if argv.len() < 7 {
+        eprintln("usage: start <race_id> <task_id> <N> <area_prefix>")
+        exit(2)
+    }
+    let race_id = _str(argv[3]).trim()
+    let task_id = _str(argv[4]).trim()
+    let n = _to_int0(_str(argv[5]).trim())
+    let area_prefix = _str(argv[6]).trim()
+    if race_id == "" || task_id == "" || n <= 0 || area_prefix == "" {
+        eprintln("REJECT: invalid args (race_id/task_id/N/area_prefix)")
+        exit(2)
+    }
+
+    let mut agents: [string] = []
+    let mut i = 0
+    let prompt_hash = "race:" + race_id + ":" + task_id
+    while i < n {
+        let area = area_prefix + ".race." + race_id + ".a" + to_string(i)
+        let aid = register_via_ledger(area, prompt_hash, "sonnet", 0)
+        if aid != "" {
+            agents = agents + [aid]
+            println(aid)
+        } else {
+            eprintln("[H-RACE-WARN] agent_ledger.register empty id for " + area)
+        }
+        i = i + 1
+    }
+
+    let ts = now_unix()
+    let mut ids_json = "["
+    let mut k = 0
+    while k < agents.len() {
+        if k > 0 { ids_json = ids_json + "," }
+        ids_json = ids_json + "\"" + agents[k] + "\""
+        k = k + 1
+    }
+    ids_json = ids_json + "]"
+
+    let row = "{\"race_id\":\"" + race_id + "\"," +
+              "\"task_id\":\"" + json_escape(task_id) + "\"," +
+              "\"fanout\":" + to_string(n) + "," +
+              "\"agents\":" + ids_json + "," +
+              "\"status\":\"started\"," +
+              "\"ts_unix\":" + to_string(ts) + "}"
+    audit_append(row)
+}
+
+// ─── finish ───
+// usage: finish <race_id> <winner_agent_id> <elapsed_sec>
+fn cmd_finish(argv: [string]) {
+    if env("NEXUS_RACE_OK") == "1" { return }
+    if argv.len() < 6 {
+        eprintln("usage: finish <race_id> <winner_agent_id> <elapsed_sec>")
+        exit(2)
+    }
+    let race_id = _str(argv[3]).trim()
+    let winner = _str(argv[4]).trim()
+    let elapsed = _to_int0(_str(argv[5]).trim())
+    if race_id == "" || winner == "" {
+        eprintln("REJECT: race_id/winner 필수")
+        exit(2)
+    }
+
+    // audit log 에서 started row 찾아 agents 배열 재구성
+    let grep_cmd = "grep '\"race_id\":\"" + race_id + "\"' '" + RACE_LOG + "' 2>/dev/null | " +
+                   "grep '\"status\":\"started\"' | tail -1"
+    let started = _str(exec(grep_cmd)).trim()
+    let mut losers: [string] = []
+    if started != "" {
+        // agents":[...]" 블록 추출
+        let tag = "\"agents\":["
+        if started.contains(tag) {
+            let after = started.split(tag)[1]
+            let close = after.index_of("]")
+            if close > 0 {
+                let inner = after.substring(0, close)
+                for tok in inner.split(",") {
+                    let t = _str(tok).trim().replace("\"", "")
+                    if t != "" && t != winner {
+                        losers = losers + [t]
+                    }
+                }
+            }
+        }
+    }
+
+    complete_via_ledger(winner)
+    let mut li = 0
+    while li < losers.len() {
+        cancel_via_ledger(losers[li])
+        li = li + 1
+    }
+
+    let ts = now_unix()
+    let mut losers_json = "["
+    let mut k = 0
+    while k < losers.len() {
+        if k > 0 { losers_json = losers_json + "," }
+        losers_json = losers_json + "\"" + losers[k] + "\""
+        k = k + 1
+    }
+    losers_json = losers_json + "]"
+
+    let row = "{\"race_id\":\"" + race_id + "\"," +
+              "\"winner_agent_id\":\"" + winner + "\"," +
+              "\"loser_agent_ids\":" + losers_json + "," +
+              "\"time_to_first_sec\":" + to_string(elapsed) + "," +
+              "\"status\":\"finished\"," +
+              "\"ts_unix\":" + to_string(ts) + "}"
+    audit_append(row)
+    println("winner=" + winner + " losers=" + to_string(losers.len()) + " t=" + to_string(elapsed) + "s")
+}
+
+// ─── status ───
+fn cmd_status(argv: [string]) {
+    if argv.len() < 4 {
+        eprintln("usage: status <race_id>")
+        exit(2)
+    }
+    let race_id = _str(argv[3]).trim()
+    let cmd = "grep '\"race_id\":\"" + race_id + "\"' '" + RACE_LOG + "' 2>/dev/null"
+    let out = _str(exec(cmd)).trim()
+    if out == "" {
+        println("(race not found)")
+        return
+    }
+    println(out)
+}
+
+// ─── list ───
+fn cmd_list(argv: [string]) {
+    _ensure_log()
+    // 모든 planned/started 중 finished 없는 race_id 출력
+    let cmd = "awk -F'\"race_id\":\"' 'NF>1 { split($2,a,\"\\\"\"); id=a[1]; if($0 ~ /\"status\":\"finished\"/){ fin[id]=1 } else if($0 ~ /\"status\":\"started\"/ || $0 ~ /\"status\":\"planned\"/){ pend[id]=1 } } END{ for(k in pend){ if(!(k in fin)) print k } }' '" + RACE_LOG + "' 2>/dev/null"
+    let out = _str(exec(cmd)).trim()
+    if out == "" {
+        println("(no active races)")
+        return
+    }
+    println(out)
+}
+
+// ─── simulate — smoke mode ───
+// usage: simulate <N_tasks> <N_per_task>
+// 각 task 당 N agent register → 랜덤 winner 선택 → finish → audit row
+// 실제 Agent API 호출 없음. ledger/audit 만 움직임.
+fn cmd_simulate(argv: [string]) {
+    if argv.len() < 5 {
+        eprintln("usage: simulate <N_tasks> <N_per_task>")
+        exit(2)
+    }
+    let n_tasks = _to_int0(_str(argv[3]).trim())
+    let n_per = _to_int0(_str(argv[4]).trim())
+    if n_tasks <= 0 || n_per <= 0 {
+        eprintln("REJECT: N_tasks/N_per_task > 0 필수")
+        exit(2)
+    }
+
+    println("# simulate " + to_string(n_tasks) + " tasks x " + to_string(n_per) + " agents")
+    let mut t = 0
+    let mut total_wins: i64 = 0
+    let mut total_first_sec: i64 = 0
+    while t < n_tasks {
+        let task_id = "smoke-task-" + to_string(t)
+        // plan
+        let race_id = make_race_id(task_id)
+        let ts0 = now_unix()
+        let plan_row = "{\"race_id\":\"" + race_id + "\"," +
+                       "\"task_id\":\"" + json_escape(task_id) + "\"," +
+                       "\"fanout\":" + to_string(n_per) + "," +
+                       "\"status\":\"planned\"," +
+                       "\"ts_unix\":" + to_string(ts0) + "," +
+                       "\"mode\":\"simulate\"}"
+        audit_append(plan_row)
+
+        // start — register n_per agents via ledger
+        let mut agents: [string] = []
+        let mut i = 0
+        let prompt_hash = "simulate:" + race_id + ":" + task_id
+        while i < n_per {
+            let area = "agl_p8_smoke.race." + race_id + ".a" + to_string(i)
+            let aid = register_via_ledger(area, prompt_hash, "sonnet", 0)
+            if aid != "" { agents = agents + [aid] }
+            i = i + 1
+        }
+
+        let ts1 = now_unix()
+        let mut started_ids = "["
+        let mut ai = 0
+        while ai < agents.len() {
+            if ai > 0 { started_ids = started_ids + "," }
+            started_ids = started_ids + "\"" + agents[ai] + "\""
+            ai = ai + 1
+        }
+        started_ids = started_ids + "]"
+        let start_row = "{\"race_id\":\"" + race_id + "\"," +
+                        "\"task_id\":\"" + json_escape(task_id) + "\"," +
+                        "\"fanout\":" + to_string(n_per) + "," +
+                        "\"agents\":" + started_ids + "," +
+                        "\"status\":\"started\"," +
+                        "\"ts_unix\":" + to_string(ts1) + "," +
+                        "\"mode\":\"simulate\"}"
+        audit_append(start_row)
+
+        // mock first-done — pseudo-random via shasum of race_id
+        // pick index = int(sha_prefix) mod n_per, elapsed = 1 + (index*7 % 20)
+        let hcmd = "printf '%s' '" + race_id + "' | /usr/bin/shasum -a 256 2>/dev/null | cut -c1-4"
+        let hhex = _str(exec(hcmd)).trim()
+        let mut h_int: i64 = 0
+        if hhex != "" {
+            // hex → int (4 hex = 0..65535)
+            let map = "0123456789abcdef"
+            let mut j = 0
+            while j < hhex.len() {
+                let ch = _str(hhex.substring(j, j + 1)).trim()
+                let idx = map.index_of(ch)
+                if idx >= 0 {
+                    h_int = h_int * 16 + idx
+                }
+                j = j + 1
+            }
+        }
+        let winner_idx = if agents.len() > 0 { h_int % agents.len() } else { 0 }
+        let elapsed = 1 + ((h_int / 8) % 20)
+        let winner = if agents.len() > 0 { agents[winner_idx] } else { "" }
+
+        // finish — complete winner, cancel losers
+        if winner != "" {
+            complete_via_ledger(winner)
+            let mut li = 0
+            let mut losers: [string] = []
+            while li < agents.len() {
+                if li != winner_idx {
+                    cancel_via_ledger(agents[li])
+                    losers = losers + [agents[li]]
+                }
+                li = li + 1
+            }
+            let mut losers_json = "["
+            let mut k = 0
+            while k < losers.len() {
+                if k > 0 { losers_json = losers_json + "," }
+                losers_json = losers_json + "\"" + losers[k] + "\""
+                k = k + 1
+            }
+            losers_json = losers_json + "]"
+            let ts2 = now_unix()
+            let fin_row = "{\"race_id\":\"" + race_id + "\"," +
+                          "\"winner_agent_id\":\"" + winner + "\"," +
+                          "\"loser_agent_ids\":" + losers_json + "," +
+                          "\"time_to_first_sec\":" + to_string(elapsed) + "," +
+                          "\"status\":\"finished\"," +
+                          "\"ts_unix\":" + to_string(ts2) + "," +
+                          "\"mode\":\"simulate\"}"
+            audit_append(fin_row)
+            total_wins = total_wins + 1
+            total_first_sec = total_first_sec + elapsed
+            println("task=" + task_id + " race=" + race_id + " winner=" + winner + " elapsed=" + to_string(elapsed) + "s losers=" + to_string(losers.len()))
+        }
+        t = t + 1
+    }
+
+    let avg = if total_wins > 0 { total_first_sec / total_wins } else { 0 }
+    println("# smoke summary: wins=" + to_string(total_wins) + "/" + to_string(n_tasks) + " avg_time_to_first=" + to_string(avg) + "s")
+}
+
+fn main() {
+    // argv 정규화 (2026-04-19): Mac=[hexa, script, user...] Linux-stage1=[hexa, "run", script, user...]
+    // 이전까지 Mac-only argv[2] 가정 → Linux 에서 argv[2] = script path 로 dispatch 실패.
+    let _raw_argv = args()
+    let mut _script_idx = -1
+    let mut _scan_i = 0
+    while _scan_i < _raw_argv.len() {
+        if _raw_argv[_scan_i].ends_with(".hexa") { _script_idx = _scan_i; break }
+        _scan_i = _scan_i + 1
+    }
+    let mut _user_start = 2
+    let mut _script_token = ""
+    if _script_idx >= 0 {
+        _user_start = _script_idx + 1
+        _script_token = _raw_argv[_script_idx]
+    } else {
+        if _raw_argv.len() >= 3 {
+            if _raw_argv[1] == "run" { _user_start = 3 }
+            if _raw_argv[1] == "eval" { _user_start = 3 }
+        }
+    }
+    let mut argv: [str] = [_raw_argv[0], _script_token]
+    let mut _ua_i = _user_start
+    while _ua_i < _raw_argv.len() {
+        argv = argv + [_raw_argv[_ua_i]]
+        _ua_i = _ua_i + 1
+    }
+    if _script_token.len() > 0 && argv.len() >= 3 {
+        if argv[2] == _script_token {
+            let mut _a2: [str] = [_raw_argv[0], _script_token]
+            let mut _j2 = 3
+            while _j2 < argv.len() {
+                _a2 = _a2 + [argv[_j2]]
+                _j2 = _j2 + 1
+            }
+            argv = _a2
+        }
+    }
+    if argv.len() < 3 {
+        eprintln("usage: agent_race <plan|start|finish|status|list|simulate> [args...]")
+        exit(2)
+    }
+    let mode = _str(argv[2]).trim()
+    if mode == "plan" { cmd_plan(argv) }
+    else if mode == "start" { cmd_start(argv) }
+    else if mode == "finish" { cmd_finish(argv) }
+    else if mode == "status" { cmd_status(argv) }
+    else if mode == "list" { cmd_list(argv) }
+    else if mode == "simulate" { cmd_simulate(argv) }
+    else {
+        eprintln("REJECT: unknown mode '" + mode + "' — modes: plan|start|finish|status|list|simulate")
+        exit(2)
+    }
+}
+
+main()

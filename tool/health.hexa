@@ -1,0 +1,185 @@
+// health.hexa — 하네스 health 라우터 (atlas + nexus 통합, 본문 위임)
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+// modes: list | atlas [--verbose] | nexus [--verbose|--dry-run] | all [--verbose]
+// delegates: shared/n6/atlas_health.hexa (L0) · shared/scripts/nexus_ensure_running.hexa
+
+let HOME = env("HOME")
+let HEXA = HOME + "/Dev/nexus/bin/hexa"
+let ATLAS_HEALTH = HOME + "/Dev/nexus/n6/atlas_health.hexa"
+let NEXUS_ENSURE = HOME + "/Dev/nexus/scripts/nexus_ensure_running.hexa"
+
+fn print_list() {
+    println("health modes:")
+    println("  atlas  — atlas.n6 헬스체크 (readonly) → " + ATLAS_HEALTH)
+    println("  nexus  — nexus 성장 데몬 보장 (--dry-run 지원) → " + NEXUS_ENSURE)
+    println("  all    — atlas + nexus + 종합 점수")
+    println("  list   — 이 목록")
+    println("flags: --verbose|-v, --dry-run (nexus only)")
+}
+
+fn run_atlas(rest: [str]) -> i64 {
+    if file_exists(ATLAS_HEALTH) == false {
+        eprintln("REJECT: atlas_health not found: " + ATLAS_HEALTH)
+        return 2
+    }
+    let mut cmd = HEXA + " run " + ATLAS_HEALTH
+    for a in rest {
+        let safe = a.replace("\"", "\\\"")
+        cmd = cmd + " \"" + safe + "\""
+    }
+    let out = to_string(exec(cmd + " 2>&1"))  // @allow-bare-exec
+    if out.trim().len() > 0 { print(out) }
+    // atlas_health 는 problem 있으면 exit(1) — stdout 마커로 판정
+    if out.contains("real orphans:  0") && out.contains("dup data lines:0") && out.contains("malformed:     0") && out.contains("formula errors:0") {
+        return 0
+    }
+    return 1
+}
+
+fn run_nexus(rest: [str]) -> i64 {
+    // --dry-run 은 라우터 레벨에서 처리 (원본 수정 금지)
+    let mut dry = false
+    let mut verbose = false
+    let mut forward = []
+    for a in rest {
+        if a == "--dry-run" { dry = true }
+        else if a == "--verbose" || a == "-v" { verbose = true; forward.push(a) }
+        else { forward.push(a) }
+    }
+    if dry {
+        let nexus_scripts = HOME + "/Dev/n6-architecture/bridge/scripts"
+        let pid_file = HOME + "/.nexus/daemon.pid"
+        let dir_ok = to_string(exec("test -d '" + nexus_scripts + "' && echo y || echo n")).trim()  // @allow-bare-exec
+        let pid_ok = to_string(exec("test -f '" + pid_file + "' && echo y || echo n")).trim()  // @allow-bare-exec
+        let mut running = "not-running"
+        if pid_ok == "y" {
+            let pid = to_string(exec("cat '" + pid_file + "' 2>/dev/null")).trim()  // @allow-bare-exec
+            if pid.len() > 0 {
+                let alive = to_string(exec("kill -0 " + pid + " 2>/dev/null && echo y || echo n")).trim()  // @allow-bare-exec
+                running = if alive == "y" { "alive (pid=" + pid + ")" } else { "stale-pid" }
+            }
+        } else {
+            let pgrep_ok = to_string(exec("pgrep -f nexus_growth_daemon >/dev/null 2>&1 && echo y || echo n")).trim()  // @allow-bare-exec
+            if pgrep_ok == "y" { running = "alive (pgrep)" }
+        }
+        println("=== nexus daemon dry-run ===")
+        println("  scripts_dir:   " + nexus_scripts + " (" + dir_ok + ")")
+        println("  pid_file:      " + pid_file + " (" + pid_ok + ")")
+        println("  status:        " + running)
+        if dir_ok == "n" || running == "not-running" || running == "stale-pid" { return 1 }
+        return 0
+    }
+    if file_exists(NEXUS_ENSURE) == false {
+        eprintln("REJECT: nexus_ensure_running not found: " + NEXUS_ENSURE)
+        return 2
+    }
+    let mut cmd = HEXA + " run " + NEXUS_ENSURE
+    for a in forward {
+        let safe = a.replace("\"", "\\\"")
+        cmd = cmd + " \"" + safe + "\""
+    }
+    let out = to_string(exec(cmd + " 2>&1"))  // @allow-bare-exec
+    if out.trim().len() > 0 { print(out) }
+    if verbose {
+        println("=== nexus daemon ensure ===")
+        println("  delegate:      " + NEXUS_ENSURE)
+        println("  status:        OK (silent — ensure 는 멱등)")
+    }
+    return 0
+}
+
+fn run_all(rest: [str]) -> i64 {
+    println("=== health:all ===")
+    println("--- [1/2] atlas ---")
+    let a_code = run_atlas(rest)
+    println("")
+    println("--- [2/2] nexus ---")
+    // all 모드에서는 dry-run 강제 — 부작용 방지
+    let mut n_rest = ["--dry-run"]
+    for r in rest { n_rest.push(r) }
+    let n_code = run_nexus(n_rest)
+    println("")
+    // 종합 점수 — 각 50점, 실패당 0
+    let a_score = if a_code == 0 { 50 } else { 0 }
+    let n_score = if n_code == 0 { 50 } else { 0 }
+    let total = a_score + n_score
+    println("=== summary ===")
+    println("  atlas:         " + (if a_code == 0 { "OK" } else { "WARN" }) + " (" + to_string(a_score) + "/50)")
+    println("  nexus:         " + (if n_code == 0 { "OK" } else { "WARN" }) + " (" + to_string(n_score) + "/50)")
+    println("  total:         " + to_string(total) + "/100")
+    if total == 100 { return 0 }
+    return 1
+}
+
+fn main() {
+    // argv 정규화 (2026-04-19): Mac=[hexa, script, user...] Linux-stage1=[hexa, "run", script, user...]
+    // 이전까지 Mac-only argv[2] 가정 → Linux 에서 argv[2] = script path 로 dispatch 실패.
+    let _raw_argv = args()
+    let mut _script_idx = -1
+    let mut _scan_i = 0
+    while _scan_i < _raw_argv.len() {
+        if _raw_argv[_scan_i].ends_with(".hexa") { _script_idx = _scan_i; break }
+        _scan_i = _scan_i + 1
+    }
+    let mut _user_start = 2
+    let mut _script_token = ""
+    if _script_idx >= 0 {
+        _user_start = _script_idx + 1
+        _script_token = _raw_argv[_script_idx]
+    } else {
+        if _raw_argv.len() >= 3 {
+            if _raw_argv[1] == "run" { _user_start = 3 }
+            if _raw_argv[1] == "eval" { _user_start = 3 }
+        }
+    }
+    let mut argv: [str] = [_raw_argv[0], _script_token]
+    let mut _ua_i = _user_start
+    while _ua_i < _raw_argv.len() {
+        argv = argv + [_raw_argv[_ua_i]]
+        _ua_i = _ua_i + 1
+    }
+    if _script_token.len() > 0 && argv.len() >= 3 {
+        if argv[2] == _script_token {
+            let mut _a2: [str] = [_raw_argv[0], _script_token]
+            let mut _j2 = 3
+            while _j2 < argv.len() {
+                _a2 = _a2 + [argv[_j2]]
+                _j2 = _j2 + 1
+            }
+            argv = _a2
+        }
+    }
+    if argv.len() < 3 {
+        print_list()
+        return
+    }
+    let mode = argv[2].trim().to_lower()
+    let mut rest = []
+    let mut i = 3
+    while i < argv.len() {
+        rest.push(argv[i])
+        i = i + 1
+    }
+    if mode == "list" || mode == "-h" || mode == "--help" || mode == "help" {
+        print_list()
+        return
+    }
+    if mode == "atlas" {
+        let c = run_atlas(rest)
+        exit(c)
+    }
+    if mode == "nexus" {
+        let c = run_nexus(rest)
+        exit(c)
+    }
+    if mode == "all" {
+        let c = run_all(rest)
+        exit(c)
+    }
+    eprintln("REJECT: unknown mode '" + mode + "' — modes: list|atlas|nexus|all")
+    exit(2)
+}
+
+main()

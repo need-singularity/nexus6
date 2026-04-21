@@ -1,0 +1,472 @@
+// cl_refresh_check.hexa — INFRA-P8-1 coherence audit
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+// role: cl_refresh_spec.json v2 coherence check — 7 프로젝트 정합 감시 (read-only)
+//
+// spec : shared/engine/cl_refresh_spec.json  (schema_version=2)
+// SSOT  : shared/bin/cl-refresh, cl-refresh-launchd, launchd/com.nexus.cl-refresh.plist (L0)
+// report: shared/reports/cl_refresh_coherence.json
+// audit : shared/logs/cl_refresh_audit.jsonl (append-only)
+//
+// invariants (I1~I7):
+//   I1_SINGLE_PLIST        ~/Library/LaunchAgents/com.nexus.cl-refresh.plist 정확히 1개
+//   I2_INTERVAL_UNIFORM    projects[*].refresh_interval_min 단일값
+//   I3_CACHE_PATH_UNIFORM  projects[*].usage_cache_path 단일값
+//   I4_CACHE_FRESH         usage-cache._ts < 2*interval*60 초과 아님
+//   I5_SHARED_SYMLINK      6개 프로젝트 .shared → ../nexus/shared 유효
+//   I6_L0_INTEGRITY        3 L0 파일 존재 + lockdown 등록
+//   I7_CALLER_SINGLE       caller_id 전 프로젝트 동일
+//
+// usage:
+//   hexa run shared/tool/cl_refresh_check.hexa              — run + report
+//   hexa run shared/tool/cl_refresh_check.hexa status       — 최근 리포트 dump
+//   hexa run shared/tool/cl_refresh_check.hexa help         — 사용법
+//
+// 원칙: read-only audit. exit 항상 0. 실패는 리포트/audit_trail 에만 기록.
+//        sentinel 마지막 라인: __CL_REFRESH_COHERENCE__ PASS|FAIL
+
+// ─── void-safe helpers ───
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _to_int0(s: string) -> i64 {
+    let t = s.trim()
+    if t == "" { return 0 }
+    let mut v: i64 = 0
+    try { v = to_int(t) } catch e { v = 0 }
+    return v
+}
+
+fn _shq(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+// ─── paths ───
+let HOME = env("HOME")
+let NEXUS_ENV = env("NEXUS")
+let NEXUS = if NEXUS_ENV != "" { NEXUS_ENV } else { HOME + "/Dev/nexus" }
+let SHARED = NEXUS + "/shared"
+let SPEC_PATH = SHARED + "/engine/cl_refresh_spec.json"
+let LOCKDOWN = SHARED + "/lockdown/lockdown.json"
+let PLIST_REPO = SHARED + "/launchd/com.nexus.cl-refresh.plist"
+let PLIST_LIVE = HOME + "/Library/LaunchAgents/com.nexus.cl-refresh.plist"
+let CL_REFRESH = SHARED + "/bin/cl-refresh"
+let CL_REFRESH_LAUNCHD = SHARED + "/bin/cl-refresh-launchd"
+let USAGE_CACHE = SHARED + "/.runtime/accounts/usage-cache.json"
+let REPORT_DIR = SHARED + "/reports"
+let REPORT_PATH = REPORT_DIR + "/cl_refresh_coherence.json"
+let LOG_DIR = SHARED + "/logs"
+let AUDIT_PATH = LOG_DIR + "/cl_refresh_audit.jsonl"
+
+// ─── 7 core projects (SSOT: shared/config/projects.json .categories.core) ───
+// H-PROJ-ALL 준수 — 하드코딩 회피. 로드 실패 시 fallback.
+fn load_projects() -> [string] {
+    let pj_path = SHARED + "/config/projects.json"
+    if file_exists(pj_path) {
+        let names = _str(exec("jq -r '.categories.core[]' " + _shq(pj_path) + " 2>/dev/null")).trim()  // @allow-bare-exec
+        if names.len() > 0 {
+            let mut out: [string] = []
+            for line in names.split("\n") {
+                let t = _str(line).trim()
+                if t.len() > 0 { out = out.push(t) }
+            }
+            if len(out) == 7 { return out }
+        }
+    }
+    // fallback (projects.json 미존재/손상 시)
+    // @allow-project-list — H-PROJ-HARDCODE 예외 (SSOT 실패 시 최후 fallback)
+    return ["nexus", "anima", "n6-architecture", "papers", "hexa-lang", "void", "airgenome"]
+}
+let PROJECTS: [string] = load_projects()
+
+// ─── json string field extractor (substring-based, single-line friendly) ───
+fn json_escape(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", " ")
+    r = r.replace("\r", " ")
+    r = r.replace("\t", " ")
+    return r
+}
+
+// jq 가 설치돼 있으니 쉘 위임. spec 파싱/launchctl/plist grep 전부 jq+shell 로 처리.
+fn jq_read(path: string, expr: string) -> string {
+    let cmd = "jq -r " + _shq(expr) + " " + _shq(path) + " 2>/dev/null"
+    let out = _str(exec(cmd)).trim()  // @allow-bare-exec
+    if out == "null" { return "" }
+    return out
+}
+
+fn now_unix() -> i64 {
+    return _to_int0(_str(exec("date +%s")).trim())  // @allow-bare-exec
+}
+
+fn now_iso() -> string {
+    return _str(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()  // @allow-bare-exec
+}
+
+// ─── invariant results ───
+struct InvResult {
+    id: string,
+    status: string,       // "PASS" | "FAIL"
+    detail: string
+}
+
+fn mk_pass(id: string, detail: string) -> InvResult {
+    return InvResult { id: id, status: "PASS", detail: detail }
+}
+
+fn mk_fail(id: string, detail: string) -> InvResult {
+    return InvResult { id: id, status: "FAIL", detail: detail }
+}
+
+// ─── I1_SINGLE_PLIST ───
+fn check_i1() -> InvResult {
+    // repo plist 필수
+    if file_exists(PLIST_REPO) == false {
+        return mk_fail("I1_SINGLE_PLIST", "repo plist 누락: " + PLIST_REPO)
+    }
+    // live plist (LaunchAgents) — 유저 로컬에만 있을 수 있음
+    let live_ok = file_exists(PLIST_LIVE)
+    // 추가: com.nexus.cl-refresh 라는 Label 로 로드된 launchctl entry 수
+    let lc = _str(exec("launchctl list 2>/dev/null | awk '$3==\"com.nexus.cl-refresh\"{n++} END{print n+0}'")).trim()  // @allow-bare-exec
+    let n = _to_int0(lc)
+    if live_ok == false && n == 0 {
+        return mk_fail("I1_SINGLE_PLIST", "live plist 미설치 + launchctl 미로드")
+    }
+    if n > 1 {
+        return mk_fail("I1_SINGLE_PLIST", "launchctl duplicate: " + to_string(n))
+    }
+    return mk_pass("I1_SINGLE_PLIST", "repo_plist=OK live_plist=" + (if live_ok { "OK" } else { "absent" }) + " launchctl=" + to_string(n))
+}
+
+// ─── I2_INTERVAL_UNIFORM ───
+fn check_i2() -> InvResult {
+    // projects[*].refresh_interval_min 집합 크기 == 1
+    let vals = jq_read(SPEC_PATH, ".projects | to_entries | map(select(.key | startswith(\"_\") | not)) | map(.value.refresh_interval_min) | unique | length")
+    if vals == "" {
+        return mk_fail("I2_INTERVAL_UNIFORM", "spec.projects 파싱 실패")
+    }
+    let n = _to_int0(vals)
+    if n != 1 {
+        let listing = jq_read(SPEC_PATH, ".projects | to_entries | map(select(.key | startswith(\"_\") | not)) | map({k:.key, v:.value.refresh_interval_min}) | tostring")
+        return mk_fail("I2_INTERVAL_UNIFORM", "distinct_count=" + to_string(n) + " values=" + listing)
+    }
+    let v = jq_read(SPEC_PATH, ".projects.nexus.refresh_interval_min")
+    return mk_pass("I2_INTERVAL_UNIFORM", "all 7 = " + v + " min")
+}
+
+// ─── I3_CACHE_PATH_UNIFORM ───
+fn check_i3() -> InvResult {
+    let vals = jq_read(SPEC_PATH, ".projects | to_entries | map(select(.key | startswith(\"_\") | not)) | map(.value.usage_cache_path) | unique | length")
+    if vals == "" {
+        return mk_fail("I3_CACHE_PATH_UNIFORM", "spec.projects.usage_cache_path 파싱 실패")
+    }
+    let n = _to_int0(vals)
+    if n != 1 {
+        return mk_fail("I3_CACHE_PATH_UNIFORM", "distinct_count=" + to_string(n))
+    }
+    let v = jq_read(SPEC_PATH, ".projects.nexus.usage_cache_path")
+    return mk_pass("I3_CACHE_PATH_UNIFORM", "all 7 = " + v)
+}
+
+// ─── I4_CACHE_FRESH ───
+fn check_i4() -> InvResult {
+    if file_exists(USAGE_CACHE) == false {
+        return mk_fail("I4_CACHE_FRESH", "usage-cache.json 없음: " + USAGE_CACHE)
+    }
+    let ts_s = jq_read(USAGE_CACHE, "._ts // 0")
+    let ts = _to_int0(ts_s)
+    if ts <= 0 {
+        return mk_fail("I4_CACHE_FRESH", "_ts 필드 누락 또는 0")
+    }
+    let now = now_unix()
+    let age = now - ts
+    // threshold = 2 * interval_min * 60 (spec I4)
+    let interval_s = jq_read(SPEC_PATH, ".projects.nexus.refresh_interval_min // 5")
+    let interval = _to_int0(interval_s)
+    if interval == 0 { interval = 5 }
+    let threshold = 2 * interval * 60
+    if age > threshold {
+        return mk_fail("I4_CACHE_FRESH", "age=" + to_string(age) + "s > threshold=" + to_string(threshold) + "s (ts=" + to_string(ts) + " interval=" + to_string(interval) + "m)")
+    }
+    return mk_pass("I4_CACHE_FRESH", "age=" + to_string(age) + "s <= " + to_string(threshold) + "s")
+}
+
+// ─── I5_SHARED_SYMLINK ───
+fn check_i5() -> InvResult {
+    let mut bad: [string] = []
+    let mut detail_parts: [string] = []
+    let dev = HOME + "/Dev"
+    for p in PROJECTS {
+        if p == "nexus" {
+            continue
+        }
+        let link = dev + "/" + p + "/.shared"
+        // test -L + readlink -e (dangling symlink 검출)
+        let is_link = _str(exec("[ -L " + _shq(link) + " ] && echo y || echo n")).trim()  // @allow-bare-exec
+        if is_link != "y" {
+            bad = bad.push(p + ":no-symlink")
+            continue
+        }
+        let resolved = _str(exec("readlink -f " + _shq(link) + " 2>/dev/null")).trim()  // @allow-bare-exec
+        let expect = dev + "/nexus/shared"
+        if resolved != expect {
+            bad = bad.push(p + ":target=" + resolved)
+        } else {
+            detail_parts = detail_parts.push(p + "=OK")
+        }
+    }
+    if len(bad) > 0 {
+        let mut s = ""
+        for b in bad {
+            if s.len() > 0 { s = s + "," }
+            s = s + b
+        }
+        return mk_fail("I5_SHARED_SYMLINK", "bad: " + s)
+    }
+    return mk_pass("I5_SHARED_SYMLINK", "6/6 symlink valid")
+}
+
+// ─── I6_L0_INTEGRITY ───
+fn check_i6() -> InvResult {
+    let l0_files: [string] = [CL_REFRESH, CL_REFRESH_LAUNCHD, PLIST_REPO]
+    let mut missing: [string] = []
+    for f in l0_files {
+        if file_exists(f) == false { missing = missing.push(f) }
+    }
+    if len(missing) > 0 {
+        let mut s = ""
+        for m in missing {
+            if s.len() > 0 { s = s + "; " }
+            s = s + m
+        }
+        return mk_fail("I6_L0_INTEGRITY", "missing: " + s)
+    }
+    // lockdown.json 내 3 path 등록 확인
+    if file_exists(LOCKDOWN) == false {
+        return mk_fail("I6_L0_INTEGRITY", "lockdown.json 없음")
+    }
+    let need: [string] = [
+        "shared/bin/cl-refresh",
+        "shared/bin/cl-refresh-launchd",
+        "shared/launchd/com.nexus.cl-refresh.plist"
+    ]
+    let mut unlocked: [string] = []
+    for n in need {
+        let hit = _str(exec("jq -r '.. | objects | .path? // empty' " + _shq(LOCKDOWN) + " 2>/dev/null | awk -v p=" + _shq(n) + " '$0==p{f=1} END{print f+0}'")).trim()  // @allow-bare-exec
+        if hit != "1" {
+            unlocked = unlocked.push(n)
+        }
+    }
+    if len(unlocked) > 0 {
+        let mut s = ""
+        for u in unlocked {
+            if s.len() > 0 { s = s + "; " }
+            s = s + u
+        }
+        return mk_fail("I6_L0_INTEGRITY", "lockdown 미등록: " + s)
+    }
+    return mk_pass("I6_L0_INTEGRITY", "3/3 L0 파일 존재 + lockdown 등록")
+}
+
+// ─── I7_CALLER_SINGLE ───
+fn check_i7() -> InvResult {
+    let n_s = jq_read(SPEC_PATH, ".projects | to_entries | map(select(.key | startswith(\"_\") | not)) | map(.value.caller_id) | unique | length")
+    let n = _to_int0(n_s)
+    if n == 0 {
+        return mk_fail("I7_CALLER_SINGLE", "caller_id 파싱 실패")
+    }
+    // 전 프로젝트 동일 caller_id 기대. 복수 허용 시 manual:* 혼합만 용인.
+    if n != 1 {
+        return mk_fail("I7_CALLER_SINGLE", "distinct_caller_ids=" + to_string(n))
+    }
+    let v = jq_read(SPEC_PATH, ".projects.nexus.caller_id")
+    return mk_pass("I7_CALLER_SINGLE", "all 7 caller_id = " + v)
+}
+
+// ─── report emission ───
+fn emit_report(results: [InvResult], overall: string, projects_with_caller: i64) -> string {
+    let mut body = "{\n"
+    body = body + "  \"ts\": \"" + now_iso() + "\",\n"
+    body = body + "  \"schema_version\": \"2\",\n"
+    body = body + "  \"projects_checked\": 7,\n"
+    body = body + "  \"projects_with_caller\": " + to_string(projects_with_caller) + ",\n"
+    body = body + "  \"invariants\": {\n"
+    let n = len(results)
+    let mut i: i64 = 0
+    while i < n {
+        let r = results[i]
+        body = body + "    \"" + r.id + "\": \"" + r.status + "\""
+        if i < n - 1 { body = body + "," }
+        body = body + "\n"
+        i = i + 1
+    }
+    body = body + "  },\n"
+    // failures
+    body = body + "  \"failures\": ["
+    let mut j: i64 = 0
+    let mut first = true
+    while j < n {
+        let r = results[j]
+        if r.status == "FAIL" {
+            if first == false { body = body + "," }
+            body = body + "\n    {\"invariant_id\":\"" + r.id + "\",\"detail\":\"" + json_escape(r.detail) + "\"}"
+            first = false
+        }
+        j = j + 1
+    }
+    if first == false { body = body + "\n  " }
+    body = body + "],\n"
+    body = body + "  \"overall\": \"" + overall + "\"\n"
+    body = body + "}\n"
+    return body
+}
+
+// ─── audit trail append ───
+fn audit_append(event: string, invariant_id: string, detail: string) {
+    let _ = exec("mkdir -p " + _shq(LOG_DIR))  // @allow-bare-exec
+    let line = "{\"ts\":" + to_string(now_unix()) + ",\"event\":\"" + event + "\",\"invariant_id\":\"" + invariant_id + "\",\"detail\":\"" + json_escape(detail) + "\"}"
+    let cmd = "printf '%s\\n' " + _shq(line) + " >> " + _shq(AUDIT_PATH)
+    let _ = exec(cmd)  // @allow-bare-exec
+    // rotate if >5MB
+    let sz = _to_int0(_str(exec("[ -f " + _shq(AUDIT_PATH) + " ] && wc -c < " + _shq(AUDIT_PATH) + " || echo 0")).trim())  // @allow-bare-exec
+    if sz > 5242880 {
+        let _ = exec("tail -n 500 " + _shq(AUDIT_PATH) + " > " + _shq(AUDIT_PATH + ".tmp") + " && mv " + _shq(AUDIT_PATH + ".tmp") + " " + _shq(AUDIT_PATH))  // @allow-bare-exec
+    }
+}
+
+fn print_usage() {
+    println("cl_refresh_check — INFRA-P8-1 coherence audit")
+    println("")
+    println("usage:")
+    println("  hexa run shared/tool/cl_refresh_check.hexa              — run audit + write report")
+    println("  hexa run shared/tool/cl_refresh_check.hexa status       — 최근 리포트 dump")
+    println("  hexa run shared/tool/cl_refresh_check.hexa help         — 사용법")
+    println("")
+    println("spec  : " + SPEC_PATH)
+    println("report: " + REPORT_PATH)
+    println("audit : " + AUDIT_PATH)
+    println("")
+    println("invariants: I1_SINGLE_PLIST I2_INTERVAL_UNIFORM I3_CACHE_PATH_UNIFORM I4_CACHE_FRESH I5_SHARED_SYMLINK I6_L0_INTEGRITY I7_CALLER_SINGLE")
+}
+
+fn run_all() {
+    // ensure dirs
+    if file_exists(REPORT_DIR) == false {
+        let _ = exec("mkdir -p " + _shq(REPORT_DIR))  // @allow-bare-exec
+    }
+    if file_exists(LOG_DIR) == false {
+        let _ = exec("mkdir -p " + _shq(LOG_DIR))  // @allow-bare-exec
+    }
+
+    // spec 필수
+    if file_exists(SPEC_PATH) == false {
+        eprintln("[cl_refresh_check] FAIL: spec 파일 없음 — " + SPEC_PATH)
+        audit_append("check_run", "", "spec missing: " + SPEC_PATH)
+        println("__CL_REFRESH_COHERENCE__ FAIL")
+        return
+    }
+
+    // schema_version 확인
+    let sv = jq_read(SPEC_PATH, ".schema_version // \"\"")
+    if sv != "2" {
+        eprintln("[cl_refresh_check] WARN: schema_version 기대=2 실제=\"" + sv + "\"")
+        audit_append("check_run", "", "schema_version mismatch: " + sv)
+    }
+
+    // run invariants
+    let mut results: [InvResult] = []
+    results = results.push(check_i1())
+    results = results.push(check_i2())
+    results = results.push(check_i3())
+    results = results.push(check_i4())
+    results = results.push(check_i5())
+    results = results.push(check_i6())
+    results = results.push(check_i7())
+
+    // projects_with_caller — 7 프로젝트 spec 에 caller_id 있는 수
+    let pwc_s = jq_read(SPEC_PATH, ".projects | to_entries | map(select(.key | startswith(\"_\") | not)) | map(select(.value.caller_id != null)) | length")
+    let pwc = _to_int0(pwc_s)
+
+    // overall
+    let mut overall = "PASS"
+    let mut fails: i64 = 0
+    for r in results {
+        if r.status == "FAIL" {
+            overall = "FAIL"
+            fails = fails + 1
+            audit_append("invariant_fail", r.id, r.detail)
+        } else {
+            audit_append("invariant_pass", r.id, r.detail)
+        }
+    }
+
+    let body = emit_report(results, overall, pwc)
+    let mut wrote = false
+    try {
+        write_file(REPORT_PATH, body)
+        wrote = true
+    } catch e {
+        wrote = false
+    }
+
+    // stdout summary — 하네스 H1 원칙 (성공 조용, 실패 시끄럽게)
+    println("[cl_refresh_check] " + now_iso() + " — " + overall + " (" + to_string(len(results) - fails) + "/" + to_string(len(results)) + ")")
+    if overall == "FAIL" {
+        for r in results {
+            if r.status == "FAIL" {
+                eprintln("  FAIL " + r.id + ": " + r.detail)
+            }
+        }
+    }
+    if wrote {
+        println("  report: " + REPORT_PATH)
+    } else {
+        eprintln("  report write FAIL — stdout fallback")
+        print(body)
+    }
+
+    audit_append("check_run", "", "overall=" + overall + " fails=" + to_string(fails) + " wrote=" + (if wrote { "1" } else { "0" }))
+    println("__CL_REFRESH_COHERENCE__ " + overall)
+}
+
+fn cmd_status() {
+    if file_exists(REPORT_PATH) == false {
+        println("[cl_refresh_check] 리포트 없음 — 먼저 run 실행")
+        return
+    }
+    let out = _str(exec("cat " + _shq(REPORT_PATH) + " 2>&1"))  // @allow-bare-exec
+    print(out)
+    if out.ends_with("\n") == false { println("") }
+}
+
+// ─── main ───
+let _argv_all = args()
+let _argv_all_n = len(_argv_all)
+let ARG_OFFSET: i64 = 2
+let mut a: [string] = []
+let mut _ai: i64 = ARG_OFFSET
+while _ai < _argv_all_n {
+    a = a.push(_str(_argv_all[_ai]))
+    _ai = _ai + 1
+}
+let argc = len(a)
+let mode = if argc == 0 { "run" } else { _str(a[0]) }
+
+if mode == "--help" || mode == "-h" || mode == "help" {
+    print_usage()
+    exit(0)
+}
+if mode == "status" {
+    cmd_status()
+    exit(0)
+}
+// default: run
+run_all()
+exit(0)

@@ -1669,11 +1669,11 @@ case "${1:-status}" in
     touch "$HOME/.nexus/halt" 2>/dev/null || \
       (mkdir -p "$HOME/.nexus" && touch "$HOME/.nexus/halt")
     # Also touch shared/discovery/cycle/halt since that's where the tick actually checks
-    mkdir -p "$(pwd)/shared/cycle" && touch "$(pwd)/shared/discovery/cycle/halt"
+    mkdir -p "$(pwd)/cycle" && touch "$(pwd)/discovery/cycle/halt"
     echo "halt flag set"
     ;;
   resume)
-    rm -f "$(pwd)/shared/discovery/cycle/halt" "$HOME/.nexus/halt"
+    rm -f "$(pwd)/discovery/cycle/halt" "$HOME/.nexus/halt"
     echo "halt flag cleared"
     ;;
   status)

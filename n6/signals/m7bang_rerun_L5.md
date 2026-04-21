@@ -1,7 +1,7 @@
 # L5 — [M7!] 35 breakthrough 후보 재현 가능 상위 10
 
 - 생성: 2026-04-15
-- 원본: `/Users/ghost/Dev/nexus/shared/n6/atlas.signals.n6`
+- 원본: `/Users/ghost/Dev/nexus/n6/atlas.signals.n6`
 - [M7!] 전체: **35**
 - 상위 추림: **10**
 

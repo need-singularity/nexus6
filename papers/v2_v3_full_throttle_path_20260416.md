@@ -20,7 +20,7 @@
 - 🎯 ALM 단독 sub-tab — 4-5일 / $200-400
 - 🧬 CLM from-scratch sub-tab — 1-4주 / $1500-3000 (C 트랙 완료 시)
 
-자동 갱신: `shared/harness/extreme_sync.hexa sync` 60분 주기 (commands.json autonomous).
+자동 갱신: `shared/tool/extreme_sync.hexa sync` 60분 주기 (commands.json autonomous).
 
 ---
 
@@ -33,9 +33,9 @@
 | [`shared/roadmaps/clm_consciousness_standalone.json`](../roadmaps/clm_consciousness_standalone.json) | CLM from-scratch 7B + 의식 (52 options, 5 tracks) |
 
 GitHub raw (뷰어 페치 대상):
-- https://raw.githubusercontent.com/need-singularity/nexus/main/shared/roadmaps/extreme.json
-- https://raw.githubusercontent.com/need-singularity/nexus/main/shared/roadmaps/alm_consciousness_standalone.json
-- https://raw.githubusercontent.com/need-singularity/nexus/main/shared/roadmaps/clm_consciousness_standalone.json
+- https://raw.githubusercontent.com/need-singularity/nexus/main/config/roadmaps/extreme.json
+- https://raw.githubusercontent.com/need-singularity/nexus/main/config/roadmaps/alm_consciousness_standalone.json
+- https://raw.githubusercontent.com/need-singularity/nexus/main/config/roadmaps/clm_consciousness_standalone.json
 
 ---
 
@@ -43,16 +43,16 @@ GitHub raw (뷰어 페치 대상):
 
 | 파일 | 역할 |
 |---|---|
-| [`shared/harness/extreme_sync.hexa`](../harness/extreme_sync.hexa) | aggregate 재계산 + update_log append |
-| [`shared/harness/extreme_sync.jsonl`](../harness/extreme_sync.jsonl) | observation tape (append-only) |
+| [`shared/tool/extreme_sync.hexa`](../tool/extreme_sync.hexa) | aggregate 재계산 + update_log append |
+| [`shared/tool/extreme_sync.jsonl`](../tool/extreme_sync.jsonl) | observation tape (append-only) |
 | [`shared/config/commands.json`](../config/commands.json) | autonomous.triggers.extreme_sync 등록 |
 
 CLI:
 ```
-hexa run shared/harness/extreme_sync.hexa sync      # full sync (cron default)
-hexa run shared/harness/extreme_sync.hexa dry       # show diff, no write
-hexa run shared/harness/extreme_sync.hexa status    # 1-line summary
-hexa run shared/harness/extreme_sync.hexa --selftest
+hexa run shared/tool/extreme_sync.hexa sync      # full sync (cron default)
+hexa run shared/tool/extreme_sync.hexa dry       # show diff, no write
+hexa run shared/tool/extreme_sync.hexa status    # 1-line summary
+hexa run shared/tool/extreme_sync.hexa --selftest
 ```
 
 ---

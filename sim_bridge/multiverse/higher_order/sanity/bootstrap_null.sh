@@ -5,9 +5,9 @@
 set -u
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 NEXUS_ROOT="/Users/ghost/Dev/nexus"
-MULTIVERSE="$NEXUS_ROOT/shared/sim_bridge/multiverse"
+MULTIVERSE="$NEXUS_ROOT/sim_bridge/multiverse"
 HIGHER_ORDER="$MULTIVERSE/higher_order"
-HEXA="$NEXUS_ROOT/shared/bin/hexa"
+HEXA="$NEXUS_ROOT/bin/hexa"
 export HEXA_LOCAL=1
 
 K="${K:-10}"

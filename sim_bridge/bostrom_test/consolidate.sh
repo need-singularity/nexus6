@@ -4,7 +4,7 @@
 
 set -uo pipefail
 
-OUT_DIR="${1:-/Users/ghost/Dev/nexus/shared/sim_bridge/bostrom_test/runs/bostrom_final}"
+OUT_DIR="${1:-/Users/ghost/Dev/nexus/sim_bridge/bostrom_test/runs/bostrom_final}"
 mkdir -p "$OUT_DIR"
 OUT_HEX="$OUT_DIR/anu_stream.hex"
 OUT_META="$OUT_DIR/anu_stream.hex.meta.jsonl"
@@ -15,7 +15,7 @@ OUT_META="$OUT_DIR/anu_stream.hex.meta.jsonl"
 echo "[consolidate] scanning bostrom runs..."
 export BOSTROM_OUT_HEX="$OUT_HEX"
 export BOSTROM_OUT_META="$OUT_META"
-/usr/bin/python3 /Users/ghost/Dev/nexus/shared/sim_bridge/bostrom_test/consolidate_impl.py
+/usr/bin/python3 /Users/ghost/Dev/nexus/sim_bridge/bostrom_test/consolidate_impl.py
 BYTES=$(wc -c < "$OUT_HEX" | tr -d ' ')
 echo "[consolidate] total hex chars: $BYTES = $((BYTES / 2)) bytes"
 echo "[consolidate] out: $OUT_HEX"

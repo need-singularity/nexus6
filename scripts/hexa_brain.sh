@@ -14,8 +14,8 @@ BRAIN_LOG="${LOG_DIR}/hexa_brain.jsonl"
 mkdir -p "$LOG_DIR"
 
 CLAUDE_BIN="${HEXA_BRAIN_CLAUDE:-$HOME/.local/bin/claude}"
-CL_BIN="${NEXUS:-$HOME/Dev/nexus}/shared/bin/cl"
-PROMPT_FILE="${NEXUS:-$HOME/Dev/nexus}/shared/harness/hexa_brain_prompt.md"
+CL_BIN="${NEXUS:-$HOME/Dev/nexus}/bin/cl"
+PROMPT_FILE="${NEXUS:-$HOME/Dev/nexus}/tool/hexa_brain_prompt.md"
 EFFORT="${HEXA_BRAIN_EFFORT:-low}"
 
 now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -53,11 +53,11 @@ IDLE_CLAUDES=$(ps -eo pid=,stat=,pcpu=,etime=,command= | awk '
     END { print c+0 }')
 
 # dispatch 정책 위반 감지 (L2)
-DISPATCH_CHECK=$("$NEXUS/shared/scripts/hexa_dispatch_check.sh" 2>/dev/null)
+DISPATCH_CHECK=$("$NEXUS/scripts/hexa_dispatch_check.sh" 2>/dev/null)
 [[ -z "$DISPATCH_CHECK" ]] && DISPATCH_CHECK='{"violation":false,"reason":"checker unavailable"}'
 
 # 패턴 분석 (L3) — 반복 offender + escalate 통계
-PATTERNS_HINT=$("$NEXUS/shared/scripts/hexa_patterns.sh" brain-hint 2>/dev/null)
+PATTERNS_HINT=$("$NEXUS/scripts/hexa_patterns.sh" brain-hint 2>/dev/null)
 [[ -z "$PATTERNS_HINT" ]] && PATTERNS_HINT="patterns: analyzer unavailable"
 
 # PROMPT 조립
@@ -127,7 +127,7 @@ if printf '%s' "$RESULT" | tail -1 | jq -e . >/dev/null 2>&1; then
     printf '{"ts":"%s","tier":2,"brain":%s}\n' "$(now_iso)" "$BRAIN_JSON" >> "$GUARD_LOG"
 
     # recommend 를 action queue 에 append (1h TTL dedup)
-    ACTIONS_BIN="${NEXUS:-$HOME/Dev/nexus}/shared/scripts/hexa_actions.sh"
+    ACTIONS_BIN="${NEXUS:-$HOME/Dev/nexus}/scripts/hexa_actions.sh"
     if [[ -x "$ACTIONS_BIN" ]]; then
         printf '%s' "$BRAIN_JSON" | jq -r '.recommend[]? // empty' 2>/dev/null | \
         while IFS= read -r rec; do

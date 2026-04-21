@@ -21,7 +21,7 @@ set -e
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-HEXA="${HEXA:-$HOME/Dev/nexus/shared/bin/hexa}"
+HEXA="${HEXA:-$HOME/Dev/nexus/bin/hexa}"
 PY="/usr/bin/python3"
 M="${M:-50}"
 T="${T:-2000}"
@@ -40,7 +40,7 @@ echo "[runner] run_dir=$RUN_DIR"
 START_TIME=$(date +%s)
 
 # ----- ANU cache source -----
-ANU_CACHE="$HOME/Dev/nexus/shared/discovery/rng_lab/.anu_cache.bin"
+ANU_CACHE="$HOME/Dev/nexus/discovery/rng_lab/.anu_cache.bin"
 ANU_HEX=""
 ANU_LEN_BYTES=0
 if [ -f "$ANU_CACHE" ] && [ "${SKIP_ANU:-0}" != "1" ]; then

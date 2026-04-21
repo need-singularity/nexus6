@@ -70,7 +70,7 @@ if has_directive == "yes" {
 
 - Verified: `/tmp/rt33_import.hexa` (has import) still preprocesses + runs; probe + real hook skip it.
 - `hexa version`, `hexa help`, `hexa run` (import + no-import) smoke-tested with the locally rebuilt `/tmp/hexa_rt33`.
-- **Not installed**: binary on PATH (`~/.hx/bin/hexa` → `Dev/airgenome/nexus/shared/bin/hexa`) is left untouched to avoid disrupting parallel training/agents on this machine. Installation happens on merge.
+- **Not installed**: binary on PATH (`~/.hx/bin/hexa` → `Dev/airgenome/nexus/bin/hexa`) is left untouched to avoid disrupting parallel training/agents on this machine. Installation happens on merge.
 
 ## AOT cache (bt#36) — why re-enabling isn't the easy win the task hypothesized
 

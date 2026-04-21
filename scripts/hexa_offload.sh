@@ -14,7 +14,7 @@
 set -u
 
 NEXUS="${NEXUS:-$HOME/Dev/nexus}"
-DISPATCH="$NEXUS/shared/dispatch_state.json"
+DISPATCH="$NEXUS/dispatch_state.json"
 LOG="${HOME}/.airgenome/hexa_offload.jsonl"
 mkdir -p "$(dirname "$LOG")"
 

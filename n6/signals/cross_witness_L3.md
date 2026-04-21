@@ -1,7 +1,7 @@
 # L3 — CROSS 22 witness 증가 유망 상위 10
 
 - 생성: 2026-04-15
-- 원본: `/Users/ghost/Dev/nexus/shared/n6/signals/cross_repo_candidates.txt`
+- 원본: `/Users/ghost/Dev/nexus/n6/signals/cross_repo_candidates.txt`
 - 총 매칭 쌍: **38**
 - 상위 추림: **10**
 

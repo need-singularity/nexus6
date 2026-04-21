@@ -1,0 +1,360 @@
+// rule_proposer.hexa — GOV-P8-1 AI 자동 룰 제안 엔진
+// @allow-bare-exec
+// @no-sandbox
+//
+// Input : shared/tool/mistakes.jsonl  (하네스 lint 위반 로그)
+// Output: shared/rules/proposed/YYYYMMDD_<rule_id>.json  (staged, bulletin — 자동 enforce 없음)
+//
+// Logic:
+//   1. mistakes.jsonl 마지막 N (기본 3000) 라인 스캔
+//   2. 윈도우(기본 7일) 내 kind=lint_fail rule 별 카운트
+//   3. threshold(기본 3) 이상인 rule 중 index 미등록 상위 TopK 추출
+//   4. 각 cluster → proposed rule (severity=warn) JSON 파일 생성
+//
+// Usage:
+//   hexa run rule_proposer.hexa scan                      — top cluster 출력 (dry-run)
+//   hexa run rule_proposer.hexa propose [--top N=3]       — 상위 N cluster → proposed/ 파일
+//   hexa run rule_proposer.hexa clean                     — proposed/ 비우기 (유저 승인 필요)
+//
+// 규약:
+//   - common.json / {project}.json 직접 append 절대 금지 (staged only)
+//   - severity 기본 warn (enforce 아님)
+//   - anima 참조 금지 (이 파일에서 anima 경로 하드코드 금지)
+
+let HOME = env("HOME")
+let NEXUS_ROOT = HOME + "/Dev/nexus"
+let MISTAKES = NEXUS_ROOT + "/tool/mistakes.jsonl"
+let INDEX = NEXUS_ROOT + "/rules/.rules_index.jsonl"
+let PROPOSED_DIR = NEXUS_ROOT + "/rules/proposed"
+
+// 기본 파라미터
+let DEFAULT_WINDOW_DAYS: i64 = 7
+let DEFAULT_THRESHOLD: i64 = 3
+let DEFAULT_TOP: i64 = 3
+let DEFAULT_SCAN_LINES: i64 = 3000
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _to_int0(s: string) -> i64 {
+    if s == "" { return 0 }
+    let first = _str(s.split("\n")[0]).trim()
+    if first == "" { return 0 }
+    return to_int(first)
+}
+
+fn now_iso() -> string {
+    return _str(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()  // @allow-bare-exec
+}
+
+fn today_stamp() -> string {
+    return _str(exec("date -u +%Y%m%d")).trim()  // @allow-bare-exec
+}
+
+fn json_escape(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", " ")
+    r = r.replace("\r", " ")
+    r = r.replace("\t", " ")
+    return r
+}
+
+// 윈도우 컷오프 시점 ISO 반환 (현재 - N일).
+fn cutoff_iso(days: i64) -> string {
+    let secs = days * 86400
+    // BSD(mac) 와 GNU 모두 호환: date -v-Nd 또는 date -d "N days ago"
+    let cmd = "date -u -v-" + to_string(days) + "d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || " +
+              "date -u -d '" + to_string(days) + " days ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null"
+    return _str(exec(cmd)).trim()  // @allow-bare-exec
+}
+
+// rule 이 이미 index 에 있으면 true (제안 생략).
+fn rule_exists_in_index(rule_id: string) -> bool {
+    if !file_exists(INDEX) { return false }
+    let cmd = "grep -c '\"id\":\"" + rule_id + "\"' '" + INDEX + "' 2>/dev/null"
+    let n = _to_int0(_str(exec(cmd)))  // @allow-bare-exec
+    return n > 0
+}
+
+// mistakes.jsonl 에서 윈도우 안 kind=lint_fail rule 을 카운트한 TSV (count\trule) 반환.
+// 최근 scan_lines 만 처리 (과거 드리프트 잡음 배제).
+fn tally_lint_fail(window_days: i64, scan_lines: i64) -> string {
+    if !file_exists(MISTAKES) { return "" }
+    let cutoff = cutoff_iso(window_days)
+    // tail → grep kind → awk ts>=cutoff → awk rule → sort uniq -c → sort -rn
+    let cmd = "tail -" + to_string(scan_lines) + " '" + MISTAKES + "' 2>/dev/null | " +
+              "grep '\"kind\":\"lint_fail\"' | " +
+              "awk -F'\"ts\":\"' '{split($2,a,\"\\\"\"); if (a[1]>=\"" + cutoff + "\") print $0}' | " +
+              "awk -F'\"rule\":\"' '{split($2,a,\"\\\"\"); print a[1]}' | " +
+              "sort | uniq -c | sort -rn"
+    return _str(exec(cmd))  // @allow-bare-exec
+}
+
+// cluster 에 해당하는 대표 샘플 fix 메시지 1개 추출 (rule → how_to_detect 힌트).
+fn sample_fix_for(rule_id: string) -> string {
+    if !file_exists(MISTAKES) { return "" }
+    let cmd = "tail -3000 '" + MISTAKES + "' 2>/dev/null | " +
+              "grep '\"kind\":\"lint_fail\"' | " +
+              "grep '\"rule\":\"" + rule_id + "\"' | tail -1 | " +
+              "awk -F'\"fix\":\"' '{split($2,a,\"\\\"\"); print a[1]}'"
+    return _str(exec(cmd)).trim()  // @allow-bare-exec
+}
+
+// cluster 에 해당하는 sample 파일 경로 3개 추출 (제안 how_to_detect 재현용).
+fn sample_files_for(rule_id: string) -> string {
+    if !file_exists(MISTAKES) { return "" }
+    let cmd = "tail -3000 '" + MISTAKES + "' 2>/dev/null | " +
+              "grep '\"kind\":\"lint_fail\"' | " +
+              "grep '\"rule\":\"" + rule_id + "\"' | " +
+              "awk -F'\"file\":\"' '{split($2,a,\"\\\"\"); print a[1]}' | " +
+              "sort -u | head -3"
+    return _str(exec(cmd)).trim()  // @allow-bare-exec
+}
+
+// rule_id 에 해당하는 기존 룰 텍스트 (common 등) 있으면 반환. 없으면 빈 문자열.
+fn existing_rule_text(rule_id: string) -> string {
+    if !file_exists(INDEX) { return "" }
+    let cmd = "grep '\"id\":\"" + rule_id + "\"' '" + INDEX +
+              "' 2>/dev/null | head -1 | /usr/bin/jq -r '.pattern' 2>/dev/null"
+    return _str(exec(cmd)).trim()  // @allow-bare-exec
+}
+
+// proposed rule id 생성: PR-<rule_id>-<YYYYMMDD>
+// 이미 index 에 있는 rule_id 도 강화(boost) 제안으로 수용 가능. PR- prefix 로 충돌 회피.
+fn propose_id(src_rule: string) -> string {
+    return "PR-" + src_rule + "-" + today_stamp()
+}
+
+// 한 cluster 를 proposed/<id>.json 파일로 저장.
+fn emit_proposed(src_rule: string, count: i64, window_days: i64) -> string {
+    let pid = propose_id(src_rule)
+    let fname = PROPOSED_DIR + "/" + today_stamp() + "_" + pid + ".json"
+
+    let sample_fix = sample_fix_for(src_rule)
+    let sample_files = sample_files_for(src_rule)
+    let existing = existing_rule_text(src_rule)
+
+    let mut why = ""
+    if existing != "" {
+        why = "기존 rule '" + src_rule + "' 재발 " + to_string(count) +
+              "회 감지 — 강화 또는 자동 fixer 도입 검토. 원문: " + existing
+    } else {
+        why = "미등록 rule_id '" + src_rule + "' 가 lint_fail 로 " + to_string(count) +
+              "회 발생 — 정식 룰 승격 검토. 대표 fix: " + sample_fix
+    }
+
+    let mut detect = "grep -nE '" + src_rule + "' (lint.hexa 또는 project.lint.jsonl 기반)"
+    if sample_fix != "" { detect = sample_fix }
+
+    // scope: rule id prefix 로 추정 (R/H = common, AN = anima, NX = nexus, N6/N61/N62 = n6-architecture, VP = void, AG = airgenome, HX = hexa-lang, PP = papers, CT = contact)
+    let mut rule_scope = "common"
+    if src_rule.starts_with("AN") { rule_scope = "anima" }
+    if src_rule.starts_with("NX") { rule_scope = "nexus" }
+    if src_rule.starts_with("N6") { rule_scope = "n6-architecture" }
+    if src_rule.starts_with("VP") { rule_scope = "void" }
+    if src_rule.starts_with("AG") { rule_scope = "airgenome" }
+    if src_rule.starts_with("HX") { rule_scope = "hexa-lang" }
+    if src_rule.starts_with("PP") { rule_scope = "papers" }
+    if src_rule.starts_with("CT") { rule_scope = "contact" }
+    if src_rule.starts_with("H-") { rule_scope = "common" }
+
+    let json = "{\n" +
+               "  \"id\": \"" + pid + "\",\n" +
+               "  \"description\": \"Auto-proposed from mistakes cluster (src=" + src_rule +
+               ", window=" + to_string(window_days) + "d, count=" + to_string(count) + ")\",\n" +
+               "  \"why\": \"" + json_escape(why) + "\",\n" +
+               "  \"how_to_detect\": \"" + json_escape(detect) + "\",\n" +
+               "  \"severity\": \"warn\",\n" +
+               "  \"scope\": \"" + rule_scope + "\",\n" +
+               "  \"source_rule\": \"" + src_rule + "\",\n" +
+               "  \"sample_files\": [\n" +
+               _format_sample_files(sample_files) +
+               "  ],\n" +
+               "  \"proposed_ts\": \"" + now_iso() + "\",\n" +
+               "  \"staged\": true,\n" +
+               "  \"enforce\": false\n" +
+               "}\n"
+
+    try { write_file(fname, json) } catch e {
+        eprintln("[rule_proposer] write fail: " + fname)
+        return ""
+    }
+    return fname
+}
+
+fn _format_sample_files(raw: string) -> string {
+    if raw == "" { return "" }
+    let mut out = ""
+    let lines = raw.split("\n")
+    let n = lines.len()
+    let mut i: i64 = 0
+    while i < n {
+        let f = _str(lines[i]).trim()
+        if f == "" { i = i + 1; continue }
+        let comma = if i + 1 < n { "," } else { "" }
+        out = out + "    \"" + json_escape(f) + "\"" + comma + "\n"
+        i = i + 1
+    }
+    return out
+}
+
+fn _ensure_proposed_dir() {
+    if !file_exists(PROPOSED_DIR) {
+        exec("mkdir -p '" + PROPOSED_DIR + "' 2>/dev/null")  // @allow-bare-exec
+    }
+}
+
+fn cmd_scan(argv: [string]) {
+    let mut win = DEFAULT_WINDOW_DAYS
+    let mut scan = DEFAULT_SCAN_LINES
+    // 파라미터: --window N --scan N
+    let mut i: i64 = 3
+    while i < argv.len() {
+        let a = argv[i]
+        if a == "--window" && i + 1 < argv.len() { win = _to_int0(argv[i + 1]); i = i + 2; continue }
+        if a == "--scan" && i + 1 < argv.len() { scan = _to_int0(argv[i + 1]); i = i + 2; continue }
+        i = i + 1
+    }
+    let tally = tally_lint_fail(win, scan)
+    if tally.trim() == "" {
+        println("[rule_proposer] no lint_fail in window=" + to_string(win) + "d scan=" + to_string(scan))
+        return
+    }
+    println("# rule_proposer scan window=" + to_string(win) + "d scan=" + to_string(scan) +
+            " cutoff=" + cutoff_iso(win))
+    println("# count  rule_id")
+    for ln in tally.split("\n") {
+        let line = _str(ln).trim()
+        if line == "" { continue }
+        println(line)
+    }
+}
+
+fn cmd_propose(argv: [string]) {
+    let mut win = DEFAULT_WINDOW_DAYS
+    let mut thr = DEFAULT_THRESHOLD
+    let mut top = DEFAULT_TOP
+    let mut scan = DEFAULT_SCAN_LINES
+    let mut i: i64 = 3
+    while i < argv.len() {
+        let a = argv[i]
+        if a == "--window" && i + 1 < argv.len() { win = _to_int0(argv[i + 1]); i = i + 2; continue }
+        if a == "--threshold" && i + 1 < argv.len() { thr = _to_int0(argv[i + 1]); i = i + 2; continue }
+        if a == "--top" && i + 1 < argv.len() { top = _to_int0(argv[i + 1]); i = i + 2; continue }
+        if a == "--scan" && i + 1 < argv.len() { scan = _to_int0(argv[i + 1]); i = i + 2; continue }
+        i = i + 1
+    }
+
+    _ensure_proposed_dir()
+
+    let tally = tally_lint_fail(win, scan)
+    if tally.trim() == "" {
+        println("[rule_proposer] no lint_fail — nothing to propose")
+        return
+    }
+
+    let mut emitted: i64 = 0
+    let mut skipped_threshold: i64 = 0
+    let mut skipped_existing_promoted: i64 = 0
+    let mut out_lines = ""
+
+    for ln in tally.split("\n") {
+        if emitted >= top { break }
+        let line = _str(ln).trim()
+        if line == "" { continue }
+        // `  nnn  RULE`
+        let parts = line.split(" ")
+        // 정수 + rule 추출
+        let mut cnt: i64 = 0
+        let mut rid = ""
+        for p in parts {
+            let s = _str(p).trim()
+            if s == "" { continue }
+            if cnt == 0 {
+                let v = _to_int0(s)
+                if v > 0 { cnt = v; continue }
+            }
+            if cnt > 0 && rid == "" { rid = s; break }
+        }
+        if cnt < thr { skipped_threshold = skipped_threshold + 1; continue }
+        if rid == "" { continue }
+        // 재발 많아도 의미있는 rule: 기존 rule 도 강화(boost) 제안 허용. 과밀 방지 위해 top 로만 제한.
+        let path = emit_proposed(rid, cnt, win)
+        if path == "" { continue }
+        emitted = emitted + 1
+        out_lines = out_lines + path + " (src=" + rid + ", count=" + to_string(cnt) + ")\n"
+    }
+
+    println("[rule_proposer] emitted=" + to_string(emitted) +
+            " threshold=" + to_string(thr) +
+            " window=" + to_string(win) + "d")
+    if out_lines != "" {
+        println(out_lines.trim())
+    }
+}
+
+fn cmd_clean() {
+    if !file_exists(PROPOSED_DIR) {
+        println("[rule_proposer] proposed/ 없음")
+        return
+    }
+    exec("rm -f '" + PROPOSED_DIR + "'/*.json 2>/dev/null")  // @allow-bare-exec
+    println("[rule_proposer] cleaned " + PROPOSED_DIR)
+}
+
+fn main() {
+    // argv 정규화 (2026-04-19): Mac=[hexa, script, user...] Linux-stage1=[hexa, "run", script, user...]
+    // 이전까지 Mac-only argv[2] 가정 → Linux 에서 argv[2] = script path 로 dispatch 실패.
+    let _raw_argv = args()
+    let mut _script_idx = -1
+    let mut _scan_i = 0
+    while _scan_i < _raw_argv.len() {
+        if _raw_argv[_scan_i].ends_with(".hexa") { _script_idx = _scan_i; break }
+        _scan_i = _scan_i + 1
+    }
+    let mut _user_start = 2
+    let mut _script_token = ""
+    if _script_idx >= 0 {
+        _user_start = _script_idx + 1
+        _script_token = _raw_argv[_script_idx]
+    } else {
+        if _raw_argv.len() >= 3 {
+            if _raw_argv[1] == "run" { _user_start = 3 }
+            if _raw_argv[1] == "eval" { _user_start = 3 }
+        }
+    }
+    let mut argv: [str] = [_raw_argv[0], _script_token]
+    let mut _ua_i = _user_start
+    while _ua_i < _raw_argv.len() {
+        argv = argv + [_raw_argv[_ua_i]]
+        _ua_i = _ua_i + 1
+    }
+    if _script_token.len() > 0 && argv.len() >= 3 {
+        if argv[2] == _script_token {
+            let mut _a2: [str] = [_raw_argv[0], _script_token]
+            let mut _j2 = 3
+            while _j2 < argv.len() {
+                _a2 = _a2 + [argv[_j2]]
+                _j2 = _j2 + 1
+            }
+            argv = _a2
+        }
+    }
+    if argv.len() < 3 {
+        eprintln("usage: rule_proposer.hexa <scan|propose|clean> [opts]")
+        eprintln("  scan    [--window N=7] [--scan N=3000]")
+        eprintln("  propose [--window N=7] [--threshold N=3] [--top N=3] [--scan N=3000]")
+        eprintln("  clean")
+        return
+    }
+    let cmd = argv[2]
+    if cmd == "scan" { cmd_scan(argv) }
+    else if cmd == "propose" { cmd_propose(argv) }
+    else if cmd == "clean" { cmd_clean() }
+    else { eprintln("unknown cmd: " + cmd) }
+}

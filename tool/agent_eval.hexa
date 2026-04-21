@@ -1,0 +1,578 @@
+// agent_eval.hexa — AGL-P9-1 agent 평가 rubric + 자동 rank
+// @no-lock-needed
+// @no-sandbox
+// @allow-bare-exec
+// 역할: work_registry.jsonl + mistakes.jsonl + lint_log.jsonl 를 교차 분석하여
+//       에이전트별 품질 스코어(0-100) 산출 + 순위표 출력.
+//
+// 평가 차원 (4):
+//   D1 accuracy    (30w) — 해당 agent area 의 lint_fail/gc_violation 카운트 역비례
+//   D2 completeness(30w) — done vs active/stale 비율 + ts_end 존재
+//   D3 efficiency  (20w) — 소요 시간 (duration_sec) 밴드
+//   D4 compliance  (20w) — hexa 규칙 준수 (R-NOZ, H-GRC, L0 위반 역비례)
+//
+// rubric: score = w1*D1 + w2*D2 + w3*D3 + w4*D4 (0-100)
+//
+// SSOT out:
+//   shared/tool/agent_eval_results.jsonl (append-only)
+//
+// CLI:
+//   hexa run agent_eval.hexa eval [agent_id|area]  — 단일/영역 평가 + JSONL append
+//   hexa run agent_eval.hexa rank [N]              — 전체 순위표 (default top 20)
+//   hexa run agent_eval.hexa history [agent_id]    — 특정 agent 이력
+//   hexa run agent_eval.hexa summary               — 전체 통계 1줄
+//   hexa run agent_eval.hexa --selftest            — smoke 검증
+//
+// exit: 0 ok / 1 eval fail / 2 usage / 3 selftest fail
+// 성공 조용 X — 평가 결과 출력이 목적.
+
+let HOME = env("HOME")
+let NEXUS_ENV = env("NEXUS")
+let NEXUS = if NEXUS_ENV == "" { HOME + "/Dev/nexus" } else { NEXUS_ENV }
+let HARNESS = NEXUS + "/harness"
+
+let WORK_REG = HARNESS + "/work_registry.jsonl"
+let MISTAKES = HARNESS + "/mistakes.jsonl"
+let LINT_LOG = HARNESS + "/lint_log.jsonl"
+let EVAL_OUT = HARNESS + "/agent_eval_results.jsonl"
+
+// weights
+let W_ACCURACY: i64 = 30
+let W_COMPLETENESS: i64 = 30
+let W_EFFICIENCY: i64 = 20
+let W_COMPLIANCE: i64 = 20
+
+// ─── void-safe helpers ───
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _to_int0(s: string) -> i64 {
+    if s == "" { return 0 }
+    let first = _str(s.split("\n")[0]).trim()
+    if first == "" { return 0 }
+    try { return to_int(first) } catch e { return 0 }
+}
+
+fn now_unix() -> i64 {
+    return _to_int0(_str(exec("date +%s")).trim())
+}
+
+fn iso_now() -> string {
+    return _str(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()
+}
+
+fn json_escape(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", " ")
+    r = r.replace("\r", " ")
+    r = r.replace("\t", " ")
+    return r
+}
+
+fn _ensure_file(p: string) {
+    if file_exists(p) == false {
+        try { write_file(p, "") } catch e {}
+    }
+}
+
+// ─── data loaders (awk fast-path, hexa minimal) ───
+
+// Load agent entries from work_registry: returns line count + builds temp file for awk
+// Returns total agent count from registry
+fn count_agents() -> i64 {
+    if file_exists(WORK_REG) == false { return 0 }
+    let cmd = "wc -l < '" + WORK_REG + "' 2>/dev/null"
+    return _to_int0(_str(exec(cmd)).trim())
+}
+
+// Count done agents
+fn count_done() -> i64 {
+    if file_exists(WORK_REG) == false { return 0 }
+    let cmd = "grep -c '\"status\":\"done\"' '" + WORK_REG + "' 2>/dev/null"
+    return _to_int0(_str(exec(cmd)).trim())
+}
+
+// Count stale agents
+fn count_stale() -> i64 {
+    if file_exists(WORK_REG) == false { return 0 }
+    let cmd = "grep -c '\"status\":\"stale\"' '" + WORK_REG + "' 2>/dev/null"
+    return _to_int0(_str(exec(cmd)).trim())
+}
+
+// Count active agents
+fn count_active() -> i64 {
+    if file_exists(WORK_REG) == false { return 0 }
+    let cmd = "grep -c '\"status\":\"active\"' '" + WORK_REG + "' 2>/dev/null"
+    return _to_int0(_str(exec(cmd)).trim())
+}
+
+// Count mistakes (lint_fail) for a given area pattern
+fn count_mistakes_for_area(area: string) -> i64 {
+    if file_exists(MISTAKES) == false { return 0 }
+    let esc = area.replace("'", "")
+    // area maps to file paths — search mistakes for files containing the area name
+    let cmd = "grep -c '\"" + esc + "\"' '" + MISTAKES + "' 2>/dev/null"
+    return _to_int0(_str(exec(cmd)).trim())
+}
+
+// Count lint violations for a given file/area
+fn count_lint_violations_for_area(area: string) -> i64 {
+    if file_exists(LINT_LOG) == false { return 0 }
+    let esc = area.replace("'", "")
+    let cmd = "grep '\"pass\":false' '" + LINT_LOG + "' 2>/dev/null | grep -c '\"" + esc + "\"' 2>/dev/null"
+    return _to_int0(_str(exec(cmd)).trim())
+}
+
+// Count compliance violations (H-GRC, R-NOZ, L0) for an area
+fn count_compliance_violations(area: string) -> i64 {
+    if file_exists(MISTAKES) == false { return 0 }
+    let esc = area.replace("'", "")
+    let cmd = "grep '\"" + esc + "\"' '" + MISTAKES + "' 2>/dev/null | grep -cE '\"rule\":\"(H-GRC|R-NOZ|L0|HEXA-ALGO)\"' 2>/dev/null"
+    return _to_int0(_str(exec(cmd)).trim())
+}
+
+// Get agent info by agent_id — returns tab-delimited: agent_id area status ts_start ts_end
+fn get_agent_info(agent_id: string) -> string {
+    if file_exists(WORK_REG) == false { return "" }
+    let esc = agent_id.replace("'", "")
+    let cmd = "grep '\"agent_id\":\"" + esc + "\"' '" + WORK_REG + "' 2>/dev/null | tail -1"
+    return _str(exec(cmd)).trim()
+}
+
+// Get all done agents — returns lines of JSON
+fn get_done_agents_tail(n: i64) -> string {
+    if file_exists(WORK_REG) == false { return "" }
+    let cmd = "grep '\"status\":\"done\"' '" + WORK_REG + "' 2>/dev/null | tail -" + to_string(n)
+    return _str(exec(cmd)).trim()
+}
+
+// ─── scoring functions ───
+
+// D1 accuracy: 10 - (mistakes_count * 2), clamped 0-10, scaled to weight
+fn score_accuracy(area: string) -> i64 {
+    let mistakes = count_mistakes_for_area(area)
+    let lint_fails = count_lint_violations_for_area(area)
+    let total_errors = mistakes + lint_fails
+    // 0 errors = 10, each error deducts 1, min 0
+    let mut raw = 10 - total_errors
+    if raw < 0 { raw = 0 }
+    if raw > 10 { raw = 10 }
+    return raw * W_ACCURACY / 10
+}
+
+// D2 completeness: done=10, active(recent)=5, stale=2, unknown=0
+fn score_completeness(status: string, has_end: bool) -> i64 {
+    let mut raw = 0
+    if status == "done" && has_end {
+        raw = 10
+    } else if status == "done" {
+        raw = 8
+    } else if status == "active" {
+        raw = 5
+    } else if status == "stale" {
+        raw = 2
+    }
+    return raw * W_COMPLETENESS / 10
+}
+
+// D3 efficiency: duration band scoring
+//   < 60s  = 10 (fast)
+//   < 300s = 8  (normal)
+//   < 900s = 6  (slow)
+//   < 3600s = 4 (very slow)
+//   >= 3600s = 2 (timeout territory)
+//   no end = 1
+fn score_efficiency(duration_sec: i64, has_end: bool) -> i64 {
+    if has_end == false { return 1 * W_EFFICIENCY / 10 }
+    let mut raw = 2
+    if duration_sec < 60 { raw = 10 }
+    else if duration_sec < 300 { raw = 8 }
+    else if duration_sec < 900 { raw = 6 }
+    else if duration_sec < 3600 { raw = 4 }
+    return raw * W_EFFICIENCY / 10
+}
+
+// D4 compliance: 10 - (violation_count * 3), clamped 0-10
+fn score_compliance(area: string) -> i64 {
+    let violations = count_compliance_violations(area)
+    let mut raw = 10 - violations * 3
+    if raw < 0 { raw = 0 }
+    if raw > 10 { raw = 10 }
+    return raw * W_COMPLIANCE / 10
+}
+
+// ─── extract fields from JSON line (lightweight, no jq) ───
+fn _extract_field(line: string, field: string) -> string {
+    let key = "\"" + field + "\":"
+    let idx = line.index_of(key)
+    if idx < 0 { return "" }
+    let after = line.substring(idx + key.len(), line.len())
+    // check if value is quoted string or number
+    let trimmed = after.trim()
+    if trimmed.len() == 0 { return "" }
+    let first_ch = trimmed.substring(0, 1)
+    if first_ch == "\"" {
+        // find closing quote
+        let rest = trimmed.substring(1, trimmed.len())
+        let end = rest.index_of("\"")
+        if end < 0 { return rest }
+        return rest.substring(0, end)
+    }
+    // number or null — read until comma or }
+    let mut end = trimmed.index_of(",")
+    let end2 = trimmed.index_of("}")
+    if end < 0 { end = end2 }
+    else if end2 >= 0 && end2 < end { end = end2 }
+    if end < 0 { return trimmed }
+    return trimmed.substring(0, end).trim()
+}
+
+// ─── evaluate single agent ───
+fn eval_agent_line(line: string) -> string {
+    let agent_id = _extract_field(line, "agent_id")
+    let area = _extract_field(line, "area")
+    let status = _extract_field(line, "status")
+    let ts_start_s = _extract_field(line, "ts_start")
+    let ts_end_s = _extract_field(line, "ts_end")
+
+    if agent_id == "" { return "" }
+
+    let ts_start = _to_int0(ts_start_s)
+    let ts_end = _to_int0(ts_end_s)
+    let has_end = ts_end > 0 && ts_end_s != "null"
+    let duration = if has_end { ts_end - ts_start } else { 0 }
+
+    let d1 = score_accuracy(area)
+    let d2 = score_completeness(status, has_end)
+    let d3 = score_efficiency(duration, has_end)
+    let d4 = score_compliance(area)
+    let total = d1 + d2 + d3 + d4
+
+    let grade = if total >= 90 { "S" }
+        else if total >= 75 { "A" }
+        else if total >= 60 { "B" }
+        else if total >= 40 { "C" }
+        else { "D" }
+
+    let ts = iso_now()
+    let result = "{\"ts\":\"" + ts + "\",\"agent_id\":\"" + json_escape(agent_id)
+        + "\",\"area\":\"" + json_escape(area)
+        + "\",\"status\":\"" + json_escape(status)
+        + "\",\"duration_sec\":" + to_string(duration)
+        + ",\"scores\":{\"accuracy\":" + to_string(d1)
+        + ",\"completeness\":" + to_string(d2)
+        + ",\"efficiency\":" + to_string(d3)
+        + ",\"compliance\":" + to_string(d4) + "}"
+        + ",\"total\":" + to_string(total)
+        + ",\"grade\":\"" + grade + "\"}"
+    return result
+}
+
+// ─── commands ───
+
+fn cmd_eval(filter: string) -> i64 {
+    _ensure_file(EVAL_OUT)
+    if file_exists(WORK_REG) == false {
+        eprintln("agent_eval: work_registry.jsonl not found")
+        return 1
+    }
+    // if filter given, grep for it; else eval last 50 done agents
+    let mut lines_raw = ""
+    if filter != "" {
+        let esc = filter.replace("'", "")
+        let cmd = "grep '\"" + esc + "\"' '" + WORK_REG + "' 2>/dev/null | tail -50"
+        lines_raw = _str(exec(cmd)).trim()
+    } else {
+        lines_raw = get_done_agents_tail(50)
+    }
+    if lines_raw == "" {
+        println("agent_eval: no matching agents found")
+        return 0
+    }
+    let lines = lines_raw.split("\n")
+    let mut evaluated: i64 = 0
+    let mut total_sum: i64 = 0
+    let mut i: i64 = 0
+    while i < lines.len() {
+        let line = _str(lines[i]).trim()
+        if line == "" { i = i + 1; continue }
+        let result = eval_agent_line(line)
+        if result != "" {
+            // append to results
+            let append_cmd = "printf '%s\\n' '" + result.replace("'", "'\\''") + "' >> '" + EVAL_OUT + "'"
+            exec(append_cmd)
+            // extract total for summary
+            let total_s = _extract_field(result, "total")
+            total_sum = total_sum + _to_int0(total_s)
+            evaluated = evaluated + 1
+        }
+        i = i + 1
+    }
+    let avg = if evaluated > 0 { total_sum / evaluated } else { 0 }
+    println("agent_eval: " + to_string(evaluated) + " agents evaluated, avg score " + to_string(avg) + "/100")
+    return 0
+}
+
+fn cmd_rank(top_n: i64) -> i64 {
+    _ensure_file(EVAL_OUT)
+    if file_exists(WORK_REG) == false {
+        eprintln("agent_eval: work_registry.jsonl not found")
+        return 1
+    }
+    // eval all done agents (last 200), rank by total score descending
+    let lines_raw = get_done_agents_tail(200)
+    if lines_raw == "" {
+        println("agent_eval rank: no done agents")
+        return 0
+    }
+    let lines = lines_raw.split("\n")
+
+    // collect results as tab-separated: total \t agent_id \t area \t grade \t duration
+    let tmp = "/tmp/agent_eval_rank_" + to_string(now_unix()) + ".tsv"
+    let mut i: i64 = 0
+    let mut buf = ""
+    while i < lines.len() {
+        let line = _str(lines[i]).trim()
+        if line == "" { i = i + 1; continue }
+        let result = eval_agent_line(line)
+        if result != "" {
+            let total_s = _extract_field(result, "total")
+            let aid = _extract_field(result, "agent_id")
+            let area = _extract_field(result, "area")
+            let grade = _extract_field(result, "grade")
+            let dur = _extract_field(result, "duration_sec")
+            buf = buf + total_s + "\t" + aid + "\t" + area + "\t" + grade + "\t" + dur + "\n"
+        }
+        i = i + 1
+    }
+    try { write_file(tmp, buf) } catch e {
+        eprintln("agent_eval: failed to write tmp"); return 1
+    }
+    // sort descending by first column, take top N
+    let sort_cmd = "sort -t'\t' -k1 -rn '" + tmp + "' | head -" + to_string(top_n)
+    let sorted = _str(exec(sort_cmd)).trim()
+    exec("rm -f '" + tmp + "'")
+    if sorted == "" {
+        println("agent_eval rank: no results")
+        return 0
+    }
+    // header
+    println("RANK  SCORE  GRADE  AGENT_ID     AREA                          DURATION")
+    println("----  -----  -----  -----------  ----------------------------  --------")
+    let rows = sorted.split("\n")
+    let mut rank: i64 = 1
+    let mut ri: i64 = 0
+    while ri < rows.len() {
+        let row = _str(rows[ri]).trim()
+        if row == "" { ri = ri + 1; continue }
+        let cols = row.split("\t")
+        if cols.len() < 5 { ri = ri + 1; continue }
+        let score = _str(cols[0])
+        let aid = _str(cols[1])
+        let area = _str(cols[2])
+        let grade = _str(cols[3])
+        let dur = _str(cols[4])
+        // pad for alignment
+        let rank_s = to_string(rank)
+        let pad_rank = if rank < 10 { "  " + rank_s + "  " } else { " " + rank_s + "  " }
+        let pad_score = if score.len() < 3 { "  " + score + "  " } else { " " + score + "  " }
+        // truncate area to 28 chars
+        let area_disp = if area.len() > 28 { area.substring(0, 28) } else { area }
+        let dur_disp = dur + "s"
+        println(pad_rank + "  " + pad_score + "  " + grade + "      " + aid + "  " + area_disp + "  " + dur_disp)
+        rank = rank + 1
+        ri = ri + 1
+    }
+    println("")
+    println("total ranked: " + to_string(rank - 1) + " agents")
+    return 0
+}
+
+fn cmd_history(agent_id: string) -> i64 {
+    if agent_id == "" {
+        eprintln("usage: agent_eval.hexa history <agent_id>")
+        return 2
+    }
+    // search work_registry for this agent
+    let info = get_agent_info(agent_id)
+    if info == "" {
+        println("agent_eval history: agent '" + agent_id + "' not found")
+        return 0
+    }
+    println("--- Agent: " + agent_id + " ---")
+    let area = _extract_field(info, "area")
+    let status = _extract_field(info, "status")
+    let ts_start = _extract_field(info, "ts_start")
+    let ts_end = _extract_field(info, "ts_end")
+    let model = _extract_field(info, "model")
+    println("area:     " + area)
+    println("status:   " + status)
+    println("ts_start: " + ts_start)
+    println("ts_end:   " + ts_end)
+    println("model:    " + model)
+
+    // compute score
+    let result = eval_agent_line(info)
+    if result != "" {
+        let total = _extract_field(result, "total")
+        let grade = _extract_field(result, "grade")
+        let acc = _extract_field(result, "accuracy")
+        let comp = _extract_field(result, "completeness")
+        let eff = _extract_field(result, "efficiency")
+        let compl = _extract_field(result, "compliance")
+        let dur = _extract_field(result, "duration_sec")
+        println("")
+        println("score: " + total + "/100 (grade " + grade + ")")
+        println("  accuracy:     " + acc + "/" + to_string(W_ACCURACY))
+        println("  completeness: " + comp + "/" + to_string(W_COMPLETENESS))
+        println("  efficiency:   " + eff + "/" + to_string(W_EFFICIENCY) + " (" + dur + "s)")
+        println("  compliance:   " + compl + "/" + to_string(W_COMPLIANCE))
+    }
+
+    // check past eval results
+    if file_exists(EVAL_OUT) {
+        let esc = agent_id.replace("'", "")
+        let past = _str(exec("grep '\"" + esc + "\"' '" + EVAL_OUT + "' 2>/dev/null | tail -5")).trim()
+        if past != "" {
+            println("")
+            println("eval history:")
+            let plines = past.split("\n")
+            let mut pi: i64 = 0
+            while pi < plines.len() {
+                let pl = _str(plines[pi]).trim()
+                if pl != "" {
+                    let pts = _extract_field(pl, "ts")
+                    let ptotal = _extract_field(pl, "total")
+                    let pgrade = _extract_field(pl, "grade")
+                    println("  " + pts + " score=" + ptotal + " grade=" + pgrade)
+                }
+                pi = pi + 1
+            }
+        }
+    }
+    return 0
+}
+
+fn cmd_summary() -> i64 {
+    let total = count_agents()
+    let done = count_done()
+    let active = count_active()
+    let stale = count_stale()
+    let completion_pct = if total > 0 { done * 100 / total } else { 0 }
+    // quick average score of last 20 done
+    let sample = get_done_agents_tail(20)
+    let mut score_sum: i64 = 0
+    let mut score_cnt: i64 = 0
+    if sample != "" {
+        let slines = sample.split("\n")
+        let mut si: i64 = 0
+        while si < slines.len() {
+            let sl = _str(slines[si]).trim()
+            if sl != "" {
+                let r = eval_agent_line(sl)
+                if r != "" {
+                    score_sum = score_sum + _to_int0(_extract_field(r, "total"))
+                    score_cnt = score_cnt + 1
+                }
+            }
+            si = si + 1
+        }
+    }
+    let avg = if score_cnt > 0 { score_sum / score_cnt } else { 0 }
+    println("agents: " + to_string(total) + " (done=" + to_string(done) + " active=" + to_string(active) + " stale=" + to_string(stale) + ") completion=" + to_string(completion_pct) + "% avg_score=" + to_string(avg) + "/100")
+    return 0
+}
+
+fn cmd_selftest() -> i64 {
+    let mut fails: i64 = 0
+    // check files exist
+    if file_exists(WORK_REG) == false {
+        eprintln("selftest FAIL: " + WORK_REG + " missing")
+        fails = fails + 1
+    }
+    if file_exists(MISTAKES) == false {
+        eprintln("selftest FAIL: " + MISTAKES + " missing")
+        fails = fails + 1
+    }
+    if file_exists(LINT_LOG) == false {
+        eprintln("selftest FAIL: " + LINT_LOG + " missing")
+        fails = fails + 1
+    }
+    // test scoring function
+    let test_line = "{\"agent_id\":\"atest001\",\"area\":\"selftest\",\"status\":\"done\",\"ts_start\":1000000,\"ts_end\":1000060}"
+    let result = eval_agent_line(test_line)
+    if result == "" {
+        eprintln("selftest FAIL: eval_agent_line returned empty")
+        fails = fails + 1
+    } else {
+        let total = _to_int0(_extract_field(result, "total"))
+        if total <= 0 || total > 100 {
+            eprintln("selftest FAIL: score out of range: " + to_string(total))
+            fails = fails + 1
+        }
+    }
+    // test field extraction
+    let test_id = _extract_field(test_line, "agent_id")
+    if test_id != "atest001" {
+        eprintln("selftest FAIL: _extract_field got '" + test_id + "' expected 'atest001'")
+        fails = fails + 1
+    }
+    if fails > 0 {
+        eprintln("agent_eval selftest: " + to_string(fails) + " failure(s)")
+        return 3
+    }
+    println("agent_eval selftest OK — scoring + extraction verified")
+    return 0
+}
+
+fn usage() {
+    eprintln("usage: hexa agent_eval.hexa <eval|rank|history|summary|--selftest> [args]")
+    eprintln("  eval [agent_id|area]  — evaluate agents (filter optional)")
+    eprintln("  rank [N]              — top-N ranking table (default 20)")
+    eprintln("  history <agent_id>    — single agent detail + score")
+    eprintln("  summary               — 1-line fleet stats")
+    eprintln("  --selftest            — smoke check")
+}
+
+fn main() -> i64 {
+    let argv = args()
+    // find command
+    let cmds = ["eval", "rank", "history", "summary", "--selftest"]
+    let mut cmd = ""
+    let mut cmd_idx: i64 = -1
+    let mut i: i64 = 0
+    while i < argv.len() {
+        let a = _str(argv[i])
+        let mut j: i64 = 0
+        while j < cmds.len() {
+            if a == cmds[j] { cmd = a; cmd_idx = i; break }
+            j = j + 1
+        }
+        if cmd != "" { break }
+        i = i + 1
+    }
+    if cmd == "" {
+        usage()
+        return 2
+    }
+    let arg1 = if cmd_idx + 1 < argv.len() { _str(argv[cmd_idx + 1]) } else { "" }
+
+    if cmd == "eval" { return cmd_eval(arg1) }
+    if cmd == "rank" {
+        let n = if arg1 != "" { _to_int0(arg1) } else { 20 }
+        let top = if n > 0 { n } else { 20 }
+        return cmd_rank(top)
+    }
+    if cmd == "history" { return cmd_history(arg1) }
+    if cmd == "summary" { return cmd_summary() }
+    if cmd == "--selftest" { return cmd_selftest() }
+    usage()
+    return 2
+}
+
+exit(main())

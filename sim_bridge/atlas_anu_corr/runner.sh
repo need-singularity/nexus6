@@ -14,7 +14,7 @@ RUN="runs/$TS"
 mkdir -p "$RUN"
 
 export HEXA_LOCAL=1
-HEXA="$HOME/Dev/nexus/shared/bin/hexa"
+HEXA="$HOME/Dev/nexus/bin/hexa"
 
 echo "[1/5] constants extract"
 "$HEXA" "$HERE/atlas_constants.hexa" > "$RUN/constants.tsv"

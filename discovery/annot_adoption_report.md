@@ -32,8 +32,8 @@ annot_rules.json status `prospective` → `active`. kind=alias 19 룰 채택 정
 - `shared/bin/hexa-rule` (alias 정의 처리기 — comment)
 - `shared/bin/hexa-meta-map` (`@theory_of_mind` 메타-인지 kind, alias 와 충돌 가능성 — known_clash 등재)
 - `shared/state/annot_system_build_20260416.json` (마이그레이션 이력)
-- `shared/harness/lint_annot.hexa` (검사 엔진)
-- `shared/harness/thinking_log.jsonl` (로그)
+- `shared/tool/lint_annot.hexa` (검사 엔진)
+- `shared/tool/thinking_log.jsonl` (로그)
 
 ## 변경 산출물
 
@@ -41,11 +41,11 @@ annot_rules.json status `prospective` → `active`. kind=alias 19 룰 채택 정
    - `status: "active"` 추가
    - `adoption{}` 블록 추가 (verification + enforcement + known_clashes)
 
-2. **shared/harness/entry.hexa**
+2. **shared/tool/entry.hexa**
    - `lint_annot` 모드 추가 (dispatch_file → lint_annot.hexa)
    - 사용법 docstring + unknown-mode REJECT msg 갱신
 
-3. **shared/harness/post_edit.hexa**
+3. **shared/tool/post_edit.hexa**
    - `auto_lint_annot()` 추가 — .hexa Write/Edit 후 자동 lint_annot scan 호출
    - 우회: `NEXUS_NOAUTOLINT=1` 또는 `NEXUS_ANNOT_OK=1`
    - 자기참조 회피: `lint_annot.hexa`, `pre_tool_guard.hexa`, `post_edit.hexa`
@@ -60,10 +60,10 @@ annot_rules.json status `prospective` → `active`. kind=alias 19 룰 채택 정
 
 ## 검증 통과
 
-- `hexa parse shared/harness/entry.hexa` → OK
-- `hexa parse shared/harness/post_edit.hexa` → OK
-- `hexa parse shared/harness/lint_annot.hexa` → OK
-- `hexa run shared/harness/lint_annot.hexa scan shared/harness/` → exit 0, 0 violations
+- `hexa parse shared/tool/entry.hexa` → OK
+- `hexa parse shared/tool/post_edit.hexa` → OK
+- `hexa parse shared/tool/lint_annot.hexa` → OK
+- `hexa run shared/tool/lint_annot.hexa scan shared/tool/` → exit 0, 0 violations
 - `jq . shared/config/annot_rules.json` → JSON OK, .rules length=33
 
 ## 알려진 충돌

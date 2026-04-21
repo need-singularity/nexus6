@@ -13,7 +13,7 @@ date: 2026-04-16
 | Role              | Scope                                        | Authority                        | Escalation Target   |
 |-------------------|----------------------------------------------|----------------------------------|---------------------|
 | System Owner      | Full nexus ecosystem, L0 protected assets    | Approve L0 changes, merge to main | —                   |
-| Harness Maintainer| shared/harness/*, entry.hexa dispatcher      | Modify gate rules, add H-* rules | System Owner        |
+| Harness Maintainer| shared/tool/*, entry.hexa dispatcher      | Modify gate rules, add H-* rules | System Owner        |
 | Engine Operator   | blowup pipeline, seed engine, atlas writes   | Launch runs, approve seed changes | Harness Maintainer  |
 | Module Contributor| shared/blowup/modules/*, shared/calc/*       | Write modules within guard rails | Engine Operator     |
 | Infra Operator    | hetzner remote, launchd, sim_bridge          | Server ops, daemon management    | System Owner        |
@@ -48,7 +48,7 @@ date: 2026-04-16
 
 ### Handoff Protocol
 
-- End of session: run `hexa shared/harness/session_prompt_gen.hexa` to generate handoff.
+- End of session: run `hexa shared/tool/session_prompt_gen.hexa` to generate handoff.
 - Handoff includes: active tasks, blocking items, uncommitted state, next actions.
 - Incoming session: read handoff-latest.md before starting work.
 

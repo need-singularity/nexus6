@@ -1,0 +1,363 @@
+// remote_monthly.hexa — 원격 compute 월간 이용 리포트 (REM-P7-1)
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// PURPOSE
+//   지난 30일 원격 compute(hetzner/ubu/runpod) 이용 집계 + cost-effectiveness.
+//   - runpod.json: active_pods + completed_runs 에서 GPU-hour 추출, 실비 계산
+//   - hetzner/ubu: flat-rate 서버 (owned/self-hosted), 월정액 고정 분할 (TBD 주석)
+//   - mac: 로컬 (무과금)
+//   - unit-work_metric: cost_per_invocation + cost_per_gpu_hour
+//
+// INPUT SSOT
+//   shared/config/infrastructure.json   — 호스트 카탈로그 + 요금
+//   shared/config/runpod.json           — active_pods + completed_runs (GPU-hour + $/hr)
+//   shared/tool/work_registry.jsonl  — agent invocation (optional counter)
+//   shared/tool/commit_log.jsonl     — commit-log 이벤트 (optional counter)
+//
+// OUTPUT SSOT
+//   shared/reports/remote_monthly_<YYYYMM>.json
+//
+// FIELDS
+//   {host, invocations, cpu_hours, gpu_hours, cost_usd_estimated,
+//    cost_per_invocation, unit_work_metric}
+//
+// USAGE
+//   hexa shared/tool/remote_monthly.hexa         # current month report
+//   hexa shared/tool/remote_monthly.hexa --month 202604
+// ═══════════════════════════════════════════════════════════════════════════
+
+let HOME = env("HOME")
+let NEXUS = HOME + "/Dev/nexus"
+let INFRA = NEXUS + "/config/infrastructure.json"
+let RUNPOD = NEXUS + "/config/runpod.json"
+let WORK_REG = NEXUS + "/tool/work_registry.jsonl"
+let COMMIT_LOG = NEXUS + "/tool/commit_log.jsonl"
+let REPORTS_DIR = NEXUS + "/reports"
+
+// Hetzner AX102 월정액 참고치 (infrastructure.json 에 없음 — TBD)
+// https://www.hetzner.com/dedicated-rootserver/ax102/ ~€186/month = ~$200/month
+// ubu = 자체 보유 하드웨어 (전기료만, ~$10/mo 참고치) — 실비 산정 어려움
+let HETZNER_MONTHLY_USD: i64 = 200
+let UBU_MONTHLY_USD: i64 = 10
+let MAC_MONTHLY_USD: i64 = 0
+
+fn sh(cmd: string) -> string {
+    return to_string(exec(cmd + " 2>/dev/null")).trim()  // @allow-bare-exec
+}
+
+fn iso_now() -> string {
+    return sh("date -u +%Y-%m-%dT%H:%M:%SZ")
+}
+
+fn now_epoch() -> i64 {
+    return to_int(sh("date +%s"))
+}
+
+fn current_yyyymm() -> string {
+    return sh("date -u +%Y%m")
+}
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _to_int0(s: string) -> i64 {
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+// ── Python3 bridge: write + exec script (h100_idle_guard pattern) ──────────
+let mut _py_seq: i64 = 0
+
+fn run_py(script: string) -> string {
+    // R37/AN13/L3-PY violation — python3 wrapper-fallback removed 2026-04-18
+    // Original: write /tmp/remote_monthly_N.py + /usr/bin/python3 exec for runpod cost aggregation
+    _py_seq = _py_seq + 1
+    let _ = script
+    eprintln("R37/AN13/L3-PY: python3 invocation blocked at remote_monthly.hexa:run_py. Escalate to user for hexa-native replacement.")
+    return ""
+}
+
+// ── Parse runpod.json: sum GPU-hours + USD cost in last 30 days ────────────
+// Logic:
+//   for pod in active_pods ∪ completed_runs:
+//     start = started_at or created_at
+//     end   = torn_down_at or now()
+//     if end < window_start: skip
+//     clamp start to window_start
+//     hours = (end - start) / 3600 * gpu_count_or_1
+//     cost  = hours * cost_per_hr_usd (or price_usd_hr, or estimated_cost_usd fallback)
+fn runpod_monthly_summary(window_start: i64, window_end: i64) -> string {
+    let script = "" +
+"import json, datetime, sys\n" +
+"from datetime import timezone\n" +
+"\n" +
+"path = '" + RUNPOD + "'\n" +
+"ws = " + to_string(window_start) + "\n" +
+"we = " + to_string(window_end) + "\n" +
+"\n" +
+"def parse_ts(s):\n" +
+"    if not s: return None\n" +
+"    s = str(s).replace('Z','+00:00')\n" +
+"    # strip stray tildes/prefixes sometimes present ('2026-04-15T~23:30Z')\n" +
+"    if '~' in s: s = s.replace('~','')\n" +
+"    try: return int(datetime.datetime.fromisoformat(s).replace(tzinfo=timezone.utc if 'fromisoformat' else None).timestamp())\n" +
+"    except Exception: return None\n" +
+"\n" +
+"with open(path) as f: d = json.load(f)\n" +
+"\n" +
+"total_hours = 0.0\n" +
+"total_cost  = 0.0\n" +
+"invocations = 0\n" +
+"pods_seen   = []\n" +
+"\n" +
+"def add_pod(p, default_end=None):\n" +
+"    global total_hours, total_cost, invocations\n" +
+"    start = parse_ts(p.get('started_at') or p.get('created_at'))\n" +
+"    end   = parse_ts(p.get('torn_down_at')) or default_end or we\n" +
+"    if start is None: return\n" +
+"    # clamp to window\n" +
+"    s = max(start, ws)\n" +
+"    e = min(end, we)\n" +
+"    if e <= s: return\n" +
+"    hours = (e - s) / 3600.0\n" +
+"    gpu_n = p.get('gpu_count', 1) or 1\n" +
+"    gpu_hr = hours * gpu_n\n" +
+"    rate = p.get('cost_per_hr_usd') or p.get('price_usd_hr') or 0.0\n" +
+"    cost = hours * rate\n" +
+"    # fallback: if estimated_cost_usd present and no rate, use it directly\n" +
+"    if rate == 0.0 and p.get('estimated_cost_usd'):\n" +
+"        cost = float(p['estimated_cost_usd'])\n" +
+"    total_hours += gpu_hr\n" +
+"    total_cost  += cost\n" +
+"    invocations += 1\n" +
+"    pods_seen.append({'id':p.get('id',''),'name':p.get('name',''),'gpu_hr':round(gpu_hr,3),'cost':round(cost,2)})\n" +
+"\n" +
+"for p in d.get('active_pods', []):\n" +
+"    add_pod(p, default_end=we)\n" +
+"for p in d.get('completed_runs', []):\n" +
+"    add_pod(p, default_end=None)\n" +
+"\n" +
+"print(json.dumps({\n" +
+"    'invocations': invocations,\n" +
+"    'gpu_hours': round(total_hours,3),\n" +
+"    'cost_usd': round(total_cost,2),\n" +
+"    'pods_count': len(pods_seen),\n" +
+"    'pods': pods_seen\n" +
+"}))\n"
+    return run_py(script)
+}
+
+// ── Count jsonl lines whose ts (first field) falls within window ───────────
+fn count_lines_in_window(path: string, window_start: i64, window_end: i64) -> i64 {
+    if file_exists(path) == false { return 0 }
+    let script = "" +
+"import json, datetime\n" +
+"from datetime import timezone\n" +
+"path = '" + path + "'\n" +
+"ws = " + to_string(window_start) + "\n" +
+"we = " + to_string(window_end) + "\n" +
+"n = 0\n" +
+"try:\n" +
+"    with open(path, encoding='utf-8', errors='replace') as f:\n" +
+"        for line in f:\n" +
+"            line = line.strip()\n" +
+"            if not line: continue\n" +
+"            try: o = json.loads(line)\n" +
+"            except: continue\n" +
+"            ts_s = o.get('ts') or o.get('timestamp') or ''\n" +
+"            ts_n = o.get('ts_start')\n" +
+"            if ts_s and isinstance(ts_s,str):\n" +
+"                try: t = int(datetime.datetime.fromisoformat(ts_s.replace('Z','+00:00')).timestamp())\n" +
+"                except: t = 0\n" +
+"            elif ts_n:\n" +
+"                try: t = int(ts_n)\n" +
+"                except: t = 0\n" +
+"            else: t = 0\n" +
+"            if ws <= t <= we: n += 1\n" +
+"except FileNotFoundError: pass\n" +
+"print(n)\n"
+    let out = run_py(script)
+    return _to_int0(out)
+}
+
+// ── Write report json ─────────────────────────────────────────────────────
+fn write_report(yyyymm: string, window_start: i64, window_end: i64,
+                runpod_json: string, hetzner_inv: i64, ubu_inv: i64) {
+    let _ = sh("mkdir -p '" + REPORTS_DIR + "'")
+    let path = REPORTS_DIR + "/remote_monthly_" + yyyymm + ".json"
+
+    let hetz_cost = HETZNER_MONTHLY_USD
+    let ubu_cost = UBU_MONTHLY_USD
+    let mac_cost = MAC_MONTHLY_USD
+
+    let report_script = "" +
+"import json\n" +
+"\n" +
+"runpod = json.loads('''" + runpod_json + "''')\n" +
+"\n" +
+"rp_inv  = runpod.get('invocations',0)\n" +
+"rp_gpuh = runpod.get('gpu_hours',0.0)\n" +
+"rp_cost = runpod.get('cost_usd',0.0)\n" +
+"\n" +
+"hetz_inv = " + to_string(hetzner_inv) + "\n" +
+"ubu_inv  = " + to_string(ubu_inv) + "\n" +
+"hetz_cost = " + to_string(hetz_cost) + "\n" +
+"ubu_cost  = " + to_string(ubu_cost) + "\n" +
+"mac_cost  = " + to_string(mac_cost) + "\n" +
+"\n" +
+"# hetzner = 32 threads * 24h * 30d = 23040 cpu_hours theoretical; actual usage unknown.\n" +
+"# ubu     = 12 threads * 24h * 30d = 8640   theoretical. no per-invocation tracking.\n" +
+"hetz_cpu_hours_capacity = 32*24*30\n" +
+"ubu_cpu_hours_capacity  = 12*24*30\n" +
+"\n" +
+"hosts = [\n" +
+"    {\n" +
+"        'host': 'runpod',\n" +
+"        'role': 'GPU cloud (H100/A100 on-demand)',\n" +
+"        'billing': 'per-hour',\n" +
+"        'invocations': rp_inv,\n" +
+"        'cpu_hours': 0,\n" +
+"        'gpu_hours': rp_gpuh,\n" +
+"        'cost_usd_estimated': round(rp_cost,2),\n" +
+"        'cost_per_invocation': round(rp_cost/max(rp_inv,1),2),\n" +
+"        'unit_work_metric': {\n" +
+"            'cost_per_gpu_hour_usd': round(rp_cost/max(rp_gpuh,0.001),2),\n" +
+"            'note': 'GPU-hour = wall_hours * gpu_count; source=runpod.json active_pods+completed_runs'\n" +
+"        }\n" +
+"    },\n" +
+"    {\n" +
+"        'host': 'hetzner',\n" +
+"        'role': 'CPU dedicated (AX102 EPYC 7950X3D 32T)',\n" +
+"        'billing': 'monthly-flat (TBD — infrastructure.json 에 요금 없음)',\n" +
+"        'invocations': hetz_inv,\n" +
+"        'cpu_hours': hetz_cpu_hours_capacity,\n" +
+"        'gpu_hours': 0,\n" +
+"        'cost_usd_estimated': hetz_cost,\n" +
+"        'cost_per_invocation': round(hetz_cost/max(hetz_inv,1),4),\n" +
+"        'unit_work_metric': {\n" +
+"            'cost_per_cpu_hour_usd': round(hetz_cost/hetz_cpu_hours_capacity,5),\n" +
+"            'note': 'flat-rate; cpu_hours = capacity not actual usage. Invocation proxy=agent_ledger+commit_log count.'\n" +
+"        }\n" +
+"    },\n" +
+"    {\n" +
+"        'host': 'ubu',\n" +
+"        'role': 'GPU local (RTX 5070 12GB)',\n" +
+"        'billing': 'self-hosted (electricity ~$10/mo TBD)',\n" +
+"        'invocations': ubu_inv,\n" +
+"        'cpu_hours': ubu_cpu_hours_capacity,\n" +
+"        'gpu_hours': 0,\n" +
+"        'cost_usd_estimated': ubu_cost,\n" +
+"        'cost_per_invocation': round(ubu_cost/max(ubu_inv,1),4),\n" +
+"        'unit_work_metric': {\n" +
+"            'cost_per_cpu_hour_usd': round(ubu_cost/ubu_cpu_hours_capacity,6),\n" +
+"            'note': 'self-owned hardware; no metered billing. Invocation proxy unreliable.'\n" +
+"        }\n" +
+"    }\n" +
+"]\n" +
+"\n" +
+"total_cost = sum(h['cost_usd_estimated'] for h in hosts)\n" +
+"total_gpu_hours = sum(h['gpu_hours'] for h in hosts)\n" +
+"total_cpu_hours = sum(h['cpu_hours'] for h in hosts)\n" +
+"total_invocations = sum(h['invocations'] for h in hosts)\n" +
+"\n" +
+"cost_eff = {\n" +
+"    'total_cost_usd': round(total_cost,2),\n" +
+"    'total_gpu_hours': round(total_gpu_hours,3),\n" +
+"    'total_cpu_hours': total_cpu_hours,\n" +
+"    'total_invocations': total_invocations,\n" +
+"    'blended_cost_per_gpu_hour_usd': round(total_cost/max(total_gpu_hours,0.001),2),\n" +
+"    'primary_cost_driver': max(hosts, key=lambda h: h['cost_usd_estimated'])['host'],\n" +
+"    'cheapest_per_invocation': min(hosts, key=lambda h: h['cost_per_invocation'])['host']\n" +
+"}\n" +
+"\n" +
+"report = {\n" +
+"    '_meta': {\n" +
+"        'task':   'REM-P7-1',\n" +
+"        'track':  'A14_REMOTE_COMPUTE',\n" +
+"        'phase':  'P7',\n" +
+"        'month':  '" + yyyymm + "',\n" +
+"        'window': {'start_epoch': " + to_string(window_start) + ", 'end_epoch': " + to_string(window_end) + "},\n" +
+"        'generator': 'shared/tool/remote_monthly.hexa',\n" +
+"        'generated_at': '" + iso_now() + "'\n" +
+"    },\n" +
+"    'hosts': hosts,\n" +
+"    'cost_effectiveness': cost_eff,\n" +
+"    'sources': {\n" +
+"        'runpod':   'shared/config/runpod.json (active_pods + completed_runs)',\n" +
+"        'hetzner':  'shared/config/infrastructure.json (flat-rate est.; actual billing TBD)',\n" +
+"        'ubu':      'shared/config/infrastructure.json (self-hosted; electricity est.)',\n" +
+"        'invocations_proxy': ['shared/tool/work_registry.jsonl', 'shared/tool/commit_log.jsonl']\n" +
+"    }\n" +
+"}\n" +
+"\n" +
+"with open('" + path + "','w') as f:\n" +
+"    json.dump(report, f, indent=2, ensure_ascii=False)\n" +
+"print(json.dumps(cost_eff))\n"
+
+    let summary = run_py(report_script)
+    println("")
+    println("═══ REMOTE MONTHLY REPORT ═════════════════════════════════════════════")
+    println("  path: " + path)
+    println("  summary: " + summary)
+    println("═══════════════════════════════════════════════════════════════════════")
+}
+
+// ── Main ───────────────────────────────────────────────────────────────────
+fn main() {
+    let argv = args()
+    let mut yyyymm = current_yyyymm()
+    let mut i = 0
+    while i < len(argv) {
+        let a = argv[i]
+        if a == "--month" && i + 1 < len(argv) {
+            yyyymm = argv[i + 1]
+            i = i + 1
+        }
+        i = i + 1
+    }
+
+    // Window = last 30 days ending now (UTC). yyyymm param is label only;
+    // for arbitrary historical month we'd compute actual month start/end —
+    // for P7-1 scope, rolling-30 suffices.
+    let now_e = now_epoch()
+    let win_start = now_e - (30 * 24 * 3600)
+    let win_end = now_e
+
+    println("remote_monthly: month=" + yyyymm + " window=" +
+            to_string(win_start) + ".." + to_string(win_end))
+
+    if file_exists(INFRA) == false {
+        println("REJECT: missing " + INFRA)
+        return
+    }
+    if file_exists(RUNPOD) == false {
+        println("REJECT: missing " + RUNPOD)
+        return
+    }
+
+    // 1. runpod summary
+    let runpod_json = runpod_monthly_summary(win_start, win_end)
+    println("runpod: " + runpod_json)
+
+    // 2. invocation proxy counts — hetzner/ubu 구분은 log 가 호스트 태그 안 다는 한 어려움.
+    //    일단 commit_log 전체를 hetzner 로 돌리고, work_registry 를 분할.
+    let commit_n = count_lines_in_window(COMMIT_LOG, win_start, win_end)
+    let work_n = count_lines_in_window(WORK_REG, win_start, win_end)
+    println("commit_log: " + to_string(commit_n) + " lines in window")
+    println("work_registry: " + to_string(work_n) + " lines in window")
+
+    // 배분: hetzner=commit_log (CPU 작업 주)  +  work_registry 의 2/3
+    //       ubu    =work_registry 의 1/3 (GPU 실시간 워커 가정)
+    let hetz_inv = commit_n + (work_n * 2 / 3)
+    let ubu_inv = work_n / 3
+
+    // 3. write report
+    write_report(yyyymm, win_start, win_end, runpod_json, hetz_inv, ubu_inv)
+}
+

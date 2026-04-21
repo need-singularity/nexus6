@@ -1,0 +1,313 @@
+// @enforce-sandbox  — H-ENFORCE-SANDBOX: night-time random sampling, atlas.n6 I/O heavy
+// @no-lock-needed
+// @allow-bare-exec
+// dream_engine.hexa — P7 야간 발견: Dream (무작위 bisociation 결합)
+// 역할: atlas.n6.deg 에서 노드 샘플링 → 무작위 2-3개 결합 → 새 pair 생성
+//       cross_feed 큐 append 로 atlas 등록 유도
+// SSOT: shared/tool/dream_log.jsonl (append-only)
+//
+// subcommands:
+//   dream                 현재 시각 22~05 시 사이에만 실행 (외 시간 silent skip).
+//                         atlas.n6.deg head-200 에서 deterministic-random 2-3 노드 sample
+//                         → "dream-{node1}-x-{node2}" pair 생성 → log append + cross_feed 위임
+//   status                최근 24h dream 세션 수 + unique pair 수
+//   history [N=10]        dream_log.jsonl 마지막 N 줄
+//
+// 성공 조용 (H1). dream 만 최소 stdout.
+
+import "safe_hexa_enforce.hexa"
+
+let HOME = env("HOME")
+let NEXUS = HOME + "/Dev/nexus"
+let HARNESS = NEXUS + "/harness"
+
+let LOG = HARNESS + "/dream_log.jsonl"
+let ATLAS_DEG = NEXUS + "/n6/atlas.n6.deg"
+let CROSS_FEED = HARNESS + "/cross_feed.hexa"
+let HEXA_BIN = NEXUS + "/bin/hexa"
+
+// ─── void-safe coercion ───
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _to_int0(s: string) -> i64 {
+    if s == "" { return 0 }
+    let first = _str(s.split("\n")[0]).trim()
+    if first == "" { return 0 }
+    return to_int(first)
+}
+
+fn now_unix() -> i64 {
+    return _to_int0(_str(exec("date +%s")).trim())  // @allow-bare-exec
+}
+
+fn current_hour() -> i64 {
+    return _to_int0(_str(exec("date +%H")).trim())  // @allow-bare-exec
+}
+
+fn json_escape(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", " ")
+    r = r.replace("\r", " ")
+    r = r.replace("\t", " ")
+    return r
+}
+
+// ─── JSON 필드 추출 ───
+fn json_field(line: string, key: string) -> string {
+    let tag = "\"" + key + "\""
+    if line.contains(tag) == false { return "" }
+    let after = line.split(tag)[1]
+    let parts = after.split(":")
+    if parts.len() < 2 { return "" }
+    let mut rest = parts[1]
+    let mut i = 2
+    while i < parts.len() {
+        rest = rest + ":" + parts[i]
+        i = i + 1
+    }
+    let s = rest.trim()
+    if s.len() == 0 { return "" }
+    if s.substring(0, 1) == "\"" {
+        let inner = s.substring(1, s.len())
+        let ep = inner.split("\"")
+        if ep.len() < 1 { return "" }
+        return ep[0]
+    }
+    let mut end = 0
+    while end < s.len() {
+        let c = s.substring(end, end + 1)
+        if c == "," || c == "}" || c == "\n" || c == " " { break }
+        end = end + 1
+    }
+    return s.substring(0, end).trim()
+}
+
+fn _ensure_log() {
+    if file_exists(LOG) == false {
+        try { write_file(LOG, "") } catch e {}
+    }
+}
+
+fn append_line(path: string, line: string) {
+    let cmd = "printf '%s\\n' " + shell_quote(line) + " >> '" + path + "' 2>/dev/null"
+    let _r = exec(cmd)  // @allow-bare-exec
+}
+
+fn shell_quote(s: string) -> string {
+    let escaped = s.replace("'", "'\\''")
+    return "'" + escaped + "'"
+}
+
+// ─── atlas.n6.deg 에서 head-200 노드 로드 ───
+fn load_head_nodes() -> [string] {
+    let mut nodes: [string] = []
+    if file_exists(ATLAS_DEG) == false { return nodes }
+    let raw = _str(exec("head -200 '" + ATLAS_DEG + "' 2>/dev/null"))  // @allow-bare-exec
+    if raw.trim() == "" { return nodes }
+    let lines = raw.split("\n")
+    let mut i = 0
+    while i < lines.len() {
+        let line = _str(lines[i]).trim()
+        if line.len() > 0 {
+            let parts = line.split("\t")
+            if parts.len() >= 1 {
+                let node = _str(parts[0]).trim()
+                if node.len() > 0 { nodes = nodes.push(node) }
+            }
+        }
+        i = i + 1
+    }
+    return nodes
+}
+
+// ─── deterministic random pick — epoch ts mod len ───
+fn pick_index(ts: i64, salt: i64, len: i64) -> i64 {
+    if len <= 0 { return 0 }
+    let mut v = ts + salt * 31
+    if v < 0 { v = 0 - v }
+    return v % len
+}
+
+// ─── dream ───
+fn cmd_dream(argv: [string]) {
+    // 시간 gate — 22~05 시 사이만 (NEXUS_DREAM_FORCE=1 로 bypass)
+    let hour = current_hour()
+    let in_window = (hour >= 22) || (hour <= 5)
+    let force = _str(env("NEXUS_DREAM_FORCE"))
+    if in_window == false && force != "1" {
+        // silent skip (cron 호출 대비)
+        return
+    }
+
+    _ensure_log()
+    let nodes = load_head_nodes()
+    if nodes.len() < 2 {
+        eprintln("REJECT: atlas.n6.deg head-200 노드 부족 (len=" + to_string(nodes.len()) + ")")
+        exit(2)
+    }
+
+    let ts = now_unix()
+    let i1 = pick_index(ts, 1, nodes.len())
+    let mut i2 = pick_index(ts, 7, nodes.len())
+    if i2 == i1 { i2 = (i1 + 1) % nodes.len() }
+    // 3번째는 50% 확률 (ts mod 2 == 0)
+    let use_third = (ts % 2) == 0
+    let i3 = pick_index(ts, 13, nodes.len())
+
+    let n1 = nodes[i1]
+    let n2 = nodes[i2]
+    let mut pair = "dream-" + n1 + "-x-" + n2
+    let mut seeds: [string] = [n1, n2]
+    let mut strength: i64 = 2
+    if use_third && i3 != i1 && i3 != i2 {
+        let n3 = nodes[i3]
+        pair = pair + "-x-" + n3
+        seeds = seeds.push(n3)
+        strength = 3
+    }
+
+    // log append
+    let mut seeds_json = "["
+    let mut k = 0
+    while k < seeds.len() {
+        if k > 0 { seeds_json = seeds_json + "," }
+        seeds_json = seeds_json + "\"" + json_escape(seeds[k]) + "\""
+        k = k + 1
+    }
+    seeds_json = seeds_json + "]"
+
+    let row = "{\"ts\":" + to_string(ts) +
+              ",\"kind\":\"dream\"" +
+              ",\"pair\":\"" + json_escape(pair) + "\"" +
+              ",\"seeds\":" + seeds_json +
+              ",\"strength\":" + to_string(strength) + "}"
+    append_line(LOG, row)
+
+    // cross_feed 위임 (blowup→atlas direction)
+    let summary = "night-dream-" + to_string(strength) + "-bisociation"
+    let cf_cmd = "'" + HEXA_BIN + "' run '" + CROSS_FEED + "' append_blowup dream_engine " +
+                 shell_quote(pair) + " " + shell_quote(summary) + " >/dev/null 2>&1"
+    let _r = exec(cf_cmd)  // @allow-bare-exec
+
+    println("dream: " + pair + " (strength=" + to_string(strength) + " hour=" + to_string(hour) + ")")
+}
+
+// ─── status ───
+fn cmd_status(argv: [string]) {
+    if file_exists(LOG) == false {
+        println("dream sessions_24h=0 unique_pairs_24h=0 last_ts=0")
+        return
+    }
+    let raw = _str(read_file(LOG))
+    if raw.trim() == "" {
+        println("dream sessions_24h=0 unique_pairs_24h=0 last_ts=0")
+        return
+    }
+    let now = now_unix()
+    let cutoff = now - 86400
+    let lines = raw.split("\n")
+    let mut sessions: i64 = 0
+    let mut last_ts: i64 = 0
+    let mut pairs_seen: [string] = []
+    let mut i = 0
+    while i < lines.len() {
+        let line = _str(lines[i]).trim()
+        if line.len() > 0 {
+            let ts = _to_int0(json_field(line, "ts"))
+            if ts >= cutoff {
+                sessions = sessions + 1
+                if ts > last_ts { last_ts = ts }
+                let pair = json_field(line, "pair")
+                if pair.len() > 0 {
+                    let mut found = false
+                    let mut j = 0
+                    while j < pairs_seen.len() {
+                        if pairs_seen[j] == pair { found = true; break }
+                        j = j + 1
+                    }
+                    if found == false { pairs_seen = pairs_seen.push(pair) }
+                }
+            }
+        }
+        i = i + 1
+    }
+    println("dream sessions_24h=" + to_string(sessions) +
+            " unique_pairs_24h=" + to_string(pairs_seen.len()) +
+            " last_ts=" + to_string(last_ts))
+}
+
+// ─── history ───
+fn cmd_history(argv: [string]) {
+    let mut n: i64 = 10
+    if argv.len() >= 4 {
+        let v = _to_int0(argv[3].trim())
+        if v > 0 { n = v }
+    }
+    if file_exists(LOG) == false {
+        return
+    }
+    let cmd = "tail -n " + to_string(n) + " '" + LOG + "' 2>/dev/null"
+    let out = _str(exec(cmd))  // @allow-bare-exec
+    print(out)
+}
+
+fn main() {
+    ensure_launchd_sandbox()
+    // argv 정규화 (2026-04-19): Mac=[hexa, script, user...] Linux-stage1=[hexa, "run", script, user...]
+    // 이전까지 Mac-only argv[2] 가정 → Linux 에서 argv[2] = script path 로 dispatch 실패.
+    let _raw_argv = args()
+    let mut _script_idx = -1
+    let mut _scan_i = 0
+    while _scan_i < _raw_argv.len() {
+        if _raw_argv[_scan_i].ends_with(".hexa") { _script_idx = _scan_i; break }
+        _scan_i = _scan_i + 1
+    }
+    let mut _user_start = 2
+    let mut _script_token = ""
+    if _script_idx >= 0 {
+        _user_start = _script_idx + 1
+        _script_token = _raw_argv[_script_idx]
+    } else {
+        if _raw_argv.len() >= 3 {
+            if _raw_argv[1] == "run" { _user_start = 3 }
+            if _raw_argv[1] == "eval" { _user_start = 3 }
+        }
+    }
+    let mut argv: [str] = [_raw_argv[0], _script_token]
+    let mut _ua_i = _user_start
+    while _ua_i < _raw_argv.len() {
+        argv = argv + [_raw_argv[_ua_i]]
+        _ua_i = _ua_i + 1
+    }
+    if _script_token.len() > 0 && argv.len() >= 3 {
+        if argv[2] == _script_token {
+            let mut _a2: [str] = [_raw_argv[0], _script_token]
+            let mut _j2 = 3
+            while _j2 < argv.len() {
+                _a2 = _a2 + [argv[_j2]]
+                _j2 = _j2 + 1
+            }
+            argv = _a2
+        }
+    }
+    if argv.len() < 3 {
+        eprintln("usage: dream_engine <dream|status|history> [args...]")
+        exit(2)
+    }
+    let mode = argv[2].trim()
+    if mode == "dream" { cmd_dream(argv) }
+    else if mode == "status" { cmd_status(argv) }
+    else if mode == "history" { cmd_history(argv) }
+    else {
+        eprintln("REJECT: unknown mode '" + mode + "' — modes: dream|status|history")
+        exit(2)
+    }
+}
+
+main()

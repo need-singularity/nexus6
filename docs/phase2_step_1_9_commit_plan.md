@@ -8,7 +8,7 @@
 
 ## 0. nexus repo 현재 상태
 
-- **Stash pop conflict 미해소**: `shared/harness/roadmap_*.json|.hexa` 10 파일 AA (both added)
+- **Stash pop conflict 미해소**: `shared/tool/roadmap_*.json|.hexa` 10 파일 AA (both added)
   - 이번 Phase 2 포팅 수정 경로 (`cli/scripts/`, `test/`, `shared/reports/`, `shared/drill/`) 와 **완전 분리**
   - 따라서 `git commit --only <file...>` 로 conflict 를 건드리지 않고 격리 commit 가능
 - **Phase 2 관련 변경**:

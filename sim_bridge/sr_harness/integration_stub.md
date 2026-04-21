@@ -86,7 +86,7 @@ let noisy = add_sr_noise_gated(raw_metric, 0.1, seed)
 ## Growth (2 candidates)
 
 ### 6. growth_tick stale threshold
-- **file**: `shared/harness/growth_tick.hexa`
+- **file**: `shared/tool/growth_tick.hexa`
 - **line**: 18 — `let MIN_CONSECUTIVE: i64 = 6`  (hard integer threshold)
 - **metric**: threshold for triggering escalation; SR simulates a
   probabilistic trigger around 6
@@ -101,7 +101,7 @@ let noisy = add_sr_noise_gated(raw_metric, 0.1, seed)
   smooths the boundary
 
 ### 7. growth_tick STALE_THRESHOLD (6h)
-- **file**: `shared/harness/growth_tick.hexa`
+- **file**: `shared/tool/growth_tick.hexa`
 - **line**: 17 — `let STALE_THRESHOLD: i64 = 21600`  (6h in seconds)
 - **metric**: second-level gate — perturb as fraction
 - **sigma**: 0.05 (5% of 6h = 18min jitter), **seed_base**: `ts_i / 3600`

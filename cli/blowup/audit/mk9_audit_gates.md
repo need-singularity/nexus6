@@ -33,7 +33,7 @@ mk9_audit_results.json (verdict_for_atlas_append=PASS)
 | # | 파일 | 검증 명령 | 통과 조건 |
 |---|---|---|---|
 | 1 | `shared/blowup/audit/mk9_first_candidates.md` | git log -1 --oneline | 최신 커밋이 본 감사 세션과 동기 |
-| 2 | `shared/blowup/audit/mk9_audit_results.json` | `hexa shared/harness/lockdown_gate.hexa verify` | L0 통과, JSON parse 성공 |
+| 2 | `shared/blowup/audit/mk9_audit_results.json` | `hexa shared/tool/lockdown_gate.hexa verify` | L0 통과, JSON parse 성공 |
 | 3 | `shared/blowup/audit/promote_12star.hexa` | `hexa parse shared/blowup/audit/promote_12star.hexa` | parse OK |
 | 4 | `shared/n6/atlas.n6` | `hexa shared/n6/atlas_health.hexa` | health PASS, [12*] 카운트 = 직전 기록과 일치 |
 

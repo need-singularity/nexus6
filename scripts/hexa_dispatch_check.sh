@@ -1,7 +1,7 @@
 #!/bin/bash
 # hexa_dispatch_check.sh — mac 에서 dispatch 정책 위반 감지 (L2)
 #
-# 정책 소스: $NEXUS/shared/dispatch_state.json (modules/dispatch.hexa 산출)
+# 정책 소스: $NEXUS/dispatch_state.json (modules/dispatch.hexa 산출)
 # 규칙 (AG6): heavy/compute/gpu 가 ubu 또는 htz 로 가야 하는 상황에
 #           mac 에서 heavy hexa 작업 실행 중이면 위반.
 #
@@ -19,7 +19,7 @@
 set -u
 
 NEXUS="${NEXUS:-$HOME/Dev/nexus}"
-DISPATCH="$NEXUS/shared/dispatch_state.json"
+DISPATCH="$NEXUS/dispatch_state.json"
 HUMAN=0
 [[ "${1:-}" == "--human" ]] && HUMAN=1
 

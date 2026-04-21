@@ -1,0 +1,186 @@
+// convergence_update.hexa — I1 자동 골화 gap 스캐너
+//
+// PURPOSE
+//   세션이 생성한 training/*_report.md + serving/*_report.md 를 스캔하여
+//   shared/convergence/*.convergence 대응이 없는 track 을 식별, 수렴
+//   파이프의 누락 지점을 stderr + JSONL 로 보고한다.
+//
+//   CDO P1~P5 원칙 (shared/rules/convergence_ops.json):
+//     P1 모든 문제는 한 번만 — 같은 gap 재발 시 즉시 규칙화
+//     P2 해결되면 absolute_rule 승격
+//     P5 Antifragile — 실패(gap)로 더 강해짐
+//
+// USAGE
+//   hexa shared/tool/convergence_update.hexa scan
+//     → stderr: gap 목록 + stdout: summary 1줄
+//   hexa shared/tool/convergence_update.hexa scan --jsonl
+//     → stdout: JSONL 각 gap (automation 친화)
+//
+// SAFETY
+//   read-only: .convergence 파일을 자동 생성하지 않음. Claude/human 판단 필요.
+//   (자동 생성은 hallucinated track 오염 리스크 — 수동 승인 SSOT 유지)
+//
+// EXIT
+//   0  no gaps
+//   1  input error
+//   2  N gaps detected
+
+let HOME = env("HOME")
+let ANIMA = if env("ANIMA") != "" { env("ANIMA") } else { HOME + "/mac_home/dev/anima" }
+let CONV_DIR = ANIMA + "/convergence"
+let TRAINING_DIR = ANIMA + "/training"
+let SERVING_DIR = ANIMA + "/serving"
+let GAP_LOG = ANIMA + "/convergence/_auto_gap_log.jsonl"
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn list_files(dir: string, suffix: string) -> array {
+    // shell-out — hexa ls builtin varies by build
+    let cmd = "ls -1 " + dir + " 2>/dev/null | grep -E '" + suffix + "$' || true"
+    let out = _str(exec(cmd))
+    let lines = out.split("\n")
+    let mut acc = []
+    let mut i = 0
+    let n = len(lines)
+    while i < n {
+        let line = _str(lines[i]).trim()
+        if line != "" { acc = push(acc, line) }
+        i = i + 1
+    }
+    return acc
+}
+
+// Heuristic: report "foo_bar_report.md" → candidate track name "foo_bar".
+// Truncate known trailing noise tokens (smoke/v2/real/etc) conservatively.
+fn report_to_track(fname: string) -> string {
+    let mut base = fname
+    // strip trailing _report.md / .md
+    if base.ends_with("_report.md") { base = base.substring(0, len(base) - 10) }
+    else if base.ends_with(".md")   { base = base.substring(0, len(base) - 3) }
+    return base
+}
+
+fn convergence_exists(track_name: string) -> bool {
+    // match shared/convergence/{anything containing track_name}.convergence
+    let cmd = "ls -1 " + CONV_DIR + " 2>/dev/null | grep -F '" + track_name + "' || true"
+    let out = _str(exec(cmd)).trim()
+    return out != ""
+}
+
+fn anima_json_has_track(track_name: string) -> bool {
+    // simple grep into SSOT anima.json for track key or item id
+    let cmd = "grep -Fq '\"" + track_name + "\"' " + CONV_DIR + "/anima.json && echo HIT || true"
+    let out = _str(exec(cmd)).trim()
+    return out == "HIT"
+}
+
+fn now_utc() -> string {
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn emit_gap_jsonl(report: string, track: string, source: string) {
+    let line = "{\"ts\":\"" + now_utc() + "\"," +
+               "\"report\":\"" + report + "\"," +
+               "\"track\":\"" + track + "\"," +
+               "\"source\":\"" + source + "\"," +
+               "\"action_needed\":\"create_convergence_file_or_update_anima_json\"}\n"
+    // append — no hexa append builtin that we can rely on; use shell cat>>
+    let script = "/tmp/_conv_gap_append.sh"
+    write_file(script, "#!/bin/sh\ncat >> " + GAP_LOG + " <<'GAP_EOF'\n" + line + "GAP_EOF\n")
+    exec("chmod +x " + script)
+    exec(script)
+}
+
+fn scan_dir(dir: string, source_tag: string, jsonl: bool) -> int {
+    let reports = list_files(dir, "_report\\.md")
+    let n = len(reports)
+    let mut gaps = 0
+    let mut i = 0
+    while i < n {
+        let fname = _str(reports[i])
+        let track = report_to_track(fname)
+        let has_conv = convergence_exists(track)
+        let has_anima = anima_json_has_track(track)
+        if !has_conv && !has_anima {
+            gaps = gaps + 1
+            if jsonl {
+                print("{\"report\":\"" + fname + "\",\"track\":\"" + track + "\",\"source\":\"" + source_tag + "\"}")
+            } else {
+                eprint("[gap] " + source_tag + "/" + fname + " → track=" + track + " (no .convergence, no anima.json entry)")
+            }
+            emit_gap_jsonl(fname, track, source_tag)
+        }
+        i = i + 1
+    }
+    return gaps
+}
+
+// Scan untracked .hexa files in a dir; a .hexa is "covered" when its basename
+// appears as a string literal anywhere in shared/convergence/*.convergence.
+// Untracked = modified-status ?? per git; filtered by suffix here.
+fn scan_hexa_artifacts(dir: string, source_tag: string, jsonl: bool) -> int {
+    let hexa_files = list_files(dir, "\\.hexa")
+    let n = len(hexa_files)
+    let mut gaps = 0
+    let mut i = 0
+    while i < n {
+        let fname = _str(hexa_files[i])
+        // basename-match against entire convergence dir
+        let cmd = "grep -Fql '" + fname + "' " + CONV_DIR + "/*.convergence 2>/dev/null && echo HIT || true"
+        let out = _str(exec(cmd)).trim()
+        if out != "HIT" {
+            gaps = gaps + 1
+            if jsonl {
+                print("{\"hexa\":\"" + fname + "\",\"source\":\"" + source_tag + "\"}")
+            } else {
+                eprint("[gap_hexa] " + source_tag + "/" + fname + " (no .convergence reference)")
+            }
+            emit_gap_jsonl(fname, fname, source_tag + "_hexa")
+        }
+        i = i + 1
+    }
+    return gaps
+}
+
+fn main() {
+    let argv = args()
+    let argc = len(argv)
+    let mut mode = "scan"
+    let mut jsonl = false
+    let mut include_hexa = true
+    let mut k = 0
+    while k < argc {
+        let a = _str(argv[k])
+        if a == "--jsonl"      { jsonl = true }
+        if a == "--no-hexa"    { include_hexa = false }
+        if a == "--reports-only" { include_hexa = false }
+        k = k + 1
+    }
+
+    let gaps_t = scan_dir(TRAINING_DIR, "training", jsonl)
+    let gaps_s = scan_dir(SERVING_DIR, "serving", jsonl)
+    let mut gaps_th = 0
+    let mut gaps_sh = 0
+    let mut gaps_ah = 0
+    let mut gaps_ah2 = 0
+    if include_hexa {
+        gaps_th = scan_hexa_artifacts(TRAINING_DIR, "training", jsonl)
+        gaps_sh = scan_hexa_artifacts(SERVING_DIR, "serving", jsonl)
+        gaps_ah = scan_hexa_artifacts(ANIMA + "/anima-speak", "anima-speak", jsonl)
+        gaps_ah2 = scan_hexa_artifacts(ANIMA + "/scripts", "scripts", jsonl)
+    }
+    let total = gaps_t + gaps_s + gaps_th + gaps_sh + gaps_ah + gaps_ah2
+
+    if !jsonl {
+        println("[convergence_update] scan done — report_gaps=" + to_string(gaps_t + gaps_s) +
+                " hexa_gaps=" + to_string(gaps_th + gaps_sh + gaps_ah + gaps_ah2) +
+                " total=" + to_string(total))
+    }
+
+    if total > 0 { exit(2) }
+    exit(0)
+}

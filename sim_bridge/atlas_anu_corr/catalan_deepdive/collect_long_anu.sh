@@ -20,8 +20,8 @@ CUR_BYTES=$(( ${#CUR_HEX} / 2 ))
 echo "[$(date +%H:%M:%S)] start goal=${GOAL}B current=${CUR_BYTES}B out=$OUT" | tee -a "$LOG"
 
 # seed cache from existing ANU cache if present & we have 0 bytes
-if [ $CUR_BYTES -lt 64 ] && [ -f "$HOME/Dev/nexus/shared/discovery/rng_lab/.anu_cache.bin" ]; then
-    SEED="$(cat "$HOME/Dev/nexus/shared/discovery/rng_lab/.anu_cache.bin" 2>/dev/null)"
+if [ $CUR_BYTES -lt 64 ] && [ -f "$HOME/Dev/nexus/discovery/rng_lab/.anu_cache.bin" ]; then
+    SEED="$(cat "$HOME/Dev/nexus/discovery/rng_lab/.anu_cache.bin" 2>/dev/null)"
     if [ ${#SEED} -ge 128 ]; then
         CUR_HEX="${SEED:0:128}"
         CUR_BYTES=$(( ${#CUR_HEX} / 2 ))

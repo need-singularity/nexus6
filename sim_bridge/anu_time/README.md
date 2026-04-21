@@ -17,7 +17,7 @@ wall-clock 과 독립된 "quantum-event-discrete" universe.
 
 ```bash
 cd $NEXUS_ROOT                      # ~/Dev/nexus
-./shared/sim_bridge/anu_time/runner.sh 300 my_run
+./sim_bridge/anu_time/runner.sh 300 my_run
 ```
 
 Artifacts → `shared/sim_bridge/anu_time/runs/my_run/`:

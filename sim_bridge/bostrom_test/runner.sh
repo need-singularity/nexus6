@@ -30,7 +30,7 @@ echo "-- Step 1: ANU collection --"
 export HEXA_LOCAL=1
 export NEXUS_NO_BUDGET_OK=1
 export NEXUS_NO_TIMEOUT_OK=1
-/Users/ghost/Dev/nexus/shared/bin/hexa "$ROOT/anu_collector.hexa" "$HEX_FILE" "$N_REQ" 65 2>&1 | tee "$RUN_DIR/collect.log"
+/Users/ghost/Dev/nexus/bin/hexa "$ROOT/anu_collector.hexa" "$HEX_FILE" "$N_REQ" 65 2>&1 | tee "$RUN_DIR/collect.log"
 
 # Convert hex to binary
 HEX=$(tr -d '[:space:]' < "$HEX_FILE")

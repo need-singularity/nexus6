@@ -13,7 +13,7 @@ set -u
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
-HEXA=/Users/ghost/Dev/nexus/shared/bin/hexa
+HEXA=/Users/ghost/Dev/nexus/bin/hexa
 export HEXA_LOCAL=1
 
 SIGMAS_CSV="${SIGMAS_CSV:-0,0.05,0.1,0.2,0.3}"

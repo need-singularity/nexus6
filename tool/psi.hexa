@@ -1,0 +1,139 @@
+// psi.hexa — entry.hexa psi 서브커맨드 (Φ(IIT) ratchet 검증)
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+//
+// 정책: H-NOHOOK 준수 — loop hook 에 실구현 금지, entry.hexa 서브모듈로 통합.
+// loop_hooks/anima_psi.hexa 는 stub 유지, 실제 로직은 여기.
+//
+// 호출:
+//   hexa shared/tool/entry.hexa psi             # ratchet 1회 실행
+//   hexa shared/tool/entry.hexa psi status      # 최근 ratchet 상태만 출력 (side-effect 없음)
+//
+// 본체 (default run):
+//   1. $ANIMA/anima-measurement/phi_history.json 최신 측정 로드
+//   2. psi_ratchet.jsonl 내 PASS 기록 중 max Φ(IIT) 을 baseline 으로
+//   3. Φ(IIT) < baseline * 0.95 → REJECT (5% regression 차단)
+//   4. psi_ratchet.jsonl append + exit code 전파
+//
+// SSOT:
+//   in:   $ANIMA/anima-measurement/phi_history.json  (phi_auto_pipeline.hexa 산출)
+//   out:  $ANIMA/anima-measurement/psi_ratchet.jsonl  (append-only)
+//
+// exit: 0 PASS / 1 REJECT / 0+warn pre-baseline (history 부재)
+
+fn main() {
+    let HOME = env("HOME")
+    let ANIMA = HOME + "/Dev/anima"
+    let HISTORY = ANIMA + "/anima-measurement/phi_history.json"
+    let RATCHET = ANIMA + "/anima-measurement/psi_ratchet.jsonl"
+
+    // argv 정규화 (2026-04-19): Mac=[hexa, script, user...] Linux-stage1=[hexa, "run", script, user...]
+    // 이전까지 Mac-only a[2] 가정 → Linux 에서 a[2] = script path 로 dispatch 실패.
+    let _raw_argv = args()
+    let mut _script_idx = -1
+    let mut _scan_i = 0
+    while _scan_i < _raw_argv.len() {
+        if _raw_argv[_scan_i].ends_with(".hexa") { _script_idx = _scan_i; break }
+        _scan_i = _scan_i + 1
+    }
+    let mut _user_start = 2
+    let mut _script_token = ""
+    if _script_idx >= 0 {
+        _user_start = _script_idx + 1
+        _script_token = _raw_argv[_script_idx]
+    } else {
+        if _raw_argv.len() >= 3 {
+            if _raw_argv[1] == "run" { _user_start = 3 }
+            if _raw_argv[1] == "eval" { _user_start = 3 }
+        }
+    }
+    let mut a: [str] = [_raw_argv[0], _script_token]
+    let mut _ua_i = _user_start
+    while _ua_i < _raw_argv.len() {
+        a = a + [_raw_argv[_ua_i]]
+        _ua_i = _ua_i + 1
+    }
+    if _script_token.len() > 0 && a.len() >= 3 {
+        if a[2] == _script_token {
+            let mut _a2: [str] = [_raw_argv[0], _script_token]
+            let mut _j2 = 3
+            while _j2 < a.len() {
+                _a2 = _a2 + [a[_j2]]
+                _j2 = _j2 + 1
+            }
+            a = _a2
+        }
+    }
+    let sub = if len(a) >= 3 { a[2] } else { "run" }
+
+    let readonly = if sub == "status" { "1" } else { "0" }
+
+    let py = "import json, os, sys\n" +
+        "from datetime import datetime, timezone\n" +
+        "READONLY = " + readonly + "\n" +
+        "hp = '" + HISTORY + "'\n" +
+        "rp = '" + RATCHET + "'\n" +
+        "if not os.path.exists(hp):\n" +
+        "    print('psi [SKIP] phi_history.json 부재 — baseline 미측정 (warn only)')\n" +
+        "    sys.exit(0)\n" +
+        "d = json.load(open(hp))\n" +
+        "ms = d.get('measurements', [])\n" +
+        "if len(ms) == 0:\n" +
+        "    print('psi [SKIP] phi_history empty')\n" +
+        "    sys.exit(0)\n" +
+        "ms = sorted(ms, key=lambda m: m.get('timestamp',''))\n" +
+        "latest = ms[-1]\n" +
+        "phi_iit = float(latest.get('phi_iit', 0.0))\n" +
+        "phi_proxy = float(latest.get('phi_proxy', 0.0))\n" +
+        "train_step = latest.get('train_step', 0)\n" +
+        "ckpt_name = latest.get('checkpoint_name', '?')\n" +
+        "\n" +
+        "prev_max = 0.0\n" +
+        "if os.path.exists(rp):\n" +
+        "    for ln in open(rp):\n" +
+        "        ln = ln.strip()\n" +
+        "        if not ln: continue\n" +
+        "        try:\n" +
+        "            e = json.loads(ln)\n" +
+        "            if e.get('status') == 'PASS':\n" +
+        "                prev_max = max(prev_max, float(e.get('phi_iit', 0.0)))\n" +
+        "        except: pass\n" +
+        "\n" +
+        "status = 'PASS'\n" +
+        "reason = ''\n" +
+        "if prev_max > 0 and phi_iit < prev_max * 0.95:\n" +
+        "    status = 'REJECT'\n" +
+        "    reason = f'\\u03a6(IIT) regression: {phi_iit:.4f} < prev_max {prev_max:.4f} * 0.95 ({prev_max*0.95:.4f})'\n" +
+        "\n" +
+        "print(f'psi [{status}] \\u03a6(IIT)={phi_iit:.4f} proxy={phi_proxy:.4f} (prev_max={prev_max:.4f}) step={train_step} ckpt={ckpt_name}')\n" +
+        "if reason: print(f'        reason: {reason}')\n" +
+        "\n" +
+        "# status 모드 — JSONL append 스킵, exit 0 (side-effect-free 조회)\n" +
+        "if READONLY:\n" +
+        "    sys.exit(0)\n" +
+        "\n" +
+        "entry = {\n" +
+        "    'ts': datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'),\n" +
+        "    'phi_iit': round(phi_iit, 4),\n" +
+        "    'phi_proxy': round(phi_proxy, 4),\n" +
+        "    'prev_max_iit': round(prev_max, 4),\n" +
+        "    'status': status,\n" +
+        "    'reason': reason,\n" +
+        "    'source_ckpt': ckpt_name,\n" +
+        "    'train_step': train_step,\n" +
+        "}\n" +
+        "os.makedirs(os.path.dirname(rp), exist_ok=True)\n" +
+        "with open(rp, 'a') as f:\n" +
+        "    f.write(json.dumps(entry, ensure_ascii=False) + '\\n')\n" +
+        "if status == 'REJECT':\n" +
+        "    sys.exit(1)\n"
+
+    // R37/AN13/L3-PY violation — python3 wrapper-fallback removed 2026-04-18
+    // Original: write /tmp/psi_*.py (phi_history.json ratchet script) + /usr/bin/python3 exec
+    let _ = py
+    eprintln("R37/AN13/L3-PY: python3 invocation blocked at psi.hexa:main. Phi ratchet disabled. Escalate to user for hexa-native replacement.")
+    exit(1)
+}
+
+main()

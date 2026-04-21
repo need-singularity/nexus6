@@ -37,39 +37,39 @@ All paths run locally with `HEXA_LOCAL=1`.  `$NEXUS = ~/Dev/nexus`.
 ### self-test (RFC 7539 §2.3.2 KAT)
 
 ```
-HEXA_LOCAL=1 $NEXUS/shared/bin/hexa chacha20.hexa test
+HEXA_LOCAL=1 $NEXUS/bin/hexa chacha20.hexa test
 # expected: PASS rfc7539_block expect=10f1e7e4d13b5915500fdd1fa32071c4
 ```
 
 ### emit a keystream block (one-shot)
 
 ```
-HEXA_LOCAL=1 $NEXUS/shared/bin/hexa stream_daemon.hexa once
+HEXA_LOCAL=1 $NEXUS/bin/hexa stream_daemon.hexa once
 # prints  seed=<64 hex>  block0=<128 hex>
 ```
 
 ### file mode (N bytes to disk)
 
 ```
-HEXA_LOCAL=1 $NEXUS/shared/bin/hexa stream_daemon.hexa file 65536 /tmp/ks.bin
+HEXA_LOCAL=1 $NEXUS/bin/hexa stream_daemon.hexa file 65536 /tmp/ks.bin
 ```
 
 ### hex mode (pipeable)
 
 ```
-HEXA_LOCAL=1 $NEXUS/shared/bin/hexa stream_daemon.hexa hexout 4096 | head -c 64
+HEXA_LOCAL=1 $NEXUS/bin/hexa stream_daemon.hexa hexout 4096 | head -c 64
 ```
 
 ### stdout raw bytes
 
 ```
-HEXA_LOCAL=1 $NEXUS/shared/bin/hexa stream_daemon.hexa stdout 4096 > /tmp/ks.bin
+HEXA_LOCAL=1 $NEXUS/bin/hexa stream_daemon.hexa stdout 4096 > /tmp/ks.bin
 ```
 
 ### Monte Carlo π demo (client)
 
 ```
-HEXA_LOCAL=1 $NEXUS/shared/bin/hexa client_example.hexa pi 100000
+HEXA_LOCAL=1 $NEXUS/bin/hexa client_example.hexa pi 100000
 # measured run: pi_est=3.1466  |err|=0.00501  1σ=0.00519  within 3σ: YES
 #              |err|<0.01: YES   elapsed≈467s   samples_per_sec≈214
 ```

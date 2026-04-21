@@ -1,0 +1,487 @@
+// @enforce-sandbox  — H-ENFORCE-SANDBOX: long-running guard, GraphQL + periodic polling
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+// h100_idle_guard.hexa — ANIMA + HEXA-LANG H100 유휴 가드 (4-pod enforcement)
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// PURPOSE
+//   모든 가동 중인 H100 pod을 감시해 유휴 상태를 방지한다.
+//   - RunPod GraphQL로 가동 pod 목록 + 상태 조회
+//   - GPU util 실시간 체크: runpodctl + nvidia-smi SSH (< 5% = idle)
+//   - 각 slot의 heartbeat 파일 age 검사 (shared/state/h100_heartbeat/<slot>.json)
+//   - idle_policy.action_sequence 단계적 실행 (강화):
+//       3분  → warn (alert jsonl 기록)
+//       5분  → dispatch_fallback (큐 다음 작업 지시)
+//       8분  → HARD KILL (runpodctl pod stop — 실제 실행, alert 아님)
+//   - GPU util < 5% 감지 시 즉시 경고, 2회 연속 시 HARD KILL
+//   - 예산 모니터링 (일일/월간 cap)
+//   - 사람이 읽는 상태표 출력
+//
+// ENFORCED BY
+//   - shared/config/loop/anima.json every_cycle[] → h100_idle_check
+//   - ScheduleWakeup (session-bound, 1200초 간격)
+//   - pre-commit hook (선택 — 과다 pod 기동 방지)
+//
+// SSOT
+//   shared/config/h100_plan.json                 ← 플랜 + 정책
+//   shared/state/h100_heartbeat/<slot>.json      ← pod이 주기 기록
+//   shared/tool/h100_alerts.jsonl             ← 가드 이벤트 로그
+//   ~/.runpod/config.toml                        ← API key
+//
+// USAGE
+//   hexa shared/tool/h100_idle_guard.hexa                # 기본 check
+//   hexa shared/tool/h100_idle_guard.hexa --dry          # 종료 없이 시뮬
+//   hexa shared/tool/h100_idle_guard.hexa --status       # 상태표만
+//   hexa shared/tool/h100_idle_guard.hexa --plan         # 3-pod 플랜표
+// ═══════════════════════════════════════════════════════════════════════════
+
+import "safe_hexa_enforce.hexa"
+
+let HOME = env("HOME")
+let NEXUS = HOME + "/Dev/nexus"
+let PLAN = NEXUS + "/config/h100_plan.json"
+let HB_DIR = NEXUS + "/state/h100_heartbeat"
+let ALERTS = NEXUS + "/tool/h100_alerts.jsonl"
+let STATE = NEXUS + "/tool/h100_state.json"
+let RUNPOD_CFG = HOME + "/.runpod/config.toml"
+
+fn sh(cmd: string) -> string {
+    return to_string(exec(cmd + " 2>/dev/null")).trim()  // @allow-bare-exec
+}
+
+fn sh_stderr(cmd: string) -> string {
+    return to_string(exec(cmd + " 2>&1")).trim()  // @allow-bare-exec
+}
+
+fn read_api_key() -> string {
+    if file_exists(RUNPOD_CFG) == false { return "" }
+    let raw = sh("grep -E '^apikey' '" + RUNPOD_CFG + "' | head -1 | sed \"s/.*'\\(.*\\)'.*/\\1/\"")
+    return raw
+}
+
+fn file_mtime(path: string) -> int {
+    let s = sh("stat -f '%m' '" + path + "' 2>/dev/null || stat -c '%Y' '" + path + "' 2>/dev/null")
+    return to_int(s)
+}
+
+fn now_epoch() -> int {
+    return to_int(sh("date +%s"))
+}
+
+fn iso_now() -> string {
+    return sh("date -u +%Y-%m-%dT%H:%M:%SZ")
+}
+
+fn jsonl_append(line: string) {
+    let esc = line.replace("'", "'\\''")
+    let _ = exec("printf '%s\\n' '" + esc + "' >> '" + ALERTS + "' 2>/dev/null")  // @allow-bare-exec
+}
+
+// ── Plan loader — R37/AN13/L3-PY: python3 stubs returning sentinels ─────────
+fn plan_get_int(path: string, key: string) -> int {
+    // R37/AN13/L3-PY violation — python3 wrapper-fallback removed 2026-04-18
+    let _ = path
+    let _ = key
+    eprintln("R37/AN13/L3-PY: python3 invocation blocked at h100_idle_guard.hexa:plan_get_int. Escalate to user for hexa-native replacement.")
+    return 0
+}
+
+fn plan_get_str(path: string, key: string) -> string {
+    // R37/AN13/L3-PY violation — python3 wrapper-fallback removed 2026-04-18
+    let _ = path
+    let _ = key
+    eprintln("R37/AN13/L3-PY: python3 invocation blocked at h100_idle_guard.hexa:plan_get_str. Escalate to user for hexa-native replacement.")
+    return ""
+}
+
+fn plan_pod_count() -> int {
+    return plan_get_int(PLAN, "['pods'].__len__()")
+}
+
+fn plan_pod_field(idx: int, field: string) -> string {
+    return plan_get_str(PLAN, "['pods'][" + to_string(idx) + "]['" + field + "']")
+}
+
+fn plan_pod_int(idx: int, field: string) -> int {
+    return plan_get_int(PLAN, "['pods'][" + to_string(idx) + "]['" + field + "']")
+}
+
+// ── RunPod GraphQL query ────────────────────────────────────────────────────
+@convergence(state="ossified", id="RUNPOD_GRAPHQL_RUNTIME_PORTS", value="pod.ports=String('22/tcp'), runtime.ports=[{ip,publicPort,privatePort}]. SSH info from runtime{ports{...}} only", ossified_at="2026-04-16")
+@convergence(state="ossified", id="RUNPOD_POD_FLEET_VARIANCE", value="Same stack, 31% step/min variance across H100 SXM pods. Tag measurements with pod_id. Same-pod A/B preferred", ossified_at="2026-04-16")
+@convergence(state="ossified", id="RUNPOD_POD_LIST_FRESHNESS_GATE", value="Any 'running'/'active' claim must cite runpodctl pod list output ≤5min old. Incident 2026-04-16: anima_train.json had ALM P4-4 in_progress for pod tubq10zkct0t8f absent from pod list ≥12h. Every health tick MUST query live GraphQL (this fn) before trusting state files", ossified_at="2026-04-16")
+fn query_pods(api_key: string) -> string {
+    if len(api_key) == 0 { return "" }
+    let q = "{\\\"query\\\":\\\"query { myself { pods { id name desiredStatus costPerHr machine { gpuDisplayName } runtime { uptimeInSeconds gpus { gpuUtilPerc } ports { ip publicPort privatePort } } } } }\\\"}"
+    let cmd = "curl -s -H 'Authorization: Bearer " + api_key + "' -H 'Content-Type: application/json' -X POST -d \"" + q + "\" https://api.runpod.io/graphql"
+    return sh(cmd)
+}
+
+let TMP_RESP = "/tmp/h100_guard_resp.json"
+let TMP_IDLE = "/tmp/h100_idle_consecutive.json"
+
+fn stash_resp(resp: string) {
+    write_file(TMP_RESP, resp)
+}
+
+fn count_running_pods(resp: string) -> int {
+    if len(resp) == 0 { return 0 }
+    stash_resp(resp)
+    // R37/AN13/L3-PY violation — python3 wrapper-fallback removed 2026-04-18
+    eprintln("R37/AN13/L3-PY: python3 invocation blocked at h100_idle_guard.hexa:count_running_pods. Escalate to user for hexa-native replacement.")
+    return 0
+}
+
+fn total_cost_per_hr(resp: string) -> string {
+    if len(resp) == 0 { return "0.00" }
+    stash_resp(resp)
+    // R37/AN13/L3-PY violation — python3 wrapper-fallback removed 2026-04-18
+    eprintln("R37/AN13/L3-PY: python3 invocation blocked at h100_idle_guard.hexa:total_cost_per_hr. Escalate to user for hexa-native replacement.")
+    return "0.00"
+}
+
+// ── GPU utilization check per pod ───────────────────────────────────────────
+// RunPod GraphQL gpuUtilPerc 사용. 없으면 SSH nvidia-smi fallback.
+fn get_running_pod_ids(resp: string) -> string {
+    if len(resp) == 0 { return "" }
+    stash_resp(resp)
+    // R37/AN13/L3-PY violation — python3 wrapper-fallback removed 2026-04-18
+    eprintln("R37/AN13/L3-PY: python3 invocation blocked at h100_idle_guard.hexa:get_running_pod_ids. Escalate to user for hexa-native replacement.")
+    return ""
+}
+
+fn get_pod_ssh(resp: string, pod_id: string) -> string {
+    // R37/AN13/L3-PY violation — python3 wrapper-fallback removed 2026-04-18
+    stash_resp(resp)
+    let _ = pod_id
+    eprintln("R37/AN13/L3-PY: python3 invocation blocked at h100_idle_guard.hexa:get_pod_ssh. Escalate to user for hexa-native replacement.")
+    return ""
+}
+
+fn check_gpu_util_ssh(ip: string, port: string) -> int {
+    // SSH nvidia-smi fallback — returns GPU util % or -1 on failure
+    let ssh_key = HOME + "/.runpod/ssh/RunPod-Key-Go"
+    let cmd = "ssh -i " + ssh_key + " -o StrictHostKeyChecking=no -o ConnectTimeout=5 root@" + ip + " -p " + port + " 'nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits' 2>/dev/null | head -1"
+    let r = sh(cmd)
+    if len(r) == 0 { return -1 }
+    return to_int(r)
+}
+
+// ── Consecutive idle tracker (file-based) ───────────────────────────────────
+fn load_idle_counts() -> string {
+    if file_exists(TMP_IDLE) { return read_file(TMP_IDLE) }
+    return "{}"
+}
+
+fn get_idle_count(pod_id: string) -> int {
+    // R37/AN13/L3-PY violation — python3 wrapper-fallback removed 2026-04-18
+    let _ = load_idle_counts()
+    let _ = pod_id
+    eprintln("R37/AN13/L3-PY: python3 invocation blocked at h100_idle_guard.hexa:get_idle_count. Escalate to user for hexa-native replacement.")
+    return 0
+}
+
+fn set_idle_count(pod_id: string, count: int) {
+    // R37/AN13/L3-PY violation — python3 wrapper-fallback removed 2026-04-18
+    let _ = load_idle_counts()
+    let _ = pod_id
+    let _ = count
+    eprintln("R37/AN13/L3-PY: python3 invocation blocked at h100_idle_guard.hexa:set_idle_count. Escalate to user for hexa-native replacement.")
+}
+
+fn clear_idle_count(pod_id: string) {
+    set_idle_count(pod_id, 0)
+}
+
+// ── GPU idle enforcement pass ───────────────────────────────────────────────
+// Returns number of pods killed
+@convergence(state="ossified", id="RUNPOD_H100_IDLE_ZERO_TOLERANCE", value="Delete pod IMMEDIATELY after training. $2.99/hr idle unacceptable. 2xH100=$5.98/hr — 5min idle max", ossified_at="2026-04-16")
+@convergence(state="ossified", id="RUNPOD_IDLE_POD_BURN_UNDETECTED", value="Pod can be desiredStatus=RUNNING yet training process dead/idle — $3.07/hr burns silently. Incident 2026-04-16: CLM pod u744u0lbts5v1w idled after container restart until Agent 1 health check. Mitigation: this fn queries GPU util every tick + ssh nvidia-smi fallback, 2× consecutive <5% → HARD KILL. Scheduled ≤10min interval via loop/anima.json", ossified_at="2026-04-16")
+fn enforce_gpu_idle(resp: string, dry: bool) -> int {
+    let lines = get_running_pod_ids(resp)
+    if len(lines) == 0 { return 0 }
+    let mut killed = 0
+    let threshold = 5  // GPU util < 5% = idle
+    let max_consecutive = 2  // 2회 연속 idle → HARD KILL
+
+    // Parse each pod line: "id|gpuUtil|name"
+    let cmd = "echo '" + lines.replace("'", "'\\''") + "' | while IFS='|' read pid gpu name; do echo \"$pid $gpu $name\"; done"
+    let parsed = sh(cmd)
+    // R37/AN13/L3-PY violation — python3 wrapper-fallback removed 2026-04-18
+    // Original: python3 HEREDOC parsing lines → idle file update → HARD KILL decision
+    let _ = parsed
+    let _ = threshold
+    let _ = max_consecutive
+    let result = "R37/AN13/L3-PY: python3 invocation blocked at h100_idle_guard.hexa:enforce_gpu_idle. Escalate to user for hexa-native replacement."
+    eprintln(result)
+    return 0
+
+    // Extract KILL list and execute
+    let kill_list = sh("echo '" + result.replace("'", "'\\''") + "' | grep '^KILL:' | sed 's/KILL://'")
+    if len(kill_list) == 0 { return 0 }
+    if kill_list == "" { return 0 }
+
+    // Actually kill each pod
+    let kill_exec = "for pid in $(echo '" + kill_list + "' | tr ',' ' '); do " +
+        "if [ -n \"$pid\" ]; then " +
+        (if dry { "echo \"[DRY] would stop $pid\"" } else { "runpodctl pod stop $pid 2>&1 | head -1" }) +
+        "; fi; done"
+    let kill_result = sh_stderr(kill_exec)
+    if len(kill_result) > 0 { println("  " + kill_result) }
+
+    // Count kills
+    let kc = sh("echo '" + kill_list + "' | tr ',' '\\n' | grep -c '.' 2>/dev/null")
+    killed = to_int(kc)
+
+    // Log kills
+    let mut ki = 0
+    let ts = iso_now()
+    let ids = sh("echo '" + kill_list + "' | tr ',' '\\n'")
+    // Emit alert for each kill
+    if killed > 0 {
+        emit_alert("_gpu_idle", "HARD_KILL", killed, "pods=" + kill_list + " gpu<" + to_string(threshold) + "% x" + to_string(max_consecutive))
+    }
+    return killed
+}
+
+// ── Heartbeat age check ─────────────────────────────────────────────────────
+fn hb_age_seconds(slot: string) -> int {
+    let p = HB_DIR + "/" + slot + ".json"
+    if file_exists(p) == false { return -1 }  // never heartbeated
+    let mt = file_mtime(p)
+    if mt == 0 { return -1 }
+    let now = now_epoch()
+    return now - mt
+}
+
+// ── Action: warn / dispatch / terminate ─────────────────────────────────────
+fn emit_alert(slot: string, kind: string, age_sec: int, note: string) {
+    let ts = iso_now()
+    let line = "{\"ts\":\"" + ts + "\",\"slot\":\"" + slot + "\",\"kind\":\"" + kind + "\",\"age_sec\":" + to_string(age_sec) + ",\"note\":\"" + note + "\"}"
+    jsonl_append(line)
+}
+
+fn action_for_age(age_sec: int, kill_minutes: int) -> string {
+    if age_sec < 0 { return "grace" }         // no heartbeat yet
+    let m = age_sec / 60
+    if m >= kill_minutes { return "terminate" }
+    if m >= (kill_minutes * 2 / 3) { return "dispatch_fallback" }
+    if m >= (kill_minutes / 3) { return "warn" }
+    return "ok"
+}
+
+fn dispatch_fallback(slot: string, fq_hint: string) {
+    // 현 단계 구현: alert jsonl에 "need fallback"만 기록 (loop.hexa가 읽고 에이전트 발사)
+    emit_alert(slot, "dispatch_fallback", 0, "hint=" + fq_hint)
+    println("  → fallback 권장: " + fq_hint)
+}
+
+fn terminate_pod(slot: string, dry: bool) -> string {
+    if dry { return "dry-run (skipped terminate)" }
+    // HARD KILL — runpodctl pod stop 실제 실행
+    // slot name으로 pod_id 매핑: runpodctl pod list → name 매칭
+    // R37/AN13/L3-PY violation — python3 wrapper-fallback removed 2026-04-18
+    // Original: runpodctl pod list | python3 -c "..." for slot→pod_id mapping
+    eprintln("R37/AN13/L3-PY: python3 invocation blocked at h100_idle_guard.hexa:terminate_pod. Escalate to user for hexa-native replacement.")
+    let pod_id = ""
+    if len(pod_id) == 0 {
+        emit_alert(slot, "terminate_no_match", 0, "no running pod matching slot=" + slot)
+        return "no pod found for slot " + slot
+    }
+    // Execute hard kill
+    let stop_result = sh_stderr("runpodctl pod stop " + pod_id)
+    emit_alert(slot, "HARD_KILL", 0, "pod_id=" + pod_id + " result=" + stop_result)
+    println("  [HARD KILL] " + slot + " pod=" + pod_id + " → " + stop_result)
+    return "KILLED pod=" + pod_id
+}
+
+// ── Status table ────────────────────────────────────────────────────────────
+fn print_plan_table() {
+    println("")
+    println("═══ GPU 4-POD PLAN (H100/A100 auto-fallback) ════════════════════════")
+    let n = plan_pod_count()
+    println("  slot                role                              budget/day  idle_kill")
+    println("  ─────────────────── ────────────────────────────────  ──────────  ─────────")
+    let mut i = 0
+    while i < n {
+        let slot = plan_pod_field(i, "slot")
+        let role = plan_pod_field(i, "role")
+        let budget = plan_pod_int(i, "budget_usd_per_day_max")
+        let kill = plan_pod_int(i, "idle_kill_minutes")
+        let role_trim = if role.len() > 32 { role.substring(0, 32) } else { role }
+        println("  " + rpad(slot, 19) + " " + rpad(role_trim, 33) + " $" + rpad(to_string(budget), 9) + " " + to_string(kill) + "min")
+        i = i + 1
+    }
+    let daily = plan_get_int(PLAN, "['limits']['daily_budget_usd_total']")
+    let monthly = plan_get_int(PLAN, "['cost']['monthly_cap_usd']")
+    let maxp = plan_get_int(PLAN, "['limits']['max_concurrent_pods']")
+    let auto = plan_get_int(PLAN, "['limits']['auto_launch_authorized']")
+    println("")
+    println("  limits: max_pods=" + to_string(maxp) + "  daily=$" + to_string(daily) + "  monthly=$" + to_string(monthly) + "  auto_launch≤" + to_string(auto))
+    println("══════════════════════════════════════════════════════════════════════")
+}
+
+fn rpad(s: string, n: int) -> string {
+    let mut r = s
+    while r.len() < n { r = r + " " }
+    return r
+}
+
+fn print_status(running_pods: int, cost_per_hr: string) {
+    println("")
+    println("═══ H100 GUARD STATUS ═════════════════════════════════════════════════")
+    println("  time:         " + iso_now())
+    println("  running pods: " + to_string(running_pods))
+    println("  $/hr now:     " + cost_per_hr)
+    println("  slot                hb_age       action")
+    println("  ─────────────────── ────────────  ────────────────────")
+    let n = plan_pod_count()
+    let mut i = 0
+    while i < n {
+        let slot = plan_pod_field(i, "slot")
+        let kill = plan_pod_int(i, "idle_kill_minutes")
+        let age = hb_age_seconds(slot)
+        let age_s = if age < 0 { "(none)" } else { to_string(age / 60) + "m" + to_string(age % 60) + "s" }
+        let act = action_for_age(age, kill)
+        println("  " + rpad(slot, 19) + " " + rpad(age_s, 12) + " " + act)
+        i = i + 1
+    }
+    println("══════════════════════════════════════════════════════════════════════")
+}
+
+// ── Main ────────────────────────────────────────────────────────────────────
+fn main() {
+    ensure_launchd_sandbox()
+    let argv = args()
+    let mut dry = false
+    let mut status_only = false
+    let mut plan_only = false
+    for a in argv {
+        if a == "--dry" { dry = true }
+        else if a == "--status" { status_only = true }
+        else if a == "--plan" { plan_only = true }
+    }
+
+    if plan_only {
+        print_plan_table()
+        return
+    }
+
+    if file_exists(PLAN) == false {
+        println("REJECT: plan missing: " + PLAN)
+        return
+    }
+
+    let _ = exec("mkdir -p '" + HB_DIR + "' 2>/dev/null")  // @allow-bare-exec
+
+    let api_key = read_api_key()
+    let pods_json = query_pods(api_key)
+    let running = count_running_pods(pods_json)
+    let costhr = total_cost_per_hr(pods_json)
+
+    print_plan_table()
+    print_status(running, costhr)
+
+    if status_only { return }
+
+    // ── GPU utilization enforcement (PRIMARY — 최우선) ──────────────────
+    println("")
+    println("── GPU IDLE ENFORCEMENT ──────────────────────────────────────")
+    let gpu_killed = enforce_gpu_idle(pods_json, dry)
+    if gpu_killed > 0 {
+        println("  ✗ " + to_string(gpu_killed) + " pod(s) HARD KILLED (GPU idle)")
+    } else {
+        println("  ✓ all pods GPU active")
+    }
+
+    // ── heartbeat enforcement pass (SECONDARY — GPU 체크 보완) ──────────
+    println("")
+    println("── HEARTBEAT ENFORCEMENT ────────────────────────────────────")
+    let n = plan_pod_count()
+    let mut actions_taken = gpu_killed
+    let mut i = 0
+    while i < n {
+        let slot = plan_pod_field(i, "slot")
+        let kill = plan_pod_int(i, "idle_kill_minutes")
+        let age = hb_age_seconds(slot)
+        let act = action_for_age(age, kill)
+        if act == "warn" {
+            emit_alert(slot, "warn", age, "heartbeat stale ≥ " + to_string(kill / 3) + "min")
+            println("  [WARN] " + slot + " — heartbeat stale " + to_string(age / 60) + "min")
+            actions_taken = actions_taken + 1
+        }
+        else if act == "dispatch_fallback" {
+            let fq = plan_get_str(PLAN, "['pods'][" + to_string(i) + "]['fallback_queue_keys'][0]")
+            dispatch_fallback(slot, fq)
+            actions_taken = actions_taken + 1
+        }
+        else if act == "terminate" {
+            let r = terminate_pod(slot, dry)
+            actions_taken = actions_taken + 1
+        }
+        i = i + 1
+    }
+
+    // budget alert
+    let daily = plan_get_int(PLAN, "['limits']['daily_budget_usd_total']")
+    // R37/AN13/L3-PY violation — python3 wrapper-fallback removed 2026-04-18
+    // Original: python3 -c "print(int(float(costhr)*24))" for 24h cost projection
+    let _ = costhr
+    eprintln("R37/AN13/L3-PY: python3 invocation blocked at h100_idle_guard.hexa:budget-projection. Escalate to user for hexa-native replacement.")
+    let projected = 0
+    if projected > daily {
+        emit_alert("_global", "budget_over", projected, "24h projection $" + to_string(projected) + " > daily cap $" + to_string(daily))
+        println("  [BUDGET] 24h projection $" + to_string(projected) + " > cap $" + to_string(daily))
+        actions_taken = actions_taken + 1
+    }
+
+    // Write realtime state snapshot (consumed by SPA)
+    write_state(running, costhr, actions_taken, projected, daily)
+
+    println("")
+    println("guard: " + to_string(actions_taken) + " action(s) emitted → " + ALERTS)
+    println("state: " + STATE)
+    if dry { println("(dry-run — no terminations executed)") }
+}
+
+fn write_state(running: int, costhr: string, actions: int, projected: int, daily: int) {
+    let ts = iso_now()
+    let n = plan_pod_count()
+    let mut slots_json = ""
+    let mut i = 0
+    while i < n {
+        let slot = plan_pod_field(i, "slot")
+        let role = plan_pod_field(i, "role")
+        let track = plan_pod_field(i, "track")
+        let kill = plan_pod_int(i, "idle_kill_minutes")
+        let budget = plan_pod_int(i, "budget_usd_per_day_max")
+        let age = hb_age_seconds(slot)
+        let act = action_for_age(age, kill)
+        let comma = if i > 0 { "," } else { "" }
+        slots_json = slots_json + comma + "{" +
+            "\"slot\":\"" + slot + "\"," +
+            "\"role\":\"" + role.replace("\"", "\\\"") + "\"," +
+            "\"track\":\"" + track + "\"," +
+            "\"idle_kill_min\":" + to_string(kill) + "," +
+            "\"budget_usd_day\":" + to_string(budget) + "," +
+            "\"hb_age_sec\":" + to_string(age) + "," +
+            "\"action\":\"" + act + "\"" +
+        "}"
+        i = i + 1
+    }
+    let body = "{" +
+        "\"ts\":\"" + ts + "\"," +
+        "\"running_pods\":" + to_string(running) + "," +
+        "\"cost_per_hr_usd\":" + costhr + "," +
+        "\"projected_24h_usd\":" + to_string(projected) + "," +
+        "\"daily_budget_usd\":" + to_string(daily) + "," +
+        "\"actions_emitted\":" + to_string(actions) + "," +
+        "\"alerts_log\":\"shared/tool/h100_alerts.jsonl\"," +
+        "\"plan_source\":\"shared/config/h100_plan.json\"," +
+        "\"slots\":[" + slots_json + "]" +
+    "}"
+    write_file(STATE, body + "\n")
+}
+
+main()

@@ -16,7 +16,7 @@
 
 ```bash
 cd $NEXUS_ROOT
-./shared/sim_bridge/bostrom_test/runner.sh 30 my_run
+./sim_bridge/bostrom_test/runner.sh 30 my_run
 ```
 
 Output → `runs/my_run/`:

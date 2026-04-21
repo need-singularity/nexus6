@@ -1,0 +1,189 @@
+// pass_gate_an11.hexa — AN11 위반 스캐너 + 경고 + 자동 revoke
+//
+// GOVERNS: shared/rules/anima.json#AN11 (⛔ 실사용_완성_강제)
+// PURPOSE: .convergence 파일의 @state pass/ossified/completed 패턴 감지 시
+//          3 필드 (@phi_evidence + @weight_emergent_proof + @real_usable_endpoint) 검사.
+//          하나라도 빈 값 / 위반 값 (prompt/mock/scaffold) 이면 auto-revoke + stderr WARN.
+//
+// USAGE:
+//   hexa shared/tool/pass_gate_an11.hexa scan
+//     → stderr: [AN11-VIOLATION] 목록 + stdout: summary 1줄, exit 2 if any violation
+//   hexa shared/tool/pass_gate_an11.hexa scan --jsonl
+//     → stdout: JSONL 각 violation
+//   hexa shared/tool/pass_gate_an11.hexa scan --auto-revoke
+//     → 위반 .convergence 에 @state revoked_an11_violation 자동 기입 + @revocation_reason 작성
+
+let HOME = env("HOME")
+let ANIMA = if env("ANIMA") != "" { env("ANIMA") } else { HOME + "/mac_home/dev/anima" }
+let CONV_DIR = ANIMA + "/convergence"
+let VIOLATIONS_LOG = ANIMA + "/convergence/_an11_violations.jsonl"
+let MISTAKES_LOG = ANIMA + "/tool/mistakes.jsonl"
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+// Patterns that count as "claimed PASS":
+let PASS_PATTERNS = ["@state ossified", "@state pass", "@state completed", "@state done",
+                     "@state ossified_pass", "@state scaffold_done", "@state completed_gap"]
+
+// Violations on field values:
+let BAD_VALUE_TOKENS = ["prompt", "wrapping", "mock", "scaffold", "smoke", "stub",
+                        "README pending", "TBD", "pending"]
+
+fn list_convergence() -> array {
+    let cmd = "ls -1 " + CONV_DIR + " 2>/dev/null | grep -E '\\.convergence$' || true"
+    let out = _str(exec(cmd))
+    let lines = out.split("\n")
+    let mut acc = []
+    let mut i = 0
+    let n = len(lines)
+    while i < n {
+        let line = _str(lines[i]).trim()
+        if line != "" { acc = push(acc, line) }
+        i = i + 1
+    }
+    return acc
+}
+
+fn claims_pass(content: string) -> bool {
+    let mut j = 0
+    while j < len(PASS_PATTERNS) {
+        let p = _str(PASS_PATTERNS[j])
+        if content.index_of(p) >= 0 { return true }
+        j = j + 1
+    }
+    return false
+}
+
+fn has_revoked_marker(content: string) -> bool {
+    return content.index_of("revoked") >= 0
+}
+
+// Extract @directive value (everything on same line after the @tag)
+fn extract_directive(content: string, tag: string) -> string {
+    let needle = "\n" + tag + " "
+    let at = content.index_of(needle)
+    if at < 0 {
+        // try at start of file
+        if content.index_of(tag + " ") == 0 {
+            let end = content.index_of("\n")
+            if end < 0 { return content.substring(len(tag) + 1, len(content)).trim() }
+            return content.substring(len(tag) + 1, end).trim()
+        }
+        return ""
+    }
+    let start = at + len(needle)
+    let rest = content.substring(start, len(content))
+    let nl = rest.index_of("\n")
+    if nl < 0 { return rest.trim() }
+    return rest.substring(0, nl).trim()
+}
+
+fn contains_bad_token(val: string) -> string {
+    let v_low = val.to_lower()
+    let mut k = 0
+    while k < len(BAD_VALUE_TOKENS) {
+        let bt = _str(BAD_VALUE_TOKENS[k]).to_lower()
+        if v_low.index_of(bt) >= 0 { return bt }
+        k = k + 1
+    }
+    return ""
+}
+
+fn now_utc() -> string {
+    return _str(exec("date -u +%FT%TZ")).trim()
+}
+
+fn append_jsonl(path: string, line: string) {
+    let script = "/tmp/_an11_append.sh"
+    write_file(script, "#!/bin/sh\ncat >> " + path + " <<'AN11_EOF'\n" + line + "AN11_EOF\n")
+    exec("chmod +x " + script)
+    exec(script)
+}
+
+fn scan_one(fname: string, jsonl: bool, auto_revoke: bool) -> int {
+    let path = CONV_DIR + "/" + fname
+    let content = read_file(path)
+    if !claims_pass(content) { return 0 }
+    if has_revoked_marker(content) { return 0 }  // already revoked
+
+    let phi = extract_directive(content, "@phi_evidence")
+    let weight = extract_directive(content, "@weight_emergent_proof")
+    let endpoint = extract_directive(content, "@real_usable_endpoint")
+
+    let mut fails = []
+    if phi == "" { fails = push(fails, "a_missing_phi_evidence") }
+    if weight == "" { fails = push(fails, "b_missing_weight_emergent_proof") }
+    if endpoint == "" { fails = push(fails, "c_missing_real_usable_endpoint") }
+
+    let bad_phi = contains_bad_token(phi)
+    let bad_weight = contains_bad_token(weight)
+    let bad_endpoint = contains_bad_token(endpoint)
+    if bad_phi != "" { fails = push(fails, "a_bad_phi[" + bad_phi + "]") }
+    if bad_weight != "" { fails = push(fails, "b_bad_weight[" + bad_weight + "]") }
+    if bad_endpoint != "" { fails = push(fails, "c_bad_endpoint[" + bad_endpoint + "]") }
+
+    if len(fails) == 0 { return 0 }  // no violation
+
+    let ts = now_utc()
+    let fails_str = join(fails, ",")
+
+    if jsonl {
+        print("{\"ts\":\"" + ts + "\",\"file\":\"" + fname + "\",\"fails\":[\"" +
+              join(fails, "\",\"") + "\"]}")
+    } else {
+        eprint("[AN11-VIOLATION] " + fname + " — fails=[" + fails_str + "]")
+    }
+
+    append_jsonl(VIOLATIONS_LOG,
+        "{\"ts\":\"" + ts + "\",\"file\":\"" + fname + "\",\"fails\":\"" + fails_str + "\",\"action\":\"" +
+        (if auto_revoke { "auto_revoke" } else { "warn_only" }) + "\"}\n")
+
+    if auto_revoke {
+        let new_state_line = "@state revoked_an11_violation"
+        let reason_line = "@revocation_reason AN11 auto-revoke " + ts + " fails=[" + fails_str + "]\n"
+        // Simple patch: prepend reason if not present (safest)
+        // The actual @state rewrite we leave to human review to avoid corruption.
+        let patched = content + "\n\n" + reason_line
+        write_file(path, patched)
+    }
+
+    return 1
+}
+
+fn main() {
+    let argv = args()
+    let argc = len(argv)
+    let mut mode = "scan"
+    let mut jsonl = false
+    let mut auto_revoke = false
+    let mut k = 0
+    while k < argc {
+        let a = _str(argv[k])
+        if a == "--jsonl" { jsonl = true }
+        if a == "--auto-revoke" { auto_revoke = true }
+        k = k + 1
+    }
+
+    let files = list_convergence()
+    let n = len(files)
+    let mut violations = 0
+    let mut i = 0
+    while i < n {
+        let fname = _str(files[i])
+        violations = violations + scan_one(fname, jsonl, auto_revoke)
+        i = i + 1
+    }
+
+    if !jsonl {
+        println("[pass_gate_an11] scanned=" + to_string(n) +
+                " violations=" + to_string(violations) +
+                " auto_revoke=" + to_string(auto_revoke))
+    }
+
+    if violations > 0 { exit(2) }
+    exit(0)
+}

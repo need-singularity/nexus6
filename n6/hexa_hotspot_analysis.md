@@ -34,7 +34,7 @@ The `shared/bin/hexa` referenced in the ROI item is a Bash wrapper, not the comp
 
 ```
 ~/.hx/bin/hexa (symlink)
-  -> $AIRGENOME/nexus/shared/bin/hexa (Bash script, 152 lines)
+  -> $AIRGENOME/nexus/bin/hexa (Bash script, 152 lines)
      -> L0 guard check (python3)
      -> Mac-only passthrough OR remote routing (ubu/hetzner)
      -> exec $LOCAL_HEXA "$@"

@@ -1,0 +1,264 @@
+// project.hexa — projects.json CRUD (list|add|remove|all)
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+// SSOT: shared/config/projects.json
+// 대체 대상: shared/tool/project_crud.py (R1 위반 — .py)
+//
+// usage:
+//   hexa run project.hexa [list|add <name>|remove <name>|all <cmd>]
+// 규약: 성공 조용(add/remove 는 확인 println), 실패 stderr + exit 1.
+
+let HOME = env("HOME")
+let SSOT = HOME + "/Dev/nexus/config/projects.json"  // @allow-devpath
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _to_int0(s: string) -> i64 {
+    if s == "" { return 0 }
+    let first = _str(s.split("\n")[0]).trim()
+    if first == "" { return 0 }
+    return to_int(first)
+}
+
+// UTF-8 byte-size heuristic: 3+ bytes = CJK/emoji → 시각폭 2, else 1
+fn visual_width(s: string) -> i64 {
+    let mut w: i64 = 0
+    for ch in s.chars() {
+        if ch.len() >= 3 { w = w + 2 } else { w = w + 1 }
+    }
+    return w
+}
+
+fn pad_right(s: string, tw: i64) -> string {
+    let mut out = s
+    let mut rem = tw - visual_width(s)
+    if rem < 0 { rem = 0 }
+    for i in range(0, rem) { out = out + " " }
+    return out
+}
+
+fn repeat(s: string, n: i64) -> string {
+    let mut out = ""
+    for i in range(0, n) { out = out + s }
+    return out
+}
+
+fn hline(l: string, m: string, r: string, widths) -> string {
+    let mut parts = []
+    for w in widths { parts.push(repeat("─", w + 2)) }
+    return l + parts.join(m) + r
+}
+
+fn render_row(cells, widths) -> string {
+    let mut parts = []
+    for i in range(0, widths.len()) {
+        parts = parts.push(pad_right(cells[i], widths[i]))
+    }
+    return "│ " + parts.join(" │ ") + " │"
+}
+
+// ── JSON 연산은 /usr/bin/jq 경유 ──
+fn jq_keys() -> [string] {
+    let out = _str(exec("/usr/bin/jq -r '.projects | keys[]' '" + SSOT + "' 2>/dev/null"))  // @allow-bare-exec
+    let mut names = []
+    for ln in out.split("\n") {
+        let t = ln.trim()
+        if t != "" { names.push(t) }
+    }
+    return names
+}
+
+fn jq_field(name: string, field: string) -> string {
+    let esc_n = name.replace("'", "")
+    let esc_f = field.replace("'", "")
+    let q = "/usr/bin/jq -r --arg n '" + esc_n + "' --arg f '" + esc_f +
+            "' '.projects[$n][$f] // \"?\"' '" + SSOT + "' 2>/dev/null"
+    return _str(exec(q)).trim()  // @allow-bare-exec
+}
+
+fn resolve_root(name: string, root_raw: string) -> string {
+    if root_raw == "?" || root_raw == "" {
+        return HOME + "/Dev/" + name
+    }
+    if root_raw.starts_with("~/") {
+        return HOME + "/" + root_raw.substring(2, root_raw.len())
+    }
+    if root_raw.starts_with("/") {
+        return root_raw
+    }
+    // 상대경로 — 원 파이선 동작 보존 (cwd 기준)
+    return root_raw
+}
+
+fn cmd_list() {
+    let names = jq_keys()
+    if names.len() == 0 {
+        println("(empty)")
+        return
+    }
+    let headers = ["name", "display", "root", "role"]
+    let mut rows = []
+    rows = rows.push(headers)
+    for n in names {
+        let d = jq_field(n, "display_name")
+        let r = jq_field(n, "root")
+        let role = jq_field(n, "role")
+        rows = rows.push([n, d, r, role])
+    }
+    let ncol: i64 = 4
+    let mut widths = []
+    for i in range(0, ncol) {
+        let mut mw: i64 = 0
+        for row in rows {
+            let w = visual_width(row[i])
+            if w > mw { mw = w }
+        }
+        widths = widths.push(mw)
+    }
+    println(hline("┌", "┬", "┐", widths))
+    println(render_row(rows[0], widths))
+    println(hline("├", "┼", "┤", widths))
+    for i in range(1, rows.len()) {
+        println(render_row(rows[i], widths))
+        if i < rows.len() - 1 {
+            println(hline("├", "┼", "┤", widths))
+        }
+    }
+    println(hline("└", "┴", "┘", widths))
+    println("총 " + to_string(names.len()) + " 프로젝트")
+}
+
+fn cmd_add(argv) {
+    if argv.len() < 4 {
+        eprintln("usage: project add <name>")
+        exit(1)
+    }
+    let name = argv[3]
+    let esc = name.replace("'", "")
+    let chk = _str(exec("/usr/bin/jq -r --arg n '" + esc +  // @allow-bare-exec
+                       "' '.projects[$n] // \"MISSING\"' '" + SSOT + "' 2>/dev/null")).trim()
+    if chk != "MISSING" {
+        eprintln("REJECT: '" + name + "' 이미 존재")
+        exit(1)
+    }
+    let tmp = SSOT + ".tmp"
+    let skeleton = "{\"root\":(\"~/Dev/\" + $n),\"display_name\":$n,\"role\":\"unknown\",\"description\":\"auto-generated skeleton\",\"hypothesis_dirs\":[],\"constant_dirs\":[],\"verify_harvest\":{}}"
+    let cmd = "/usr/bin/jq --arg n '" + esc + "' '.projects[$n] = " + skeleton +
+              "' '" + SSOT + "' > '" + tmp + "' && mv '" + tmp + "' '" + SSOT + "'"
+    exec(cmd)  // @allow-bare-exec
+    let count = jq_keys().len()
+    println("✓ '" + name + "' 추가됨 (총 " + to_string(count) + ")")
+}
+
+fn cmd_remove(argv) {
+    if argv.len() < 4 {
+        eprintln("usage: project remove <name>")
+        exit(1)
+    }
+    let name = argv[3]
+    let esc = name.replace("'", "")
+    let chk = _str(exec("/usr/bin/jq -r --arg n '" + esc +  // @allow-bare-exec
+                       "' '.projects[$n] // \"MISSING\"' '" + SSOT + "' 2>/dev/null")).trim()
+    if chk == "MISSING" {
+        eprintln("NOT_FOUND: '" + name + "'")
+        exit(1)
+    }
+    let root_raw = jq_field(name, "root")
+    let abs_root = resolve_root(name, root_raw)
+    let markers = [".ssot", "shared/L0", "CLAUDE.md", "shared/lockdown"]
+    let mut found = []
+    for m in markers {
+        let p = abs_root + "/" + m
+        if file_exists(p) || dir_exists(p) { found.push(m) }
+    }
+    if found.len() > 0 {
+        eprintln("REJECT: L0 자산 존재 — " + found.join(","))
+        exit(2)
+    }
+    let tmp = SSOT + ".tmp"
+    let cmd = "/usr/bin/jq --arg n '" + esc + "' 'del(.projects[$n])' '" +
+              SSOT + "' > '" + tmp + "' && mv '" + tmp + "' '" + SSOT + "'"
+    exec(cmd)  // @allow-bare-exec
+    let count = jq_keys().len()
+    println("✓ '" + name + "' 제거됨 (총 " + to_string(count) + ")")
+}
+
+fn cmd_all(argv) {
+    if argv.len() < 4 {
+        eprintln("usage: project all <cmd>")
+        exit(1)
+    }
+    let mut parts = []
+    for i in range(3, argv.len()) { parts.push(argv[i]) }
+    let shell_cmd = parts.join(" ")
+    let names = jq_keys()
+    for n in names {
+        let root_raw = jq_field(n, "root")
+        let abs_root = resolve_root(n, root_raw)
+        if !dir_exists(abs_root) {
+            println("=== " + n + " === (SKIP: " + abs_root + " 없음)")
+            continue
+        }
+        println("=== " + n + " ===")
+        let out = _str(exec("cd '" + abs_root + "' && " + shell_cmd + " 2>&1 | head -c 800"))  // @allow-bare-exec
+        if out != "" { println(out) }
+    }
+}
+
+fn main() {
+    // argv 정규화 (2026-04-19): Mac=[hexa, script, user...] Linux-stage1=[hexa, "run", script, user...]
+    // 이전까지 Mac-only argv[2] 가정 → Linux 에서 argv[2] = script path 로 dispatch 실패.
+    let _raw_argv = args()
+    let mut _script_idx = -1
+    let mut _scan_i = 0
+    while _scan_i < _raw_argv.len() {
+        if _raw_argv[_scan_i].ends_with(".hexa") { _script_idx = _scan_i; break }
+        _scan_i = _scan_i + 1
+    }
+    let mut _user_start = 2
+    let mut _script_token = ""
+    if _script_idx >= 0 {
+        _user_start = _script_idx + 1
+        _script_token = _raw_argv[_script_idx]
+    } else {
+        if _raw_argv.len() >= 3 {
+            if _raw_argv[1] == "run" { _user_start = 3 }
+            if _raw_argv[1] == "eval" { _user_start = 3 }
+        }
+    }
+    let mut argv: [str] = [_raw_argv[0], _script_token]
+    let mut _ua_i = _user_start
+    while _ua_i < _raw_argv.len() {
+        argv = argv + [_raw_argv[_ua_i]]
+        _ua_i = _ua_i + 1
+    }
+    if _script_token.len() > 0 && argv.len() >= 3 {
+        if argv[2] == _script_token {
+            let mut _a2: [str] = [_raw_argv[0], _script_token]
+            let mut _j2 = 3
+            while _j2 < argv.len() {
+                _a2 = _a2 + [argv[_j2]]
+                _j2 = _j2 + 1
+            }
+            argv = _a2
+        }
+    }
+    let mut sub = "list"
+    if argv.len() >= 3 { sub = argv[2] }
+
+    if sub == "list" { cmd_list() }
+    else if sub == "add" { cmd_add(argv) }
+    else if sub == "remove" { cmd_remove(argv) }
+    else if sub == "all" { cmd_all(argv) }
+    else {
+        eprintln("USAGE: project.hexa [list|add <name>|remove <name>|all <cmd>]")
+        exit(1)
+    }
+}
+
+main()

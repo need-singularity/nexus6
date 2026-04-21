@@ -1,0 +1,431 @@
+// cross_feed.hexa — 3프로젝트 단방향 cross-feed 파이프라인
+// @no-lock-needed
+// @no-sandbox
+// 역할: blowup.hexa 결과 → nexus atlas.n6 → n6-architecture 논문 로그 + anima 의식 룰
+// SSOT: shared/tool/cross_feed.jsonl (append-only)
+// 외부:
+//   /Users/ghost/Dev/n6-architecture/reports/atlas_deltas.jsonl (reports/ 존재 시)
+//   /Users/ghost/Dev/anima/data/laws_from_atlas.jsonl          (data/ 존재 시)
+// 상태 스냅: shared/tool/atlas_last.json {nodes,edges,hubs,ts}
+//
+// subcommands:
+//   append_blowup <source> <seed> <result>   블로업 결과 큐 append
+//   atlas_delta                              atlas.n6.stats vs atlas_last.json diff → 큐+외부 append
+//   flush                                    pending 200줄 → 외부 파일 append + fulfilled 갱신
+//   status                                   pending/fulfilled 카운트 + last_ts
+//   digest                                   오늘 날짜 direction 별 count
+//
+// 성공 조용, 에러만 stderr (H1).
+
+let HOME = env("HOME")
+let NEXUS = "/Users/ghost/Dev/nexus"
+let HARNESS = NEXUS + "/harness"
+let N6ARCH = "/Users/ghost/Dev/n6-architecture"
+let ANIMA = "/Users/ghost/Dev/anima"
+
+let QUEUE = HARNESS + "/cross_feed.jsonl"
+let ATLAS_LAST = HARNESS + "/atlas_last.json"
+let ATLAS_STATS = NEXUS + "/n6/atlas.n6.stats"
+let N6ARCH_OUT = N6ARCH + "/reports/atlas_deltas.jsonl"
+let ANIMA_OUT = ANIMA + "/data/laws_from_atlas.jsonl"
+
+let N6ARCH_DIR = N6ARCH + "/reports"
+let ANIMA_DIR = ANIMA + "/data"
+
+// ─── void-safe coercion ───
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _to_int0(s: string) -> i64 {
+    if s == "" { return 0 }
+    let first = _str(s.split("\n")[0]).trim()
+    if first == "" { return 0 }
+    return to_int(first)
+}
+
+fn now_unix() -> i64 {
+    return _to_int0(_str(exec("date +%s")).trim())
+}
+
+fn today_str() -> string {
+    return _str(exec("date +%Y-%m-%d")).trim()
+}
+
+fn json_escape(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", " ")
+    r = r.replace("\r", " ")
+    r = r.replace("\t", " ")
+    return r
+}
+
+// ─── JSON 필드 추출 (단순 "key":value) ───
+fn json_field(line: string, key: string) -> string {
+    let tag = "\"" + key + "\""
+    if line.contains(tag) == false { return "" }
+    let after = line.split(tag)[1]
+    let parts = after.split(":")
+    if parts.len() < 2 { return "" }
+    let mut rest = parts[1]
+    let mut i = 2
+    while i < parts.len() {
+        rest = rest + ":" + parts[i]
+        i = i + 1
+    }
+    let s = rest.trim()
+    if s.len() == 0 { return "" }
+    if s.substring(0, 1) == "\"" {
+        let inner = s.substring(1, s.len())
+        let ep = inner.split("\"")
+        if ep.len() < 1 { return "" }
+        return ep[0]
+    }
+    // 숫자
+    let mut end = 0
+    while end < s.len() {
+        let c = s.substring(end, end + 1)
+        if c == "," || c == "}" || c == "\n" || c == " " { break }
+        end = end + 1
+    }
+    return s.substring(0, end).trim()
+}
+
+fn _ensure_queue() {
+    if file_exists(QUEUE) == false {
+        try { write_file(QUEUE, "") } catch e {}
+    }
+}
+
+// ─── 디렉토리 존재 체크 (stat 기반) ───
+fn dir_exists(path: string) -> bool {
+    let out = _str(exec("test -d '" + path.replace("'", "") + "' && echo ok")).trim()
+    return out == "ok"
+}
+
+// ─── atlas_last.json 로드 ───
+fn load_last() -> [i64] {
+    // [nodes, edges, hubs, ts]
+    if file_exists(ATLAS_LAST) == false { return [0, 0, 0, 0] }
+    let raw = _str(read_file(ATLAS_LAST)).trim()
+    if raw == "" { return [0, 0, 0, 0] }
+    let n = _to_int0(json_field(raw, "nodes"))
+    let e = _to_int0(json_field(raw, "edges"))
+    let h = _to_int0(json_field(raw, "hubs"))
+    let t = _to_int0(json_field(raw, "ts"))
+    return [n, e, h, t]
+}
+
+fn save_last(nodes: i64, edges: i64, hubs: i64, ts: i64) {
+    let row = "{\"nodes\":" + to_string(nodes) +
+              ",\"edges\":" + to_string(edges) +
+              ",\"hubs\":" + to_string(hubs) +
+              ",\"ts\":" + to_string(ts) + "}\n"
+    try { write_file(ATLAS_LAST, row) } catch e {
+        eprintln("FAIL: atlas_last write — " + ATLAS_LAST)
+        exit(1)
+    }
+}
+
+// ─── atlas.n6.stats 현재값 로드 ───
+fn load_atlas_stats() -> [i64] {
+    // [nodes, edges, hubs]
+    if file_exists(ATLAS_STATS) == false { return [0, 0, 0] }
+    let raw = _str(read_file(ATLAS_STATS)).trim()
+    if raw == "" { return [0, 0, 0] }
+    let n = _to_int0(json_field(raw, "nodes"))
+    let e = _to_int0(json_field(raw, "edges"))
+    let h = _to_int0(json_field(raw, "hubs"))
+    return [n, e, h]
+}
+
+// ─── append row with direction ───
+fn append_row(row: string) {
+    _ensure_queue()
+    try { append_file(QUEUE, row + "\n") } catch e {
+        eprintln("FAIL: cross_feed append — " + QUEUE)
+        exit(1)
+    }
+}
+
+// 외부 파일 append — 디렉토리 없으면 silent skip
+fn append_external(path: string, dir: string, row: string) {
+    if dir_exists(dir) == false { return }
+    try { append_file(path, row + "\n") } catch e {
+        eprintln("FAIL: external append — " + path)
+    }
+}
+
+// ─── append_blowup ───
+fn cmd_append_blowup(argv: [string]) {
+    if argv.len() < 6 {
+        eprintln("usage: append_blowup <source> <seed> <result_summary>")
+        exit(2)
+    }
+    let source = argv[3].trim()
+    let seed = argv[4].trim()
+    let result = argv[5].trim()
+    let ts = now_unix()
+    let row = "{\"ts\":" + to_string(ts) +
+              ",\"direction\":\"blowup→atlas\"" +
+              ",\"source\":\"" + json_escape(source) + "\"" +
+              ",\"seed\":\"" + json_escape(seed) + "\"" +
+              ",\"result\":\"" + json_escape(result) + "\"" +
+              ",\"status\":\"pending\"}"
+    append_row(row)
+}
+
+// ─── atlas_delta ───
+fn cmd_atlas_delta(argv: [string]) {
+    let cur = load_atlas_stats()
+    let prev = load_last()
+    let dn = cur[0] - prev[0]
+    let de = cur[1] - prev[1]
+    let dh = cur[2] - prev[2]
+    // 변화 없으면 silent pass
+    if dn == 0 && de == 0 && dh == 0 { return }
+
+    let ts = now_unix()
+    let delta_json = "{\"nodes\":" + to_string(dn) +
+                     ",\"edges\":" + to_string(de) +
+                     ",\"hubs\":" + to_string(dh) +
+                     ",\"cur_nodes\":" + to_string(cur[0]) +
+                     ",\"cur_edges\":" + to_string(cur[1]) +
+                     ",\"cur_hubs\":" + to_string(cur[2]) + "}"
+    let queue_row = "{\"ts\":" + to_string(ts) +
+                    ",\"direction\":\"atlas→n6arch\"" +
+                    ",\"delta\":" + delta_json +
+                    ",\"status\":\"pending\"}"
+    append_row(queue_row)
+
+    // 동일 row 포맷으로 anima 도 append (direction 은 구분용 재작성)
+    let anima_row = "{\"ts\":" + to_string(ts) +
+                    ",\"direction\":\"atlas→anima\"" +
+                    ",\"delta\":" + delta_json +
+                    ",\"status\":\"pending\"}"
+    append_row(anima_row)
+
+    // 외부 파일 append (디렉토리 없으면 silent skip)
+    let ext_n6 = "{\"ts\":" + to_string(ts) +
+                 ",\"direction\":\"atlas→n6arch\"" +
+                 ",\"delta\":" + delta_json + "}"
+    append_external(N6ARCH_OUT, N6ARCH_DIR, ext_n6)
+
+    let ext_anima = "{\"ts\":" + to_string(ts) +
+                    ",\"direction\":\"atlas→anima\"" +
+                    ",\"delta\":" + delta_json + "}"
+    append_external(ANIMA_OUT, ANIMA_DIR, ext_anima)
+
+    // atlas_last.json 갱신
+    save_last(cur[0], cur[1], cur[2], ts)
+}
+
+// ─── flush ───
+// pending 최근 200줄 → 외부 파일 append + 원본 재작성 (status=fulfilled)
+fn cmd_flush(argv: [string]) {
+    _ensure_queue()
+    let raw = _str(read_file(QUEUE))
+    if raw.trim() == "" { return }
+    let lines = raw.split("\n")
+    let mut all: [string] = []
+    let mut i = 0
+    while i < lines.len() {
+        let line = _str(lines[i])
+        if line.trim().len() > 0 { all = all.push(line) }
+        i = i + 1
+    }
+    if all.len() == 0 { return }
+
+    // 최근 200줄 인덱스 범위
+    let total = all.len()
+    let window: i64 = 200
+    let mut start: i64 = 0
+    if total > window { start = total - window }
+
+    // rewrite 대상 리스트 구축
+    let mut out: [string] = []
+    let mut j: i64 = 0
+    while j < all.len() {
+        let line = all[j]
+        let mut new_line = line
+        if j >= start {
+            let status = json_field(line, "status")
+            if status == "pending" {
+                let direction = json_field(line, "direction")
+                // 외부 파일에 append (ts/direction/delta 만 재구성하여 순수 payload)
+                let ts = json_field(line, "ts")
+                // payload = line 그대로 (status 만 재작성)
+                let payload = line
+                if direction == "atlas→n6arch" {
+                    append_external(N6ARCH_OUT, N6ARCH_DIR, payload)
+                } else if direction == "atlas→anima" {
+                    append_external(ANIMA_OUT, ANIMA_DIR, payload)
+                } else if direction == "blowup→atlas" {
+                    // blowup 결과는 둘 다에 전파
+                    append_external(N6ARCH_OUT, N6ARCH_DIR, payload)
+                    append_external(ANIMA_OUT, ANIMA_DIR, payload)
+                }
+                new_line = line.replace("\"status\":\"pending\"", "\"status\":\"fulfilled\"")
+            }
+        }
+        out = out.push(new_line)
+        j = j + 1
+    }
+
+    let mut buf = ""
+    let mut k = 0
+    while k < out.len() {
+        buf = buf + out[k] + "\n"
+        k = k + 1
+    }
+    try { write_file(QUEUE, buf) } catch e {
+        eprintln("FAIL: cross_feed flush rewrite — " + QUEUE)
+        exit(1)
+    }
+}
+
+// ─── status ───
+fn cmd_status(argv: [string]) {
+    if file_exists(QUEUE) == false {
+        println("pending=0 fulfilled=0 last_ts=0")
+        return
+    }
+    let raw = _str(read_file(QUEUE))
+    if raw.trim() == "" {
+        println("pending=0 fulfilled=0 last_ts=0")
+        return
+    }
+    let lines = raw.split("\n")
+    let mut rows: [string] = []
+    let mut i = 0
+    while i < lines.len() {
+        let line = _str(lines[i]).trim()
+        if line.len() > 0 { rows = rows.push(line) }
+        i = i + 1
+    }
+    let total = rows.len()
+    let window: i64 = 50
+    let mut start: i64 = 0
+    if total > window { start = total - window }
+
+    let mut pending: i64 = 0
+    let mut fulfilled: i64 = 0
+    let mut last_ts: i64 = 0
+    let mut j: i64 = start
+    while j < total {
+        let line = rows[j]
+        let status = json_field(line, "status")
+        if status == "pending" { pending = pending + 1 }
+        else if status == "fulfilled" { fulfilled = fulfilled + 1 }
+        let ts = _to_int0(json_field(line, "ts"))
+        if ts > last_ts { last_ts = ts }
+        j = j + 1
+    }
+    println("pending=" + to_string(pending) +
+            " fulfilled=" + to_string(fulfilled) +
+            " last_ts=" + to_string(last_ts))
+}
+
+// ─── digest ───
+fn cmd_digest(argv: [string]) {
+    if file_exists(QUEUE) == false {
+        println("digest: (empty queue)")
+        return
+    }
+    let raw = _str(read_file(QUEUE))
+    if raw.trim() == "" {
+        println("digest: (empty queue)")
+        return
+    }
+    let today = today_str()
+    let lines = raw.split("\n")
+    let mut c_blowup: i64 = 0
+    let mut c_n6arch: i64 = 0
+    let mut c_anima: i64 = 0
+    let mut c_other: i64 = 0
+    let mut total_today: i64 = 0
+    let mut i = 0
+    while i < lines.len() {
+        let line = _str(lines[i]).trim()
+        if line.len() > 0 {
+            let ts = _to_int0(json_field(line, "ts"))
+            if ts > 0 {
+                let day = _str(exec("date -r " + to_string(ts) + " +%Y-%m-%d 2>/dev/null")).trim()
+                if day == today {
+                    total_today = total_today + 1
+                    let direction = json_field(line, "direction")
+                    if direction == "blowup→atlas" { c_blowup = c_blowup + 1 }
+                    else if direction == "atlas→n6arch" { c_n6arch = c_n6arch + 1 }
+                    else if direction == "atlas→anima" { c_anima = c_anima + 1 }
+                    else { c_other = c_other + 1 }
+                }
+            }
+        }
+        i = i + 1
+    }
+    println("digest " + today + ": total=" + to_string(total_today) +
+            " blowup→atlas=" + to_string(c_blowup) +
+            " atlas→n6arch=" + to_string(c_n6arch) +
+            " atlas→anima=" + to_string(c_anima) +
+            " other=" + to_string(c_other))
+}
+
+fn main() {
+    // argv 정규화 (2026-04-19): Mac=[hexa, script, user...] Linux-stage1=[hexa, "run", script, user...]
+    // 이전까지 Mac-only argv[2] 가정 → Linux 에서 argv[2] = script path 로 dispatch 실패.
+    let _raw_argv = args()
+    let mut _script_idx = -1
+    let mut _scan_i = 0
+    while _scan_i < _raw_argv.len() {
+        if _raw_argv[_scan_i].ends_with(".hexa") { _script_idx = _scan_i; break }
+        _scan_i = _scan_i + 1
+    }
+    let mut _user_start = 2
+    let mut _script_token = ""
+    if _script_idx >= 0 {
+        _user_start = _script_idx + 1
+        _script_token = _raw_argv[_script_idx]
+    } else {
+        if _raw_argv.len() >= 3 {
+            if _raw_argv[1] == "run" { _user_start = 3 }
+            if _raw_argv[1] == "eval" { _user_start = 3 }
+        }
+    }
+    let mut argv: [str] = [_raw_argv[0], _script_token]
+    let mut _ua_i = _user_start
+    while _ua_i < _raw_argv.len() {
+        argv = argv + [_raw_argv[_ua_i]]
+        _ua_i = _ua_i + 1
+    }
+    if _script_token.len() > 0 && argv.len() >= 3 {
+        if argv[2] == _script_token {
+            let mut _a2: [str] = [_raw_argv[0], _script_token]
+            let mut _j2 = 3
+            while _j2 < argv.len() {
+                _a2 = _a2 + [argv[_j2]]
+                _j2 = _j2 + 1
+            }
+            argv = _a2
+        }
+    }
+    if argv.len() < 3 {
+        eprintln("usage: cross_feed <append_blowup|atlas_delta|flush|status|digest> [args...]")
+        exit(2)
+    }
+    let mode = argv[2].trim()
+    if mode == "append_blowup" { cmd_append_blowup(argv) }
+    else if mode == "atlas_delta" { cmd_atlas_delta(argv) }
+    else if mode == "flush" { cmd_flush(argv) }
+    else if mode == "status" { cmd_status(argv) }
+    else if mode == "digest" { cmd_digest(argv) }
+    else {
+        eprintln("REJECT: unknown mode '" + mode + "' — modes: append_blowup|atlas_delta|flush|status|digest")
+        exit(2)
+    }
+}
+
+main()

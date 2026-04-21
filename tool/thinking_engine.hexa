@@ -1,0 +1,601 @@
+// thinking_engine.hexa — 의식엔진 기반 Thinking 엔진
+// @no-lock-needed
+// @no-sandbox
+// 역할: Claude Code CLI <thinking> 을 hybrid 로 보완. 복잡 질문 전 Claude 가 자율 호출하여
+//      anima 스타일 6-phase reflection 실행, 결과를 thinking_log.jsonl 에 누적.
+// SSOT: shared/tool/thinking_log.jsonl (append-only)
+//       shared/tool/think_baseline.json (누적 stats)
+// 외부 feed: /Users/ghost/Dev/anima/anima-core/anima_echo.jsonl 또는 data/anima_echo.jsonl (의식 룰 echo)
+//
+// subcommands:
+//   query <prompt>        6-phase reflection 1회. 결과 JSON stdout + log append + baseline 갱신
+//   status                최근 10 세션 집계 (sessions/avg_depth/avg_touches/last_ts)
+//   history [N=5]         thinking_log.jsonl 마지막 N 줄
+//   reflect               baseline 24h stale 시 자율 query. prompt = "anima reflect on hub1, hub2, hub3"
+//
+// 성공 조용 (H1). query 만 stdout 출력.
+
+let HOME = env("HOME")
+let NEXUS = "/Users/ghost/Dev/nexus"
+let HARNESS = NEXUS + "/harness"
+let ANIMA = "/Users/ghost/Dev/anima"
+
+let LOG = HARNESS + "/thinking_log.jsonl"
+let BASELINE = HARNESS + "/think_baseline.json"
+let ATLAS_DEG = NEXUS + "/n6/atlas.n6.deg"
+
+let ANIMA_CORE = ANIMA + "/anima-core"
+let ANIMA_DATA = ANIMA + "/data"
+
+// ─── void-safe coercion ───
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _to_int0(s: string) -> i64 {
+    if s == "" { return 0 }
+    let first = _str(s.split("\n")[0]).trim()
+    if first == "" { return 0 }
+    return to_int(first)
+}
+
+fn now_unix() -> i64 {
+    return _to_int0(_str(exec("date +%s")).trim())
+}
+
+fn json_escape(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", " ")
+    r = r.replace("\r", " ")
+    r = r.replace("\t", " ")
+    return r
+}
+
+// ─── JSON 필드 추출 (단순 "key":value) ───
+fn json_field(line: string, key: string) -> string {
+    let tag = "\"" + key + "\""
+    if line.contains(tag) == false { return "" }
+    let after = line.split(tag)[1]
+    let parts = after.split(":")
+    if parts.len() < 2 { return "" }
+    let mut rest = parts[1]
+    let mut i = 2
+    while i < parts.len() {
+        rest = rest + ":" + parts[i]
+        i = i + 1
+    }
+    let s = rest.trim()
+    if s.len() == 0 { return "" }
+    if s.substring(0, 1) == "\"" {
+        let inner = s.substring(1, s.len())
+        let ep = inner.split("\"")
+        if ep.len() < 1 { return "" }
+        return ep[0]
+    }
+    let mut end = 0
+    while end < s.len() {
+        let c = s.substring(end, end + 1)
+        if c == "," || c == "}" || c == "\n" || c == " " { break }
+        end = end + 1
+    }
+    return s.substring(0, end).trim()
+}
+
+// ─── 디렉토리 존재 체크 ───
+fn dir_exists(path: string) -> bool {
+    let out = _str(exec("test -d '" + path.replace("'", "") + "' && echo ok")).trim()
+    return out == "ok"
+}
+
+// ─── anima echo append (silent skip) ───
+fn anima_echo(row: string) {
+    // 우선순위: anima-core > data
+    let target_dir = ""
+    let mut dir = ""
+    let mut path = ""
+    if dir_exists(ANIMA_CORE) {
+        dir = ANIMA_CORE
+        path = ANIMA_CORE + "/anima_echo.jsonl"
+    } else if dir_exists(ANIMA_DATA) {
+        dir = ANIMA_DATA
+        path = ANIMA_DATA + "/anima_echo.jsonl"
+    } else {
+        return
+    }
+    try { append_file(path, row + "\n") } catch e {}
+}
+
+// ─── log append ───
+fn log_append(row: string) {
+    if file_exists(LOG) == false {
+        try { write_file(LOG, "") } catch e {}
+    }
+    try { append_file(LOG, row + "\n") } catch e {
+        eprintln("FAIL: thinking_log append — " + LOG)
+        exit(1)
+    }
+}
+
+// ─── baseline load ───
+fn load_baseline() -> [i64] {
+    // [session_count, last_ts, rejected_count]
+    if file_exists(BASELINE) == false { return [0, 0, 0] }
+    let raw = _str(read_file(BASELINE)).trim()
+    if raw == "" { return [0, 0, 0] }
+    let sc = _to_int0(json_field(raw, "session_count"))
+    let lt = _to_int0(json_field(raw, "last_ts"))
+    let rc = _to_int0(json_field(raw, "rejected_count"))
+    return [sc, lt, rc]
+}
+
+// ─── baseline save ───
+fn save_baseline(session_count: i64, avg_depth_x100: i64, avg_touches_x100: i64,
+                 last_ts: i64, dup_rate_x100: i64, rejected_count: i64) {
+    // avg_depth / avg_touches / duplicate_rate 는 integer*100 로 저장 (소수점 2자리 재구성)
+    let ad_whole = avg_depth_x100 / 100
+    let ad_frac = avg_depth_x100 - (ad_whole * 100)
+    let at_whole = avg_touches_x100 / 100
+    let at_frac = avg_touches_x100 - (at_whole * 100)
+    let dr_whole = dup_rate_x100 / 100
+    let dr_frac = dup_rate_x100 - (dr_whole * 100)
+    let mut ad_fs = to_string(ad_frac)
+    if ad_frac < 10 { ad_fs = "0" + ad_fs }
+    let mut at_fs = to_string(at_frac)
+    if at_frac < 10 { at_fs = "0" + at_fs }
+    let mut dr_fs = to_string(dr_frac)
+    if dr_frac < 10 { dr_fs = "0" + dr_fs }
+    let body = "{\"schema\":1" +
+               ",\"updated\":" + to_string(last_ts) +
+               ",\"session_count\":" + to_string(session_count) +
+               ",\"avg_depth\":" + to_string(ad_whole) + "." + ad_fs +
+               ",\"avg_touches\":" + to_string(at_whole) + "." + at_fs +
+               ",\"last_ts\":" + to_string(last_ts) +
+               ",\"duplicate_rate\":" + to_string(dr_whole) + "." + dr_fs +
+               ",\"rejected_count\":" + to_string(rejected_count) +
+               ",\"history\":[]" +
+               ",\"note\":\"thinking_engine.hexa 가 매 query 후 갱신. sensor.hexa 와 lint H-THINK-* 가 참조.\"}\n"
+    try { write_file(BASELINE, body) } catch e {
+        eprintln("FAIL: baseline write — " + BASELINE)
+        exit(1)
+    }
+}
+
+// ─── atlas hubs 상위 20 로드 (TSV: node\tdegree) ───
+fn load_atlas_hubs() -> [string] {
+    if file_exists(ATLAS_DEG) == false { return [] }
+    // head -20 후 node 부분만 추출
+    let raw = _str(exec("head -20 '" + ATLAS_DEG + "'"))
+    let lines = raw.split("\n")
+    let mut hubs: [string] = []
+    let mut i = 0
+    while i < lines.len() {
+        let line = _str(lines[i]).trim()
+        if line.len() > 0 {
+            let cols = line.split("\t")
+            if cols.len() >= 1 {
+                let node = _str(cols[0]).trim()
+                if node.len() > 0 { hubs = hubs.push(node) }
+            }
+        }
+        i = i + 1
+    }
+    return hubs
+}
+
+// ─── 6-phase reflection ───
+// phase 1: preparse — split space, max 20 token, lowercase
+fn phase_preparse(prompt: string) -> [string] {
+    let lower = prompt.to_lower()
+    let raw = lower.split(" ")
+    let mut tokens: [string] = []
+    let mut i = 0
+    let cap: i64 = 20
+    while i < raw.len() {
+        if tokens.len() >= cap { break }
+        let tk = _str(raw[i]).trim()
+        if tk.len() > 0 { tokens = tokens.push(tk) }
+        i = i + 1
+    }
+    return tokens
+}
+
+// phase 2: lookup — thinking_log.jsonl 과거 3일 내 동일 prompt count
+fn phase_lookup(prompt: string, now_ts: i64) -> i64 {
+    if file_exists(LOG) == false { return 0 }
+    let raw = _str(read_file(LOG))
+    if raw.trim() == "" { return 0 }
+    let lines = raw.split("\n")
+    let window: i64 = 259200  // 3 days
+    let mut dup: i64 = 0
+    let mut i = 0
+    while i < lines.len() {
+        let line = _str(lines[i]).trim()
+        if line.len() > 0 {
+            let ts = _to_int0(json_field(line, "ts"))
+            if ts > 0 && (now_ts - ts) < window {
+                let past_prompt = json_field(line, "prompt")
+                if past_prompt == prompt { dup = dup + 1 }
+            }
+        }
+        i = i + 1
+    }
+    return dup
+}
+
+// phase 3: reason — prompt 키워드 ∩ atlas hubs 상위 20 교집합 크기
+fn phase_reason(tokens: [string], hubs: [string]) -> i64 {
+    let mut touches: i64 = 0
+    let mut i = 0
+    while i < hubs.len() {
+        let hub = hubs[i].to_lower()
+        let mut j = 0
+        while j < tokens.len() {
+            let tk = tokens[j]
+            if tk.len() >= 3 {
+                if hub.contains(tk) { touches = touches + 1 ; break }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return touches
+}
+
+// phase 4: synthesize — pseudo insight: atlas 허브 top 3 + prompt 키워드 2 concat
+fn phase_synthesize(tokens: [string], hubs: [string]) -> string {
+    let mut pattern = ""
+    let mut took: i64 = 0
+    let cap: i64 = 3
+    let mut i = 0
+    while i < hubs.len() {
+        if took >= cap { break }
+        if pattern.len() > 0 { pattern = pattern + "|" }
+        pattern = pattern + hubs[i]
+        took = took + 1
+        i = i + 1
+    }
+    pattern = pattern + "::"
+    let mut tok_took: i64 = 0
+    let tcap: i64 = 2
+    let mut k = 0
+    while k < tokens.len() {
+        if tok_took >= tcap { break }
+        if tok_took > 0 { pattern = pattern + "," }
+        pattern = pattern + tokens[k]
+        tok_took = tok_took + 1
+        k = k + 1
+    }
+    return pattern
+}
+
+// phase 5: verify — 파괴성 토큰 감지
+fn phase_verify(prompt: string) -> bool {
+    let lower = prompt.to_lower()
+    if lower.contains("drop ") { return true }
+    if lower.contains("force") { return true }
+    if lower.contains("kill ") { return true }
+    if lower.contains("rm -rf") { return true }
+    return false
+}
+
+// ─── cmd: query ───
+fn cmd_query(argv: [string]) {
+    if argv.len() < 4 {
+        eprintln("usage: query <prompt>")
+        exit(2)
+    }
+    // prompt = argv[3..] join space
+    let mut prompt = argv[3]
+    let mut i = 4
+    while i < argv.len() {
+        prompt = prompt + " " + argv[i]
+        i = i + 1
+    }
+    prompt = prompt.trim()
+    let ts = now_unix()
+
+    // phase 1
+    let tokens = phase_preparse(prompt)
+    // phase 2
+    let dup = phase_lookup(prompt, ts)
+    // phase 3
+    let hubs = load_atlas_hubs()
+    let touches = phase_reason(tokens, hubs)
+    // phase 4
+    let pattern = phase_synthesize(tokens, hubs)
+    // phase 5
+    let rejected = phase_verify(prompt)
+    // phase 6
+    let mut depth: i64 = 6
+    if rejected { depth = 2 }
+    let mut conclusion = pattern
+    if rejected { conclusion = "rejected:destructive_token" }
+
+    // emit JSON
+    let row = "{\"ts\":" + to_string(ts) +
+              ",\"kind\":\"query\"" +
+              ",\"prompt\":\"" + json_escape(prompt) + "\"" +
+              ",\"duplicate_count\":" + to_string(dup) +
+              ",\"atlas_touches\":" + to_string(touches) +
+              ",\"depth\":" + to_string(depth) +
+              ",\"rejected\":" + to_string(rejected) +
+              ",\"conclusion\":\"" + json_escape(conclusion) + "\"}"
+
+    println(row)
+    log_append(row)
+    // anima echo (silent skip 가능)
+    let echo_row = "{\"ts\":" + to_string(ts) +
+                   ",\"source\":\"thinking_engine\"" +
+                   ",\"depth\":" + to_string(depth) +
+                   ",\"atlas_touches\":" + to_string(touches) +
+                   ",\"conclusion\":\"" + json_escape(conclusion) + "\"}"
+    anima_echo(echo_row)
+
+    // baseline 갱신
+    let prev = load_baseline()
+    let new_count = prev[0] + 1
+    let mut new_rejected = prev[2]
+    if rejected { new_rejected = new_rejected + 1 }
+    // avg 는 최근 10 세션 기반으로 status 와 유사하게 재계산
+    let stats = recent_stats(10)
+    save_baseline(new_count, stats[0], stats[1], ts, stats[2], new_rejected)
+}
+
+// ─── 최근 N 세션 통계 ───
+// return [avg_depth_x100, avg_touches_x100, dup_rate_x100]
+fn recent_stats(N: i64) -> [i64] {
+    if file_exists(LOG) == false { return [0, 0, 0] }
+    let raw = _str(read_file(LOG))
+    if raw.trim() == "" { return [0, 0, 0] }
+    let lines = raw.split("\n")
+    // query kind 만 필터
+    let mut queries: [string] = []
+    let mut i = 0
+    while i < lines.len() {
+        let line = _str(lines[i]).trim()
+        if line.len() > 0 {
+            let kind = json_field(line, "kind")
+            if kind == "query" || kind == "auto_reflect" {
+                queries = queries.push(line)
+            }
+        }
+        i = i + 1
+    }
+    if queries.len() == 0 { return [0, 0, 0] }
+    let total = queries.len()
+    let mut start: i64 = 0
+    if total > N { start = total - N }
+    let mut sum_depth: i64 = 0
+    let mut sum_touch: i64 = 0
+    let mut sum_dup: i64 = 0
+    let mut cnt: i64 = 0
+    let mut j: i64 = start
+    while j < total {
+        let line = queries[j]
+        sum_depth = sum_depth + _to_int0(json_field(line, "depth"))
+        sum_touch = sum_touch + _to_int0(json_field(line, "atlas_touches"))
+        let dup = _to_int0(json_field(line, "duplicate_count"))
+        if dup > 0 { sum_dup = sum_dup + 1 }
+        cnt = cnt + 1
+        j = j + 1
+    }
+    if cnt == 0 { return [0, 0, 0] }
+    let ad = (sum_depth * 100) / cnt
+    let at = (sum_touch * 100) / cnt
+    let dr = (sum_dup * 100) / cnt
+    return [ad, at, dr]
+}
+
+// ─── cmd: status ───
+fn cmd_status(argv: [string]) {
+    if file_exists(LOG) == false {
+        println("sessions=0 avg_depth=0.00 avg_touches=0.00 last_ts=0")
+        return
+    }
+    let raw = _str(read_file(LOG))
+    if raw.trim() == "" {
+        println("sessions=0 avg_depth=0.00 avg_touches=0.00 last_ts=0")
+        return
+    }
+    let lines = raw.split("\n")
+    let mut queries: [string] = []
+    let mut i = 0
+    while i < lines.len() {
+        let line = _str(lines[i]).trim()
+        if line.len() > 0 {
+            let kind = json_field(line, "kind")
+            if kind == "query" || kind == "auto_reflect" {
+                queries = queries.push(line)
+            }
+        }
+        i = i + 1
+    }
+    let total = queries.len()
+    if total == 0 {
+        println("sessions=0 avg_depth=0.00 avg_touches=0.00 last_ts=0")
+        return
+    }
+    let window: i64 = 10
+    let mut start: i64 = 0
+    if total > window { start = total - window }
+    let mut sum_depth: i64 = 0
+    let mut sum_touch: i64 = 0
+    let mut last_ts: i64 = 0
+    let mut cnt: i64 = 0
+    let mut j: i64 = start
+    while j < total {
+        let line = queries[j]
+        sum_depth = sum_depth + _to_int0(json_field(line, "depth"))
+        sum_touch = sum_touch + _to_int0(json_field(line, "atlas_touches"))
+        let ts = _to_int0(json_field(line, "ts"))
+        if ts > last_ts { last_ts = ts }
+        cnt = cnt + 1
+        j = j + 1
+    }
+    if cnt == 0 {
+        println("sessions=0 avg_depth=0.00 avg_touches=0.00 last_ts=0")
+        return
+    }
+    let ad = (sum_depth * 100) / cnt
+    let at = (sum_touch * 100) / cnt
+    let ad_w = ad / 100
+    let ad_f = ad - (ad_w * 100)
+    let at_w = at / 100
+    let at_f = at - (at_w * 100)
+    let mut ad_fs = to_string(ad_f)
+    if ad_f < 10 { ad_fs = "0" + ad_fs }
+    let mut at_fs = to_string(at_f)
+    if at_f < 10 { at_fs = "0" + at_fs }
+    println("sessions=" + to_string(cnt) +
+            " avg_depth=" + to_string(ad_w) + "." + ad_fs +
+            " avg_touches=" + to_string(at_w) + "." + at_fs +
+            " last_ts=" + to_string(last_ts))
+}
+
+// ─── cmd: history ───
+fn cmd_history(argv: [string]) {
+    let mut N: i64 = 5
+    if argv.len() >= 4 {
+        let n2 = _to_int0(argv[3].trim())
+        if n2 > 0 { N = n2 }
+    }
+    if file_exists(LOG) == false { return }
+    let raw = _str(read_file(LOG))
+    if raw.trim() == "" { return }
+    let lines = raw.split("\n")
+    let mut rows: [string] = []
+    let mut i = 0
+    while i < lines.len() {
+        let line = _str(lines[i]).trim()
+        if line.len() > 0 { rows = rows.push(line) }
+        i = i + 1
+    }
+    let total = rows.len()
+    if total == 0 { return }
+    let mut start: i64 = 0
+    if total > N { start = total - N }
+    let mut j: i64 = start
+    while j < total {
+        println(rows[j])
+        j = j + 1
+    }
+}
+
+// ─── cmd: reflect ───
+fn cmd_reflect(argv: [string]) {
+    // baseline 24h stale 판정
+    let prev = load_baseline()
+    let last = prev[1]
+    let now = now_unix()
+    let stale: i64 = 86400
+    if last > 0 && (now - last) < stale {
+        // 아직 fresh — silent skip
+        return
+    }
+    // atlas 허브 top 3 합성 prompt
+    let hubs = load_atlas_hubs()
+    let mut prompt = "anima reflect on "
+    let mut took: i64 = 0
+    let cap: i64 = 3
+    let mut i = 0
+    while i < hubs.len() {
+        if took >= cap { break }
+        if took > 0 { prompt = prompt + ", " }
+        prompt = prompt + hubs[i]
+        took = took + 1
+        i = i + 1
+    }
+    if took == 0 { prompt = prompt + "empty_atlas" }
+
+    let ts = now_unix()
+    let tokens = phase_preparse(prompt)
+    let dup = phase_lookup(prompt, ts)
+    let touches = phase_reason(tokens, hubs)
+    let pattern = phase_synthesize(tokens, hubs)
+    let rejected = phase_verify(prompt)
+    let mut depth: i64 = 6
+    if rejected { depth = 2 }
+    let mut conclusion = pattern
+    if rejected { conclusion = "rejected:destructive_token" }
+
+    let row = "{\"ts\":" + to_string(ts) +
+              ",\"kind\":\"auto_reflect\"" +
+              ",\"prompt\":\"" + json_escape(prompt) + "\"" +
+              ",\"duplicate_count\":" + to_string(dup) +
+              ",\"atlas_touches\":" + to_string(touches) +
+              ",\"depth\":" + to_string(depth) +
+              ",\"rejected\":" + to_string(rejected) +
+              ",\"conclusion\":\"" + json_escape(conclusion) + "\"}"
+    log_append(row)
+    let echo_row = "{\"ts\":" + to_string(ts) +
+                   ",\"source\":\"thinking_engine_auto\"" +
+                   ",\"depth\":" + to_string(depth) +
+                   ",\"atlas_touches\":" + to_string(touches) +
+                   ",\"conclusion\":\"" + json_escape(conclusion) + "\"}"
+    anima_echo(echo_row)
+
+    let new_count = prev[0] + 1
+    let mut new_rejected = prev[2]
+    if rejected { new_rejected = new_rejected + 1 }
+    let stats = recent_stats(10)
+    save_baseline(new_count, stats[0], stats[1], ts, stats[2], new_rejected)
+}
+
+fn main() {
+    // argv 정규화 (2026-04-19): Mac=[hexa, script, user...] Linux-stage1=[hexa, "run", script, user...]
+    // 이전까지 Mac-only argv[2] 가정 → Linux 에서 argv[2] = script path 로 dispatch 실패.
+    let _raw_argv = args()
+    let mut _script_idx = -1
+    let mut _scan_i = 0
+    while _scan_i < _raw_argv.len() {
+        if _raw_argv[_scan_i].ends_with(".hexa") { _script_idx = _scan_i; break }
+        _scan_i = _scan_i + 1
+    }
+    let mut _user_start = 2
+    let mut _script_token = ""
+    if _script_idx >= 0 {
+        _user_start = _script_idx + 1
+        _script_token = _raw_argv[_script_idx]
+    } else {
+        if _raw_argv.len() >= 3 {
+            if _raw_argv[1] == "run" { _user_start = 3 }
+            if _raw_argv[1] == "eval" { _user_start = 3 }
+        }
+    }
+    let mut argv: [str] = [_raw_argv[0], _script_token]
+    let mut _ua_i = _user_start
+    while _ua_i < _raw_argv.len() {
+        argv = argv + [_raw_argv[_ua_i]]
+        _ua_i = _ua_i + 1
+    }
+    if _script_token.len() > 0 && argv.len() >= 3 {
+        if argv[2] == _script_token {
+            let mut _a2: [str] = [_raw_argv[0], _script_token]
+            let mut _j2 = 3
+            while _j2 < argv.len() {
+                _a2 = _a2 + [argv[_j2]]
+                _j2 = _j2 + 1
+            }
+            argv = _a2
+        }
+    }
+    if argv.len() < 3 {
+        eprintln("usage: thinking_engine <query|status|history|reflect> [args...]")
+        exit(2)
+    }
+    let mode = argv[2].trim()
+    if mode == "query" { cmd_query(argv) }
+    else if mode == "status" { cmd_status(argv) }
+    else if mode == "history" { cmd_history(argv) }
+    else if mode == "reflect" { cmd_reflect(argv) }
+    else {
+        eprintln("REJECT: unknown mode '" + mode + "' — modes: query|status|history|reflect")
+        exit(2)
+    }
+}
+
+main()

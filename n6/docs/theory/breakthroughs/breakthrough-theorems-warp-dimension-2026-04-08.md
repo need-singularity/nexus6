@@ -293,7 +293,7 @@ for n_, a, b in checks:
 
 1. CLAUDE.md BT 목록에 BT-351~357 등재 (별도 세션)
 2. docs/breakthrough-theorems.md Warp-Dimensional 섹션 확장 (BT-351~360 통합)
-3. nexus/shared/discovery_log.jsonl 에 7건 append (HEXA-FIRST 도구로)
+3. nexus/discovery_log.jsonl 에 7건 append (HEXA-FIRST 도구로)
 4. 검증 코드는 정의에서 도출 — 본 문서 §8 코드를 calc/ 또는 docs/<domain>/verify_*.py 로 별도 작성 (코드 작성 세션)
 
 ---

@@ -70,8 +70,8 @@ touch shared/discovery/cycle/halt     # 정지 (tick skip)
 rm shared/discovery/cycle/halt        # 재개
 
 # 일괄 흡수 / 실시간 흡수
-nexus singularity-backfill --base-dir $NEXUS/shared/cycle
-nexus singularity-daemon --interval 30 --base-dir $NEXUS/shared/cycle
+nexus singularity-backfill --base-dir $NEXUS/cycle
+nexus singularity-daemon --interval 30 --base-dir $NEXUS/cycle
 ```
 
 ## 관련 스펙

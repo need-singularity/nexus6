@@ -17,7 +17,7 @@ if [ "$N" -lt 1 ]; then N=1; fi
 
 TS="$(date +%Y%m%d-%H%M%S)"
 BASE="$(cd "$(dirname "$0")" && pwd)"
-HEXA="$HOME/Dev/nexus/shared/bin/hexa"
+HEXA="$HOME/Dev/nexus/bin/hexa"
 
 echo "[scale_runner] N=$N mode=$MODE ts=$TS base=$BASE"
 echo "[scale_runner] hexa=$HEXA"

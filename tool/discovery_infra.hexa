@@ -1,0 +1,346 @@
+// ═══════════════════════════════════════════════════════════
+// discovery_infra.hexa — DISC-P1-2 + DISC-P1-3 인프라 트리거
+// (roadmap nexus.json P1 DISCOVERY 2건)
+//
+// 모드 (default = --all):
+//   --reindex   edges.adjacency.json → msgpack 갱신 (lag > 1h 이면)
+//               -> shared/discovery/cycle/edges_reindex.hexa 위임
+//   --rollover  discovery_log.jsonl 주간 롤오버 (>=7일 OR >=100MB)
+//               -> discovery_log_week_NN.jsonl.gz + meta 갱신
+//   --sqlite    discovery_log.sqlite 라인 인덱스 (.jsonl 변경 감지)
+//               -> sqlite3 CLI 위임 (hexa native 미지원)
+//   --all       세 가지 전부 (cron/launchd 용)
+//   --status    상태 출력만
+//
+// 출력: shared/tool/.discovery_infra_state.json (ts/lag 기록)
+//       shared/tool/mistakes.jsonl (실패 시)
+// 참고: shared/tool/gc.hexa weekly 패턴 + edges_reindex.hexa staleness 패턴
+// 우회: NEXUS_DISC_INFRA_OK=1 (강제 통과 — 미사용)
+// @no-lock-needed (단발 cron 트리거 — 내부 stat/gzip/sqlite 빌드만)
+// @allow-bare-exec (safe_exec inc 내부 wrapper 검증 1회)
+// ═══════════════════════════════════════════════════════════
+
+// ─── safe_exec inc copy-paste (hexa stage1 native include 미지원) ───
+let _SE_HOME = env("HOME")
+let _SE_WRAPPER = _SE_HOME + "/Dev/nexus/tool/perl_timeout.sh"
+
+fn _se_str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _se_shq(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _se_wrapper_ok() -> bool {
+    let r = _se_str(exec("test -x '" + _SE_WRAPPER + "' && echo y || echo n")).trim()
+    return r == "y"
+}
+
+fn _se_wrap(cmd: string, timeout_sec: i64) -> string {
+    if !_se_wrapper_ok() { return cmd }
+    return "'" + _SE_WRAPPER + "' " + to_string(timeout_sec) + " bash -c " + _se_shq(cmd)
+}
+
+fn safe_exec(cmd: string, timeout_sec: i64) -> string {
+    let wrapped = _se_wrap(cmd, timeout_sec)
+    return _se_str(exec(wrapped + " 2>&1"))  // @allow-bare-exec — wrapped via perl_timeout
+}
+
+fn safe_exec_str(cmd: string, timeout_sec: i64) -> string {
+    return safe_exec(cmd, timeout_sec).trim()
+}
+
+// ─── 경로 ───
+let HOME = env("HOME")
+let NEXUS = HOME + "/Dev/nexus"
+let SHARED = NEXUS + "/shared"
+let HARNESS = SHARED + "/harness"
+let STATE = HARNESS + "/.discovery_infra_state.json"
+let MISTAKES = HARNESS + "/mistakes.jsonl"
+
+let CYCLE = SHARED + "/discovery/cycle"
+let EDGES_JSON = CYCLE + "/edges.adjacency.json"
+let EDGES_MSGPACK = CYCLE + "/edges.adjacency.msgpack"
+let EDGES_REINDEX = CYCLE + "/edges_reindex.hexa"
+
+let DISC_LOG = SHARED + "/discovery_log.jsonl"
+let DISC_META = SHARED + "/discovery_log.meta.json"
+let DISC_SQLITE = SHARED + "/discovery_log.sqlite"
+let HEXA_BIN = SHARED + "/bin/hexa"
+
+let LAG_THRESHOLD: i64 = 3600       // 1h — DISC-P1-2 done_criteria
+let ROLLOVER_AGE: i64 = 604800      // 7d
+let ROLLOVER_SIZE: i64 = 104857600  // 100 MB
+
+// ─── 시간/문자열 헬퍼 ───
+fn now_ts() -> i64 {
+    let r = safe_exec_str("date +%s", 5)
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+fn now_iso() -> string {
+    return safe_exec_str("date -u +%Y-%m-%dT%H:%M:%SZ", 5)
+}
+
+fn file_mtime(path: string) -> i64 {
+    if !file_exists(path) { return 0 }
+    let r = safe_exec_str("stat -f '%m' '" + path + "' 2>/dev/null || stat -c '%Y' '" + path + "' 2>/dev/null", 5)
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+fn file_size(path: string) -> i64 {
+    if !file_exists(path) { return 0 }
+    let r = safe_exec_str("stat -f '%z' '" + path + "' 2>/dev/null || stat -c '%s' '" + path + "' 2>/dev/null", 5)
+    if r == "" { return 0 }
+    return to_int(r)
+}
+
+fn json_escape(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", "\\n")
+    return r
+}
+
+fn log_mistake(kind: string, msg: string) {
+    let line = "{\"ts\":\"" + now_iso() + "\",\"kind\":\"" + kind + "\",\"msg\":\"" + json_escape(msg) + "\"}"
+    let cmd = "echo " + _se_shq(line) + " >> '" + MISTAKES + "'"
+    let _ = safe_exec(cmd, 5)
+}
+
+fn write_state(reindex_ts: i64, rollover_ts: i64, sqlite_ts: i64, lag: i64) {
+    let body = "{\"updated\":\"" + now_iso() + "\",\"last_reindex_ts\":" + to_string(reindex_ts) +
+               ",\"last_rollover_ts\":" + to_string(rollover_ts) +
+               ",\"last_sqlite_ts\":" + to_string(sqlite_ts) +
+               ",\"current_lag_sec\":" + to_string(lag) + "}"
+    let cmd = "cat > '" + STATE + "' <<'__EOF__'\n" + body + "\n__EOF__"
+    let _ = safe_exec(cmd, 5)
+}
+
+fn read_state_field(key: string) -> i64 {
+    if !file_exists(STATE) { return 0 }
+    // R37/AN13/L3-PY violation — python3 wrapper-fallback removed 2026-04-18
+    // Original: /usr/bin/python3 -c "import json; d=json.load(open(STATE)); print(d.get(key, 0))"
+    let _ = key
+    eprintln("R37/AN13/L3-PY: python3 invocation blocked at discovery_infra.hexa:read_state_field. Escalate to user for hexa-native replacement.")
+    return 0
+}
+
+// ─── DISC-P1-2: edges reindex 트리거 ───
+fn check_reindex(force: bool) -> [string] {
+    // [status, lag_str, action]
+    if !file_exists(EDGES_JSON) {
+        return ["skip", "0", "source missing: edges.adjacency.json"]
+    }
+    let src_mt = file_mtime(EDGES_JSON)
+    let dst_mt = file_mtime(EDGES_MSGPACK)
+    let lag = src_mt - dst_mt
+    if dst_mt == 0 {
+        // msgpack 부재 — 무조건 빌드
+    } else if !force && lag < LAG_THRESHOLD {
+        return ["fresh", to_string(lag), "lag=" + to_string(lag) + "s < " + to_string(LAG_THRESHOLD) + "s"]
+    }
+
+    if !file_exists(EDGES_REINDEX) {
+        log_mistake("disc_infra_reindex", "edges_reindex.hexa missing: " + EDGES_REINDEX)
+        return ["error", to_string(lag), "edges_reindex.hexa not found"]
+    }
+
+    // 위임 — staleness 재판정 + msgpack/meta 빌드
+    let cmd = "'" + HEXA_BIN + "' run '" + EDGES_REINDEX + "' 2>&1"
+    let out = safe_exec(cmd, 600)  // 10분 (178MB JSON 처리)
+    let last = _se_str(out).trim()
+    // edges_reindex 는 OK 시 'DONE' 또는 'FRESH' 출력
+    if last.contains("ERROR") || last.contains("error") {
+        log_mistake("disc_infra_reindex", "edges_reindex failed: " + last.substring(0, 200))
+        return ["error", to_string(lag), "reindex failed (see mistakes.jsonl)"]
+    }
+    let new_dst_mt = file_mtime(EDGES_MSGPACK)
+    let new_lag = src_mt - new_dst_mt
+    return ["rebuilt", to_string(new_lag), "msgpack mtime updated"]
+}
+
+// ─── DISC-P1-3a: discovery_log.jsonl 주간 롤오버 ───
+fn check_rollover(force: bool) -> [string] {
+    // [status, age_str, action]
+    if !file_exists(DISC_LOG) {
+        return ["skip", "0", "log absent — nothing to rotate"]
+    }
+    let sz = file_size(DISC_LOG)
+    let mt = file_mtime(DISC_LOG)
+    let age = now_ts() - mt
+    if sz == 0 {
+        return ["empty", to_string(age), "log empty"]
+    }
+    let due_age = age >= ROLLOVER_AGE
+    let due_size = sz >= ROLLOVER_SIZE
+    if !force && !due_age && !due_size {
+        return ["fresh", to_string(age), "size=" + to_string(sz) + " age=" + to_string(age) + "s"]
+    }
+
+    // 주차 번호 (현재 년+ISO 주차)
+    let year_week = safe_exec_str("date -u +%Y_W%V", 5)
+    let archive = SHARED + "/discovery_log_week_" + year_week + ".jsonl.gz"
+
+    // 이미 같은 주차 archive 존재 시 _2/_3 suffix
+    let mut out_path = archive
+    if file_exists(out_path) {
+        let mut idx: i64 = 2
+        while idx < 100 {
+            let alt = SHARED + "/discovery_log_week_" + year_week + "_" + to_string(idx) + ".jsonl.gz"
+            if !file_exists(alt) { out_path = alt; break }
+            idx = idx + 1
+        }
+    }
+
+    // gzip + truncate (atomic 패턴: copy → gzip → truncate)
+    let cmd = "set -e; gzip -c '" + DISC_LOG + "' > '" + out_path + "' && : > '" + DISC_LOG + "'"
+    let out = safe_exec(cmd, 120)
+    if !file_exists(out_path) || file_size(out_path) == 0 {
+        log_mistake("disc_infra_rollover", "rollover failed: " + _se_str(out).substring(0, 200))
+        return ["error", to_string(age), "gzip failed"]
+    }
+
+    // meta.json 갱신
+    let arch_sz = file_size(out_path)
+    let meta_body = "{\"log_file\":\"$NEXUS/discovery_log.jsonl\"," +
+                    "\"line_count\":0,\"size_bytes\":0,\"first_ts\":\"\",\"last_ts\":\"\"," +
+                    "\"mtime\":\"" + to_string(now_ts()) + "\"," +
+                    "\"updated_at\":\"" + now_iso() + "\"," +
+                    "\"archives\":[{\"file\":\"$NEXUS/" + out_path.replace(NEXUS + "/", "") +
+                    "\",\"size\":" + to_string(arch_sz) + "}]}"
+    let mcmd = "cat > '" + DISC_META + "' <<'__EOF__'\n" + meta_body + "\n__EOF__"
+    let _ = safe_exec(mcmd, 5)
+
+    return ["rolled", to_string(age), "→ " + out_path.replace(NEXUS + "/", "") + " (" + to_string(arch_sz) + "B)"]
+}
+
+// ─── DISC-P1-3b: SQLite 라인 인덱스 ───
+fn check_sqlite(force: bool) -> [string] {
+    // [status, line_count_str, action]
+    if !file_exists(DISC_LOG) {
+        // 로그 없으면 빈 인덱스만 보장
+        if !file_exists(DISC_SQLITE) {
+            let init = "sqlite3 '" + DISC_SQLITE + "' " + _se_shq("CREATE TABLE IF NOT EXISTS line_index(line_no INTEGER PRIMARY KEY, byte_offset INTEGER, ts TEXT, kind TEXT); CREATE INDEX IF NOT EXISTS idx_ts ON line_index(ts); CREATE INDEX IF NOT EXISTS idx_kind ON line_index(kind);")
+            let _ = safe_exec(init, 10)
+        }
+        return ["skip", "0", "log absent"]
+    }
+    let log_mt = file_mtime(DISC_LOG)
+    let idx_mt = file_mtime(DISC_SQLITE)
+    if !force && idx_mt > 0 && log_mt <= idx_mt {
+        // 인덱스가 신선
+        let cnt = safe_exec_str("sqlite3 '" + DISC_SQLITE + "' 'SELECT COUNT(*) FROM line_index'", 10)
+        return ["fresh", cnt, "log_mt <= idx_mt"]
+    }
+
+    // R37/AN13/L3-PY violation — python3 wrapper-fallback removed 2026-04-18
+    // Original: python3 1-pass scanner building SQLite line_index (byte offset + ts + kind)
+    log_mistake("disc_infra_sqlite", "R37/AN13/L3-PY: python3 invocation blocked at discovery_infra.hexa:check_sqlite. Escalate to user for hexa-native replacement.")
+    let out = ""
+    let cnt = ""
+    if !file_exists(DISC_SQLITE) || cnt == "" {
+        log_mistake("disc_infra_sqlite", "sqlite build failed: " + _se_str(out).substring(0, 200))
+        return ["error", "0", "build failed"]
+    }
+    // 마지막 라인이 숫자가 아니면 (python 에러 메시지) error
+    let lines = cnt.split("\n")
+    let last = _se_str(lines[len(lines) - 1]).trim()
+    return ["built", last, to_string(file_size(DISC_SQLITE)) + "B sqlite"]
+}
+
+// ─── 출력 포맷 ───
+fn print_result(label: string, r: [string]) {
+    let st = _se_str(r[0])
+    let val = _se_str(r[1])
+    let act = _se_str(r[2])
+    println("  " + label + ": " + st + " (" + val + ") — " + act)
+}
+
+// ─── Main ───
+let a = args()
+let mut do_reindex = false
+let mut do_rollover = false
+let mut do_sqlite = false
+let mut do_status = false
+let mut force = false
+let mut ai: i64 = 2
+while ai < len(a) {
+    let t = a[ai]
+    if t == "--reindex" { do_reindex = true }
+    else if t == "--rollover" { do_rollover = true }
+    else if t == "--sqlite" { do_sqlite = true }
+    else if t == "--all" { do_reindex = true; do_rollover = true; do_sqlite = true }
+    else if t == "--status" { do_status = true }
+    else if t == "--force" || t == "-f" { force = true }
+    else if t == "--help" || t == "-h" {
+        println("usage: hexa run shared/tool/discovery_infra.hexa [--reindex|--rollover|--sqlite|--all|--status] [--force]")
+        println("  --reindex   edges.adjacency.msgpack 자동 갱신 (lag > 1h)")
+        println("  --rollover  discovery_log.jsonl 주간 롤오버 (>=7d OR >=100MB)")
+        println("  --sqlite    discovery_log.sqlite 라인 인덱스 빌드 (mtime 변경 감지)")
+        println("  --all       세 가지 전부 (default)")
+        println("  --status    현재 상태 출력만")
+        println("  --force     mtime/age 무시, 강제 실행")
+        exit(0)
+    }
+    ai = ai + 1
+}
+
+if !do_reindex && !do_rollover && !do_sqlite && !do_status {
+    do_reindex = true; do_rollover = true; do_sqlite = true
+}
+
+println("discovery_infra " + now_iso())
+
+if do_status {
+    let last_re = read_state_field("last_reindex_ts")
+    let last_ro = read_state_field("last_rollover_ts")
+    let last_sq = read_state_field("last_sqlite_ts")
+    let lag = read_state_field("current_lag_sec")
+    println("  last_reindex_ts:  " + to_string(last_re))
+    println("  last_rollover_ts: " + to_string(last_ro))
+    println("  last_sqlite_ts:   " + to_string(last_sq))
+    println("  current_lag_sec:  " + to_string(lag))
+    println("  edges.json mt:    " + to_string(file_mtime(EDGES_JSON)))
+    println("  edges.msgpack mt: " + to_string(file_mtime(EDGES_MSGPACK)))
+    println("  disc_log size:    " + to_string(file_size(DISC_LOG)))
+    println("  disc_sqlite size: " + to_string(file_size(DISC_SQLITE)))
+    exit(0)
+}
+
+let mut last_re = read_state_field("last_reindex_ts")
+let mut last_ro = read_state_field("last_rollover_ts")
+let mut last_sq = read_state_field("last_sqlite_ts")
+let mut cur_lag: i64 = 0
+
+if do_reindex {
+    let r = check_reindex(force)
+    print_result("reindex ", r)
+    let st = _se_str(r[0])
+    cur_lag = to_int(_se_str(r[1]))
+    if st == "rebuilt" || st == "fresh" { last_re = now_ts() }
+}
+
+if do_rollover {
+    let r = check_rollover(force)
+    print_result("rollover", r)
+    let st = _se_str(r[0])
+    if st == "rolled" || st == "fresh" || st == "empty" { last_ro = now_ts() }
+}
+
+if do_sqlite {
+    let r = check_sqlite(force)
+    print_result("sqlite  ", r)
+    let st = _se_str(r[0])
+    if st == "built" || st == "fresh" || st == "skip" { last_sq = now_ts() }
+}
+
+write_state(last_re, last_ro, last_sq, cur_lag)
+println("state: " + STATE.replace(NEXUS + "/", ""))
+exit(0)

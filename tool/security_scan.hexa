@@ -1,0 +1,322 @@
+// security_scan.hexa — passive secret/path/MCP 스캔
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+// 역할: 사용자 입력/파일 경로/.mcp.json 에서 위험 패턴 탐지.
+// 원칙: passive — 모든 모드 exit 0 (sentinel PASS). 발견은 stderr WARN + governance.jsonl.
+// SSOT: shared/tool/governance.jsonl (append-only)
+// 분류: severity_map.json gc_kind { secret_detected:block, sensitive_path:defer, mcp_*:defer }
+//
+// usage:
+//   security_scan.hexa prompt <text>           — 사용자 텍스트 secret regex 스캔
+//   security_scan.hexa path <file_path>        — 파일 내용 + 경로 sensitive 체크
+//   security_scan.hexa mcp                     — .mcp.json 분석 (없으면 silent)
+//   security_scan.hexa status                  — governance.jsonl 최근 10건 tail
+//
+// sentinel: 마지막 라인 __HARNESS_SECURITY_RESULT__ PASS (항상 PASS, hexa exit 미전파 우회)
+
+let HOME = env("HOME")
+let NEXUS = HOME + "/Dev/nexus"
+let HARNESS = NEXUS + "/harness"
+let GOV = HARNESS + "/governance.jsonl"
+let MCP_JSON = NEXUS + "/.mcp.json"
+
+// ─── void-safe coercion ───
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _to_int0(s: string) -> i64 {
+    if s == "" { return 0 }
+    let first = _str(s.split("\n")[0]).trim()
+    if first == "" { return 0 }
+    return to_int(first)
+}
+
+fn now_ts_iso() -> string {
+    return _str(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()  // @allow-bare-exec
+}
+
+fn now_unix() -> i64 {
+    return _to_int0(_str(exec("date +%s")).trim())  // @allow-bare-exec
+}
+
+fn json_escape(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", " ")
+    r = r.replace("\r", " ")
+    r = r.replace("\t", " ")
+    return r
+}
+
+fn _ensure() {
+    if file_exists(GOV) == false {
+        try { write_file(GOV, "") } catch e {}
+    }
+}
+
+fn _shq(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+// ─── sentinel ───
+fn pass() {
+    println("__HARNESS_SECURITY_RESULT__ PASS")
+}
+
+// ─── governance row append ───
+fn record(kind: string, evidence: string, file: string, severity: string) {
+    _ensure()
+    let ts = now_ts_iso()
+    let proj = _str(exec("basename \"$(pwd)\" 2>/dev/null")).trim()  // @allow-bare-exec
+    let row = "{\"ts\":\"" + ts + "\"," +
+              "\"project\":\"" + proj + "\"," +
+              "\"kind\":\"" + kind + "\"," +
+              "\"evidence\":\"" + json_escape(evidence) + "\"," +
+              "\"file\":\"" + json_escape(file) + "\"," +
+              "\"severity\":\"" + severity + "\"}"
+    try { append_file(GOV, row + "\n") } catch e {}
+}
+
+// ─── 미리보기 64자 (preview) ───
+fn preview_text(s: string) -> string {
+    let trimmed = s.trim()
+    let n = len(trimmed)
+    if n <= 64 { return trimmed }
+    return trimmed.substring(0, 64) + "..."
+}
+
+// ─── secret regex 패턴 (kind, ERE) ───
+fn secret_patterns() -> [[string]] {
+    // ERE 로 grep -Eo 호환. private_key 는 단일 라인 패턴.
+    let mut p: [[string]] = []
+    p = p.push(["aws_access_key", "AKIA[0-9A-Z]{16}"])
+    p = p.push(["jwt", "eyJ[A-Za-z0-9_-]+\\.eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_.-]+"])
+    p = p.push(["github_token", "gh[pousr]_[A-Za-z0-9]{36,}"])
+    p = p.push(["private_key", "-----BEGIN [A-Z ]*PRIVATE KEY-----"])
+    p = p.push(["generic_secret", "(API_KEY|SECRET_KEY|PASSWORD)=[A-Za-z0-9_-]{16,}"])
+    return p
+}
+
+// ─── 입력 텍스트(또는 파일 내용)에 대해 secret regex 매칭 ───
+// mode = "text" (stdin echo) 또는 "file" (file -E)
+fn scan_text_secrets(text: string, source_label: string) -> i64 {
+    let mut hits: i64 = 0
+    let pats = secret_patterns()
+    let esc_text = _shq(text)
+    for kp in pats {
+        let kind = kp[0]
+        let pat = kp[1]
+        let cmd = "printf '%s' " + esc_text + " | /usr/bin/grep -Eo " + _shq(pat) + " 2>/dev/null | head -1"
+        let r = _str(exec(cmd)).trim()  // @allow-bare-exec
+        if r.len() > 0 {
+            let prev = preview_text(text)
+            eprintln("[security_scan] secret_detected: " + kind + " in " + source_label + " (" + prev + ")")
+            record("secret_detected", kind, source_label, "block")
+            hits = hits + 1
+        }
+    }
+    return hits
+}
+
+fn scan_file_secrets(path: string) -> i64 {
+    let mut hits: i64 = 0
+    let pats = secret_patterns()
+    let esc_path = _shq(path)
+    for kp in pats {
+        let kind = kp[0]
+        let pat = kp[1]
+        let cmd = "/usr/bin/grep -Eo " + _shq(pat) + " " + esc_path + " 2>/dev/null | head -1"
+        let r = _str(exec(cmd)).trim()  // @allow-bare-exec
+        if r.len() > 0 {
+            eprintln("[security_scan] secret_detected: " + kind + " in " + path + " (" + preview_text(r) + ")")
+            record("secret_detected", kind, path, "block")
+            hits = hits + 1
+        }
+    }
+    return hits
+}
+
+// ─── 경로 sensitive 체크 ───
+fn check_sensitive_path(path: string) -> bool {
+    let needles = [
+        "/.env",
+        "/.env.",
+        "/.ssh/",
+        "/.aws/",
+        "credentials.json",
+        "id_rsa",
+        "service-account"
+    ]
+    for n in needles {
+        if path.contains(n) {
+            eprintln("[security_scan] sensitive_path: " + n + " in " + path)
+            record("sensitive_path", n, path, "defer")
+            return true
+        }
+    }
+    return false
+}
+
+// ─── prompt 모드 ───
+fn cmd_prompt(argv: [string]) {
+    if argv.len() < 4 {
+        pass()
+        return
+    }
+    let text = argv[3]
+    if text.trim().len() == 0 {
+        pass()
+        return
+    }
+    scan_text_secrets(text, "prompt")
+    pass()
+}
+
+// ─── path 모드 ───
+fn cmd_path(argv: [string]) {
+    if argv.len() < 4 {
+        pass()
+        return
+    }
+    let path = argv[3].trim()
+    if path.len() == 0 {
+        pass()
+        return
+    }
+    // 경로 패턴 검사 — 파일 존재 여부 무관
+    check_sensitive_path(path)
+    // 파일 내용 secret 스캔 (존재하고 정규 파일일 때)
+    if file_exists(path) {
+        let is_file = _str(exec("test -f " + _shq(path) + " && echo y || echo n")).trim()  // @allow-bare-exec
+        if is_file == "y" {
+            // 너무 큰 파일은 회피 (>1MB)
+            let sz = _to_int0(_str(exec("/usr/bin/wc -c < " + _shq(path) + " 2>/dev/null")).trim())  // @allow-bare-exec
+            if sz > 0 && sz <= 1048576 {
+                scan_file_secrets(path)
+            }
+        }
+    }
+    pass()
+}
+
+// ─── mcp 모드 ───
+fn cmd_mcp(argv: [string]) {
+    // override 경로 (테스트용): argv[3] 가 있으면 사용
+    let mut target = MCP_JSON
+    if argv.len() >= 4 {
+        let cand = argv[3].trim()
+        if cand.len() > 0 { target = cand }
+    }
+    if file_exists(target) == false {
+        // silent skip
+        pass()
+        return
+    }
+    // enableAllProjectMcpServers: true 검사
+    let q1 = "/usr/bin/jq -r '.enableAllProjectMcpServers // false' " + _shq(target) + " 2>/dev/null"
+    let r1 = _str(exec(q1)).trim()  // @allow-bare-exec
+    if r1 == "true" {
+        eprintln("[security_scan] mcp_auto_approve: enableAllProjectMcpServers=true in " + target)
+        record("mcp_auto_approve", "enableAllProjectMcpServers=true", target, "defer")
+    }
+    // 서버 command 에서 outbound 위험 키워드 (curl|wget|nc|ssh)
+    let q2 = "/usr/bin/jq -r '(.mcpServers // {}) | to_entries[] | \"\\(.key)\\t\\(.value.command // \"\")\\t\\(.value.args // [] | join(\" \"))\"' " + _shq(target) + " 2>/dev/null"
+    let r2 = _str(exec(q2))  // @allow-bare-exec
+    let danger = ["curl", "wget", "nc", "ssh"]
+    for line in r2.split("\n") {
+        let s = _str(line).trim()
+        if s.len() == 0 { continue }
+        let parts = s.split("\t")
+        if parts.len() < 2 { continue }
+        let name = _str(parts[0])
+        let cmdline = _str(parts[1])
+        let mut argline = ""
+        if parts.len() >= 3 { argline = _str(parts[2]) }
+        let combined = cmdline + " " + argline
+        for d in danger {
+            // 단어 경계 비슷한 검사 — 토큰 분리
+            let lc = combined.to_lower()
+            // 단순 substring + 공백/슬래시 경계
+            let needle1 = " " + d + " "
+            let needle2 = "/" + d + " "
+            let needle3 = " " + d
+            let needle4 = "/" + d
+            if lc == d || lc.contains(needle1) || lc.contains(needle2) || lc.ends_with(needle3) || lc.ends_with(needle4) || lc.starts_with(d + " ") {
+                eprintln("[security_scan] mcp_outbound: " + d + " in server '" + name + "' (" + preview_text(combined) + ")")
+                record("mcp_outbound", d + " in " + name, target, "defer")
+                break
+            }
+        }
+    }
+    pass()
+}
+
+// ─── status 모드 ───
+fn cmd_status(argv: [string]) {
+    _ensure()
+    let cmd = "/usr/bin/tail -n 10 " + _shq(GOV) + " 2>/dev/null"
+    let r = _str(exec(cmd)).trim()  // @allow-bare-exec
+    if r.len() > 0 { println(r) }
+    pass()
+}
+
+fn main() {
+    // argv 정규화 (2026-04-19): Mac=[hexa, script, user...] Linux-stage1=[hexa, "run", script, user...]
+    // 이전까지 Mac-only argv[2] 가정 → Linux 에서 argv[2] = script path 로 dispatch 실패.
+    let _raw_argv = args()
+    let mut _script_idx = -1
+    let mut _scan_i = 0
+    while _scan_i < _raw_argv.len() {
+        if _raw_argv[_scan_i].ends_with(".hexa") { _script_idx = _scan_i; break }
+        _scan_i = _scan_i + 1
+    }
+    let mut _user_start = 2
+    let mut _script_token = ""
+    if _script_idx >= 0 {
+        _user_start = _script_idx + 1
+        _script_token = _raw_argv[_script_idx]
+    } else {
+        if _raw_argv.len() >= 3 {
+            if _raw_argv[1] == "run" { _user_start = 3 }
+            if _raw_argv[1] == "eval" { _user_start = 3 }
+        }
+    }
+    let mut argv: [str] = [_raw_argv[0], _script_token]
+    let mut _ua_i = _user_start
+    while _ua_i < _raw_argv.len() {
+        argv = argv + [_raw_argv[_ua_i]]
+        _ua_i = _ua_i + 1
+    }
+    if _script_token.len() > 0 && argv.len() >= 3 {
+        if argv[2] == _script_token {
+            let mut _a2: [str] = [_raw_argv[0], _script_token]
+            let mut _j2 = 3
+            while _j2 < argv.len() {
+                _a2 = _a2 + [argv[_j2]]
+                _j2 = _j2 + 1
+            }
+            argv = _a2
+        }
+    }
+    if argv.len() < 3 {
+        eprintln("usage: security_scan.hexa <prompt|path|mcp|status> [args]")
+        pass()
+        return
+    }
+    let mode = argv[2].trim()
+    if mode == "prompt" { cmd_prompt(argv) }
+    else if mode == "path" { cmd_path(argv) }
+    else if mode == "mcp" { cmd_mcp(argv) }
+    else if mode == "status" { cmd_status(argv) }
+    else {
+        eprintln("[security_scan] unknown mode: " + mode + " — modes: prompt|path|mcp|status")
+        pass()
+    }
+}
+
+main()

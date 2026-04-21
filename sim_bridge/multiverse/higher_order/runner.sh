@@ -22,7 +22,7 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PARENT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-HEXA="${HEXA:-$HOME/Dev/nexus/shared/bin/hexa}"
+HEXA="${HEXA:-$HOME/Dev/nexus/bin/hexa}"
 M="${M:-20}"
 T="${T:-500}"
 DIM="${DIM:-32}"
@@ -46,10 +46,10 @@ if [ "${SKIP_ANU:-0}" = "1" ]; then
   echo "[higherorder] SKIP_ANU=1 → ANU seed also urandom (dev mode)"
   head -c "$NEED" /dev/urandom | od -An -vtu1 | tr -s ' \n' ' ' > "$ANU_SEED"
 else
-  ANU_CACHE="$HOME/Dev/nexus/shared/discovery/rng_lab/.anu_cache.bin"
+  ANU_CACHE="$HOME/Dev/nexus/discovery/rng_lab/.anu_cache.bin"
   if [ ! -f "$ANU_CACHE" ]; then
     echo "[higherorder] WARN: no ANU cache — attempting fresh fetch"
-    HEXA_LOCAL=1 "$HEXA" "$HOME/Dev/nexus/shared/discovery/rng_lab/fetch_anu.hexa" info >/dev/null 2>&1 || true
+    HEXA_LOCAL=1 "$HEXA" "$HOME/Dev/nexus/discovery/rng_lab/fetch_anu.hexa" info >/dev/null 2>&1 || true
   fi
   if [ -f "$ANU_CACHE" ]; then
     ANU_HEX="$(tr -d '\n ' < "$ANU_CACHE")"

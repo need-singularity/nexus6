@@ -27,7 +27,7 @@ RUN_DIR="$HERE/runs/$TS"
 mkdir -p "$RUN_DIR"
 
 export HEXA_LOCAL=1
-HEXA="$HOME/Dev/nexus/shared/bin/hexa"
+HEXA="$HOME/Dev/nexus/bin/hexa"
 SHADOW="$HERE/ouroboros_shadow.hexa"
 
 echo "[runner] ts=$TS trials=$NTRIALS gens=$GENS"

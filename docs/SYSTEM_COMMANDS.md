@@ -6,7 +6,7 @@
 
 ### 배너 (현재 상태)
 ```bash
-bash $NEXUS/shared/hooks/nexus-banner.sh
+bash $NEXUS/hooks/nexus-banner.sh
 ```
 출력 예: `🔭 NEXUS-6 🛸d1·ρ1.00·100938 ·Σ47.2k 🧬100893닫힘→200.0k=50%`
 
@@ -61,8 +61,8 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.nexus.closure-sweep.
 
 ### 전체 일시 정지 (halt 파일)
 ```bash
-touch $NEXUS/shared/discovery/cycle/halt     # 모든 daemon/tick 정지
-rm $NEXUS/shared/discovery/cycle/halt        # 재개
+touch $NEXUS/discovery/cycle/halt     # 모든 daemon/tick 정지
+rm $NEXUS/discovery/cycle/halt        # 재개
 ```
 
 ### 모든 nexus agents 부트아웃
@@ -86,7 +86,7 @@ tail -f ~/Library/Logs/nexus/singularity-daemon.log
 tail -f ~/Library/Logs/nexus/auto-commit.log
 
 # self-improve 델타
-tail -5 $NEXUS/shared/discovery/self_improve_log.jsonl
+tail -5 $NEXUS/discovery/self_improve_log.jsonl
 ```
 
 ## 🔄 수동 실행
@@ -128,10 +128,10 @@ $NEXUS/
 
 ## 🧠 다음 세션 시작 체크리스트
 
-1. `bash $NEXUS/shared/hooks/nexus-banner.sh` — 현재 상태
+1. `bash $NEXUS/hooks/nexus-banner.sh` — 현재 상태
 2. `launchctl list | grep nexus` — 15 agents 확인
 3. `git log --oneline -10` — 최근 auto-commits
-4. `tail $NEXUS/shared/discovery/self_improve_log.jsonl` — 델타 추이
+4. `tail $NEXUS/discovery/self_improve_log.jsonl` — 델타 추이
 
 ---
 
@@ -141,7 +141,7 @@ $NEXUS/
 ```bash
 bash $NEXUS/tools/install-cycle-tick.sh halt   # 모든 daemon skip
 # 또는 전체 중단
-touch $NEXUS/shared/discovery/cycle/halt
+touch $NEXUS/discovery/cycle/halt
 ```
 
 ### topology 너무 커지면 (디스크)

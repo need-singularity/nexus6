@@ -2,7 +2,7 @@
 
 **목적**: n6 현실지도의 7+ 차원을 단일 3D 공간에 투영(projection)하지 않고, **사용자가 차원을 하나씩 풀어서 펼침/접힘(unfold/fold) 할 수 있도록** 레이아웃을 전환.
 
-**대상 파일**: `$NEXUS/shared/discovery/reality_map_3d.html` (L0 잠금, 추가만)
+**대상 파일**: `$NEXUS/discovery/reality_map_3d.html` (L0 잠금, 추가만)
 **데이터 원본**: `reality_map_live.json` (n6 merge 후 2625+ 노드)
 
 ---

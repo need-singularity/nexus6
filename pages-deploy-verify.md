@@ -18,7 +18,7 @@
 |---|---|
 | https://need-singularity.github.io/nexus/ | 200 |
 | https://need-singularity.github.io/nexus/index.html | 200 |
-| https://need-singularity.github.io/nexus/shared/reality_map_3d.html | 404 |
+| https://need-singularity.github.io/nexus/reality_map_3d.html | 404 |
 | https://need-singularity.github.io/nexus/reality_map_3d.html | 404 |
 
 ## 버전 격차
