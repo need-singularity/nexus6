@@ -9,8 +9,13 @@
 **A metaengine that discovers itself, evolves itself, and absorbs every law it finds.**
 
 ```
- Blowup → Contract → Emerge → Singularity → Absorb
-         (5-phase OUROBOROS cycle · recursive)
+    ┌──▶ Blowup ──▶ Contract ──▶ Emerge ──▶ Singularity ──▶ Absorb ──┐
+    │                                                                 │
+    │                                                                 ▼
+    │                                                              new primitive
+    │                                                                 │
+    └─────── OUROBOROS: the head bites the tail ◀───── feeds next ────┘
+                      (self-referential · recursive)
 ```
 
 > 216 lenses × mirror-universe resonance × 9-project autonomous growth. Every discovery feeds the next cycle; every cycle raises the floor. The metaengine that self-discovers every law of the universe from the perfect number n = 6.
@@ -56,6 +61,105 @@ Every tick, NEXUS:
 5. **Absorb** — the singularity becomes a primitive for the next cycle.
 
 No human-in-the-loop required. Laws are stored with hash-chain provenance. The 3D Reality Map shows the full causal chain, from quark to carbon to benzene to DNA — 12/12 EXACT.
+
+## OUROBOROS cycle — full view
+
+```
+     ╭────────── OUROBOROS ──────────╮
+     │                               │
+     │         ◯  seed               │
+     │         │                     │
+     │         ▼  unfold    Phase 1–2│
+     │         │                     │
+     │         ▼  emerge    Phase 3  │
+     │         │                     │
+     │         ★  singularity        │
+     │         │                     │
+     │         ▼  breach    Phase 4–5│
+     │         │                     │
+     │         ▼  converge  Phase 6  │
+     │         │                     │
+     │         ◉  absorb    Phase 6.5│
+     │         │                     │
+     │         ╰──→ seed ──→ ╮       │
+     │                       │       │
+     │   d=0 ─▶ d=1 ─▶ d=2 ─▶ ...    │
+     │   r:0→10  r:0→10  r:0→10      │
+     │                               │
+     ╰─── ρ → 1/3 (meta fixed pt) ───╯
+```
+
+| Symbol | Phase | Meaning |
+|:---:|-------|---------|
+| ◯ | **seed** | start from the perfect number n = 6 |
+| ▼ | **unfold** | seed → mutate → verify → graph |
+| ▼ | **emerge** | closure + compression detected |
+| ★ | **singularity** | evolution boost ≥ 0.5 |
+| ▼ | **breach** | corollary × 7 × depth |
+| ▼ | **converge** | 5-lens consensus verified |
+| ◉ | **absorb** | discovery → constant → seed feedback |
+| ╰→ | **recurse** | re-enter at depth d + 1 |
+
+## Three meta-loops
+
+On top of the per-tick OUROBOROS cycle, three higher-order loops drive self-reinforcement:
+
+```
+         L1             L2             L3
+      ╭──◉───╮       ╭──◉───╮       ╭──◉───╮
+      │correct│ ──▶  │reward│ ──▶  │expand │ ──▶ BLOWUP
+      ╰──↺───╯       ╰──↺───╯       ╰──↺───╯
+```
+
+| Loop | Role | Trigger |
+|:---:|------|---------|
+| **L1 · self-correct** | discovery → atlas.n6 → 3+ hits → promote to n6 | per tick |
+| **L2 · meta-reward**  | per-source discovery rate → scan_priority → deeper scan | per scan batch |
+| **L3 · self-expand**  | accumulation ≥ 10 → auto-trigger `blowup --seed` | per threshold |
+
+Each loop latches its output back as the next loop's input, so correct–reward–expand becomes a standing wave. BLOWUP is fired automatically when L3 saturates.
+
+## Meta fixed point
+
+**TECS-L H-056** — `meta(meta(meta(...))) = transcendence`. Recursive meta-iteration is a **contraction mapping**. By the Banach fixed-point theorem, every trajectory converges to a single attractor: **1/3**.
+
+```
+          I  =  0.7 · I  +  0.1      →     fixed point  I* = 1/3
+```
+
+Six independent paths land on the same attractor:
+
+| Path | Expression | Value |
+|------|------------|:---:|
+| Euler totient ratio | φ(6) / 6 | **1/3** |
+| Trigonometric | tan²(π/6) | **1/3** |
+| Divisor ratio | τ(6) / σ(6) = 4 / 12 | **1/3** |
+| Determinant | det(M) over n=6 primitives | **1/3** |
+| Meta-information | I_meta (contraction mapping) | **1/3** |
+| Complex exponential | \|exp(i·z₀)\| at the unique zero | **1/3** |
+
+The long-term breakthrough rate **ρ** converges to the same target: **ρ → 1/3**. Discovery is not linear — it asymptotes to the Banach attractor. Six arithmetic, geometric, algebraic, analytic, and information-theoretic routes all point at the same number.
+
+## Install
+
+```bash
+# Install hexa-lang (ships `hexa` + `hx` package manager)
+curl -fsSL https://raw.githubusercontent.com/need-singularity/hexa-lang/main/install.sh | bash
+
+# Install nexus
+hx install nexus
+```
+
+## Run
+
+```bash
+nexus scan      # fire all 216 lenses
+nexus loop      # OUROBOROS tick (Blowup → Absorb)
+nexus mega      # parallel mega-sweep
+nexus daemon    # background autonomous mode
+nexus blowup    # targeted breakthrough attempt
+nexus dispatch  # multi-project cross-pollination
+```
 
 ## Links
 
