@@ -1,0 +1,130 @@
+// test/test_daemon_reset.hexa — §4.1 byte-identity state-leak guard (Phase 2 Step 4)
+//
+// Boots nexus_drilld, sends smash(A) → smash(B) → smash(A), and compares
+// the A_1 and A_3 responses after masking non-deterministic fields
+// (ms, round_new timestamp). If reset_round() is incomplete (leaking a
+// round-scoped var), a later A_3 will diverge from A_1.
+//
+// Invocation:
+//   cd ~/core/nexus && hexa run test/test_daemon_reset.hexa
+//
+// Exit:
+//   0 = PASS (byte-identity holds)
+//   1 = FAIL (divergence — check §4.1 reset target)
+//   2 = daemon boot / IO failure
+//
+// Current status (Phase 2 Step 2 exec-based smash): vacuously PASS — each
+// round spawns a fresh subprocess, no in-proc state to leak. This test
+// becomes meaningful in Step 5 once in-proc dispatch lands.
+
+let SEED_A = "math_lattice_gauge"
+let SEED_B = "topo_knot_poly"
+let REQ_FIFO = "/tmp/nexus_drilld.sock"
+let PID_FILE = "/tmp/nexus_drilld.pid"
+let TERM_FLAG = "/tmp/nexus_drilld.term"
+let LOG_FILE = "/tmp/test_daemon_reset.daemon.log"
+let REPLY_A1 = "/tmp/test_daemon_reset.a1.reply"
+let REPLY_B  = "/tmp/test_daemon_reset.b.reply"
+let REPLY_A3 = "/tmp/test_daemon_reset.a3.reply"
+
+fn _shq(s: str) -> str {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _sleep_ms(ms: int) -> void {
+    // coarse sleep via `sleep` — fine enough for boot/IO waits.
+    let s = (ms + 999) / 1000
+    exec("sleep " + to_string(s))
+}
+
+fn _spawn_daemon() -> bool {
+    // rm any stale state
+    exec("rm -f " + _shq(REQ_FIFO) + " " + _shq(PID_FILE) + " " + _shq(TERM_FLAG) + " 2>/dev/null || true")
+    // background daemon — logs redirected so this script's stdout is clean
+    let cmd = "nohup hexa run cli/scripts/nexus_drilld.hexa > " + _shq(LOG_FILE) + " 2>&1 &"
+    exec(cmd)
+    // wait up to 10 s for READY (PID_FILE + FIFO both present)
+    let mut i = 0
+    while i < 20 {
+        _sleep_ms(500)
+        let chk = exec("[ -p " + _shq(REQ_FIFO) + " ] && [ -s " + _shq(PID_FILE) + " ] && echo y || echo n").trim()
+        if chk == "y" { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _stop_daemon() -> void {
+    let pid = exec("cat " + _shq(PID_FILE) + " 2>/dev/null || true").trim()
+    if pid.len() > 0 { exec("kill -TERM " + pid + " 2>/dev/null || true") }
+    // wake the blocking FIFO read so the daemon can observe TERM_FLAG
+    let quit = "{\"op\":\"quit\"}"
+    exec("printf '%s\\n' " + _shq(quit) + " > " + _shq(REQ_FIFO) + " 2>/dev/null || true")
+    _sleep_ms(1000)
+    // hard kill fallback
+    if pid.len() > 0 { exec("kill -9 " + pid + " 2>/dev/null || true") }
+    exec("rm -f " + _shq(REQ_FIFO) + " " + _shq(PID_FILE) + " " + _shq(TERM_FLAG)
+        + " " + _shq(REPLY_A1) + " " + _shq(REPLY_B) + " " + _shq(REPLY_A3)
+        + " 2>/dev/null || true")
+}
+
+fn _smash_request(seed: str, reply_path: str) -> str {
+    // Set up reply-FIFO (per-request, §3 protocol), fire smash, read one line back.
+    exec("rm -f " + _shq(reply_path) + " 2>/dev/null || true")
+    exec("mkfifo -m 0600 " + _shq(reply_path) + " 2>/dev/null || true")
+    let req = "{\"op\":\"smash\",\"seed\":\"" + seed
+        + "\",\"depth\":3,\"fast\":true,\"reply\":\"" + reply_path + "\"}"
+    // Write request to REQ_FIFO (blocks until daemon opens read side — daemon
+    // loop reads each line). Background so we can read reply in parallel.
+    exec("(printf '%s\\n' " + _shq(req) + " > " + _shq(REQ_FIFO) + " 2>/dev/null &) 2>/dev/null")
+    // Read one line from reply FIFO, up to 30 s.
+    let resp = exec("IFS= timeout 30 cat " + _shq(reply_path) + " 2>/dev/null | head -1 || true").trim()
+    exec("rm -f " + _shq(reply_path) + " 2>/dev/null || true")
+    return resp
+}
+
+fn _mask(resp: str) -> str {
+    // Drop timing / id fields — everything else is seed-derivative and must match.
+    // We zero out "ms":<N>,  and   "round_new":"r_<ts>_<clean>_<hash>"
+    // via awk-style scrub so the comparison is deterministic.
+    let sh_cmd = "printf '%s' " + _shq(resp)
+        + " | sed -E 's/\"ms\":[0-9]+/\"ms\":0/g; s/\"round_new\":\"r_[0-9]+_[a-z0-9_]*_[0-9a-f]+\"/\"round_new\":\"MASKED\"/g'"
+    return exec(sh_cmd).trim()
+}
+
+fn main() -> void {
+    println("[test_daemon_reset] booting nexus_drilld …")
+    let ok = _spawn_daemon()
+    if !ok {
+        eprintln("[test_daemon_reset] daemon boot failed — see " + LOG_FILE)
+        _stop_daemon()
+        exit(2)  // @allow-silent-exit
+    }
+    println("[test_daemon_reset] READY — sending 3 smash rounds (A, B, A)")
+
+    let resp_a1 = _smash_request(SEED_A, REPLY_A1)
+    let resp_b  = _smash_request(SEED_B, REPLY_B)
+    let resp_a3 = _smash_request(SEED_A, REPLY_A3)
+
+    _stop_daemon()
+
+    let m_a1 = _mask(resp_a1)
+    let m_a3 = _mask(resp_a3)
+
+    if m_a1.len() == 0 || m_a3.len() == 0 {
+        eprintln("[test_daemon_reset] empty response — A_1=" + resp_a1 + " A_3=" + resp_a3)
+        exit(2)  // @allow-silent-exit
+    }
+    if m_a1 == m_a3 {
+        println("PASS: byte-identity holds (A_1 ≡ A_3)")
+        println("  A_1 = " + m_a1)
+        exit(0)  // @allow-silent-exit
+    }
+    eprintln("FAIL: byte-identity broken — reset_round() is incomplete")
+    eprintln("  A_1 = " + m_a1)
+    eprintln("  A_3 = " + m_a3)
+    eprintln("  B   = " + _mask(resp_b))
+    exit(1)  // @allow-silent-exit
+}
+
+main()

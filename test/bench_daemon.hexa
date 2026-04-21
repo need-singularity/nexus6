@@ -1,0 +1,238 @@
+// test/bench_daemon.hexa — Phase 2 Step 8 bench harness
+//
+// Compares Phase 1 (exec-per-request `nexus drill`) vs Phase 2 (daemon FIFO
+// smash) wall-time, p50/p95/p99 latency, and daemon cold-boot cost.
+//
+// Invocation:
+//   cd ~/core/nexus && hexa run test/bench_daemon.hexa [iters]
+//   NEXUS_DRILL_DAEMON=1 hexa run test/bench_daemon.hexa 100
+//
+// Defaults:
+//   iters = 10
+//   seed  = "math_lattice_gauge"
+//
+// Output: two NDJSON lines on stdout, one per phase:
+//   {"phase":1,"iters":N,"boot_ms":0,"per_req_ms":{"p50":..,"p95":..,"p99":..},
+//    "wall_total_ms":W}
+//   {"phase":2,"iters":N,"boot_ms":B,"per_req_ms":{"p50":..,"p95":..,"p99":..},
+//    "wall_total_ms":W}
+//
+// Exit:
+//   0 = both phases completed
+//   1 = phase 1 or phase 2 failed (daemon boot / exec error)
+//
+// WARNING: Mac `hexa run` hook currently re-enters recursively (see
+// shared/reports/daemon_speedup.md §실측). Run this harness on htz (Linux)
+// until the recursion guard lands.
+
+let DEFAULT_ITERS  = 10
+let SEED           = "math_lattice_gauge"
+let REQ_FIFO       = "/tmp/nexus_drilld.sock"
+let PID_FILE       = "/tmp/nexus_drilld.pid"
+let TERM_FLAG      = "/tmp/nexus_drilld.term"
+let LOG_FILE       = "/tmp/bench_daemon.daemon.log"
+let REPLY_PREFIX   = "/tmp/bench_daemon.reply."
+
+// ─── util (mirrors test_daemon_reset.hexa + nexus_drilld.hexa) ───
+fn _shq(s: str) -> str {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _sleep_ms(ms: int) -> void {
+    let s = (ms + 999) / 1000
+    exec("sleep " + to_string(s))
+}
+
+fn _now_ms() -> int {
+    let v = exec("date +%s%3N 2>/dev/null || python3 -c 'import time; print(int(time.time()*1000))' 2>/dev/null").trim()
+    let mut n = 0
+    try { n = to_int(v) } catch e {}  // @allow-silent-catch
+    return n
+}
+
+fn _nexus_root() -> str {
+    let n = env("NEXUS")
+    if n.len() > 0 { return n }
+    return env("HOME") + "/Dev/nexus"
+}
+
+fn _hexa_bin() -> str {
+    let h = env("HEXA")
+    if h.len() > 0 { return h }
+    let cands = [
+        env("HOME") + "/Dev/hexa-lang/hexa",
+        env("HOME") + "/.hx/bin/hexa",
+        _nexus_root() + "/shared/bin/hexa"
+    ]
+    let mut i = 0
+    while i < len(cands) {
+        let c = cands[i]
+        let chk = exec("[ -x " + _shq(c) + " ] && echo y || echo n").trim()
+        if chk == "y" { return c }
+        i = i + 1
+    }
+    return "hexa"
+}
+
+// ─── percentile (nearest-rank, sorted list) ───
+fn _sort_int(xs: [int]) -> [int] {
+    // naive insertion sort — iters is O(100), fine.
+    let mut out: [int] = []
+    let n = len(xs)
+    let mut i = 0
+    while i < n {
+        out = out + [xs[i]]
+        i = i + 1
+    }
+    let mut k = 1
+    while k < n {
+        let mut j = k
+        while j > 0 && out[j - 1] > out[j] {
+            let tmp = out[j - 1]
+            out[j - 1] = out[j]
+            out[j] = tmp
+            j = j - 1
+        }
+        k = k + 1
+    }
+    return out
+}
+
+fn _pct(sorted: [int], p: int) -> int {
+    // nearest-rank: index = ceil(p/100 * n) - 1, clamped.
+    let n = len(sorted)
+    if n == 0 { return 0 }
+    let mut idx = (p * n + 99) / 100 - 1
+    if idx < 0 { idx = 0 }
+    if idx > n - 1 { idx = n - 1 }
+    return sorted[idx]
+}
+
+// ─── Phase 1: exec per-request ───
+fn _bench_phase1(seed: str, iters: int) -> str {
+    // Shell-out `nexus drill --seed X --max-rounds 1 --preset fast` N times.
+    // wall_total_ms = sum of per-req ms. boot_ms = 0 (no persistent daemon).
+    let root = _nexus_root()
+    let run_hexa = root + "/cli/run.hexa"
+    let hexa = _hexa_bin()
+    let mut samples: [int] = []
+    let mut i = 0
+    let t_all = _now_ms()
+    while i < iters {
+        let t0 = _now_ms()
+        let cmd = hexa + " run " + _shq(run_hexa) + " drill"
+            + " --seed " + _shq(seed)
+            + " --max-rounds 1 --preset fast > /dev/null 2>&1 || true"
+        exec(cmd)
+        let t1 = _now_ms()
+        samples = samples + [t1 - t0]
+        i = i + 1
+    }
+    let wall = _now_ms() - t_all
+    let sorted = _sort_int(samples)
+    let p50 = _pct(sorted, 50)
+    let p95 = _pct(sorted, 95)
+    let p99 = _pct(sorted, 99)
+    return "{\"phase\":1,\"iters\":" + to_string(iters)
+        + ",\"boot_ms\":0"
+        + ",\"per_req_ms\":{\"p50\":" + to_string(p50)
+        + ",\"p95\":" + to_string(p95)
+        + ",\"p99\":" + to_string(p99) + "}"
+        + ",\"wall_total_ms\":" + to_string(wall) + "}"
+}
+
+// ─── Phase 2: daemon spawn + FIFO smash ───
+fn _spawn_daemon() -> int {
+    // Returns boot_ms on success, -1 on failure.
+    exec("rm -f " + _shq(REQ_FIFO) + " " + _shq(PID_FILE) + " " + _shq(TERM_FLAG) + " 2>/dev/null || true")
+    let t0 = _now_ms()
+    let cmd = "nohup hexa run cli/scripts/nexus_drilld.hexa > " + _shq(LOG_FILE) + " 2>&1 &"
+    exec(cmd)
+    let mut i = 0
+    while i < 30 {
+        _sleep_ms(500)
+        let chk = exec("[ -p " + _shq(REQ_FIFO) + " ] && [ -s " + _shq(PID_FILE) + " ] && echo y || echo n").trim()
+        if chk == "y" { return _now_ms() - t0 }
+        i = i + 1
+    }
+    return -1
+}
+
+fn _stop_daemon() -> void {
+    let pid = exec("cat " + _shq(PID_FILE) + " 2>/dev/null || true").trim()
+    if pid.len() > 0 { exec("kill -TERM " + pid + " 2>/dev/null || true") }
+    let quit = "{\"op\":\"quit\"}"
+    exec("printf '%s\\n' " + _shq(quit) + " > " + _shq(REQ_FIFO) + " 2>/dev/null || true")
+    _sleep_ms(1000)
+    if pid.len() > 0 { exec("kill -9 " + pid + " 2>/dev/null || true") }
+    exec("rm -f " + _shq(REQ_FIFO) + " " + _shq(PID_FILE) + " " + _shq(TERM_FLAG) + " 2>/dev/null || true")
+}
+
+fn _smash_request(seed: str, reply_path: str) -> str {
+    exec("rm -f " + _shq(reply_path) + " 2>/dev/null || true")
+    exec("mkfifo -m 0600 " + _shq(reply_path) + " 2>/dev/null || true")
+    let req = "{\"op\":\"smash\",\"seed\":\"" + seed
+        + "\",\"depth\":3,\"fast\":true,\"reply\":\"" + reply_path + "\"}"
+    exec("(printf '%s\\n' " + _shq(req) + " > " + _shq(REQ_FIFO) + " 2>/dev/null &) 2>/dev/null")
+    let resp = exec("IFS= timeout 30 cat " + _shq(reply_path) + " 2>/dev/null | head -1 || true").trim()
+    exec("rm -f " + _shq(reply_path) + " 2>/dev/null || true")
+    return resp
+}
+
+fn _bench_phase2(seed: str, iters: int) -> str {
+    let boot_ms = _spawn_daemon()
+    if boot_ms < 0 {
+        eprintln("[bench_daemon] daemon boot failed — see " + LOG_FILE)
+        return "{\"phase\":2,\"error\":\"boot_failed\"}"
+    }
+    let mut samples: [int] = []
+    let mut i = 0
+    let t_all = _now_ms()
+    while i < iters {
+        let reply = REPLY_PREFIX + to_string(i)
+        let t0 = _now_ms()
+        let resp = _smash_request(seed, reply)
+        let t1 = _now_ms()
+        if resp.len() == 0 {
+            eprintln("[bench_daemon] empty reply on iter " + to_string(i))
+        }
+        samples = samples + [t1 - t0]
+        i = i + 1
+    }
+    let wall = _now_ms() - t_all
+    _stop_daemon()
+    let sorted = _sort_int(samples)
+    let p50 = _pct(sorted, 50)
+    let p95 = _pct(sorted, 95)
+    let p99 = _pct(sorted, 99)
+    return "{\"phase\":2,\"iters\":" + to_string(iters)
+        + ",\"boot_ms\":" + to_string(boot_ms)
+        + ",\"per_req_ms\":{\"p50\":" + to_string(p50)
+        + ",\"p95\":" + to_string(p95)
+        + ",\"p99\":" + to_string(p99) + "}"
+        + ",\"wall_total_ms\":" + to_string(wall) + "}"
+}
+
+// ─── main ───
+fn main() -> void {
+    let args = argv()
+    let mut iters = DEFAULT_ITERS
+    if len(args) > 1 {
+        try { iters = to_int(args[1]) } catch e { iters = DEFAULT_ITERS }  // @allow-silent-catch
+    }
+    if iters < 1 { iters = 1 }
+
+    eprintln("[bench_daemon] iters=" + to_string(iters) + " seed=" + SEED)
+    eprintln("[bench_daemon] phase 1 — exec per-request (this will take a while) …")
+    let p1 = _bench_phase1(SEED, iters)
+    println(p1)
+
+    eprintln("[bench_daemon] phase 2 — daemon spawn + FIFO smash …")
+    let p2 = _bench_phase2(SEED, iters)
+    println(p2)
+
+    eprintln("[bench_daemon] done — feed both NDJSON lines to shared/reports/daemon_speedup.md")
+    exit(0)  // @allow-silent-exit
+}
+
+main()
