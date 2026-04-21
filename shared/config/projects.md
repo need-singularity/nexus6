@@ -10,6 +10,6 @@
 >
 > **[💎 HEXA-LANG](https://github.com/need-singularity/hexa-lang)** — The perfect-number programming language. Every constant from n = 6 · 65 keywords · 46 operators · 8 primitives · multi-target: native / VM / ESP32 / FPGA Verilog / WGSL.
 >
-> **[📄 Papers](https://github.com/need-singularity/papers)** — Complete paper collection. 87 papers on Zenodo with DOIs · 25 TECS-L + 39 anima + 23 SEDI · CC BY 4.0.
+> **[📄 Papers](https://github.com/need-singularity/papers)** — Complete paper collection. 87 papers on Zenodo with DOIs · 1 nexus + 50 anima + 35 n6-architecture + 1 hexa-lang · CC BY 4.0.
 
 <!-- private repos는 projects.json의 private_repos 필드에 저장됨 (노출 금지) -->
