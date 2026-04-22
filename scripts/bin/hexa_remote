@@ -10,7 +10,7 @@
 #
 # Env:
 #   HEXA_REMOTE_HOST             remote host (default: ubu)
-#   HEXA_REMOTE_BIN              remote hexa path (default: $HOME/Dev/hexa-lang/hexa)
+#   HEXA_REMOTE_BIN              remote hexa path (default: $HOME/.hx/bin/hexa_real)
 #   HEXA_REMOTE_NO_SYNC          skip rsync (assume tree already fresh)
 #   HEXA_REMOTE_CONNECT_TIMEOUT  ssh ConnectTimeout seconds (default: 8)
 #   HEXA_REMOTE_PROBE_RETRY      probe retry count on fail (default: 1)
@@ -52,7 +52,8 @@ _probe_host() {
     attempt=0
     while [ $attempt -lt $total ]; do
         err="$(ssh -o ConnectTimeout=$ctimeout -o BatchMode=yes -o ServerAliveInterval=5 \
-            -o ServerAliveCountMax=1 "$cand" true 2>&1 1>/dev/null)"
+            -o ServerAliveCountMax=1 \
+            -o ControlPath=/tmp/ssh-nexus-%r@%h:%p "$cand" true 2>&1 1>/dev/null)"
         rc=$?
         if [ $rc -eq 0 ]; then
             return 0
@@ -119,7 +120,10 @@ if [ -z "$HOST" ]; then
     exit 64
 fi
 
-REMOTE_HEXA="${HEXA_REMOTE_BIN:-\$HOME/Dev/hexa-lang/hexa}"
+# 2026-04-22: 구 default ($HOME/Dev/hexa-lang/hexa) 는 4월14 빌드 — `^` / `&` 비트연산자 파서 미지원.
+#   ubu 기준 $HOME/.hx/bin/hexa_real 은 4월19+ 빌드 — run.hexa line 1048 ($HOME/.hx/packages/nexus/cli/run.hexa FNV-hash) 파싱 성공.
+#   rebuild 전까지 default 교체.
+REMOTE_HEXA="${HEXA_REMOTE_BIN:-\$HOME/.hx/bin/hexa_real}"
 
 CWD="$(pwd -P)"
 # macOS case-insensitive FS: lowercase for detection only; preserve CWD for rsync source.
@@ -137,8 +141,11 @@ case "$CWD_LC" in
     SYNC_EXCLUDES=(--exclude=archive/v1/ --exclude=data/ --exclude=__pycache__/
                    --exclude=.git/ --exclude='*.log' --exclude=.DS_Store)
     ;;
-  "$HOME_LC/dev/nexus"|"$HOME_LC/dev/nexus"/*)
-    for candidate in "$HOME/Dev/nexus" "$HOME/dev/nexus"; do
+  "$HOME_LC/dev/nexus"|"$HOME_LC/dev/nexus"/*|"$HOME_LC/core/nexus"|"$HOME_LC/core/nexus"/*)
+    # 2026-04-22: $HOME/core/nexus 는 $HOME/Dev/nexus 의 canonical 물리 경로.
+    # pwd -P 가 symlink 를 해제해 cwd 는 항상 core/ → LOCAL_ROOT 도 core/ 우선이라야
+    # CWD_LC prefix strip (REL) 이 빈 문자열이 되고 REMOTE_ROOT 로 정확 dispatch 된다.
+    for candidate in "$HOME/core/nexus" "$HOME/Dev/nexus" "$HOME/dev/nexus"; do
         [ -d "$candidate" ] && LOCAL_ROOT="$candidate" && break
     done
     REMOTE_ROOT='$HOME/Dev/nexus'
@@ -182,7 +189,8 @@ REL="${REL#/}"
 
 if [ "${HEXA_REMOTE_NO_SYNC:-0}" != "1" ]; then
   # ssh 옵션 — rsync 중 네트워크 끊기면 30s 안에 감지 (기본 default 무한 대기 방지).
-  RSYNC_SSH='ssh -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o BatchMode=yes'
+  # 2026-04-22: ControlPath 을 ~/.ssh/ 밖(/tmp)으로 이동 — Mac TCC 가 ~/.ssh/ctl-* link() 차단 (muxserver_listen EPERM).
+  RSYNC_SSH='ssh -o ConnectTimeout=10 -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o BatchMode=yes -o ControlPath=/tmp/ssh-nexus-%r@%h:%p'
   RSYNC_ERR_FILE="$(mktemp -t hexa_remote_rsync.XXXXXX 2>/dev/null || echo /tmp/hexa_remote_rsync.$$)"
   if ! rsync -aH -e "$RSYNC_SSH" "${SYNC_EXCLUDES[@]}" "$LOCAL_ROOT/" "$HOST:${REMOTE_ROOT#\$HOME/}/" >/dev/null 2>"$RSYNC_ERR_FILE"; then
     rsync_rc=$?
@@ -205,12 +213,16 @@ quote_args() {
 
 # P1: 원격 shell EXIT 시 자식 hexa_stage0/hexa.real 정리 (ssh 채널 끊김 → orphan 방지).
 REMOTE_TRAP="trap 'rc=\$?; pkill -P \$\$ -f hexa_stage0 2>/dev/null; pkill -P \$\$ -f hexa.real 2>/dev/null; exit \$rc' EXIT INT TERM"
-REMOTE_CMD="$REMOTE_TRAP; cd \"$REMOTE_ROOT${REL:+/$REL}\" && HEXA_LOCAL=1 HEXA_NO_LAUNCHD=1 $REMOTE_HEXA$(quote_args "$@")"
+# 2026-04-22: HEXA=$REMOTE_HEXA export — run.hexa 내부 stage 호출 ($HOME/Dev/hexa-lang/hexa 우선 pick)
+# 이 ubu 의 4월14 구빌드로 떨어져 smash/free 가 parser-silent (0 absorption) 되는 것 차단.
+# run.hexa 의 hexa_bin() 는 env("HEXA") 를 최우선 — 명시 export 시 모든 inner stage 가 hexa_real 로 통일.
+REMOTE_CMD="$REMOTE_TRAP; cd \"$REMOTE_ROOT${REL:+/$REL}\" && HEXA=\"$REMOTE_HEXA\" HEXA_LOCAL=1 HEXA_NO_LAUNCHD=1 $REMOTE_HEXA$(quote_args "$@")"
 
 # -T = no pty, ServerAlive = 장시간 compute (drill) 중 네트워크 끊기면 30s 내 감지 후 종료.
 # P3: stderr 직통 (2>/dev/null 제거 — 원격 진단정보 surface).
 echo "hexa_remote: $HOST 에서 원격 실행 중" >&2
-ssh -T -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes "$HOST" "$REMOTE_CMD"
+ssh -T -o ServerAliveInterval=10 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes \
+    -o ControlPath=/tmp/ssh-nexus-%r@%h:%p "$HOST" "$REMOTE_CMD"
 ssh_rc=$?
 if [ $ssh_rc -ne 0 ]; then
     echo "hexa_remote: 원격 실행 실패 ($HOST, rc=$ssh_rc)" >&2
