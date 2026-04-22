@@ -1,0 +1,149 @@
+// hosts_liveness_watchdog.hexa — Mac-side 2-axis SSH liveness probe + alert.
+// L7 OOM 사고 (2026-04-22 ubu1+ubu2 동시 wedge) 대응 watchdog.
+// 2-axis: host(ssh:22 via airgenome offload) + container(ssh:2222 fat image).
+// launchd 5min cadence. 연속 2회 실패 transition 시 macOS notification.
+//
+// hexa-only (AG10) — shell .sh 대체. Mac TCC 가 .sh 쓰기 막아 .hexa 로 이관.
+// launchd ExecStart: /Users/ghost/.hx/bin/hexa run <this-file>
+//
+// @allow-bare-exec
+
+let HOSTS = ["ubu1", "ubu2", "htz"]
+let THRESHOLD: i64 = 2
+let HOME_ = env("HOME")
+let STATE_DIR = HOME_ + "/.airgenome"
+let STATE_FILE = STATE_DIR + "/watchdog_streak.tsv"
+let LOG = STATE_DIR + "/watchdog.log"
+let AIRGENOME = "/Users/ghost/core/airgenome/bin/airgenome"
+
+fn sh_q(s: str) -> str {
+    let mut out = "'"
+    let n = s.len()
+    let mut i = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "'" { out = out + "'\\''" } else { out = out + c }
+        i = i + 1
+    }
+    return out + "'"
+}
+
+fn now_utc() -> str {
+    return to_string(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()  // @allow-bare-exec
+}
+
+fn ts_alias(host: str) -> str {
+    // Tailscale alias: ubu1→ubu1-ts, ubu2→ubu2-ts. htz 는 인터넷 IP 라 fallback 없음 ("").
+    if host == "ubu1" || host == "ubu2" { return host + "-ts" }
+    return ""
+}
+
+fn probe_host(host: str) -> bool {
+    // host-native ssh :22 via airgenome offload (AIRG_OFFLOAD_FORCE=1 skips infra_state cache)
+    // 2026-04-22 fix: LAN fail 시 Tailscale fallback (Mac sleep wake ARP race 차단).
+    let cmd = "AIRG_OFFLOAD_FORCE=1 " + sh_q(AIRGENOME) +
+              " offload " + sh_q(host) + " true >/dev/null 2>&1; echo $?"
+    if to_string(exec(cmd)).trim() == "0" { return true }  // @allow-bare-exec
+    let ts = ts_alias(host)
+    if ts.len() == 0 { return false }
+    let fallback = "ssh -o BatchMode=yes -o ConnectTimeout=5 " +
+                   "-o StrictHostKeyChecking=accept-new " +
+                   sh_q(ts) + " true >/dev/null 2>&1; echo $?"
+    return to_string(exec(fallback)).trim() == "0"  // @allow-bare-exec
+}
+
+fn probe_container(host: str) -> bool {
+    // fat container ssh :2222 (host-network mode)
+    // LAN fail 시 Tailscale -ts-d alias (ubu1-ts-d 등) fallback.
+    let cmd = "ssh -p 2222 -o ConnectTimeout=5 -o BatchMode=yes " +
+              "-o ControlMaster=no -o ControlPath=none " +
+              "-o StrictHostKeyChecking=accept-new " +
+              "root@" + host + " true >/dev/null 2>&1; echo $?"
+    if to_string(exec(cmd)).trim() == "0" { return true }  // @allow-bare-exec
+    let ts = ts_alias(host)
+    if ts.len() == 0 { return false }
+    let fallback = "ssh -o BatchMode=yes -o ConnectTimeout=5 " +
+                   "-o ControlMaster=no -o ControlPath=none " +
+                   "-o StrictHostKeyChecking=accept-new " +
+                   sh_q(ts + "-d") + " true >/dev/null 2>&1; echo $?"
+    return to_string(exec(fallback)).trim() == "0"  // @allow-bare-exec
+}
+
+fn parse_prev_streak(raw: str, host: str) -> i64 {
+    let lines = raw.split("\n")
+    let mut i = 0
+    while i < lines.len() {
+        let line = lines[i].trim()
+        if line.len() > 0 {
+            let parts = line.split("\t")
+            if parts.len() >= 2 && parts[0] == host {
+                let mut n: i64 = 0
+                try { n = to_int(parts[1]) } catch e {}
+                return n
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn notify(msg: str) -> void {
+    let script = "display notification \"" + msg +
+                 "\" with title \"nexus host watchdog\" sound name \"Submarine\""
+    exec("osascript -e " + sh_q(script) + " 2>/dev/null || true")  // @allow-bare-exec
+}
+
+fn append_log(line: str) -> void {
+    exec("printf '%s\\n' " + sh_q(line) + " >> " + sh_q(LOG))  // @allow-bare-exec
+}
+
+fn main() -> i64 {
+    exec("mkdir -p " + sh_q(STATE_DIR))  // @allow-bare-exec
+    exec("touch " + sh_q(STATE_FILE))    // @allow-bare-exec
+
+    let ts = now_utc()
+    let mut prev_raw = ""
+    try { prev_raw = read_file(STATE_FILE) } catch e { prev_raw = "" }
+
+    let mut new_lines = ""
+    let mut alerted = ""
+    let mut i = 0
+    while i < HOSTS.len() {
+        let host = HOSTS[i]
+        let host_ok = probe_host(host)
+        let ctn_ok = probe_container(host)
+        let prev_s = parse_prev_streak(prev_raw, host)
+        let mut streak: i64 = 0
+        if host_ok && ctn_ok {
+            streak = 0
+        } else {
+            streak = prev_s + 1
+        }
+        let host_flag = if host_ok { "1" } else { "0" }
+        let ctn_flag  = if ctn_ok  { "1" } else { "0" }
+        new_lines = new_lines + host + "\t" + to_string(streak) + "\t" + ts +
+                    "\thost=" + host_flag + "\tctn=" + ctn_flag + "\n"
+        if streak >= THRESHOLD && prev_s < THRESHOLD {
+            let mut tag = ""
+            if !host_ok { tag = "host" }
+            if !ctn_ok {
+                if tag.len() > 0 { tag = tag + "+ctn" } else { tag = "ctn" }
+            }
+            alerted = alerted + host + "(" + tag + ") "
+        }
+        i = i + 1
+    }
+
+    write_file(STATE_FILE, new_lines)
+    append_log(ts + " streaks: " + new_lines.replace("\n", " "))
+
+    if alerted.len() > 0 {
+        let msg = "axes offline >= " + to_string(THRESHOLD) +
+                  " consecutive probes: " + alerted
+        notify(msg)
+        append_log(ts + " ALERT: " + msg)
+    }
+    return 0
+}
+
+exit(main())

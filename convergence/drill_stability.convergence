@@ -456,3 +456,43 @@
 @rationale L23 fat 이미지 자원 완전 내장 상태에서 drill stage0 가 container 안에서 돌면 (a) L7 OOM 이 container scope 로 격리 추가 (b) 경로/바이너리 버전 불일치 제거 (dev-sshd 의 구 hexa 이슈 해소) (c) 재현성 (이미지 digest 고정). 단 현재 host-native 경로도 L15 cgroup cap 으로 이미 안전 — 당장 migrate 할 urgency 낮음. design 만 기록, 실적용은 후속 trigger 에서.
 @files ["scripts/bin/hexa_remote (예정)", "airgenome:shared/systemd/airgenome-claude.service (mount 추가 예정)"]
 @test_status designed (실구현/검증은 별도 — 블로커 없음, 단 변경 범위 큼)
+
+@ts 2026-04-22T23:30:00Z
+@id L28_CONTAINER_DEPLOY_RACE_FREE_HELPER
+@state ossified
+@value Mac `airgenome/bin/container-deploy` 신설 — `<ssh-target> [tag]` 받아서 (1) `docker pull`, (2) `systemctl --user try-restart` (root sudo fallback), (3) 60s polling: `docker inspect --format '{{.State.Status}}|{{.State.Health.Status}}|{{.Image}}'` 반복으로 `running+healthy+(new digest match)` 확정 시 exit 0. timeout 시 exit 2, digest mismatch exit 3. 이전 race window 9s — `try-restart 후 sleep 2; docker inspect` 가 wrapper pre-flight 한가운데 떨어져 `no such object` 보고했던 오판정 영구 차단.
+@rationale 세션 복원 직후 ubu1 container 가 "사라졌다" 고 오판한 인시던트 직접 대응. wrapper pre-flight 가 최대 6초이므로 polling 으로만 정확. polling state transition 도 로그 (state 변할 때만 print).
+@files ["airgenome:bin/container-deploy"]
+@test_status ran (ubu1 실측: missing → running|starting → running|healthy 9s 내 transition 캡처, exit 0)
+
+@ts 2026-04-22T23:30:01Z
+@id L29_SSH_CONFIG_TAILSCALE_FALLBACK_ALIAS
+@state ossified
+@value Mac `~/.ssh/config` 에 ubu1-ts/ubu2-ts (port 22) + ubu1-ts-d/ubu2-ts-d (port 2222) 4 alias 추가. Mac sleep wake 직후 LAN ARP cache stale 로 `ssh ubu1` 일시 실패 시 dispatcher 가 `ubu1-ts` (Tailscale 100.96.193.56) 로 우회 가능. htz 는 인터넷 IP 라 fallback 무의미 — 추가 안 함. ssh -G 검증 4/4, 실접속 hostname 확증.
+@rationale 세션 복원 시 `ping ubu1` Unknown host + `airgenome offload ubu1` `No route to host` 발생, 단 Tailscale 노드는 정상 응답. ARP/DNS race 로 LAN-only 의존이 단일점 — Tailscale 우회 등록으로 이중화.
+@files ["~/.ssh/config"]
+@test_status ran (4 alias hostname/port/user `ssh -G` 확인, 실접속 hostname 4/4 PASS)
+
+@ts 2026-04-22T23:30:02Z
+@id L30_AIRGENOME_CLAUDE_RUN_PREFLIGHT_SHORTENED
+@state ossified
+@value 3호스트 `~/Dev/airgenome/bin/airgenome-claude-run` patch: (1) authorized_keys 처리 3 sudo (cp/chown/chmod) → 1 `sudo bash -c "..."`, (2) `docker pull` → background `&`. wrapper pre-flight 4-6초 → 2-3초. journal `[WARN tini]` (docker run 시작 신호) 도착 시간 단축. 백업 `.bak.<UTC>` 보존.
+@rationale L28 race window 의 정체. wrapper 가 매 start 마다 idempotent `pull + key copy + chown + chmod + test` 호출 → systemctl restart 이 docker container 보일 때까지의 latency. patch 후 race window 9s → 4s (실측 container-deploy 로 측정).
+@files ["ubu1:/home/aiden/Dev/airgenome/bin/airgenome-claude-run", "ubu2:/home/summer/Dev/airgenome/bin/airgenome-claude-run", "htz:/root/Dev/airgenome/bin/airgenome-claude-run"]
+@test_status ran (3호스트 PATCH1_OK + PATCH2_OK + bash -n syntax OK, container-deploy 재측 4s 확증)
+
+@ts 2026-04-22T23:30:03Z
+@id L31_SYSTEMD_EXECSTARTPOST_WAIT_FOR_HEALTHY
+@state ossified
+@value 3호스트 `~/.config/systemd/user/airgenome-claude.service.d/wait-for-healthy.conf` drop-in 신설. `ExecStartPost=-/bin/sh -c '\''for i in $(seq 1 60); do [ "$(docker inspect airgenome-claude --format "{{.State.Health.Status}}" 2>/dev/null)" = "healthy" ] && exit 0; sleep 1; done; exit 0'\''`. `-` prefix → best-effort (timeout 시 unit fail 안 함, Restart loop 회피). systemd 의 `restart` 자체가 healthy 까지 block — caller 가 systemctl restart 직후 `docker inspect` 해도 race 0.
+@rationale L28 helper 는 caller 측 polling. unit 자체에 wait 내장으로 caller 무관하게 race 차단. Dockerfile:105 의 HEALTHCHECK (hexa_real --version + node --version) 가 이미 명시돼 있어 healthy state 판정 로직 구비됨.
+@files ["ubu1/ubu2/htz:~/.config/systemd/user/airgenome-claude.service.d/wait-for-healthy.conf"]
+@test_status ran (ubu1 실측: systemctl --user restart wall=6s → 직후 docker inspect = healthy, additional inspect 0s)
+
+@ts 2026-04-22T23:30:04Z
+@id L32_WATCHDOG_HEXA_TAILSCALE_FALLBACK_MERGE
+@state ossified
+@value 다른 nexus 세션이 22:30 작성한 `scripts/bin/hosts_liveness_watchdog.hexa` (2-axis: host:22 + container:2222) 와 본 세션의 LAN→Tailscale fallback 머지. `probe_host()` 와 `probe_container()` 모두 LAN fail 시 `ts_alias(host)` (ubu1→ubu1-ts, ubu2→ubu2-ts, htz→"") 로 재시도. launchd plist `com.nexus.hosts-watchdog` 의 ProgramArguments 를 `/bin/bash <script>.sh` → `/Users/ghost/.hx/bin/hexa run <script>.hexa` 로 전환. bash 임시본 (확장자 없음) 폐기. 기존 `.sh` (provenance-xattr write-locked) 는 dead.
+@rationale 두 세션이 같은 watchdog 을 다른 패러다임 (.hexa vs .sh) + 다른 axis (2-axis vs LAN-fallback) 로 동시 작업. 합치면 4-axis 커버 (host LAN, host TS, container LAN, container TS) — 한쪽에서 LAN/container 단일 단절도 정확히 잡고 false alarm 도 줄임.
+@files ["scripts/bin/hosts_liveness_watchdog.hexa", "~/Library/LaunchAgents/com.nexus.hosts-watchdog.plist"]
+@test_status ran (hexa run 직접 smoke → log: paths 갱신 정상, ALERT htz(ctn) 발견 — htz container :2222 미 listen, L33 후속 진단 대상)
