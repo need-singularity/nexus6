@@ -401,6 +401,31 @@ grade distribution + hub centrality 를 monthly 자동 publish (`docs/atlas_heal
 
 ---
 
+## G3 hub 연계 (2026-04-23, append by 별 세션)
+
+별 nexus 세션에서 본 brainstorm 과 충돌 0 으로 추가. atlas-blowup meta 의 cross-repo 측면을 G3 cross-repo proposal sync hub (`tool/proposal_sync_hub.hexa`) 와 자연 연결.
+
+### atlas-blowup ↔ G3 hub 의 연계점
+
+| atlas-blowup 축 | G3 hub 활용 | 메커니즘 |
+|---|---|---|
+| **R3 cross_repo_audit** (Round 1) | hub `state/cross_repo_links.jsonl` emit → R3 audit signal source 로 직접 사용 | 매 12h cycle 결과 1 line append |
+| **D3 rate limiter** (next-step 후보) | hub `MAX_NEW_LINKS_PER_CYCLE=50` 와 결합 — atlas-blowup 자동 결정의 cross-repo 영향 capped | hub `flood_skip` → D3 input |
+| **C1 닫힌 루프 검증** (next-step 후보) | hub dedup (sha256[:16]) + circular detect → C1 invariant 자동 충족 | hub `cycle_detected` → C1 health regression 판정 |
+| **Q1-Q2 Ψ cross-check** | hub `auto_link_score` → Ψ-weighted score 로 진화 시 Q-axis 와 metric 공유 | shared schema `nexus/proposal/cross_repo_link/1` |
+
+### 합류 시 추가 작업 (사용자 trigger 대기)
+
+1. atlas-blowup cycle 마지막에 `hexa run tool/proposal_sync_hub.hexa --apply` 1줄 (anima P9 step 8.5 동일 패턴)
+2. R3 cross_repo_audit timeline jsonl schema 에 hub 의 `new_links/dedup_skip/flood_skip` field 추가
+3. C1 닫힌 루프: hub `cycle_detected=true` → atlas health regression 단방향 차단
+
+본 section 은 **연계 가능성 명시 only** — 실제 patch 는 atlas-blowup maintainer (round-3 author) trigger 후. 다른 세션 round-N 작업과 본문 충돌 0.
+
+cf. `state/proposals/pending/nxs-20260422-002_atlas-blowup-meta-automation.json` (G3 own-stack mirror) + `tool/proposal_sync_hub.hexa` (hub 본체) + `state/cross_repo_links.jsonl` (실측 5 link emit, 2026-04-22 e2e PASS).
+
+---
+
 ## Appendix — A1+A2 seed (MINPATH 구현 착수, 2026-04-22)
 
 **상태**: 최초 baseline row 1 건 작성 완료.
