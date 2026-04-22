@@ -1,0 +1,178 @@
+// blowup_phase_profile.hexa — per-phase wall-time profiler for cli/blowup/core/blowup.hexa
+//
+// Usage:
+//   hexa run shared/scripts/bin/blowup_phase_profile.hexa <domain> <depth> [extra...]
+//   hexa run shared/scripts/bin/blowup_phase_profile.hexa "sum_k2_identity_probe" 3 --fast --no-graph --max-rounds 1
+//
+// Method:
+//   1. t0 = _now_ms() at wrapper entry
+//   2. spawn blowup via exec() with stdout captured; awk timestamps each line ns
+//   3. parse `--- Phase N ... ---` and `═══ Phase N.M ... ═══` boundary markers
+//   4. per-phase wall = next_boundary_ts - this_boundary_ts
+//
+// Why hexa (not bash)? — repo policy = hexa-only; no .sh/.py/.rs/.c created.
+// Exec shell under-the-hood is fine (existing _progress_now_ms() precedent).
+//
+// No modification to blowup.hexa — pure observer wrapper.
+
+fn _now_ms() -> i64 {
+    let raw = exec("date +%s%N").trim()
+    let mut v: i64 = 0
+    try { v = to_int(raw) } catch e { v = 0 }
+    if v > 1000000000000000 { return v / 1000000 }
+    let sec = exec("date +%s").trim()
+    let mut s: i64 = 0
+    try { s = to_int(sec) } catch e { s = 0 }
+    return s * 1000
+}
+
+fn _home() -> string {
+    let mut h = ""
+    try { h = env("HOME") } catch e {}
+    if h == "" {
+        try { h = to_string(exec("printenv HOME")).trim() } catch e {}
+    }
+    return h
+}
+
+// Entry
+let _argv = args()
+let mut _fwd_parts: list = []
+let mut _ai: i64 = 0
+while _ai < len(_argv) {
+    _fwd_parts = _fwd_parts.push(to_string(_argv[_ai]))
+    _ai = _ai + 1
+}
+// Shell-quote each argv token (simple single-quote escape)
+fn _shq(s: string) -> string {
+    // replace ' with '\'' then wrap in ''
+    let mut out = "'"
+    let mut i: i64 = 0
+    while i < s.len() {
+        let c = s.substring(i, i + 1)
+        if c == "'" { out = out + "'\\''" } else { out = out + c }
+        i = i + 1
+    }
+    out = out + "'"
+    return out
+}
+
+let HOME = _home()
+let NEXUS = HOME + "/mac_home/core/nexus"
+let BLOW_CORE = NEXUS + "/cli/blowup/core/blowup.hexa"
+// Fallback for Mac path layout.
+let mut CORE_PATH = BLOW_CORE
+if !file_exists(CORE_PATH) {
+    CORE_PATH = HOME + "/Dev/nexus/cli/blowup/core/blowup.hexa"
+}
+
+let mut HEXA_BIN = ""
+try { HEXA_BIN = env("HEXA_BIN") } catch e {}
+if HEXA_BIN == "" {
+    let cands = [
+        HOME + "/.hx/bin/hexa_real",
+        HOME + "/.hx/bin/hexa",
+        "/home/summer/.hx/bin/hexa_real",
+    ]
+    for p in cands { if file_exists(p) { HEXA_BIN = p; break } }
+}
+
+let mut _fwd = ""
+let mut _fi: i64 = 0
+while _fi < len(_fwd_parts) {
+    if _fi > 0 { _fwd = _fwd + " " }
+    _fwd = _fwd + _shq(to_string(_fwd_parts[_fi]))
+    _fi = _fi + 1
+}
+
+let pid = to_string(exec("echo $$")).trim()
+let OUT_NDJSON = "/tmp/blowup_profile_" + pid + ".ndjson"
+let OUT_RAW = "/tmp/blowup_profile_" + pid + ".raw"
+write_file(OUT_NDJSON, "")
+write_file(OUT_RAW, "")
+
+let t0_ms = _now_ms()
+println("blowup_phase_profile: start t0=" + to_string(t0_ms) + "ms")
+println("  core=" + CORE_PATH)
+println("  hexa=" + HEXA_BIN)
+println("  argv=" + _fwd)
+println("  ndjson=" + OUT_NDJSON)
+println("")
+
+// Run blowup with stdbuf for line-buffered output, tee to raw file,
+// then awk processes boundary markers into NDJSON via external awk+date subshell.
+// We do this as a single shell pipeline via exec().
+let cmd = "NO_HEXA_SHIM=1 BLOWUP_TRACE=0 stdbuf -oL -eL "
+    + _shq(HEXA_BIN) + " run " + _shq(CORE_PATH) + " " + _fwd
+    + " 2>&1 | stdbuf -oL tee " + _shq(OUT_RAW)
+    + " | stdbuf -oL awk -v T0=" + to_string(t0_ms)
+    + " -v OUT=" + _shq(OUT_NDJSON)
+    + " 'function now_ms(   r,L) { \"date +%s%N\" | getline L; close(\"date +%s%N\"); return int((L+0)/1000000); }"
+    + " BEGIN { prev_ms=T0; prev_phase=\"0-init\"; n=0; }"
+    + " { ms=now_ms(); rel=ms-T0; printf(\"[%8d ms] %s\\n\", rel, $0) > \"/dev/stderr\"; fflush(\"/dev/stderr\");"
+    + "   pname=\"\";"
+    + "   if (match($0, /--- Phase [0-9]+(\\.[0-9]+)?[^-]*---/)) { pname=substr($0, RSTART+4, RLENGTH-8); }"
+    + "   else if (match($0, /═══ Phase [0-9]+(\\.[0-9]+)?[^═]*═══/)) { pname=substr($0, RSTART+4, RLENGTH-8); }"
+    + "   if (pname != \"\") { sub(/^[ \\t]+/, \"\", pname); sub(/[ \\t]+$/, \"\", pname);"
+    + "     dur = ms - prev_ms;"
+    + "     printf(\"{\\\"phase\\\":\\\"%s\\\",\\\"start_rel_ms\\\":%d,\\\"dur_ms\\\":%d}\\n\", prev_phase, prev_ms-T0, dur) >> OUT;"
+    + "     fflush(OUT); prev_phase=pname; prev_ms=ms; n++; } }"
+    + " END { ms=now_ms(); dur=ms-prev_ms;"
+    + "       printf(\"{\\\"phase\\\":\\\"%s\\\",\\\"start_rel_ms\\\":%d,\\\"dur_ms\\\":%d}\\n\", prev_phase, prev_ms-T0, dur) >> OUT;"
+    + "       printf(\"{\\\"phase\\\":\\\"_total\\\",\\\"start_rel_ms\\\":0,\\\"dur_ms\\\":%d}\\n\", ms-T0) >> OUT; fflush(OUT); }'"
+println("exec: " + cmd)
+try { let _out = exec(cmd); println(to_string(_out)) } catch e { eprintln("exec failed: " + to_string(e)) }
+
+let t1_ms = _now_ms()
+let total_ms = t1_ms - t0_ms
+
+println("")
+println("════════════════════════════════════════")
+println(" BLOWUP PHASE PROFILE (pid=" + pid + ")")
+println("════════════════════════════════════════")
+println(" total wall : " + to_string(total_ms) + " ms")
+println(" ndjson     : " + OUT_NDJSON)
+println(" raw        : " + OUT_RAW)
+println("")
+
+// Read ndjson and emit summary table
+let _raw = read_file(OUT_NDJSON)
+let _lines = _raw.split("\n")
+println("Phase                                     | wall ms |   %")
+println("------------------------------------------|---------|------")
+// Parse total first
+let mut tot: i64 = 1
+for ln in _lines {
+    if ln.contains("\"_total\"") {
+        let parts = ln.split("\"dur_ms\":")
+        if len(parts) >= 2 {
+            let tail = to_string(parts[1]).split("}")[0]
+            try { tot = to_int(to_string(tail).trim()) } catch e { tot = 1 }
+            if tot < 1 { tot = 1 }
+        }
+    }
+}
+for ln in _lines {
+    if ln.trim() == "" { continue }
+    if ln.contains("\"_total\"") { continue }
+    // crude parse: phase name between first \" and next \",
+    let after = ln.split("\"phase\":\"")
+    if len(after) < 2 { continue }
+    let rest = to_string(after[1])
+    let nm = rest.split("\"")[0]
+    let dparts = ln.split("\"dur_ms\":")
+    if len(dparts) < 2 { continue }
+    let dtail = to_string(dparts[1]).split("}")[0]
+    let mut d: i64 = 0
+    try { d = to_int(to_string(dtail).trim()) } catch e { d = 0 }
+    let pct_int = if tot > 0 { (d * 1000) / tot } else { 0 }
+    let pct_i = pct_int / 10
+    let pct_f = pct_int - (pct_i * 10)
+    let name_s = if to_string(nm).len() > 40 { to_string(nm).substring(0, 40) } else { to_string(nm) }
+    // right-pad name to 40
+    let mut padded = name_s
+    while padded.len() < 40 { padded = padded + " " }
+    println(" " + padded + " | " + to_string(d) + " | " + to_string(pct_i) + "." + to_string(pct_f) + "%")
+}
+println("------------------------------------------|---------|------")
+println(" TOTAL                                    | " + to_string(tot) + " | 100.0%")

@@ -1,0 +1,1 @@
+/Users/ghost/Dev/nexus/tool/safe_hexa_launchd.sh
