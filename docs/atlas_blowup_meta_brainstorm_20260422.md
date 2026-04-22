@@ -398,3 +398,59 @@ grade distribution + hub centrality 를 monthly 자동 publish (`docs/atlas_heal
 - 본 문서는 사용자 세션 (2026-04-22) 중 "우리도 meta (자동화) 필요하다" 요청으로 생성.
 - 대상은 nexus `atlas.n6` + blowup/consciousness_atlas. hexa-lang roadmap engine 은 별건.
 - 구현 책임: nexus maintainer 세션.
+
+---
+
+## Appendix — A1+A2 seed (MINPATH 구현 착수, 2026-04-22)
+
+**상태**: 최초 baseline row 1 건 작성 완료.
+**출력**: `nexus/state/atlas_health_timeline.jsonl` (append-only).
+**첫 row 예**:
+```
+{"ts":"2026-04-22T12:43:59Z","atlas_lines":21800,"atlas_bytes":1503957,
+ "types":{"@P":326,"@C":357,"@L":255,"@F":1240,"@R":5928,"@S":2,"@X":1497,"@?":12},
+ "grades":{"brkthr":24,"exact10":6335,"close8":25,"near7":27,"near9":119,"miss5":120},
+ "typed_total":9617}
+```
+
+**관찰 (이 스냅샷 기준)**:
+- typed_total 9617 (2026-04-11 atlas_emergence 의 6321 대비 +3296 — atlas 확장 중).
+- @S=2 (이전 1 → B7 대칭 공백 일부 충전됨, 여전히 관심 대상).
+- breakthrough 24 (이전 7 → +17, 크게 성장).
+- @X=1497 (교차 에지 다수). bt/celestial/galactic 집중 여부는 per-domain 집계 추가 시 확인 가능.
+
+**재실행 레시피 (cron / launchd 에 등록할 본체)**:
+```bash
+ATLAS="$HOME/core/nexus/n6/atlas.n6"
+OUT="$HOME/core/nexus/state/atlas_health_timeline.jsonl"
+ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+lines=$(wc -l < "$ATLAS" | tr -d ' ')
+size=$(wc -c < "$ATLAS" | tr -d ' ')
+body=$(awk '
+/^@P /{tp["@P"]++} /^@C /{tp["@C"]++} /^@L /{tp["@L"]++}
+/^@F /{tp["@F"]++} /^@R /{tp["@R"]++} /^@S /{tp["@S"]++}
+/^@X /{tp["@X"]++} /^@\? /{tp["@?"]++}
+/\[10\*!\]/{g["brkthr"]++} /\[10\*\]/{g["exact10"]++}
+/\[9!?\]/{g["near9"]++}   /\[8!?\]/{g["close8"]++}
+/\[7!?\]/{g["near7"]++}   /\[5\?\]/{g["miss5"]++}
+END{
+  split("@P @C @L @F @R @S @X @?",tk," ")
+  printf "\"types\":{"
+  for(i=1;i<=length(tk);i++){if(i>1)printf ","; printf "\"%s\":%d",tk[i],tp[tk[i]]+0}
+  n=0; for(k in tp)n+=tp[k]
+  printf "},\"grades\":{\"brkthr\":%d,\"exact10\":%d,\"close8\":%d,\"near7\":%d,\"near9\":%d,\"miss5\":%d},\"typed_total\":%d",
+    g["brkthr"]+0,g["exact10"]+0,g["close8"]+0,g["near7"]+0,g["near9"]+0,g["miss5"]+0,n
+}' "$ATLAS")
+echo "{\"ts\":\"$ts\",\"atlas_lines\":$lines,\"atlas_bytes\":$size,$body}" >> "$OUT"
+```
+
+**배치**: 현재 AG10 정책으로 `nexus/tool/`, `nexus/scripts/` 에 신규 `.sh`/`.hexa` 생성 차단 상태.
+영구 도구화는 다음 중 하나 필요:
+- (a) 기존 hexa 도구 `n6/atlas_health_export.hexa` 수정 (args 컨벤션 버그: `a[1]` → `a[2]` 로) + timeline append 로직 추가
+- (b) maintainer 세션에서 `nexus/tool/atlas_health_timeline.sh` 로 승격
+- (c) `launchd/` plist 추가 (12h interval)
+임시로 본 recipe 를 crontab 에 직접 등록 가능 (`0 */12 * * * bash -c '...'`).
+
+**다음 step**:
+- 72h 누적 후 delta 자동 출력 (이미 recipe 에 `tail -n 1` 비교 로직 여지 있음 — docs/atlas_blowup_meta_brainstorm A1 참조).
+- C1 (닫힌 루프) 준비: blowup 결과 반영 시 row 앞뒤 비교로 health regression 판정.
