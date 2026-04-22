@@ -145,6 +145,161 @@ fn emit_link(src_repo: str, src_id: str, tgt_repo: str, tgt_id: str,
     return json
 }
 
+// ── pending/*.json scanner ────────────────────────────────────────────────
+// list_pending_jsons(repo) → ["abs path", ...] (graceful empty 시 [])
+fn list_pending_jsons(repo: str) -> [str] {
+    let dir = CORE + "/" + repo + "/state/proposals/pending"
+    let cmd = "ls -1 " + sh_q(dir) + "/*.json 2>/dev/null"
+    let raw = to_string(exec(cmd))  // @allow-bare-exec
+    let mut out: [str] = []
+    let lines = raw.split("\n")
+    let mut i = 0
+    while i < lines.len() {
+        let p = lines[i].trim()
+        if p.len() > 0 { out.push(p) }
+        i = i + 1
+    }
+    return out
+}
+
+// hexa 의 array .indexOf() 부재 → 직접 구현
+fn arr_index_of(arr: [str], needle: str) -> i64 {
+    let mut i = 0
+    while i < arr.len() {
+        if arr[i] == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// hexa 에 find_last 없음 → 직접 구현
+fn find_last(s: str, needle: str) -> i64 {
+    let mut last: i64 = -1
+    let mut i = 0
+    let n = s.len()
+    let m = needle.len()
+    if m == 0 { return -1 }
+    while i + m <= n {
+        if s.substring(i, i + m) == needle { last = i }
+        i = i + 1
+    }
+    return last
+}
+
+// extract_id_from_filename("/.../pending/anima-20260422-001_xxx.json") → "anima-20260422-001"
+// 파일명에 prefix 없으면 (anima 의 legacy 20260422-NNN) src_repo prefix 자동 부여.
+fn extract_id_from_filename(path: str, src_repo: str) -> str {
+    let slash = find_last(path, "/")
+    let base = if slash >= 0 { path.substring(slash + 1, path.len()) } else { path }
+    // base = "20260422-001_xxx.json" 또는 "anima-20260422-001_xxx.json"
+    let underscore = base.find("_")
+    let mut id = if underscore >= 0 { base.substring(0, underscore) } else {
+        // no underscore → strip .json
+        let dot = find_last(base, ".")
+        if dot >= 0 { base.substring(0, dot) } else { base }
+    }
+    // legacy id (no prefix) → add prefix
+    if id.find("-") == 8 {  // pattern "20260422-001" 의 첫 - 위치
+        let prefix_idx = arr_index_of(REPO_NAMES, src_repo)
+        if prefix_idx >= 0 { id = REPO_PREFIXES[prefix_idx] + "-" + id }
+    }
+    return id
+}
+
+// extract_evidence_paths(json_text) → ["abs path", ...]
+// proposal JSON 의 evidence_sources[].path 만 텍스트 스캔. multi-line OK.
+fn extract_evidence_paths(text: str) -> [str] {
+    let mut paths: [str] = []
+    let lines = text.split("\n")
+    let mut in_evidence = false
+    let mut i = 0
+    while i < lines.len() {
+        let line = lines[i]
+        if line.find("\"evidence_sources\"") >= 0 { in_evidence = true }
+        if in_evidence {
+            let pidx = line.find("\"path\"")
+            if pidx >= 0 {
+                // "path": "<value>"
+                let after = line.substring(pidx + 6, line.len())
+                let q1 = after.find("\"")
+                if q1 >= 0 {
+                    let rest = after.substring(q1 + 1, after.len())
+                    let q2 = rest.find("\"")
+                    if q2 > 0 {
+                        let p = rest.substring(0, q2)
+                        if p.len() > 0 { paths.push(p) }
+                    }
+                }
+            }
+            // evidence_sources array 끝 (])
+            if line.find("]") >= 0 && line.find("\"evidence_sources\"") < 0 { in_evidence = false }
+        }
+        i = i + 1
+    }
+    return paths
+}
+
+// resolve_path(p, src_repo) — relative path 면 src_repo root 기준 절대화.
+fn resolve_path(p: str, src_repo: str) -> str {
+    if p.find("/") == 0 { return p }  // absolute
+    return CORE + "/" + src_repo + "/" + p
+}
+
+// link_id_in(jsonl, id) — sidecar jsonl 에 해당 link id 가 있나 체크
+fn link_in_sidecar(sidecar_raw: str, link_id: str) -> bool {
+    return sidecar_raw.find("\"id\":\"" + link_id + "\"") >= 0
+}
+
+fn sidecar_path(repo: str) -> str {
+    return CORE + "/" + repo + "/state/cross_repo_links.jsonl"
+}
+
+fn read_sidecar(repo: str) -> str {
+    let p = sidecar_path(repo)
+    let mut raw = ""
+    try { raw = read_file(p) } catch e { raw = "" }
+    return raw
+}
+
+fn append_sidecar(repo: str, json_line: str) -> void {
+    let p = sidecar_path(repo)
+    exec("printf '%s\\n' " + sh_q(json_line) + " >> " + sh_q(p))  // @allow-bare-exec
+}
+
+// circular detect: A→B→C→A 같은 cycle 있나. simple O(N) DFS.
+// links: [{src_repo, src_id, tgt_repo, tgt_id}, ...] (parse 부담 회피 위해
+// "src_repo:src_id" → "tgt_repo:tgt_id" tuple list 받음)
+fn has_cycle(edges_src: [str], edges_tgt: [str]) -> bool {
+    // 각 노드의 outgoing edge → DFS visited / in_stack
+    // small N 가정 (cycle 검출 1차). 큰 그래프는 후속.
+    let n = edges_src.len()
+    if n == 0 { return false }
+    let mut i = 0
+    while i < n {
+        // src_i 시작점, 깊이 N 까지 follow
+        let mut cur = edges_tgt[i]
+        let mut depth = 0
+        while depth < n {
+            if cur == edges_src[i] { return true }
+            // cur 와 같은 src 인 edge 찾기
+            let mut j = 0
+            let mut found = false
+            while j < n {
+                if edges_src[j] == cur {
+                    cur = edges_tgt[j]
+                    found = true
+                    break
+                }
+                j = j + 1
+            }
+            if !found { break }
+            depth = depth + 1
+        }
+        i = i + 1
+    }
+    return false
+}
+
 fn main() -> i64 {
     let mut apply = false
     let mut i = 1
@@ -153,7 +308,7 @@ fn main() -> i64 {
         if args[i] == "--help" || args[i] == "-h" {
             println("usage: hexa run tool/proposal_sync_hub.hexa [--apply]")
             println("       --dry (default): scan only, print would-emit links")
-            println("       --apply        : write inventory _meta.cross_repo_links[]")
+            println("       --apply        : append cross_repo_links.jsonl + log to each repo")
             return 0
         }
         i = i + 1
@@ -182,22 +337,107 @@ fn main() -> i64 {
         return 1
     }
 
-    // 2. TODO (next batch): scan each repo's pending/approved/*.json 의 evidence_sources[].path
-    //    → detect_cross_repo_path() → emit_link() → dedup → flood-protect 50/cycle
-    //    skeleton 단계라 스캐닝 logic 은 후속. 본 run 은 connectivity check + id count 만.
+    // 2. scan pending/*.json in each reachable repo, extract evidence_sources[].path,
+    //    detect cross-repo references, emit + dedup + flood-protect.
+    let mut new_links_total = 0
+    let mut dedup_skips = 0
+    let mut flood_skip = 0
+    let mut emitted_per_repo: [i64] = []
+    // for circular detect (across all newly-emitted + existing)
+    let mut edge_src: [str] = []
+    let mut edge_tgt: [str] = []
 
-    // 3. log
+    // pre-load all sidecars (dedup baseline)
+    let mut sidecars: [str] = []
+    let mut sk = 0
+    while sk < REPO_NAMES.len() {
+        sidecars.push(read_sidecar(REPO_NAMES[sk]))
+        sk = sk + 1
+    }
+
+    let mut rr = 0
+    while rr < REPO_NAMES.len() {
+        let src = REPO_NAMES[rr]
+        emitted_per_repo.push(0)
+        let inv = read_inventory_safe(src)
+        if inv.len() == 0 { rr = rr + 1; continue }
+
+        let pendings = list_pending_jsons(src)
+        let mut pi = 0
+        while pi < pendings.len() {
+            if new_links_total >= MAX_NEW_LINKS_PER_CYCLE { flood_skip = flood_skip + 1; break }
+            let ppath = pendings[pi]
+            let mut pjson = ""
+            try { pjson = read_file(ppath) } catch e { pjson = "" }
+            if pjson.len() > 0 {
+                let src_id = extract_id_from_filename(ppath, src)
+                let evpaths = extract_evidence_paths(pjson)
+                let mut ei = 0
+                while ei < evpaths.len() {
+                    let resolved = resolve_path(evpaths[ei], src)
+                    let tgt = detect_cross_repo_path(resolved, src)
+                    if tgt.len() > 0 {
+                        // tgt_id = "evidence-pointer" (실제 tgt proposal 매칭은 후속 — 우선 path-based mirror)
+                        // 임시 tgt_id: tgt repo prefix + path hash 7자리
+                        let tgt_prefix_idx = arr_index_of(REPO_NAMES, tgt)
+                        let tgt_pref = if tgt_prefix_idx >= 0 { REPO_PREFIXES[tgt_prefix_idx] } else { tgt }
+                        let phash = sha256_hex16(resolved)
+                        let tgt_id = tgt_pref + "-evp-" + phash.substring(0, 8)
+                        let link_type = "mirrors"
+                        let link_json = emit_link(src, src_id, tgt, tgt_id, link_type, resolved, ts)
+                        // dedup id = key sha256
+                        let key = src + "|" + src_id + "|" + tgt + "|" + tgt_id + "|" + link_type
+                        let lid = sha256_hex16(key)
+                        let src_idx = arr_index_of(REPO_NAMES, src)
+                        let tgt_idx = arr_index_of(REPO_NAMES, tgt)
+                        let in_src = link_in_sidecar(sidecars[src_idx], lid)
+                        let in_tgt = link_in_sidecar(sidecars[tgt_idx], lid)
+                        if in_src && in_tgt {
+                            dedup_skips = dedup_skips + 1
+                        } else {
+                            new_links_total = new_links_total + 1
+                            emitted_per_repo[src_idx] = emitted_per_repo[src_idx] + 1
+                            edge_src.push(src + ":" + src_id)
+                            edge_tgt.push(tgt + ":" + tgt_id)
+                            if apply {
+                                if !in_src { append_sidecar(src, link_json); sidecars[src_idx] = sidecars[src_idx] + link_json + "\n" }
+                                if !in_tgt { append_sidecar(tgt, link_json); sidecars[tgt_idx] = sidecars[tgt_idx] + link_json + "\n" }
+                            } else {
+                                println("  (dry) +link " + src + ":" + src_id + " --[" + link_type + "]→ " + tgt + ":" + tgt_id)
+                            }
+                        }
+                    }
+                    ei = ei + 1
+                }
+            }
+            pi = pi + 1
+        }
+        rr = rr + 1
+    }
+
+    // 3. circular detect on union of new edges
+    let cyc = has_cycle(edge_src, edge_tgt)
+
+    // 4. log
     let mut log_line = "{\"ts\":\"" + ts + "\",\"hub_version\":\"" + HUB_VERSION
     log_line = log_line + "\",\"mode\":\"" + mode + "\",\"reachable\":" + to_string(reachable)
     log_line = log_line + ",\"id_counts\":["
-    let mut j = 0
-    while j < id_counts.len() {
-        if j > 0 { log_line = log_line + "," }
-        log_line = log_line + to_string(id_counts[j])
+    let mut jj = 0
+    while jj < id_counts.len() {
+        if jj > 0 { log_line = log_line + "," }
+        log_line = log_line + to_string(id_counts[jj])
     }
-    log_line = log_line + "]}"
+    log_line = log_line + "],\"new_links\":" + to_string(new_links_total)
+    log_line = log_line + ",\"dedup_skip\":" + to_string(dedup_skips)
+    log_line = log_line + ",\"flood_skip\":" + to_string(flood_skip)
+    log_line = log_line + ",\"cycle_detected\":" + (if cyc { "true" } else { "false" }) + "}"
 
-    // 모든 reachable repo 의 sync log 에 동일 entry append (own audit trail)
+    println("emit summary: new=" + to_string(new_links_total) +
+            " dedup=" + to_string(dedup_skips) +
+            " flood=" + to_string(flood_skip) +
+            " cycle=" + (if cyc { "YES" } else { "no" }))
+
+    // 5. log to all reachable repos
     if apply {
         let mut k = 0
         while k < REPO_NAMES.len() {
