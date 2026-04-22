@@ -14,7 +14,7 @@ cd "$ROOT"
 
 HEXA=/Users/ghost/Dev/nexus/bin/hexa
 # Force local exec so write_file/read_file target local FS (avoid remote dispatch
-# which would write to ubu/hetzner and lose the log/stats for analyze).
+# which would write to ubu1/hetzner and lose the log/stats for analyze).
 export HEXA_LOCAL=1
 MODE="${1:-full}"
 

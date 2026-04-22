@@ -10,7 +10,7 @@ ship a short-term improvement.
 **Toolchain**: `hexa 0.1.0-stage1`, `hexa bench --runs 3 --json`
 **Platform**:
 - **local** — Mac (native interpreter, `HEXA_LOCAL=1`)
-- **remote** — hexa_remote wrapper dispatch to ubu host (default path)
+- **remote** — hexa_remote wrapper dispatch to ubu1 host (default path)
 
 ---
 

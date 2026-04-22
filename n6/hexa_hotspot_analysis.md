@@ -36,7 +36,7 @@ The `shared/bin/hexa` referenced in the ROI item is a Bash wrapper, not the comp
 ~/.hx/bin/hexa (symlink)
   -> $AIRGENOME/nexus/bin/hexa (Bash script, 152 lines)
      -> L0 guard check (python3)
-     -> Mac-only passthrough OR remote routing (ubu/hetzner)
+     -> Mac-only passthrough OR remote routing (ubu1/hetzner)
      -> exec $LOCAL_HEXA "$@"
         -> $HEXA_LANG/hexa (actual Rust binary, 6.6 MB)
 ```
