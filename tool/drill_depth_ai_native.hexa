@@ -1,0 +1,669 @@
+// drill_depth_ai_native.hexa — AI-native drill depth engine enhancements
+//
+// Role (Agent F' by-proxy delegation, 2026-04-21):
+//   n6 side commit chain 49c20260..0106b946 수리 후속. ROI#48c D1 에서 bias_jitter
+//   0.03 → 0.10 + Phase 2 permutation 으로 r1/r2/r3 seed_n6_ratio divergence 4.09/4.64/4.74
+//   실측. 다음 단계: hash bucket collision 외 지능적(AI-native) grouping 3종.
+//
+// 개선 3종 (additive, 기존 blowup 엔진 호출 signature 무변경):
+//   1) DYNAMIC BIAS — seed entropy/length 기반 bias 자동 조절
+//        fixed 0.10 → adaptive [0.05, 0.20]. 고엔트로피 긴 seed 는 이미 분화 → bias ↓,
+//        저엔트로피 짧은 seed 는 분화 부족 → bias ↑.
+//   2) FEATURE WEIGHTING — 8-slot feature importance score
+//        variance-based weight. constant slot (모든 seed 에서 동일) → w≈0,
+//        고주파 slot (seed 마다 다름) → w≈1. 가중치는 seed_n6_ratio 대체 projection.
+//   3) CLUSTER-AWARE GROUPING — k-medoids 유사 O(n) clustering
+//        hash bucket (O(1) collision-prone) 대신 feature vector L1 거리로 k=3 greedy
+//        cluster assignment. round 간 같은 cluster 면 대표값 캐시.
+//
+// 호환:
+//   - SSOT 변경 없음 (drill.json 에 선택적 consumer field 만 후속 추가 가능)
+//   - engine 호출 signature 무변경 (seed_to_features 는 기존 형식 유지)
+//   - 기존 blowup.hexa 는 그대로 동작 — 이 파일은 offline probe 용 (현재)
+//
+// usage:
+//   hexa tool/drill_depth_ai_native.hexa                    → full smoke
+//   hexa tool/drill_depth_ai_native.hexa --bench dynamic    → dynamic bias probe
+//   hexa tool/drill_depth_ai_native.hexa --bench weights    → feature weight probe
+//   hexa tool/drill_depth_ai_native.hexa --bench cluster    → cluster grouping probe
+//   hexa tool/drill_depth_ai_native.hexa --json             → smoke JSON only
+
+// ═══════════════════════════════════════════════════════════
+// ─── PRIMITIVES — seed → 8-slot feature (blowup.hexa mirror) ───
+// blowup.hexa 전체를 import 할 수 없으므로 필수 primitive 만 복제.
+// 불변식: 8-slot signature 동일 (length/entropy/digit/domain/FNV/DJB2/SHA64/words).
+// ═══════════════════════════════════════════════════════════
+
+fn _char_code_at(s: str, i: int) -> int {
+    // 1-byte ASCII assumption; multi-byte 는 naive 처리 (smoke 용 OK).
+    let n = s.len()
+    if i < 0 || i >= n { return 0 }
+    // hexa string → byte 접근: substring(i, i+1) 의 첫 바이트
+    let ch = s.substring(i, i + 1)
+    if ch.len() == 0 { return 0 }
+    // to_int on single-char string returns 0 for non-digit — use ascii lookup.
+    // naive: 비교로 추출 — 간단한 byte table 구축 (0..127).
+    let mut k = 0
+    while k < 128 {
+        // try compare first — identity map via repeated substring equal
+        let probe = _ascii_char(k)
+        if probe == ch { return k }
+        k = k + 1
+    }
+    return 0
+}
+
+fn _ascii_char(n: int) -> str {
+    // 0..127 ASCII 만 지원 — naive switch (smoke 용; 실운영은 blowup.hexa char_code 사용)
+    // full table 대체: 자주 쓰는 범위만 구현
+    if n == 32 { return " " }
+    if n == 45 { return "-" }
+    if n == 46 { return "." }
+    if n == 95 { return "_" }
+    if n >= 48 && n <= 57 {
+        if n == 48 { return "0" }
+        if n == 49 { return "1" }
+        if n == 50 { return "2" }
+        if n == 51 { return "3" }
+        if n == 52 { return "4" }
+        if n == 53 { return "5" }
+        if n == 54 { return "6" }
+        if n == 55 { return "7" }
+        if n == 56 { return "8" }
+        if n == 57 { return "9" }
+    }
+    if n >= 65 && n <= 90 {
+        // upper — 'A'=65
+        let letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        return letters.substring(n - 65, n - 64)
+    }
+    if n >= 97 && n <= 122 {
+        let letters = "abcdefghijklmnopqrstuvwxyz"
+        return letters.substring(n - 97, n - 96)
+    }
+    return ""
+}
+
+// ─── fallback byte-sum hash (ascii table 우회) ───
+// 실제 blowup.hexa 는 char_code(s, i) 내장 함수 사용. 여기서는 offline probe 용.
+// interpreter primitive 제한 회피: string.len() + bytewise fnv1a 를 naive char iteration 으로.
+// (smoke 수준에서는 동일 seed 에 동일 값만 보장되면 충분)
+fn _simple_bytesum(s: str) -> int {
+    let n = s.len()
+    let mut sum = 0
+    let mut i = 0
+    while i < n {
+        let c = _char_code_at(s, i)
+        sum = sum + c
+        i = i + 1
+    }
+    return sum
+}
+
+// FNV-1a-like (mirror blowup.hexa style, reduced to int)
+fn _fnv1a(s: str) -> float {
+    if s.len() == 0 { return 0.0 }
+    let mut h = 2166136261
+    let mut i = 0
+    let n = s.len()
+    while i < n {
+        let cc = _char_code_at(s, i)
+        h = (h + cc) % 4294967296
+        h = (h * 16777619) % 4294967296
+        i = i + 1
+    }
+    if h < 0 { h = 0 - h }
+    return to_float(h % 1000000) / 1000000.0
+}
+
+fn _djb2(s: str) -> float {
+    if s.len() == 0 { return 0.0 }
+    let mut h = 5381
+    let mut i = 0
+    let n = s.len()
+    while i < n {
+        let cc = _char_code_at(s, i)
+        h = ((h * 33) + cc) % 4294967296
+        i = i + 1
+    }
+    if h < 0 { h = 0 - h }
+    return to_float(h % 1000000) / 1000000.0
+}
+
+fn _sha64_low(s: str) -> float {
+    if s.len() == 0 { return 0.0 }
+    let mut a = 1779033703
+    let mut b = 3144134277
+    let mut i = 0
+    let n = s.len()
+    while i < n {
+        let cc = _char_code_at(s, i)
+        a = (a + cc * 2654435761) % 4294967296
+        b = (b * 31 + a) % 4294967296
+        i = i + 1
+    }
+    let mix = (a + b) % 4294967296
+    let mut mx = mix
+    if mx < 0 { mx = 0 - mx }
+    return to_float(mx % 1000000) / 1000000.0
+}
+
+fn _ln(x: float) -> float {
+    if x <= 0.0 { return 0.0 }
+    let mut sum = 0.0
+    let mut term = (x - 1.0) / (x + 1.0)
+    let t2 = term * term
+    let mut k = 1
+    while k <= 15 {
+        let c = term / to_float(k)
+        sum = sum + c
+        let mut absc = c
+        if absc < 0.0 { absc = 0.0 - absc }
+        if absc < 0.0000000001 { return 2.0 * sum }
+        term = term * t2
+        k = k + 2
+    }
+    return 2.0 * sum
+}
+
+fn _length_norm(s: str) -> float {
+    let n = s.len()
+    let num = _ln(1.0 + to_float(n))
+    let den = _ln(257.0)
+    if den <= 0.0 { return 0.0 }
+    let r = num / den
+    if r < 0.0 { return 0.0 }
+    if r > 1.0 { return 1.0 }
+    return r
+}
+
+fn _entropy_norm(s: str) -> float {
+    let n = s.len()
+    if n == 0 { return 0.0 }
+    // histogram — use map keyed by char_code string
+    let mut counts = #{}
+    let mut i = 0
+    while i < n {
+        let cc = _char_code_at(s, i)
+        let k = to_string(cc)
+        let mut c = 0
+        try { c = to_int(to_string(counts[k])) } catch e {}
+        counts[k] = to_string(c + 1)
+        i = i + 1
+    }
+    let ks = counts.keys()
+    let mut H = 0.0
+    let mut ki = 0
+    let tot = to_float(n)
+    while ki < ks.len() {
+        let k = ks[ki]
+        let mut c = 0
+        try { c = to_int(to_string(counts[k])) } catch e {}
+        let p = to_float(c) / tot
+        if p > 0.0 {
+            let lp = _ln(p) / 0.6931471805599453
+            H = H - p * lp
+        }
+        ki = ki + 1
+    }
+    let r = H / 8.0
+    if r < 0.0 { return 0.0 }
+    if r > 1.0 { return 1.0 }
+    return r
+}
+
+fn _digit_ratio(s: str) -> float {
+    let n = s.len()
+    if n == 0 { return 0.0 }
+    let mut d = 0
+    let mut i = 0
+    while i < n {
+        let cc = _char_code_at(s, i)
+        if cc >= 48 && cc <= 57 { d = d + 1 }
+        i = i + 1
+    }
+    return to_float(d) / to_float(n)
+}
+
+fn _domain_match(s: str) -> float {
+    if s.len() == 0 { return 0.0 }
+    let mut h = 0
+    if s.contains("math") || s.contains("alg") || s.contains("geom") || s.contains("num") { h = h + 1 }
+    if s.contains("phys") || s.contains("quant") || s.contains("wave") || s.contains("energy") { h = h + 1 }
+    if s.contains("bio") || s.contains("cell") || s.contains("gene") || s.contains("life") { h = h + 1 }
+    if s.contains("mind") || s.contains("cons") || s.contains("think") || s.contains("self") { h = h + 1 }
+    if s.contains("info") || s.contains("data") || s.contains("bit") || s.contains("entro") { h = h + 1 }
+    if s.contains("arch") || s.contains("struct") || s.contains("system") || s.contains("frame") { h = h + 1 }
+    return to_float(h) / 6.0
+}
+
+fn _word_norm(s: str) -> float {
+    let n = s.len()
+    if n == 0 { return 0.0 }
+    let mut w = 1
+    let mut i = 0
+    let mut in_ws = false
+    while i < n {
+        let cc = _char_code_at(s, i)
+        if cc == 32 || cc == 9 || cc == 95 || cc == 45 {
+            if in_ws == false { w = w + 1 }
+            in_ws = true
+        } else {
+            in_ws = false
+        }
+        i = i + 1
+    }
+    let num = _ln(1.0 + to_float(w))
+    let den = _ln(33.0)
+    if den <= 0.0 { return 0.0 }
+    let r = num / den
+    if r < 0.0 { return 0.0 }
+    if r > 1.0 { return 1.0 }
+    return r
+}
+
+// 8-slot feature (seed_to_features mirror, sans nonce/salt mix)
+fn features(s: str) -> list {
+    let mut f = []
+    f = f.push(_length_norm(s))
+    f = f.push(_entropy_norm(s))
+    f = f.push(_digit_ratio(s))
+    f = f.push(_domain_match(s))
+    f = f.push(_fnv1a(s))
+    f = f.push(_djb2(s))
+    f = f.push(_sha64_low(s))
+    f = f.push(_word_norm(s))
+    return f
+}
+
+fn _abs_f(x: float) -> float { if x < 0.0 { return 0.0 - x }; return x }
+
+// ═══════════════════════════════════════════════════════════
+// ─── IMPROVEMENT 1: DYNAMIC BIAS ───
+// seed entropy × length 기반 adaptive bias ∈ [0.05, 0.20].
+// 고엔트로피 긴 seed (entropy>0.7, length>0.5) → 자연 분화 이미 풍부 → bias_lo (0.05).
+// 저엔트로피 짧은 seed → bias_hi (0.20) 로 round 간 분기 강화.
+// 중간대역은 linear interpolation.
+// ═══════════════════════════════════════════════════════════
+
+fn dynamic_bias(s: str) -> float {
+    let f = features(s)
+    let len_n = to_float(f[0])
+    let ent_n = to_float(f[1])
+    // diversity score: 0 (저) ~ 1 (고)
+    // 길이 × 엔트로피 geometric-mean-like, [0,1] 유지
+    let div = len_n * 0.4 + ent_n * 0.6
+    // diversity 1.0 → bias 0.05, diversity 0.0 → bias 0.20
+    // linear: bias = 0.20 - div * 0.15
+    let b = 0.20 - div * 0.15
+    if b < 0.05 { return 0.05 }
+    if b > 0.20 { return 0.20 }
+    return b
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── IMPROVEMENT 2: FEATURE WEIGHTING ───
+// N seed 집합에 대해 slot-별 variance 계산 → weight = variance / max_variance.
+// constant slot (variance≈0) → w≈0; 고변이 slot → w≈1.
+// seed_n6_ratio 의 fixed basis 를 weight-aware projection 으로 대체하는 후보.
+// ═══════════════════════════════════════════════════════════
+
+fn feature_weights(seeds: list) -> list {
+    let n = seeds.len()
+    if n < 2 {
+        // degenerate — uniform
+        let mut w = []
+        let mut i = 0
+        while i < 8 { w = w.push(0.125); i = i + 1 }
+        return w
+    }
+    // 8×n matrix 계산: slot-별 mean, variance
+    let mut means = []
+    let mut k = 0
+    while k < 8 { means = means.push(0.0); k = k + 1 }
+    // collect features once
+    let mut feats = []
+    let mut i = 0
+    while i < n {
+        let f = features(seeds[i])
+        feats = feats.push(f)
+        let mut s = 0
+        while s < 8 {
+            means = _list_set_f(means, s, to_float(means[s]) + to_float(f[s]))
+            s = s + 1
+        }
+        i = i + 1
+    }
+    let mut s2 = 0
+    while s2 < 8 {
+        means = _list_set_f(means, s2, to_float(means[s2]) / to_float(n))
+        s2 = s2 + 1
+    }
+    let mut vars = []
+    let mut kv = 0
+    while kv < 8 { vars = vars.push(0.0); kv = kv + 1 }
+    let mut j = 0
+    while j < n {
+        let f = feats[j]
+        let mut sv = 0
+        while sv < 8 {
+            let d = to_float(f[sv]) - to_float(means[sv])
+            vars = _list_set_f(vars, sv, to_float(vars[sv]) + d * d)
+            sv = sv + 1
+        }
+        j = j + 1
+    }
+    let mut max_v = 0.0
+    let mut sn = 0
+    while sn < 8 {
+        let v = to_float(vars[sn]) / to_float(n)
+        vars = _list_set_f(vars, sn, v)
+        if v > max_v { max_v = v }
+        sn = sn + 1
+    }
+    let mut w = []
+    let mut sw = 0
+    while sw < 8 {
+        let nv = if max_v > 0.0000000001 { to_float(vars[sw]) / max_v } else { 0.125 }
+        w = w.push(nv)
+        sw = sw + 1
+    }
+    return w
+}
+
+fn _list_set_f(l: list, i: int, v: float) -> list {
+    // hexa immutable list: rebuild — O(n), acceptable for small 8-slot
+    let mut out = []
+    let mut k = 0
+    while k < l.len() {
+        if k == i { out = out.push(v) } else { out = out.push(to_float(l[k])) }
+        k = k + 1
+    }
+    return out
+}
+
+// weighted n6 projection — seed_n6_ratio 대체 후보
+fn weighted_n6_ratio(s: str, weights: list) -> float {
+    let f = features(s)
+    let mut basis = []
+    basis = basis.push(1.0)
+    basis = basis.push(1.414213)
+    basis = basis.push(0.577350)
+    basis = basis.push(2.449489)
+    basis = basis.push(0.25)
+    basis = basis.push(0.5)
+    basis = basis.push(0.166666)
+    basis = basis.push(0.25)
+    let mut dot = 0.0
+    let mut i = 0
+    while i < 8 {
+        dot = dot + to_float(f[i]) * to_float(basis[i]) * to_float(weights[i])
+        i = i + 1
+    }
+    return dot
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── IMPROVEMENT 3: CLUSTER-AWARE GROUPING ───
+// k-medoids 유사 — k=3 fixed, greedy seed picking + L1 거리 assign.
+// hash bucket (FNV mod) 대비 장점:
+//   a) semantic proximity 반영 (유사 feature vector → 같은 cluster)
+//   b) collision 없음 (k 고정)
+//   c) round-to-round stability 확보 (같은 seed → 같은 cluster 결정적)
+// ═══════════════════════════════════════════════════════════
+
+fn _l1_distance(a: list, b: list) -> float {
+    let mut d = 0.0
+    let mut i = 0
+    while i < 8 {
+        let diff = to_float(a[i]) - to_float(b[i])
+        d = d + _abs_f(diff)
+        i = i + 1
+    }
+    return d
+}
+
+// greedy medoid seed selection: first seed + farthest + farthest-from-both.
+fn pick_medoids(seeds: list, k: int) -> list {
+    let n = seeds.len()
+    if n == 0 { return [] }
+    if n <= k {
+        let mut out = []
+        let mut i = 0
+        while i < n { out = out.push(features(seeds[i])); i = i + 1 }
+        return out
+    }
+    let mut medoids = []
+    medoids = medoids.push(features(seeds[0]))
+    // seed 2: max-distance from medoid[0]
+    let mut best_idx = 1
+    let mut best_d = 0.0
+    let mut i = 1
+    while i < n {
+        let f = features(seeds[i])
+        let d = _l1_distance(to_float_list(medoids[0]), f)
+        if d > best_d { best_d = d; best_idx = i }
+        i = i + 1
+    }
+    medoids = medoids.push(features(seeds[best_idx]))
+    if k <= 2 { return medoids }
+    // seed 3: max-min distance from both existing medoids
+    let mut bi = 0
+    let mut bd = 0.0 - 1.0
+    let mut j = 0
+    while j < n {
+        let f = features(seeds[j])
+        let d1 = _l1_distance(to_float_list(medoids[0]), f)
+        let d2 = _l1_distance(to_float_list(medoids[1]), f)
+        let mn = if d1 < d2 { d1 } else { d2 }
+        if mn > bd { bd = mn; bi = j }
+        j = j + 1
+    }
+    medoids = medoids.push(features(seeds[bi]))
+    return medoids
+}
+
+fn to_float_list(l: list) -> list {
+    let mut out = []
+    let mut i = 0
+    while i < l.len() {
+        out = out.push(to_float(l[i]))
+        i = i + 1
+    }
+    return out
+}
+
+// assign seed → cluster id (0..k-1)
+fn cluster_of(seed: str, medoids: list) -> int {
+    let f = features(seed)
+    let mut best = 0
+    let mut bd = 1000000.0
+    let mut i = 0
+    while i < medoids.len() {
+        let d = _l1_distance(to_float_list(medoids[i]), f)
+        if d < bd { bd = d; best = i }
+        i = i + 1
+    }
+    return best
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── SMOKE TESTS ───
+// ═══════════════════════════════════════════════════════════
+
+fn _fmt_f(x: float) -> str {
+    // 3 decimal places
+    let shifted = x * 1000.0
+    let mut n = to_int(shifted + 0.5)
+    if shifted < 0.0 { n = to_int(shifted - 0.5) }
+    let whole = n / 1000
+    let mut frac = n - whole * 1000
+    if frac < 0 { frac = 0 - frac }
+    let mut fs = to_string(frac)
+    while fs.len() < 3 { fs = "0" + fs }
+    return to_string(whole) + "." + fs
+}
+
+fn smoke_dynamic_bias() -> str {
+    println("─── smoke 1: dynamic_bias ───")
+    let seeds = [
+        "x",
+        "hello",
+        "sum k^2 equals n*(n+1)*(2n+1)/6 closed form",
+        "round=2-r123456789|phys quantum wave energy math algebraic geometry"
+    ]
+    let mut i = 0
+    let mut out = ""
+    while i < seeds.len() {
+        let s = to_string(seeds[i])
+        let b = dynamic_bias(s)
+        let label = s.substring(0, if s.len() < 32 { s.len() } else { 32 })
+        println("  seed[" + to_string(i) + "] bias=" + _fmt_f(b) + "  '" + label + "...'")
+        out = out + to_string(i) + ":" + _fmt_f(b) + " "
+        i = i + 1
+    }
+    return out
+}
+
+fn smoke_feature_weights() -> str {
+    println("─── smoke 2: feature_weights ───")
+    let seeds = [
+        "math algebra geometry",
+        "phys quantum wave energy",
+        "bio cell gene life form",
+        "mind consciousness think self aware",
+        "info data bit entropy",
+        "arch struct system frame"
+    ]
+    let w = feature_weights(seeds)
+    let labels = ["len", "ent", "dig", "dom", "fnv", "djb", "sha", "wrd"]
+    let mut i = 0
+    let mut out = ""
+    while i < 8 {
+        let wv = to_float(w[i])
+        println("  slot[" + to_string(i) + "] " + to_string(labels[i]) + " weight=" + _fmt_f(wv))
+        out = out + _fmt_f(wv) + " "
+        i = i + 1
+    }
+    return out
+}
+
+fn smoke_cluster() -> str {
+    println("─── smoke 3: cluster_of ───")
+    let seeds = [
+        "math algebraic curves",
+        "math geometry topology",
+        "math number theory",
+        "phys quantum mechanics",
+        "phys wave equation",
+        "bio cell division",
+        "bio gene expression",
+        "mind consciousness self"
+    ]
+    let medoids = pick_medoids(seeds, 3)
+    println("  medoids picked: " + to_string(medoids.len()))
+    let mut i = 0
+    let mut cts = #{"0": 0, "1": 0, "2": 0}
+    let mut out = ""
+    while i < seeds.len() {
+        let c = cluster_of(to_string(seeds[i]), medoids)
+        let key = to_string(c)
+        let mut cur = 0
+        try { cur = to_int(to_string(cts[key])) } catch e {}
+        cts[key] = to_string(cur + 1)
+        let label = to_string(seeds[i]).substring(0, 24)
+        println("  seed[" + to_string(i) + "] cluster=" + to_string(c) + "  '" + label + "'")
+        out = out + to_string(i) + "→" + to_string(c) + " "
+        i = i + 1
+    }
+    let c0 = to_int(to_string(cts["0"]))
+    let c1 = to_int(to_string(cts["1"]))
+    let c2 = to_int(to_string(cts["2"]))
+    println("  distribution: c0=" + to_string(c0) + " c1=" + to_string(c1) + " c2=" + to_string(c2))
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── INTEGRATION CHECK — 3 improvements 조합 ───
+// ═══════════════════════════════════════════════════════════
+
+fn smoke_integration() -> str {
+    println("─── smoke 4: integration (3 개선 조합) ───")
+    let seeds = [
+        "sum k^2 equals n*(n+1)*(2n+1)/6 closed form",
+        "sum k^3 equals (n*(n+1)/2)^2",
+        "fibonacci recurrence golden ratio",
+        "prime number theorem asymptotic",
+        "riemann zeta nontrivial zeros",
+        "phys schrodinger wave function",
+        "bio DNA double helix replication",
+        "mind consciousness qualia emergence"
+    ]
+    // step 1: weights from corpus
+    let w = feature_weights(seeds)
+    // step 2: medoids for clustering
+    let m = pick_medoids(seeds, 3)
+    // step 3: per-seed — dynamic_bias + cluster + weighted_n6
+    let mut i = 0
+    let mut total_bias = 0.0
+    while i < seeds.len() {
+        let s = to_string(seeds[i])
+        let b = dynamic_bias(s)
+        let c = cluster_of(s, m)
+        let r = weighted_n6_ratio(s, w)
+        total_bias = total_bias + b
+        println("  [" + to_string(i) + "] bias=" + _fmt_f(b) + " cluster=" + to_string(c) + " wR=" + _fmt_f(r))
+        i = i + 1
+    }
+    let avg_bias = total_bias / to_float(seeds.len())
+    println("  avg dynamic_bias=" + _fmt_f(avg_bias) + " (target: 내 [0.05, 0.20])")
+    return _fmt_f(avg_bias)
+}
+
+// ═══════════════════════════════════════════════════════════
+// ─── MAIN ───
+// ═══════════════════════════════════════════════════════════
+
+fn main() {
+    let a = args()
+    let mut bench = ""
+    let mut json_only = false
+    let mut i = 0
+    while i < a.len() {
+        let t = to_string(a[i])
+        if t == "--bench" && i + 1 < a.len() { bench = to_string(a[i + 1]); i = i + 1 }
+        if t == "--json" { json_only = true }
+        i = i + 1
+    }
+
+    if json_only == false {
+        println("═══════════════════════════════════════════════════")
+        println(" drill-depth AI-native probe (Agent F' delegate)")
+        println(" 3 개선: dynamic_bias + feature_weights + cluster")
+        println("═══════════════════════════════════════════════════")
+    }
+
+    let mut r1 = ""
+    let mut r2 = ""
+    let mut r3 = ""
+    let mut r4 = ""
+
+    if bench == "" || bench == "dynamic" {
+        r1 = smoke_dynamic_bias()
+    }
+    if bench == "" || bench == "weights" {
+        r2 = smoke_feature_weights()
+    }
+    if bench == "" || bench == "cluster" {
+        r3 = smoke_cluster()
+    }
+    if bench == "" {
+        r4 = smoke_integration()
+    }
+
+    println("")
+    println("NEXUS_AI_DRILL_SMOKE {\"kind\":\"ai_drill_smoke\",\"bias\":\"" + r1 + "\",\"weights\":\"" + r2 + "\",\"cluster\":\"" + r3 + "\",\"integ_avg_bias\":\"" + r4 + "\"}")
+    println("__AI_DRILL__ OK")
+}
+
+main()
