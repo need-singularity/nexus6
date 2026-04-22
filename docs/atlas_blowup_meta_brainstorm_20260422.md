@@ -454,3 +454,53 @@ echo "{\"ts\":\"$ts\",\"atlas_lines\":$lines,\"atlas_bytes\":$size,$body}" >> "$
 **다음 step**:
 - 72h 누적 후 delta 자동 출력 (이미 recipe 에 `tail -n 1` 비교 로직 여지 있음 — docs/atlas_blowup_meta_brainstorm A1 참조).
 - C1 (닫힌 루프) 준비: blowup 결과 반영 시 row 앞뒤 비교로 health regression 판정.
+
+---
+
+## Appendix 2 — "all go" 일괄 baseline seed (2026-04-22)
+
+MINPATH 으로 scannable 항목 전수 baseline row 1건씩 append. 모두 `nexus/state/*.jsonl` (gitignored, runtime).
+
+| 항목 | 파일 | 주요 baseline 값 |
+|---|---|---|
+| A1/A2 atlas health + grade | `atlas_health_timeline.jsonl` | typed=9617, brkthr=24, @S=2, miss5=120 |
+| A3 hub centrality | `atlas_hub_centrality.jsonl` | hub>10: 157, hub≥20: 137, max_degree=4651 |
+| A4 저집중 cluster | `atlas_cluster_watch.jsonl` | 값공유 ≥5: 73, ≥8: 55, ≥10: 48 (2026-04-11 7 → +66) |
+| A5 domain @X tunnel | `atlas_domain_tunnel.jsonl` | 751 domains; top: celestial 304 / galactic 204 / cosmological 137; material/music/linguistics ≤7 (희박 tunnel 후보) |
+| B1 blowup 활동 | `blowup_activity_timeline.jsonl` | 89167 events, last_event_ts 2026-04-19 (3일 전), file 총 17MB |
+| B7 @S 공백 | (A1 내) | @S=2 (2026-04-11 1 → 여전 희박) |
+| C2 grade-up candidates | `atlas_grade_up_candidates.jsonl` | `[5?]` 120 nodes (verify queue) |
+| C3 convergence witness | `atlas_convergence_witness.jsonl` | 독립 도달 ≥2 domain: 137 값, ≥3: 79, ≥4: 49 |
+| F1 selftest 커버리지 | `tool_selftest_inventory.jsonl` | 476 .hexa 도구 중 32 에 selftest = **6.7%** (심각한 gap) |
+| F2 bypass incidents | `bypass_incidents_timeline.jsonl` | `--no-verify` 0 lifetime (clean), `HEXA_LOCAL=1` 11, `NO_CAP` 6 |
+| F3 proof-carrying SHA | `proof_carrying_audit.jsonl` | roadmap_engine_theory.md 10 SHA 중 9 resolvable, **1 rotted** |
+| H1 state lifecycle | `state_lifecycle_audit.jsonl` | 253 파일 전부 hot (≤7d) — warm/cold 이관 대상 0 |
+| H3 versioned artifacts | (H1 동일 파일) | `_vN` 파일 4 (경미) |
+| K1 crash/incidents | `crash_monitor_timeline.jsonl` | incidents/ 1건 (7d 내) |
+| L1/L2 cross-repo refs | `cross_repo_audit.jsonl` | anima 10212, airgenome 44 files reference hexa-lang |
+| P1 memory decay | `memory_decay_audit.jsonl` | `memory/` 디렉토리 존재 X (세션 시작 후 아직 저장된 메모리 없음) |
+| Q1 n6 invariant | `atlas_invariant_audit.jsonl` | invariant mention 32, breakthrough node 25 |
+
+### 주요 관찰 (2026-04-11 emergence snapshot 대비)
+
+- **atlas 성장**: typed node 6321 → 9617 (+52%). brkthr 7 → 24 (+17).
+- **cluster densification**: 값공유 ≥5 cluster 7 → 73 (10×). "단일 값 다도메인 수렴" 이 atlas 의 메인 성장 축.
+- **@S 여전 희박**: 1 → 2. 대칭 indexer 투입 필요 (B7 actionable).
+- **@X 편중 그대로**: celestial/galactic/cosmological 이 여전 지배. material/bio/music/linguistics 희박 tunnel 대상 (A5 actionable).
+- **blowup 재가동**: mtime 2026-04-22, last_event 2026-04-19 → 완전 dormant 아님. 최근 3일 활동 있음.
+- **selftest 6.7%**: F1 이 최우선 actionable gap. 476 도구 중 444 가 selftest 없음.
+- **rotted SHA 1**: roadmap_engine_theory.md 에 commit SHA 하나가 이미 resolve 불가. F3 actionable.
+
+### 구현 미착수 (baseline 불가 — 설계 필요)
+
+B3 applied/decayed (스키마 신설 필요), B4 param tune (run history 필요), B5 live monitor (daemon), C1 닫힌 루프 (mutation), C4 Ψ re-fit (계산), D1–D4 governance, E1–E3 cost tracking, G1–G3 scheduler, H2 schema migration, I1–I2 gate 통계, J1–J2 agent lock, K2–K3 rollback/chaos, M1–M2 query, N1–N2 viz, O1–O2 feature flag, P2 upshot transfer, Q2 Ψ cross-check, R1–R2 user loop.
+
+### 재실행 레시피 (bash one-shot)
+
+각 항목 본 appendix 내 추후 extract. 공통 접근: `awk` 기반 POSIX 스캔 → `echo '{"ts":...}' >> state/<topic>.jsonl`. 영구 스케줄은 `launchd` plist 또는 `crontab` 등록 (tool/scripts/ write 차단 회피).
+
+### Actionable top-3 (선별)
+
+1. **F1 selftest coverage 6.7%** — 444 도구 selftest 부재. 하루 10개씩 추가 = 1.5달 내 100%. ROI 높음.
+2. **F3 rotted SHA 1** — proof-carrying 주장이 이미 무효. 즉시 수정 필요.
+3. **A5 material/bio/music tunnel 공백** — @X ≤7 인 중간 스케일 도메인 5개. blowup 타겟 queue 에 투입.
