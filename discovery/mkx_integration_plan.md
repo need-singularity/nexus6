@@ -240,7 +240,7 @@ axis_3 (rate)     ─soft→  axis_2/4/5 (suggested_axis 출력)
 
 **Risk + mitigation**:
 - rate.jsonl 무한 증가 → 14d retention + daily aggregate 자동 회전.
-- launchd plist 충돌 → 기존 com.nexus.cl-refresh / com.nexus.health 와 다른 label, 동일 cadence 30m 권장.
+- launchd plist 충돌 → 기존 com.nexus.health 와 다른 label, 동일 cadence 30m 권장.
 
 ---
 
@@ -436,7 +436,7 @@ axis_3 (rate)     ─soft→  axis_2/4/5 (suggested_axis 출력)
 - **H-DOD**: 8 게이트 = DoD verifier 입력.
 - **H-CLAIM-LEX**: 본 plan 은 design only, "구현 완료" 주장 없음.
 - **H-SCOPE**: 본 세션 산출물은 .md + .json 3개.
-- **H-NOHOOK**: launchd plist (axis_3, axis_5) 는 hook 아닌 daemon. shared/launchd/ 기존 패턴 (`com.nexus.cl-refresh`, `com.nexus.health`) 와 동일.
+- **H-NOHOOK**: launchd plist (axis_3, axis_5) 는 hook 아닌 daemon. shared/launchd/ 기존 패턴 (`com.nexus.health`) 와 동일.
 - **VD3** (산문 금지): 본 .md 는 design proposal — VD3 예외.
 
 ### 5.3 알려진 미해결

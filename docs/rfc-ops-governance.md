@@ -59,7 +59,7 @@ date: 2026-04-16
 | Shift        | Duration | Primary Duty                          | Backup         |
 |--------------|----------|---------------------------------------|----------------|
 | Active       | Session  | Monitor harness alerts, unblock gates | System Owner   |
-| Passive      | Between sessions | Automated cron checks (cl-refresh 30m) | launchd watchdog |
+| Passive      | Between sessions | Automated cron checks                  | launchd watchdog |
 | Escalation   | On demand | L0 violations, OOM/zombie incidents   | System Owner   |
 
 ### On-Call Responsibilities
@@ -72,7 +72,6 @@ date: 2026-04-16
 
 ### Automated Coverage (Between Sessions)
 
-- cl-refresh launchd: 30-minute cycle, usage cache fetch.
 - budget_gate: Prevents runaway resource consumption.
 - lock_gate: Prevents concurrent mutation of shared state.
 - reaper: Zombie process cleanup (H-NOZOMBIE 5-layer defense).

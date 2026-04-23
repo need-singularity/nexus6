@@ -14,7 +14,6 @@ BRAIN_LOG="${LOG_DIR}/hexa_brain.jsonl"
 mkdir -p "$LOG_DIR"
 
 CLAUDE_BIN="${HEXA_BRAIN_CLAUDE:-$HOME/.local/bin/claude}"
-CL_BIN="${NEXUS:-$HOME/Dev/nexus}/bin/cl"
 PROMPT_FILE="${NEXUS:-$HOME/Dev/nexus}/tool/hexa_brain_prompt.md"
 EFFORT="${HEXA_BRAIN_EFFORT:-low}"
 
@@ -26,8 +25,6 @@ TOP_PROCS=$(ps -eo pid=,pcpu=,%mem=,etime=,command= 2>/dev/null | sort -k2 -rn |
 MEM_STATS=$(vm_stat 2>/dev/null | head -8)
 RECENT_REFLEX=$(tail -25 "$GUARD_LOG" 2>/dev/null)
 [[ -z "$RECENT_REFLEX" ]] && RECENT_REFLEX="(no reflex events yet)"
-CL_STATUS=$("$CL_BIN" u 2>/dev/null)
-[[ -z "$CL_STATUS" ]] && CL_STATUS="(cl unavailable)"
 
 # reflex 추적 중인 PID 수
 REFLEX_ACTIVE=0
@@ -75,9 +72,6 @@ $TOP_PROCS
 
 ### reflex state (active=$REFLEX_ACTIVE)
 $RECENT_REFLEX
-
-### claude account utilization
-$CL_STATUS
 
 ### disk cache hot (claude project states)
 $DISK_HOT

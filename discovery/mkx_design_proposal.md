@@ -316,8 +316,7 @@ Mk.IX 가 만든 `[12*]` 등급은 *사다리만 있고 채워지지 않은* 상
    - 항목: `{timestamp, line_count, lines_added_1h, lines_added_24h, lines_added_7d,
      promotions_10star_1h, promotions_11star_1h, promotions_12star_1h,
      new_hubs_1h, top_hub_degree_max}`
-   - 갱신 주기: launchd 30분 (기존 `com.nexus.cl-refresh.plist` 와 같은 cadence
-     로 별도 plist `com.nexus.atlas-rate.plist`).
+   - 갱신 주기: launchd 30분 — plist `com.nexus.atlas-rate.plist`.
    - 14 일 retention, 그 이후 daily aggregate 만.
 
 2. **Plateau Detector**: `hexa shared/n6/plateau_detector.hexa`
