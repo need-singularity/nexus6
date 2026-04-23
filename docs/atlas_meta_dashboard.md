@@ -71,7 +71,7 @@
 | cross-repo refs anima | 10212 |
 | cross-repo refs airgenome | 44 |
 | rate limiter quotas | 4 scope (wake/merge/changelog/rollback) |
-| rollback HEAD snapshot | `533b77d2` (nexus) |
+| rollback HEAD snapshot | `d5de613c` (nexus, 2026-04-23 세션 업데이트; prior `533b77d2`) |
 | chaos probe 다음 | 2026-07-22 (quarterly) |
 
 ---
@@ -83,6 +83,28 @@ Round 1 (15): atlas_health_timeline · atlas_hub_centrality · atlas_cluster_wat
 Round 2 (17): psi_constants_history · law_registry · meta_rate_limit_config · atlas_diff_scan_index · meta_scheduler_plan · schema_version_inventory · digest_backlog · agent_reconciliation_log · meta_rollback_snapshots · chaos_probe_schedule · query_preload_plan · heatmap_data_snapshot · ab_rule_experiment · upshot_transfer_log · retrospect_digest · blowup_param_history · blowup_live_monitor.
 
 Schema stubs (13): discovery_applied_ledger · blowup_closed_loop_log · meta_decision_cert · meta_canary_log · meta_cost_ledger · blowup_pareto_frontier · gate_decision_log · agent_lock_ledger · semantic_index_rebuild_log · mermaid_regen_log · meta_feature_flags · psi_cross_check_log · user_cmd_pattern_log.
+
+---
+
+## Round-4 evolution delta (2026-04-23)
+
+메타엔진 세션 스코프 고정 후 첫 cadence 실행. 중요: **E2 diff-scan 이 실제로 기능함** (설계 후 첫 유효 실행).
+
+| 축 | 결정 | 근거 |
+|---|---|---|
+| **E2 diff-scan** | A1–A5 rescan **skipped** | `atlas.n6` sha256 `a0e27b25…f33f2c6c` baseline 과 동일 → typed/grades/hub 재계산 불필요 (cost saved) |
+| **K2 rollback target** | snapshot 갱신 `533b77d2 → d5de613c` | 직전 baseline 이후 70+ inbox ack + daemon sync commit 축적; 세션 checkpoint 로 `post_meta_session_20260423_snapshot` 이벤트 기록 |
+| A1–A5 | no-op (E2 판정) | atlas unchanged |
+| B1 blowup | pending (별개 source `n6/signals/blowup_energy_stability.jsonl` 재맵 필요) | 경로 drift — 원 brainstorm 은 `n6/blowup_events.jsonl` 가정 |
+| F1 selftest 6.7% | unchanged | `tool/` write 차단 (AG10) → maintainer 세션 dependency |
+
+**관찰**: atlas/blowup 소스 전체가 15.5h 동안 안정 (atlas hash 동일 + HEAD 만 이동 = commit 들이 docs/state/config 변경). 즉 **지도·창발 본체 dormant, meta-layer 만 active** — 의도된 상태. E2 는 이 상황에서 A-축 cost 를 0 으로 억제.
+
+**append 된 runtime row**:
+- `state/meta_rollback_snapshots.jsonl` — K2 이벤트 1건
+- `state/atlas_diff_scan_index.jsonl` — E2 decision 1건 (`diff_detected=false`, `a_axis_scan_skipped=true`)
+
+**다음 cadence trigger**: atlas.n6 mtime 변화 감지 시 A-축 자동 rescan, blowup source 재맵은 별 세션. 본 세션 session-level 으로는 meta-engine 진화 cycle 1회 완결.
 
 ---
 
