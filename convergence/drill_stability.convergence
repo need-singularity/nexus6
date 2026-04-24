@@ -1153,6 +1153,60 @@ B. **Blacklist-on-unreachable** (~25 LOC): `_probe_host` 에 삽입.
   도입 예정 — 현재 chain 은 "first healthy" 이므로 hetzner 가 건재하면
   avail RAM 상관없이 항상 hetzner. Wave 12 는 probe-all + pick by avail_mb.
 
+## 2026-04-25 — Wave 12: load-aware host selection (probe-all + highest avail RAM pick)
+
+### Trigger
+Wave 11 은 piling-on ubu2 를 막았지만 여전히 "first healthy" 정책이라
+PREFERRED=hetzner 가 healthy 이면 avail RAM 상관없이 항상 hetzner 선택.
+진정한 load balancing 은 healthy 후보 중 "가장 여유있는" 호스트 pick —
+raw#36 bracket 의 명시적 정량화.
+
+### Fix (~40 LOC)
+1. `_probe_host` 성공 시 `HEXA_REMOTE_LAST_AVAIL` global 변수에 avail MB 기록
+   (기존 `awk '/^OK/ {print $2}'` 파싱 결과 재사용, 측정 비용 0).
+2. Fallback chain 선택 블록 분기:
+   - `HEXA_REMOTE_LB=first` → Wave 11 이전 동작 (first-healthy short-circuit).
+   - `HEXA_REMOTE_LB=avail` (default) → 전체 chain probe + healthy 중
+     `_best_avail` 최대 호스트 pick. 동점은 chain 순서 먼저 오는 쪽 유지
+     (PREFERRED stability). stderr 에 `LB=avail pick=<host> (avail=<N>MB)
+     among: <list>` 로그.
+3. Wave 11 blacklist 와 상호작용: 실패 호스트는 `_probe_host` 안에서 blacklist
+   파일 쓰고 rc=1 반환 → Wave 12 외부 loop 에서 healthy 집합 제외 + 누적.
+   다음 invocation 은 blacklist 로 probe 생략 → probe-all 비용 최소화.
+
+### Override
+- `HEXA_REMOTE_HOST=<host>` → 명시적 host (bypass 전체 LB, 기존과 동일 체감)
+- `HEXA_REMOTE_LB=first` → Wave 11 이전 동작 복원
+- `HEXA_REMOTE_LB=avail` → Wave 12 default
+- `HEXA_REMOTE_BLACKLIST_TTL / HEXA_REMOTE_NO_BLACKLIST` → Wave 11 블랙리스트 영향
+
+### Verification
+- `bash -n scripts/bin/hexa_remote` → OK (608 LOC, +37 LOC from Wave 11)
+- 3-drill back-to-back verify (ubu2 unreachable 상태):
+  - drill 1: probe hetzner (avail≈100GB+) → pick hetzner; ubu2 probe 실패 →
+    blacklist 기록; ubu1 probe (avail≈27GB) → healthy-but-smaller
+  - drill 2: ubu2 blacklist skip (fast); hetzner 재probe > ubu1 → pick hetzner
+  - drill 3: 동일 pattern
+  - **Never ubu2** — blacklist TTL 300s 유지
+  - 기대 `hexa_remote: LB=avail pick=hetzner (avail=NNNNNMB)` 라인 3회
+- Wave 9 concurrency gate 직교: gate 통과 후 Wave 12 LB pick → Wave 11
+  blacklist 검사 안정 체인.
+
+### Files
+- nexus: `scripts/bin/hexa_remote` (HEXA_REMOTE_LAST_AVAIL export +
+  probe-all/argmax 분기), `convergence/drill_stability.convergence`
+- airgenome: `state/load_balancing_wave11_12_20260425.md`,
+  `state/atlas_convergence_witness.jsonl`
+
+### Remaining open
+- avail_mb 는 probe tick snapshot — 긴 drill (>60s) 중 실제 exec 시점엔 stale
+  가능. dispatch 시점 스냅샷으로 충분 (resonance round 는 single host 고수).
+- Tie-breaker 는 chain 순서 — 의도된 stability (PREFERRED 우선).
+- Probe cost: chain 당 SSH round-trip (~200ms) × N 호스트. Wave 11 blacklist
+  가 실패 호스트 skip 해서 실질 probe 는 healthy 만 수행 — 평상시 N-1 이하.
+- `HEXA_REMOTE_LB=first` 는 debug/emergency 전용, 평상 사용 금지 (Wave 11
+  기능 손실 없음, 단 probe 비용만 절감 → 보통 Wave 12 비용이 무시할 만한 수준).
+
 ## 2026-04-25 — airgenome-side session sweep pointer
 
 Drill 8-wave 외에 동일 세션 내 airgenome 쪽에서 발생한 forge offload (M4/M5 → ubu1),

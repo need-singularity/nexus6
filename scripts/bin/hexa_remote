@@ -102,6 +102,9 @@ _probe_host() {
             avail="$(printf '%s' "$err" | awk '/^OK/ {print $2}' | head -n1)"
             # Accept if RAM check disabled OR avail >= threshold.
             if [ "$min_ram" = "0" ] || { [ -n "$avail" ] && [ "$avail" -ge "$min_ram" ] 2>/dev/null; }; then
+                # Wave 12 (2026-04-25): export avail MB to caller for load-aware
+                # selection (probe-all + argmax). 비어있으면 0 으로 기록.
+                HEXA_REMOTE_LAST_AVAIL="${avail:-0}"
                 return 0
             fi
             echo "hexa_remote: host=$cand SSH OK but RAM avail=${avail:-?}MB < ${min_ram}MB threshold (raw#36 bracket) — skipping" >&2
@@ -277,13 +280,47 @@ if [ "${HEXA_REMOTE_SKIP_PREFLIGHT:-0}" != "1" ] \
 fi
 
 HOST=""
-for cand in $FALLBACK_CHAIN; do
-    if _probe_host "$cand"; then
-        HOST="$cand"
-        [ "$PREFERRED" != "$cand" ] && echo "hexa_remote: $PREFERRED unreachable, using $cand" >&2
-        break
+# Wave 12 (2026-04-25): load-aware selection. 전체 chain probe 후 healthy 중
+# `HEXA_REMOTE_LAST_AVAIL` (probe 가 기록) 최대값인 호스트 pick. PREFERRED 는
+# 동일 avail tie-breaker (chain 순서 그대로 PREFERRED 가 먼저 collected 되므로
+# 나중 동점 갱신은 무시 — PREFERRED stability 보장).
+#   HEXA_REMOTE_LB=first  → Wave 11 이전 동작 (first-healthy short-circuit)
+#   HEXA_REMOTE_LB=avail  → Wave 12 default (highest avail RAM)
+# 직접 지정 (HEXA_REMOTE_HOST) 은 FALLBACK_CHAIN 앞머리에 있고 preferred=그 값
+# 이므로 probe 통과 즉시 선택됨 (Wave 11 이전과 동일 체감).
+_LB_MODE="${HEXA_REMOTE_LB:-avail}"
+if [ "$_LB_MODE" = "first" ]; then
+    for cand in $FALLBACK_CHAIN; do
+        if _probe_host "$cand"; then
+            HOST="$cand"
+            [ "$PREFERRED" != "$cand" ] && echo "hexa_remote: $PREFERRED unreachable, using $cand" >&2
+            break
+        fi
+    done
+else
+    # probe-all + argmax(avail). 실패 호스트는 Wave 11 blacklist 가 기록
+    # (다음 invocation 에서 자동 skip), 여기선 in-memory 누적만 수행.
+    _best_host=""
+    _best_avail=-1
+    _healthy_hosts=""
+    for cand in $FALLBACK_CHAIN; do
+        HEXA_REMOTE_LAST_AVAIL=""
+        if _probe_host "$cand"; then
+            _cand_avail="${HEXA_REMOTE_LAST_AVAIL:-0}"
+            _healthy_hosts="$_healthy_hosts $cand(avail=${_cand_avail}MB)"
+            # Strict `>` — tie 는 chain 순서 먼저 온 쪽 유지 (PREFERRED stability).
+            if [ "$_cand_avail" -gt "$_best_avail" ] 2>/dev/null; then
+                _best_avail="$_cand_avail"
+                _best_host="$cand"
+            fi
+        fi
+    done
+    if [ -n "$_best_host" ]; then
+        HOST="$_best_host"
+        echo "hexa_remote: LB=avail pick=$HOST (avail=${_best_avail}MB) among:${_healthy_hosts}" >&2
+        [ "$PREFERRED" != "$HOST" ] && echo "hexa_remote: $PREFERRED not chosen (load-aware), using $HOST" >&2
     fi
-done
+fi
 
 if [ -z "$HOST" ]; then
     echo "hexa_remote: all hosts unreachable (tried: $FALLBACK_CHAIN), falling back to local" >&2
