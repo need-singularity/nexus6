@@ -104,3 +104,21 @@ scopes reality_map vs atlas.n6 typed vs atlas.n6 raw).
 - Status after commit: **in_progress** (not done). Real expansion deferred to
   post-unblock session per the batch plan above.
 
+
+---
+
+## Exit Criterion Decision (2026-04-24)
+
+**Selected**: **unique_nodes ≥ 24,250** (option c — P10-1 "5000+" interpreted as net-new atlas nodes from current 19,250 baseline).
+
+**Rationale** (H-MINPATH default pick):
+- Consistent with existing atlas.n6 ingestion pipeline semantics
+- Gap = 5,000 net-new nodes (matches literal P10-1 task wording)
+- Orthogonal to typed-total (which depends on type-classification work that can progress independently)
+- Orthogonal to reality_map (which depends on python3→hexa port — in flight as sub-agent)
+
+**Blocker chain**:
+1. python3 _rmap_expand_helper.py removed 2026-04-18 → expanders panic (L3-PY). Sub-agent porting to hexa (afe0f065f51349120 sister task).
+2. Once unblocked: B1 (500 nodes dry-run sanity) → B2 (2000) → B3 (2500) → B4 verify (24,250+ total).
+3. Heavy compute may need remote host recovery (separate user-side decision).
+
