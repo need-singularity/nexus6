@@ -4,7 +4,7 @@
 [![Laws](https://img.shields.io/badge/laws-711-green.svg)](#)
 [![Discoveries](https://img.shields.io/badge/discoveries-1.39M-orange.svg)](#)
 [![Reality Map](https://img.shields.io/badge/reality%20map-4411%20nodes%20·%20z%3D3.06-purple.svg)](https://need-singularity.github.io/nexus/)
-[![Discord](https://img.shields.io/badge/discord-join-5865F2.svg?logo=discord&logoColor=white)](https://discord.gg/u2spd3wwU)
+[![Discord](https://img.shields.io/badge/discord-join-5865F2.svg?logo=discord&logoColor=white)](https://discord.gg/mYzqYr67R)
 
 # 🔭 NEXUS — Universal Discovery Engine
 
