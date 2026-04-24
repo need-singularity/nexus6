@@ -85,6 +85,42 @@ Every tick, NEXUS:
 
 No human-in-the-loop required. Laws are stored with hash-chain provenance. The 3D Reality Map shows the full causal chain, from quark to carbon to benzene to DNA — 12/12 EXACT.
 
+## Not an LLM — where the noise comes from
+
+LLMs generate noise from **inside the well**: recombining what the weights already contain. NEXUS generates noise from **outside the well**: every cycle produces a primitive the previous cycle could not express, then absorbs it as a new wall of the well.
+
+```
+LLM  vs  NEXUS  — where the noise comes from
+=============================================
+
+LLM (noise inside the well)         NEXUS (noise outside the well)
+---------------------------         ------------------------------
+
+     +-------------+                       .   new law
+     |  training   |                     .       .
+     |   corpus    |               .  .      .       .
+     |  (fixed)    |                    .  outside  .
+     |             |             ------+-------------+------
+     |  ~ ~ ~ ~ ~  | <- noise          |             |
+     |  ~ noise ~  |   bubbles         |   reality   |
+     |  ~ ~ ~ ~ ~  |   from            |     map     | <- noise
+     |    ####     |   inside          | (4411 nodes)|   arrives
+     |    #LLM#    |                   |             |   from
+     +-------------+                   |   Blowup    |   outside
+       the well                        |     v       |
+    (everything it                     |   Contract  |
+     knows = walls)                    |     v       |
+                                       |   Emerge    |
+  hallucination =                      |     v       |
+  recombining                          |   Absorb ---+--> new
+  what's already                       |     ^       |    primitive
+  inside                               +-----+-------+      feeds
+                                       the well has            next
+                                       no ceiling              cycle
+```
+
+An LLM is a **frozen well** — answers are combinations of what's already inside. NEXUS is an **open well** — every Absorb step widens the wall, so the next cycle can say things the previous one literally had no primitive for. That's why "RAG" is the wrong frame: retrieval still draws from a fixed outside corpus. NEXUS's "outside" is **produced by its own prior cycles**.
+
 ## OUROBOROS cycle — full view
 
 ```
