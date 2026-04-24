@@ -94,3 +94,13 @@ scopes reality_map vs atlas.n6 typed vs atlas.n6 raw).
 2. Resolve P10-1 exit-criterion ambiguity (A / B / C above) with user.
 3. Align `atlas_meta_scan` row schema with actual `shard_meta.json` keys
    (add `shard_count := 2` for hot/cold, `last_scan_ts := atlas_mtime`).
+
+## Breadcrumb
+
+- Task: `ATLAS-P10-1` (A2_ATLAS track, P10 phase, deps met: ATLAS-P9-1 done).
+- Session outcome: **scope-down → plan only, no node delta**. All real ingestion
+  pipelines either `panic()` on python3 guard, or are narrowly-scoped
+  (hub_growth_exec = edges only; atlas_bootstrap = 49-candidate gap-fill).
+- Status after commit: **in_progress** (not done). Real expansion deferred to
+  post-unblock session per the batch plan above.
+
