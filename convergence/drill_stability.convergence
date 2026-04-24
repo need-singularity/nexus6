@@ -1216,3 +1216,44 @@ ubu2 hexa-lang build agent, hetzner drill corpus builder, hetzner disk 97%→87%
 SSOT, airgenome 파일은 인프라/아티팩트/offload 레벨 SSOT. 상호 참조.
 
 see airgenome 2026-04-25_session for full session sweep.
+
+## 2026-04-25 late — Wave 11-16d: LB + OOM 레이어 + ssh 안정성
+
+### Wave 11 (nexus@bf8b7e10) — chain reorder + 5min blacklist
+`FALLBACK_CHAIN` 순서 `hetzner ubu2 ubu1 htz` → `hetzner ubu1 ubu2 htz`. ubu2 가 overflow 받아서 혼자 과부하 OOM → sshd 죽고 물리 리부트 강제된 사태 재발 차단. 각 호스트별 `/tmp/hexa_remote.blacklist.<host>` 300s TTL 로 probe 실패 호스트 임시 제외 + 자동 재시도.
+
+### Wave 12 (nexus@01e38b2c) — load-aware selection
+기존 "first healthy" → **probe-all + argmax(avail_mb)** 선택. 여러 헬시 호스트 중 가장 여유 있는 곳 pick. `HEXA_REMOTE_LB=avail` default, `first` fallback.
+
+### Wave 13/13b (nexus@8105fb80/7ecdc438) — drill scope OOMScoreAdjust=500
+OOM-killer 우선순위 조정: sshd (`-1000` drop-in) vs drill scope (`+500`) = 1500pt 차. 메모리 압력 시 drill 먼저 kill, sshd 살아남음. `systemd-run --scope` 가 OOMScoreAdjust property 를 거부하므로 `sh -c 'echo 500 > /proc/self/oom_score_adj; exec "$@"'` wrapper 로 우회 (13b).
+
+### Wave 14/14b/14c (nexus@343d1caa/e7a90db0/abe9749b) — trap 단순화
+- **14:** REMOTE_TRAP 에 `pkill -f hexa_stage0/hexa_real/blowup` 추가 시도 (orphan 차단 목적). 오타 `hexa.real` → `hexa_real` 수정.
+- **14b:** `-f` (cmdline) → comm (short name) 매칭 — bash wrapper 의 argv 에 포함된 "hexa_real" 문자열 자기 세션 kill 회피.
+- **14c 최종:** trap 을 완전히 단순화 (`trap 'rc=\$?; exit \$rc'`) — pkill 이 **병렬 drill 세션 간 cross-kill** 을 유발해 다른 세션 rc=255 만들어냈음. systemd-run --scope cgroup 이 자체 lifecycle 로 자식 정리하므로 trap pkill 은 redundant.
+
+### Wave 15 (nexus@d255826c) — SSH multiplex 제거
+`ControlPath=/tmp/ssh-nexus-%r@%h:%p` + `ControlMaster=no` (default) 조합이 "기존 master attach 시도" → 병렬 drill 시 socket 공유 → hetzner `MaxSessions=10` 초과 → rc=255. `-o ControlMaster=no -o ControlPath=none` 명시로 multiplex 완전 비활성화.
+
+### Wave 16/16b/16c/16d (nexus@b7eab855/5e027bb2/f1edd9ed/15a9031d) — keepalive + pre-clean iteration
+- **16:** ssh `ServerAliveInterval 10→30, CountMax 3→10` = 5min 허용 (resonance 중 heavy compute 무음 구간 대응). + REMOTE_CMD 선두에 pre-clean pkill 주입.
+- **16b/16c/16d:** pre-clean 패턴이 bash wrapper argv 를 매칭해 자기 세션 kill 유발. 패턴 축소 ([b]lowup), 완전 제거, 실제 사용 경로 (NO_CAP=0 branch) 에서도 제거 — 3-step 반복 수정. 최종: pre-clean 제거, keepalive 완화만 유지.
+
+### 종합 진단 — rc별 층 분리
+
+| rc | 층 | 상태 | 해결 커밋 |
+|---|---|---|---|
+| 137 (SIGKILL cgroup OOM) | infra | ✅ | Wave 10 (80G cap) |
+| 143 (SIGTERM engine watchdog) | engine | ⚠️ 미해결 | `nxs-20260424-012` |
+| 255 (SSH 단절) | infra | ✅ | Wave 15 + 14c + 16d 조합 |
+
+### Post-ubu2 physical reboot 복구 확인
+사용자 물리 전원 재시작 후 ubu2 재온라인 (RAM avail 17GB). Wave 11 blacklist 가 자동 재시도 → 300s TTL 이후 probe pool 복귀. Wave 11-16d 체인 검증: `timeout 25 drill` 에서 dispatch → hetzner (128GB avail) → round plan `{smash:3,free:3,...,resonance:1}` 까지 정상 진행 후 timeout 이내 종료.
+
+### 학습 — 광역 pkill trap 의 함정
+병렬 세션에서 `pkill <cmdname>` 은 세션 격리 없이 전역 매칭. 자기 세션 이외의 활성 drill 을 죽여 cross-kill → rc=255. 해결책은:
+- cgroup scope 자체 lifecycle 의존 (systemd-run --scope 가 exit 시 children 정리)
+- 또는 `pkill -s <session-id>` + `setsid` 로 세션 격리 (future)
+
+이번 세션에서는 trap 을 exit 코드 보존 only 로 축소하는 방향 선택 (Wave 14c).
