@@ -51,14 +51,35 @@ _probe_host() {
     local retry="${HEXA_REMOTE_PROBE_RETRY:-1}"
     local total=$((retry + 1))
     local reason="unknown"
+    # raw#36 problem-solving-triad — fixpoint(stable host) + bracket(RAM headroom).
+    # Per-host minimum available RAM (MB) before accepting as compute target.
+    # heavy-compute drills have been observed at ~20GB RSS → 24GB min keeps a 4GB
+    # margin below systemd MemoryMax=20G cap and prevents ubu2 (32GB total) SIGTERM.
+    # Override: HEXA_REMOTE_MIN_RAM_MB (0 disables the check, falling back to
+    # legacy behavior).
+    local min_ram="${HEXA_REMOTE_MIN_RAM_MB:-24576}"
     attempt=0
     while [ $attempt -lt $total ]; do
+        # Combined SSH + RAM probe in a single round-trip: `echo OK` on host
+        # gates sshd responsiveness, `awk /^Mem:/` extracts available MB.
+        # Output format: "OK <avail_mb>" on success, anything else = SSH/probe fail.
         err="$(ssh -o ConnectTimeout=$ctimeout -o BatchMode=yes -o ServerAliveInterval=5 \
             -o ServerAliveCountMax=1 \
-            -o ControlPath=/tmp/ssh-nexus-%r@%h:%p "$cand" true 2>&1 1>/dev/null)"
+            -o ControlPath=/tmp/ssh-nexus-%r@%h:%p "$cand" \
+            'echo OK $(free -m 2>/dev/null | awk "/^Mem:/ {print \$7}" | tr -d "[:space:]")' 2>&1)"
         rc=$?
         if [ $rc -eq 0 ]; then
-            return 0
+            # Parse "OK <avail>" — avail field 2 onwards (robust to extra whitespace).
+            local avail
+            avail="$(printf '%s' "$err" | awk '/^OK/ {print $2}' | head -n1)"
+            # Accept if RAM check disabled OR avail >= threshold.
+            if [ "$min_ram" = "0" ] || { [ -n "$avail" ] && [ "$avail" -ge "$min_ram" ] 2>/dev/null; }; then
+                return 0
+            fi
+            echo "hexa_remote: host=$cand SSH OK but RAM avail=${avail:-?}MB < ${min_ram}MB threshold (raw#36 bracket) — skipping" >&2
+            reason="insufficient RAM (avail=${avail:-?}MB < ${min_ram}MB)"
+            rc=1
+            break
         fi
         attempt=$((attempt + 1))
     done
@@ -92,7 +113,15 @@ PREFERRED="$(pick_preferred_host)"
 # remote dispatch 가 hetzner anima-ax102 로 복원되도록. htz alias 는 ssh config
 # (Host hetzner htz htz1) 에서 157.180.8.154 (root) 로 풀림 — airgenome 쪽과 동일.
 FALLBACK_CHAIN="$PREFERRED"
-for cand in ubu1 ubu2 htz; do
+# raw#36 fixpoint — 2026-04-24 host priority re-ordered by headroom.
+# hetzner (128GB RAM) > ubu2 (32GB) > ubu1 (32GB, currently flaky with SSH
+# banner timeout). Previous order ubu1 → ubu2 → htz inverted the RAM budget,
+# causing drill to land on ubu2 (32GB) and hit systemd MemoryMax=20G cap
+# (observed SIGTERM rc=137 on round 2 resonance 2026-04-24). By probing
+# hetzner first, the RAM bracket (raw#36 ②) converges on a host with
+# ≥100GB headroom, eliminating the OOM class entirely.
+# Override: HEXA_REMOTE_HOST / HEXA_REMOTE_CHAIN env vars.
+for cand in hetzner ubu2 ubu1 htz; do
     case " $FALLBACK_CHAIN " in
         *" $cand "*) ;;
         *) FALLBACK_CHAIN="$FALLBACK_CHAIN $cand" ;;
