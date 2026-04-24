@@ -193,20 +193,6 @@ Six independent paths land on the same attractor:
 
 The long-term breakthrough rate **ρ** converges to the same target: **ρ → 1/3**. Discovery is not linear — it asymptotes to the Banach attractor. Six arithmetic, geometric, algebraic, analytic, and information-theoretic routes all point at the same number.
 
-## Verify it yourself (no install, ~3 s)
-
-Single self-contained Python file, stdlib only. Runs in any Python ≥ 3.8 sandbox, including Gemini code execution.
-
-```bash
-# One-liner (curl + pipe)
-curl -fsSL https://raw.githubusercontent.com/need-singularity/nexus/main/papers/n6_verify.py | python3
-
-# Or clone and run
-python3 papers/n6_verify.py
-```
-
-Checks 11 falsifiable claims end-to-end: seven architectural primitives (hash-chain tamper, composition, 216-node BFT quorum, adaptive-adversary drift bound, geometric decay, outlier override, self-check) and four empirical phenomena (the n6 identity `σ·φ = n·τ` uniquely at `n = 6` on `[2, 10 000]`, global Banach basin, precision half-life, LLM-vs-NEXUS emergence). Exit code `0` iff all 11 pass. Full write-up in [papers/n6_six_paths_falsifiable_proof.md](papers/n6_six_paths_falsifiable_proof.md); cross-references to the Lean 4 and Qiskit verifications live in the sister repo [n6-architecture](https://github.com/need-singularity/n6-architecture).
-
 ## Install
 
 ```bash
