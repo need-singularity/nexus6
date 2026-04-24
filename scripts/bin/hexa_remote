@@ -145,6 +145,59 @@ if [ "$_IS_HEAVY_COMPUTE" = "1" ]; then
     HEXA_REMOTE_NO_SYNC=1
 fi
 
+# 2026-04-25 (Wave 9): heavy-compute concurrency gate. Mac jetsam SIGKILL
+# (rc=137) 은 ssh ClientCount 동시성에 비례. 6-parallel drill 시도가 전원
+# rc=137 로 실패 관측 (Wave 8 post-mortem). Wave 9 는 preemptive gate —
+# 로컬 측 heavy dispatch 를 최대 N (default 2) 로 제한. macOS 에 flock(1)
+# 이 없어 mkdir 원자성으로 lock primitive 구현 (dir 존재 시 mkdir 실패 =
+# slot taken). 비-heavy (probe/helpers) 경로는 영향 없음.
+# Override: HEXA_REMOTE_CONCURRENCY=N, HEXA_REMOTE_NO_CONCURRENCY=1 bypass,
+# HEXA_REMOTE_CONCURRENCY_WAIT=S wait seconds (default 300).
+if [ "$_IS_HEAVY_COMPUTE" = "1" ] && [ "${HEXA_REMOTE_NO_CONCURRENCY:-0}" != "1" ]; then
+    _N_MAX="${HEXA_REMOTE_CONCURRENCY:-2}"
+    _WAIT_S="${HEXA_REMOTE_CONCURRENCY_WAIT:-300}"
+    _LOCK_DIR_PREFIX="/tmp/nexus_heavy_dispatch.slot"
+    _ACQUIRED=""
+    _acquire_slot() {
+        _i=1
+        while [ "$_i" -le "$_N_MAX" ]; do
+            _ld="${_LOCK_DIR_PREFIX}${_i}.lock"
+            if mkdir "$_ld" 2>/dev/null; then
+                echo "$$" > "$_ld/pid" 2>/dev/null || true
+                _ACQUIRED="$_ld"
+                # 프로세스 종료 시 slot 해제 (flock auto-release 대체).
+                trap 'rm -rf "$_ACQUIRED" 2>/dev/null || true' EXIT INT TERM
+                return 0
+            else
+                # stale detection: pid 파일이 있고 해당 pid 가 죽었으면 회수.
+                _pid="$(cat "$_ld/pid" 2>/dev/null || echo "")"
+                if [ -n "$_pid" ] && ! kill -0 "$_pid" 2>/dev/null; then
+                    rm -rf "$_ld" 2>/dev/null || true
+                    continue  # same slot 재시도
+                fi
+            fi
+            _i=$((_i + 1))
+        done
+        return 1
+    }
+    if ! _acquire_slot; then
+        echo "hexa_remote: Wave 9 concurrency gate — all $_N_MAX slots busy, waiting up to ${_WAIT_S}s" >&2
+        _t=0
+        while [ "$_t" -lt "$_WAIT_S" ]; do
+            sleep 1
+            _t=$((_t + 1))
+            if _acquire_slot; then
+                echo "hexa_remote: slot acquired after ${_t}s" >&2
+                break
+            fi
+        done
+        if [ -z "$_ACQUIRED" ]; then
+            printf 'NEXUS_REMOTE_ERROR {"reason":"heavy_concurrency_exceeded","limit":%s,"wait_s":%s,"exit_code":64}\n' "$_N_MAX" "$_WAIT_S" >&2
+            exit 64
+        fi
+    fi
+fi
+
 # Build fallback chain — preferred 먼저, 그 다음 ubu1/ubu2/htz (compute host).
 # 2026-04-22: htz 를 체인 말단에 추가. ubu1/ubu2 동시 unreachable (LAN 장애) 시에도
 # remote dispatch 가 hetzner anima-ax102 로 복원되도록. htz alias 는 ssh config

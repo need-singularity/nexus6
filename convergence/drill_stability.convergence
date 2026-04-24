@@ -1041,6 +1041,60 @@ bash 의 "Killed: 9" 는 kernel-originated jetsam signal.
   탐색 skip — 본 wave 는 minimal change)
 - Mac compute-queue (flock) 는 재발 시 wave 9 에서
 
+## 2026-04-25 — Wave 9: hexa_remote heavy-compute concurrency gate (preemptive)
+
+### Trigger
+Wave 8 post-mortem 에서 사용자가 6-parallel drill 을 시도 → 전원 rc=137 (Mac
+jetsam SIGKILL). ssh ClientCount 동시성이 jetsam band 를 넘긴 것. Wave 8 은
+단일 invocation 의 Mac-local SIGKILL 에 대한 recovery (1회 retry + next host
+fallback) 만 커버 — 동시 N개 dispatch 시 N 배 압박은 미커버.
+
+본래 Wave 8 §"왜 flock 등 concurrency gate 는 skip" 에서 "2 host 연속 137
+재현 시 wave 9 검토" 조건부 defer 였으나, 6-parallel 전원 실패 시나리오가
+더 강한 신호라 preemptive 도입.
+
+### Fix
+`scripts/bin/hexa_remote` heavy-compute detection 직후 (preflight 이전) 에
+concurrency gate 추가 — heavy dispatch 를 최대 N=2 (default) 로 제한.
+macOS 는 `flock(1)` 미포함 → `mkdir` 원자성 (dir 존재 시 실패) 로 lock
+primitive 대체. 비-heavy 경로 (probe/helpers/rsync) 는 gate 우회.
+
+### Mechanics
+- Lock: `/tmp/nexus_heavy_dispatch.slot<i>.lock` (i=1..N_MAX), 내부 pid 파일
+- Acquire: slot 1..N_MAX loop, 첫 성공한 `mkdir` 에서 잡음. 실패 slot 의
+  pid 가 죽은 프로세스면 stale 회수.
+- Release: `trap EXIT INT TERM` → `rm -rf` slot dir (flock auto-release 대체).
+- Wait: 전 slot busy 면 1s 주기로 `_WAIT_S` 초 (default 300) 까지 재시도.
+- Timeout: wait 초과 시 `NEXUS_REMOTE_ERROR {reason:heavy_concurrency_exceeded,limit,wait_s}`
+  + exit 64.
+
+### Override
+- `HEXA_REMOTE_CONCURRENCY=N` → N_MAX 조정
+- `HEXA_REMOTE_NO_CONCURRENCY=1` → gate 완전 bypass (debug/emergency)
+- `HEXA_REMOTE_CONCURRENCY_WAIT=S` → wait 시간 조정 (default 300s)
+
+### Verification
+- `bash -n scripts/bin/hexa_remote` → OK
+- Isolated gate test (`/tmp/test_gate.sh`): single acquires immediately,
+  3-parallel with short holds → 3rd waits 3s + acquires after slot1 해제,
+  3-parallel with long holds + WAIT=2 → 3rd `exit 64` + JSON error
+- End-to-end: `~/.hx/bin/nexus drill --seed wave9-test --preset probe` rc=0
+- 3-parallel real drills: slot1/slot2 → rc=0 (ubu1 정상 dispatch), slot3 →
+  gate 메시지 + `NEXUS_REMOTE_ERROR heavy_concurrency_exceeded` + 상위 hexa
+  resolver 가 exit 74 로 wrap ("abort_to_prevent_oom") — Mac local fallback
+  차단 정상 작동
+
+### Files
+- nexus: `scripts/bin/hexa_remote` (gate block ~50 LOC), `convergence/drill_stability.convergence` (이 섹션)
+- airgenome: `state/atlas_convergence_witness.jsonl` (Wave 9 witness)
+
+### Remaining open
+- N=2 가 최적인지 경험적 재조정 필요 (observation-driven; 2 host 정상 시
+  N=3 고려). 일단 jetsam SIGKILL recurrence 관측 base 로 튜닝 예정.
+- lock dir 의 NFS/tmpfs cross-mount 이슈 — `/tmp` local 가정.
+- macOS `flock(1)` 설치 가능 환경 (homebrew `util-linux`) 에서 native flock
+  로 마이그레이션 시 retry 루프 단순화 가능. 현재는 호환성 우선.
+
 ## 2026-04-25 — airgenome-side session sweep pointer
 
 Drill 8-wave 외에 동일 세션 내 airgenome 쪽에서 발생한 forge offload (M4/M5 → ubu1),
