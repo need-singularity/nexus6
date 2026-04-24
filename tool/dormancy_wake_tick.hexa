@@ -1,0 +1,322 @@
+// dormancy_wake_tick.hexa — 1-shot LaunchAgent tick for elapsed-threshold triggers
+// @allow-bare-exec
+// @no-sandbox
+// Role: poll state/meta_trigger_watchlist.jsonl. For every row with
+//       state != "fired_executed" and fires_when "elapsed>=Nh", if now-last_event_ts
+//       >= N hours → append dormancy_wake_fire to growth_bus.jsonl, flip row state
+//       to "fired_executed", atomic write-back (tmp + rename).
+// Paired plist: tool/com.nexus.dormancy-wake.plist (StartInterval=3600)
+// Unblocks: blowup_dormancy_wake (B1_wake / B2 / B4)
+// ai-native: stdout JSONL-only, no human text.
+
+let HOME = env("HOME")
+let mut NEXUS_ROOT = env("NEXUS")
+if NEXUS_ROOT.len() == 0 { NEXUS_ROOT = "/Users/ghost/core/nexus" }
+let WATCHLIST = NEXUS_ROOT + "/state/meta_trigger_watchlist.jsonl"
+let WATCHLIST_TMP = WATCHLIST + ".tmp"
+let GROWTH_BUS = NEXUS_ROOT + "/growth_bus.jsonl"
+let SHOT_PID_FILE = "/tmp/nexus_dormancy_wake.pid"
+let LOG_STDOUT = ""  // JSONL lines are emitted to stdout directly
+
+// ─── shell helpers (mirror nexus_growth_daemon.hexa) ─────────────────
+fn _sh(cmd: str) -> str {
+    let mut out = ""
+    try { out = to_string(exec(cmd)) } catch e { out = "" }  // @allow-bare-exec
+    return out.trim()
+}
+
+fn _now_epoch() -> str { return _sh("date +%s") }
+fn _now_iso() -> str   { return _sh("date -u +%Y-%m-%dT%H:%M:%SZ") }
+
+fn _pid_alive(pid: str) -> bool {
+    if pid.len() == 0 { return false }
+    let r = _sh("kill -0 " + pid + " 2>/dev/null && echo y || echo n")
+    return r == "y"
+}
+
+fn _my_pid() -> str {
+    // same PPID trick as nexus_growth_daemon — echo $$ returns subshell pid which dies instantly
+    return _sh("sh -c 'echo $PPID'")
+}
+
+fn _shq(s: str) -> str {
+    let mut out = "'"
+    let n = s.len()
+    let mut i: i64 = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "'" { out = out + "'\\''" }
+        else { out = out + c }
+        i = i + 1
+    }
+    out = out + "'"
+    return out
+}
+
+fn _emit(line: str) {
+    // structured JSONL to stdout (captured by LaunchAgent StandardOutPath)
+    println(line)
+}
+
+// ─── singleton guard ─────────────────────────────────────────────────
+fn acquire_lock() -> i64 {
+    if file_exists(SHOT_PID_FILE) {
+        let existing = _sh("cat " + _shq(SHOT_PID_FILE) + " 2>/dev/null | tr -d '[:space:]'")
+        if existing.len() > 0 && _pid_alive(existing) {
+            _emit("{\"ts\":\"" + _now_iso() + "\",\"kind\":\"dormancy_wake_busy\",\"alive_pid\":\"" + existing + "\"}")
+            return 1
+        } else if existing.len() > 0 {
+            _emit("{\"ts\":\"" + _now_iso() + "\",\"kind\":\"dormancy_wake_stale_cleanup\",\"dead_pid\":\"" + existing + "\"}")
+            try { exec("rm -f " + _shq(SHOT_PID_FILE)) } catch e {}  // @allow-bare-exec
+        }
+    }
+    let mypid = _my_pid()
+    if mypid.len() == 0 { return 2 }
+    try { exec("printf '%s' '" + mypid + "' > " + _shq(SHOT_PID_FILE)) } catch e {}  // @allow-bare-exec
+    return 0
+}
+
+fn release_lock() {
+    try { exec("rm -f " + _shq(SHOT_PID_FILE)) } catch e {}  // @allow-bare-exec
+}
+
+// ─── JSONL row helpers (regex-free, minimal) ─────────────────────────
+// Returns substring value for a "key":"..." pair, or empty string if absent.
+// Only handles simple string values (no embedded escaped quotes beyond \").
+fn json_str_field(line: str, key: str) -> str {
+    let needle = "\"" + key + "\""
+    let k = line.index_of(needle)
+    if k < 0 { return "" }
+    let mut i = k + needle.len()
+    // skip whitespace + colon
+    while i < line.len() {
+        let c = line.substring(i, i + 1)
+        if c == ":" || c == " " || c == "\t" { i = i + 1 }
+        else { break }
+    }
+    if i >= line.len() { return "" }
+    if line.substring(i, i + 1) != "\"" { return "" }
+    i = i + 1
+    let start = i
+    while i < line.len() {
+        let c = line.substring(i, i + 1)
+        if c == "\\" { i = i + 2; continue }
+        if c == "\"" { break }
+        i = i + 1
+    }
+    return line.substring(start, i)
+}
+
+// Parse "elapsed>=72h" → 72. Returns -1 if not an elapsed-hours form.
+fn parse_elapsed_hours(fires_when: str) -> i64 {
+    let lo = fires_when.to_lower()
+    if lo.index_of("elapsed") < 0 { return -1 }
+    let geq = lo.index_of(">=")
+    if geq < 0 { return -1 }
+    let mut i = geq + 2
+    while i < lo.len() {
+        let c = lo.substring(i, i + 1)
+        if c == " " || c == "\t" { i = i + 1 } else { break }
+    }
+    let start = i
+    while i < lo.len() {
+        let c = lo.substring(i, i + 1)
+        if c >= "0" && c <= "9" { i = i + 1 } else { break }
+    }
+    if i == start { return -1 }
+    let num_str = lo.substring(start, i)
+    // accept trailing 'h' or nothing
+    let mut n: i64 = 0
+    try { n = to_i64(num_str) } catch e { return -1 }
+    return n
+}
+
+// ISO8601 "2026-04-19T03:54:13Z" → epoch seconds via `date -jf` (BSD) fallback to `date -d` (GNU)
+fn iso_to_epoch(iso: str) -> i64 {
+    if iso.len() == 0 { return -1 }
+    // BSD date (macOS)
+    let bsd = _sh("date -u -jf '%Y-%m-%dT%H:%M:%SZ' " + _shq(iso) + " +%s 2>/dev/null")
+    if bsd.len() > 0 {
+        let mut n: i64 = -1
+        try { n = to_i64(bsd) } catch e {}
+        if n > 0 { return n }
+    }
+    // GNU date (Linux stage1 fallback)
+    let gnu = _sh("date -u -d " + _shq(iso) + " +%s 2>/dev/null")
+    if gnu.len() > 0 {
+        let mut n: i64 = -1
+        try { n = to_i64(gnu) } catch e {}
+        if n > 0 { return n }
+    }
+    return -1
+}
+
+// Flip a row's "state":"..." to "fired_executed" and insert "fired_ts":"<iso>".
+// Preserves everything else. If "fired_ts" already present, replaces it.
+fn rewrite_row(line: str, fired_ts: str) -> str {
+    // 1) replace "state":"<old>" with "state":"fired_executed"
+    let mut out = line
+    let state_key = "\"state\""
+    let sk = out.index_of(state_key)
+    if sk >= 0 {
+        // find the colon+quote and the closing quote
+        let mut i = sk + state_key.len()
+        while i < out.len() {
+            let c = out.substring(i, i + 1)
+            if c == ":" || c == " " || c == "\t" { i = i + 1 } else { break }
+        }
+        if i < out.len() && out.substring(i, i + 1) == "\"" {
+            let vstart = i + 1
+            let mut j = vstart
+            while j < out.len() {
+                let c = out.substring(j, j + 1)
+                if c == "\\" { j = j + 2; continue }
+                if c == "\"" { break }
+                j = j + 1
+            }
+            // out = [0..vstart) + "fired_executed" + [j..end)
+            out = out.substring(0, vstart) + "fired_executed" + out.substring(j, out.len())
+        }
+    }
+    // 2) upsert "fired_ts":"<iso>" — if present, replace; else inject before closing '}'
+    let ft_key = "\"fired_ts\""
+    let fk = out.index_of(ft_key)
+    if fk >= 0 {
+        let mut i = fk + ft_key.len()
+        while i < out.len() {
+            let c = out.substring(i, i + 1)
+            if c == ":" || c == " " || c == "\t" { i = i + 1 } else { break }
+        }
+        if i < out.len() && out.substring(i, i + 1) == "\"" {
+            let vstart = i + 1
+            let mut j = vstart
+            while j < out.len() {
+                let c = out.substring(j, j + 1)
+                if c == "\\" { j = j + 2; continue }
+                if c == "\"" { break }
+                j = j + 1
+            }
+            out = out.substring(0, vstart) + fired_ts + out.substring(j, out.len())
+        }
+    } else {
+        // find last '}' and inject ",\"fired_ts\":\"<iso>\"" before it
+        let mut last_brace = -1
+        let mut k = out.len() - 1
+        while k >= 0 {
+            if out.substring(k, k + 1) == "}" { last_brace = k; break }
+            k = k - 1
+        }
+        if last_brace > 0 {
+            let injection = ", \"fired_ts\": \"" + fired_ts + "\""
+            out = out.substring(0, last_brace) + injection + out.substring(last_brace, out.len())
+        }
+    }
+    return out
+}
+
+// ─── main tick ───────────────────────────────────────────────────────
+fn run_tick() -> i64 {
+    if file_exists(WATCHLIST) == false {
+        _emit("{\"ts\":\"" + _now_iso() + "\",\"kind\":\"dormancy_wake_skip\",\"reason\":\"watchlist_missing\",\"path\":\"" + WATCHLIST + "\"}")
+        return 0
+    }
+    let raw = to_string(read_file(WATCHLIST))
+    if raw.len() == 0 {
+        _emit("{\"ts\":\"" + _now_iso() + "\",\"kind\":\"dormancy_wake_skip\",\"reason\":\"watchlist_empty\"}")
+        return 0
+    }
+    let now_epoch_str = _now_epoch()
+    let mut now_epoch: i64 = 0
+    try { now_epoch = to_i64(now_epoch_str) } catch e { now_epoch = 0 }
+    let now_iso = _now_iso()
+
+    let lines = raw.split("\n")
+    let mut new_lines: [str] = []
+    let mut fired_count: i64 = 0
+    let mut changed = false
+
+    let mut li = 0
+    while li < lines.len() {
+        let line = lines[li]
+        if line.len() == 0 {
+            new_lines = new_lines + [line]
+            li = li + 1
+            continue
+        }
+        // only process object lines
+        let tline = line.trim()
+        if tline.substring(0, 1) != "{" {
+            new_lines = new_lines + [line]
+            li = li + 1
+            continue
+        }
+        let state = json_str_field(line, "state")
+        let fires_when = json_str_field(line, "fires_when")
+        let trigger_id = json_str_field(line, "trigger_id")
+        let last_event_ts = json_str_field(line, "last_event_ts")
+
+        if state == "fired_executed" {
+            new_lines = new_lines + [line]
+            li = li + 1
+            continue
+        }
+        let threshold_h = parse_elapsed_hours(fires_when)
+        if threshold_h <= 0 {
+            new_lines = new_lines + [line]
+            li = li + 1
+            continue
+        }
+        let last_ep = iso_to_epoch(last_event_ts)
+        if last_ep <= 0 {
+            new_lines = new_lines + [line]
+            li = li + 1
+            continue
+        }
+        let elapsed_h = (now_epoch - last_ep) / 3600
+        if elapsed_h >= threshold_h {
+            // fire
+            let evt = "{\"ts\":\"" + now_iso + "\",\"kind\":\"dormancy_wake_fire\",\"trigger_id\":\"" + trigger_id + "\",\"elapsed_hours\":" + to_string(elapsed_h) + ",\"threshold_hours\":" + to_string(threshold_h) + "}"
+            // append to growth_bus.jsonl (atomic-append via shell >>)
+            try { exec("printf '%s\\n' " + _shq(evt) + " >> " + _shq(GROWTH_BUS)) } catch e {}  // @allow-bare-exec
+            _emit(evt)
+            // rewrite row state
+            let rewritten = rewrite_row(line, now_iso)
+            new_lines = new_lines + [rewritten]
+            fired_count = fired_count + 1
+            changed = true
+        } else {
+            new_lines = new_lines + [line]
+        }
+        li = li + 1
+    }
+
+    if changed {
+        // atomic write-back: tmp + rename
+        let mut buf = ""
+        let mut oi = 0
+        while oi < new_lines.len() {
+            buf = buf + new_lines[oi]
+            if oi < new_lines.len() - 1 { buf = buf + "\n" }
+            oi = oi + 1
+        }
+        try { write_file(WATCHLIST_TMP, buf) } catch e {
+            _emit("{\"ts\":\"" + now_iso + "\",\"kind\":\"dormancy_wake_error\",\"stage\":\"write_tmp\"}")
+            return 1
+        }
+        try { exec("mv " + _shq(WATCHLIST_TMP) + " " + _shq(WATCHLIST)) } catch e {  // @allow-bare-exec
+            _emit("{\"ts\":\"" + now_iso + "\",\"kind\":\"dormancy_wake_error\",\"stage\":\"rename\"}")
+            return 1
+        }
+    }
+    _emit("{\"ts\":\"" + now_iso + "\",\"kind\":\"dormancy_wake_tick\",\"fired\":" + to_string(fired_count) + ",\"rows\":" + to_string(lines.len()) + "}")
+    return 0
+}
+
+fn main() {
+    let lock_rc = acquire_lock()
+    if lock_rc != 0 { return }
+    let _rc = run_tick()
+    release_lock()
+}
+
+main()

@@ -1,0 +1,470 @@
+// proposal_archive.hexa — terminal-proposal archive migrator.
+// paradigm §1 proposal lifecycle: pending → refinement → debate → approved
+//                               → [implement] → archived (this tool).
+//
+// 역할:
+//   1. state/proposals/inventory.json 읽기
+//   2. entries[] 를 terminal (status ∈ {done, implemented, rejected}) vs open 분할
+//   3. terminal entry 마다:
+//        - year = done_ts || submitted_ts || now_utc() 의 YYYY 추출
+//        - pending/<id>_*.json (richer payload) 있으면 그 내용으로 archive
+//          없으면 inventory 행 자체를 JSON 으로 직렬화
+//        - state/proposals/archived/<YYYY>/<id>.json 에 atomic write (tmp→rename)
+//   4. inventory.json 을 open-only entries[] 로 재작성 (_meta + schema + proposals 보존)
+//   5. top-level updated_ts 갱신
+//
+// INVARIANT (paradigm §6):
+//   - state/proposals/ 외 mutate 금지
+//   - atomic write: <path>.tmp → rename
+//   - --dry-run 기본. --apply 일 때만 실제 mutate.
+//
+// Modes:
+//   --dry-run (default)   — 예상 동작 출력, mutate 없음
+//   --apply               — 실제 archive + inventory rewrite
+//   --entry <id>          — 단일 entry 로 제한 (테스트용)
+//   _smoke                — --dry-run 돌리고 terminal 이 있으면 N>0 assert
+//
+// lang_gap (2026-04-24):
+//   hexa 에 JSON object-level parse primitive 없음 → text line-scan 으로 entry block
+//   추출 + 필드 추출. proposal_sync_hub.hexa 과 동일 패턴. file per
+//   /Users/ghost/core/hexa-lang/bin/proposal_inbox submit --to hexa-lang
+//   --category lang_gap --kind cluster --title 'json object/entry-block parse helpers'
+//
+// Usage:
+//   hexa run tool/proposal_archive.hexa                       # --dry-run (default)
+//   hexa run tool/proposal_archive.hexa --apply               # 실제 mutate
+//   hexa run tool/proposal_archive.hexa --entry nxs-20260422-001
+//   hexa run tool/proposal_archive.hexa _smoke                # 자체 smoke test
+//
+// @allow-bare-exec
+
+let TOOL_VERSION = "0.1.0"
+let HOME = env("HOME")
+let mut NEXUS_ROOT = env("NEXUS")
+if NEXUS_ROOT.len() == 0 { NEXUS_ROOT = HOME + "/core/nexus" }
+
+let INVENTORY = NEXUS_ROOT + "/state/proposals/inventory.json"
+let PENDING_DIR = NEXUS_ROOT + "/state/proposals/pending"
+let ARCHIVE_DIR = NEXUS_ROOT + "/state/proposals/archived"
+
+let TERMINAL_STATUSES = ["done", "implemented", "rejected"]
+
+// ── shell helpers (proposal_sync_hub pattern) ───────────────────────────────
+fn sh_q(s: str) -> str {
+    let mut out = "'"
+    let n = s.len()
+    let mut i = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "'" { out = out + "'\\''" } else { out = out + c }
+        i = i + 1
+    }
+    return out + "'"
+}
+
+fn now_utc() -> str {
+    return to_string(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()  // @allow-bare-exec
+}
+
+fn current_year() -> str {
+    return to_string(exec("date -u +%Y")).trim()  // @allow-bare-exec
+}
+
+// hexa str_idx polyfill (proposal_sync_hub 주석 참조)
+fn str_idx(s: str, needle: str) -> i64 {
+    let n = s.len()
+    let m = needle.len()
+    if m == 0 { return 0 }
+    if m > n { return -1 }
+    let mut i = 0
+    while i + m <= n {
+        if s.substring(i, i + m) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// rfind — last occurrence (lang_gap 내부 polyfill)
+fn rfind(s: str, needle: str) -> i64 {
+    let mut last: i64 = -1
+    let mut i = 0
+    let n = s.len()
+    let m = needle.len()
+    if m == 0 { return -1 }
+    while i + m <= n {
+        if s.substring(i, i + m) == needle { last = i }
+        i = i + 1
+    }
+    return last
+}
+
+fn arr_contains(arr: [str], needle: str) -> bool {
+    let mut i = 0
+    while i < arr.len() {
+        if arr[i] == needle { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ── entry-block parser ──────────────────────────────────────────────────────
+// inventory.json entries[] 는 indent 4-space 블록 `    {` .. `    }` 또는 `    },`.
+// 내부 nested object 없음 (확인: 2026-04-24 schema). line-based scan OK.
+// 반환: 각 entry 의 raw JSON text (trailing comma 제거).
+fn parse_entry_blocks(raw: str) -> [str] {
+    let mut blocks: [str] = []
+    let lines = raw.split("\n")
+    let n = lines.len()
+    let start_marker = str_idx(raw, "\"entries\":")
+    if start_marker < 0 { return blocks }
+
+    let mut in_entries = false
+    let mut in_block = false
+    let mut buf_parts: [str] = []
+    let mut i = 0
+    while i < n {
+        let line = lines[i]
+        let trimmed = line.trim()
+
+        if !in_entries {
+            if str_idx(line, "\"entries\":") >= 0 && str_idx(line, "[") >= 0 {
+                in_entries = true
+            }
+            i = i + 1
+            continue
+        }
+
+        // entries[] 끝 — 4-space indent `  ]`
+        if !in_block && (trimmed == "]" || trimmed == "],") {
+            break
+        }
+
+        if !in_block {
+            // entry 시작: `    {`
+            if trimmed == "{" {
+                in_block = true
+                buf_parts = []
+                buf_parts.push("{")
+            }
+            i = i + 1
+            continue
+        }
+
+        // in_block — entry 끝 `    }` or `    },`
+        if trimmed == "}" || trimmed == "}," {
+            buf_parts.push("}")
+            blocks.push(buf_parts.join("\n"))
+            in_block = false
+            buf_parts = []
+            i = i + 1
+            continue
+        }
+
+        buf_parts.push(line)
+        i = i + 1
+    }
+    return blocks
+}
+
+// extract_string_field(block, "id") → "" if missing.
+// block 은 entry raw JSON (multi-line). `"field": "value"` scan.
+fn extract_string_field(block: str, field: str) -> str {
+    let key = "\"" + field + "\":"
+    let idx = str_idx(block, key)
+    if idx < 0 { return "" }
+    let rest = block.substring(idx + key.len(), block.len())
+    let qstart = str_idx(rest, "\"")
+    if qstart < 0 { return "" }
+    let afterq = rest.substring(qstart + 1, rest.len())
+    // skip escaped quotes: simple scan (inventory 값에는 \" 가 있을 수 있음)
+    let mut j = 0
+    let m = afterq.len()
+    while j < m {
+        let ch = afterq.substring(j, j + 1)
+        if ch == "\\" {
+            j = j + 2
+            continue
+        }
+        if ch == "\"" { return afterq.substring(0, j) }
+        j = j + 1
+    }
+    return ""
+}
+
+// year_from_ts("2026-04-23T02:21:46Z") → "2026". ISO prefix 가정.
+fn year_from_ts(ts: str) -> str {
+    if ts.len() < 4 { return "" }
+    return ts.substring(0, 4)
+}
+
+// pending file path lookup: state/proposals/pending/<id>_*.json
+// shell glob (ls 1-line) — 없으면 "" 반환.
+fn find_pending_payload(id: str) -> str {
+    let cmd = "ls -1 " + sh_q(PENDING_DIR) + "/" + id + "_*.json 2>/dev/null | head -n 1"
+    let p = to_string(exec(cmd)).trim()  // @allow-bare-exec
+    if p.len() == 0 { return "" }
+    let mut raw = ""
+    try { raw = read_file(p) } catch e { raw = "" }
+    return raw
+}
+
+fn ensure_dir(path: str) -> void {
+    // mkdir -p path (atomic, idempotent)
+    exec("mkdir -p " + sh_q(path))  // @allow-bare-exec
+}
+
+// atomic_write_file(path, content) → tmp write + rename.
+fn atomic_write_file(path: str, content: str) -> void {
+    let tmp = path + ".tmp"
+    write_file(tmp, content)
+    exec("mv " + sh_q(tmp) + " " + sh_q(path))  // @allow-bare-exec
+}
+
+// ── inventory rewrite ──────────────────────────────────────────────────────
+// 원본 raw 에서 entries[] 영역만 open_blocks 로 치환, updated_ts 는 now_utc 로 갱신,
+// _meta + schema + proposals 는 그대로 보존.
+fn rewrite_inventory(raw: str, open_blocks: [str], new_ts: str) -> str {
+    // 1. find top-level updated_ts and replace value
+    let mut out = raw
+    let ts_key = "\"updated_ts\":"
+    let ts_idx = str_idx(out, ts_key)
+    if ts_idx >= 0 {
+        let rest = out.substring(ts_idx + ts_key.len(), out.len())
+        let q1 = str_idx(rest, "\"")
+        if q1 >= 0 {
+            let afterq = rest.substring(q1 + 1, rest.len())
+            let q2 = str_idx(afterq, "\"")
+            if q2 > 0 {
+                let before = out.substring(0, ts_idx + ts_key.len() + q1 + 1)
+                let after = afterq.substring(q2, afterq.len())
+                out = before + new_ts + after
+            }
+        }
+    }
+
+    // 2. find entries[] span and replace
+    let en_key = "\"entries\":"
+    let en_idx = str_idx(out, en_key)
+    if en_idx < 0 { return out }
+    let lbr_rel = str_idx(out.substring(en_idx, out.len()), "[")
+    if lbr_rel < 0 { return out }
+    let lbr = en_idx + lbr_rel
+
+    // bracket matching: nested objects OK, count [ ] ignoring strings.
+    let mut depth = 0
+    let mut j = lbr
+    let n = out.len()
+    let mut in_str = false
+    let mut esc = false
+    let mut rbr: i64 = -1
+    while j < n {
+        let ch = out.substring(j, j + 1)
+        if in_str {
+            if esc { esc = false }
+            else if ch == "\\" { esc = true }
+            else if ch == "\"" { in_str = false }
+        } else {
+            if ch == "\"" { in_str = true }
+            else if ch == "[" { depth = depth + 1 }
+            else if ch == "]" {
+                depth = depth - 1
+                if depth == 0 { rbr = j; break }
+            }
+        }
+        j = j + 1
+    }
+    if rbr < 0 { return out }
+
+    // build replacement entries[] body.
+    // output indent matches original (4-space per entry brace, 6-space per field).
+    let mut body_parts: [str] = []
+    body_parts.push("[")
+    let mut k = 0
+    while k < open_blocks.len() {
+        body_parts.push("\n    ")
+        body_parts.push(open_blocks[k])
+        if k < open_blocks.len() - 1 { body_parts.push(",") }
+        k = k + 1
+    }
+    if open_blocks.len() > 0 { body_parts.push("\n  ") }
+    body_parts.push("]")
+    let new_entries = body_parts.join("")
+
+    let before2 = out.substring(0, lbr)
+    let after2 = out.substring(rbr + 1, out.len())
+    return before2 + new_entries + after2
+}
+
+// ── main migration logic ───────────────────────────────────────────────────
+fn do_migrate(mode: str, entry_filter: str) -> i64 {
+    let mut raw = ""
+    try { raw = read_file(INVENTORY) } catch e { raw = "" }
+    if raw.len() == 0 {
+        println("FATAL: inventory.json not readable at " + INVENTORY)
+        return 1
+    }
+
+    let blocks = parse_entry_blocks(raw)
+    println("proposal_archive v" + TOOL_VERSION + " mode=" + mode +
+            (if entry_filter.len() > 0 { " filter=" + entry_filter } else { "" }))
+    println("  inventory: " + INVENTORY)
+    println("  entries parsed: " + to_string(blocks.len()))
+
+    let mut terminal_ids: [str] = []
+    let mut terminal_years: [str] = []
+    let mut terminal_statuses: [str] = []
+    let mut terminal_blocks: [str] = []
+    let mut open_blocks: [str] = []
+
+    let fallback_year = current_year()
+
+    let mut i = 0
+    while i < blocks.len() {
+        let b = blocks[i]
+        let id = extract_string_field(b, "id")
+        let status = extract_string_field(b, "user_status")
+
+        let is_terminal = arr_contains(TERMINAL_STATUSES, status)
+        let pass_filter = if entry_filter.len() > 0 { id == entry_filter } else { true }
+
+        if is_terminal && pass_filter {
+            let done_ts = extract_string_field(b, "done_ts")
+            let sub_ts = extract_string_field(b, "submitted_ts")
+            let mut yr = year_from_ts(done_ts)
+            if yr.len() == 0 { yr = year_from_ts(sub_ts) }
+            if yr.len() == 0 { yr = fallback_year }
+
+            terminal_ids.push(id)
+            terminal_years.push(yr)
+            terminal_statuses.push(status)
+            terminal_blocks.push(b)
+        } else {
+            // open, OR terminal but filtered out — keep in inventory
+            open_blocks.push(b)
+        }
+        i = i + 1
+    }
+
+    println("  terminal: " + to_string(terminal_ids.len()) +
+            "  open-after: " + to_string(open_blocks.len()))
+
+    // print listing
+    let mut p = 0
+    while p < terminal_ids.len() {
+        println("    - " + terminal_ids[p] +
+                "  from_status=" + terminal_statuses[p] +
+                "  target=archived/" + terminal_years[p] + "/" + terminal_ids[p] + ".json")
+        p = p + 1
+    }
+
+    if mode == "dry" {
+        println("(dry-run) would move " + to_string(terminal_ids.len()) +
+                " terminal entries to archived/, rewrite inventory.json. NO CHANGES.")
+        return 0
+    }
+
+    // apply: write per-entry files + rewrite inventory
+    let new_ts = now_utc()
+    ensure_dir(ARCHIVE_DIR)
+
+    let mut written = 0
+    let mut q = 0
+    while q < terminal_ids.len() {
+        let id = terminal_ids[q]
+        let yr = terminal_years[q]
+        let block = terminal_blocks[q]
+        let ydir = ARCHIVE_DIR + "/" + yr
+        ensure_dir(ydir)
+
+        // prefer richer pending payload; fallback to inventory block
+        let payload_rich = find_pending_payload(id)
+        let payload = if payload_rich.len() > 0 { payload_rich } else { block }
+
+        let outpath = ydir + "/" + id + ".json"
+        atomic_write_file(outpath, payload)
+        written = written + 1
+
+        println("  wrote " + outpath +
+                (if payload_rich.len() > 0 { " (from pending/)" } else { " (from inventory row)" }))
+
+        q = q + 1
+    }
+
+    // rewrite inventory with open-only entries
+    let new_inv = rewrite_inventory(raw, open_blocks, new_ts)
+    atomic_write_file(INVENTORY, new_inv)
+    println("  rewrote inventory.json: " + to_string(open_blocks.len()) +
+            " entries remain, updated_ts=" + new_ts)
+    println("apply done. wrote=" + to_string(written))
+    return 0
+}
+
+// ── _smoke test ────────────────────────────────────────────────────────────
+// dry-run 돌리고 terminal>0 assert (현재 inventory 에는 terminal 이 존재해야 함)
+fn run_smoke() -> i64 {
+    println("[_smoke] running --dry-run ...")
+    let mut raw = ""
+    try { raw = read_file(INVENTORY) } catch e { raw = "" }
+    if raw.len() == 0 {
+        println("[_smoke] FAIL: inventory not readable")
+        return 1
+    }
+    let blocks = parse_entry_blocks(raw)
+    let mut terminal_count = 0
+    let mut i = 0
+    while i < blocks.len() {
+        let status = extract_string_field(blocks[i], "user_status")
+        if arr_contains(TERMINAL_STATUSES, status) { terminal_count = terminal_count + 1 }
+        i = i + 1
+    }
+    println("[_smoke] parsed=" + to_string(blocks.len()) +
+            " terminal=" + to_string(terminal_count))
+    if blocks.len() > 0 && terminal_count <= 0 {
+        println("[_smoke] FAIL: expected terminal>0 (inventory has " +
+                to_string(blocks.len()) + " entries)")
+        return 2
+    }
+    // exercise the full dry-run path
+    let rc = do_migrate("dry", "")
+    if rc != 0 {
+        println("[_smoke] FAIL: dry-run rc=" + to_string(rc))
+        return 3
+    }
+    println("[_smoke] OK — terminal=" + to_string(terminal_count) + " (>0), dry-run rc=0")
+    return 0
+}
+
+fn main() -> i64 {
+    let mut mode = "dry"
+    let mut entry_filter = ""
+    let mut smoke = false
+
+    try {
+        let argn = args.len()
+        let mut i = 1
+        while i < argn {
+            let a = args[i]
+            if a == "--apply" { mode = "apply" }
+            else if a == "--dry-run" { mode = "dry" }
+            else if a == "_smoke" { smoke = true }
+            else if a == "--entry" {
+                if i + 1 < argn { entry_filter = args[i + 1]; i = i + 1 }
+            }
+            else if a == "--help" || a == "-h" {
+                println("usage: hexa run tool/proposal_archive.hexa [--dry-run|--apply] [--entry <id>]")
+                println("       hexa run tool/proposal_archive.hexa _smoke")
+                println("  --dry-run (default): preview only, no changes")
+                println("  --apply            : write files + rewrite inventory")
+                println("  --entry <id>       : restrict to one id (testing)")
+                println("  _smoke             : run dry-run + assert terminal>0")
+                return 0
+            }
+            i = i + 1
+        }
+    } catch e {}
+
+    if smoke { return run_smoke() }
+    return do_migrate(mode, entry_filter)
+}
+
+exit(main())

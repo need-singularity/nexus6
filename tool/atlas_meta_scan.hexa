@@ -1,0 +1,190 @@
+// atlas_meta_scan.hexa — R18 Phase-1 MVP (nxs-20260422-002 atlas-blowup meta automation)
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+//
+// Purpose: periodic meta-health sampler. Reads state/atlas.n6.shard_meta.json
+//          and state/atlas.n6.stats.json, computes lightweight drift signals,
+//          and appends ONE row to state/atlas_health_timeline.jsonl every run.
+//          Runs via LaunchAgent (com.nexus.atlas-meta-scan.plist, 12h cadence).
+//
+// Phase-1 contract: timeline row schema is minimal + never-empty.
+//   normal : {"ts", "shard_count", "hub_top3", "scan_age_hours", "source":"atlas_meta_scan"}
+//   partial: {"ts", "state":"partial", "reason":"missing_<x>", "source":"atlas_meta_scan"}
+//
+// Unlocks: A1/A2 β-coverage (11→13 of 54).
+//
+// Flags:
+//   --dry-run   — print the row to stdout, do not append
+//
+// Exit: always 0 (partial-state is still a valid sample).
+
+let HOME = env("HOME")
+let NEXUS_ROOT = HOME + "/core/nexus"
+let SHARD_META = NEXUS_ROOT + "/state/atlas.n6.shard_meta.json"
+let STATS      = NEXUS_ROOT + "/state/atlas.n6.stats.json"
+let TIMELINE   = NEXUS_ROOT + "/state/atlas_health_timeline.jsonl"
+let SOURCE     = "atlas_meta_scan"
+
+// ─── void-safe string coercion (hexa idiom, matches agent_ledger.hexa) ───
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _to_int0(s: string) -> i64 {
+    if s == "" { return 0 }
+    let first = _str(s.split("\n")[0]).trim()
+    if first == "" { return 0 }
+    return to_int(first)
+}
+
+fn now_unix() -> i64 {
+    return _to_int0(_str(exec("date +%s")).trim())  // @allow-bare-exec
+}
+
+fn now_iso() -> string {
+    // UTC ISO-8601 (matches other timeline writers in tool/)
+    return _str(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()  // @allow-bare-exec
+}
+
+fn json_escape(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", " ")
+    r = r.replace("\r", " ")
+    r = r.replace("\t", " ")
+    return r
+}
+
+// ─── primitive extractors — no native JSON, so shell-out to python3 / grep ───
+// Returns "" on any failure. Caller decides whether "" is partial.
+fn extract_number(path: string, key: string) -> string {
+    if file_exists(path) == false { return "" }
+    // python3 is present on all macOS + our ubu stage1; avoids a jq dep.
+    let esc_path = path.replace("'", "")
+    let esc_key  = key.replace("'", "")
+    let script = "import json,sys\n" +
+                 "try:\n" +
+                 "  d=json.load(open('" + esc_path + "'))\n" +
+                 "  v=d.get('" + esc_key + "')\n" +
+                 "  print('' if v is None else v)\n" +
+                 "except Exception: print('')\n"
+    let cmd = "/usr/bin/env python3 -c \"" + script.replace("\"", "\\\"") + "\" 2>/dev/null"
+    return _str(exec(cmd)).trim()  // @allow-bare-exec
+}
+
+fn extract_hub_top3(path: string) -> string {
+    if file_exists(path) == false { return "" }
+    let esc_path = path.replace("'", "")
+    // hub_centrality is commonly either {node: score, ...} or a list of [node, score].
+    // We yield a stable "a:0.12|b:0.10|c:0.08"-style string; empty if unavailable.
+    let script = "import json\n" +
+                 "try:\n" +
+                 "  d=json.load(open('" + esc_path + "'))\n" +
+                 "  hc=d.get('hub_centrality') or d.get('hub_top') or {}\n" +
+                 "  if isinstance(hc,dict):\n" +
+                 "    items=sorted(hc.items(), key=lambda kv:-float(kv[1]))[:3]\n" +
+                 "  elif isinstance(hc,list):\n" +
+                 "    norm=[(x[0],float(x[1])) for x in hc if len(x)>=2]\n" +
+                 "    items=sorted(norm, key=lambda kv:-kv[1])[:3]\n" +
+                 "  else: items=[]\n" +
+                 "  print('|'.join(f'{k}:{v:.3f}' for k,v in items))\n" +
+                 "except Exception: print('')\n"
+    let cmd = "/usr/bin/env python3 -c \"" + script.replace("\"", "\\\"") + "\" 2>/dev/null"
+    return _str(exec(cmd)).trim()  // @allow-bare-exec
+}
+
+// ─── row builders ───
+fn build_partial_row(ts: string, reason: string) -> string {
+    return "{\"ts\":\"" + ts + "\"," +
+           "\"state\":\"partial\"," +
+           "\"reason\":\"" + json_escape(reason) + "\"," +
+           "\"source\":\"" + SOURCE + "\"}"
+}
+
+fn build_normal_row(ts: string, shard_count: string, hub_top3: string, scan_age_hours: string) -> string {
+    let sc  = if shard_count == "" { "null" } else { shard_count }
+    let sah = if scan_age_hours == "" { "null" } else { scan_age_hours }
+    return "{\"ts\":\"" + ts + "\"," +
+           "\"shard_count\":" + sc + "," +
+           "\"hub_top3\":\"" + json_escape(hub_top3) + "\"," +
+           "\"scan_age_hours\":" + sah + "," +
+           "\"source\":\"" + SOURCE + "\"}"
+}
+
+fn compute_scan_age_hours(last_scan_ts: string) -> string {
+    if last_scan_ts == "" { return "" }
+    // last_scan_ts may be unix seconds ("1745000000") or ISO-8601. Handle both.
+    let now = now_unix()
+    // try unix-seconds first
+    let as_int = _to_int0(last_scan_ts)
+    if as_int > 0 {
+        let delta = now - as_int
+        if delta < 0 { return "0" }
+        // integer hours (round-down). keep it cheap — timeline can re-derive precision later.
+        let hrs = delta / 3600
+        return to_string(hrs)
+    }
+    // ISO fallback via python3
+    let esc = last_scan_ts.replace("'", "")
+    let script = "import datetime,sys\n" +
+                 "try:\n" +
+                 "  t=datetime.datetime.fromisoformat('" + esc + "'.replace('Z','+00:00'))\n" +
+                 "  now=datetime.datetime.now(datetime.timezone.utc)\n" +
+                 "  print(int((now-t).total_seconds()//3600))\n" +
+                 "except Exception: print('')\n"
+    let cmd = "/usr/bin/env python3 -c \"" + script.replace("\"", "\\\"") + "\" 2>/dev/null"
+    return _str(exec(cmd)).trim()  // @allow-bare-exec
+}
+
+fn emit_row(row: string, dry: bool) {
+    if dry {
+        println(row)
+        return
+    }
+    try { append_file(TIMELINE, row + "\n") } catch e {
+        // Never exit nonzero — Phase-1 contract. Surface on stderr for launchd logs.
+        eprintln("[atlas_meta_scan] append_file failed: " + TIMELINE)
+        println(row)  // fallback: at least print so the row isn't lost
+    }
+}
+
+fn main() {
+    // flag parse — only --dry-run recognised in Phase-1
+    let argv = args()
+    let mut dry = false
+    let mut i = 1
+    while i < argv.len() {
+        if argv[i] == "--dry-run" { dry = true }
+        i = i + 1
+    }
+
+    let ts = now_iso()
+
+    // Gate 1: shard_meta must exist — it is the minimum viable sample.
+    if file_exists(SHARD_META) == false {
+        emit_row(build_partial_row(ts, "missing_shard_meta"), dry)
+        exit(0)
+    }
+
+    let shard_count = extract_number(SHARD_META, "shard_count")
+    let last_scan_ts = extract_number(SHARD_META, "last_scan_ts")
+    let scan_age_hours = compute_scan_age_hours(last_scan_ts)
+
+    // Gate 2: stats optional — partial-but-useful if stats missing.
+    if file_exists(STATS) == false {
+        // Still emit a normal-shaped row with empty hub_top3 and a note.
+        // (We prefer a real sample over a partial, so stats-missing is soft.)
+        emit_row(build_normal_row(ts, shard_count, "", scan_age_hours), dry)
+        exit(0)
+    }
+
+    let hub_top3 = extract_hub_top3(STATS)
+    emit_row(build_normal_row(ts, shard_count, hub_top3, scan_age_hours), dry)
+    exit(0)
+}
+
+main()
