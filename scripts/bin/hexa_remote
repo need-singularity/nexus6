@@ -85,27 +85,37 @@ _probe_host() {
     local min_ram="${HEXA_REMOTE_MIN_RAM_MB:-24576}"
     attempt=0
     while [ $attempt -lt $total ]; do
-        # Combined SSH + RAM probe in a single round-trip: `echo OK` on host
-        # gates sshd responsiveness, `awk /^Mem:/` extracts available MB.
-        # Output format: "OK <avail_mb>" on success, anything else = SSH/probe fail.
+        # Combined SSH + RAM + PSI probe in a single round-trip: `echo OK` on host
+        # gates sshd responsiveness, `awk /^Mem:/` extracts available MB, and
+        # /proc/pressure/memory's "some avg10" is appended on a second line.
+        # Output format:
+        #   line 1: "OK <avail_mb>"
+        #   line 2: "<psi_some_avg10>"  (e.g. "0.00", "12.34"; "0.00" if file absent — macOS)
         # 2026-04-25: LC_ALL=C forced — Korean-locale hosts print "메모리:" instead
         # of "Mem:", breaking the /^Mem:/ match and silently dropping RAM parsing
         # (→ avail=?MB → host wrongly skipped). Observed on ubu1 after 2026-04-24
         # recovery; prior sessions only worked because hetzner defaulted to C locale.
+        # L4 (2026-04-25): PSI feedback. /proc/pressure/memory 의 some avg10 (10s
+        # 윈도 동안 task 메모리 stall % ratio) 을 같은 ssh round-trip 으로 수집 →
+        # 외부 admission block 에서 호스트 활성 메모리 압박 기반 reject 판단.
         err="$(ssh -o ConnectTimeout=$ctimeout -o BatchMode=yes -o ServerAliveInterval=5 \
             -o ServerAliveCountMax=1 \
             -o ControlMaster=no -o ControlPath=none "$cand" \
-            'echo OK $(LC_ALL=C free -m 2>/dev/null | awk "/^Mem:/ {print \$7}" | tr -d "[:space:]")' 2>&1)"
+            'echo OK $(LC_ALL=C free -m 2>/dev/null | awk "/^Mem:/ {print \$7}" | tr -d "[:space:]"); awk "/^some/ {gsub(/avg10=/,\"\"); print \$2; exit}" /proc/pressure/memory 2>/dev/null || echo "0.00"' 2>&1)"
         rc=$?
         if [ $rc -eq 0 ]; then
             # Parse "OK <avail>" — avail field 2 onwards (robust to extra whitespace).
-            local avail
+            local avail psi
             avail="$(printf '%s' "$err" | awk '/^OK/ {print $2}' | head -n1)"
+            # PSI: 첫 OK 줄을 제외한 다음 줄. 빈 값이면 미지원 (macOS 등) → "" 로 둠.
+            psi="$(printf '%s' "$err" | awk 'NR>1 && $0!="" {print; exit}')"
             # Accept if RAM check disabled OR avail >= threshold.
             if [ "$min_ram" = "0" ] || { [ -n "$avail" ] && [ "$avail" -ge "$min_ram" ] 2>/dev/null; }; then
                 # Wave 12 (2026-04-25): export avail MB to caller for load-aware
                 # selection (probe-all + argmax). 비어있으면 0 으로 기록.
                 HEXA_REMOTE_LAST_AVAIL="${avail:-0}"
+                # L4: export PSI some avg10 (string, e.g. "12.34"). 미지원 호스트 = "".
+                HEXA_REMOTE_LAST_PSI="${psi:-}"
                 return 0
             fi
             echo "hexa_remote: host=$cand SSH OK but RAM avail=${avail:-?}MB < ${min_ram}MB threshold (raw#36 bracket) — skipping" >&2
@@ -376,8 +386,11 @@ HOST=""
 _LB_MODE="${HEXA_REMOTE_LB:-avail}"
 if [ "$_LB_MODE" = "first" ]; then
     for cand in $FALLBACK_CHAIN; do
+        HEXA_REMOTE_LAST_PSI=""
         if _probe_host "$cand"; then
             HOST="$cand"
+            # L4: capture picked host PSI for admission guard.
+            _picked_psi="${HEXA_REMOTE_LAST_PSI:-}"
             [ "$PREFERRED" != "$cand" ] && echo "hexa_remote: $PREFERRED unreachable, using $cand" >&2
             break
         fi
@@ -385,24 +398,31 @@ if [ "$_LB_MODE" = "first" ]; then
 else
     # probe-all + argmax(avail). 실패 호스트는 Wave 11 blacklist 가 기록
     # (다음 invocation 에서 자동 skip), 여기선 in-memory 누적만 수행.
+    # L4 (2026-04-25): probe 가 동시에 수집한 PSI some avg10 도 picked host 의
+    # `_picked_psi` 로 보존 → 아래 L4 admission 가드가 사용.
     _best_host=""
     _best_avail=-1
+    _best_psi=""
     _healthy_hosts=""
     for cand in $FALLBACK_CHAIN; do
         HEXA_REMOTE_LAST_AVAIL=""
+        HEXA_REMOTE_LAST_PSI=""
         if _probe_host "$cand"; then
             _cand_avail="${HEXA_REMOTE_LAST_AVAIL:-0}"
-            _healthy_hosts="$_healthy_hosts $cand(avail=${_cand_avail}MB)"
+            _cand_psi="${HEXA_REMOTE_LAST_PSI:-}"
+            _healthy_hosts="$_healthy_hosts $cand(avail=${_cand_avail}MB,psi=${_cand_psi:-NA})"
             # Strict `>` — tie 는 chain 순서 먼저 온 쪽 유지 (PREFERRED stability).
             if [ "$_cand_avail" -gt "$_best_avail" ] 2>/dev/null; then
                 _best_avail="$_cand_avail"
+                _best_psi="$_cand_psi"
                 _best_host="$cand"
             fi
         fi
     done
     if [ -n "$_best_host" ]; then
         HOST="$_best_host"
-        echo "hexa_remote: LB=avail pick=$HOST (avail=${_best_avail}MB) among:${_healthy_hosts}" >&2
+        _picked_psi="$_best_psi"
+        echo "hexa_remote: LB=avail pick=$HOST (avail=${_best_avail}MB psi=${_picked_psi:-NA}) among:${_healthy_hosts}" >&2
         [ "$PREFERRED" != "$HOST" ] && echo "hexa_remote: $PREFERRED not chosen (load-aware), using $HOST" >&2
     fi
 fi
@@ -489,8 +509,58 @@ if [ "$_IS_HEAVY_COMPUTE" = "1" ] \
             "$HOST" "$_best_avail" "$_admit_min_mb" "$_job_class" >&2
         exit 64
     fi
-    # Success path — class/min 한 줄 진단 (caller observability).
-    echo "hexa_remote: L3 class=$_job_class min_avail=${_admit_min_mb}MB host=$HOST" >&2
+    # ──────────────────────────────────────────────────────────────────────
+    # Wave 25 / L4 (2026-04-25): cgroup PSI feedback admission throttle.
+    # L1-L3 는 dispatch-time *static* admission (작업 시작 전 RAM avail snapshot).
+    # L4 는 *post-dispatch live* signal — `/proc/pressure/memory` 의 `some avg10`
+    # (최근 10초간 어떤 task 라도 메모리 stall 한 시간 비율 %) 가 임계 초과면
+    # 이미 호스트가 메모리 압박 상태이므로 다음 admission 을 보수적으로 reject.
+    # avail RAM 만으로 알 수 없는 "free 처럼 보이지만 reclaim 중" 케이스 차단
+    # → cluster 활용도 RAM 70% → 82% 목표 (실효 throughput 기준).
+    #
+    # Class-aware threshold 매트릭스:
+    #   small  → some avg10 ≥ 70% reject (관대 — 짧은 작업, peak RSS 낮음)
+    #   medium → some avg10 ≥ 50% reject
+    #   large  → some avg10 ≥ 30% reject (보수적 — peak RSS 큼, 압박 가속 위험)
+    # 우선순위:
+    #   1) HEXA_REMOTE_PSI_REJECT_PCT  (global override, 모든 class 적용)
+    #   2) class default (70/50/30)
+    # macOS 호스트는 /proc/pressure/memory 부재 → probe 가 _picked_psi="" 로 둠
+    # → 이 가드 자동 skip (class-aware default 미적용). Mac heavy-compute 는 어차피
+    # 차단되어 있어 무영향.
+    # Bypass: HEXA_REMOTE_NO_PSI_GATE=1
+    if [ "${HEXA_REMOTE_NO_PSI_GATE:-0}" != "1" ] \
+       && [ -n "${_picked_psi:-}" ]; then
+        _psi_threshold="${HEXA_REMOTE_PSI_REJECT_PCT:-}"
+        if [ -z "$_psi_threshold" ]; then
+            case "$_job_class" in
+                small)  _psi_threshold="70" ;;
+                medium) _psi_threshold="50" ;;
+                large)  _psi_threshold="30" ;;
+                *)      _psi_threshold="50" ;;
+            esac
+        fi
+        # PSI 는 float (e.g. "12.34"). 정수부만 비교 — 임계 자체가 정수 단위라 충분.
+        # awk 의 `+0` 으로 숫자 변환 + 부동소수점 자릿수 제거.
+        _psi_int="$(printf '%s' "$_picked_psi" | awk -F. '{print $1+0}')"
+        if [ -n "$_psi_int" ] && [ "$_psi_int" -ge "$_psi_threshold" ] 2>/dev/null; then
+            echo "hexa_remote: L4 PSI reject — host=$HOST class=$_job_class psi_avg10=${_picked_psi}% ≥ ${_psi_threshold}%" >&2
+            # Slot 즉시 반납 (L3 reject path 와 동일 cleanup).
+            if [ -n "${_ACQUIRED:-}" ]; then
+                rm -rf "$_ACQUIRED" 2>/dev/null || true
+                _ACQUIRED=""
+            fi
+            # blacklist 등록 — 다음 invocation 도 같은 호스트 재시도 차단 (TTL 300s).
+            if [ "${HEXA_REMOTE_NO_BLACKLIST:-0}" != "1" ]; then
+                : > "/tmp/hexa_remote.blacklist.$HOST" 2>/dev/null || true
+            fi
+            printf 'NEXUS_REMOTE_ERROR {"host":"%s","psi_avg10":"%s","psi_threshold":%s,"job_class":"%s","reason":"l4_psi_pressure","exit_code":64}\n' \
+                "$HOST" "$_picked_psi" "$_psi_threshold" "$_job_class" >&2
+            exit 64
+        fi
+    fi
+    # Success path — class/min/psi 한 줄 진단 (caller observability).
+    echo "hexa_remote: L3+L4 class=$_job_class min_avail=${_admit_min_mb}MB psi=${_picked_psi:-NA}% host=$HOST" >&2
 fi
 
 # 2026-04-22: 구 default ($HOME/Dev/hexa-lang/hexa) 는 4월14 빌드 — `^` / `&` 비트연산자 파서 미지원.
