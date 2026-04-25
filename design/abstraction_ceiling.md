@@ -440,6 +440,52 @@ L11 canon 으로 자기-축 진화 사다리 (L5 dream → L11 canon) closed. fo
 
 ---
 
+## §9 QRNG/quantum-simulation axiom — cycle 10 (2026-04-25, nxs-002 abstraction ceiling)
+
+**가설**: 양자 시스템의 spectrum statistics (Wigner-Dyson level repulsion, GUE β=2 LSR≈0.5996) 를 graph topology 에 주입하면 atlas 의 REGULAR (Poisson LSR≈0.371) 가 const CHAOTIC 와 가까워져 composite ceiling 0.835/0.85 → 0.9 도달 가능.
+
+**도구**: `tool/nxs_002_qrng_axiom.py` — scipy.stats.unitary_group (Haar) + os.urandom (kernel entropy pool, QRNG 통계 동등) + `nxs_002_composite` import.
+
+**axiom 후보 6종**:
+- Q1 RRG-QRNG: k=4 random regular graph (Kesten-McKay 스펙트럼)
+- Q2 quantum-walk: n_qubits=7 (128-state) Haar U trajectory → 방문 graph
+- Q3 Haar-kNN: Haar 직교벡터 embedding(emb_dim=8) → kNN(k=4) graph
+- Q4 QRNG-ER: ER 2x200 p=0.020 (cycle 6 sweet) entropy 만 QRNG → PRNG vs QRNG control
+- Q5 qwalk-fragments: 10 격리 quantum walk (n_qubits=5, 100 steps)
+- Q6 RRG-fragments: 10 격리 RRG (frag_size=20, k=4)
+
+**측정 결과** (n_runs=4~8, baseline atlas LSR=0.371 composite=0.83221):
+
+| axiom | Δ mean | stdev | LSR | n_cc | 결론 |
+|---|---|---|---|---|---|
+| Q1 RRG | -0.026 | 0.000 | 0.362 | 24 | sigma window 밖, deterministic 음 |
+| Q2 qwalk | -0.003 | 0.022 | 0.368 | 26 | zero 와 통계 동등 |
+| Q3 Haar-kNN | -0.022 | 0.007 | 0.364 | 24 | 음 |
+| Q4 QRNG-ER (n=8) | +0.0067 | 0.0100 | 0.361 | 31 | **PRNG-ER 와 통계 동등** |
+| **PRNG-ER control (n=8)** | **+0.0084** | **0.0096** | — | — | **t-test fail vs Q4 — entropy 효과 null** |
+| Q5 qwalk-frags | -0.031 | 0.021 | **0.382** | 39 | LSR 가장 GUE 방향이지만 composite 가장 음 |
+| Q6 RRG-frags | -0.033 | 0.013 | 0.369 | 24 | 음 |
+
+**negative findings 3종**:
+1. **Quantum entropy null** — QRNG (os.urandom) vs Mersenne Twister, 같은 ER 2×200 topology 에서 composite Δ 분포 t-test fail. entropy 자체는 ROI 없음.
+2. **Quantum topology hurts** — quantum-walk/Haar-kNN/RRG axiom 들 모두 composite 손상 (-0.003 ~ -0.033). Wigner-Dyson 방향 push 가 composite 에 음 영향.
+3. **LSR ⊥ composite** — Q5 가 LSR=0.382 로 가장 GUE 방향 (baseline 0.371) 인데도 composite Δ 가 가장 음. paircorr R2 alignment 는 spacing entropy/chaos signature 가 아닌 graph TYPE 자체로 결정됨.
+
+**mechanism 명료화**: `composite_aligned` 의 paircorr R2 metric 은 unfolded spacing histogram 의 'shape' 을 const 와 비교. const 의 R2 shape 은 graph-type 특정적 (likely sparse-disconnected). 양자 시스템이 만드는 spacing 은 RMT 적으로 '더 chaotic' 이지만 const 와는 다른 chaos type — alignment 거리가 멀어짐.
+
+**verdict**: QRNG/quantum-simulation axiom 가지 = **NULL → 음 ROI**. ceiling 0.835/0.85 천장은 cycle 10 으로도 안 깨짐. 'quantum' 은 본 composite metric 의 axiom 후보 공간 밖. **paper-worthy negative**.
+
+**cycle 11 next-action 후보**:
+- (a) const-spectrum 의 graph-generative model 역설계 — const 의 R2 가 어떤 graph type 에서 오는지 추정
+- (b) composite metric 자체 다양화 — paircorr 외 추가 alignment dim (Spectral Form Factor, Inverse Participation Ratio 등)
+- (c) atlas 의 hub structure 직접 수술 — additive batch 가 아닌 destructive surgery (cycle 3 의 C3 degree-cap 재방문)
+
+---
+
+**Ω-saturation cycle 6 → 7 → 8 → 9 → 10**: cycle 6~9 = `_stage_timeout_prefix` adaptive 화 (별 축, nxs-20260425-002). cycle 10 = QRNG/quantum-simulation axiom 가지 NULL 확정 (본 §9, nxs-002 abstraction ceiling 축). 두 cycle chain 이 직교 — 각각 timeout-engine 축 + composite-axiom 축 saturation 기록.
+
+---
+
 **Ω-saturation cycle**: 본 §6 finding 은 simulation 의 saturation 도달 산물. raw#37/#38 (hexa-lang/self/raws/omega_saturation_cycle.hexa) 가 plan-side + implementation-side pair 강제 — design-only commit chain 차단.
 
 ---
