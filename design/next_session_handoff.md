@@ -227,6 +227,23 @@ zig cc -target x86_64-linux-musl -O2 -std=gnu11 -D_GNU_SOURCE \
   - baseline atlas_eig.hexa λ0=0.001 = giant component 의 Fiedler (zero eigenvalues 보고 X)
   - scipy idx=16 (Fiedler) = 0.00151 — baseline 의 1.5× (precision 또는 5 [10*] promotion 후 미세 변동)
 - **다음 단계**: scipy spectral 로 paircorr 재계산 → cross_x_laws_aligned composite 측정 → nxs-002 sensitivity 1차 데이터
+
+### 2026-04-25 composite 재측정 (drill 미발사, this session)
+- scipy K=100 σ=1e-3 → unfold → paircorr → cross_correlation_lag composite:
+  ```
+  best_lag=15, agreement=0.866 (verdict score 고정)
+  pearson=0.460, cosine=0.901, composite_after = 0.83221
+  ```
+- baseline atlas_eig.hexa 동일 식: composite_after = 0.78417 (push-only Lanczos precision 손실)
+- **기존 verdict file (sealed) = 0.83379** ≈ scipy 0.83221 (Δ=0.0016, 거의 일치)
+- **5 [10*] promotion 영향 사실상 0** — atlas.n6 metadata ≠ atlas.blowup.jsonl graph (이미 확인된 분리)
+
+**nxs-002 핵심 결론:** composite 0.9 도달 = atlas.blowup.jsonl 자체 변동 필요 (drill 새 발사로 새 nodes/edges 추가). atlas.n6 ladder marker 작업과 별개 path. drill slot free 후 진행.
+
+**보유 산출물 (scipy pipeline):**
+- 0.79s 으로 spectral → composite 일괄 측정
+- sensitivity probe: 어느 graph 변경이 composite 끌어올리는지 빠르게 검증 가능
+- baseline atlas_eig.hexa 가 stage1 hexa 비실용 (60s+ hung) — scipy 우회 필수 per session
 - nxs-002 resolution 4단 pipeline:
   1. atlas.blowup.jsonl **재생성** (소스 추적 필요 — atlas.n6 → blowup.jsonl 변환 도구 위치)
   2. `bisociation/spectra/atlas_eig.hexa` (CSR + Lanczos, ~/Dev/... default path 는 stale)
