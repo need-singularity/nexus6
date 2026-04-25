@@ -387,6 +387,42 @@ if [ "$_IS_HEAVY_COMPUTE" = "1" ] && [ "${HEXA_REMOTE_NO_CONCURRENCY:-0}" != "1"
     _gate_acquire_for_host "$HOST"
 fi
 
+# Wave 23 / L2 (2026-04-25): headroom-aware admission. L1 (per-host slot) 은
+# 호스트 *수* 만큼 활용도 (33→100%) 만 회복; 단일 호스트 내부 RAM 잔량은 무관심.
+# 결과: hetzner cap=80G 인데 free=53G → drill RSS class 가 cap 직전이면 OOM 위험,
+# 그렇다고 드릴 미세화 없이 reject 하면 ubu1/ubu2 (24GB free) 도 admission 통과
+# 못 해 cluster idle. L2 는 probe 가 측정한 avail RAM (`_best_avail`, MB) 이
+# `HEXA_REMOTE_MIN_AVAIL_MB` (default 4096 — stage0 RSS cap + small drill 여유)
+# 미만이면 slot 즉시 반납 + blacklist 등록 후 exit 64 fallback chain 트리거.
+# Per-host override: HEXA_REMOTE_MIN_AVAIL_MB_HETZNER / _UBU1 / _UBU2.
+# Bypass:           HEXA_REMOTE_NO_ADMISSION=1
+# Backward-compat:  _best_avail 미세팅 (LB=first 경로 / probe 미실행) 시 skip.
+if [ "$_IS_HEAVY_COMPUTE" = "1" ] \
+   && [ "${HEXA_REMOTE_NO_ADMISSION:-0}" != "1" ] \
+   && [ -n "${_best_avail:-}" ] \
+   && [ "${_best_avail:-0}" != "-1" ]; then
+    _admit_host_uc="$(printf '%s' "$HOST" | tr '[:lower:]' '[:upper:]')"
+    _admit_min_var="HEXA_REMOTE_MIN_AVAIL_MB_${_admit_host_uc}"
+    _admit_min_mb="$(eval "printf '%s' \"\${${_admit_min_var}:-\${HEXA_REMOTE_MIN_AVAIL_MB:-4096}}\"")"
+    if [ "${_best_avail:-0}" -lt "${_admit_min_mb}" ] 2>/dev/null; then
+        echo "hexa_remote: L2 admission reject — host=$HOST avail=${_best_avail}MB < min=${_admit_min_mb}MB" >&2
+        # Slot 즉시 반납 (lock leak 방지). _ACQUIRED 가 비어있어도 안전.
+        if [ -n "${_ACQUIRED:-}" ]; then
+            rm -rf "$_ACQUIRED" 2>/dev/null || true
+            _ACQUIRED=""
+        fi
+        # 다음 invocation 이 같은 호스트로 재실험 안 가게 blacklist 등록 (#D TTL 300s).
+        # blacklist 파일 경로는 _probe_host 와 동일 규칙 (host basename).
+        if [ "${HEXA_REMOTE_NO_BLACKLIST:-0}" != "1" ]; then
+            : > "/tmp/hexa_remote.blacklist.$HOST" 2>/dev/null || true
+        fi
+        # AI-native JSON emit — caller 가 fallback chain 진입.
+        printf 'NEXUS_REMOTE_ERROR {"host":"%s","avail_mb":%s,"min_mb":%s,"reason":"l2_admission_insufficient_ram","exit_code":64}\n' \
+            "$HOST" "$_best_avail" "$_admit_min_mb" >&2
+        exit 64
+    fi
+fi
+
 # 2026-04-22: 구 default ($HOME/Dev/hexa-lang/hexa) 는 4월14 빌드 — `^` / `&` 비트연산자 파서 미지원.
 #   ubu1 기준 $HOME/.hx/bin/hexa_real 은 4월19+ 빌드 — run.hexa line 1048 ($HOME/.hx/packages/nexus/cli/run.hexa FNV-hash) 파싱 성공.
 #   rebuild 전까지 default 교체.
