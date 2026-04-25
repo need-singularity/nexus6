@@ -79,25 +79,86 @@ cycle 2 의 첫 task 는 **H1/H2/H3 분기 falsification**.
 
 ---
 
-## §4 cycle 2~ 후보
+## §4 cycle 2 first finding — DISPATCH_ONLY (2026-04-25)
 
-### Cycle 2 — H1/H2/H3 falsification + sink 확장
-- (a) `cmd_omega` 의 호출 사이트 모두 grep — `cli/run.hexa:5832` 외 실제 사용처 카운트.
-- (b) cron plist (`tool/com.nexus.*.plist`) 에 omega 호출이 있는지, 있다면 stderr redirect 어디로.
-- (c) scan dirs 확장: `bisociation/`, `n6/atlas-side`, sub-repo logs (airgenome, hexa-lang, anima, …).
-- (d) result: H1/H2/H3 중 어느 것이 사실인지 확정 → cycle 3 의 design 분기 결정.
+### 변경
+- `tool/beyond_omega_ghost_trace.py` SCAN 확장: `EXTRA_GLOBS = ["/tmp/nexus_omega_*.log", "/tmp/nexus_omega_*.out.log", "/tmp/nexus_omega_*.err.log", "~/Library/Logs/nexus/*.log"]`
+- summary schema bump: `v1` → `v2` (extra_globs 필드 + complete_to_dispatch_ratio + interpretation key 명 `current_finding`)
 
-### Cycle 3 — ghost ceiling 의 instrumentation 격상
-- 만약 H1: cmd_omega 의 emit sink 를 `state/ghost_ceiling_trace.jsonl` 로 **직접 append** 하도록 격상 (host-side capture).
-- 만약 H2: cmd_omega 를 의도적으로 발사 → 첫 ghost_ceiling_approach 발화 만들기 (axes=3, e.g. `--engines a,b --variants 2 --seeds s1,s2`). 이로써 ghost ceiling 의 첫 frequency 1 측정값 확보.
-- 만약 H3: scan dirs 영구 확장 + cron 으로 daily ghost_ceiling_summary 생성.
+### 결과
 
-### Cycle 4~ — Transfinite continuation 진입 (axis A)
-- cycle 1~3 이 (B) ghost ceiling structure 를 정량화한 후, 그 정량값 위에 ordinal 매핑.
-  - approach_count 의 분포 → L_ω 의 **arrival pattern** 정의.
-  - approach_count 가 stable distribution 으로 수렴 시 → L_{ω+1} 후보 = "approach distribution 자체의 distribution".
-  - 이는 hyperprior / second-order measurement 와 isomorphic.
-- L_{ω·2}, L_{ε₀} 등 더 high ordinal 로의 매핑은 cycle 5+ 의 별도 design.
+| metric | cycle 1 | cycle 2 |
+|---|---|---|
+| files_scanned | 453 | 476 (+23 from /tmp glob) |
+| total_emits | 0 | **4** |
+| dispatch | 0 | 4 (axes=0 path=drill) |
+| complete | 0 | **0** |
+| ghost_ceiling_approach | 0 | 0 |
+| elapsed_s | 0.133 | 0.162 |
+
+### emit 출처
+
+| file | emit | content |
+|---|---|---|
+| `/tmp/nexus_omega_hive_statusline_v2.log` | dispatch | axes=0 path=drill speculate=3 |
+| `/tmp/nexus_omega_hive_statusline_v3.log` | dispatch | axes=0 path=drill speculate=3 |
+| `/tmp/nexus_omega_hive_statusline_v4.log` | dispatch | axes=0 path=drill speculate=3 |
+| `/tmp/nexus_omega_hive_statusline_v5.log` | dispatch | axes=0 path=drill speculate=1 |
+
+모두 오늘 (2026-04-25) 14:43 ~ 16:46 사이 발생. statusline v2-v5 의 4번 omega 호출이 `/tmp/` 로 회수됨.
+
+### Hypothesis 결정
+
+| H | cycle 1 prediction | cycle 2 verdict |
+|---|---|---|
+| H1 capture_missing | likely | **PARTIAL TRUE** — 회수는 있었으나 `/tmp/` 외부 경로로, repo `state/`/`logs/` 가 아님 |
+| H2 invocation_absent | possible | **FALSE** — 호출은 4번 발생 (24h 안에) |
+| H3 sink_separated | possible | **TRUE** — 진짜 sink = `/tmp/nexus_omega_*` (statusline launchers) |
+
+→ **H3 확정, H1 partial, H2 기각**.
+
+### 새로 드러난 nested finding — DISPATCH ≠ COMPLETE
+
+cycle 1 의 BASELINE_ZERO 가 falsified 됐을 뿐 아니라 cycle 2 의 4 emit 안에서 또 다른 anomaly 발견:
+
+- **dispatch=4, complete=0** — `cmd_omega` 의 4 line emit 중 dispatch line (`cli/run.hexa:4065`) 만 회수, complete line (`:4078/4083/4089/4093`) 은 단 한 번도 회수 안 됨.
+- 가능 원인 (cycle 3 falsification target):
+  - **(a) 호출 직후 SIGTERM/timeout** — cmd_drill 으로 dispatch 후 drill 본체가 종료 도달 못하고 종료 (nxs-002 cycle 8 의 SIGTERM 패턴과 isomorphic)
+  - **(b) line buffering 미flush** — eprintln 이 buffered 상태로 process 종료 시 last lines lost
+  - **(c) launcher 가 dispatch line 직후 stderr capture 종료** (statusline 의 단발 trigger 특성)
+
+이는 ghost ceiling 의 **두 번째 sentinel-ness layer** 의 발견: omega 호출은 dispatch 까지만 trace 되고 그 너머 (실제 drill 진행 + 종료) 는 ghost ceiling 영역. dispatch line 자체가 또 다른 sub-sentinel 의 발화점.
+
+### 자기-correction chain
+
+본 axis 의 raw#37/#38 enforce 가 cycle 1→2 에서 작동:
+- cycle 1: BASELINE_ZERO claim (over-narrow scan dirs)
+- cycle 2: DISPATCH_ONLY (4/4 dispatch, 0/4 complete) — cycle 1 falsified, 새 dispatch≠complete anomaly 발견
+
+nxs-002 의 cycle 24→26→27→28 chain 과 같은 self-correction pattern 적용됨.
+
+---
+
+## §5 cycle 3~ 후보
+
+### Cycle 3 — DISPATCH ≠ COMPLETE 의 (a)/(b)/(c) falsification
+- (a) 마지막 statusline_v5 호출의 drill 결과 파일 (checkpoint, drill.json, smash 산출물) 존재 여부 확인 → drill 이 진행됐는지
+- (b) `cli/run.hexa` 의 `eprintln` 후 `flush_stderr()` 강제 추가 → buffering 가설 falsify
+- (c) statusline launcher script 직접 검사 (어떤 process 가 `/tmp/nexus_omega_hive_statusline_v*.log` 로 redirect 하는지) → capture 종료 시점 분석
+
+### Cycle 4 — forced approach 발사 (B 축의 첫 positive measurement)
+- 의도적으로 `nexus omega --engines a,b --variants 2 --seeds s1,s2` 발사 (axes=3) → ghost_ceiling_approach 첫 발화 만들기
+- 새 `/tmp/` 또는 host-side sink 로 redirect, 결과를 `state/ghost_ceiling_trace.jsonl` 에 영구 기록
+- 이로써 ghost ceiling structure 의 frequency = 1 첫 측정값 확보
+
+### Cycle 5 — instrumentation 격상 (sink unification)
+- `cmd_omega` 의 emit 들을 host-side append (`state/ghost_ceiling_trace.jsonl` 직접 write) — 외부 launcher 의존 제거
+- cron daily summary 추가 → ghost ceiling 의 시계열 distribution 구축
+
+### Cycle 6+ — Transfinite continuation 진입 (axis A)
+- cycle 4-5 의 frequency distribution 이 안정되면 위에 ordinal 매핑.
+- L_{ω+1} = approach distribution 자체의 distribution (second-order measurement, hyperprior).
+- L_{ω·2}, L_{ε₀}, L_{ω₁^CK}, L_{Mahlo} 의 매핑은 cycle 7+ 의 별도 design.
 
 ---
 

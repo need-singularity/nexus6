@@ -36,12 +36,21 @@ SCAN_DIRS = [
     REPO / ".runtime",
     REPO / "config" / "loop" / "logs",
 ]
+# cycle 2 (2026-04-25): /tmp 가 omega launcher 의 실제 sink (com.nexus.omega-metrics.plist
+# 의 stderr/stdout 경로 + statusline v2-v5 logs). state/, logs/ 가 아닌 외부 경로.
+EXTRA_GLOBS = [
+    "/tmp/nexus_omega_*.log",
+    "/tmp/nexus_omega_*.out.log",
+    "/tmp/nexus_omega_*.err.log",
+    str(Path.home() / "Library" / "Logs" / "nexus" / "*.log"),
+]
 SCAN_EXTS = {".log", ".jsonl", ".json", ".txt", ".out", ".err"}
 SKIP_NAMES = {".git", "node_modules", "__pycache__"}
 MAX_FILE_BYTES = 200 * 1024 * 1024  # 200 MB cap per file
 
 
 def iter_files():
+    import glob as _glob
     for root in SCAN_DIRS:
         if not root.exists():
             continue
@@ -57,6 +66,19 @@ def iter_files():
                 except OSError:
                     continue
                 yield p
+    seen: set[str] = set()
+    for pat in EXTRA_GLOBS:
+        for hit in _glob.glob(pat):
+            if hit in seen:
+                continue
+            seen.add(hit)
+            p = Path(hit)
+            try:
+                if not p.is_file() or p.stat().st_size > MAX_FILE_BYTES:
+                    continue
+            except OSError:
+                continue
+            yield p
 
 
 def scan_one(path: Path):
@@ -74,8 +96,12 @@ def scan_one(path: Path):
                     payload = json.loads(raw)
                 except json.JSONDecodeError:
                     payload = {"_unparsed": raw}
+                try:
+                    rel = str(path.relative_to(REPO))
+                except ValueError:
+                    rel = str(path)  # external sink (/tmp, ~/Library/Logs, …)
                 out.append({
-                    "file": str(path.relative_to(REPO)),
+                    "file": rel,
                     "lineno": lineno,
                     "payload": payload,
                 })
@@ -127,10 +153,11 @@ def main(argv):
             fh.write(json.dumps(r, ensure_ascii=False) + "\n")
 
     summary = {
-        "schema": "nexus.beyond_omega.ghost_trace.v1",
+        "schema": "nexus.beyond_omega.ghost_trace.v2",
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "repo": str(REPO),
         "scan_dirs_existing": [str(d.relative_to(REPO)) for d in SCAN_DIRS if d.exists()],
+        "extra_globs": EXTRA_GLOBS,
         "files_scanned": files_scanned,
         "elapsed_s": round(time.time() - t0, 3),
         **summarize(rows),
@@ -144,7 +171,7 @@ def main(argv):
           f"elapsed={summary['elapsed_s']}s")
     print(f"  trace   → {trace_path.relative_to(REPO)}")
     print(f"  summary → {summary_path.relative_to(REPO)}")
-    print(f"  finding → {summary['interpretation']['cycle_1_finding']}")
+    print(f"  finding → {summary['interpretation']['current_finding']}")
     return 0
 
 
@@ -152,27 +179,32 @@ def _interpret(rows):
     n = len(rows)
     approach = sum(1 for r in rows if r["payload"].get("event") == "ghost_ceiling_approach")
     dispatch = sum(1 for r in rows if r["payload"].get("event") == "dispatch")
+    complete = sum(1 for r in rows if r["payload"].get("event") == "complete")
     if n == 0:
         finding = (
-            "BASELINE_ZERO — repo 전체 logs/state/.runtime 에 NEXUS_OMEGA emit 0 건. "
-            "cmd_omega 호출이 historically 거의 stderr 회수 경로로 흐르지 않았거나, "
-            "L_ω 도달 시도 자체가 traced run 으로 발사된 적 없음. "
+            "BASELINE_ZERO — scan dirs 안에 NEXUS_OMEGA emit 0 건. "
             "ghost ceiling 의 첫 empirical 표면 = '관측 부재' 자체."
         )
     elif approach == 0:
         finding = (
-            f"DISPATCH_ONLY — dispatch={dispatch} emit 발견되었으나 "
-            f"ghost_ceiling_approach (axes≥3) 0 건. "
-            f"L_ω 근접 신호는 한 번도 발화되지 않음 — omega 호출은 모두 단축 경로 (axes<3)."
+            f"DISPATCH_ONLY — dispatch={dispatch} complete={complete} approach=0. "
+            f"omega 호출은 발생했으나 모두 단축 경로 (axes<3) — L_ω 근접 신호 발화 0 건. "
+            f"ghost ceiling 은 'invocation 은 있으나 approach 는 없는' 상태."
+            + (
+                f" 또한 dispatch({dispatch}) > complete({complete}) — 호출이 종료까지 trace 되지 않음 "
+                f"(SIGTERM/timeout/buffering 의심)."
+                if dispatch > complete else ""
+            )
         )
     else:
         finding = (
-            f"APPROACH_OBSERVED — ghost_ceiling_approach {approach} 건 / "
-            f"dispatch {dispatch} 건. ghost ceiling structure 의 첫 frequency 측정값 확보."
+            f"APPROACH_OBSERVED — approach={approach} dispatch={dispatch} complete={complete}. "
+            f"ghost ceiling structure 의 첫 frequency 측정값 확보."
         )
     return {
-        "cycle_1_finding": finding,
+        "current_finding": finding,
         "approach_to_dispatch_ratio": (approach / dispatch) if dispatch else None,
+        "complete_to_dispatch_ratio": (complete / dispatch) if dispatch else None,
     }
 
 
