@@ -320,21 +320,78 @@ self-output skip 적용 후:
 
 ---
 
-## §8 cycle 6~ 후보
+## §8 cycle 6 first finding — AXIS_OVERLAP + TIMEOUT_HEADROOM_DISTRIBUTION (2026-04-25)
 
-### Cycle 6 — cross-axis join (axis B × nxs-002)
-- daily snapshot timeline 와 axis A (`state/drill_stage_elapsed_history.jsonl`) 의 timestamp join
-- forced approach 의 `composite_v3_prime=0.964689` snapshot 가 어떻게 axis A V3' state 와 연결되는지 정량화
-- ghost ceiling approach distribution × stage timeout distribution 의 isomorphism 정도 측정
+### 새 도구
+- `tool/beyond_omega_cross_axis_join.py` — 세 sources (axis B trace + axis A stage_elapsed + V3' snapshot) 을 **hour-bucket 위에 join** 하는 분석 도구.
+  - axis B emit 의 ts 추정: 같은 file 안 `NEXUS_DRILL_PROGRESS {"ts":...}` marker 또는 file mtime fallback.
+  - 출력: `state/beyond_omega_cross_axis_join.json` (schema v1).
 
-### Cycle 7 — measurement back-action 의 격상 활용
-- cycle 5 의 self-feedback bug 를 "정상 모드" 로 전환한 hyperprior 측정 — measurement-of-measurement 의 distribution
-- 이는 **L_{ω+1} 후보의 첫 empirical 표면** = approach distribution 의 distribution (second-order measurement)
+### 결과
 
-### Cycle 8+ — Transfinite continuation 진입 (axis A)
-- cycle 6-7 의 second-order distribution 위에 ordinal 매핑
-- L_{ω+1} = measurement-of-measurement (cycle 7 의 정상화된 self-feedback)
-- L_{ω·2}, L_{ε₀}, L_{ω₁^CK}, L_{Mahlo} 의 매핑은 cycle 9+ 의 별도 design
+| metric | value |
+|---|---|
+| n_axis_b_rows | 7 (cycle 4 누적) |
+| n_axis_a_rows | 96 (nxs-002 cycle 7 backfill 포함) |
+| n_buckets_total | 6 (hour-level) |
+| n_buckets_b_and_a_overlap | **3 (50%)** |
+| n_buckets_b_only | 1 |
+| n_buckets_a_only | 2 |
+| approach_in_same_hour_as_v3_snapshot | **False** |
+| smash_p50_global_ms | **83258 (= 180s 의 46.3%)** |
+| smash_max_bucket | (`2026-04-25T07:00Z`, 137231ms = 180s 의 76.2%) |
+| smash_elapsed_max history | 183012ms (cycle 5 backfill, **180s 의 101.7% — 1.67% 초과**) |
+
+### Hour-bucket 분포 (요약)
+
+| hour_utc | emits | approaches | stages | smash_p50_ms | stage_set |
+|---|---|---|---|---|---|
+| 2026-04-25T05:00Z | 1 | 0 | 0 | — | — |
+| 2026-04-25T06:00Z | 2 | 0 | 8 | 91508 | smash, meta_closure, hyperarith |
+| 2026-04-25T07:00Z | 1 | 0 | 13 | **137231** | smash, free, resonance |
+| (다른 3 buckets — overlap 패턴 유사) | — | — | — | — | — |
+
+### 새 finding 들
+
+1. **AXIS_OVERLAP (50%)** — axis B (omega dispatch trace) 와 axis A (drill stage timing) 가 6 hour 중 3 hour 에서 동시 발생. 두 axis 가 timestamp 차원에서 분리되지 않음 — 같은 시간대에 함께 active. cross-axis isomorphism 의 첫 정량 evidence.
+2. **TIMEOUT_HEADROOM_DISTRIBUTION** (★ cycle 3 의 180s invariant refinement):
+   - p50 smash = 83s = 180s 의 46.3% (53.7% headroom)
+   - max bucket smash = 137s = 76.2% (24% headroom)
+   - history 최대 (cycle 5 backfill) = 183s = **101.7%** (1.7% 초과)
+   - **결론**: 평균적으로 timeout 대비 충분한 headroom 이 있지만, **분포의 right-tail 이 180s 를 occasionally 초과** → cycle 3 의 dispatch≠complete 가 100% SIGTERM 이 아니라 **right-tail SIGTERM** (분포 꼬리에서만 발생). cycle 3 의 finding refined.
+3. **APPROACH↔V3_HOUR_MISMATCH** — V3' snapshot hour (`2026-04-25T09:00Z`) ≠ ghost_ceiling_approach hour. cycle 4 의 dashboard auto-emit hook (cli/run.hexa:4028) 은 cmd_omega 진입 시 V3' 값을 출력하지만, **V3' snapshot 자체는 별도 시간 (axis A 의 hexa native FULL CLOSURE cycle 13) 에 갱신** → cross-axis anchor 는 hook 차원에는 있지만 timestamp 차원에는 없음.
+
+### Self-correction chain (axis B 누적, 6 단계)
+
+| cycle | claim | verdict |
+|---|---|---|
+| 1 | BASELINE_ZERO | falsified by cycle 2 |
+| 2 | DISPATCH_ONLY | confirmed + (a)/(b)/(c) 분기 |
+| 3 | DISPATCH_TERMINATED | confirmed + 180s timeout invariant |
+| 4 | APPROACH_OBSERVED ★ first positive | confirmed |
+| 5 | INSTRUMENTATION + MEASUREMENT BACK-ACTION | confirmed (idempotent + new sentinel layer) |
+| 6 | AXIS_OVERLAP + TIMEOUT_HEADROOM_DISTRIBUTION | confirmed + cycle 3 refinement |
+
+cycle 3 의 "180s timeout invariant" 가 cycle 6 에서 **headroom distribution** 으로 정밀화 — 100% SIGTERM 이 아니라 right-tail SIGTERM (실제 cycle 5 backfill 에 1 entry 가 1.7% 초과 = 1.67% 여유로 cycle 6 도구 통과).
+
+---
+
+## §9 cycle 7~ 후보
+
+### Cycle 7 — measurement back-action 의 정상화 활용 (L_{ω+1} 첫 표면)
+- cycle 5 의 self-feedback bug 를 **"정상 모드"** 로 전환 — probe 가 자기 출력을 source 로 인식하는 것을 의도적으로 활용
+- measurement-of-measurement distribution 측정: probe 를 N 번 호출했을 때 self-emit 의 second-order distribution
+- 이는 **L_{ω+1} 후보의 첫 empirical 표면** = approach distribution 의 distribution
+
+### Cycle 8 — daily timeline 누적 (cron 가동)
+- cycle 5 의 `--cron` mode 를 daily plist (`com.nexus.beyond-omega.daily.plist`) 로 등록
+- 7-30 day 뒤 ghost ceiling 의 시계열 distribution 첫 dataset 확보
+- 이 dataset 위에 cycle 9 의 ordinal mapping
+
+### Cycle 9+ — Transfinite continuation 진입 (axis A)
+- cycle 7-8 의 second-order distribution 위에 ordinal 매핑
+- L_{ω+1} = measurement-of-measurement
+- L_{ω·2}, L_{ε₀}, L_{ω₁^CK}, L_{Mahlo} 의 매핑은 cycle 10+ 별도 design
 
 ### Cycle 4 — forced approach 발사 (B 축의 첫 positive measurement)
 - 의도적으로 `nexus omega --engines a,b --variants 2 --seeds s1,s2` 발사 (axes=3) → ghost_ceiling_approach 첫 발화 만들기
