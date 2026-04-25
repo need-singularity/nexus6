@@ -1,0 +1,366 @@
+#!hexa strict
+// tool/codata_bridge.hexa — CODATA ↔ HEXA-SIM α^-1 bridge: NIST live fetch + fractional gap quantification.
+//
+// @tool(slug="codata_bridge", desc="CODATA fundamental constants fetch + axis_constants/axis_counter alpha^-1=137 fractional gap (≈0.036) quantification")
+// @usage(hexa run tool/codata_bridge.hexa [--selftest] [--json] [--no-fetch])
+// @exit_codes(0=PASS, 1=usage/io error, 2=value verification failure)
+// @sentinel(__CODATA_BRIDGE__ PASS|FAIL alpha_inv_codata=<float> hexa_sim_int=137 fractional_gap=<float> gap_pct=<float>)
+// @origin(hive raw 73 structural-admissibility — empirical anchor reconciliation for §X.4 declared-counterexample binding)
+// @abstraction(hive raw 70 design-multi-axis-verify-grid — quantitative bridge between §SYMBOLIC alpha^-1=sigma^2-sopfr-phi=137 and CODATA 2022 measured value)
+// @paradigm(structural-admissibility — fixed scaling, no float arithmetic, integer-only ROI gap)
+// @allow-bare-exec
+// @no-sandbox
+//
+// Endpoint: https://physics.nist.gov/cuu/Constants/Table/allascii.txt (plain text, ~30KB)
+// Target line: "inverse fine-structure constant            137.035 999 177      0.000 000 021"
+// Hardcoded fallback (CODATA 2022): 137.035999177 ± 0.000000021 (used when --no-fetch or curl fails).
+//
+// HEXA-SIM symbolic identity (n=6):  alpha^-1 = sigma^2 - sopfr - phi = 144 - 5 - 2 = 137
+// fractional_gap = |alpha_inv_codata - 137|  ≈ 0.035999177
+// gap_pct = 100 * gap / codata        ≈ 0.0263 %
+
+// ─── scaled-integer constants (9 fractional digits = nano resolution) ───
+
+fn SCALE() -> i64 { return 1000000000 }       // 10^9
+fn HEXA_SIM_INT() -> i64 { return 137 }
+fn HEXA_SIM_SCALED() -> i64 { return 137000000000 }  // 137.000000000 in scaled units (literal to avoid mul-init quirks)
+
+// CODATA 2022 hardcoded fallback (as scaled integer, 9 frac digits)
+fn FALLBACK_ALPHA_SCALED() -> i64 { return 137035999177 }       // 137.035999177
+fn FALLBACK_UNCERT_SCALED() -> i64 { return 21 }                // 0.000000021 → 21 in 10^-9 scale
+
+// ─── string helpers ───
+
+fn _abs_i(x: i64) -> i64 { if x < 0 { return 0 - x } return x }
+
+fn _str_to_i(s: string) -> i64 {
+    if len(s) == 0 { return 0 }
+    let mut neg = false
+    let mut i = 0
+    if s.substring(0, 1) == "-" { neg = true; i = 1 }
+    let mut acc: i64 = 0
+    while i < len(s) {
+        let c = s.substring(i, i + 1)
+        if c == "0" { acc = acc * 10 }
+        else if c == "1" { acc = acc * 10 + 1 }
+        else if c == "2" { acc = acc * 10 + 2 }
+        else if c == "3" { acc = acc * 10 + 3 }
+        else if c == "4" { acc = acc * 10 + 4 }
+        else if c == "5" { acc = acc * 10 + 5 }
+        else if c == "6" { acc = acc * 10 + 6 }
+        else if c == "7" { acc = acc * 10 + 7 }
+        else if c == "8" { acc = acc * 10 + 8 }
+        else if c == "9" { acc = acc * 10 + 9 }
+        i = i + 1
+    }
+    if neg { return 0 - acc }
+    return acc
+}
+
+// Format a scaled integer (val / 10^9) as decimal string with 9 fractional digits
+fn _fmt_scaled(scaled: i64) -> string {
+    let neg = scaled < 0
+    let v = _abs_i(scaled)
+    let int_part = v / SCALE()
+    let frac_part = v % SCALE()
+    // pad frac_part to 9 digits
+    let mut frac_str = to_string(frac_part)
+    while len(frac_str) < 9 { frac_str = "0" + frac_str }
+    let core = to_string(int_part) + "." + frac_str
+    if neg { return "-" + core }
+    return core
+}
+
+// Format a scaled integer with N fractional digits (truncates)
+fn _fmt_scaled_n(scaled: i64, n: i64) -> string {
+    let full = _fmt_scaled(scaled)
+    let dot = full.index_of(".")
+    if dot < 0 { return full }
+    if n <= 0 { return full.substring(0, dot) }
+    let want_end = dot + 1 + n
+    if want_end > len(full) { return full }
+    return full.substring(0, want_end)
+}
+
+// ─── NIST fetch + parse ───
+
+fn fetch_codata_text() -> string {
+    let url = "https://physics.nist.gov/cuu/Constants/Table/allascii.txt"
+    let cmd = "curl -s --max-time 10 '" + url + "' 2>/dev/null | grep -i 'inverse fine-structure' | head -1"
+    let raw = exec(cmd)  // @allow-bare-exec
+    return to_string(raw).trim()
+}
+
+// Parse a "137.035 999 177" style numeric string into scaled integer (10^9 frac).
+// Strips spaces; takes integer part + up to 9 fractional digits (zero-pads if shorter).
+fn _parse_decimal_scaled(s: string) -> i64 {
+    let cleaned = s.replace(" ", "")
+    let dot = cleaned.index_of(".")
+    if dot < 0 {
+        // no fractional part
+        return _str_to_i(cleaned) * SCALE()
+    }
+    let int_str = cleaned.substring(0, dot)
+    let mut frac_str = cleaned.substring(dot + 1, len(cleaned))
+    // strip non-digits at end (e.g. exponents, units) — for our target lines we expect pure digits
+    let mut clean_frac = ""
+    let mut i = 0
+    while i < len(frac_str) {
+        let c = frac_str.substring(i, i + 1)
+        if c == "0" || c == "1" || c == "2" || c == "3" || c == "4" || c == "5" || c == "6" || c == "7" || c == "8" || c == "9" {
+            clean_frac = clean_frac + c
+        } else {
+            i = len(frac_str)  // break on first non-digit
+        }
+        i = i + 1
+    }
+    // truncate or zero-pad to 9 digits
+    if len(clean_frac) > 9 { clean_frac = clean_frac.substring(0, 9) }
+    while len(clean_frac) < 9 { clean_frac = clean_frac + "0" }
+    let int_v = _str_to_i(int_str)
+    let frac_v = _str_to_i(clean_frac)
+    return int_v * SCALE() + frac_v
+}
+
+// Extract "137.035 999 177" numeric token from a NIST line like:
+//   "inverse fine-structure constant       137.035 999 177    0.000 000 021"
+// Strategy: find first digit position, then take chars while they are digit/space/dot,
+// stop at the first occurrence of double-space-then-digit (= column gap to uncertainty)
+// or at end-of-line. Then post-trim trailing spaces.
+fn extract_alpha_inv_token(line: string) -> string {
+    let n = len(line)
+    if n == 0 { return "" }
+    // find first digit
+    let mut start: i64 = -1
+    let mut i = 0
+    while i < n {
+        let c = line.substring(i, i + 1)
+        if c == "0" || c == "1" || c == "2" || c == "3" || c == "4" || c == "5" || c == "6" || c == "7" || c == "8" || c == "9" {
+            start = i
+            i = n
+        }
+        i = i + 1
+    }
+    if start < 0 { return "" }
+    // walk forward; stop at end OR at a "  " (two consecutive spaces) which delimits the uncertainty column
+    let mut end = start
+    let mut j = start
+    let mut prev_space = false
+    while j < n {
+        let c = line.substring(j, j + 1)
+        if c == " " {
+            if prev_space {
+                // double space — column boundary
+                j = n
+            } else {
+                prev_space = true
+                end = j
+            }
+        } else {
+            let is_digit = c == "0" || c == "1" || c == "2" || c == "3" || c == "4" || c == "5" || c == "6" || c == "7" || c == "8" || c == "9"
+            if is_digit || c == "." {
+                end = j + 1
+                prev_space = false
+            } else {
+                // any other char = stop
+                j = n
+            }
+        }
+        j = j + 1
+    }
+    return line.substring(start, end).trim()
+}
+
+fn extract_alpha_inv_scaled(line: string) -> i64 {
+    let tok = extract_alpha_inv_token(line)
+    if len(tok) == 0 { return -1 }
+    return _parse_decimal_scaled(tok)
+}
+
+// ─── core: bridge computation ───
+
+fn compute_bridge(alpha_scaled: i64) -> array {
+    let hexa_int_scaled = HEXA_SIM_SCALED()
+    let gap_scaled = _abs_i(alpha_scaled - hexa_int_scaled)
+    // gap_pct (scaled): 100 * gap / alpha — want extra precision so multiply by 10^6 first → result is gap_pct * 10^6
+    // i.e. gap_scaled / alpha_scaled gives ratio; * 100 gives percent. To preserve precision: (gap_scaled * 100 * 10^6) / alpha_scaled.
+    let pct_scaled_e6: i64 = (gap_scaled * 100 * 1000000) / alpha_scaled
+    return [alpha_scaled, gap_scaled, pct_scaled_e6]
+}
+
+// Format gap_pct (which lives at 10^6 scale, units = percent) to a string with 4 decimal digits
+fn _fmt_pct_e6(pct_e6: i64) -> string {
+    let neg = pct_e6 < 0
+    let v = _abs_i(pct_e6)
+    let int_part = v / 1000000
+    let frac_part = v % 1000000
+    let mut frac_str = to_string(frac_part)
+    while len(frac_str) < 6 { frac_str = "0" + frac_str }
+    // truncate to 4 frac digits
+    let frac_4 = frac_str.substring(0, 4)
+    let core = to_string(int_part) + "." + frac_4
+    if neg { return "-" + core }
+    return core
+}
+
+// ─── selftest ───
+
+fn _selftest() {
+    let mut bad = []
+
+    // 1. parse "137.035 999 177" → 137035999177
+    let p1 = _parse_decimal_scaled("137.035 999 177")
+    if p1 != 137035999177 { bad.push("parse_decimal('137.035 999 177') expected 137035999177 got " + to_string(p1)) }
+
+    // 2. parse "137.036" → 137036000000
+    let p2 = _parse_decimal_scaled("137.036")
+    if p2 != 137036000000 { bad.push("parse_decimal('137.036') expected 137036000000 got " + to_string(p2)) }
+
+    // 3. parse "137" (no dot) → 137000000000
+    let p3 = _parse_decimal_scaled("137")
+    if p3 != 137000000000 { bad.push("parse_decimal('137') expected 137000000000 got " + to_string(p3)) }
+
+    // 4. extract token from realistic NIST line
+    let line = "inverse fine-structure constant                             137.035 999 177          0.000 000 021"
+    let tok = extract_alpha_inv_token(line)
+    if tok != "137.035 999 177" { bad.push("extract_token expected '137.035 999 177' got '" + tok + "'") }
+
+    // 5. extract+parse roundtrip
+    let s = extract_alpha_inv_scaled(line)
+    if s != 137035999177 { bad.push("extract_scaled expected 137035999177 got " + to_string(s)) }
+
+    // 6. compute_bridge with fallback value
+    let br = compute_bridge(FALLBACK_ALPHA_SCALED())
+    let alpha_v: i64 = br[0]
+    let gap_v: i64 = br[1]
+    let pct_e6: i64 = br[2]
+    if alpha_v != 137035999177 { bad.push("bridge alpha expected 137035999177 got " + to_string(alpha_v)) }
+    if gap_v != 35999177 { bad.push("bridge gap expected 35999177 got " + to_string(gap_v)) }
+    // expected pct ≈ 100 * 35999177 / 137035999177 * 10^6 ≈ 26269 (i.e. 0.0263 %)
+    if pct_e6 < 26000 || pct_e6 > 27000 { bad.push("bridge pct_e6 expected ~26269 got " + to_string(pct_e6)) }
+
+    // 7. format roundtrip
+    let f1 = _fmt_scaled(137035999177)
+    if f1 != "137.035999177" { bad.push("_fmt_scaled expected '137.035999177' got '" + f1 + "'") }
+
+    let f2 = _fmt_scaled_n(137035999177, 6)
+    if f2 != "137.035999" { bad.push("_fmt_scaled_n(.,6) expected '137.035999' got '" + f2 + "'") }
+
+    let f3 = _fmt_pct_e6(26269)
+    if f3 != "0.0262" && f3 != "0.0263" { bad.push("_fmt_pct_e6(26269) expected ~'0.0262' got '" + f3 + "'") }
+
+    // 8. HEXA-SIM symbolic identity sanity
+    let sym = 144 - 5 - 2
+    if sym != HEXA_SIM_INT() { bad.push("symbolic 144-5-2 expected 137 got " + to_string(sym)) }
+
+    if len(bad) > 0 {
+        eprintln("[codata_bridge selftest] FAIL: " + bad.join(", "))
+        exit(1)
+    }
+    println("[codata_bridge selftest] OK — parse + extract + bridge + format + identity (8 checks)")
+    exit(0)
+}
+
+// ─── emit helpers ───
+
+fn _emit_text(alpha_scaled: i64, uncert_scaled: i64, gap_scaled: i64, pct_e6: i64, source: string) {
+    println("CODATA_SOURCE     : " + source)
+    println("alpha_inv_codata  : " + _fmt_scaled(alpha_scaled))
+    println("uncertainty       : " + _fmt_scaled(uncert_scaled))
+    println("hexa_sim_integer  : " + to_string(HEXA_SIM_INT()) + "   (= sigma^2 - sopfr - phi = 144 - 5 - 2)")
+    println("fractional_gap    : " + _fmt_scaled(gap_scaled))
+    println("gap_pct_of_codata : " + _fmt_pct_e6(pct_e6) + " %")
+    println("---")
+}
+
+fn _emit_json(alpha_scaled: i64, uncert_scaled: i64, gap_scaled: i64, pct_e6: i64, source: string) {
+    println("{")
+    println("  \"tool\": \"codata_bridge\",")
+    println("  \"origin\": \"hive raw 70 design-multi-axis-verify-grid\",")
+    println("  \"paradigm\": \"structural-admissibility (raw 73)\",")
+    println("  \"source\": \"" + source + "\",")
+    println("  \"codata_alpha_inv\": " + _fmt_scaled(alpha_scaled) + ",")
+    println("  \"codata_uncertainty\": " + _fmt_scaled(uncert_scaled) + ",")
+    println("  \"hexa_sim_integer\": " + to_string(HEXA_SIM_INT()) + ",")
+    println("  \"fractional_gap\": " + _fmt_scaled(gap_scaled) + ",")
+    println("  \"gap_pct_of_codata\": " + _fmt_pct_e6(pct_e6))
+    println("}")
+}
+
+// ─── main ───
+
+fn main() -> void {
+    let raw_args = args()
+    let mut cli = []
+    let mut ai = 2
+    while ai < len(raw_args) {
+        cli.push(raw_args[ai])
+        ai = ai + 1
+    }
+
+    let mut json_mode = false
+    let mut no_fetch = false
+    let mut i = 0
+    while i < len(cli) {
+        let a = cli[i]
+        if a == "--selftest" || a == "selftest" { _selftest() }
+        else if a == "--json" { json_mode = true }
+        else if a == "--no-fetch" { no_fetch = true }
+        else if a == "--help" || a == "-h" {
+            println("usage: hexa run tool/codata_bridge.hexa [--selftest] [--json] [--no-fetch]")
+            println("  --selftest : 8-check internal verification, exit 0/1")
+            println("  --json     : emit single JSON object on stdout")
+            println("  --no-fetch : skip NIST curl, use hardcoded CODATA 2022 fallback (137.035999177)")
+            println("origin: hive raw 70/73 — bridge HEXA-SIM symbolic alpha^-1=137 vs CODATA measured ~137.036")
+            exit(0)
+        }
+        else {
+            eprintln("codata_bridge: unknown arg `" + a + "`")
+            exit(1)
+        }
+        i = i + 1
+    }
+
+    let mut alpha_scaled: i64 = 0
+    let mut uncert_scaled: i64 = FALLBACK_UNCERT_SCALED()
+    let mut source: string = "fallback:CODATA-2022-hardcoded"
+
+    if no_fetch {
+        alpha_scaled = FALLBACK_ALPHA_SCALED()
+    } else {
+        let line = fetch_codata_text()
+        if len(line) == 0 {
+            // fetch failed → graceful fallback
+            alpha_scaled = FALLBACK_ALPHA_SCALED()
+            source = "fallback:fetch-failed (CODATA-2022-hardcoded)"
+        } else {
+            let parsed = extract_alpha_inv_scaled(line)
+            if parsed <= 0 {
+                alpha_scaled = FALLBACK_ALPHA_SCALED()
+                source = "fallback:parse-failed (CODATA-2022-hardcoded)"
+            } else {
+                alpha_scaled = parsed
+                source = "live:nist.gov/cuu/Constants/Table/allascii.txt"
+            }
+        }
+    }
+
+    let br = compute_bridge(alpha_scaled)
+    let av: i64 = br[0]
+    let gap_v: i64 = br[1]
+    let pct_e6: i64 = br[2]
+
+    if json_mode { _emit_json(av, uncert_scaled, gap_v, pct_e6, source) }
+    else { _emit_text(av, uncert_scaled, gap_v, pct_e6, source) }
+
+    // sentinel: PASS if alpha_scaled is in [136.5, 137.5] window AND gap is within sane range (< 1.0)
+    let lo: i64 = 136500000000
+    let hi: i64 = 137500000000
+    let sane = av >= lo && av <= hi && gap_v < SCALE()
+    if !sane {
+        println("__CODATA_BRIDGE__ FAIL alpha_inv_codata=" + _fmt_scaled_n(av, 6) + " hexa_sim_int=" + to_string(HEXA_SIM_INT()) + " fractional_gap=" + _fmt_scaled_n(gap_v, 6) + " gap_pct=" + _fmt_pct_e6(pct_e6))
+        exit(2)
+    }
+    println("__CODATA_BRIDGE__ PASS alpha_inv_codata=" + _fmt_scaled_n(av, 6) + " hexa_sim_int=" + to_string(HEXA_SIM_INT()) + " fractional_gap=" + _fmt_scaled_n(gap_v, 6) + " gap_pct=" + _fmt_pct_e6(pct_e6))
+    exit(0)
+}
