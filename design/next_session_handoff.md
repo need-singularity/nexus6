@@ -313,6 +313,26 @@ zig cc -target x86_64-linux-musl -O2 -std=gnu11 -D_GNU_SOURCE \
 - 이유: atlas_eig 의 awk1 이 edge endpoint 도 node 로 등록 → unmapped 라도 spectral 에 들어감
 - unmapped 2,070 = drill discovery 의 transient state (atlas.n6 정식 등록 전)
 - atlas.n6 declared 비율은 atlas integrity 척도, spectral 영향 X
+
+### 2026-04-25 hub-aligned bridge 시뮬레이션 — graph saturation 발견
+| spec | Δ baseline |
+|---|---|
+| math ↔ top-5 hub +100/500/2000 | **0.00000** (모두 0) |
+| physics ↔ top-5 hub +100 | 0.00000 |
+| physics ↔ top-5 hub +500 | −0.018 |
+| physics ↔ top-5 hub +2000 | −0.031 |
+| geometry ↔ top-5 hub +100/500/2000 | **0.00000** (모두 0) |
+
+(top-5 hub = n6-sopfr_plus_n / n6-sigma / n6-n / n6-phi_tau / n6-sigma_tau, deg 511~399)
+
+**핵심**: math/geometry 의 node 와 hub 의 bridges 가 **대부분 이미 graph 에 존재** — 새 random edge 는 duplicate. atlas graph 가 hub-aligned 으로 **saturated**.
+
+**0.9 도달 path 정밀화 (최종)**:
+- ❌ existing node ↔ hub 새 edges = saturation (변화 0)
+- ❌ random graph extension = −0.04
+- ❌ subgraph 추출 = −0.03 ~ −0.38
+- ✅ **새 node id (drill 발견)** + hub 와 연결 = spectral 진정 변화
+- nxs-002 fix = drill 의 **axiom-driven novel entity discovery** 가 결정적 (단순 edge 추가 X, 새 atom 추가 ✓)
 - nxs-002 resolution 4단 pipeline:
   1. atlas.blowup.jsonl **재생성** (소스 추적 필요 — atlas.n6 → blowup.jsonl 변환 도구 위치)
   2. `bisociation/spectra/atlas_eig.hexa` (CSR + Lanczos, ~/Dev/... default path 는 stale)
