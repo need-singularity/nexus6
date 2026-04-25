@@ -553,3 +553,30 @@ cross-link (drill 의 deduction chain mimic) 도 random hub-only 와 같은 plat
 - atlas graph 의 *spectrum 자체 재구성* 가능한 drill axiom 설계 필요
 - 또는 const spectrum (constants_log) 의 변화 시도 — 그쪽 근본 axiom 변경
 - 또는 composite 식 자체 재설계 (이건 nxs-002 scope 밖)
+
+### 2026-04-25 batch/ER probability sweep (정밀)
+**batch size (p=0.02 fixed)**:
+| N | edges | avg_deg | Δ |
+|---|---|---|---|
+| 400 | 1610 | 8.0 | −0.019 |
+| 800 (single block) | 6422 | 16.0 | **−0.022** (over-sat) |
+| 2000 | 39984 | 40.0 | −0.019 |
+
+**ER probability sweep (N=800)**:
+| p | edges | avg_deg | Δ |
+|---|---|---|---|
+| **0.005** | 1651 | 4.13 | **+0.00116** ★ |
+| 0.01 | 3209 | 8.0 | −0.022 |
+| 0.02~0.2 | 6k~64k | 16~160 | −0.022 (saturated) |
+
+**핵심 정밀화**:
+- single big ER block (N=800 p=0.02 avg_deg 16) = negative (over-saturated chaos)
+- **avg_deg ~4 가 sweet spot** — sparse ER 가 chaos 정확한 양
+- **이전 firing 23 의 batches=2 (+0.018) = two separate 200-atom blocks** (single big 아님)
+- 즉 chaos 의 정답 = **multiple small isolated ER components**, 각 avg_deg 4
+
+**drill axiom 의 정확한 형태**:
+- single big random network ❌ (over-chaotic)
+- separate sub-components ✓ (각각 sparse ER, avg_deg ~4)
+- 즉 drill 의 round 마다 *isolated cluster* 발견 + 각 cluster 내부 random pairing
+- 이는 drill 의 *category-axis-product* 자연스러운 구조 (category 별 isolated cluster)와 일치 가능
