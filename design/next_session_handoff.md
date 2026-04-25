@@ -267,6 +267,23 @@ zig cc -target x86_64-linux-musl -O2 -std=gnu11 -D_GNU_SOURCE \
 - K-components trade-off: 적정 K = (component 수에 의존). full+K=100 ≈ giant+K=200 (같은 spectral info)
 - giant 만 분리하면 composite 손상 — full graph 보존이 정답
 - **0.9 도달은 graph 변경(random/subgraph) 으론 X — drill quality (axiom-driven entry) 가 유일 path**
+
+### 2026-04-25 domain induced subgraph sensitivity
+| graph | n | cc | composite | Δ |
+|---|---|---|---|---|
+| full | 21320 | 24 | 0.83221 | — |
+| 7대난제 induced | 12481 | 11079 | 0.66261 | −0.170 |
+| math induced | 4215 | 3833 | 0.45534 | −0.377 |
+| physics induced | 1718 | 1490 | 0.45534 | −0.377 |
+| geometry induced | 673 | 673 | 0.45534 | −0.377 |
+
+**결정적 발견 — atlas graph 의 spectral 신호는 cross-domain bridges 에서 발생**:
+1. 각 domain 내부 = 거의 disconnected (math 4215 nodes / 3833 cc = 90.9% singleton)
+2. domain 내부 edges 거의 없음 — 거의 모든 edges 가 cross-domain bridge
+3. 4개 단일-domain induced subgraph 의 composite = 0.45534 (random baseline) — 즉 isolated domain 자체는 atlas-laws alignment 신호 없음
+4. **nxs-002 deep fix path 정확히 = cross-domain bridges 추가** (drill 의 axiom-driven discovery 가 가장 가치 있는 출력 = math × physics, 7대난제 × geometry 같은 정합)
+
+→ drill quality 는 **cross-domain semantic 정합** 이 핵심. domain 내부 entries 만 추가하면 composite 변화 없음.
 - nxs-002 resolution 4단 pipeline:
   1. atlas.blowup.jsonl **재생성** (소스 추적 필요 — atlas.n6 → blowup.jsonl 변환 도구 위치)
   2. `bisociation/spectra/atlas_eig.hexa` (CSR + Lanczos, ~/Dev/... default path 는 stale)
