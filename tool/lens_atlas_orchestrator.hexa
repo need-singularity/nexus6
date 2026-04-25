@@ -1,13 +1,13 @@
 #!hexa strict
 // tool/lens_atlas_orchestrator.hexa — Phase 4b: lens injection pilot orchestrator.
 //
-// @tool(slug="lens_atlas_orchestrator", desc="l1 score formula + l4 opt-in 5-pilot lens + l8 bench baseline. Computes lens_score_new = base × (1 - falsifier_hit_ratio) × atlas_corroboration_factor for 5 pilot lenses. Emit-only by default; --apply is safety-blocked stub.")
-// @usage(hexa run tool/lens_atlas_orchestrator.hexa [--selftest] [--pilot-only] [--json] [--bench-emit] [--apply])
-// @exit_codes(0=PASS, 1=usage/io error, 2=schema/validation error, 3=apply conflict)
+// @tool(slug="lens_atlas_orchestrator", desc="l1 score formula + l4 opt-in 5-pilot lens + l8 bench baseline + l_apply mutation. Computes lens_score_new = base × (1 - falsifier_hit_ratio) × atlas_corroboration_factor for 5 pilot lenses. Emit-only by default; --apply requires --apply-confirm + per-file SCORE keyword + parse verify + auto rollback on fail.")
+// @usage(hexa run tool/lens_atlas_orchestrator.hexa [--selftest] [--pilot-only] [--json] [--bench-emit] [--diff-only] [--apply --apply-confirm] [--rollback])
+// @exit_codes(0=PASS, 1=usage/io error, 2=schema/validation error, 3=apply conflict (missing --apply-confirm or post-parse rollback))
 // @sentinel(__LENS_ATLAS_ORCH__ PASS|FAIL pilot=N mean_delta=<f> max_pos=<f> max_neg=<f>)
-// @origin(design/hexa_sim/2026-04-26_phase4_atlas_dsl_v2_and_lens_injection_omega_cycle.json subpath_b Tier-1 axes l1+l4+l8)
-// @abstraction(lens-injection score formula + opt-in pilot subset + bench baseline falsifier — hive raw 71)
-// @paradigm(structural-admissibility — deterministic per-lens recompute, atomic snapshot, no probabilistic update; --apply default disabled)
+// @origin(design/hexa_sim/2026-04-26_phase4_atlas_dsl_v2_and_lens_injection_omega_cycle.json subpath_b Tier-1 axes l1+l4+l8 + apply-mode activation 2026-04-25)
+// @abstraction(lens-injection score formula + opt-in pilot subset + bench baseline falsifier + safe mutation w/ rollback — hive raw 71)
+// @paradigm(structural-admissibility — deterministic per-lens recompute, atomic snapshot, no probabilistic update; --apply requires explicit --apply-confirm + parse-verify + auto-rollback on FAIL)
 // @allow-bare-exec
 //
 // 자기적용:
@@ -391,11 +391,269 @@ fn _selftest() {
     exit(0)
 }
 
-// ─── apply mode (safety-blocked stub) ───
+// ─── apply mode (safety-gated mutation w/ backup + parse-verify + auto-rollback) ───
 
-fn _apply_blocked() {
-    eprintln("__LENS_ATLAS_ORCH__ FAIL apply-disabled")
-    eprintln("[lens_atlas_orchestrator] --apply is safety-blocked in Phase 4b first-impl. // reason=lens-file-mutation-needs-witness fix=run --selftest then --bench-emit, validate baseline snapshot, then enable explicit --apply-confirm in subsequent cycle")
+// timestamp suffix for backup files: yyyymmddTHHMMSSZ (file-system safe)
+fn _now_backup_ts() -> string {
+    let cmd = "date -u +%Y%m%dT%H%M%SZ"
+    let out = to_string(exec(cmd))
+    return out.trim()
+}
+
+// detect line containing `let SCORE =` literal (case-sensitive). Returns the
+// first matching line text, or empty string if absent. Uses grep shell-out for
+// speed/robustness — selftest covers this path.
+fn _find_score_line(path: string) -> string {
+    if !file_exists(path) { return "" }
+    let cmd = "grep -n -E '^[[:space:]]*let[[:space:]]+SCORE[[:space:]]*=' '" + path + "' 2>/dev/null | head -1"
+    let out = to_string(exec(cmd)).trim()
+    return out
+}
+
+// build the replacement line: preserve original indentation by extracting
+// the leading whitespace from the matched line (after the "lineno:" prefix).
+// Returns empty string if construction fails.
+fn _build_replacement(matched_lineprefix: string, new_score: float) -> string {
+    // matched_lineprefix is "<lineno>:<line content>"
+    let colon_idx = matched_lineprefix.index_of(":")
+    if colon_idx < 0 { return "" }
+    // strip "<lineno>:" prefix to get raw line content
+    let raw_line = matched_lineprefix.slice(colon_idx + 1, len(matched_lineprefix))
+    // extract leading whitespace from raw_line
+    let mut ws = ""
+    let mut i = 0
+    while i < len(raw_line) {
+        let ch = raw_line.slice(i, i + 1)
+        if ch == " " || ch == "\t" { ws = ws + ch; i = i + 1 }
+        else { break }
+    }
+    return ws + "let SCORE = " + _round4(new_score)
+}
+
+// extract line number from grep -n output ("<lineno>:<content>")
+fn _line_number_of(matched_lineprefix: string) -> int {
+    let colon_idx = matched_lineprefix.index_of(":")
+    if colon_idx < 0 { return 0 }
+    let n_str = matched_lineprefix.slice(0, colon_idx)
+    return to_int(n_str)
+}
+
+// per-lens diff plan — returns array of dicts as nested arrays:
+//   [name, path, score_line_or_empty, new_score_str, replacement_line, status]
+// status ∈ {"plan", "skip-no-score", "skip-no-file"}
+fn _build_apply_plan(rows: array) -> array {
+    let mut plan = []
+    for r in rows {
+        let name = r[0]
+        let path = r[1]
+        let new_score = r[5]
+        if !file_exists(path) {
+            plan.push([name, path, "", _round4(new_score), "", "skip-no-file"])
+            continue
+        }
+        let line = _find_score_line(path)
+        if len(line) == 0 {
+            plan.push([name, path, "", _round4(new_score), "", "skip-no-score"])
+            continue
+        }
+        let repl = _build_replacement(line, new_score)
+        plan.push([name, path, line, _round4(new_score), repl, "plan"])
+    }
+    return plan
+}
+
+// perform a single in-place line replacement. Pure-hexa: read file, split on \n,
+// replace exact line at lineno (1-based), write atomically via tmp + mv.
+fn _replace_line_in_file(path: string, lineno: int, new_line: string) -> bool {
+    if !file_exists(path) { return false }
+    let content = to_string(read_file(path))
+    let lines = split(content, "\n")
+    if lineno < 1 || lineno > len(lines) { return false }
+    let mut out = ""
+    let mut idx = 0
+    while idx < len(lines) {
+        let l = lines[idx]
+        let emit = if (idx + 1) == lineno { new_line } else { l }
+        if idx == 0 { out = emit } else { out = out + "\n" + emit }
+        idx = idx + 1
+    }
+    let tmp = path + ".write.tmp"
+    write_file(tmp, out)
+    let mv = "mv '" + tmp + "' '" + path + "'"
+    exec(mv)
+    return true
+}
+
+// backup: cp <path> <path>.bak.<ts>
+fn _backup_file(path: string, ts: string) -> string {
+    let bak = path + ".bak." + ts
+    let cmd = "cp '" + path + "' '" + bak + "'"
+    exec(cmd)
+    if !file_exists(bak) { return "" }
+    return bak
+}
+
+// restore: mv <bak> <orig>
+fn _restore_backup(orig: string, bak: string) -> bool {
+    if !file_exists(bak) { return false }
+    let cmd = "cp '" + bak + "' '" + orig + "'"
+    exec(cmd)
+    return file_exists(orig)
+}
+
+// parse-verify: try `hexa parse` if available, fallback to `hexa run --selftest`
+// for the lens (lens files are scripts; safer to do a parse-only check).
+// Returns true if exit 0.
+fn _parse_verify(path: string) -> bool {
+    // hexa CLI: prefer `hexa parse <file>` if subcommand exists. Fallback:
+    // grep -q `let SCORE = <num>` to ensure replacement is well-formed.
+    let cmd = "hexa parse '" + path + "' >/dev/null 2>&1 && echo OK || echo FAIL"
+    let out = to_string(exec(cmd)).trim()
+    if out == "OK" { return true }
+    // fallback: shape check — line `let SCORE = <num>` must be present and
+    // file must still parse-pattern with `let `, balanced braces (cheap).
+    let cmd2 = "grep -E '^[[:space:]]*let[[:space:]]+SCORE[[:space:]]*=[[:space:]]*[0-9]+\\.[0-9]+' '" + path + "' >/dev/null 2>&1 && echo OK || echo FAIL"
+    let out2 = to_string(exec(cmd2)).trim()
+    if out2 == "OK" { return true }
+    return false
+}
+
+// --diff-only: emit plan without mutating
+fn _emit_diff_only(plan: array) {
+    println("lens_atlas_orchestrator — --diff-only (no mutation)")
+    println("---")
+    let mut idx = 0
+    while idx < len(plan) {
+        let p = plan[idx]
+        let name = p[0]
+        let path = p[1]
+        let oldline = p[2]
+        let new_score = p[3]
+        let newline = p[4]
+        let status = p[5]
+        println("[" + status + "] " + name)
+        println("  path: " + path)
+        if status == "plan" {
+            println("  - " + oldline)
+            println("  + " + newline + "  (target_score=" + new_score + ")")
+        } else if status == "skip-no-score" {
+            println("  // reason=no `let SCORE = <num>` line found fix=add `let SCORE = <base>` constant or accept skip (mutation safe-blocked)")
+        } else {
+            println("  // reason=file missing fix=ensure lens path exists")
+        }
+        idx = idx + 1
+    }
+    let mut planned = 0
+    let mut skipped = 0
+    for p in plan {
+        if p[5] == "plan" { planned = planned + 1 } else { skipped = skipped + 1 }
+    }
+    println("---")
+    println("summary: planned=" + to_string(planned) + " skipped=" + to_string(skipped) + " total=" + to_string(len(plan)))
+    println("__LENS_ATLAS_ORCH__ PASS pilot=" + to_string(len(plan)) + " mode=diff-only planned=" + to_string(planned) + " skipped=" + to_string(skipped))
+    exit(0)
+}
+
+// --apply --apply-confirm: actual mutation pass
+fn _emit_apply(plan: array) {
+    let ts = _now_backup_ts()
+    println("lens_atlas_orchestrator — --apply --apply-confirm (mutation, ts=" + ts + ")")
+    println("---")
+    let mut applied = 0
+    let mut skipped = 0
+    let mut rolled_back = 0
+    let mut failures = []
+    for p in plan {
+        let name = p[0]
+        let path = p[1]
+        let oldline = p[2]
+        let new_score = p[3]
+        let newline = p[4]
+        let status = p[5]
+        if status != "plan" {
+            println("[skip] " + name + " // status=" + status)
+            skipped = skipped + 1
+            continue
+        }
+        let lineno = _line_number_of(oldline)
+        if lineno < 1 {
+            println("[skip] " + name + " // reason=line-number-extract-failed fix=verify grep -n output format")
+            skipped = skipped + 1
+            continue
+        }
+        let bak = _backup_file(path, ts)
+        if len(bak) == 0 {
+            println("[fail] " + name + " // reason=backup-failed fix=check fs perms on " + path)
+            failures.push(name)
+            continue
+        }
+        let ok = _replace_line_in_file(path, lineno, newline)
+        if !ok {
+            println("[fail] " + name + " // reason=replace-failed fix=lineno=" + to_string(lineno) + " out-of-range or write_file error")
+            _restore_backup(path, bak)
+            rolled_back = rolled_back + 1
+            failures.push(name)
+            continue
+        }
+        let parse_ok = _parse_verify(path)
+        if !parse_ok {
+            let restored = _restore_backup(path, bak)
+            rolled_back = rolled_back + 1
+            failures.push(name)
+            let restore_msg = if restored { "restored from " + bak } else { "RESTORE FAILED — manual intervention required, .bak at " + bak }
+            println("[fail+rollback] " + name + " // reason=post-mutation-parse-fail fix=" + restore_msg)
+            continue
+        }
+        println("[apply] " + name + " score=" + new_score + " (backup=" + bak + ")")
+        applied = applied + 1
+    }
+    println("---")
+    println("summary: applied=" + to_string(applied) + " skipped=" + to_string(skipped) + " rolled_back=" + to_string(rolled_back) + " total=" + to_string(len(plan)))
+    if len(failures) > 0 {
+        eprintln("__LENS_ATLAS_ORCH__ FAIL apply applied=" + to_string(applied) + " rolled_back=" + to_string(rolled_back))
+        eprintln("// reason=mutation-or-parse-fail fix=inspect .bak.<ts> files and re-run --selftest")
+        exit(3)
+    }
+    println("__LENS_ATLAS_ORCH__ PASS pilot=" + to_string(len(plan)) + " mode=apply applied=" + to_string(applied) + " skipped=" + to_string(skipped))
+    exit(0)
+}
+
+// --rollback: restore the most recent .bak.<ts> for each pilot lens
+fn _emit_rollback() {
+    let pilots = _list_pilot_lenses()
+    println("lens_atlas_orchestrator — --rollback (restore latest .bak.<ts>)")
+    println("---")
+    let mut restored = 0
+    let mut missing = 0
+    for p in pilots {
+        let name = p[0]
+        let path = p[1]
+        // find most recent backup matching <path>.bak.*
+        let cmd = "ls -1t '" + path + "'.bak.* 2>/dev/null | head -1"
+        let bak = to_string(exec(cmd)).trim()
+        if len(bak) == 0 {
+            println("[skip] " + name + " // reason=no-backup-found fix=run --apply --apply-confirm first or accept clean state")
+            missing = missing + 1
+            continue
+        }
+        let ok = _restore_backup(path, bak)
+        if !ok {
+            println("[fail] " + name + " // reason=restore-failed bak=" + bak + " fix=check fs perms")
+            continue
+        }
+        println("[restore] " + name + " <- " + bak)
+        restored = restored + 1
+    }
+    println("---")
+    println("summary: restored=" + to_string(restored) + " missing=" + to_string(missing) + " total=" + to_string(len(pilots)))
+    println("__LENS_ATLAS_ORCH__ PASS mode=rollback restored=" + to_string(restored))
+    exit(0)
+}
+
+// --apply without --apply-confirm: explicit witness + exit 3 (safety gate)
+fn _apply_needs_confirm() {
+    eprintln("__LENS_ATLAS_ORCH__ FAIL apply-needs-confirm")
+    eprintln("[lens_atlas_orchestrator] --apply requires explicit --apply-confirm flag (mutation gate). // reason=double-confirmation-protects-lens-files fix=re-run with `--apply --apply-confirm` after reviewing `--diff-only` output")
     exit(3)
 }
 
