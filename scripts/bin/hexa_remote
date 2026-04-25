@@ -643,19 +643,139 @@ if [ "$_IS_HEAVY_COMPUTE" = "1" ] \
         # awk 의 `+0` 으로 숫자 변환 + 부동소수점 자릿수 제거.
         _psi_int="$(printf '%s' "$_picked_psi" | awk -F. '{print $1+0}')"
         if [ -n "$_psi_int" ] && [ "$_psi_int" -ge "$_psi_threshold" ] 2>/dev/null; then
-            echo "hexa_remote: L4 PSI reject — host=$HOST class=$_job_class psi_avg10=${_picked_psi}% ≥ ${_psi_threshold}%" >&2
-            # Slot 즉시 반납 (L3 reject path 와 동일 cleanup).
-            if [ -n "${_ACQUIRED:-}" ]; then
-                rm -rf "$_ACQUIRED" 2>/dev/null || true
-                _ACQUIRED=""
+            # ──────────────────────────────────────────────────────────────
+            # nxs-20260425-003 Phase 4 / L7 (cycle 52, 2026-04-26):
+            # PSI-defer FIFO queue — cross-session drill contention 해결.
+            #
+            # Background (cycle 51 진단):
+            #   다른 Claude 세션 active drill (round 10+) 시 host PSI 97% →
+            #   본 세션 dispatch 도 같은 host 진입 시 L4 PSI reject (Phase 1
+            #   85% 도 부족) → blacklist 모든 host → abort. Phase 1 (PSI
+            #   threshold) + Phase 4 minimal (lock fast-fail) 만으로 미커버.
+            #
+            # Mechanism (Mac-side, shared file FIFO + per-host PSI poll):
+            #   1) L4 PSI reject 시 즉시 exit 64 대신 /tmp/hexa_remote.psi_queue.<host>.tsv
+            #      에 self 등록 (mkdir lock atomic enqueue).
+            #   2) Polling loop: head pid=self 이고 PSI 가 threshold 아래로
+            #      회복했는지 _probe_host 로 재측정 (HEXA_REMOTE_LAST_PSI 갱신).
+            #   3) 회복 시 dequeue + 정상 진행 (blacklist 미등록).
+            #   4) Deadline (default 300s) 초과 시 dequeue + blacklist 등록 +
+            #      기존 exit 64 path (caller 가 fallback chain 진행).
+            #
+            # Fairness: FIFO head pid 우선 (동시 다 세션 이 같은 host 대기 시
+            # enqueue 순서대로 진입). 동일 host 자원 직렬화 → cross-session
+            # contention 예측 가능 wait time.
+            #
+            # 의존도 0 정책: shell script 변경만, 새 helper file/외부 layer
+            # 미추가. 기존 mkdir-lock pattern (L6 큐 line 443+) 동일 패턴.
+            #
+            # Override:
+            #   HEXA_REMOTE_NO_PSI_QUEUE=1     L7 비활성 (즉시 exit 64, cycle 51 동작)
+            #   HEXA_REMOTE_PSI_QUEUE_TTL=S    deadline (default 300s)
+            #   HEXA_REMOTE_PSI_QUEUE_POLL=S   polling 간격 (default 10s)
+            # ──────────────────────────────────────────────────────────────
+            if [ "${HEXA_REMOTE_NO_PSI_QUEUE:-0}" != "1" ]; then
+                _PSI_Q_FILE="/tmp/hexa_remote.psi_queue.${HOST}.tsv"
+                _PSI_Q_LOCK="${_PSI_Q_FILE}.lock"
+                _PSI_Q_TS="$(date +%s)"
+                _PSI_Q_TTL="${HEXA_REMOTE_PSI_QUEUE_TTL:-300}"
+                _PSI_Q_POLL="${HEXA_REMOTE_PSI_QUEUE_POLL:-10}"
+                _PSI_Q_DEADLINE=$((_PSI_Q_TS + _PSI_Q_TTL))
+                # Acquire enqueue lock (atomic mkdir, 5s timeout w/ stale clean).
+                _psiq_lock_tries=0
+                while ! mkdir "$_PSI_Q_LOCK" 2>/dev/null; do
+                    _psiq_lock_tries=$((_psiq_lock_tries + 1))
+                    if [ "$_psiq_lock_tries" -ge 50 ]; then
+                        _psiq_lock_age="$(( $(date +%s) - $(stat -f %m "$_PSI_Q_LOCK" 2>/dev/null || stat -c %Y "$_PSI_Q_LOCK" 2>/dev/null || date +%s) ))"
+                        if [ "$_psiq_lock_age" -ge 30 ]; then
+                            rm -rf "$_PSI_Q_LOCK" 2>/dev/null || true
+                        fi
+                        break
+                    fi
+                    sleep 0.1
+                done
+                # Stale-clean: deadline 초과 entry 제거.
+                if [ -f "$_PSI_Q_FILE" ]; then
+                    _psiq_now="$(date +%s)"
+                    awk -F'\t' -v now="$_psiq_now" '$2 > now {print}' "$_PSI_Q_FILE" > "$_PSI_Q_FILE.tmp" 2>/dev/null \
+                        && mv "$_PSI_Q_FILE.tmp" "$_PSI_Q_FILE"
+                fi
+                # Append self: enqueue_ts \t deadline \t class \t pid \t psi_seen
+                printf '%s\t%s\t%s\t%s\t%s\n' "$_PSI_Q_TS" "$_PSI_Q_DEADLINE" "$_job_class" "$$" "$_picked_psi" >> "$_PSI_Q_FILE"
+                rm -rf "$_PSI_Q_LOCK" 2>/dev/null || true
+                # Self-cleanup trap (자기 entry 제거, idempotent w/ dequeue).
+                trap '
+                    if mkdir "'"$_PSI_Q_LOCK"'" 2>/dev/null; then
+                        if [ -f "'"$_PSI_Q_FILE"'" ]; then
+                            awk -F"\t" -v p="'"$$"'" "\$4 != p {print}" "'"$_PSI_Q_FILE"'" > "'"$_PSI_Q_FILE"'.tmp" 2>/dev/null \
+                                && mv "'"$_PSI_Q_FILE"'.tmp" "'"$_PSI_Q_FILE"'"
+                        fi
+                        rm -rf "'"$_PSI_Q_LOCK"'" 2>/dev/null || true
+                    fi
+                    if [ -n "${_ACQUIRED:-}" ]; then rm -rf "$_ACQUIRED" 2>/dev/null || true; fi
+                ' EXIT INT TERM
+                echo "hexa_remote: L7 PSI-defer queue — host=$HOST class=$_job_class psi=${_picked_psi}% ≥ ${_psi_threshold}% (pid=$$ ttl=${_PSI_Q_TTL}s, polling every ${_PSI_Q_POLL}s)" >&2
+                # Polling loop: head pid + PSI 회복 체크.
+                _psiq_recovered=0
+                while [ "$(date +%s)" -lt "$_PSI_Q_DEADLINE" ]; do
+                    sleep "$_PSI_Q_POLL"
+                    _psiq_head_pid="$(awk -F'\t' 'NR==1 {print $4}' "$_PSI_Q_FILE" 2>/dev/null || echo "")"
+                    if [ "$_psiq_head_pid" != "$$" ]; then
+                        continue  # 앞순위 작업 진행 중.
+                    fi
+                    # head — re-probe PSI.
+                    HEXA_REMOTE_LAST_AVAIL=""
+                    HEXA_REMOTE_LAST_PSI=""
+                    if _probe_host "$HOST"; then
+                        _psiq_new_psi="${HEXA_REMOTE_LAST_PSI:-}"
+                        _psiq_new_int="$(printf '%s' "$_psiq_new_psi" | awk -F. '{print $1+0}')"
+                        if [ -n "$_psiq_new_int" ] && [ "$_psiq_new_int" -lt "$_psi_threshold" ] 2>/dev/null; then
+                            # Recovered. Update _picked_psi + _best_avail and dequeue.
+                            _picked_psi="$_psiq_new_psi"
+                            _best_avail="${HEXA_REMOTE_LAST_AVAIL:-$_best_avail}"
+                            if mkdir "$_PSI_Q_LOCK" 2>/dev/null; then
+                                if [ -f "$_PSI_Q_FILE" ]; then
+                                    awk -F'\t' -v p="$$" '$4 != p {print}' "$_PSI_Q_FILE" > "$_PSI_Q_FILE.tmp" 2>/dev/null \
+                                        && mv "$_PSI_Q_FILE.tmp" "$_PSI_Q_FILE"
+                                fi
+                                rm -rf "$_PSI_Q_LOCK" 2>/dev/null || true
+                            fi
+                            echo "hexa_remote: L7 dequeued — host=$HOST psi recovered ${_picked_psi}% < ${_psi_threshold}% after $(( $(date +%s) - _PSI_Q_TS ))s wait" >&2
+                            _psiq_recovered=1
+                            break
+                        fi
+                    fi
+                done
+                if [ "$_psiq_recovered" = "1" ]; then
+                    : # fall-through to success path below (skip exit 64).
+                else
+                    # Deadline reached — fallback to original blacklist+exit 64 behavior.
+                    echo "hexa_remote: L7 PSI-defer timeout (${_PSI_Q_TTL}s) — host=$HOST psi 회복 실패, fallback chain trigger" >&2
+                    if [ -n "${_ACQUIRED:-}" ]; then
+                        rm -rf "$_ACQUIRED" 2>/dev/null || true
+                        _ACQUIRED=""
+                    fi
+                    if [ "${HEXA_REMOTE_NO_BLACKLIST:-0}" != "1" ]; then
+                        : > "/tmp/hexa_remote.blacklist.$HOST" 2>/dev/null || true
+                    fi
+                    printf 'NEXUS_REMOTE_ERROR {"host":"%s","psi_avg10":"%s","psi_threshold":%s,"job_class":"%s","reason":"l7_psi_defer_timeout","wait_s":%s,"exit_code":64}\n' \
+                        "$HOST" "$_picked_psi" "$_psi_threshold" "$_job_class" "$_PSI_Q_TTL" >&2
+                    exit 64
+                fi
+            else
+                # Original Phase 1 behavior (NO_PSI_QUEUE=1 bypass).
+                echo "hexa_remote: L4 PSI reject — host=$HOST class=$_job_class psi_avg10=${_picked_psi}% ≥ ${_psi_threshold}%" >&2
+                if [ -n "${_ACQUIRED:-}" ]; then
+                    rm -rf "$_ACQUIRED" 2>/dev/null || true
+                    _ACQUIRED=""
+                fi
+                if [ "${HEXA_REMOTE_NO_BLACKLIST:-0}" != "1" ]; then
+                    : > "/tmp/hexa_remote.blacklist.$HOST" 2>/dev/null || true
+                fi
+                printf 'NEXUS_REMOTE_ERROR {"host":"%s","psi_avg10":"%s","psi_threshold":%s,"job_class":"%s","reason":"l4_psi_pressure","exit_code":64}\n' \
+                    "$HOST" "$_picked_psi" "$_psi_threshold" "$_job_class" >&2
+                exit 64
             fi
-            # blacklist 등록 — 다음 invocation 도 같은 호스트 재시도 차단 (TTL 300s).
-            if [ "${HEXA_REMOTE_NO_BLACKLIST:-0}" != "1" ]; then
-                : > "/tmp/hexa_remote.blacklist.$HOST" 2>/dev/null || true
-            fi
-            printf 'NEXUS_REMOTE_ERROR {"host":"%s","psi_avg10":"%s","psi_threshold":%s,"job_class":"%s","reason":"l4_psi_pressure","exit_code":64}\n' \
-                "$HOST" "$_picked_psi" "$_psi_threshold" "$_job_class" >&2
-            exit 64
         fi
     fi
     # Success path — class/min/psi 한 줄 진단 (caller observability).

@@ -99,9 +99,92 @@ User explicit override (`HEXA_REMOTE_REMOTE_LOCK_WAIT`, `HEXA_REMOTE_NO_REMOTE_L
 |---|---|
 | 2 | hexa-runner Dockerfile audit + bind mount fix (docker fallback path validation) |
 | 4 | host-side NEXUS_LOCK_TIMEOUT JSON emit wrapper |
-| 4 | drill slot semaphore (multiple parallel slots) |
-| 4 | FIFO queue + reject 표시 |
+| 4 | ~~drill slot semaphore (multiple parallel slots)~~ → **§9 L7 PSI-defer FIFO queue (cycle 52)** |
+| 4 | ~~FIFO queue + reject 표시~~ → **§9 L7 (cycle 52, design+impl)** |
 | enforce | git pre-commit / lint / runtime caller wire (의존 layer 추가 필요 — user 결정 대기) |
+
+---
+
+## 9. Phase 4 / L7 PSI-defer FIFO queue (cycle 52, ✅ DESIGN + IMPL)
+
+### 9.1 Background — cycle 51 진단 결과
+
+cycle 51 에서 본 세션 dispatch path 의 **진짜 root cause** 가 발견됨:
+
+```
+hexa_remote: L4 PSI reject — host=htz class=small psi_avg10=97.07% ≥ 85%
+NEXUS_REMOTE_ERROR exit_code:64
+NEXUS_REMOTE_DOWNGRADE fallback:abort
+hexa resolver: heavy-compute + Darwin + all-hosts-unreachable → abort
+```
+
+다른 Claude 세션 active drill (round 10+ 진행) 이 host PSI 97% 까지 올림 → Phase 1 fix 의 85% 도 부족 → 모든 host blacklist 5min TTL → abort.
+
+Phase 1 (PSI 70→85) + Phase 4 minimal (lock 30s + flock -E 64) 만으로 미커버.
+
+### 9.2 Saturation phase — mechanism candidates
+
+| 후보 | 분석 | 채택 |
+|---|---|---|
+| (A) drill slot semaphore (per-host N parallel) | host 자원이 *PSI* 로 saturate 된 상황엔 무용 — single drill 이 hetzner 100GB+ RSS 점유, 두 번째 slot 들어가도 즉시 OOM | ❌ |
+| (B) PSI dynamic threshold (active drill count 기반) | active drill count 추적 = 별도 host-side counter file 필요. 여전히 본질은 같은 자원 경쟁 | △ partial |
+| (C) FIFO queue + 즉시 abort 표시 | abort 자체가 본 세션 drill 0 yield 의 원인 — 본질 미해결 | ❌ |
+| (D) **PSI-defer FIFO queue** (L4 reject 시 즉시 exit 대신 queue + PSI 회복 polling) | 자원 직렬화 + fairness + abort 회피 모두 만족. 기존 L6 queue pattern 재사용 (mkdir lock atomic) | ✅ |
+
+**채택**: (D) — drill slot semaphore 의 본질 (cross-session 직렬화) 을 single-host PSI 자원 자체에 적용. semaphore 의 "N concurrent slots" 대신 "PSI threshold 아래 = 1 slot, 그 이상 = 0 slot" 의 dynamic admission.
+
+### 9.3 Implementation
+
+`scripts/bin/hexa_remote:645+` (line 645-660 의 L4 reject 분기 확장):
+
+| 변경 | before (cycle 51) | **after (cycle 52)** |
+|---|---|---|
+| L4 PSI reject 동작 | 즉시 blacklist + `exit 64` | **L7 PSI-defer FIFO queue + polling** |
+| Recovery path | 없음 (caller fallback chain → abort) | **PSI 회복 시 dequeue + 정상 진행 (no blacklist)** |
+| Timeout fallback | n/a | **deadline (default 300s) 초과 시 기존 blacklist+exit 64 path** |
+
+**Mechanism details**:
+- Queue file: `/tmp/hexa_remote.psi_queue.<host>.tsv` (per-host FIFO)
+- Lock: `mkdir <queue>.lock` atomic (기존 L6 pattern 재사용)
+- Format (TSV): `enqueue_ts \t deadline \t class \t pid \t psi_seen`
+- Polling: head pid=self 이고 `_probe_host` 가 PSI < threshold 회복 시 dequeue + fall-through to success path
+- Trap cleanup: EXIT/INT/TERM 시 자기 entry 자동 제거 (idempotent w/ dequeue)
+
+**Override** (의존도 0 정책 일관):
+- `HEXA_REMOTE_NO_PSI_QUEUE=1` — L7 비활성 (cycle 51 동작 — 즉시 exit 64)
+- `HEXA_REMOTE_PSI_QUEUE_TTL=S` — deadline (default 300s)
+- `HEXA_REMOTE_PSI_QUEUE_POLL=S` — polling 간격 (default 10s)
+
+### 9.4 Sensitivity probe
+
+| param | default | rationale |
+|---|---|---|
+| TTL 300s | 300s | drill round 1개 typical 60-180s — 1-3 round 대기로 충분. user override 가능. |
+| POLL 10s | 10s | PSI avg10 가 10s window → polling 도 같은 window. 너무 자주 = SSH probe 비용, 너무 드물게 = head 통과 후 다음 entry 대기 lag. |
+| stale clean 30s lock age | 30s | mkdir-lock holder 가 죽은 경우 회수 — 기존 L6 (cycle 30 추가) 동일 값. |
+
+### 9.5 Effect 예측
+
+| 시나리오 | before (cycle 51) | **after (cycle 52)** |
+|---|---|---|
+| 다른 세션 drill 60s 진행 중 | 본 세션 즉시 abort | **본 세션 60s 후 정상 진행** (queue head, PSI 회복) |
+| 두 세션 동시 진입, 같은 host | 둘 중 하나 abort | **FIFO 순서대로 직렬 진행** (fairness) |
+| 다른 세션 drill 5min+ 장기 | 본 세션 abort | **300s TTL 후 fallback** (기존 abort 동작 보존) |
+| no contention | 영향 없음 | **영향 없음** (L4 PSI 통과 → L7 미진입) |
+| `HEXA_REMOTE_NO_PSI_QUEUE=1` | n/a | **cycle 51 동작 그대로** (override 우선) |
+
+### 9.6 의존도 0 일관성
+
+| layer | status |
+|---|---|
+| Claude hooks | ❌ 미사용 |
+| git hooks | ❌ 미사용 |
+| launchd | ❌ 미사용 |
+| LD_PRELOAD | ❌ 미사용 |
+| 새 helper file | ❌ 미추가 (`hexa_remote` 단일 파일 변경) |
+| 새 shared 의존성 | ❌ (`/tmp` mkdir/awk/sleep/stat — POSIX) |
+
+기존 L6 cross-host queue (line 430-521) + L4 PSI gate (line 627-645) 와 동일 pattern. 새 dependency layer 0.
 
 ---
 
@@ -109,4 +192,6 @@ User explicit override (`HEXA_REMOTE_REMOTE_LOCK_WAIT`, `HEXA_REMOTE_NO_REMOTE_L
 
 본 세션 cycle 12-47 의 nxs-20260425-003 dispatch blocker 작업 = drill_zero_yield 의 4-layer root cause 중 L1+L4 fix 완료. L2/L3 lower priority. 의존도 0 정책 일관 유지. raw 37/38 enforce 는 voluntary discipline 으로 honest disclosure.
 
-본 audit 가 nxs-003 의 deliverable. 후속 작업 (Phase 2 docker, Phase 4 추가 features, real enforce wire) 는 별개 cycles.
+cycle 52 에서 cross-session contention 잔존 issue 를 L7 PSI-defer FIFO queue 로 해결 (§9). drill slot semaphore + FIFO queue 의 본질 (자원 직렬화 + fairness) 을 PSI threshold 회복 polling 으로 통합. 의존도 0 정책 일관.
+
+본 audit 가 nxs-003 의 deliverable. 후속 작업 (Phase 2 docker, real enforce wire) 는 별개 cycles.
