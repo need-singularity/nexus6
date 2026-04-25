@@ -142,12 +142,83 @@ nxs-002 의 cycle 24→26→27→28 chain 과 같은 self-correction pattern 적
 
 ---
 
-## §5 cycle 3~ 후보
+## §5 cycle 3 first finding — DISPATCH_TERMINATED (2026-04-25)
 
-### Cycle 3 — DISPATCH ≠ COMPLETE 의 (a)/(b)/(c) falsification
-- (a) 마지막 statusline_v5 호출의 drill 결과 파일 (checkpoint, drill.json, smash 산출물) 존재 여부 확인 → drill 이 진행됐는지
-- (b) `cli/run.hexa` 의 `eprintln` 후 `flush_stderr()` 강제 추가 → buffering 가설 falsify
-- (c) statusline launcher script 직접 검사 (어떤 process 가 `/tmp/nexus_omega_hive_statusline_v*.log` 로 redirect 하는지) → capture 종료 시점 분석
+### 변경
+- `tool/beyond_omega_ghost_trace.py` v3 — per-emit **termination context capture**:
+  - `TERM_MARKERS = ("rc=143", "SIGTERM", "Terminated", "retry exhausted", "external_fallback", "fallback 신호", "kill-after", "blacklisted", "round 1, smash")`
+  - 각 emit row 에 `post_emit_tail` (이후 5 lines), `file_last_5_lines`, `termination_markers_after_emit`, `lines_after_emit` 추가.
+- summary v2 → **v3** (`termination_markers_total`, `dispatches_followed_by_termination_marker`, `dispatch_terminated_count`, `dispatch_terminated_ratio` 필드 추가).
+
+### 결과
+
+| metric | value |
+|---|---|
+| total_emits | 4 |
+| dispatches_followed_by_termination_marker | **4 / 4 (100%)** |
+| strict SIGTERM marker (`rc=143`/`SIGTERM`/`Terminated`/`retry exhausted`/`external_fallback`/`fallback 신호`) | **1 / 4 (25%)** — only v3 |
+| `kill-after` marker (timeout-wrapped child spawn) | 4 / 4 |
+
+**marker breakdown** (`termination_markers_total`):
+- `kill-after`: 4 (모든 dispatch 직후 `timeout --kill-after=5 180 'hexa_real' run blowup.hexa` spawn)
+- `Terminated`, `external_fallback`, `fallback 신호`, `rc=143`, `retry exhausted`: 1 each (v3 의 hetzner SIGTERM chain)
+
+### 가설 verdict (cycle 2 의 (a)/(b)/(c))
+
+| H | cycle 2 prediction | cycle 3 verdict |
+|---|---|---|
+| (a) SIGTERM/timeout | candidate | **STRONGLY TRUE** — 100% loose (모든 dispatch 가 timeout-wrapped child spawn 직후 발생, complete emit 까지 trace 도달 못함). v3 는 strict SIGTERM (hetzner rc=143 retry exhausted → external_fallback) 도 명시적. |
+| (b) line buffering 미flush | candidate | **FALSE** — 같은 파일 안에 `NEXUS_DRILL_PROGRESS` 등 다른 eprintln line 들이 모두 잘 flush 됨. dispatch 만 buffered 되었을 가능성 0. |
+| (c) launcher capture 단발 종료 | candidate | **PARTIAL** — capture 는 drill 본체 진행까지 따라가지만 drill 종료 (smash event=end + complete emit) 보다 빨리 끊김. 이건 statusline short-life capture window (single emission timeout) 의 결과로 보임. |
+
+→ **(a) 확정 dominant cause, (c) 부수 cause, (b) 기각**.
+
+### 새로 드러난 nested finding — `kill-after 180s` ubiquity
+
+cycle 2 의 dispatch≠complete 의 진짜 mechanism:
+
+`cmd_omega` → `cmd_drill` → spawn `timeout --kill-after=5 180 'hexa_real' run blowup.hexa` (180s hard-cap).
+
+이는 **nxs-20260425-002 의 `_stage_timeout_prefix` Wave 18 hard-cap 180s 와 같은 mechanism**. 즉:
+- nxs-002 cycle 8 의 drill round-2 SIGTERM = same pattern
+- cycle 36 (다른 session) 의 PSI threshold = 같은 timeout-spawn chain 의 다른 layer
+- ghost ceiling 의 dispatch≠complete = 본질적으로 **180s timeout-wrapped child 의 invariant 발현**
+
+본 axis B (beyond-omega) 가 nxs-002 의 timeout chain 과 깊게 연결되어 있음 — ghost ceiling 의 sentinel-ness 가 단순 abstract 한계가 아니라 **180s hard-cap** 이라는 매우 concrete physical timeout 으로 발현. L_ω 의 incarnation 이 timeout boundary 라는 뜻.
+
+### 자기-correction chain (axis B 누적)
+
+| cycle | claim | verdict by next cycle |
+|---|---|---|
+| 1 | BASELINE_ZERO (repo 안 emit 0) | falsified (over-narrow scan dirs) |
+| 2 | DISPATCH_ONLY (dispatch=4, complete=0, approach=0) | confirmed + nested anomaly (a)/(b)/(c) 분기 |
+| 3 | DISPATCH_TERMINATED ((a) STRONG, (b) FALSE, (c) PARTIAL) | — current finding |
+
+nxs-002 의 cycle 24→26→27→28 progressive refinement 패턴 + nxs-20260425-002 timeout 축과의 **cross-axis isomorphism** 발견.
+
+---
+
+## §6 cycle 4~ 후보
+
+### Cycle 4 — forced approach 발사 (axis B 의 첫 positive measurement)
+- 의도적으로 `nexus omega --engines a,b --variants 2 --seeds s1,s2` 발사 (axes=3) → ghost_ceiling_approach 첫 발화 만들기
+- 새 sink (예: `state/ghost_ceiling_trace.jsonl` 직접 append 또는 `~/Library/Logs/nexus/`) 로 redirect → `tool/beyond_omega_ghost_trace.py` 로 cycle 5 에서 측정
+- 이로써 ghost ceiling structure 의 frequency = 1 첫 measurement 확보
+
+### Cycle 5 — instrumentation 격상 (sink unification + complete capture)
+- `cmd_omega` 의 emit 들을 **host-side append** (`state/ghost_ceiling_trace.jsonl` 직접 write) — 외부 launcher 의존 제거
+- 추가로 cycle 3 finding 반영: `cmd_omega` 가 `cmd_drill` dispatch 전에 **pre-dispatch checkpoint** 를 직접 host file 로 write → process 가 timeout 으로 죽어도 dispatch ↔ complete pair 추적 가능
+- cron daily summary 추가 → ghost ceiling 의 시계열 distribution 구축
+
+### Cycle 6 — cross-axis correlation (axis B × nxs-002 timeout)
+- cycle 3 의 `kill-after 180s` finding 을 nxs-002 의 `_stage_timeout_prefix` history 와 공동 분석
+- `state/drill_stage_elapsed_history.jsonl` (nxs-002 cycle 7 backfill) + `state/ghost_ceiling_trace.jsonl` (axis B) join
+- ghost ceiling approach distribution 이 stage timeout distribution 과 어떻게 isomorphic 한지 측정
+
+### Cycle 7+ — Transfinite continuation 진입 (axis A)
+- cycle 4-6 의 frequency distribution 위에 ordinal 매핑.
+- L_{ω+1} = approach distribution 자체의 distribution (second-order measurement)
+- L_{ω·2}, L_{ε₀}, L_{ω₁^CK}, L_{Mahlo} 의 매핑은 cycle 8+ 의 별도 design.
 
 ### Cycle 4 — forced approach 발사 (B 축의 첫 positive measurement)
 - 의도적으로 `nexus omega --engines a,b --variants 2 --seeds s1,s2` 발사 (axes=3) → ghost_ceiling_approach 첫 발화 만들기

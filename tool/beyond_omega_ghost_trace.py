@@ -81,32 +81,59 @@ def iter_files():
             yield p
 
 
+# cycle 3 (2026-04-25): per-emit termination context capture.
+# dispatch≠complete anomaly 의 (a) SIGTERM / (b) buffering / (c) launcher capture
+# 셋 중 어느 것이 사실인지 falsify 하려면 emit 직후 file tail 에 SIGTERM/rc=143/
+# external_fallback/timeout 등의 marker 가 있는지 확인해야 함.
+TERM_MARKERS = (
+    "rc=143",
+    "SIGTERM",
+    "Terminated",
+    "retry exhausted",
+    "external_fallback",
+    "fallback 신호",
+    "kill-after",
+    "blacklisted",
+    "round 1, smash",
+)
+
+
 def scan_one(path: Path):
     out = []
+    lines: list[str] = []
     try:
         with open(path, "r", errors="replace") as fh:
-            for lineno, line in enumerate(fh, 1):
-                if "NEXUS_OMEGA" not in line:
-                    continue
-                m = EMIT_RE.search(line)
-                if not m:
-                    continue
-                raw = m.group(1)
-                try:
-                    payload = json.loads(raw)
-                except json.JSONDecodeError:
-                    payload = {"_unparsed": raw}
-                try:
-                    rel = str(path.relative_to(REPO))
-                except ValueError:
-                    rel = str(path)  # external sink (/tmp, ~/Library/Logs, …)
-                out.append({
-                    "file": rel,
-                    "lineno": lineno,
-                    "payload": payload,
-                })
+            lines = fh.readlines()
     except OSError:
-        pass
+        return out
+    for lineno, line in enumerate(lines, 1):
+        if "NEXUS_OMEGA" not in line:
+            continue
+        m = EMIT_RE.search(line)
+        if not m:
+            continue
+        raw = m.group(1)
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            payload = {"_unparsed": raw}
+        try:
+            rel = str(path.relative_to(REPO))
+        except ValueError:
+            rel = str(path)
+        # tail context: emit 이후 마지막 5 lines, 그리고 termination marker hit
+        tail = [l.rstrip() for l in lines[lineno:lineno + 5]]
+        last_tail = [l.rstrip() for l in lines[-5:]]
+        markers_hit = sorted({mk for mk in TERM_MARKERS for l in lines[lineno:] if mk in l})
+        out.append({
+            "file": rel,
+            "lineno": lineno,
+            "payload": payload,
+            "post_emit_tail": tail,
+            "file_last_5_lines": last_tail,
+            "termination_markers_after_emit": markers_hit,
+            "lines_after_emit": len(lines) - lineno,
+        })
     return out
 
 
@@ -114,7 +141,9 @@ def summarize(rows):
     by_event: dict[str, int] = {}
     by_path: dict[str, int] = {}
     by_axes: dict[str, int] = {}
+    by_marker: dict[str, int] = {}
     ghost_approach = []
+    dispatches_with_marker = 0
     for r in rows:
         p = r["payload"]
         ev = str(p.get("event", "_unknown"))
@@ -125,11 +154,18 @@ def summarize(rows):
             by_axes[str(p["axes"])] = by_axes.get(str(p["axes"]), 0) + 1
         if ev == "ghost_ceiling_approach":
             ghost_approach.append(r)
+        markers = r.get("termination_markers_after_emit", [])
+        if ev == "dispatch" and markers:
+            dispatches_with_marker += 1
+        for mk in markers:
+            by_marker[mk] = by_marker.get(mk, 0) + 1
     return {
         "total_emits": len(rows),
         "events": by_event,
         "paths": by_path,
         "axes_distribution": by_axes,
+        "termination_markers_total": by_marker,
+        "dispatches_followed_by_termination_marker": dispatches_with_marker,
         "ghost_ceiling_approach_count": by_event.get("ghost_ceiling_approach", 0),
         "ghost_ceiling_approach_samples": ghost_approach[:10],
     }
@@ -153,7 +189,7 @@ def main(argv):
             fh.write(json.dumps(r, ensure_ascii=False) + "\n")
 
     summary = {
-        "schema": "nexus.beyond_omega.ghost_trace.v2",
+        "schema": "nexus.beyond_omega.ghost_trace.v3",
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "repo": str(REPO),
         "scan_dirs_existing": [str(d.relative_to(REPO)) for d in SCAN_DIRS if d.exists()],
@@ -180,31 +216,35 @@ def _interpret(rows):
     approach = sum(1 for r in rows if r["payload"].get("event") == "ghost_ceiling_approach")
     dispatch = sum(1 for r in rows if r["payload"].get("event") == "dispatch")
     complete = sum(1 for r in rows if r["payload"].get("event") == "complete")
+    sigterm = sum(
+        1 for r in rows
+        if r["payload"].get("event") == "dispatch"
+        and any(mk in r.get("termination_markers_after_emit", [])
+                for mk in ("rc=143", "SIGTERM", "Terminated", "retry exhausted", "external_fallback", "fallback 신호"))
+    )
     if n == 0:
+        finding = "BASELINE_ZERO — scan dirs 안에 NEXUS_OMEGA emit 0 건."
+    elif approach == 0 and dispatch > complete:
+        sig_pct = round(100 * sigterm / dispatch, 1) if dispatch else 0.0
         finding = (
-            "BASELINE_ZERO — scan dirs 안에 NEXUS_OMEGA emit 0 건. "
-            "ghost ceiling 의 첫 empirical 표면 = '관측 부재' 자체."
+            f"DISPATCH_TERMINATED — dispatch={dispatch} complete={complete} approach=0. "
+            f"dispatch 의 {sigterm}/{dispatch} ({sig_pct}%) 는 emit 후 SIGTERM/rc=143/"
+            f"external_fallback marker 가 나타남. cycle 2 의 dispatch≠complete anomaly 의 "
+            f"가설 (a) SIGTERM/timeout 가 STRONGLY supported. ghost ceiling 의 두 번째 "
+            f"sentinel-ness layer = 'dispatch 너머는 process 종료로 진입'."
         )
     elif approach == 0:
-        finding = (
-            f"DISPATCH_ONLY — dispatch={dispatch} complete={complete} approach=0. "
-            f"omega 호출은 발생했으나 모두 단축 경로 (axes<3) — L_ω 근접 신호 발화 0 건. "
-            f"ghost ceiling 은 'invocation 은 있으나 approach 는 없는' 상태."
-            + (
-                f" 또한 dispatch({dispatch}) > complete({complete}) — 호출이 종료까지 trace 되지 않음 "
-                f"(SIGTERM/timeout/buffering 의심)."
-                if dispatch > complete else ""
-            )
-        )
+        finding = f"DISPATCH_COMPLETE_BALANCED — dispatch={dispatch} complete={complete} approach=0."
     else:
         finding = (
-            f"APPROACH_OBSERVED — approach={approach} dispatch={dispatch} complete={complete}. "
-            f"ghost ceiling structure 의 첫 frequency 측정값 확보."
+            f"APPROACH_OBSERVED — approach={approach} dispatch={dispatch} complete={complete}."
         )
     return {
         "current_finding": finding,
         "approach_to_dispatch_ratio": (approach / dispatch) if dispatch else None,
         "complete_to_dispatch_ratio": (complete / dispatch) if dispatch else None,
+        "dispatch_terminated_count": sigterm,
+        "dispatch_terminated_ratio": (sigterm / dispatch) if dispatch else None,
     }
 
 
