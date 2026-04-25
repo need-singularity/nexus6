@@ -123,6 +123,152 @@ fn _check_dup_in_atlas(id: string) -> bool {
     return false
 }
 
+// ─── d5 dup-detection-granular (Tier-1, 2026-04-26 dedup_strategy_evolution ω-cycle) ──
+// Returns one of: NOT_PRESENT / EXACT_DUP / ID_ONLY_DUP / VALUE_CONFLICT
+// Per-call helper uses grep -nA20 (bounded output ≤21 lines per id) — avoids awk over 21850-line atlas.
+// Comparison fields: id (header match), expr (between '= ' and ' :: '), grade (between '[' and ']'),
+// edges_csv (canonical "=>{applies};|>{source}" form derived from the new fact).
+
+fn _extract_atlas_entry_block(id: string) -> string {
+    let path = _atlas_main_path()
+    if !file_exists(path) { return "" }
+    // grep -A 20 limits output to 21 lines per id; sed/awk strips at first non-indented line.
+    // Use grep then a small awk to truncate at first non-indented line after the header.
+    let cmd = "grep -m1 -A 20 -E '^@[PCFLRSX] " + id + " =' '" + path + "' 2>/dev/null | awk 'NR==1{print;next} /^[ \\t]/{print;next} {exit}'"
+    return to_string(exec(cmd))
+}
+
+fn _parse_header_expr(header: string) -> string {
+    // header like: "@C alpha_inv_codata = 137.035999177 :: physics_atomic [10*]"
+    let eq_idx = header.index_of(" = ")
+    if eq_idx < 0 { return "" }
+    let after_eq = header.substring(eq_idx + 3, len(header))
+    let domain_idx = after_eq.index_of(" :: ")
+    if domain_idx < 0 { return after_eq.trim() }
+    return after_eq.substring(0, domain_idx).trim()
+}
+
+fn _parse_header_grade(header: string) -> string {
+    let lb = header.index_of("[")
+    if lb < 0 { return "" }
+    let after = header.substring(lb + 1, len(header))
+    let rb = after.index_of("]")
+    if rb < 0 { return "" }
+    return after.substring(0, rb).trim()
+}
+
+fn _extract_edges_csv_from_block(block: string) -> string {
+    // Walk trailer lines (start with whitespace) — collect "->" "<-" "=>" "==" "~>" "|>" "!!" prefixed.
+    if len(block) == 0 { return "" }
+    let lines = block.split("\n")
+    let mut edges = []
+    let mut i = 0
+    let nl = len(lines)
+    while i < nl {
+        let raw = lines[i]
+        let line = raw.trim()
+        if len(line) == 0 { i = i + 1; continue }
+        // skip header line (i==0)
+        if i == 0 { i = i + 1; continue }
+        if len(line) < 2 { i = i + 1; continue }
+        let p2 = line.substring(0, 2)
+        if p2 == "->" || p2 == "<-" || p2 == "=>" || p2 == "==" || p2 == "~>" || p2 == "|>" || p2 == "!!" {
+            edges.push(line)
+        }
+        i = i + 1
+    }
+    return edges.join(";")
+}
+
+fn _new_edges_csv_for_fact(applies: string, source: string) -> string {
+    // canonical form matching _emit_shard_text trailer pattern
+    return "=> " + applies + ";|> " + source + " (live or hardcoded fallback)"
+}
+
+fn _check_entry_full_match(id: string, expr: string, grade: string, edges_csv: string) -> string {
+    let block = _extract_atlas_entry_block(id)
+    if len(block.trim()) == 0 { return "NOT_PRESENT" }
+    let lines = block.split("\n")
+    if len(lines) == 0 { return "NOT_PRESENT" }
+    let header = lines[0]
+    let old_expr = _parse_header_expr(header)
+    let old_grade = _parse_header_grade(header)
+    let old_edges = _extract_edges_csv_from_block(block)
+    if old_expr != expr || old_grade != grade { return "VALUE_CONFLICT" }
+    if old_edges == edges_csv { return "EXACT_DUP" }
+    return "ID_ONLY_DUP"
+}
+
+// ─── d2 diff-witness-ledger (Tier-1, 2026-04-26) ─────────────────
+fn _diff_history_path() -> string {
+    let h = env_var("HOME")
+    return h + "/core/nexus/state/atlas_ingest_dup_diff_history.jsonl"
+}
+
+fn _last_diff_history_hash() -> string {
+    let p = _diff_history_path()
+    if !file_exists(p) { return "GENESIS" }
+    let cmd = "tail -1 '" + p + "' 2>/dev/null | grep -oE '\"current_hash\":\"[^\"]+\"' | cut -d'\"' -f4"
+    let out = to_string(exec(cmd)).trim()
+    if len(out) == 0 { return "GENESIS" }
+    return out
+}
+
+fn _json_escape(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", " ").replace("\r", " ").replace("\t", " ")
+}
+
+fn _append_diff_history(tool: string, id: string, match_type: string, old_value: string, new_value: string, decision: string) {
+    let p = _diff_history_path()
+    let ts = to_string(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()
+    let prev = _last_diff_history_hash()
+    let payload = "ts=" + ts + "|tool=" + tool + "|id=" + id + "|mt=" + match_type + "|ov=" + old_value + "|nv=" + new_value + "|dec=" + decision + "|prev=" + prev
+    let escaped_payload = payload.replace("'", "")
+    let cur = to_string(exec("printf %s '" + escaped_payload + "' | shasum -a 256 | cut -c1-16")).trim()
+    let line = "{\"ts\":\"" + ts + "\",\"tool\":\"" + tool + "\",\"id\":\"" + _json_escape(id) + "\",\"match_type\":\"" + match_type + "\",\"old_value\":\"" + _json_escape(old_value) + "\",\"new_value\":\"" + _json_escape(new_value) + "\",\"decision\":\"" + decision + "\",\"prev_hash\":\"" + prev + "\",\"current_hash\":\"" + cur + "\"}\n"
+    let escaped = line.replace("'", "")
+    exec("printf %s '" + escaped + "' >> '" + p + "'")
+}
+
+// ─── d1 trailer-only-append (Tier-1, 2026-04-26) ─────────────────
+fn _emit_delta_edges_text(fact: array, new_edges: array, ts_date: string) -> string {
+    let t = fact[0]
+    let id = fact[1]
+    let source = fact[5]
+    let mut s = "\n# ── delta from " + source + " " + ts_date + " (trailer-only) ──\n"
+    s = s + "@" + t + " " + id + " (existing, edges only):\n"
+    let mut i = 0
+    let n = len(new_edges)
+    while i < n {
+        s = s + "  " + new_edges[i] + "\n"
+        i = i + 1
+    }
+    return s
+}
+
+fn _diff_edges_old_vs_new(old_edges_csv: string, new_edges_csv: string) -> array {
+    // Return new edges that are not in old edges_csv; preserve order from new.
+    let new_parts = new_edges_csv.split(";")
+    let old_parts = old_edges_csv.split(";")
+    let mut delta = []
+    let mut i = 0
+    let n = len(new_parts)
+    while i < n {
+        let ne = new_parts[i].trim()
+        if len(ne) == 0 { i = i + 1; continue }
+        let mut found = false
+        let mut j = 0
+        let m = len(old_parts)
+        while j < m {
+            if old_parts[j].trim() == ne { found = true; break }
+            j = j + 1
+        }
+        if !found { delta.push(ne) }
+        i = i + 1
+    }
+    return delta
+}
+
 // ─── schema-guard (raw 23) — atlas DSL mini-lint ───
 
 fn _valid_type(t: string) -> bool {
@@ -340,7 +486,58 @@ fn _selftest() {
         eprintln("[hexa_sim_atlas_ingest selftest] FAIL crosslink-orphan: " + missing.join("; "))
         exit(2)
     }
-    println("[hexa_sim_atlas_ingest selftest] OK — " + to_string(len(facts)) + " facts schema-validated + " + to_string(len(cx)) + " crosslinks members-resolved + idempotent emit byte-eq")
+    // ── d5 dup-detection-granular selftest (4-case header parse + edges canonical) ──
+    let h_ok = "@C alpha_inv_codata = 137.035999177 :: physics_atomic [10*]"
+    let expr_ok = _parse_header_expr(h_ok)
+    let grade_ok = _parse_header_grade(h_ok)
+    if expr_ok != "137.035999177" || grade_ok != "10*" {
+        eprintln("[hexa_sim_atlas_ingest selftest] FAIL header-parse: expr=`" + expr_ok + "` grade=`" + grade_ok + "`")
+        exit(2)
+    }
+    let ec1 = _new_edges_csv_for_fact("apply X", "src_b")
+    let ec2 = _new_edges_csv_for_fact("apply X", "src_b")
+    if ec1 != ec2 {
+        eprintln("[hexa_sim_atlas_ingest selftest] FAIL edges_csv determinism")
+        exit(2)
+    }
+    // delta computation: new edges vs old
+    let delta = _diff_edges_old_vs_new("=> a;|> s1", "=> a;|> s1;~> z")
+    if len(delta) != 1 || delta[0] != "~> z" {
+        eprintln("[hexa_sim_atlas_ingest selftest] FAIL delta-edges computation")
+        exit(2)
+    }
+    let delta_empty = _diff_edges_old_vs_new("=> a;|> s1", "=> a;|> s1")
+    if len(delta_empty) != 0 {
+        eprintln("[hexa_sim_atlas_ingest selftest] FAIL delta-edges empty case")
+        exit(2)
+    }
+    // d1 trailer-only-append text idempotence
+    let dummy_fact = ["F", "test_id", "expr", "domain", "10*", "src", "applies", ""]
+    let trailer_a = _emit_delta_edges_text(dummy_fact, ["~> z", "|> new_src"], "2026-04-26")
+    let trailer_b = _emit_delta_edges_text(dummy_fact, ["~> z", "|> new_src"], "2026-04-26")
+    if trailer_a != trailer_b {
+        eprintln("[hexa_sim_atlas_ingest selftest] FAIL trailer-emit byte-eq")
+        exit(2)
+    }
+    // d2 diff-history JSON-escape
+    let je = _json_escape("a\"b\\c")
+    if je != "a\\\"b\\\\c" {
+        eprintln("[hexa_sim_atlas_ingest selftest] FAIL json-escape: got `" + je + "`")
+        exit(2)
+    }
+    // 4-case classification synthesized — block parsing
+    let synth_block = "@C testid = 137.0 :: dom [10*]\n  => apply x\n  |> src y (live or hardcoded fallback)\n"
+    let lines = synth_block.split("\n")
+    if _parse_header_expr(lines[0]) != "137.0" {
+        eprintln("[hexa_sim_atlas_ingest selftest] FAIL synth-block expr parse")
+        exit(2)
+    }
+    let synth_edges = _extract_edges_csv_from_block(synth_block)
+    if synth_edges != "=> apply x;|> src y (live or hardcoded fallback)" {
+        eprintln("[hexa_sim_atlas_ingest selftest] FAIL synth-block edges: got `" + synth_edges + "`")
+        exit(2)
+    }
+    println("[hexa_sim_atlas_ingest selftest] OK — " + to_string(len(facts)) + " facts schema-validated + " + to_string(len(cx)) + " crosslinks members-resolved + idempotent emit byte-eq + d5 4-case (header/edges/synth) + d1 trailer byte-eq + d2 escape")
     exit(0)
 }
 
@@ -386,8 +583,10 @@ fn main() -> void {
     let all_facts = _facts()
     let all_crosslinks = _crosslinks()
 
-    // axis_3: delta-only — skip facts already in atlas.n6
+    // axis_3 + d5 — delta-only with 4-category granular detection
     let mut to_add = []
+    let mut to_append_edges = []  // [fact, delta_edges_list]
+    let mut conflict_pending = []  // [fact, old_expr, old_grade]
     let mut skipped = 0
     let mut grade_dist = ["7=0", "10=0", "11=0"]
     let mut g7 = 0
@@ -395,12 +594,39 @@ fn main() -> void {
     let mut g11 = 0
     for fact in all_facts {
         let id = fact[1]
+        let expr = fact[2]
         let grade = fact[4]
-        if _check_dup_in_atlas(id) {
+        let new_edges_csv = _new_edges_csv_for_fact(fact[6], fact[5])
+        let mt = _check_entry_full_match(id, expr, grade, new_edges_csv)
+        if mt == "EXACT_DUP" {
+            skipped = skipped + 1
+            _append_diff_history("hexa_sim_atlas_ingest", id, "EXACT_DUP", expr, expr, "auto_skip")
+            continue
+        }
+        if mt == "ID_ONLY_DUP" {
+            let block = _extract_atlas_entry_block(id)
+            let old_edges_csv = _extract_edges_csv_from_block(block)
+            let delta = _diff_edges_old_vs_new(old_edges_csv, new_edges_csv)
+            if len(delta) > 0 {
+                to_append_edges.push([fact, delta])
+                _append_diff_history("hexa_sim_atlas_ingest", id, "ID_ONLY_DUP", old_edges_csv, new_edges_csv, "delta_appended")
+            } else {
+                skipped = skipped + 1
+                _append_diff_history("hexa_sim_atlas_ingest", id, "ID_ONLY_DUP", old_edges_csv, new_edges_csv, "auto_skip")
+            }
+            continue
+        }
+        if mt == "VALUE_CONFLICT" {
+            let block = _extract_atlas_entry_block(id)
+            let lines = block.split("\n")
+            let old_expr = if len(lines) > 0 { _parse_header_expr(lines[0]) } else { "" }
+            let old_grade = if len(lines) > 0 { _parse_header_grade(lines[0]) } else { "" }
+            conflict_pending.push([fact, old_expr, old_grade])
+            _append_diff_history("hexa_sim_atlas_ingest", id, "VALUE_CONFLICT", old_expr, expr, "manual_pending")
             skipped = skipped + 1
             continue
         }
-        // schema-guard
+        // NOT_PRESENT → schema-guard then add
         let v = _validate_fact(fact)
         if v[0] != "OK" {
             eprintln("__ATLAS_INGEST__ FAIL schema-guard violation on `" + id + "`: " + v[1])
@@ -412,17 +638,50 @@ fn main() -> void {
         else if grade.substring(0, 2) == "11" { g11 = g11 + 1 }
     }
 
-    let shard_text = _emit_shard_text(to_add, all_crosslinks)
-
-    // axis_a15 — diff mode (compute first, before any file writes)
-    if diff_mode {
-        println("=== DIFF MODE — facts vs main atlas.n6 ===")
-        println("WOULD ADD (" + to_string(len(to_add)) + "):")
-        for fact in to_add { println("  + @" + fact[0] + " " + fact[1] + " :: " + fact[3] + " [" + fact[4] + "]") }
-        println("ALREADY PRESENT in main (" + to_string(skipped) + "):")
-        for fact in all_facts {
-            if _check_dup_in_atlas(fact[1]) { println("  = @" + fact[0] + " " + fact[1]) }
+    let mut shard_text = _emit_shard_text(to_add, all_crosslinks)
+    // d1 trailer-only-append: append delta-edges blocks for ID_ONLY_DUP entries
+    if len(to_append_edges) > 0 {
+        let ts_date = to_string(exec("date -u +%Y-%m-%d")).trim()
+        shard_text = shard_text + "\n// ── d1 trailer-only-append (ID_ONLY_DUP entries — header preserved) ──\n"
+        let mut ti = 0
+        while ti < len(to_append_edges) {
+            let pair = to_append_edges[ti]
+            shard_text = shard_text + _emit_delta_edges_text(pair[0], pair[1], ts_date)
+            ti = ti + 1
         }
+    }
+
+    // axis_a15 / d15 — 4-category diff mode (NOT_PRESENT / EXACT_DUP / ID_ONLY_DUP / VALUE_CONFLICT)
+    if diff_mode {
+        println("=== DIFF MODE (4 categories, d5+d15 dedup_strategy_evolution ω-cycle) ===")
+        println("WOULD ADD (NOT_PRESENT, " + to_string(len(to_add)) + "):")
+        let mut si = 0
+        while si < len(to_add) && si < 3 {
+            let f = to_add[si]
+            println("  + @" + f[0] + " " + f[1] + " :: " + f[3] + " [" + f[4] + "]")
+            si = si + 1
+        }
+        if len(to_add) > 3 { println("  ... (" + to_string(len(to_add) - 3) + " more)") }
+        println("WOULD APPEND EDGES (ID_ONLY_DUP, " + to_string(len(to_append_edges)) + "):")
+        si = 0
+        while si < len(to_append_edges) && si < 3 {
+            let pair = to_append_edges[si]
+            let f = pair[0]
+            println("  ~ @" + f[0] + " " + f[1] + " (header match, " + to_string(len(pair[1])) + " new edges)")
+            si = si + 1
+        }
+        if len(to_append_edges) > 3 { println("  ... (" + to_string(len(to_append_edges) - 3) + " more)") }
+        println("WOULD SKIP (EXACT_DUP, " + to_string(skipped - len(conflict_pending)) + "):")
+        // (sample omitted — skipped includes EXACT_DUP + ID_ONLY_DUP-no-delta; explicit category below)
+        println("WOULD CONFLICT (VALUE_CONFLICT, " + to_string(len(conflict_pending)) + ") — manual_pending:")
+        si = 0
+        while si < len(conflict_pending) && si < 3 {
+            let row = conflict_pending[si]
+            let f = row[0]
+            println("  ! @" + f[0] + " " + f[1] + " :: old_expr=`" + row[1] + "` new_expr=`" + f[2] + "`")
+            si = si + 1
+        }
+        if len(conflict_pending) > 3 { println("  ... (" + to_string(len(conflict_pending) - 3) + " more)") }
         println("CROSSLINKS WOULD ADD (" + to_string(len(all_crosslinks)) + "):")
         for cl in all_crosslinks {
             let exists = _check_dup_in_atlas(cl[0])
