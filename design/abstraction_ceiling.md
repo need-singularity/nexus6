@@ -221,13 +221,22 @@ L_ω  GHOST CEILING  omega        (도달 불가 placeholder)    ← Gödel + Ha
   - signal extraction: `_dream_extract_signal` 재사용
   - 신규 helper: `_reign_max_cycles`, `_reign_stagnation_k`, `_reign_signal_stagnant`
   - emits: NEXUS_REIGN {plan / iter / saturation / complete} JSON
-- ✓ **L7 swarm 구현** (이 commit) — population dynamics with elitism
+- ✓ **L7 swarm 구현** (commit 92e23ac3) — population dynamics with elitism
   - `cmd_swarm()` — N individuals × G generations, top-2 elite + breeding
   - reign 과 차별: reign 단일 에이전트, swarm 다중 에이전트 군집
   - 알고리즘: gen 1 perturb seed → gen g evaluate → top-2 by abs score → breed children
   - CAP: population × generations ≤ NEXUS_SWARM_MAX (기본 12). population [2,8], generations [1,5] clamp
   - 신규 helpers: `_swarm_perturb_seed`, `_swarm_breed`, `_swarm_extract_abs`, `_swarm_max_runs`
   - emits: NEXUS_SWARM {plan / gen / complete / reject} JSON
+- ✓ **L8 wake 구현** (이 commit) — reality-loop, 외부 signal fp 트리거
+  - `cmd_wake()` — 외부 파일 fingerprint (size + first 64 chars) 변화 감지 시에만 fire
+  - swarm 과 차별: swarm 은 내부 진화, wake 는 외부 세계 결합 (reality coupling)
+  - 알고리즘: cycle 마다 fp 측정, prev != cur 이면 fire (perturbed seed 로 blowup), else skip
+  - signal_file: `--signal-file` > NEXUS_WAKE_SIGNAL_FILE > state/atlas_health.json default
+  - CAP: NEXUS_WAKE_MAX (기본 5, ceiling=10), cooldown NEXUS_WAKE_COOLDOWN_SEC (기본 0, 최대 60)
+  - 신규 helpers: `_wake_max_cycles`, `_wake_cooldown_sec`, `_wake_default_signal_file`, `_wake_read_fp`
+  - emits: NEXUS_WAKE {plan / iter / fire / skip / complete} JSON
+  - 검증: missing file → 2 cycles 0 fires 2 skips (false-fire 방지 동작 확인)
 
 ---
 
