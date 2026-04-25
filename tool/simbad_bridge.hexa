@@ -1,0 +1,511 @@
+#!hexa strict
+// tool/simbad_bridge.hexa — SIMBAD astronomical database → HEXA-SIM cosmic observatory bridge.
+//
+// @tool(slug="simbad_bridge", desc="SIMBAD object query (RA/DEC + spectral_type + parallax + radial_velocity) feeding cosmic_observatory / hexa_cosmic / sedi_redshift_ladder / physics_galaxy_rotation lens bindings")
+// @usage(hexa run tool/simbad_bridge.hexa [--object NAME] [--selftest] [--json])
+// @exit_codes(0=PASS, 1=usage/io error, 2=parse failure)
+// @sentinel(__SIMBAD_BRIDGE__ PASS object=<NAME> ra=<float> dec=<float> spectral=<str>)
+// @origin(hive raw 70 design-multi-axis-verify-grid + raw 73 structural-admissibility — astronomical observable bridge)
+// @abstraction(n=6 binding hint: 3 position (RA, DEC, distance/parallax) + 3 motion (pmRA, pmDEC, RV))
+// @paradigm(observable bridge — CDS Strasbourg authoritative SIMBAD4 → 6 DOF state for nexus cosmic lens stack)
+// @allow-bare-exec
+// @no-sandbox
+//
+// Endpoint: https://simbad.cds.unistra.fr/simbad/sim-id?Ident=<NAME>&output.format=ASCII
+// HEXA_RESOLVER_NO_REROUTE=1 must be set so resolver does not bounce this script.
+//
+// Reference targets (selftest live):
+//   Sirius     — alf CMa, brightest star, plx≈379 mas (≈8.6 ly)
+//   M31        — Andromeda galaxy, AGN, ~2.5 Mly
+//   Sgr A*     — galactic center SMBH, no parallax
+//   Polaris    — alf UMi, Cepheid, plx≈7.54 mas (≈432 ly)
+//
+// Lens binding candidates:
+//   lenses/physics_galaxy_rotation.hexa — galaxy targets (RA/DEC + RV → rotation curve anchor)
+//   lenses/sedi_redshift_ladder.hexa    — redshift / cz feeds distance ladder
+//   n6/scripts/verify_cosmic-observatory_alien10.hexa — observatory anchor verification
+//   n6/scripts/verify_hexa-cosmic_n6.hexa             — n6 cosmic 6-DOF state binding
+
+// ─── coercion + helpers ───
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _is_digit(c: string) -> bool {
+    return c == "0" || c == "1" || c == "2" || c == "3" || c == "4"
+        || c == "5" || c == "6" || c == "7" || c == "8" || c == "9"
+}
+
+fn _is_num_char(c: string) -> bool {
+    return _is_digit(c) || c == "." || c == "+" || c == "-"
+}
+
+fn abs_f(x: f64) -> f64 { if x < 0.0 { return 0.0 - x } return x }
+
+// safe to_float (returns NaN-marker -999999.0 on failure)
+fn _safe_float(s: string) -> f64 {
+    let t = s.trim()
+    if t == "" || t == "~" { return 0.0 - 999999.0 }
+    let mut v: f64 = 0.0 - 999999.0
+    try { v = to_float(t) } catch e { v = 0.0 - 999999.0 }
+    return v
+}
+
+// ─── URL encoding (minimal: spaces → +, * stays, # → %23) ───
+
+fn _url_encode(s: string) -> string {
+    let mut out = ""
+    let mut i = 0
+    while i < len(s) {
+        let c = s.substring(i, i + 1)
+        if c == " " { out = out + "+" }
+        else if c == "#" { out = out + "%23" }
+        else if c == "&" { out = out + "%26" }
+        else if c == "?" { out = out + "%3F" }
+        else { out = out + c }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── SIMBAD fetch ───
+
+fn fetch_simbad(name: string) -> string {
+    let url = "https://simbad.cds.unistra.fr/simbad/sim-id?Ident=" + _url_encode(name) + "&output.format=ASCII"
+    let cmd = "curl -s --max-time 20 '" + url + "' 2>/dev/null"
+    return _str(exec(cmd))  // @allow-bare-exec
+}
+
+// ─── ASCII response parsing ───
+//
+// SIMBAD ASCII layout:
+//   Coordinates(ICRS,ep=J2000,eq=2000): HH MM SS.sssss  ±DD MM SS.ssss (...)
+//   Proper motions: pmRA pmDEC [errs] ...
+//   Parallax: plx_mas [err] ...
+//   Radial Velocity: rv_kms [err] ...
+//   Redshift: z [err] ...
+//   Spectral type: <type> ... ...
+//
+// We grep each line, then extract the numeric tail.
+
+fn _find_line(body: string, prefix: string) -> string {
+    let lines = body.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = _str(lines[i])
+        if ln.index_of(prefix) >= 0 { return ln }
+        i = i + 1
+    }
+    return ""
+}
+
+// Return substring after the first occurrence of `marker`, trimmed.
+fn _after(line: string, marker: string) -> string {
+    let p = line.index_of(marker)
+    if p < 0 { return "" }
+    return line.substring(p + len(marker), len(line)).trim()
+}
+
+// Convert HMS string "HH MM SS.sss" → degrees (15° per hour).
+// Returns -999999.0 if fields can't be parsed.
+fn hms_to_deg(s: string) -> f64 {
+    let t = s.trim()
+    if t == "" { return 0.0 - 999999.0 }
+    // collapse multiple spaces
+    let parts = t.split(" ")
+    let mut clean = []
+    let mut i = 0
+    while i < len(parts) {
+        let p = _str(parts[i]).trim()
+        if p != "" { clean.push(p) }
+        i = i + 1
+    }
+    if len(clean) < 3 { return 0.0 - 999999.0 }
+    let h = _safe_float(clean[0])
+    let m = _safe_float(clean[1])
+    let sec = _safe_float(clean[2])
+    if h <= 0.0 - 999998.0 || m <= 0.0 - 999998.0 || sec <= 0.0 - 999998.0 {
+        return 0.0 - 999999.0
+    }
+    return 15.0 * (h + m / 60.0 + sec / 3600.0)
+}
+
+// Convert DMS string "±DD MM SS.sss" → degrees. Negative if leading '-'.
+fn dms_to_deg(s: string) -> f64 {
+    let t = s.trim()
+    if t == "" { return 0.0 - 999999.0 }
+    let mut sign = 1.0
+    let mut body = t
+    if body.substring(0, 1) == "-" { sign = 0.0 - 1.0; body = body.substring(1, len(body)).trim() }
+    else if body.substring(0, 1) == "+" { body = body.substring(1, len(body)).trim() }
+    let parts = body.split(" ")
+    let mut clean = []
+    let mut i = 0
+    while i < len(parts) {
+        let p = _str(parts[i]).trim()
+        if p != "" { clean.push(p) }
+        i = i + 1
+    }
+    if len(clean) < 3 { return 0.0 - 999999.0 }
+    let d = _safe_float(clean[0])
+    let m = _safe_float(clean[1])
+    let sec = _safe_float(clean[2])
+    if d <= 0.0 - 999998.0 || m <= 0.0 - 999998.0 || sec <= 0.0 - 999998.0 {
+        return 0.0 - 999999.0
+    }
+    return sign * (d + m / 60.0 + sec / 3600.0)
+}
+
+// Extract ICRS coordinates: returns [ra_deg, dec_deg], both -999999.0 on failure.
+fn extract_icrs(body: string) -> array {
+    let line = _find_line(body, "Coordinates(ICRS")
+    if line == "" { return [0.0 - 999999.0, 0.0 - 999999.0] }
+    // "Coordinates(ICRS,ep=J2000,eq=2000): 06 45 08.91728  -16 42 58.0171 (Opt ) A ..."
+    let after = _after(line, "):")
+    if after == "" { return [0.0 - 999999.0, 0.0 - 999999.0] }
+    // truncate at first '(' (frame tag like "(Opt )")
+    let mut tail = after
+    let pp = tail.index_of("(")
+    if pp >= 0 { tail = tail.substring(0, pp).trim() }
+    // ra = first 3 whitespace tokens, dec = next 3 tokens (with sign).
+    // collapse runs of spaces
+    let raw_parts = tail.split(" ")
+    let mut tokens = []
+    let mut i = 0
+    while i < len(raw_parts) {
+        let p = _str(raw_parts[i]).trim()
+        if p != "" { tokens.push(p) }
+        i = i + 1
+    }
+    if len(tokens) < 6 { return [0.0 - 999999.0, 0.0 - 999999.0] }
+    let ra_str = tokens[0] + " " + tokens[1] + " " + tokens[2]
+    let dec_str = tokens[3] + " " + tokens[4] + " " + tokens[5]
+    let ra = hms_to_deg(ra_str)
+    let dec = dms_to_deg(dec_str)
+    return [ra, dec]
+}
+
+// Extract first numeric token from a line tail after `marker`. Returns -999999.0 if absent or "~".
+fn _first_num_after(body: string, marker: string) -> f64 {
+    let line = _find_line(body, marker)
+    if line == "" { return 0.0 - 999999.0 }
+    let tail = _after(line, marker)
+    if tail == "" || tail.substring(0, 1) == "~" { return 0.0 - 999999.0 }
+    // walk to first whitespace OR '['
+    let mut end = 0
+    let n = len(tail)
+    while end < n {
+        let c = tail.substring(end, end + 1)
+        if c == " " || c == "\t" || c == "[" { break }
+        end = end + 1
+    }
+    let tok = tail.substring(0, end).trim()
+    if tok == "" || tok == "~" { return 0.0 - 999999.0 }
+    return _safe_float(tok)
+}
+
+// Proper motions: returns [pmRA, pmDEC] in mas/yr, sentinel on missing.
+fn extract_proper_motion(body: string) -> array {
+    let line = _find_line(body, "Proper motions:")
+    if line == "" { return [0.0 - 999999.0, 0.0 - 999999.0] }
+    let tail = _after(line, "Proper motions:")
+    if tail == "" || tail.substring(0, 1) == "~" { return [0.0 - 999999.0, 0.0 - 999999.0] }
+    let raw_parts = tail.split(" ")
+    let mut tokens = []
+    let mut i = 0
+    while i < len(raw_parts) {
+        let p = _str(raw_parts[i]).trim()
+        if p != "" { tokens.push(p) }
+        i = i + 1
+    }
+    if len(tokens) < 2 { return [0.0 - 999999.0, 0.0 - 999999.0] }
+    let pm_ra = _safe_float(tokens[0])
+    let pm_dec = _safe_float(tokens[1])
+    return [pm_ra, pm_dec]
+}
+
+// Parallax in mas (single number)
+fn extract_parallax_mas(body: string) -> f64 {
+    return _first_num_after(body, "Parallax:")
+}
+
+// Radial velocity in km/s
+fn extract_radial_velocity(body: string) -> f64 {
+    return _first_num_after(body, "Radial Velocity:")
+}
+
+// Spectral type: free-text first token (e.g. "A0mA1Va", "F8Ib", "~")
+fn extract_spectral_type(body: string) -> string {
+    let line = _find_line(body, "Spectral type:")
+    if line == "" { return "~" }
+    let tail = _after(line, "Spectral type:").trim()
+    if tail == "" { return "~" }
+    // first whitespace-delimited token
+    let mut end = 0
+    let n = len(tail)
+    while end < n {
+        let c = tail.substring(end, end + 1)
+        if c == " " || c == "\t" { break }
+        end = end + 1
+    }
+    let tok = tail.substring(0, end).trim()
+    if tok == "" { return "~" }
+    return tok
+}
+
+// Distance from parallax: d_pc = 1000 / plx_mas; ly = pc * 3.2616
+fn parallax_to_ly(plx_mas: f64) -> f64 {
+    if plx_mas <= 0.0 || plx_mas >= 999998.0 { return 0.0 - 999999.0 }
+    let d_pc = 1000.0 / plx_mas
+    return d_pc * 3.26156
+}
+
+// ─── output ───
+
+fn _fmt_or_dash(v: f64) -> string {
+    if v <= 0.0 - 999998.0 { return "~" }
+    return to_string(v)
+}
+
+// JSON-safe: emit `null` for sentinel-missing values, raw number otherwise
+fn _fmt_or_null(v: f64) -> string {
+    if v <= 0.0 - 999998.0 { return "null" }
+    return to_string(v)
+}
+
+fn emit_text(name: string, ra: f64, dec: f64, plx: f64, rv: f64, pm_ra: f64, pm_dec: f64, sp: string, dist_ly: f64, source: string) {
+    println("simbad_bridge — SIMBAD4 → HEXA cosmic n=6 binding")
+    println("  object_name        : " + name)
+    println("  source             : " + source)
+    println("  ra_deg (ICRS)      : " + _fmt_or_dash(ra))
+    println("  dec_deg (ICRS)     : " + _fmt_or_dash(dec))
+    println("  parallax_mas       : " + _fmt_or_dash(plx))
+    println("  distance_ly        : " + _fmt_or_dash(dist_ly) + "   (1000/plx_mas * 3.26156)")
+    println("  pm_ra_mas_yr       : " + _fmt_or_dash(pm_ra))
+    println("  pm_dec_mas_yr      : " + _fmt_or_dash(pm_dec))
+    println("  radial_velocity    : " + _fmt_or_dash(rv) + " km/s")
+    println("  spectral_type      : " + sp)
+    println("  n6_state_complete  : 3 pos (ra, dec, dist) + 3 vel (pm_ra, pm_dec, rv)")
+    println("---")
+}
+
+fn emit_json(name: string, ra: f64, dec: f64, plx: f64, rv: f64, pm_ra: f64, pm_dec: f64, sp: string, dist_ly: f64, source: string) {
+    println("{"
+        + "\"tool\":\"simbad_bridge\","
+        + "\"object_name\":\"" + name + "\","
+        + "\"source\":\"" + source + "\","
+        + "\"ra_deg\":" + _fmt_or_null(ra) + ","
+        + "\"dec_deg\":" + _fmt_or_null(dec) + ","
+        + "\"parallax_mas\":" + _fmt_or_null(plx) + ","
+        + "\"distance_ly\":" + _fmt_or_null(dist_ly) + ","
+        + "\"pm_ra_mas_yr\":" + _fmt_or_null(pm_ra) + ","
+        + "\"pm_dec_mas_yr\":" + _fmt_or_null(pm_dec) + ","
+        + "\"radial_velocity_kms\":" + _fmt_or_null(rv) + ","
+        + "\"spectral_type\":\"" + sp + "\","
+        + "\"n6_dof\":\"ra+dec+dist+pm_ra+pm_dec+rv\","
+        + "\"lens_bindings\":[\"physics_galaxy_rotation\",\"sedi_redshift_ladder\",\"verify_cosmic-observatory\",\"verify_hexa-cosmic\"],"
+        + "\"origin\":\"hive raw 70/73 — SIMBAD4 cosmic observable bridge\""
+        + "}")
+}
+
+// ─── selftest (live: 4 reference targets) ───
+
+fn _check_one(name: string, expect_ra_lo: f64, expect_ra_hi: f64, expect_dec_lo: f64, expect_dec_hi: f64, must_have_plx: bool, bad: array) -> array {
+    let body = fetch_simbad(name)
+    if body == "" {
+        bad.push(name + ":empty_response")
+        return bad
+    }
+    if body.index_of("Coordinates(ICRS") < 0 {
+        bad.push(name + ":no_ICRS_block")
+        return bad
+    }
+    let coords = extract_icrs(body)
+    let ra: f64 = coords[0]
+    let dec: f64 = coords[1]
+    if ra <= 0.0 - 999998.0 || dec <= 0.0 - 999998.0 {
+        bad.push(name + ":parse_coord_failed")
+        return bad
+    }
+    if ra < expect_ra_lo || ra > expect_ra_hi {
+        bad.push(name + ":ra_out_of_range(" + to_string(ra) + ")")
+    }
+    if dec < expect_dec_lo || dec > expect_dec_hi {
+        bad.push(name + ":dec_out_of_range(" + to_string(dec) + ")")
+    }
+    if must_have_plx {
+        let plx = extract_parallax_mas(body)
+        if plx <= 0.0 - 999998.0 || plx <= 0.0 {
+            bad.push(name + ":plx_missing")
+        }
+    }
+    return bad
+}
+
+fn _selftest() {
+    let mut bad = []
+
+    // 1. hms_to_deg + dms_to_deg unit checks
+    let h_test = hms_to_deg("06 45 08.91728")    // ≈ 101.2872 deg
+    if abs_f(h_test - 101.28714867) > 0.001 { bad.push("hms_to_deg(06 45 08.917)=" + to_string(h_test)) }
+
+    let d_test = dms_to_deg("-16 42 58.0171")    // ≈ -16.71611 deg
+    if abs_f(d_test - (0.0 - 16.71611586)) > 0.001 { bad.push("dms_to_deg(-16 42 58)=" + to_string(d_test)) }
+
+    let d_pos = dms_to_deg("+89 15 50.7923")     // ≈ +89.26411 deg
+    if abs_f(d_pos - 89.26410897) > 0.001 { bad.push("dms_to_deg(+89...)=" + to_string(d_pos)) }
+
+    // 2. parallax_to_ly(379.21) ≈ 8.6 ly
+    let ly = parallax_to_ly(379.21)
+    if ly < 8.0 || ly > 9.5 { bad.push("parallax_to_ly(379.21)=" + to_string(ly)) }
+
+    // 3. _safe_float
+    if abs_f(_safe_float("3.14") - 3.14) > 0.001 { bad.push("_safe_float(3.14)") }
+    if _safe_float("~") > 0.0 - 999998.0 { bad.push("_safe_float(~)") }
+
+    // 4. URL encoding
+    if _url_encode("Sgr A*") != "Sgr+A*" { bad.push("_url_encode(Sgr A*)=" + _url_encode("Sgr A*")) }
+
+    // 5. structural parse on embedded sample (Sirius slice, no network)
+    let sample = "C.D.S.  -  SIMBAD4 rel 1.8  -  2026.04.25CEST14:32:12\n"
+              + "\n"
+              + "Sirius\n"
+              + "------\n"
+              + "\n"
+              + "Object * alf CMa  ---  SB*  ---  OID=@8399845   (@@-1,255)  ---  coobox=7392\n"
+              + "\n"
+              + "Coordinates(ICRS,ep=J2000,eq=2000): 06 45 08.91728  -16 42 58.0171 (Opt ) A [11.70 10.90 90] 2007A&A...474..653V\n"
+              + "Proper motions: -546.01 -1223.07 [1.33 1.24 0] A 2007A&A...474..653V\n"
+              + "Parallax: 379.21 [1.58] A 2007A&A...474..653V\n"
+              + "Radial Velocity: -5.50 [0.4] A 2006AstL...32..759G\n"
+              + "Spectral type: A0mA1Va C 2003AJ....126.2048G\n"
+    let cs = extract_icrs(sample)
+    let s_ra: f64 = cs[0]
+    let s_dec: f64 = cs[1]
+    if abs_f(s_ra - 101.287) > 0.01 { bad.push("sample_ra=" + to_string(s_ra)) }
+    if abs_f(s_dec - (0.0 - 16.716)) > 0.01 { bad.push("sample_dec=" + to_string(s_dec)) }
+    let pm = extract_proper_motion(sample)
+    let pm_ra: f64 = pm[0]
+    let pm_dec: f64 = pm[1]
+    if abs_f(pm_ra - (0.0 - 546.01)) > 0.01 { bad.push("sample_pm_ra=" + to_string(pm_ra)) }
+    if abs_f(pm_dec - (0.0 - 1223.07)) > 0.01 { bad.push("sample_pm_dec=" + to_string(pm_dec)) }
+    let plx = extract_parallax_mas(sample)
+    if abs_f(plx - 379.21) > 0.01 { bad.push("sample_plx=" + to_string(plx)) }
+    let rv = extract_radial_velocity(sample)
+    if abs_f(rv - (0.0 - 5.50)) > 0.01 { bad.push("sample_rv=" + to_string(rv)) }
+    let sp = extract_spectral_type(sample)
+    if sp != "A0mA1Va" { bad.push("sample_spectral=" + sp) }
+
+    // 6. live: Sirius (RA ≈ 101.29, DEC ≈ -16.72), must have parallax
+    bad = _check_one("Sirius", 100.5, 102.0, 0.0 - 17.5, 0.0 - 16.0, true, bad)
+
+    // 7. live: M31 / Andromeda (RA ≈ 10.68, DEC ≈ +41.27), no parallax requirement
+    bad = _check_one("M31", 10.0, 11.5, 40.5, 42.0, false, bad)
+
+    // 8. live: Sgr A* (RA ≈ 266.42, DEC ≈ -29.01), no parallax
+    bad = _check_one("Sgr A*", 265.5, 267.5, 0.0 - 30.0, 0.0 - 28.0, false, bad)
+
+    // 9. live: Polaris (RA ≈ 37.95, DEC ≈ +89.26), parallax expected
+    bad = _check_one("Polaris", 36.0, 40.0, 88.5, 90.0, true, bad)
+
+    if len(bad) > 0 {
+        eprintln("[simbad_bridge selftest] FAIL: " + bad.join(", "))
+        exit(1)
+    }
+    println("[simbad_bridge selftest] OK — units + sample parse + 4 live targets (Sirius, M31, Sgr A*, Polaris)")
+    exit(0)
+}
+
+// ─── main ───
+
+fn _help() {
+    println("usage: hexa run tool/simbad_bridge.hexa [--object NAME] [--selftest] [--json]")
+    println("  --object NAME   SIMBAD identifier (default: Sirius)")
+    println("                  examples: 'Sirius', 'M31', 'Sgr A*', 'Polaris', 'NGC 4258'")
+    println("  --json          emit single-line JSON")
+    println("  --selftest      unit checks + live query of 4 reference targets")
+    println("origin: hive raw 70/73 — SIMBAD4 cosmic observable bridge")
+    println("lens bindings: physics_galaxy_rotation, sedi_redshift_ladder,")
+    println("               verify_cosmic-observatory, verify_hexa-cosmic")
+}
+
+fn main() -> void {
+    let raw = args()
+    // Normalize argv across Mac/Linux dispatch styles: skip until past .hexa script path.
+    let mut script_idx: i64 = 0 - 1
+    let mut sj = 0
+    while sj < len(raw) {
+        if _str(raw[sj]).ends_with(".hexa") { script_idx = sj; break }
+        sj = sj + 1
+    }
+    let mut user_start: i64 = 2
+    if script_idx >= 0 { user_start = script_idx + 1 }
+    else if len(raw) >= 3 && (raw[1] == "run" || raw[1] == "eval") { user_start = 3 }
+
+    let mut object_name = "Sirius"
+    let mut json_mode = false
+    let mut do_selftest = false
+
+    let mut k: i64 = user_start
+    while k < len(raw) {
+        let a = _str(raw[k])
+        if a == "--selftest" || a == "selftest" { do_selftest = true; k = k + 1; continue }
+        if a == "--json" { json_mode = true; k = k + 1; continue }
+        if a == "--help" || a == "-h" { _help(); exit(0) }
+        if a == "--object" && (k + 1) < len(raw) {
+            object_name = _str(raw[k + 1]); k = k + 2; continue
+        }
+        eprintln("simbad_bridge: unknown arg `" + a + "` (try --help)")
+        exit(1)
+    }
+
+    if do_selftest { _selftest() }
+
+    let body = fetch_simbad(object_name)
+    if body == "" {
+        eprintln("simbad_bridge: empty response from SIMBAD (network/timeout)")
+        eprintln("  object=" + object_name)
+        exit(1)
+    }
+    if body.index_of("Coordinates(ICRS") < 0 {
+        eprintln("simbad_bridge: response missing ICRS coordinates block (unknown identifier?)")
+        eprintln("  object=" + object_name)
+        let head = if len(body) > 300 { body.substring(0, 300) } else { body }
+        eprintln("  head: " + head)
+        exit(2)
+    }
+
+    let coords = extract_icrs(body)
+    let ra: f64 = coords[0]
+    let dec: f64 = coords[1]
+    if ra <= 0.0 - 999998.0 || dec <= 0.0 - 999998.0 {
+        eprintln("simbad_bridge: failed to parse ICRS coordinates")
+        exit(2)
+    }
+    // physical sanity bounds
+    if ra < 0.0 || ra > 360.0 || dec < 0.0 - 90.0 || dec > 90.0 {
+        eprintln("simbad_bridge: parsed coords out of bounds: ra=" + to_string(ra) + " dec=" + to_string(dec))
+        exit(2)
+    }
+
+    let plx = extract_parallax_mas(body)
+    let rv = extract_radial_velocity(body)
+    let pm = extract_proper_motion(body)
+    let pm_ra: f64 = pm[0]
+    let pm_dec: f64 = pm[1]
+    let sp = extract_spectral_type(body)
+    let dist_ly = parallax_to_ly(plx)
+    let source = "live:simbad.cds.unistra.fr/sim-id (SIMBAD4)"
+
+    if json_mode { emit_json(object_name, ra, dec, plx, rv, pm_ra, pm_dec, sp, dist_ly, source) }
+    else { emit_text(object_name, ra, dec, plx, rv, pm_ra, pm_dec, sp, dist_ly, source) }
+
+    println("__SIMBAD_BRIDGE__ PASS object=" + object_name
+        + " ra=" + to_string(ra)
+        + " dec=" + to_string(dec)
+        + " spectral=" + sp)
+    exit(0)
+}
