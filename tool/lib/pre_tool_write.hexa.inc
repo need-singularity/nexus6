@@ -8,7 +8,7 @@
 // 참조 main: shared/tool/pre_tool_guard.hexa
 //
 // 함수 목록 (dispatch 순서):
-//   check_forbidden_ext           Write .py/.rs/.sh 신규 차단       (R1 HEXA-FIRST)
+//   check_forbidden_ext           Write .py/.rs/.sh/.toml 신규 차단 (R1 HEXA-FIRST, raw#9 + raw#66 ai-native)
 //   check_global_claude           ~/.claude/ 수정 차단                (L0)
 //   check_shared_protected        shared/hooks shared/config 보호     (L0)
 //   check_discovery_json_path     폐기 JSON 신규 생성 차단            (R28)
@@ -22,17 +22,51 @@
 //   check_annot_rules             annot_rules.json 토큰 차단          (H-ANNOT-RULES)
 // ═══════════════════════════════════════════════════════════
 
-// R1 HEXA-FIRST: .py/.rs/.sh 신규 파일 차단
+// R1 HEXA-FIRST: .py/.rs/.sh/.toml 신규 파일 차단 (raw#9 hexa-only)
+// raw#66 ai-native enrichment: hive sandbox_deny_enrich 로 cause+remedy 유도.
+// SSOT: /Users/ghost/core/hive/tool/sandbox_deny_enrich.hexa _fix_candidates("hexa-only-suffix")
+// 본 hook 은 OS-level EPERM 발생 전에 미리 차단 + 동일한 ai-native 메시지 emit.
 fn check_forbidden_ext(tool: str, file_path: str) -> str {
     if tool != "Write" { return "" }
 
-    let ext_blocked = file_path.ends_with(".py") || file_path.ends_with(".rs") || file_path.ends_with(".sh")
+    let ext_blocked = file_path.ends_with(".py") || file_path.ends_with(".rs")
+                   || file_path.ends_with(".sh") || file_path.ends_with(".toml")
     if ext_blocked == false { return "" }
 
     let exists = to_string(exec("test -f '" + file_path + "' && echo y || echo n")).trim()
     if exists == "y" { return "" }  // 기존 파일 덮어쓰기는 허용
 
-    return "REJECT: " + file_path + " — .py/.rs/.sh 신규 작성 금지 (HEXA-FIRST R1). .hexa로 작성하세요."
+    let bare = "REJECT: " + file_path + " — .py/.rs/.sh/.toml 신규 작성 금지 (HEXA-FIRST R1, raw#9). .hexa wrapper 로 작성 (runtime emit → /tmp/<stem>_helper.<ext> + exec)."
+
+    let h = env("HOME")
+    let enricher = h + "/core/hive/tool/sandbox_deny_enrich.hexa"
+    let have_enricher = to_string(exec("test -f '" + enricher + "' && echo y || echo n")).trim()
+    if have_enricher != "y" { return bare }
+    let have_jq = to_string(exec("command -v jq >/dev/null 2>&1 && echo y || echo n")).trim()
+    if have_jq != "y" { return bare }
+    let hexa_bin = h + "/core/nexus/bin/hexa"
+    let have_hexa = to_string(exec("test -x '" + hexa_bin + "' && echo y || echo n")).trim()
+    if have_hexa != "y" { return bare }
+
+    let tmp = "/tmp/_pre_tool_enrich." + to_string(exec("date +%s%N")).trim()
+    let cmd = hexa_bin + " run " + enricher + " enrich --path '" + file_path + "' --errno 1 --syscall open >'" + tmp + "' 2>/dev/null"
+    let _ = exec(cmd)
+    let reason = to_string(exec("jq -r '.reason // empty' '" + tmp + "' 2>/dev/null")).trim()
+    let fixes_raw = to_string(exec("jq -r '.fix[]? // empty' '" + tmp + "' 2>/dev/null"))
+    let _ = exec("rm -f '" + tmp + "'")
+    if reason.len() == 0 { return bare }
+
+    let mut out = "REJECT: " + file_path + " — raw#9 hexa-only-suffix (HEXA-FIRST R1) ‖ cause: " + reason + " ‖ remedy:"
+    let lines = fixes_raw.split("\n")
+    let mut i = 0
+    for ln in lines {
+        let t = to_string(ln).trim()
+        if t.len() == 0 { continue }
+        i = i + 1
+        out = out + " " + to_string(i) + ") " + t
+    }
+    out = out + " ‖ ref: raw:ai-native-error-message + raw:hexa-only (SSOT: hive/tool/sandbox_deny_enrich.hexa)"
+    return out
 }
 
 // L0: ~/.claude/ 및 ~/.claude-<suffix>/ 글로벌 수정 차단 (settings.json 제외)
