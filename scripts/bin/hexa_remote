@@ -168,6 +168,50 @@ if [ "$_IS_HEAVY_COMPUTE" = "1" ] && [ -z "${HEXA_REMOTE_HOST:-}" ]; then
     PREFERRED="hetzner"
 fi
 
+# Wave 24 / L3 (2026-04-25): per-job memory class — argv 분석으로 small/medium/large
+# 분류. L2 의 균일 MIN_AVAIL_MB=4096 가 모든 작업에 동일 cap 을 부과해 cluster
+# headroom 사장 (small drill 도 large 와 동일 admission)을 야기. L3 는 cmd /
+# seed length / heavy flags 를 보고 클래스 결정 → 클래스별 차등 MIN_AVAIL.
+# 결과: stdout 에 "small" | "medium" | "large".
+# 분류 매트릭스:
+#   - cmd ∈ {omega, absolute, meta-closure, hyperarithmetic} → large
+#   - --depth ≥ 8                                            → large
+#   - --engine mk10                                          → large
+#   - --speculate ≥ 3                                        → large
+#   - seed length > 500                                      → large
+#   - cmd ∈ {probe, status, canon}                           → small
+#   - seed length < 100 AND no --depth                       → small
+#   - 그 외                                                  → medium
+_classify_job() {
+    local _cmd="" _seed="" _depth="" _engine="" _spec=""
+    local _i _j
+    for ((_i=1; _i<=$#; _i++)); do
+        case "${!_i}" in
+            drill|omega|surge|smash|free|absolute|meta-closure|hyperarithmetic)
+                [ -z "$_cmd" ] && _cmd="${!_i}" ;;
+            --seed)     _j=$((_i+1)); _seed="${!_j:-}" ;;
+            --depth)    _j=$((_i+1)); _depth="${!_j:-}" ;;
+            --engine)   _j=$((_i+1)); _engine="${!_j:-}" ;;
+            --speculate) _j=$((_i+1)); _spec="${!_j:-}" ;;
+        esac
+    done
+    # large 트리거
+    case "$_cmd" in
+        omega|absolute|meta-closure|hyperarithmetic) echo "large"; return ;;
+    esac
+    if [ -n "$_depth" ] && [ "$_depth" -ge 8 ] 2>/dev/null; then echo "large"; return; fi
+    if [ "$_engine" = "mk10" ]; then echo "large"; return; fi
+    if [ -n "$_spec" ] && [ "$_spec" -ge 3 ] 2>/dev/null; then echo "large"; return; fi
+    if [ "${#_seed}" -gt 500 ]; then echo "large"; return; fi
+    # small 트리거
+    case "$_cmd" in
+        probe|status|canon) echo "small"; return ;;
+    esac
+    if [ "${#_seed}" -lt 100 ] && [ -z "$_depth" ]; then echo "small"; return; fi
+    # default medium
+    echo "medium"
+}
+
 # heavy-compute 는 \$HOME/.hx/packages/*/cli/*.hexa (원격 self-contained CLI) 만
 # 필요 — local repo rsync 불필요. cwd 가 어떤 case branch 에 매치되든 상관없이
 # no-sync + cd \$HOME 으로 통일. hetzner disk 포화 / rsync IO 이슈 차단.
@@ -397,15 +441,39 @@ fi
 # Per-host override: HEXA_REMOTE_MIN_AVAIL_MB_HETZNER / _UBU1 / _UBU2.
 # Bypass:           HEXA_REMOTE_NO_ADMISSION=1
 # Backward-compat:  _best_avail 미세팅 (LB=first 경로 / probe 미실행) 시 skip.
+#
+# Wave 24 / L3 (2026-04-25): per-job memory class. _classify_job 이 결정한
+# class (small/medium/large) 별 default MIN_AVAIL 차등화 → cluster 활용도
+# RAM 55% → 70% 목표.
+#   small  → 2048MB  (probe/status/canon, short seed → 32GB ubu1/ubu2 도 통과)
+#   medium → 8192MB  (default drill, seed<500)
+#   large  → 24576MB (omega/absolute, --depth≥8, mk10, --speculate≥3, seed>500)
+# 우선순위 (높→낮):
+#   1) HEXA_REMOTE_MIN_AVAIL_MB_<HOST>          (host-specific override, 기존)
+#   2) HEXA_REMOTE_MIN_AVAIL_MB                 (global override, 기존)
+#   3) HEXA_REMOTE_MIN_AVAIL_MB_<SMALL/MEDIUM/LARGE>  (class override, L3 신규)
+#   4) class default (2048/8192/24576)          (L3 신규)
 if [ "$_IS_HEAVY_COMPUTE" = "1" ] \
    && [ "${HEXA_REMOTE_NO_ADMISSION:-0}" != "1" ] \
    && [ -n "${_best_avail:-}" ] \
    && [ "${_best_avail:-0}" != "-1" ]; then
+    # L3: classify and pick class default MIN_AVAIL.
+    _job_class="$(_classify_job "$@")"
+    case "$_job_class" in
+        small)  _class_default_min=2048 ;;
+        medium) _class_default_min=8192 ;;
+        large)  _class_default_min=24576 ;;
+        *)      _class_default_min=4096 ;;
+    esac
+    _class_uc="$(printf '%s' "$_job_class" | tr '[:lower:]' '[:upper:]')"
+    _class_min_var="HEXA_REMOTE_MIN_AVAIL_MB_${_class_uc}"
+    eval "_class_min_mb=\${${_class_min_var}:-$_class_default_min}"
+    # Host-specific & global override remain higher priority (기존 L2 동작 보존).
     _admit_host_uc="$(printf '%s' "$HOST" | tr '[:lower:]' '[:upper:]')"
     _admit_min_var="HEXA_REMOTE_MIN_AVAIL_MB_${_admit_host_uc}"
-    _admit_min_mb="$(eval "printf '%s' \"\${${_admit_min_var}:-\${HEXA_REMOTE_MIN_AVAIL_MB:-4096}}\"")"
+    _admit_min_mb="$(eval "printf '%s' \"\${${_admit_min_var}:-\${HEXA_REMOTE_MIN_AVAIL_MB:-$_class_min_mb}}\"")"
     if [ "${_best_avail:-0}" -lt "${_admit_min_mb}" ] 2>/dev/null; then
-        echo "hexa_remote: L2 admission reject — host=$HOST avail=${_best_avail}MB < min=${_admit_min_mb}MB" >&2
+        echo "hexa_remote: L3 admission reject — host=$HOST class=$_job_class avail=${_best_avail}MB < min=${_admit_min_mb}MB" >&2
         # Slot 즉시 반납 (lock leak 방지). _ACQUIRED 가 비어있어도 안전.
         if [ -n "${_ACQUIRED:-}" ]; then
             rm -rf "$_ACQUIRED" 2>/dev/null || true
@@ -417,10 +485,12 @@ if [ "$_IS_HEAVY_COMPUTE" = "1" ] \
             : > "/tmp/hexa_remote.blacklist.$HOST" 2>/dev/null || true
         fi
         # AI-native JSON emit — caller 가 fallback chain 진입.
-        printf 'NEXUS_REMOTE_ERROR {"host":"%s","avail_mb":%s,"min_mb":%s,"reason":"l2_admission_insufficient_ram","exit_code":64}\n' \
-            "$HOST" "$_best_avail" "$_admit_min_mb" >&2
+        printf 'NEXUS_REMOTE_ERROR {"host":"%s","avail_mb":%s,"min_mb":%s,"job_class":"%s","reason":"l3_admission_insufficient_ram","exit_code":64}\n' \
+            "$HOST" "$_best_avail" "$_admit_min_mb" "$_job_class" >&2
         exit 64
     fi
+    # Success path — class/min 한 줄 진단 (caller observability).
+    echo "hexa_remote: L3 class=$_job_class min_avail=${_admit_min_mb}MB host=$HOST" >&2
 fi
 
 # 2026-04-22: 구 default ($HOME/Dev/hexa-lang/hexa) 는 4월14 빌드 — `^` / `&` 비트연산자 파서 미지원.
