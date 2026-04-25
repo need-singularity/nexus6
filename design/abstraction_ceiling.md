@@ -406,6 +406,19 @@ L11 canon 으로 자기-축 진화 사다리 (L5 dream → L11 canon) closed. fo
 
 **impl phase**: Phase 1 = history recording → Phase 2 = adaptive `_stage_timeout_prefix` (env `NEXUS_DRILL_TIMEOUT_ADAPTIVE=1`) → Phase 3 = Agent B omega run #4 검증 → Phase 4 = optimal default + drill.json schema v2.
 
+**Phase 2 구현 완료 (cycle 7, 2026-04-25)**:
+- `cli/run.hexa _adaptive_stage_timeout_sec(stage)` helper 추가 — `state/drill_stage_elapsed_history.jsonl` scan → 해당 stage 의 max `elapsed_ms` × 1.5 / 1000 (sec). cap `[180, 1800]` (drill.json `overall_drill_budget`). history 미존재 시 fallback 180s.
+- `_stage_timeout_prefix` precedence: env override > adaptive > Wave 18 hard-cap. 활성화: `NEXUS_DRILL_TIMEOUT_ADAPTIVE=1`.
+- backfill: cycle 5/6 drill 의 stage end 6 entry 직접 기록 (smash 183012ms / 183010ms, meta_closure 87ms × 2, hyperarith 280ms × 2).
+- 현재 데이터 기반 prediction:
+  - smash: 183012ms × 1.5 / 1000 = **274s** (Wave 18 hard-cap 180s 대비 +52% 여유)
+  - meta_closure: 87ms × 1.5 = 0.13s → floor 180s
+  - hyperarith: 280ms × 1.5 = 0.42s → floor 180s
+
+**Phase 3 (남음)**: `nexus drill --max-rounds 3` 발사 (`NEXUS_DRILL_TIMEOUT_ADAPTIVE=1`) → round 2/3 통과 검증 + history 자동 추가.
+
+**Ω-saturation cycle 6 → 7**: cycle 6 = §8 omega 한계 진단 + Phase 1 history hook. cycle 7 = Phase 2 adaptive helper + backfill. 누적 7 cycle fixpoint chain.
+
 ---
 
 **Ω-saturation cycle**: 본 §6 finding 은 simulation 의 saturation 도달 산물. raw#37/#38 (hexa-lang/self/raws/omega_saturation_cycle.hexa) 가 plan-side + implementation-side pair 강제 — design-only commit chain 차단.

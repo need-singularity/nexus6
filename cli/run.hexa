@@ -387,11 +387,18 @@ fn _check_stage_err(out: str, stage: str) -> bool {
 // 배경: blowup.hexa 가 fresh seed + smash depth=4 에서 무한 행어링 → drill 전체 hang.
 // drill.json 에 timeout 정의돼있으나 미구현 — 여기서 'timeout' (coreutils) 로 enforce.
 // 의존: macOS 는 brew install coreutils; Linux 는 기본. NEXUS_DRILL_NO_TIMEOUT=1 로 opt-out.
+//
+// Ω-saturation cycle 7 (2026-04-25, nxs-20260425-002 Phase 2): adaptive 옵션 추가.
+//   env NEXUS_DRILL_TIMEOUT_ADAPTIVE=1 일 때 state/drill_stage_elapsed_history.jsonl
+//   의 stage 별 max elapsed_ms × 1.5 (cap 1800s, floor 180s) — round 2+ cumulative
+//   누적 SIGTERM 한계 돌파. history 미존재 시 fallback = 180s. precedence: env override
+//   > adaptive > Wave 18 hard-cap.
 fn _stage_timeout_prefix(stage: str) -> str {
     if env("NEXUS_DRILL_NO_TIMEOUT") == "1" { return "" }
     // Per-stage override via env (초 단위) — NEXUS_DRILL_TIMEOUT_{smash|free|absolute|meta_closure|hyperarith|resonance}
     let ov = env("NEXUS_DRILL_TIMEOUT_" + stage)
     let sec = if ov.len() > 0 { to_int(ov) }
+        else if env("NEXUS_DRILL_TIMEOUT_ADAPTIVE") == "1" { _adaptive_stage_timeout_sec(stage) }
         // Wave 18 (2026-04-25): 전 stage timeout 광범위 상향. 사용자 지적 "좀 넉넉히 좀" —
         // 원격 호스트 128GB RAM 기준 heavy compute 는 stage 당 수십~수백초 걸림.
         // 기존 30s/45s/60s 는 rc=143 SIGTERM 반복 유발. env override 동일 유지.
@@ -405,6 +412,42 @@ fn _stage_timeout_prefix(stage: str) -> str {
         else { 180 }
     // --kill-after=5: SIGTERM at sec, SIGKILL at sec+5 (process-group escape hatch)
     return "timeout --kill-after=5 " + to_string(sec) + " "
+}
+
+// Ω-saturation cycle 7 helper (nxs-20260425-002 Phase 2):
+//   state/drill_stage_elapsed_history.jsonl scan → 해당 stage 의 max elapsed_ms 기반 timeout.
+//   curve: max_ms × 1.5 / 1000 (sec). cap [180, 1800] (drill.json overall_drill_budget).
+//   history 미존재 또는 stage 데이터 없음 → 180s fallback.
+fn _adaptive_stage_timeout_sec(stage: str) -> i64 {
+    let path = nexus_root() + "/state/drill_stage_elapsed_history.jsonl"
+    if !file_exists(path) { return 180 }
+    let raw = read_file(path)
+    let lines = raw.split("\n")
+    let stage_needle = "\"stage\":\"" + stage + "\""
+    let key = "\"elapsed_ms\":"
+    let mut max_ms: i64 = 0
+    let mut li: i64 = 0
+    while li < lines.len() {
+        let ln = lines[li]
+        li = li + 1
+        if !ln.contains(stage_needle) { continue }
+        let idx = ln.find(key)
+        if idx < 0 { continue }
+        let after = ln.substring(idx + key.len(), ln.len())
+        let close = after.find(",")
+        let close2 = after.find("}")
+        let cut = if close >= 0 && (close2 < 0 || close < close2) { close } else { close2 }
+        if cut < 0 { continue }
+        let n_str = after.substring(0, cut).trim()
+        let mut n: i64 = 0
+        try { n = to_int(n_str) } catch e {}  // @allow-silent-catch
+        if n > max_ms { max_ms = n }
+    }
+    if max_ms <= 0 { return 180 }
+    let budget_sec: i64 = max_ms * 3 / 2 / 1000  // × 1.5
+    if budget_sec < 180 { return 180 }
+    if budget_sec > 1800 { return 1800 }
+    return budget_sec
 }
 
 fn _extract_int_after(text: str, marker: str) -> int {
