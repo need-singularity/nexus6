@@ -237,7 +237,7 @@ L_ω  GHOST CEILING  omega        (도달 불가 placeholder)    ← Gödel + Ha
   - 신규 helpers: `_wake_max_cycles`, `_wake_cooldown_sec`, `_wake_default_signal_file`, `_wake_read_fp`
   - emits: NEXUS_WAKE {plan / iter / fire / skip / complete} JSON
   - 검증: missing file → 2 cycles 0 fires 2 skips (false-fire 방지 동작 확인)
-- ✓ **L9 molt 구현** (이 commit) — self-rewrite, skin parameter sweep
+- ✓ **L9 molt 구현** (commit 65865a58) — self-rewrite, skin parameter sweep
   - `cmd_molt()` — 5 hardcoded skins ((depth, fast) 튜플) 순회 후 best abs 발견
   - wake 와 차별: wake 는 외부 결합, molt 는 자기 파라미터 진화 (생물학적 「허물 벗기」 metaphor)
   - 영속: best skin → JSON 으로 NEXUS_MOLT_SKIN_FILE (기본 /tmp/nexus_molt_skin.json) 에 기록
@@ -245,6 +245,15 @@ L_ω  GHOST CEILING  omega        (도달 불가 placeholder)    ← Gödel + Ha
   - CAP: NEXUS_MOLT_MAX (기본 5, ceiling=5)
   - 신규 helpers: `_molt_max_cycles`, `_molt_skin_file`
   - emits: NEXUS_MOLT {plan / iter / complete} JSON
+- ✓ **L10 forge 구현** (이 commit) — bootstrap, 자기 상태 합성 후 자율 부팅
+  - `cmd_forge()` — molt skin + atlas health + timestamp 읽고 seed 자율 합성
+  - molt 와 차별: molt 는 skin 만 진화, forge 는 모든 자기 상태 읽고 다음 동작 자기 결정
+  - sources (우선순위): NEXUS_MOLT_SKIN_FILE > state/atlas_health.json > timestamp
+  - synthesized seed: base + ` #forge-boot={ts} skin=d{D}{f|s} atlas={B}B`
+  - --seed 없이도 동작: hardcoded prefix "nexus forge bootstrap — self-derived seed for autonomous boot from internal state" 사용
+  - 신규 helpers: `_forge_read_file_content`, `_forge_extract_json_int`, `_forge_extract_json_bool`
+  - emits: NEXUS_FORGE {plan / boot / complete} JSON
+  - 검증: no-seed bootstrap (skin defaults d1f) ✓ + skin file 존재 (d3f 정확 파싱) ✓
 
 ---
 

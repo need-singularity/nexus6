@@ -182,6 +182,8 @@ fn cmd_help() -> void {
     println("  smash --seed \"...\" [--depth N]  blowup 9-phase 돌파 (발견)")
     println("  free --seed \"...\" [--dfs N]     compose DFS 탐색 (6-core 체인)")
     println("  absolute --seed \"...\"           Mk.VIII Δ₀-absolute 검증 ([10*]→[11*])")
+    println("  forge [--seed \"...\"] [--max-rounds N]    L10 bootstrap — 자기 상태 파일들 읽고 seed 합성 → drill apex 자율 부팅 (--seed 없어도 동작)")
+    println("        sources: NEXUS_MOLT_SKIN_FILE / state/atlas_health.json / timestamp. emits: NEXUS_FORGE JSON (plan/boot/complete)")
     println("  molt --seed \"...\" [--max-cycles N]      L9 self-rewrite — skin (depth × fast) sweep, best skin 영속 (NEXUS_MOLT_SKIN_FILE)")
     println("        emits: NEXUS_MOLT JSON (plan/iter/complete) — wake 와 차별 = 자기 파라미터 진화")
     println("  wake --seed \"...\" [--signal-file path] [--max-cycles N]   L8 reality-loop — 외부 파일 fp 변화 시에만 fire")
@@ -4670,6 +4672,134 @@ fn cmd_molt(seed: str, max_cycles_flag: str) -> void {
     println("◑ molt complete — best_skin_idx=" + to_string(best_skin_idx) + " (depth=" + to_string(best_d) + " fast=" + (if best_f { "true" } else { "false" }) + ") best_abs=" + to_string(best_abs) + " → " + skin_path)
 }
 
+// ─── forge — L10 bootstrap orchestrator (2026-04-25) ───
+// 사다리 위치: L10 (molt 위 bootstrap 층). 「자기 부팅」 — engine 이 자기 상태 파일들을
+//   읽어 seed/config 를 합성, 사용자 입력 없이도 의미 있는 작업 시작. creator → creation.
+// 명명: design/abstraction_ceiling.md — 「단조/부팅」 (raw 영단어, 형상 잡기 + boot strap).
+//
+// 차별:
+//   - molt (L9)  : skin 자기 진화 (parameter 만)
+//   - forge (L10): 모든 자기 상태 (molt skin + atlas health + …) 읽고 다음 동작 자기 결정
+//
+// 자기 상태 소스 (우선순위):
+//   1) molt skin file (NEXUS_MOLT_SKIN_FILE 또는 /tmp/nexus_molt_skin.json) — best skin 적용
+//   2) atlas health (state/atlas_health.json) — 크기 기반 health hint 주입
+//   3) timestamp (date +%Y%m%d-%H%M%S) — uniqueness
+//   4) (옵션) --seed flag — 사용자 augment 입력 (없으면 bootstrap from scratch)
+//
+// 합성 seed:
+//   if --seed: orig + " #forge-boot={ts} skin=d{D}{f|s} atlas={B}B"
+//   else:      "nexus forge bootstrap {ts} skin=d{D}{f|s} atlas={B}B — self-derived seed for autonomous boot"
+//
+// emits:
+//   NEXUS_FORGE {"event":"plan","seed_provided":bool,"skin_present":bool,"atlas_present":bool}
+//   NEXUS_FORGE {"event":"boot","seed":"...","skin":{"depth":D,"fast":bool},"atlas_bytes":B,"timestamp":"..."}
+//   NEXUS_FORGE {"event":"complete","status":"dispatched_to_drill"}
+fn _forge_read_file_content(path: str) -> str {
+    let q = shell_quote(path)
+    let chk = exec("[ -f " + q + " ] && echo Y || echo N").trim()
+    if chk != "Y" { return "" }
+    return exec("cat " + q + " 2>/dev/null").trim()
+}
+
+fn _forge_extract_json_int(json: str, key: str) -> int {
+    // "key":N 패턴에서 N 추출. 실패 시 -1.
+    let needle = "\"" + key + "\":"
+    let idx = str_find(json, needle)
+    if idx < 0 { return -1 }
+    let mut i = idx + needle.len()
+    let n = json.len()
+    let mut neg = false
+    if i < n && char_code(json, i) == 45 { neg = true; i = i + 1 }  // '-'
+    let mut buf = ""
+    while i < n {
+        let cc = char_code(json, i)
+        if cc >= 48 && cc <= 57 {
+            buf = buf + json.substring(i, i + 1)
+            i = i + 1
+        } else { break }
+    }
+    if buf.len() == 0 { return -1 }
+    let mut v: i64 = 0
+    try { v = to_int(buf) } catch e { v = -1 }
+    if neg { v = 0 - v }
+    return v
+}
+
+fn _forge_extract_json_bool(json: str, key: str) -> bool {
+    // "key":true|false. 기본 false.
+    let needle = "\"" + key + "\":"
+    let idx = str_find(json, needle)
+    if idx < 0 { return false }
+    let i = idx + needle.len()
+    if i + 4 > json.len() { return false }
+    let head = json.substring(i, i + 4)
+    if head == "true" { return true }
+    return false
+}
+
+fn cmd_forge(seed_flag: str, max_rounds_flag: str) -> void {
+    let _seed_t = seed_flag.trim()
+    let has_seed = _seed_t.len() > 0
+    println("⚒ forge — L10 bootstrap orchestration (seed_provided=" + (if has_seed { "true" } else { "false" }) + ")")
+    // 1) molt skin
+    let skin_path_env = env("NEXUS_MOLT_SKIN_FILE")
+    let skin_path = if skin_path_env.len() > 0 { skin_path_env } else { "/tmp/nexus_molt_skin.json" }
+    let skin_json = _forge_read_file_content(skin_path)
+    let skin_present = skin_json.len() > 0
+    let mut skin_depth: i64 = 1
+    let mut skin_fast: bool = true
+    if skin_present {
+        let d = _forge_extract_json_int(skin_json, "depth")
+        if d >= 1 { skin_depth = d }
+        skin_fast = _forge_extract_json_bool(skin_json, "fast")
+    }
+    // 2) atlas health
+    let atlas_path = nexus_root() + "/state/atlas_health.json"
+    let atlas_chk = exec("[ -f " + shell_quote(atlas_path) + " ] && wc -c < " + shell_quote(atlas_path) + " || echo 0").trim()
+    let mut atlas_bytes: i64 = 0
+    try { atlas_bytes = to_int(atlas_chk) } catch e { atlas_bytes = 0 }
+    let atlas_present = atlas_bytes > 0
+    // 3) timestamp
+    let timestamp = exec("date +%Y%m%d-%H%M%S 2>/dev/null").trim()
+    // 4) 합성 seed
+    let f_marker = if skin_fast { "f" } else { "s" }
+    let suffix = " #forge-boot=" + timestamp + " skin=d" + to_string(skin_depth) + f_marker + " atlas=" + to_string(atlas_bytes) + "B"
+    let max_main = 200 - suffix.len()
+    let mut synthesized = ""
+    if has_seed {
+        let mut main = _seed_t
+        if main.len() > max_main {
+            if max_main < 1 { main = "" } else { main = main.substring(0, max_main) }
+        }
+        synthesized = main + suffix
+    } else {
+        // boot-from-scratch: hardcoded prefix + 자기 상태 suffix
+        let boot_prefix = "nexus forge bootstrap — self-derived seed for autonomous boot from internal state"
+        let mut main = boot_prefix
+        if main.len() > max_main {
+            if max_main < 1 { main = "" } else { main = main.substring(0, max_main) }
+        }
+        synthesized = main + suffix
+    }
+    eprintln("NEXUS_FORGE {\"event\":\"plan\",\"seed_provided\":" + (if has_seed { "true" } else { "false" })
+        + ",\"skin_present\":" + (if skin_present { "true" } else { "false" })
+        + ",\"atlas_present\":" + (if atlas_present { "true" } else { "false" }) + "}")
+    eprintln("NEXUS_FORGE {\"event\":\"boot\",\"seed_len\":" + to_string(synthesized.len())
+        + ",\"skin\":{\"depth\":" + to_string(skin_depth) + ",\"fast\":" + (if skin_fast { "true" } else { "false" }) + "}"
+        + ",\"atlas_bytes\":" + to_string(atlas_bytes)
+        + ",\"timestamp\":\"" + timestamp + "\"}")
+    println("  synthesized seed (" + to_string(synthesized.len()) + " chars): " + synthesized)
+    println("  skin: depth=" + to_string(skin_depth) + " fast=" + (if skin_fast { "true" } else { "false" }) + " (from " + skin_path + ")")
+    println("  atlas: " + to_string(atlas_bytes) + " bytes (from " + atlas_path + ")")
+    println("─── forge → dispatch to drill (apex preset) ───")
+    let per_stage_zero = [0, 0, 0, 0, 0, 0]
+    let depth_str = to_string(skin_depth)
+    cmd_drill(synthesized, max_rounds_flag, "", "", depth_str, per_stage_zero, true, true, "", "", "3")
+    eprintln("NEXUS_FORGE {\"event\":\"complete\",\"status\":\"dispatched_to_drill\"}")
+    println("⚒ forge complete")
+}
+
 // ─── E12 batch drill wrapper (2026-04-21) ───
 // SSOT: shared/config/drill.json .seed_batch
 // Sequential iterate — seed N 개를 순차 cmd_drill 호출. engine_daemon 미구현 시 naive 반복.
@@ -5265,6 +5395,14 @@ fn main() -> void {
     }
     if sub == "absolute" {
         cmd_absolute(find_flag(a, "--seed", ""))
+        return
+    }
+    if sub == "forge" {
+        // L10 bootstrap — 자기 상태 파일들 읽고 seed 합성, drill apex 로 dispatch.
+        cmd_forge(
+            find_flag(a, "--seed", ""),
+            find_flag(a, "--max-rounds", "")
+        )
         return
     }
     if sub == "molt" {
