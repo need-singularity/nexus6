@@ -245,7 +245,7 @@ L_ω  GHOST CEILING  omega        (도달 불가 placeholder)    ← Gödel + Ha
   - CAP: NEXUS_MOLT_MAX (기본 5, ceiling=5)
   - 신규 helpers: `_molt_max_cycles`, `_molt_skin_file`
   - emits: NEXUS_MOLT {plan / iter / complete} JSON
-- ✓ **L10 forge 구현** (이 commit) — bootstrap, 자기 상태 합성 후 자율 부팅
+- ✓ **L10 forge 구현** (commit 119972ef) — bootstrap, 자기 상태 합성 후 자율 부팅
   - `cmd_forge()` — molt skin + atlas health + timestamp 읽고 seed 자율 합성
   - molt 와 차별: molt 는 skin 만 진화, forge 는 모든 자기 상태 읽고 다음 동작 자기 결정
   - sources (우선순위): NEXUS_MOLT_SKIN_FILE > state/atlas_health.json > timestamp
@@ -253,7 +253,19 @@ L_ω  GHOST CEILING  omega        (도달 불가 placeholder)    ← Gödel + Ha
   - --seed 없이도 동작: hardcoded prefix "nexus forge bootstrap — self-derived seed for autonomous boot from internal state" 사용
   - 신규 helpers: `_forge_read_file_content`, `_forge_extract_json_int`, `_forge_extract_json_bool`
   - emits: NEXUS_FORGE {plan / boot / complete} JSON
-  - 검증: no-seed bootstrap (skin defaults d1f) ✓ + skin file 존재 (d3f 정확 파싱) ✓
+- ✓ **L11 canon 구현** (이 commit) — transfinite seal, 자기 상태 + 결과 → atlas-side 봉인 (사다리 마지막 단)
+  - `cmd_canon(seed_flag, note_flag)` — skin + atlas_bytes + last_drill_total + ts 한 줄 JSON entry append
+  - forge 의 역방향: forge state → seed (forward bootstrap) ↔ canon state+result → seal entry (backward closure)
+  - 영속: append-only `state/canon_seal.jsonl` (state/* gitignore 적용 → local-only ephemeral)
+  - seal_id: `canon-{YYYYMMDD-HHMMSS}-d{depth}{f|s}` (사용자 입력 없이도 결정적)
+  - sources: NEXUS_MOLT_SKIN_FILE > state/atlas_health.json > /tmp/nexus_drill_last_total.txt
+  - --seed/--note 모두 옵션 (빈 문자열 fallback). 모든 자기 상태 부재 시도 0/1f/false 로 동작 (no-throw)
+  - emits: NEXUS_CANON {plan / seal / complete} JSON
+  - 검증: no-args (skin 부재, default d1f, total=0) ✓ + skin (d3,F) + drill_total=777 + seed/note 정확 반영 ✓ + JSON 라인 valid ✓
+
+### 사다리 종료
+
+L11 canon 으로 자기-축 진화 사다리 (L5 dream → L11 canon) closed. forge (L10) 가 forward bootstrap, canon (L11) 이 backward seal — 양방향 닫힘. L_ω omega 는 정의상 도달 불가 placeholder 로 남음 (위 §5).
 
 ---
 
