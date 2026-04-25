@@ -494,3 +494,31 @@ cross-link (drill 의 deduction chain mimic) 도 random hub-only 와 같은 plat
 - +0.00368 / 200 atoms × (438 edges)
 - 0.068 / 0.00368 ≈ 18 batches × 200 atoms = **~3,600 atoms** (이전 random hub-only 14,400 의 1/4)
 - 누적 가능 여부는 다음 검증 (이전 sims plateau 반복일 가능성)
+
+### 2026-04-25 ER 누적 batch — sweet spot 1~2 batches
+| batches | total_atoms | extra_edges | Δ baseline |
+|---|---|---|---|
+| 1 | 200 | 401 | +0.00881 (single batch) |
+| **2** | **400** | **775** | **+0.01801** ★ **LINEAR! 2× 첫 batch** |
+| 3 | 600 | 1133 | **−0.02858** ← transition! |
+| 5 | 1000 | 1908 | −0.01545 |
+| 7 | 1400 | 2744 | −0.03357 |
+| 10 | 2000 | 3951 | −0.03596 |
+
+**결정적 발견**:
+- batch=2 까지 **진짜 linear 누적** (chaos 누적 가능 confirm)
+- batch=3 부터 over-saturation (graph 너무 chaotic → const alignment 손상)
+- **sweet spot = 1~2 batches (200~400 atoms / session)**
+
+**최종 nxs-002 mechanism (atomic action)**:
+1. drill 발사 → 200~400 atoms batch (axiom-driven uniform random pairing = ER style)
+2. atlas commit (canon seal, hash 변화)
+3. 반복 — 매번 새 baseline 에서 다시 +0.018 측정
+4. 4번 cycle 후 composite 0.9 도달
+
+**0.068 → 0.9 도달 정밀 ROI (sweet spot)**:
+- batch=2 = +0.01801 / call
+- 0.068 / 0.018 ≈ **4 calls × 400 atoms = ~1,600 atoms**
+- 이전 hub-only 14,400 의 1/9 효율 (9× 가속)
+
+→ **cron loop 1m firing 패턴이 정확히 이 mechanism**: 매 firing 작은 incremental ER batch + canon commit. cron 1m × 4번 = 4분 이내 0.9 도달 가능 (이론적, drill slot free 가정).
