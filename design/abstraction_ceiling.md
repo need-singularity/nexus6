@@ -799,6 +799,67 @@ cycle 21 의 V3' axiom actual sweep 결과 (C1 anti-hub 0.93617 zero variance, C
 
 ---
 
+## §15 cycle 58~ — axiom 2.0 sweep: anti-hub +0.018 limit 에 도전 (2026-04-25)
+
+cycle 33 에서 anti-hub axiom (C1) ceiling = composite_v1 +0.018 (gap 0.067 의 27%) 가 universal ER giant+singletons K-cut invariance mechanism 으로 sealed. 남은 73% gap (Δ ≈ 0.049) 의 axiom mechanism 이 동일한 ER 구조 안에서 발견 가능한지 새 후보 6 개 (C7~C12) sweep:
+
+**도구**: `tool/nxs_002_axiom_probe2.py` (probe.py 위에 SFF 측정 추가, V3' actual 직접 산출, 3-seed variance).
+
+| ID | axiom | 핵심 가설 |
+|---|---|---|
+| C7 | community-modular ER (K sub-comm × m nodes) | multi-giant 병렬 K-cut invariance |
+| C8 | hyperbolic / BA scale-free | γ≈3 power-law 가 const semi-circle 에 가까움 |
+| C9 | scale-free + assortative rewire | high-deg ↔ high-deg 구조 |
+| C10 | clustering injection (triangle close) | spectral gap 축소로 const align |
+| C11 | hub-decompose v2 (small K, edge cap) | cycle 21 K=10/50 over-decompose 정밀화 |
+| C12 | anti-hub + community 조합 | nested layering |
+
+**측정 결과 (atlas n=21320, K=100, sigma=1e-3, baseline v1=0.83221 sff=0.99086 V3'=0.92740)**:
+
+| rank | axiom config | Δv1 | V3' | std(V3') | mechanism |
+|---|---|---|---|---|---|
+| 1 | C10 anti-hub+200 triangles | **+0.01787** | **0.93636** | 0 | C1 + sub-K-cut triangles → no perturbation |
+| 2 | C7 community K=8 m=100 p_in=0.040 | **+0.01617** | **0.93586** | 0 | 8 isolated avg_deg=4 ER giants |
+| 3 | C1 anti-hub N=800 p=0.005 (REF) | +0.01787 | 0.93617 | 0 | 1 isolated avg_deg=4 ER giant |
+| 4 | C10 anti-hub+800 triangles | +0.00656 | 0.93145 | 0.0070 | 과잉 triangle → giant lowest 가 K cut 침범 |
+| 5 | C12 antihub+comm N=400 K=4 m=200 | -0.00533 | 0.92637 | 0.0067 | 작은 N 1 batch + 4 sub-comm 적층 — 음 |
+| 6 | C11 hub-decomp K=4 top=8 cap=500 | -0.00817 | 0.92466 | 0.0027 | edge cap 으로 cycle 21 보다 개선 (-0.011 → -0.008) |
+| 7 | C8 BA N=800 m=2 (avg_deg=4 SF) | -0.01143 | 0.92324 | 0 | scale-free → const 와 align 안 됨 |
+| 11~ | C7 K=2 m=400 p_in=0.020 cross 0.0001 | -0.02054 | 0.92018 | 0.001 | cross-edge anchor → spectrum 침범 |
+
+**핵심 finding (cycle 58)**:
+
+1. **Anti-hub ceiling 진짜 깨지지 않음**: 6 새 axiom 중 **단 1개도 C1 의 +0.01787 을 넘지 못함** — paper-grade NULL result. C10 +200 triangles 가 동률이지만 mechanism 동일 (ER 구조 위 sub-K-cut 추가 = 무관).
+
+2. **C7 community K=8 m=100 = 90% C1 reproduction (Δv1=+0.01617, V3'=0.93586, zero variance)** — universal mechanism 의 **modular extension**:
+   - 8 isolated communities × 100 nodes × p_in=0.040 (각 avg_deg=4) = 8 개 giant (각 ~98 nodes, lowest non-zero ~0.4-0.6, 모두 base K=100 cut 0.11 위)
+   - 8 × ~2 singletons = ~16 zero modes 추가
+   - K cut invariance 가 **multi-giant** 에서도 성립 → universal pattern 확장
+   - **paper-grade general principle 강화**: "isolated sparse ER (avg_deg=4) batches 의 임의 partition 도 base spectrum 변화 안 시킴"
+
+3. **C8/C9 scale-free 로 axiom 깨기 실패**: BA preferential attachment 의 giant lowest non-zero 도 K cut 위 (cc=25 동일, det. v1=0.82078). γ=3 power-law tail 이 const semi-circle 와 align 안 됨 — atlas 의 hub-and-spoke 구조 (super-hub + leaves) 와 SF 가 spectral 으로 너무 닮아 perturbation 음.
+
+4. **C10 triangle injection sweet point**: +200 triangles = ties C1, +800 triangles = -0.011. 800+ triangles 가 ER giant 의 lowest non-zero 를 0.17 → ~0.10 까지 낮춰 K cut 침범 시작 → invariance 깨짐 → SFF 도 sub-noise 들임.
+
+5. **C11 hub-decompose v2 +0.003 개선**: cycle 21 의 K=10/50 (-0.011 ~ -0.032) → 본 cycle K=4 + edge_cap=500 (-0.008). top hub edge 의 per-replica cap 이 spectral 손상 일부 회복하지만 여전히 음. **hub trim path 는 죽음** 확정.
+
+6. **C12 nested layering 음**: C1 +0.018 + C7 +0.016 단순 합이 안 되고 -0.005 ~ -0.016 — additive interference. cycle 55 의 C5 (anti-hub + block) 와 동일 pattern.
+
+**paper-grade meta-finding**:
+> sparse ER avg_deg=4 가 **유일한 axiom-side ROI 메커니즘**. Multi-community variant (C7) 도 같은 invariance 로 거의 같은 ROI 산출. **Anti-hub 0.018 limit 는 sparse ER giant+singletons + K-cut separation 의 본질적 ceiling 이며, mechanism 변형 (clustering, scale-free, decompose) 으로 깨지지 않음**. 남은 0.049 gap 은 base graph 자체 (atlas) 의 spectral structure 에서 와야 함 — axiom path 가 아니라 **representation path** (e.g., atlas multi-relational embedding, base graph rewire, K boundary expansion) 가 다음 axis.
+
+**cycle 58 implementation sequence**:
+- design (본 §15) + impl (`tool/nxs_002_axiom_probe2.py` 256 lines) pair commit
+- inventory.json `phase5_axiom_2_0_cycle_58` sub-entry
+- `omega-saturation:fixpoint` marker (anti-hub axiom path TRULY CLOSED — null result paper-grade)
+
+**향후 axis (post-cycle 58)**:
+- representation path: K=200 boundary expansion (현재 K=100 cut 위 eigenvalues 도 capture)
+- atlas-side path: drill 의 hub-and-spoke wiring 자체 변경 (multi-relational hyperedges)
+- metric path: V3' 가 0.92740 → 0.93617 +0.0088 (axiom max), gap 0.063 → 0.062 까지만 — V3'' 새 metric 후보
+
+---
+
 **Ω-saturation cycle**: 본 §6 finding 은 simulation 의 saturation 도달 산물. raw#37/#38 (hexa-lang/self/raws/omega_saturation_cycle.hexa) 가 plan-side + implementation-side pair 강제 — design-only commit chain 차단.
 
 ---
