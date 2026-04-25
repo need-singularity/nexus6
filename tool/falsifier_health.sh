@@ -86,6 +86,17 @@ print(d.get("cmd",""))
     CMD=$(printf '%s\n' "$META" | sed -n '4,$p')
     [ -z "$FID" ] && continue
     TOTAL=$((TOTAL+1))
+    # R2 anti-spoof lint: reject cmds that just `echo $TOKEN` (silent-corruption defense)
+    # Pattern: trimmed cmd matches `^echo [A-Z][A-Z0-9_]*$` exactly — that's a spoof signature
+    CMD_TRIMMED=$(printf '%s' "$CMD" | tr -d '[:space:]')
+    if printf '%s' "$CMD_TRIMMED" | grep -qE '^echo[A-Z][A-Z0-9_]*$'; then
+        STATUS="SPOOF"; ERROR=$((ERROR+1))
+        printf '%s\t%s\t%s\t%s\t%s\n' "$FID" "$SLUG" "$STATUS" "spoof" "0" >>"$TMP_TSV"
+        if [ "$QUIET" = "0" ] && [ "$JSON" = "0" ]; then
+            printf '  %-4s  %-50s  %-5s  reason=anti_spoof_lint  fix=audit_cmd_origin\n' "$FID" "$SLUG" "$STATUS"
+        fi
+        continue
+    fi
     T0=$(date +%s%N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1e9))')
     OUT=$(eval "$CMD" 2>&1); EC=$?
     T1=$(date +%s%N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1e9))')
