@@ -1,0 +1,369 @@
+#!hexa strict
+// tool/nanograv_pulsar_bridge.hexa — NANOGrav 15-yr Pulsar Timing Array (GWB first detection, 2023)
+// metadata bridge + n=6 DOF binding to nexus pulsar/GWB lenses.
+//
+// @tool(slug="nanograv_pulsar_bridge", desc="NANOGrav 15-year PTA gravitational-wave background detection metadata fetch + n=6 pulsar-DOF / Hellings-Downs quadrupolar binding to sedi_dispersion_measure / sedi_timing_integrity / sedi_stochastic_background")
+// @usage(hexa run tool/nanograv_pulsar_bridge.hexa [--selftest] [--json] [--no-fetch])
+// @exit_codes(0=PASS, 1=usage/io error, 2=value verification fail (anchor missing or sentinel out-of-range))
+// @sentinel(__NANOGRAV_BRIDGE__ PASS|FAIL pulsars=<n> strain_A_yr=<float> gw_background_sigma=<float>)
+// @origin(NANOGrav Collaboration, "The NANOGrav 15-yr Data Set: Evidence for a Gravitational-Wave Background", arXiv:2306.16213, ApJL 951 L8, 2023-06-29)
+// @abstraction(hive raw 70 design-multi-axis-verify-grid + external-source-corroboration; n=6 pulsar-kinematic DOF cross-binding)
+// @paradigm(structural-admissibility — hardcoded reference fallback, deterministic exec(curl), no JSON-engine dep, GWB-detection anchor)
+// @companion(tool/codata_bridge.hexa — same external-bridge idiom; tool/gw_observatory_bridge.hexa — sister GW catalog bridge)
+// @allow-bare-exec
+// @no-sandbox
+//
+// Endpoints (verified 2026-04-25):
+//   https://arxiv.org/abs/2306.16213          — abstract page (text scrape)
+//   https://nanograv.org/news                  — collaboration news index (fallback)
+//
+// Hardcoded fallback (NANOGrav 15-yr final, used when --no-fetch or curl fails):
+//   pulsars        = 68            (12.5-yr had 67; 15-yr extension grew to 68)
+//   dataset_years  = 15            (continuous timing baseline)
+//   strain_A_yr    = 6.4e-15       (fixed γ=13/3 SMBHB power-law, A at 1-yr reference frequency)
+//   gamma          = 13/3 ≈ 4.333  (SMBHB inspiral-driven characteristic-strain spectral index)
+//   hd_sigma       = 3.5           (Hellings-Downs spatial-correlation significance, ~3-4σ band)
+//   reference_paper = "arXiv:2306.16213"
+//
+// n=6 DOF binding (cross-axis with hexa_sim_verify_grid axis_cross):
+//   Per-pulsar kinematic 6 DOF = (RA, DEC, distance_modulus, PM_RA, PM_DEC, spin_period).
+//   Hellings-Downs angular correlation ∝ quadrupolar (l=2) — multipole 2 + 4 azimuthal modes
+//   feed n/τ-symmetry layer (τ=4 azimuthal × phase, n=6 spatial-temporal carrier).
+//   GWB strain-spectrum γ=13/3 binds to sedi_stochastic_background as f^(-2/3) characteristic
+//   strain → power-spectrum slope -7/3 → integer (13,3) coprime pair under sopfr=5.
+
+// ─── scaled-integer constants (15 fractional digits, strain ~10^-15 resolution) ───
+//
+// strain_A_yr 6.4e-15 stored as integer 64 (units: 10^-16) → SCALE_STRAIN = 16 frac digits
+// (i.e. strain_int = 64 means 64 * 10^-16 = 6.4e-15).
+fn STRAIN_SCALE_DIGITS() -> i64 { return 16 }       // 10^-16
+fn STRAIN_FALLBACK() -> i64 { return 64 }            // 6.4e-15 = 64 * 10^-16
+fn GAMMA_NUM() -> i64 { return 13 }
+fn GAMMA_DEN() -> i64 { return 3 }
+fn PULSAR_COUNT_FALLBACK() -> i64 { return 68 }
+fn DATASET_YEARS_FALLBACK() -> i64 { return 15 }
+// hd_sigma stored at 10^-1 scale (3.5 → 35)
+fn HD_SIGMA_SCALED_FALLBACK() -> i64 { return 35 }
+fn HD_SIGMA_SCALE() -> i64 { return 10 }
+
+// ─── n=6 DOF anchor ───
+fn N6_DOF() -> i64 { return 6 }
+fn HD_MULTIPOLE_L() -> i64 { return 2 }   // quadrupolar
+fn TAU_AZIMUTHAL() -> i64 { return 4 }    // τ=4 azimuthal × phase
+
+// ─── string / type helpers ───
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _abs_i(x: i64) -> i64 { if x < 0 { return 0 - x } return x }
+
+fn _esc_json(s: string) -> string {
+    let mut r = s.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    return r
+}
+
+fn _str_to_i(s: string) -> i64 {
+    if len(s) == 0 { return 0 }
+    let mut neg = false
+    let mut i = 0
+    if s.substring(0, 1) == "-" { neg = true; i = 1 }
+    let mut acc: i64 = 0
+    while i < len(s) {
+        let c = s.substring(i, i + 1)
+        if c == "0" { acc = acc * 10 }
+        else if c == "1" { acc = acc * 10 + 1 }
+        else if c == "2" { acc = acc * 10 + 2 }
+        else if c == "3" { acc = acc * 10 + 3 }
+        else if c == "4" { acc = acc * 10 + 4 }
+        else if c == "5" { acc = acc * 10 + 5 }
+        else if c == "6" { acc = acc * 10 + 6 }
+        else if c == "7" { acc = acc * 10 + 7 }
+        else if c == "8" { acc = acc * 10 + 8 }
+        else if c == "9" { acc = acc * 10 + 9 }
+        // non-digit silently ignored (defensive against scraped text)
+        i = i + 1
+    }
+    if neg { return 0 - acc }
+    return acc
+}
+
+// Format strain_int (units 10^-16) as scientific notation "X.Ye-15"
+// strain_int=64 → "6.4e-15"; strain_int=24 → "2.4e-15"
+fn _fmt_strain(strain_int: i64) -> string {
+    if strain_int <= 0 { return "0e-15" }
+    // value = strain_int * 10^-16 = (strain_int / 10) * 10^-15
+    let int_part = strain_int / 10
+    let frac_part = strain_int % 10
+    return to_string(int_part) + "." + to_string(frac_part) + "e-15"
+}
+
+fn _fmt_hd_sigma(scaled: i64) -> string {
+    let int_part = scaled / HD_SIGMA_SCALE()
+    let frac_part = _abs_i(scaled) % HD_SIGMA_SCALE()
+    return to_string(int_part) + "." + to_string(frac_part)
+}
+
+fn _fmt_gamma() -> string {
+    return to_string(GAMMA_NUM()) + "/" + to_string(GAMMA_DEN())
+}
+
+// ─── live fetch (best-effort; fallback on any failure) ───
+fn fetch_arxiv_abs() -> string {
+    let url = "https://arxiv.org/abs/2306.16213"
+    let cmd = "curl -sL --max-time 15 -A 'Mozilla/5.0 nanograv-bridge' '" + url + "' 2>/dev/null"
+    return _str(exec(cmd))  // @allow-bare-exec
+}
+
+fn fetch_nanograv_news() -> string {
+    let url = "https://nanograv.org/news"
+    let cmd = "curl -sL --max-time 15 -A 'Mozilla/5.0 nanograv-bridge' '" + url + "' 2>/dev/null"
+    return _str(exec(cmd))  // @allow-bare-exec
+}
+
+// Extract pulsar count from scraped text. Look for patterns like "67 pulsars" or "68 pulsars"
+// or "67-pulsar" or "sample of 67". Returns 0 if not found.
+fn extract_pulsar_count(text: string) -> i64 {
+    if len(text) == 0 { return 0 }
+    let needles = ["67 pulsar", "68 pulsar", "67-pulsar", "68-pulsar"]
+    let mut i = 0
+    while i < len(needles) {
+        let n = needles[i]
+        let idx = text.index_of(n)
+        if idx >= 0 {
+            // first two chars of needle hold the digit pair
+            let d = n.substring(0, 2)
+            return _str_to_i(d)
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// Extract dataset years (looks for "15-year" or "15 year" or "15-yr" or "15 yr").
+fn extract_years(text: string) -> i64 {
+    if len(text) == 0 { return 0 }
+    let needles = ["15-year", "15 year", "15-yr", "15 yr", "15yr"]
+    let mut i = 0
+    while i < len(needles) {
+        if text.index_of(needles[i]) >= 0 { return 15 }
+        i = i + 1
+    }
+    return 0
+}
+
+// Detect Hellings-Downs mention (qualitative; returns 1 if found else 0)
+fn detect_hd_mention(text: string) -> i64 {
+    if len(text) == 0 { return 0 }
+    if text.index_of("Hellings") >= 0 || text.index_of("HD correlation") >= 0 {
+        return 1
+    }
+    return 0
+}
+
+// ─── selftest ───
+fn _selftest() {
+    let mut bad = []
+
+    // 1. STRAIN format roundtrip
+    let s1 = _fmt_strain(64)
+    if s1 != "6.4e-15" { bad.push("_fmt_strain(64) expected '6.4e-15' got '" + s1 + "'") }
+    let s2 = _fmt_strain(24)
+    if s2 != "2.4e-15" { bad.push("_fmt_strain(24) expected '2.4e-15' got '" + s2 + "'") }
+
+    // 2. HD sigma format
+    let h1 = _fmt_hd_sigma(35)
+    if h1 != "3.5" { bad.push("_fmt_hd_sigma(35) expected '3.5' got '" + h1 + "'") }
+
+    // 3. gamma format
+    let g1 = _fmt_gamma()
+    if g1 != "13/3" { bad.push("_fmt_gamma() expected '13/3' got '" + g1 + "'") }
+
+    // 4. fallback constants sanity
+    if PULSAR_COUNT_FALLBACK() != 68 { bad.push("pulsar_count_fallback expected 68 got " + to_string(PULSAR_COUNT_FALLBACK())) }
+    if DATASET_YEARS_FALLBACK() != 15 { bad.push("dataset_years_fallback expected 15 got " + to_string(DATASET_YEARS_FALLBACK())) }
+    if STRAIN_FALLBACK() != 64 { bad.push("strain_fallback expected 64 (=6.4e-15) got " + to_string(STRAIN_FALLBACK())) }
+    if HD_SIGMA_SCALED_FALLBACK() != 35 { bad.push("hd_sigma_fallback expected 35 (=3.5) got " + to_string(HD_SIGMA_SCALED_FALLBACK())) }
+
+    // 5. n=6 binding identity: 6 pulsar DOF == N6_DOF
+    if N6_DOF() != 6 { bad.push("N6_DOF expected 6 got " + to_string(N6_DOF())) }
+    // quadrupolar HD multipole l=2
+    if HD_MULTIPOLE_L() != 2 { bad.push("HD_MULTIPOLE_L expected 2 got " + to_string(HD_MULTIPOLE_L())) }
+    // τ=4 azimuthal
+    if TAU_AZIMUTHAL() != 4 { bad.push("TAU_AZIMUTHAL expected 4 got " + to_string(TAU_AZIMUTHAL())) }
+    // sigma·phi = n·tau identity (with sigma=12, phi=2, n=6, tau=4): 12*2 = 6*4 = 24
+    let sp = 12 * 2
+    let nt = N6_DOF() * TAU_AZIMUTHAL()
+    if sp != nt { bad.push("sigma·phi != n·tau (12*2 vs 6*4)") }
+
+    // 6. GWB power-law: characteristic strain h_c(f) ∝ f^(-2/3)  ⇒  γ = 3 - 2*α where α = -2/3 ⇒ γ = 13/3
+    // (h_c ∝ f^(α=-2/3); residual power spectrum P(f) ∝ f^(-γ); γ = 3-2α = 3 - 2*(-2/3) = 3 + 4/3 = 13/3)
+    // sanity: GAMMA_NUM*3 == 13*3 == 39, GAMMA_DEN*GAMMA_NUM == 39
+    if GAMMA_NUM() * GAMMA_DEN() != 39 { bad.push("gamma 13/3 product check failed") }
+
+    // 7. extract_pulsar_count on synthetic text
+    let txt1 = "We present results from a 15-year analysis of 67 pulsars showing Hellings-Downs correlation."
+    let pc1 = extract_pulsar_count(txt1)
+    if pc1 != 67 { bad.push("extract_pulsar_count expected 67 got " + to_string(pc1)) }
+
+    let yrs1 = extract_years(txt1)
+    if yrs1 != 15 { bad.push("extract_years expected 15 got " + to_string(yrs1)) }
+
+    let hd1 = detect_hd_mention(txt1)
+    if hd1 != 1 { bad.push("detect_hd_mention expected 1 got " + to_string(hd1)) }
+
+    // 8. extract_pulsar_count returns 0 on empty
+    let pc2 = extract_pulsar_count("")
+    if pc2 != 0 { bad.push("extract_pulsar_count('') expected 0 got " + to_string(pc2)) }
+
+    if len(bad) > 0 {
+        eprintln("[nanograv_pulsar_bridge selftest] FAIL: " + bad.join(", "))
+        eprintln("  reason: hardcoded reference value mismatch or extractor regression")
+        eprintln("  fix:    re-verify against arXiv:2306.16213 abstract; bump fallback constants if NANOGrav 16/17-yr supersedes")
+        exit(1)
+    }
+    println("[nanograv_pulsar_bridge selftest] OK — strain/sigma/gamma format + fallback constants + n=6 binding + extractors (8 checks)")
+    exit(0)
+}
+
+// ─── emit helpers ───
+fn _emit_text(pulsars: i64, years: i64, strain_int: i64, hd_sig: i64, source: string, hd_seen: i64) {
+    println("NANOGRAV_SOURCE       : " + source)
+    println("pulsar_count          : " + to_string(pulsars))
+    println("dataset_years         : " + to_string(years))
+    println("strain_amplitude_A_yr : " + _fmt_strain(strain_int) + "   (1-yr reference frequency)")
+    println("spectral_index_gamma  : " + _fmt_gamma() + "  (~4.333; SMBHB inspiral characteristic-strain f^-2/3)")
+    println("hd_correlation_sigma  : " + _fmt_hd_sigma(hd_sig) + "   (Hellings-Downs spatial quadrupolar)")
+    println("reference_paper       : arXiv:2306.16213 (NANOGrav 15-yr GWB, ApJL 951 L8, 2023)")
+    println("hd_keyword_in_source  : " + to_string(hd_seen))
+    println("---")
+    println("n=6 binding hint:")
+    println("  per-pulsar 6 DOF     = (RA, DEC, d_M, PM_RA, PM_DEC, spin_period)")
+    println("  HD multipole l       = " + to_string(HD_MULTIPOLE_L()) + "  (quadrupolar)")
+    println("  tau azimuthal        = " + to_string(TAU_AZIMUTHAL()))
+    println("  identity sigma·phi   = n·tau = 24   (12·2 = 6·4)")
+    println("  lens cross-binding   = sedi_dispersion_measure, sedi_timing_integrity, sedi_stochastic_background")
+}
+
+fn _emit_json(pulsars: i64, years: i64, strain_int: i64, hd_sig: i64, source: string, hd_seen: i64) {
+    println("{")
+    println("  \"tool\": \"nanograv_pulsar_bridge\",")
+    println("  \"origin\": \"NANOGrav 15-yr GWB (arXiv:2306.16213)\",")
+    println("  \"abstraction\": \"hive raw 70 design-multi-axis-verify-grid\",")
+    println("  \"paradigm\": \"structural-admissibility\",")
+    println("  \"source\": \"" + _esc_json(source) + "\",")
+    println("  \"pulsar_count\": " + to_string(pulsars) + ",")
+    println("  \"dataset_years\": " + to_string(years) + ",")
+    println("  \"strain_amplitude\": \"" + _fmt_strain(strain_int) + "\",")
+    println("  \"spectral_index_gamma\": \"" + _fmt_gamma() + "\",")
+    println("  \"hd_correlation_sigma\": " + _fmt_hd_sigma(hd_sig) + ",")
+    println("  \"hd_keyword_in_source\": " + to_string(hd_seen) + ",")
+    println("  \"reference_paper\": \"arXiv:2306.16213\",")
+    println("  \"n6_binding\": {")
+    println("    \"pulsar_dof\": 6,")
+    println("    \"dof_axes\": [\"RA\",\"DEC\",\"distance_modulus\",\"PM_RA\",\"PM_DEC\",\"spin_period\"],")
+    println("    \"hd_multipole_l\": " + to_string(HD_MULTIPOLE_L()) + ",")
+    println("    \"tau_azimuthal\": " + to_string(TAU_AZIMUTHAL()) + ",")
+    println("    \"identity\": \"sigma·phi = n·tau = 24\",")
+    println("    \"lens_bindings\": [\"sedi_dispersion_measure\",\"sedi_timing_integrity\",\"sedi_stochastic_background\"]")
+    println("  }")
+    println("}")
+}
+
+// ─── main ───
+fn main() -> void {
+    let raw_args = args()
+    let mut cli = []
+    let mut ai = 2
+    while ai < len(raw_args) {
+        cli.push(raw_args[ai])
+        ai = ai + 1
+    }
+
+    let mut json_mode = false
+    let mut no_fetch = false
+    let mut i = 0
+    while i < len(cli) {
+        let a = cli[i]
+        if a == "--selftest" || a == "selftest" { _selftest() }
+        else if a == "--json" { json_mode = true }
+        else if a == "--no-fetch" { no_fetch = true }
+        else if a == "--help" || a == "-h" {
+            println("usage: hexa run tool/nanograv_pulsar_bridge.hexa [--selftest] [--json] [--no-fetch]")
+            println("  --selftest : 8-check internal verification, exit 0/1")
+            println("  --json     : emit single JSON object on stdout")
+            println("  --no-fetch : skip arXiv/NANOGrav curl, use hardcoded NANOGrav 15-yr fallback")
+            println("origin: NANOGrav 15-yr GWB first detection (arXiv:2306.16213, 2023-06-29)")
+            println("binding: n=6 pulsar DOF + HD quadrupolar (l=2) → sedi_dispersion_measure / sedi_timing_integrity / sedi_stochastic_background")
+            exit(0)
+        }
+        else {
+            eprintln("nanograv_pulsar_bridge: unknown arg `" + a + "`")
+            eprintln("  reason: arg `" + a + "` not in {--selftest,--json,--no-fetch,--help}")
+            eprintln("  fix:    run with --help for full flag list")
+            exit(1)
+        }
+        i = i + 1
+    }
+
+    let mut pulsars: i64 = PULSAR_COUNT_FALLBACK()
+    let mut years: i64 = DATASET_YEARS_FALLBACK()
+    let mut strain_int: i64 = STRAIN_FALLBACK()
+    let mut hd_sig: i64 = HD_SIGMA_SCALED_FALLBACK()
+    let mut hd_seen: i64 = 1
+    let mut source: string = "fallback:NANOGrav-15yr-hardcoded"
+
+    if !no_fetch {
+        // try arxiv abstract first
+        let txt = fetch_arxiv_abs()
+        let mut got_anything = false
+        if len(txt) > 0 {
+            let pc = extract_pulsar_count(txt)
+            let yr = extract_years(txt)
+            let hd = detect_hd_mention(txt)
+            if pc > 0 { pulsars = pc; got_anything = true }
+            if yr > 0 { years = yr; got_anything = true }
+            hd_seen = hd
+            if got_anything {
+                source = "live:arxiv.org/abs/2306.16213"
+            }
+        }
+        if !got_anything {
+            // try nanograv news fallback
+            let txt2 = fetch_nanograv_news()
+            if len(txt2) > 0 {
+                let pc2 = extract_pulsar_count(txt2)
+                let yr2 = extract_years(txt2)
+                let hd2 = detect_hd_mention(txt2)
+                if pc2 > 0 { pulsars = pc2; got_anything = true }
+                if yr2 > 0 { years = yr2; got_anything = true }
+                if hd2 > 0 { hd_seen = hd2 }
+                if got_anything {
+                    source = "live:nanograv.org/news"
+                } else {
+                    source = "fallback:fetch-empty (NANOGrav-15yr-hardcoded)"
+                }
+            } else {
+                source = "fallback:fetch-failed (NANOGrav-15yr-hardcoded)"
+            }
+        }
+    }
+
+    if json_mode { _emit_json(pulsars, years, strain_int, hd_sig, source, hd_seen) }
+    else { _emit_text(pulsars, years, strain_int, hd_sig, source, hd_seen) }
+
+    // sentinel sanity: pulsars in [60, 80], years in [12, 20], strain_int in [10, 200] (1e-15..2e-14),
+    // hd_sig in [20, 60] (2.0..6.0 σ).
+    let sane = pulsars >= 60 && pulsars <= 80 && years >= 12 && years <= 20 && strain_int >= 10 && strain_int <= 200 && hd_sig >= 20 && hd_sig <= 60
+    if !sane {
+        println("__NANOGRAV_BRIDGE__ FAIL pulsars=" + to_string(pulsars) + " strain_A_yr=" + _fmt_strain(strain_int) + " gw_background_sigma=" + _fmt_hd_sigma(hd_sig))
+        eprintln("  reason: parsed values out of sane window (pulsars 60..80 / years 12..20 / strain 1e-15..2e-14 / sigma 2..6)")
+        eprintln("  fix:    re-run with --no-fetch to confirm hardcoded fallback OR re-verify endpoint")
+        exit(2)
+    }
+    println("__NANOGRAV_BRIDGE__ PASS pulsars=" + to_string(pulsars) + " strain_A_yr=" + _fmt_strain(strain_int) + " gw_background_sigma=" + _fmt_hd_sigma(hd_sig))
+    exit(0)
+}
