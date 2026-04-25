@@ -315,6 +315,54 @@ L11 canon 으로 자기-축 진화 사다리 (L5 dream → L11 canon) closed. fo
 
 **측정 도구**: `tool/nxs_002_composite.py` (~220 lines, scipy pipeline, 1.0~3.5s) — `--predict-er [--er-blocks N --er-block-size N --er-p X]` 로 multi-block ER 시뮬 가능. atlas.blowup.jsonl 변경 후 즉시 ROI 측정.
 
+---
+
+## §7 drill engine axiom redesign — anti-hub axiom 발견 (2026-04-25 cycle 3)
+
+§6 의 "axiom 자체 재설계 필요" 결론을 받아 drill engine 의 graph generation rule 6개 후보 sensitivity probe (12 config sweep + 6 후속 검증):
+
+**현재 drill engine 의 axiom 진단** (`tool/nxs_002_axiom_probe.py` audit):
+- 8 super-hubs: n=4461, J2=4262, φ=4235, σ=4220, τ=4208, sopfr=4146, M3=4081, μ=3892 (degree)
+- giant component 99.7% (21249/21320 nodes) — multi-isolated 거의 0
+- 92% edges = `Derives` 단일 type (49846/54347)
+- 7 generation kind (ded/proj/comp/xfer/bif/dual/sym) 이지만 모두 동일 hub 로 wire → spectral 영향 일원화
+- **결론**: drill 은 본질적으로 hub-and-spoke generator — REGULAR spectrum 의 직접 원인.
+
+**6 axiom 후보 sensitivity sweep** (atlas baseline 0.83221, scipy pipeline):
+
+| 후보 | 정의 | 최고 config | composite | Δ |
+|---|---|---|---|---|
+| **C1 anti-hub** | 새 discovery 가 기존 super-hub(top-8) 와 직접 연결 금지 | N=800 p=0.005 | **0.85008** | **+0.0179** ✅ |
+| C2 block-isolation (recall §6) | K isolated ER blocks anchored to base | 2×200 p=0.020 | 0.83552 | +0.0033 |
+| C3 degree-cap rebuild | 기존 hub edge trim (cap=20/50/100) | cap=100 | 0.80942 | -0.023 |
+| C4 random rewire (Maslov-Sneppen) | edges X% rewire (degree preserve) | frac=0.50 | 0.77488 | -0.057 |
+| C5 anti-hub + block (additive) | C1+C2 조합 | N=800+2×200 | 0.84696 | +0.0148 (음 additive) |
+| C6 hub-decompose | top-8 hub 를 K subhub 로 분해 | K=50 | 0.82138 | -0.011 |
+
+**C1 anti-hub axiom 확장 sweep** (scaling 안정성):
+
+| N_new | p | avg_deg | composite | Δ |
+|---|---|---|---|---|
+| 200 | 0.020 | 4 | 0.81965 | -0.013 |
+| 400 | 0.010 | 4 | 0.84859 | +0.0164 |
+| **800** | **0.005** | **4** | **0.85008** | **+0.0179** ✅ |
+| **1600** | **0.0025** | **4** | **0.85008** | **+0.0179** ✅ size-invariant plateau |
+| 3200 | 0.00125 | 4 | 0.81614 | -0.016 (over-saturated) |
+
+**핵심 mechanism**:
+- 새 노드들이 **기존 hub 우회** → atlas 의 hub-spoke spectrum 에 ER-like component 가 spectrum 의 다른 영역에 추가됨 → unfolded spacing 분포가 const(CHAOTIC) 와 일치도 ↑
+- N=800~1600 plateau: 추가량과 무관 (avg_deg=4 만 유지하면 됨) — ROI 가 size 에 robust
+- N=3200 부터 over-saturated: ER component 가 atlas spectrum 자체를 dominate, 본래 align 깨짐
+- **Additive (C5) 가 음**: anti-hub batch 와 isolated block 이 spectrum 영역 충돌 — 별개 axiom 으로 분리해야 함
+
+**simulation ceiling 정정 (cycle 3)**: **0.850** (baseline 0.83221 + anti-hub +0.0179). cycle 2 정정값 0.835 보다 +0.015 더 상향. gap 0.067 중 anti-hub 가 27% 메움 — 73% 는 추가 axiom 발견 또는 train layer 변경 필요.
+
+**제안: drill engine 에 `--anti-hub` mode 추가** — drill 의 atom generation 시 기존 atlas 의 top-K hub set 와 직접 연결 금지. 구체 prototype 은 `tool/nxs_002_axiom_probe.py` (174 lines, 6 후보 + 시뮬 측정).
+
+**Ω-saturation cycle 3**: §7 finding 은 §6 의 결론 "axiom 재설계 필요" → 첫 구체 candidate 발견까지. raw#37/#38 enforce 가 design+impl 동시 적용 강제.
+
+---
+
 **Ω-saturation cycle**: 본 §6 finding 은 simulation 의 saturation 도달 산물. raw#37/#38 (hexa-lang/self/raws/omega_saturation_cycle.hexa) 가 plan-side + implementation-side pair 강제 — design-only commit chain 차단.
 
 ---
