@@ -518,10 +518,11 @@ cycle 5 의 SELF_OUTPUTS skip = quantum non-disturbing measurement (POVM minimal
 
 ## §11 cycle 9~ 후보
 
-### Cycle 9 — L_{ω·2} 진입 시도 (exponential growth 추구)
+### Cycle 9 (DONE — see §12) — L_{ω·2} 진입 시도 (exponential growth 추구)
 - cycle 8 의 linear Δ=const 가 L_{ω+1} finite measurement 였다면, **L_{ω·2} = exponential accumulation**
 - meta_back_action 도구 격상: 매 round 의 self-injection 양을 round-i 함수로 (예: i² lines) 만들어 quadratic / exponential growth 유도
 - 또는 multi-probe nested call (probe → meta → meta-meta) 로 second-order 의 second-order
+- **결과 (cycle 9, §12)**: linear inject (`i*7`) → polynomial Δ accumulation, ratio_mean=1.246 (exponential 미충족) → **L_{ω+d} (d≈2) 도달, L_{ω·2} 미진입**.
 
 ### Cycle 10 — daily timeline cron plist
 - `tool/com.nexus.beyond-omega.daily.plist` 등록 (cycle 5 의 --cron mode)
@@ -530,6 +531,81 @@ cycle 5 의 SELF_OUTPUTS skip = quantum non-disturbing measurement (POVM minimal
 ### Cycle 11+ — 본격 transfinite ordinal mapping
 - cycle 8 의 L_{ω+1} + cycle 9 의 L_{ω·2} → L_{ε₀}, L_{ω₁^CK} (Church-Kleene), L_{Mahlo}
 - 각 ordinal level 에서 reachable / sentinel 구분
+
+---
+
+## §12 cycle 9 first finding — ★ L_{ω+d}_POLYNOMIAL (axis A second positive, L_{ω·2} 미진입) (2026-04-25)
+
+### 새 도구
+- `tool/beyond_omega_cycle9_meta_squared.py` — cycle 7 도구의 격상 (cycle 7 도구는 매 round 2 lines 고정 inject; 본 도구는 round_i 함수 = `i * 7` lines).
+  - cycle 8 의 `NEXUS_BACK_ACTION_ON=1` override 유지 (override OFF 면 saturated_zero).
+  - 6 rounds × per-round inject = 7, 14, 21, 28, 35, 42 lines (linearly increasing in round index).
+  - 출력: `state/beyond_omega_cycle9_meta_squared.json` (schema v1).
+  - cycle 7 의 `tool/beyond_omega_meta_back_action.py` 는 historical 보존 (수정 없음).
+
+### 결과 — POLYNOMIAL_GROWTH (Δ_i 가 arithmetic progression, ratio_mean=1.246)
+
+| round | inject_n_lines | trace_after | summary_total_emits | Δ |
+|---|---|---|---|---|
+| 1 | 7 | 21 | 21 | (baseline) |
+| 2 | 14 | 41 | 41 | +20 |
+| 3 | 21 | 68 | 68 | +27 |
+| 4 | 28 | 102 | 102 | +34 |
+| 5 | 35 | 143 | 143 | +41 |
+| 6 | 42 | 191 | 191 | +48 |
+
+- `delta_sequence = [20, 27, 34, 41, 48]` — **arithmetic progression** (common diff = 7)
+- `delta_ratio_sequence = [1.35, 1.259, 1.206, 1.171]` — ratios **decreasing toward 1** (NOT exponential)
+- `delta_ratio_mean = 1.246`
+- `delta_mean = 34, delta_variance = 98`
+- `polynomial_degree_estimate = 2.87` (rough log-log slope; small-N estimator artifact)
+- `growth_type = polynomial_growth`
+- final round: `total_emits = 191, approach = 1`
+
+★ **Δ_i = 13 + 7·i 의 의미** — 매 round inject = i*7, 직전 round 의 7 echo emit (cycle 8 의 first-order Δ) + 본 round 의 i*7 inject 가 합쳐져 second-order accumulation 형성. **summary_total_emits 은 round 의 quadratic 함수** (∑ Δ_i = 7·N(N+1)/2 + 13·N → O(N²)). per-round Δ 는 linear-in-i, 누적은 polynomial degree=2.
+
+### Ordinal mapping verdict
+
+| growth_type | ordinal | reachable? |
+|---|---|---|
+| linear_constant (cycle 8) | L_{ω+1} | ω-finite |
+| **polynomial_growth (cycle 9, degree d)** | **L_{ω+d}** | **ω-finite (finite-d ordinal)** |
+| exponential | L_{ω·2} | ω-style accumulation (transfinite) |
+| tetration / Ackermann | L_{ε₀} | ε₀ (cycle 11+) |
+
+cycle 9 도구의 round-i 함수 (`i*7`) 는 inject 가 linear 이고, 따라서 cumulative emits 는 quadratic. 수학적 정확 verdict = **L_{ω+2} (polynomial degree 2)**, code 의 L_{ω+3} estimate 는 small-N log-log artifact.
+
+### ★ L_{ω·2} NOT REACHED — exponential 미충족
+
+- `delta_ratio_mean = 1.246` < 1.5 threshold
+- 더 강한 증거: `delta_ratio_sequence = [1.35, 1.259, 1.206, 1.171]` — **ratios 가 1 으로 수렴** (asymptotic linear-in-i Δ). exponential 이라면 ratios sustained > 1.5 (예: 2.0 const).
+- 결론: **`i*7` linear inject 만으로는 L_{ω·2} 진입 불가.** L_{ω·2} 도달하려면 inject 함수가 `2^i` (exponential) 이거나 `i!` (super-exponential) — 별도 cycle 후보.
+
+### Self-correction chain (axis A 누적, cycle 7→8→9)
+
+| cycle | claim | verdict |
+|---|---|---|
+| 7 | L_{ω+1}_ABSENT (saturated_zero) | falsified by cycle 8 |
+| 8 | ★★ L_{ω+1}_LINEAR (Δ=7 const, override required) | confirmed |
+| 9 | ★ L_{ω+d}_POLYNOMIAL (Δ_i = 13 + 7·i, degree d≈2) | confirmed; **L_{ω·2} 미진입** |
+
+★ axis A 의 **second positive measurement** — L_{ω+1} (cycle 8) 위에 L_{ω+2} (cycle 9). transfinite ladder 의 finite-d ordinal layer 가 ω-finite reachable 임이 확인. inject 함수의 polynomial degree 와 cumulative growth 의 ordinal index 가 직접 isomorphic.
+
+### Self-correction chain (axis B + axis A 진입, 9 단계)
+
+| cycle | axis | claim | verdict |
+|---|---|---|---|
+| 1 | B | BASELINE_ZERO | falsified by cycle 2 |
+| 2 | B | DISPATCH_ONLY | confirmed |
+| 3 | B | DISPATCH_TERMINATED | confirmed (cycle 6 refined) |
+| 4 | B | APPROACH_OBSERVED ★ | confirmed |
+| 5 | B | INSTRUMENTATION + BACK-ACTION layer | confirmed |
+| 6 | B | AXIS_OVERLAP + HEADROOM_DISTRIBUTION | confirmed |
+| 7 | A | L_{ω+1}_ABSENT | falsified by cycle 8 |
+| 8 | A | ★★ L_{ω+1}_LINEAR | confirmed |
+| 9 | A | ★ L_{ω+d}_POLYNOMIAL (degree~2, L_{ω·2} 미진입) | confirmed |
+
+**Phase progression**: cycle 8 가 axis A 첫 positive (L_{ω+1}) 였다면, cycle 9 는 second positive (L_{ω+2}). transfinite ladder 의 finite-d ordinal sublayer 가 inject 함수의 polynomial degree 와 직접 isomorphic 으로 매핑됨이 첫 empirical confirm. L_{ω·2} 진입은 exponential inject (`2^i`) 또는 nested probe call 로 별도 cycle.
 
 ### Cycle 4 — forced approach 발사 (B 축의 첫 positive measurement)
 - 의도적으로 `nexus omega --engines a,b --variants 2 --seeds s1,s2` 발사 (axes=3) → ghost_ceiling_approach 첫 발화 만들기
@@ -547,6 +623,185 @@ cycle 5 의 SELF_OUTPUTS skip = quantum non-disturbing measurement (POVM minimal
 
 ---
 
+## §13 cycle 10 first finding — DAILY_TIMELINE_PLIST_REGISTERED (2026-04-25)
+
+### 변경
+- `tool/com.nexus.beyond-omega-daily.plist` 신규 — `tool/com.nexus.atlas-meta-scan.plist` / `tool/com.nexus.omega-metrics.plist` 와 동일 골격 (Background ProcessType, Nice=10, LowPriorityIO, RunAtLoad=false, KeepAlive=false).
+- ProgramArguments: `/opt/homebrew/bin/python3 /Users/ghost/core/nexus/tool/beyond_omega_ghost_trace.py --cron`
+- StartCalendarInterval = `Hour=3, Minute=13` (daily 03:13 local) — 12h cadence atlas-meta-scan/omega-metrics 와 시간대 분리하여 I/O overlap 방지.
+- StandardOutPath / StandardErrorPath: `/tmp/nexus_beyond_omega_daily.{out,err}.log`
+- WorkingDirectory: `/Users/ghost/core/nexus`
+- EnvironmentVariables: PATH (`/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`) + HOME — **NEXUS_BACK_ACTION_ON 미설정** (default protected mode).
+
+### Default protected mode 의 의도 — cycle 8 override 와의 통합 정책
+
+cycle 8 (`§10`) 에서 도입된 `NEXUS_BACK_ACTION_ON=1` env override 는 cycle 5 의 `SELF_OUTPUTS skip` 을 비활성화하여 second-order distribution (L_{ω+1} echo) 을 측정하는 strong/projective measurement mode. 본 daily plist 는 그 mode 를 **사용하지 않음**:
+
+| dimension | daily plist (본 cycle 10) | manual override |
+|---|---|---|
+| env NEXUS_BACK_ACTION_ON | unset (default) | `1` (수동 발사 시) |
+| measurement semantic | weak / non-disturbing (POVM minimal disturbance) | strong / projective |
+| 측정 대상 | first-order distribution (cycle 4 의 frequency=1 + 신규 emit) | second-order echo (Δ=7 linear accumulation) |
+| daily snapshot 안정성 | idempotent (자기-feedback 0) | unbounded linear growth |
+| ordinal level | L_ω frequency timeline | L_{ω+1} echo timeline |
+
+→ **L_ω first-order distribution 의 7-30 day timeline 이 본 plist 의 단독 측정 대상**. L_{ω+1} second-order timeline 을 별도로 보려면 envvar 추가한 별개 plist 또는 수동 cron entry 가 필요 (cycle 11+ 후보).
+
+### 수동 load 명령 (사용자 승인 후)
+
+```sh
+cp /Users/ghost/core/nexus/tool/com.nexus.beyond-omega-daily.plist \
+   ~/Library/LaunchAgents/
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.nexus.beyond-omega-daily.plist
+launchctl enable     gui/$UID/com.nexus.beyond-omega-daily
+# (옵션) 다음 03:13 까지 기다리지 않고 즉시 첫 snapshot:
+launchctl kickstart -k gui/$UID/com.nexus.beyond-omega-daily
+```
+
+상태 확인 / 로그:
+```sh
+launchctl print gui/$UID/com.nexus.beyond-omega-daily
+tail -F /tmp/nexus_beyond_omega_daily.out.log /tmp/nexus_beyond_omega_daily.err.log
+ls -la /Users/ghost/core/nexus/state/ghost_ceiling_summary.daily.*.json
+```
+
+언인스톨:
+```sh
+launchctl bootout gui/$UID/com.nexus.beyond-omega-daily
+rm ~/Library/LaunchAgents/com.nexus.beyond-omega-daily.plist
+```
+
+### Expected accumulation rate
+
+- 1 snapshot/day → 7 day = 7 snapshots, 30 day = 30 snapshots
+- file size: 한 snapshot ≈ 6-10KB (summary v4 schema, files_scanned ≈ 476 + per-axis counts)
+- 30 day total ≈ 200-300KB → gitignore 권장 (`state/ghost_ceiling_summary.daily.*.json` glob)
+- trace.jsonl 자체는 idempotent — file:lineno dedup 으로 신규 emit 만 누적, 자기-feedback 0
+- daily snapshot 의 차분 = `(N_today - N_yesterday)` = 24h 안 새 NEXUS_OMEGA emit 수 → cmd_omega 호출 빈도의 **자연스러운 daily distribution**
+
+### Cycle 11+ 와의 연결
+
+- cycle 10 의 daily snapshot 누적 ≥ 7 entry 시점에서 cycle 11+ 의 ordinal hierarchy 정량화 가능:
+  - daily Δ 의 분포 → frequency distribution 의 시간 stationarity test
+  - approach_count 의 daily 시계열 → L_ω touch event 의 Poisson 적합도
+  - axis B emit hour-bucket 의 day-over-day 안정성 → cycle 6 AXIS_OVERLAP 50% 의 시간 일반화 가능 여부
+- cycle 8 echo timeline 까지 보려면 별도 plist (`com.nexus.beyond-omega-echo.plist`, env NEXUS_BACK_ACTION_ON=1) 가 cycle 11 후보로 자연스럽게 따라옴
+
+### Self-correction chain (axis B + axis A + cycle 10 instrumentation, 9 단계)
+
+| cycle | axis | claim | verdict |
+|---|---|---|---|
+| 1 | B | BASELINE_ZERO | falsified by cycle 2 |
+| 2 | B | DISPATCH_ONLY | confirmed |
+| 3 | B | DISPATCH_TERMINATED | confirmed (cycle 6 refined) |
+| 4 | B | APPROACH_OBSERVED ★ | confirmed |
+| 5 | B | INSTRUMENTATION + BACK-ACTION layer | confirmed |
+| 6 | B | AXIS_OVERLAP + HEADROOM_DISTRIBUTION | confirmed |
+| 7 | A 첫 진입 | L_{ω+1}_ABSENT | falsified by cycle 8 |
+| 8 | A 첫 positive | ★★ L_{ω+1}_LINEAR (Δ=7 echo) | confirmed |
+| 10 | B instrumentation 시계열 | DAILY_TIMELINE_PLIST_REGISTERED (default protected mode) | pending user load |
+
+cycle 10 = pure instrumentation cycle (new finding 보다는 measurement scaffolding). cycle 11+ 의 ordinal hierarchy 정량화 위한 시간 dataset 기반.
+
+---
+
+## §14 cycle 11 first finding — TRANSFINITE_ORDINAL_MAPPING_TABLE (★ theoretical, not empirical) (2026-04-25)
+
+### 산출물
+- `design/beyond_omega_transfinite_table.md` (신규) — L_ω ~ L_{measurable} 12 ordinal level 의 4-column mapping table:
+  - **axis_b_meaning** (concrete observable in axis B language: frequency, distribution, distribution-of-distribution, …)
+  - **reachable_predicted** (yes / no / depends-on-measurement-mode)
+  - **quantum_isomorphism** (대응 quantum measurement protocol)
+  - **first_falsifier_test** (어떤 cycle 도구가 confirm/falsify 가능한지)
+- 4 sub-table 으로 묶음:
+  - **Table A** (small transfinite L_ω, L_{ω+1}, L_{ω+2}, L_{ω+d}, L_{ω·2}) — empirical territory, 대부분 reachable
+  - **Table B** (L_{ω²}, L_{ω^ω}, L_{ε₀}, L_{Γ₀}) — proof-theoretic, axiom-bounded
+  - **Table C** (L_{ω₁^CK}, L_{ω₁}) — recursive supremum + uncountable, meta-mathematical
+  - **Table D** (L_{Mahlo}, L_{measurable}) — large cardinals, axiom-extension
+
+### Mapping logic — 3 layer
+
+| layer | ordinal range | reachability character |
+|---|---|---|
+| 1 — empirical | L_ω ~ L_{ω·2} | mode-dependent (cycle 8 weak-vs-strong duality), **L_ω/L_{ω+1}/L_{ω+2} 모두 confirmed reachable**, L_{ω·2} 는 exponential injector 필요 (cycle 9 결과로 NOT REACHED 확인) |
+| 2 — proof-theoretic | L_{ω²} ~ L_{Γ₀} | self-mod / swarm 도구로 L_{ω²}/L_{ω^ω} reachable, but **L_{ε₀} = 첫 진정한 sentinel beyond L_ω** (PA 일치성 한계, Gentzen) |
+| 3 — meta-mathematical | L_{ω₁^CK} ~ L_{measurable} | 모두 sentinel, 각각 다른 reason (recursivity, uncountability, large cardinal axiom) |
+
+### ★ Key predicted insight — sentinel chain 의 multi-tier 구조
+
+cycle 7 의 false claim "sentinel transfinite self-similarity (L_ω 가 sentinel 이면 L_{ω+1}~Mahlo 모두 sentinel)" 은 cycle 8 + cycle 9 에 의해 falsified — L_{ω+1}/L_{ω+2} 는 모두 reachable. cycle 11 의 mapping table 은 이 self-correction 위에 **sentinel chain 의 정확한 구조** 를 사전 등록:
+
+```
+L_ω        sentinel  ← Gödel + Halting + Bekenstein 3-impossibility (concrete physical/formal)
+L_{ω+1}    REACHABLE ← cycle 8 LINEAR (mode-dependent, open mode, Δ=7 const)
+L_{ω+2}    REACHABLE ← cycle 9 POLYNOMIAL (Δ_i = 13 + 7·i, degree~2)
+L_{ω+d}    REACHABLE ← inject = poly(i, d-1) generalization (cycle 12 후보)
+L_{ω·2}    REACHABLE ← exponential injector (`2^i`) 필요, cycle 9 NOT REACHED 확인
+L_{ω²}     REACHABLE-ish ← self-mod probe (cycle 12b 후보)
+L_{ω^ω}    REACHABLE-ish ← swarm probe (cycle 12c, 다중 process arch 필요)
+L_{ε₀}     SENTINEL  ★ ← PA 일치성 한계 (proof-theoretic, ω-tower fixed-point)
+L_{Γ₀}     SENTINEL  ← predicativity 한계 (Feferman–Schütte)
+L_{ω₁^CK}  SENTINEL  ← recursive ordinal supremum (canon L11)
+L_{ω₁}     SENTINEL  ← first uncountable
+L_{Mahlo}  SENTINEL  ← large cardinal axiom-extension
+L_{meas.}  SENTINEL  ← 0# 동치, strong axiomatic
+```
+
+→ **첫 진정한 sentinel beyond L_ω = L_{ε₀}**. 그 사이 (L_{ω+1} ~ L_{ω^ω}) 는 모두 reachable with 적절한 도구. cycle 11 의 표는 이 위계의 falsifier 사전 등록.
+
+### Quantum isomorphism extension — ladder 전체 보존 가설
+
+cycle 5/8 의 weak-vs-strong measurement duality + cycle 9 의 cascade weak measurement (POVM 의 2 단 chain) 가 ladder 전체로 자연스럽게 확장 (가설):
+
+| ordinal range | quantum protocol |
+|---|---|
+| L_ω | single-shot Born-rule readout |
+| L_{ω+1} | weak measurement / repeated POVM |
+| L_{ω+2} | cascade weak measurement (2-level) |
+| L_{ω+d} | d-level cascade weak measurement |
+| L_{ω·2} | strong projective on amplified ensemble |
+| L_{ω²} | adaptive measurement (Bayesian POVM update) |
+| L_{ω^ω} | collective decoherence / quantum darwinism |
+| L_{ε₀} | infinite-precision projective (Heisenberg limit ideal) |
+| L_{Γ₀} | non-demolition on entangled ensemble |
+| L_{ω₁^CK} | hypercomputation 영역 (Solovay randomness) |
+| L_{ω₁}+ | 측정 protocol 자체가 ZFC 너머 |
+
+→ ordinal 위계 ↔ quantum measurement protocol 위계의 isomorphism 이 cycle 5/8/9 의 세 점에서 ladder 전체로 일반화 가능 (가설). cycle 12+ 가 confirm 또는 falsify.
+
+### Falsifier registry — cycle 12+ 후보 5 개 사전 명시
+
+| cycle | target | tool 후보 |
+|---|---|---|
+| 12 | L_{ω·2} | exponential injector (`2^i`) — cycle 9 도구 격상 |
+| 12a | L_{ω+d} (general d) | inject = poly(i, d-1) generalization |
+| 12b | L_{ω²} | self-mod probe (probe 자기 source 1 line patch + 재호출) |
+| 12c | L_{ω^ω} | swarm probe (multi-process measurement community) |
+| 12d | L_{ε₀} | PA-consistency probe (Gentzen ordinal climb, 종료 불가가 confirm) |
+| 12e | L_{Γ₀} | predicative-only climb (impredicative 개입 시점 detect) |
+
+cycle 11 은 도구를 **만들지 않음** — prediction registry + structural map 만 등록 (theoretical work).
+
+### Self-correction chain (axis B + axis A + cycle 10 instrumentation + cycle 11 theoretical, 11 단계)
+
+| cycle | axis | claim | verdict |
+|---|---|---|---|
+| 1 | B | BASELINE_ZERO | falsified by cycle 2 |
+| 2 | B | DISPATCH_ONLY | confirmed |
+| 3 | B | DISPATCH_TERMINATED | confirmed (cycle 6 refined) |
+| 4 | B | APPROACH_OBSERVED ★ | confirmed |
+| 5 | B | INSTRUMENTATION + BACK-ACTION layer | confirmed |
+| 6 | B | AXIS_OVERLAP + HEADROOM_DISTRIBUTION | confirmed |
+| 7 | A | L_{ω+1}_ABSENT | falsified by cycle 8 |
+| 8 | A | ★★ L_{ω+1}_LINEAR (Δ=7 echo) | confirmed |
+| 9 | A | ★ L_{ω+2}_POLYNOMIAL (Δ_i = 13+7·i, L_{ω·2} 미진입) | confirmed |
+| 10 | B instrumentation | DAILY_TIMELINE_PLIST_REGISTERED | pending user load |
+| 11 | A theoretical | TRANSFINITE_ORDINAL_MAPPING_TABLE (12 levels mapped, L_{ε₀} = 첫 sentinel beyond L_ω) | confirmed (theoretical registry) |
+
+cycle 11 = pure theoretical cycle (cycle 10 의 instrumentation pair). cycle 9 의 L_{ω+2} empirical 결과를 Table A 에 anchor; cycle 12+ 가 Table A row 5 (L_{ω·2}, exponential injector) + Table B/C/D 의 falsifier 도구 구현 시작.
+
+---
+
 ## §5 raw#37/#38 enforce — pair 산출물
 
 본 cycle 1 의 design (이 문서) ↔ impl (`tool/beyond_omega_ghost_trace.py`) pair 강제. 아래 산출물 모두 동일 commit 에 포함:
@@ -556,6 +811,7 @@ cycle 5 의 SELF_OUTPUTS skip = quantum non-disturbing measurement (POVM minimal
 - `state/ghost_ceiling_trace.jsonl` (cycle 1 baseline = 0 lines)
 - `state/ghost_ceiling_summary.json` (cycle 1 BASELINE_ZERO finding)
 - `state/proposals/inventory.json` 의 `nxs-20260425-004` entry (cycle 1 시점에는 `nxs-20260425-003` 였음 — §0 ID note 참조)
+- `design/beyond_omega_transfinite_table.md` (cycle 11 산출, 12 ordinal level mapping table)
 
 ---
 
@@ -563,6 +819,7 @@ cycle 5 의 SELF_OUTPUTS skip = quantum non-disturbing measurement (POVM minimal
 
 - `design/abstraction_ceiling.md` §4-5 (L_ω = GHOST CEILING sentinel 정의)
 - `design/abstraction_ceiling.md` §6-13 (nxs-002 saturation cycle 1-21, V3' breakthrough)
+- `design/beyond_omega_transfinite_table.md` (cycle 11 transfinite ordinal mapping table)
 - `cli/run.hexa:4005-4095` (cmd_omega 본체)
 - `cli/run.hexa:4065, 4073` (NEXUS_OMEGA emit 사이트)
 - `state/proposals/inventory.json` `nxs-20260425-001` (V3' axiom path), `nxs-20260425-002` (timeout adaptive)
