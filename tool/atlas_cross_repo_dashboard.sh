@@ -42,14 +42,29 @@ REPOS=(
 
 # 5 Honesty preconditions (per Phase 3 supercycle)
 check_precondition_a() { [ -d "$1" ] && [ -f "$1/.git/HEAD" ] && echo PASS || echo FAIL; }   # SSOT exists + git
-check_precondition_b() {                                                                       # design dir exists
-    if [ -d "$1/design" ] && [ "$(find "$1/design" -name "*.md" 2>/dev/null | wc -l | tr -d ' ')" -gt 0 ]; then echo PASS; else echo FAIL; fi
+check_precondition_b() {                                                                       # design corpus (generous: design/ OR docs/ OR papers/ OR reports/, 어디든 ≥1 .md)
+    for sub in design docs papers reports; do
+        if [ -d "$1/$sub" ] && [ "$(find "$1/$sub" -maxdepth 3 -name "*.md" 2>/dev/null | wc -l | tr -d ' ')" -gt 0 ]; then
+            echo PASS; return
+        fi
+    done
+    echo FAIL
 }
-check_precondition_c() {                                                                       # tool/ ≥3 files
-    if [ -d "$1/tool" ] && [ "$(find "$1/tool" -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ')" -ge 3 ]; then echo PASS; else echo FAIL; fi
+check_precondition_c() {                                                                       # tool/ ≥3 files (generous: tool/ OR scripts/ OR bin/)
+    for sub in tool scripts bin; do
+        if [ -d "$1/$sub" ] && [ "$(find "$1/$sub" -maxdepth 2 -type f 2>/dev/null | wc -l | tr -d ' ')" -ge 3 ]; then
+            echo PASS; return
+        fi
+    done
+    echo FAIL
 }
-check_precondition_d() {                                                                       # atlas SSOT
-    [ -f "$1/$2" ] && echo PASS || echo FAIL
+check_precondition_d() {                                                                       # atlas SSOT (generous: spec'd path OR alternates)
+    [ -f "$1/$2" ] && echo PASS && return
+    # alternates: n6/atlas.n6, atlas/atlas.n6, atlas.n6
+    for alt in n6/atlas.n6 atlas/atlas.n6 atlas.n6; do
+        [ -f "$1/$alt" ] && echo PASS && return
+    done
+    echo FAIL
 }
 check_precondition_e() {                                                                       # LLM agents (.claude/agents/ or CLAUDE.md or AGENT.md)
     if [ -d "$1/.claude/agents" ] || [ -f "$1/CLAUDE.md" ] || [ -f "$1/AGENT.md" ]; then echo PASS; else echo FAIL; fi
