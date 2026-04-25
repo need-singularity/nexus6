@@ -1,0 +1,305 @@
+#!hexa strict
+// tool/arxiv_realtime_bridge.hexa — arXiv Atom feed → discovery_log/bisociation candidates
+//
+// @tool(slug="arxiv_realtime_bridge", desc="Fetch latest arXiv papers (cosmology/QCD/HE/etc.) via Atom API + emit metadata for nexus discovery_log / bisociation candidates")
+// @usage(hexa run tool/arxiv_realtime_bridge.hexa [--cat <category>] [--limit N] [--json] [--selftest])
+// @exit_codes(0=PASS, 1=usage/io error, 2=value validation fail)
+// @sentinel(__ARXIV_BRIDGE__ PASS category=<cat> entries=<N> latest_id=<arxiv_id> latest_pub=<date>)
+// @origin(hive raw 70-73 deep-universe-sim cluster — external evidence ingest)
+// @abstraction(realtime literature bridge → bisociation candidate generator)
+// @paradigm(streaming-ingest — curl exec + substring parse, no XML DOM dep)
+//
+// Categories: gr-qc, hep-ph, hep-th, nucl-th, astro-ph.CO, quant-ph (default: gr-qc).
+// Output text mode (4 lines / entry) or JSON. selftest validates fetch + ISO date format.
+
+// ─── void-safe helpers ───
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn json_escape(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", " ")
+    r = r.replace("\r", " ")
+    r = r.replace("\t", " ")
+    return r
+}
+
+// XML entity de-escape (minimal — Atom feed only emits these five)
+fn xml_unescape(s: string) -> string {
+    let mut r = s
+    r = r.replace("&lt;", "<")
+    r = r.replace("&gt;", ">")
+    r = r.replace("&quot;", "\"")
+    r = r.replace("&apos;", "'")
+    r = r.replace("&amp;", "&")
+    return r
+}
+
+// Collapse whitespace runs (newlines + tabs + multi-space → single space) and trim.
+fn collapse_ws(s: string) -> string {
+    let mut r = s
+    r = r.replace("\n", " ")
+    r = r.replace("\r", " ")
+    r = r.replace("\t", " ")
+    let mut prev_len = -1
+    while r.len() != prev_len {
+        prev_len = r.len()
+        r = r.replace("  ", " ")
+    }
+    return r.trim()
+}
+
+fn truncate(s: string, n: i64) -> string {
+    if s.len() <= n { return s }
+    return s.substring(0, n) + "..."
+}
+
+// ─── XML substring parsing (no full parser — split on <entry>...</entry>) ───
+
+// Extract content between first <tag>...</tag> in `block`. Returns "" on miss.
+// `tag` is the bare tag name (e.g. "title", "id", "published").
+fn parse_entry_field(block: string, tag: string) -> string {
+    let open = "<" + tag + ">"
+    let close = "</" + tag + ">"
+    let i = block.index_of(open)
+    if i < 0 { return "" }
+    let after = block.substring(i + open.len(), block.len())
+    let j = after.index_of(close)
+    if j < 0 { return "" }
+    let raw = after.substring(0, j)
+    return collapse_ws(xml_unescape(raw))
+}
+
+// First <author><name>X</name></author> — Atom nests name inside author.
+fn parse_primary_author(block: string) -> string {
+    let i = block.index_of("<author>")
+    if i < 0 { return "" }
+    let after = block.substring(i, block.len())
+    return parse_entry_field(after, "name")
+}
+
+// arxiv_id from <id>http://arxiv.org/abs/2604.21859v1</id> → "2604.21859v1"
+fn extract_arxiv_id(id_url: string) -> string {
+    let marker = "/abs/"
+    let i = id_url.index_of(marker)
+    if i < 0 { return id_url }
+    return id_url.substring(i + marker.len(), id_url.len()).trim()
+}
+
+// Split feed XML into entry blocks.
+fn extract_entries(xml: string) -> array {
+    let mut out = []
+    let open = "<entry>"
+    let close = "</entry>"
+    let mut rest = xml
+    while true {
+        let i = rest.index_of(open)
+        if i < 0 { break }
+        let after = rest.substring(i + open.len(), rest.len())
+        let j = after.index_of(close)
+        if j < 0 { break }
+        out.push(after.substring(0, j))
+        rest = after.substring(j + close.len(), after.len())
+    }
+    return out
+}
+
+// ─── ISO-8601 date validation (YYYY-MM-DDTHH:MM:SSZ) ───
+
+fn is_digit(ch: string) -> bool {
+    if ch == "0" || ch == "1" || ch == "2" || ch == "3" || ch == "4" { return true }
+    if ch == "5" || ch == "6" || ch == "7" || ch == "8" || ch == "9" { return true }
+    return false
+}
+
+fn is_iso_date(s: string) -> bool {
+    if s.len() < 20 { return false }
+    let mut k = 0
+    while k < 4 { if !is_digit(s.substring(k, k + 1)) { return false } k = k + 1 }
+    if s.substring(4, 5) != "-" { return false }
+    if !is_digit(s.substring(5, 6)) || !is_digit(s.substring(6, 7)) { return false }
+    if s.substring(7, 8) != "-" { return false }
+    if !is_digit(s.substring(8, 9)) || !is_digit(s.substring(9, 10)) { return false }
+    if s.substring(10, 11) != "T" { return false }
+    return true
+}
+
+// ─── known arXiv categories (advisory whitelist) ───
+
+fn known_categories() -> array {
+    return ["gr-qc", "hep-ph", "hep-th", "nucl-th", "nucl-ex", "astro-ph.CO", "astro-ph.HE", "astro-ph.GA", "astro-ph.SR", "astro-ph.IM", "quant-ph", "cond-mat", "cs.AI", "cs.LG", "math-ph"]
+}
+
+fn is_known_category(c: string) -> bool {
+    for k in known_categories() { if k == c { return true } }
+    return false
+}
+
+// ─── core fetch ───
+
+fn arxiv_url(cat: string, limit: i64) -> string {
+    return "https://export.arxiv.org/api/query?search_query=cat:" + cat + "&start=0&max_results=" + to_string(limit) + "&sortBy=submittedDate&sortOrder=descending"
+}
+
+fn fetch_feed(cat: string, limit: i64) -> string {
+    let url = arxiv_url(cat, limit)
+    // -L follows 301 (arxiv redirects http→https), -A sets a polite UA per arXiv API guidelines.
+    let cmd = "curl -sL --max-time 30 -A 'nexus-arxiv-bridge/1.0 (mailto:noreply@local)' '" + url + "'"
+    let raw = _str(exec(cmd))
+    return raw
+}
+
+fn build_entries(cat: string, limit: i64) -> array {
+    let xml = fetch_feed(cat, limit)
+    if xml == "" { return [] }
+    let blocks = extract_entries(xml)
+    let mut entries = []
+    let mut i = 0
+    while i < len(blocks) {
+        let b = blocks[i]
+        let id_url = parse_entry_field(b, "id")
+        let title = parse_entry_field(b, "title")
+        let pub_date = parse_entry_field(b, "published")
+        let author = parse_primary_author(b)
+        let aid = extract_arxiv_id(id_url)
+        entries.push([aid, truncate(title, 100), pub_date, author])
+        i = i + 1
+    }
+    return entries
+}
+
+// ─── emitters ───
+
+fn emit_text(cat: string, entries: array) {
+    let mut i = 0
+    while i < len(entries) {
+        let e = entries[i]
+        println("arxiv_id: " + e[0])
+        println("  title: " + e[1])
+        println("  published: " + e[2])
+        println("  author: " + e[3])
+        i = i + 1
+    }
+    println("---")
+}
+
+fn emit_json(cat: string, entries: array) {
+    println("{")
+    println("  \"tool\": \"arxiv_realtime_bridge\",")
+    println("  \"category\": \"" + cat + "\",")
+    println("  \"count\": " + to_string(len(entries)) + ",")
+    println("  \"entries\": [")
+    let mut k = 0
+    while k < len(entries) {
+        let e = entries[k]
+        let trail = if k + 1 < len(entries) { "," } else { "" }
+        println("    {\"id\": \"" + json_escape(e[0]) + "\", \"title\": \"" + json_escape(e[1]) + "\", \"published\": \"" + json_escape(e[2]) + "\", \"primary_author\": \"" + json_escape(e[3]) + "\"}" + trail)
+        k = k + 1
+    }
+    println("  ]")
+    println("}")
+}
+
+// ─── selftest ───
+
+fn _selftest() {
+    let cat = "gr-qc"
+    let entries = build_entries(cat, 5)
+    if len(entries) < 1 {
+        eprintln("[arxiv_realtime_bridge selftest] FAIL: 0 entries fetched for cat=" + cat + " (network or API issue)")
+        eprintln("  reason: curl exec returned empty body or no <entry> blocks")
+        eprintln("  fix: verify connectivity (curl -s --max-time 30 'http://export.arxiv.org/api/query?search_query=cat:gr-qc&max_results=1') or retry after 3s")
+        exit(1)
+    }
+    let latest = entries[0]
+    let pub_date = _str(latest[2])
+    if !is_iso_date(pub_date) {
+        eprintln("[arxiv_realtime_bridge selftest] FAIL: latest_pub `" + pub_date + "` not ISO-8601 (YYYY-MM-DDTHH:MM:SSZ)")
+        eprintln("  reason: parse_entry_field('published') returned non-conforming string")
+        eprintln("  fix: arXiv schema change suspected — re-inspect feed XML schema")
+        exit(2)
+    }
+    println("[arxiv_realtime_bridge selftest] OK — " + to_string(len(entries)) + " entries, latest_id=" + _str(latest[0]) + ", latest_pub=" + pub_date)
+    exit(0)
+}
+
+// ─── main ───
+
+fn main() -> void {
+    let raw_args = args()
+    let mut cli = []
+    let mut ai = 2
+    while ai < len(raw_args) {
+        cli.push(raw_args[ai])
+        ai = ai + 1
+    }
+
+    let mut cat = "gr-qc"
+    let mut limit: i64 = 5
+    let mut json_mode = false
+    let mut i = 0
+    while i < len(cli) {
+        let a = cli[i]
+        if a == "--selftest" || a == "selftest" { _selftest() }
+        else if a == "--cat" {
+            if i + 1 < len(cli) { i = i + 1; cat = cli[i] }
+        }
+        else if a == "--limit" {
+            if i + 1 < len(cli) {
+                i = i + 1
+                try { limit = to_int(cli[i]) } catch e {
+                    eprintln("arxiv_realtime_bridge: --limit `" + cli[i] + "` not int")
+                    eprintln("  reason: to_int parse failure")
+                    eprintln("  fix: pass a positive integer (e.g. --limit 5)")
+                    exit(1)
+                }
+            }
+        }
+        else if a == "--json" { json_mode = true }
+        else if a == "--help" || a == "-h" {
+            println("usage: hexa run tool/arxiv_realtime_bridge.hexa [--cat <category>] [--limit N] [--json] [--selftest]")
+            println("categories: " + known_categories().join(" "))
+            println("default: --cat gr-qc --limit 5")
+            println("output: text (4 lines / entry) or --json")
+            exit(0)
+        }
+        else {
+            eprintln("arxiv_realtime_bridge: unknown arg `" + a + "`")
+            eprintln("  reason: unrecognised CLI flag")
+            eprintln("  fix: see --help for valid flags (--cat / --limit / --json / --selftest)")
+            exit(1)
+        }
+        i = i + 1
+    }
+
+    if !is_known_category(cat) {
+        eprintln("arxiv_realtime_bridge: WARN unknown category `" + cat + "` (not in advisory list — proceeding anyway)")
+    }
+    if limit < 1 || limit > 100 {
+        eprintln("arxiv_realtime_bridge: --limit " + to_string(limit) + " out of range")
+        eprintln("  reason: arXiv API soft cap is 30k but this tool clamps to [1..100] for sanity")
+        eprintln("  fix: pass --limit between 1 and 100")
+        exit(1)
+    }
+
+    let entries = build_entries(cat, limit)
+    if len(entries) < 1 {
+        eprintln("arxiv_realtime_bridge: 0 entries from cat=" + cat)
+        eprintln("  reason: curl returned empty body OR no <entry> blocks in response")
+        eprintln("  fix: check network, retry after 3s, or verify category spelling")
+        exit(2)
+    }
+
+    if json_mode { emit_json(cat, entries) }
+    else { emit_text(cat, entries) }
+
+    let latest = entries[0]
+    println("__ARXIV_BRIDGE__ PASS category=" + cat + " entries=" + to_string(len(entries)) + " latest_id=" + _str(latest[0]) + " latest_pub=" + _str(latest[2]))
+    exit(0)
+}
