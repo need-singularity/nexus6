@@ -218,7 +218,15 @@ zig cc -target x86_64-linux-musl -O2 -std=gnu11 -D_GNU_SOURCE \
 - **atlas.n6 (hexa-native syntax) 와 별개 source** — atlas.n6 [10*] promotion 은 spectral 직접 영향 X
 - **atlas_eig.hexa stage1 hexa 비실용** — CSR load + Lanczos K=100 + QR 가 push-only 패턴으로 hung (60s+)
 - **awk preprocess 정상**: STEP1 0.8s + STEP2 1.3s — CSR 파일 (row_ptr/deg/col) 생성 OK
-- **우회 경로**: scipy.sparse.linalg.eigsh on CSR → top-K eigenvalue 직접 계산 (다음 firing)
+- **우회 경로 검증 (this session)**: scipy.sparse.linalg.eigsh on CSR — 0.24s (atlas_eig.hexa stage1 250× 가속)
+  - SM mode: 4:17 후 numerical fail (exit 1) — 비추천
+  - shift-invert σ=0: Singular (Laplacian 0 eigenvalue)
+  - **shift-invert σ=1e-3 ✓**: K=50 0.24s
+- **graph 구조 발견 (atlas.blowup.jsonl)**:
+  - connected_components: **24** (giant 21249=99.7%, 다른 27/15/3×4/1×17)
+  - baseline atlas_eig.hexa λ0=0.001 = giant component 의 Fiedler (zero eigenvalues 보고 X)
+  - scipy idx=16 (Fiedler) = 0.00151 — baseline 의 1.5× (precision 또는 5 [10*] promotion 후 미세 변동)
+- **다음 단계**: scipy spectral 로 paircorr 재계산 → cross_x_laws_aligned composite 측정 → nxs-002 sensitivity 1차 데이터
 - nxs-002 resolution 4단 pipeline:
   1. atlas.blowup.jsonl **재생성** (소스 추적 필요 — atlas.n6 → blowup.jsonl 변환 도구 위치)
   2. `bisociation/spectra/atlas_eig.hexa` (CSR + Lanczos, ~/Dev/... default path 는 stale)
