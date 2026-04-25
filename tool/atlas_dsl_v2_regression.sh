@@ -140,31 +140,58 @@ layer_3_grade_format() {
     fi
 }
 
-# ─── Layer 4 — atlas main subset stress test ─────────────────────
+# ─── Layer 4 — v2-compat shard subset stress test ────────────────
+# F23 resolution (2026-04-26): originally subset-ed atlas.n6 (main), but
+# atlas main carries v1-legacy grades incompatible with v2 parser
+# ([10*!] dual-marker, alien-index [A]/[XY]/[K3], plain numeric [24128] etc.),
+# so the serializer exited non-zero with empty stdout → both shasums matched
+# (sha256 of empty = e3b0c44298fc1c14…) → vacuous PASS.
+#
+# Fix: subset from a v2-compat shard (atlas.append.nexus-historical-absorption-…)
+# which exercises the rich v3 compound-grade allowlist (10*PASS_LITERATURE,
+# 10*REPO_INVARIANT, 11*BARRIER_CONFIRMED, …). Covers Layer-4 stress intent
+# without spurious schema-guard hits.
+#
+# Hardening: assert serializer exit=0 AND non-empty stdout to make
+# silent-failure → empty-sha vacuous PASS impossible.
+LAYER4_SHARD="${LAYER4_SHARD:-$NEXUS_ROOT/n6/atlas.append.nexus-historical-absorption-2026-04-26.n6}"
 layer_4_main_subset() {
-    if [ ! -f "$ATLAS_MAIN" ]; then
-        echo "  Layer 4 SKIP — atlas main not found"
+    if [ ! -f "$LAYER4_SHARD" ]; then
+        echo "  Layer 4 SKIP — v2-compat shard not found: $LAYER4_SHARD"
         return 0
     fi
     local tmp_subset
     tmp_subset=$(mktemp -t v2reg.XXXXX.n6)
-    # take first SAMPLE entries from atlas main with header preserved
-    head -10 "$ATLAS_MAIN" > "$tmp_subset"  # header (first 10 lines = comment block)
-    grep -E '^@[PCFLRSXMTE] [^ ]+ =' "$ATLAS_MAIN" 2>/dev/null | head -"$SAMPLE" >> "$tmp_subset"
+    # preserve shard header (comment lines until the first @-prefixed entry)
+    awk '/^@[A-Z]/ {exit} {print}' "$LAYER4_SHARD" > "$tmp_subset"
+    grep -E '^@[PCFLRSXMTE] [^ ]+ =' "$LAYER4_SHARD" 2>/dev/null | head -"$SAMPLE" >> "$tmp_subset"
     local subset_count
     subset_count=$(grep -cE '^@[PCFLRSXMTE] [^ ]+ =' "$tmp_subset")
-    # try byte-eq
-    local sha1 sha2
-    sha1=$(HEXA_RESOLVER_NO_REROUTE=1 "$HEXA_BIN" run "$SERIALIZER" --read-n6 "$tmp_subset" 2>/dev/null | shasum -a 256 | cut -c1-16)
-    sha2=$(HEXA_RESOLVER_NO_REROUTE=1 "$HEXA_BIN" run "$SERIALIZER" --read-n6 "$tmp_subset" 2>/dev/null | shasum -a 256 | cut -c1-16)
+    # byte-eq with hardened silent-failure detection (F23 vacuous-PASS guard)
+    local out1 out2 ec1 ec2 sha1 sha2
+    out1=$(HEXA_RESOLVER_NO_REROUTE=1 "$HEXA_BIN" run "$SERIALIZER" --read-n6 "$tmp_subset" 2>/dev/null); ec1=$?
+    out2=$(HEXA_RESOLVER_NO_REROUTE=1 "$HEXA_BIN" run "$SERIALIZER" --read-n6 "$tmp_subset" 2>/dev/null); ec2=$?
+    sha1=$(printf '%s' "$out1" | shasum -a 256 | cut -c1-16)
+    sha2=$(printf '%s' "$out2" | shasum -a 256 | cut -c1-16)
     rm -f "$tmp_subset"
+    # Anti-vacuous guards
+    if [ "$ec1" -ne 0 ] || [ "$ec2" -ne 0 ]; then
+        printf "  Layer 4 [v2-compat subset] FAIL — serializer non-zero exit (ec1=%d ec2=%d) shard=%s\n" "$ec1" "$ec2" "$(basename "$LAYER4_SHARD")"
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+        return 1
+    fi
+    if [ -z "$out1" ] || [ -z "$out2" ]; then
+        printf "  Layer 4 [v2-compat subset] FAIL — serializer empty stdout (vacuous-PASS guard tripped) shard=%s\n" "$(basename "$LAYER4_SHARD")"
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+        return 1
+    fi
     if [ "$sha1" = "$sha2" ]; then
-        printf "  Layer 4 [main subset N=%d] PASS — byte-eq sha %s (%d entries processed)\n" "$SAMPLE" "$sha1" "$subset_count"
+        printf "  Layer 4 [v2-compat subset N=%d shard=%s] PASS — byte-eq sha %s (%d entries processed)\n" "$SAMPLE" "$(basename "$LAYER4_SHARD")" "$sha1" "$subset_count"
         PASS_COUNT=$((PASS_COUNT + 1))
         TOTAL_ENTRIES=$((TOTAL_ENTRIES + subset_count))
         return 0
     else
-        printf "  Layer 4 [main subset] FAIL — sha %s vs %s\n" "$sha1" "$sha2"
+        printf "  Layer 4 [v2-compat subset] FAIL — sha %s vs %s\n" "$sha1" "$sha2"
         FAIL_COUNT=$((FAIL_COUNT + 1))
         return 1
     fi
