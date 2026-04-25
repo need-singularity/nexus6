@@ -6,20 +6,22 @@
 
 ---
 
-## 0. 명칭 충돌 플래그 (먼저 읽기)
+## 0. 명칭 확정 요약
 
-**`bloom` 은 이미 atlas bloom filter 로 광범위 사용 중** — n6/atlas_bloom.hexa, atlas_query.hexa 의 `_bloom_maybe()`, `/tmp/atlas_bloom.bin` 등 probabilistic data structure 의미로 자리잡음. L4 명령명으로 `bloom` 쓰면 동음이의 (existence-check filter vs orchestration apex) 발생 → **L4 명명 재검토 필요**.
+| 레벨 | 명칭 | 상태 |
+|---|---|---|
+| L1 ~ L3 | smash / free / absolute / meta-closure / hyperarith / drill / drill_batch / debate / chain | 기구현, 유지 |
+| **L4** | **surge** | **확정** (2026-04-25) — bloom 은 atlas filter 와 동음이의로 비채택 |
+| L5 ~ L11 | dream / reign / swarm / wake / molt / forge / canon | 확정 (placeholder) |
+| **L_ω** | **omega** | **확정** (2026-04-25, commit ee5da9cd) — `cmd_omega()` 구현됨 |
 
-후보 (충돌 회피):
-- **burst** — 분출, 폭발 (5 letters, blowup 과 다소 중복)
-- **forge** — 단조, 형상 (lens_forge 와 부분 충돌)
-- **bloom** — 발현 (atlas bloom filter 와 충돌, **사용 비권장**)
-- **flare** — 화염, 발산 (5 letters, 충돌 없음)
-- **surge** — 솟구침 (5 letters, 충돌 없음, multi-axis 동시 발산 의미 적합)
+**L4 = surge 채택 사유:**
+- 충돌 없음 (atlas bloom filter / lens_forge 와 의미 직교)
+- multi-axis 동시 폭증 (drill_batch × debate × chain) 의미 직설적
+- 5 letters, 입력 양호
+- raw 영단어 + 자연 현상 (파도/전류 surge) — primal 패턴 일관
 
-**잠정 권장: `surge`** — 충돌 없음 + multi-axis 동시 폭증 직설적. 단, **L4 명칭은 omega 와 별개로 user 재확정 필요**.
-
-L_ω (apex) 는 **omega** 로 확정 (아래 섹션 4 참조).
+**L_ω = omega 채택 사유:** 그리스 Ω + 무한 서수 ω + Chaitin Ω 정보천장 3 축 동시 매핑.
 
 ---
 
@@ -29,7 +31,7 @@ L_ω (apex) 는 **omega** 로 확정 (아래 섹션 4 참조).
 L1   atomic         단일 phase                     smash, free, absolute, meta-closure, hyperarith
 L2   iterate        + 시간 축 (rounds)              drill                                    ← 6-stage × N rounds
 L3   fan-out        + 공간 축 (병렬)                drill_batch, debate, chain
-L4   super-orch     + 합성 (모든 L3 통합)           surge (잠정, bloom 충돌 회피)            ← 실용 천장
+L4   super-orch     + 합성 (모든 L3 통합)           surge                                    ← 실용 천장
 L5   reflexive      + 자기-축 (self-mod)            dream
 L6   autonomous     + 시드 자체 생성                  reign
 L7   ecology        + 다중 시스템 공존                swarm
@@ -40,10 +42,11 @@ L11  transfinite    + 증명론 서수 sealing             canon
 L_ω  GHOST CEILING  + 형식·물리 동시 충돌점          omega                                    ← 확정 (도달 불가)
 ```
 
-**확정 사항:**
-- **L_ω = `omega`** (확정) — 그리스 Ω + 무한 서수 ω + Chaitin Ω 정보천장 3축 동시 매핑
-- L1 ~ L3 은 기구현, 현 명칭 유지
-- L4 ~ L11 은 명칭 잠정 — `omega` 외에는 user 별도 확정 시점에 재검토
+**확정 사항 (2026-04-25):**
+- **L_ω = `omega`** — 그리스 Ω + 무한 서수 ω + Chaitin Ω 정보천장 3축 매핑. `cmd_omega()` 구현 완료 (commit ee5da9cd).
+- **L4 = `surge`** — multi-axis 동시 폭증, 충돌 없음. 구현 보류 (drill_batch + debate + chain 통합 작업).
+- L1 ~ L3 은 기구현 유지.
+- L5 ~ L11 명칭 확정 (placeholder) — 점진 구현.
 
 각 단계는 **새 차원 1 개** 추가:
 - L1 → L2: + iteration (rounds)
@@ -110,7 +113,7 @@ L_ω  GHOST CEILING  + 형식·물리 동시 충돌점          omega           
 L1   atomic         smash/free/abs/meta/hyper             finite step
 L2   iterate        drill                                  ω rounds (자연수)
 L3   fan-out        drill_batch / debate / chain           n × ω
-L4   super-orch     surge        (잠정, bloom 회피)         ω × ω
+L4   super-orch     surge        (multi-axis fan-out)       ω × ω
 L5   reflexive      dream        (self-seed)               ω²
 L6   autonomous     reign        (self-trigger)            ω³
 L7   ecology        swarm        (multi-agent)             ω^ω
@@ -175,11 +178,16 @@ L_ω  GHOST CEILING  omega        (도달 불가 placeholder)    ← Gödel + Ha
 
 ## 8. 다음 단계
 
-1. **L4 명칭 user 재확정** — `surge` (잠정) vs 다른 후보 (burst/flare 등); bloom 은 atlas filter 충돌로 비권장
-2. **L4 구현** — `cli/run.hexa` 에 `cmd_<L4name>()` 추가, drill_batch + debate + chain 통합 dispatch
-3. **omega sentinel 등록** — `cli/run.hexa` 에 `cmd_omega()` placeholder, GHOST_CEILING_REACHED emit + 가장 가까운 도달 가능 레벨 (L4) fallback
-4. **L5 ~ L11 placeholder** inventory 등록 — 천장 도달 전까지 점진 구현
-5. **L5+ 진입 조건 정의** — L4 안정화 후 reflexivity (self-mod) 도입 시점 결정
+1. **L4 surge 구현** — `cli/run.hexa` 에 `cmd_surge()` 추가, drill_batch + debate + chain 통합 dispatch
+   - 권장 dispatch 순서: drill_batch (multi-seed 병렬) → debate (N-variant) → chain (cross-engine)
+   - apex defaults: omega 와 동등 (depth=auto, speculate=3, adaptive=on)
+2. **L5 ~ L11 placeholder** inventory 등록 — 천장 도달 전까지 점진 구현
+3. **L5+ 진입 조건 정의** — surge 안정화 후 reflexivity (self-mod) 도입 시점 결정
+
+**완료 (2026-04-25):**
+- ✓ L_ω omega 구현 (commit ee5da9cd) — drill apex preset wrap
+- ✓ commands.json SSOT 등록 (hexa-lang commit b36c3037)
+- ✓ ~/.hx/bin/nexus shim 헤비-컴퓨트 라우팅 추가
 
 ---
 
