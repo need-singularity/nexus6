@@ -1,0 +1,338 @@
+#!hexa strict
+// tool/horizons_bridge.hexa — JPL Horizons → HEXA-SIM TP-8 verification bridge.
+//
+// @tool(slug="horizons_bridge", desc="JPL Horizons solar-system ephemeris fetcher + HEXA-SIM TP-8 'Mars 2g 4-day' transit verifier")
+// @usage(hexa run tool/horizons_bridge.hexa [--target <id>] [--accel <m/s2>] [--json] [--selftest])
+// @exit_codes(0=PASS, 1=usage/io error, 2=value sanity violation)
+// @sentinel(__HORIZONS_BRIDGE__ PASS target=<id> mars_dist_au=<f> mars_dist_m=<f> tp8_2g_days=<f> tp8_target=4.0 deviation_pct=<f>)
+// @origin(HEXA-SIM TP-8 'Mars 2g 4-day' transit anchor, τ=4 day @ φ=2g constant accel)
+// @abstraction(hive raw 70 design-multi-axis-verify-grid + raw 73 structural-admissibility — empirical observable cross-check)
+// @paradigm(observable bridge — JPL ephemeris (NASA SSD authoritative source) → kinematic transit time @ 2g constant accel)
+//
+// HEXA-SIM TP-8 claim: "Mars transit @ 2g ≈ 4 days" (τ=4 day anchor).
+// Real verification: t = 2 * sqrt(d / a) where d = Earth-Mars distance (m), a = 19.62 m/s² (2g constant accel).
+// Earth-Mars distance varies 0.38..2.67 AU (closest opposition vs farthest superior conjunction);
+// 4-day claim only holds for specific geometry. We fetch CURRENT distance and report deviation.
+//
+// API: https://ssd.jpl.nasa.gov/api/horizons.api?format=text&COMMAND=<id>&CENTER='@399'
+//      &MAKE_EPHEM=YES&EPHEM_TYPE=OBSERVER&START_TIME='YYYY-MM-DD'&STOP_TIME='YYYY-MM-DD'
+//      &STEP_SIZE='1d'&QUANTITIES='20'
+//   COMMAND : 199=Mercury, 299=Venus, 399=Earth, 499=Mars, 599=Jupiter, 699=Saturn, ...
+//   CENTER  : '@399' = Earth geocenter
+//   QUANTITIES='20' returns delta (AU) + deldot (km/s)
+//   Response text contains $$SOE ... $$EOE block; first data line: "YYYY-Mon-DD HH:MM     <delta_AU>  <deldot_kms>"
+//
+// HEXA_RESOLVER_NO_REROUTE=1 must be set so resolver does not bounce this script.
+
+// ─── float math (no builtin sqrt — Newton iter, mirrors nxs_002_omega_metrics.hexa) ───
+
+fn abs_f(x: f64) -> f64 { if x < 0.0 { return 0.0 - x } return x }
+
+fn sqrt_f(x: f64) -> f64 {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    let mut i: i64 = 0
+    while i < 60 {
+        let nxt = (g + x / g) / 2.0
+        if abs_f(nxt - g) < g * 0.0000000000001 { return nxt }
+        g = nxt
+        i = i + 1
+    }
+    return g
+}
+
+// ─── astronomical constants ───
+
+fn AU_M() -> f64 { return 149597870700.0 }       // 1 AU in metres (IAU 2012 exact)
+fn G_MS2() -> f64 { return 9.81 }                // standard gravity (m/s²)
+fn ACCEL_2G() -> f64 { return 2.0 * G_MS2() }    // 19.62 m/s²
+fn TP8_TARGET_DAYS() -> f64 { return 4.0 }       // HEXA-SIM TP-8 anchor
+fn SECONDS_PER_DAY() -> f64 { return 86400.0 }
+
+// ─── coercion helpers ───
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+// ─── exec wrappers ───
+
+fn now_date() -> string {
+    return _str(exec("date -u +%Y-%m-%d")).trim()  // @allow-bare-exec
+}
+
+fn next_date(d: string) -> string {
+    // d = YYYY-MM-DD; gnu/bsd date both support -d/-v syntax differently → use python3 if available, else +1 day via gdate fallback.
+    let cmd = "python3 -c \"from datetime import date,timedelta; d=date.fromisoformat('" + d + "'); print((d+timedelta(days=1)).isoformat())\" 2>/dev/null"
+    let r = _str(exec(cmd)).trim()  // @allow-bare-exec
+    if r != "" { return r }
+    // fallback: BSD date
+    return _str(exec("date -j -v+1d -f '%Y-%m-%d' '" + d + "' +%Y-%m-%d 2>/dev/null")).trim()  // @allow-bare-exec
+}
+
+fn fetch_horizons(target_id: string, start: string, stop: string) -> string {
+    // Quotes around START/STOP/CENTER are required by Horizons API; URL-encode the @ in @399.
+    let url = "https://ssd.jpl.nasa.gov/api/horizons.api?format=text&COMMAND=" + target_id
+            + "&CENTER=%27%40399%27&MAKE_EPHEM=YES&EPHEM_TYPE=OBSERVER"
+            + "&START_TIME=%27" + start + "%27&STOP_TIME=%27" + stop + "%27"
+            + "&STEP_SIZE=%271d%27&QUANTITIES=%2720%27"
+    let cmd = "curl -s --max-time 30 '" + url + "' 2>/dev/null"
+    return _str(exec(cmd))  // @allow-bare-exec
+}
+
+// ─── ephemeris parser ───
+//
+// extract delta (AU) from a Horizons text response. We locate the $$SOE marker,
+// take the first non-blank data line after it, then read the first numeric token
+// after the timestamp prefix "YYYY-Mon-DD HH:MM" (17 chars + leading space).
+//
+// returns -1.0 on parse failure.
+
+fn _is_digit(c: string) -> bool {
+    return c == "0" || c == "1" || c == "2" || c == "3" || c == "4"
+        || c == "5" || c == "6" || c == "7" || c == "8" || c == "9"
+}
+
+fn extract_distance_au(body: string) -> f64 {
+    if body == "" { return 0.0 - 1.0 }
+    let soe = body.index_of("$$SOE")
+    if soe < 0 { return 0.0 - 1.0 }
+    let after = body.substring(soe + 5, body.len())
+    let eoe = after.index_of("$$EOE")
+    let block = if eoe >= 0 { after.substring(0, eoe) } else { after }
+    // split on newlines, find first line that begins with a digit (year)
+    let lines = block.split("\n")
+    let mut li = 0
+    while li < len(lines) {
+        let raw = _str(lines[li]).trim()
+        if raw != "" {
+            let head = raw.substring(0, 1)
+            if _is_digit(head) {
+                // skip leading "YYYY-Mon-DD HH:MM" (17 chars), then trim
+                let tail = raw.substring(17, raw.len()).trim()
+                // first whitespace-separated token = delta (AU)
+                let mut end = 0
+                let n = tail.len()
+                while end < n {
+                    let c = tail.substring(end, end + 1)
+                    if c == " " || c == "\t" { break }
+                    end = end + 1
+                }
+                let tok = tail.substring(0, end).trim()
+                if tok == "" { return 0.0 - 1.0 }
+                let mut v: f64 = 0.0 - 1.0
+                try { v = to_float(tok) } catch e { v = 0.0 - 1.0 }
+                return v
+            }
+        }
+        li = li + 1
+    }
+    return 0.0 - 1.0
+}
+
+// ─── TP-8 transit computation ───
+//
+// constant-accel rendezvous (flip-and-burn): half-distance accelerate, half-distance decelerate.
+// one-way time t = 2 * sqrt(d / a)  (where d = full distance, a = constant accel magnitude).
+
+fn compute_transit_seconds(d_m: f64, accel_ms2: f64) -> f64 {
+    if d_m <= 0.0 { return 0.0 }
+    if accel_ms2 <= 0.0 { return 0.0 }
+    return 2.0 * sqrt_f(d_m / accel_ms2)
+}
+
+fn seconds_to_days(s: f64) -> f64 { return s / SECONDS_PER_DAY() }
+
+// ─── output ───
+
+fn emit_text(target_id: string, d_au: f64, d_m: f64, accel: f64, t_days: f64, dev_days: f64, dev_pct: f64) {
+    println("horizons_bridge — JPL Horizons → HEXA-SIM TP-8 bridge")
+    println("  target_id           : " + target_id + " (CENTER=Earth@399)")
+    println("  distance_au         : " + to_string(d_au))
+    println("  distance_m          : " + to_string(d_m))
+    println("  accel_ms2           : " + to_string(accel) + "  (2g = 19.62 m/s²)")
+    println("  transit_days        : " + to_string(t_days) + "  (t = 2·√(d/a))")
+    println("  hexa_sim_target     : " + to_string(TP8_TARGET_DAYS()) + "  (TP-8 'Mars 2g 4-day' anchor)")
+    println("  deviation_days      : " + to_string(dev_days))
+    println("  deviation_pct       : " + to_string(dev_pct) + "%")
+    println("---")
+}
+
+fn emit_json(target_id: string, d_au: f64, d_m: f64, accel: f64, t_days: f64, dev_days: f64, dev_pct: f64, ts: string) {
+    println("{"
+        + "\"tool\":\"horizons_bridge\","
+        + "\"ts\":\"" + ts + "\","
+        + "\"target_id\":\"" + target_id + "\","
+        + "\"center\":\"@399\","
+        + "\"distance_au\":" + to_string(d_au) + ","
+        + "\"distance_m\":" + to_string(d_m) + ","
+        + "\"accel_ms2\":" + to_string(accel) + ","
+        + "\"transit_days\":" + to_string(t_days) + ","
+        + "\"hexa_sim_target_days\":" + to_string(TP8_TARGET_DAYS()) + ","
+        + "\"deviation_days\":" + to_string(dev_days) + ","
+        + "\"deviation_pct\":" + to_string(dev_pct) + ","
+        + "\"origin\":\"HEXA-SIM TP-8 Mars 2g 4-day transit anchor\""
+        + "}")
+}
+
+// ─── selftest ───
+//
+// structural-admissibility seal: pure-math TP-8 inverse + Mars distance bound check, no network.
+
+fn _selftest() {
+    let mut bad = []
+
+    // 1. sqrt_f sanity (4 → 2, 100 → 10, 2 → ~1.414213)
+    if abs_f(sqrt_f(4.0) - 2.0) > 0.0000001 { bad.push("sqrt_f(4)") }
+    if abs_f(sqrt_f(100.0) - 10.0) > 0.0000001 { bad.push("sqrt_f(100)") }
+    if abs_f(sqrt_f(2.0) - 1.41421356) > 0.00001 { bad.push("sqrt_f(2)") }
+
+    // 2. TP-8 inverse: at d such that t=4 day @ 2g, what distance does it imply?
+    //    d = a * (t/2)² = 19.62 * (345600/2)² = 19.62 * 172800² ≈ 5.858e11 m ≈ 3.916 AU
+    //    NOTE: 3.92 AU > Earth-Mars max (2.67 AU at far conjunction) → HEXA-SIM TP-8 4-day
+    //    claim already exceeds the physical Earth-Mars range under the 2g flip-and-burn model.
+    //    Real Mars transit at 2g is ~1.4..3.1 days depending on phase.
+    let t_target_s = TP8_TARGET_DAYS() * SECONDS_PER_DAY()
+    let d_target_m = ACCEL_2G() * (t_target_s / 2.0) * (t_target_s / 2.0)
+    let d_target_au = d_target_m / AU_M()
+    if d_target_au < 3.8 || d_target_au > 4.0 { bad.push("tp8_inverse_au=" + to_string(d_target_au)) }
+
+    // 3. forward direction at canonical Earth-Mars 0.5 AU → ≈ 1.43 day
+    let d_test_m = 0.5 * AU_M()
+    let t_test_d = seconds_to_days(compute_transit_seconds(d_test_m, ACCEL_2G()))
+    if t_test_d < 1.3 || t_test_d > 1.6 { bad.push("forward_0.5au_days=" + to_string(t_test_d)) }
+
+    // 4. Mars distance physical bound (any real ephemeris must give 0.3..2.7 AU)
+    //    pure structural check using an embedded sample response.
+    let sample = "Date__(UT)__HR:MN                delta      deldot\n"
+               + "***************************************************\n"
+               + "$$SOE\n"
+               + " 2026-Apr-25 00:00     2.25589590769889  -2.9835400\n"
+               + " 2026-Apr-26 00:00     2.25416883513488  -2.9973311\n"
+               + "$$EOE\n"
+    let parsed = extract_distance_au(sample)
+    if parsed < 0.3 || parsed > 2.7 { bad.push("parse_sample_au=" + to_string(parsed)) }
+    if abs_f(parsed - 2.25589590769889) > 0.00001 { bad.push("parse_precision=" + to_string(parsed)) }
+
+    if len(bad) > 0 {
+        eprintln("[horizons_bridge selftest] FAIL: " + bad.join(", "))
+        exit(1)
+    }
+    println("[horizons_bridge selftest] OK — sqrt_f + TP-8 inverse (d=" + to_string(d_target_au) + " AU @ t=4d/2g) + forward + parser")
+    exit(0)
+}
+
+// ─── main ───
+
+fn _help() {
+    println("usage: hexa run tool/horizons_bridge.hexa [--target <id>] [--accel <m/s2>] [--json] [--selftest]")
+    println("  --target <id>    JPL Horizons body id (default: 499 = Mars)")
+    println("                   199=Mercury 299=Venus 399=Earth 499=Mars 599=Jupiter 699=Saturn 799=Uranus 899=Neptune")
+    println("  --accel <m/s2>   constant proper acceleration (default: 19.62 = 2g)")
+    println("  --json           emit single-line JSON instead of human text")
+    println("  --selftest       structural admissibility seal (no network)")
+    println("origin: HEXA-SIM TP-8 'Mars 2g 4-day' transit anchor (τ=4 day @ φ=2g)")
+}
+
+fn main() -> void {
+    let raw = args()
+    // Normalize argv across Mac/Linux dispatch styles: skip prefix until we pass the .hexa script path.
+    let mut script_idx: i64 = 0 - 1
+    let mut sj = 0
+    while sj < len(raw) {
+        if _str(raw[sj]).ends_with(".hexa") { script_idx = sj; break }
+        sj = sj + 1
+    }
+    let mut user_start: i64 = 2
+    if script_idx >= 0 { user_start = script_idx + 1 }
+    else if len(raw) >= 3 && (raw[1] == "run" || raw[1] == "eval") { user_start = 3 }
+
+    let mut target_id = "499"        // Mars
+    let mut accel = ACCEL_2G()
+    let mut json_mode = false
+    let mut do_selftest = false
+
+    let mut k: i64 = user_start
+    while k < len(raw) {
+        let a = _str(raw[k])
+        if a == "--selftest" || a == "selftest" { do_selftest = true; k = k + 1; continue }
+        if a == "--json" { json_mode = true; k = k + 1; continue }
+        if a == "--help" || a == "-h" { _help(); exit(0) }
+        if a == "--target" && (k + 1) < len(raw) {
+            target_id = _str(raw[k + 1]); k = k + 2; continue
+        }
+        if a == "--accel" && (k + 1) < len(raw) {
+            let v_str = _str(raw[k + 1])
+            let mut v: f64 = 0.0
+            try { v = to_float(v_str) } catch e { v = 0.0 }
+            if v <= 0.0 {
+                eprintln("horizons_bridge: --accel requires positive float, got `" + v_str + "`")
+                exit(1)
+            }
+            accel = v
+            k = k + 2
+            continue
+        }
+        eprintln("horizons_bridge: unknown arg `" + a + "` (try --help)")
+        exit(1)
+    }
+
+    if do_selftest { _selftest() }
+
+    let start = now_date()
+    if start == "" {
+        eprintln("horizons_bridge: failed to obtain current UTC date")
+        exit(1)
+    }
+    let stop = next_date(start)
+    if stop == "" {
+        eprintln("horizons_bridge: failed to compute stop date")
+        exit(1)
+    }
+
+    let body = fetch_horizons(target_id, start, stop)
+    if body == "" {
+        eprintln("horizons_bridge: empty response from JPL Horizons (network/timeout)")
+        eprintln("  target_id=" + target_id + " start=" + start + " stop=" + stop)
+        exit(1)
+    }
+    if body.index_of("$$SOE") < 0 {
+        eprintln("horizons_bridge: response missing $$SOE marker (API error or unknown target id)")
+        eprintln("  target_id=" + target_id)
+        // surface first 300 chars for diagnosis
+        let head = if body.len() > 300 { body.substring(0, 300) } else { body }
+        eprintln("  head: " + head)
+        exit(1)
+    }
+
+    let d_au = extract_distance_au(body)
+    if d_au <= 0.0 {
+        eprintln("horizons_bridge: failed to parse delta from ephemeris block")
+        exit(2)
+    }
+    // physical sanity bound — any solar-system body from Earth must lie within 0.0..50 AU
+    if d_au < 0.001 || d_au > 60.0 {
+        eprintln("horizons_bridge: parsed distance out of physical bounds: " + to_string(d_au) + " AU")
+        exit(2)
+    }
+
+    let d_m = d_au * AU_M()
+    let t_s = compute_transit_seconds(d_m, accel)
+    let t_days = seconds_to_days(t_s)
+    let dev_days = t_days - TP8_TARGET_DAYS()
+    let dev_pct = if TP8_TARGET_DAYS() > 0.0 { 100.0 * dev_days / TP8_TARGET_DAYS() } else { 0.0 }
+
+    if json_mode { emit_json(target_id, d_au, d_m, accel, t_days, dev_days, dev_pct, start) }
+    else { emit_text(target_id, d_au, d_m, accel, t_days, dev_days, dev_pct) }
+
+    println("__HORIZONS_BRIDGE__ PASS target=" + target_id
+        + " mars_dist_au=" + to_string(d_au)
+        + " mars_dist_m=" + to_string(d_m)
+        + " tp8_2g_days=" + to_string(t_days)
+        + " tp8_target=" + to_string(TP8_TARGET_DAYS())
+        + " deviation_pct=" + to_string(dev_pct))
+    exit(0)
+}
