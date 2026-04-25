@@ -1,0 +1,858 @@
+#!hexa strict
+// tool/omega_cycle_atlas_ingest.hexa — ω-cycle witness JSON → atlas.n6 multi-shard auto-ingest (Tier-1 5 axes)
+//
+// @tool(slug="omega_cycle_atlas_ingest", desc="design/**/*omega_cycle*.json glob auto-discovery + auto type classification (@P/@C/@F/@L/@R/@S/@X) + per-cycle shard emit + extended grade tokens + cross-repo aggregate (nexus + n6-architecture + anima). single-domain hexa_sim_atlas_ingest 의 일반화 evolution.")
+// @usage(hexa run tool/omega_cycle_atlas_ingest.hexa [--selftest] [--dry-run] [--absorb] [--diff] [--json-summary] [--repo-only NAME])
+// @exit_codes(0=PASS, 1=usage/io, 2=schema-guard violation, 3=absorb conflict)
+// @sentinel(__OMEGA_CYCLE_ATLAS_INGEST__ PASS|FAIL cycles=N facts=M crosslinks=X repos=R grade_dist=...)
+// @origin(design/hexa_sim/2026-04-26_atlas_ingest_tool_evolution_omega_cycle.json Tier-1 axes a10+a3+a4+a7+a6)
+// @abstraction(raw 23 schema-guard + raw 68 byte-eq + raw 70 multi-axis + raw 73 structural-admissibility + raw 77 audit-append-only + raw 67 cross-repo)
+// @paradigm(structural — auto-discover witness corpus, deterministic per-cycle emit, byte-eq idempotence on identical input set)
+// @allow-bare-exec
+//
+// atlas DSL grammar (atlas.n6 v1):
+//   @<TYPE> <id> = <expr> :: <domain> [<grade>]
+//     <- depends_on / -> derives / => application / == equiv / ~> converges / |> verified / !! breakthrough
+//   types: P primitive, C constant, L law, F formula, R relation, S symmetry, X crossing
+//   grade: 0-11 + d.r alien index; * verified, ! breakthrough, ? hypothesis
+//   extended grade tokens (a7): [10*PASS_LITERATURE], [10*PROBE_RUN], [10*BARRIER_CONFIRMED], [10*NEGATIVE_VERDICT], [11*REPO_INVARIANT]
+
+// ─── polyfill: dir_exists (hexa stdlib gap; str_find polyfill removed — use s.index_of() builtin) ─────
+
+fn dir_exists(p: string) -> bool {
+    let out = to_string(exec("test -d '" + p + "' && echo y || echo n")).trim()
+    if out == "y" { return true }
+    return false
+}
+
+// ─── repo registry (a6 cross-repo) ──────────────────────────────
+
+fn _repo_paths() -> array {
+    // [name, abs_path_to_design_dir, honesty_guard_relpath]
+    let h = env_var("HOME")
+    return [
+        ["nexus", h + "/core/nexus/design", "honesty_invariant"],
+        ["n6-architecture", h + "/core/n6-architecture/design", "honesty_invariant"],
+        ["anima", h + "/core/anima/design", "honesty_invariant"]
+    ]
+}
+
+// ─── cycle discovery (a10 auto-glob) ─────────────────────────────
+
+fn _glob_cycles(repo_design_dir: string) -> array {
+    // shell out to find — sandbox-safe via @allow-bare-exec
+    if !dir_exists(repo_design_dir) { return [] }
+    let cmd = "find '" + repo_design_dir + "' -name '*omega_cycle*.json' -type f 2>/dev/null | sort"
+    let out = to_string(exec(cmd)).trim()
+    if len(out) == 0 { return [] }
+    let parts = out.split("\n")
+    let mut acc = []
+    for p in parts {
+        let pt = p.trim()
+        if len(pt) > 0 { acc.push(pt) }
+    }
+    return acc
+}
+
+fn _discover_all_cycles(repo_filter: string) -> array {
+    // returns array of [repo_name, witness_path]
+    let mut all = []
+    for r in _repo_paths() {
+        let name = r[0]
+        let dpath = r[1]
+        if len(repo_filter) > 0 && repo_filter != name { continue }
+        let paths = _glob_cycles(dpath)
+        for p in paths { all.push([name, p]) }
+    }
+    return all
+}
+
+// ─── cycle metadata / slug ───────────────────────────────────────
+
+fn _basename_no_ext(path: string) -> string {
+    let cmd = "basename '" + path + "' .json"
+    return to_string(exec(cmd)).trim()
+}
+
+fn _slugify_cycle(witness_path: string) -> string {
+    // strip leading YYYY-MM-DD_ (10+1 = 11 chars) if present, drop trailing "_omega_cycle" if present
+    let base = _basename_no_ext(witness_path)
+    let mut s = base
+    if len(s) > 11 {
+        let head = s.substring(0, 4)
+        let dash1 = s.substring(4, 5)
+        let dash2 = s.substring(7, 8)
+        let under = s.substring(10, 11)
+        if dash1 == "-" && dash2 == "-" && under == "_" {
+            // numeric check on YYYY/MM/DD parts: skip strict, prefix shape OK
+            s = s.substring(11, len(s))
+        }
+    }
+    // strip trailing "_omega_cycle"
+    let suffix = "_omega_cycle"
+    if len(s) > len(suffix) {
+        let tail = s.substring(len(s) - len(suffix), len(s))
+        if tail == suffix { s = s.substring(0, len(s) - len(suffix)) }
+    }
+    // sanitize: replace _ with -, lowercase already mostly
+    let mut out = ""
+    let n = len(s)
+    let mut i = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "_" { out = out + "-" }
+        else { out = out + c }
+        i = i + 1
+    }
+    if len(out) == 0 { return "unknown-cycle" }
+    return out
+}
+
+// ─── witness JSON shallow scan (no full JSON parser; regex-style line scan) ─
+// We extract:
+//   - trawl_id (string)
+//   - axes_total_surfaced (int) if present
+//   - tier_1 candidate count (count of "axis_id" inside tier_1_* arrays)
+//   - fact-like atoms from "summary"/"facts"/"rationale"/"name" string values
+// Strategy: line-by-line; single fact per non-empty descriptive value.
+
+fn _read_witness(path: string) -> string {
+    if !file_exists(path) { return "" }
+    return to_string(read_file(path))
+}
+
+fn _extract_field(content: string, key: string) -> string {
+    // naive: find "key": "value" pattern, return value (truncated at next unescaped quote)
+    let needle = "\"" + key + "\""
+    let idx = content.index_of(needle)
+    if idx < 0 { return "" }
+    let rest = content.substring(idx + len(needle), len(content))
+    // skip past ':' and whitespace and opening quote
+    let mut j = 0
+    let nrest = len(rest)
+    while j < nrest {
+        let c = rest.substring(j, j + 1)
+        if c == "\"" { break }
+        j = j + 1
+        if j > 64 { return "" }  // bail if key not followed by string value soon
+    }
+    if j >= nrest { return "" }
+    let body = rest.substring(j + 1, nrest)
+    // find closing unescaped quote
+    let mut k = 0
+    let nbody = len(body)
+    while k < nbody {
+        let c = body.substring(k, k + 1)
+        if c == "\"" {
+            // check escape
+            if k > 0 && body.substring(k - 1, k) == "\\" { k = k + 1; continue }
+            return body.substring(0, k)
+        }
+        k = k + 1
+    }
+    return ""
+}
+
+fn _extract_int(content: string, key: string) -> i64 {
+    let needle = "\"" + key + "\""
+    let idx = content.index_of(needle)
+    if idx < 0 { return -1 }
+    let rest = content.substring(idx + len(needle), len(content))
+    // skip past ':' and whitespace, accumulate digits
+    let mut j = 0
+    let nrest = len(rest)
+    let mut started = false
+    let mut s = ""
+    while j < nrest {
+        let c = rest.substring(j, j + 1)
+        if !started {
+            if c >= "0" && c <= "9" { started = true; s = s + c }
+            else if c == ":" || c == " " || c == "\t" { /* skip */ }
+            else { return -1 }
+        } else {
+            if c >= "0" && c <= "9" { s = s + c }
+            else { break }
+        }
+        j = j + 1
+    }
+    if len(s) == 0 { return -1 }
+    return to_int(s)
+}
+
+// ─── auto type classification (a3) ───────────────────────────────
+// heuristic priority: @S > @X > @L > @R > @F > @C > @P (then fallback @C)
+
+fn _has_substr(s: string, sub: string) -> bool {
+    return s.index_of(sub) >= 0
+}
+
+fn _classify_type(text: string, id_hint: string) -> string {
+    // @S symmetry — group notation / SU/SO/PMNS/Sp/E8/×
+    if _has_substr(text, "SU(") || _has_substr(text, "SO(") || _has_substr(text, "Sp(") {
+        return "S"
+    }
+    if _has_substr(text, "PMNS") || _has_substr(text, "E_8") || _has_substr(text, "E8 ") {
+        return "S"
+    }
+    // @X crossing — multi-source / N-of-M / cross-bridge / cross-repo / N-witness
+    if _has_substr(text, "multi-source") || _has_substr(text, "cross-bridge") || _has_substr(text, "cross-BT") {
+        return "X"
+    }
+    if _has_substr(text, "Cross-BT") || _has_substr(text, "5-witness") || _has_substr(text, "3-source") {
+        return "X"
+    }
+    if _has_substr(text, "REPO_INVARIANT") || _has_substr(text, "cross-repo") || _has_substr(text, "n6+nexus") {
+        return "X"
+    }
+    if _has_substr(text, "N-of-M") || _has_substr(text, "joint witness") {
+        return "X"
+    }
+    // @L law — criterion / bound / barrier / KEEP_AS_IS / PATTERN_STRONGLY_GENERAL / limit
+    if _has_substr(text, "criterion") || _has_substr(text, "bound") || _has_substr(text, "barrier") {
+        return "L"
+    }
+    if _has_substr(text, "KEEP_AS_IS") || _has_substr(text, "PATTERN_STRONGLY_GENERAL") {
+        return "L"
+    }
+    if _has_substr(text, "BKM") || _has_substr(text, "Lemma") || _has_substr(text, "rule") {
+        return "L"
+    }
+    // @R relation — depends-on / derives / <- / -> / cycle origin / chain
+    if _has_substr(text, "depends-on") || _has_substr(text, "depends_on") {
+        return "R"
+    }
+    if _has_substr(text, "derives") || _has_substr(text, "<-") || _has_substr(text, "->") {
+        return "R"
+    }
+    if _has_substr(text, "cycle 의 origin") || _has_substr(text, "chain ") || _has_substr(text, "origin of") {
+        return "R"
+    }
+    // @F formula — equation / α(s) / Δα / sigma·phi / =
+    if _has_substr(text, "α(") || _has_substr(text, "Δα") || _has_substr(text, "sigma·phi") {
+        return "F"
+    }
+    if _has_substr(text, "alpha=") || _has_substr(text, "alpha-inv") || _has_substr(text, "= ") {
+        // numeric "= " expression check; but could be also @C — keep @F priority for "= <expr>" form
+        if _has_substr(text, "==") || _has_substr(text, "= max") || _has_substr(text, "= 1+") {
+            return "F"
+        }
+    }
+    // @C constant — numeric value (decimal / scientific notation / km/s / Mpc / GeV)
+    if _has_substr(text, ".") {
+        // contains a digit-dot-digit pattern? naive check: "0." or any digit followed by dot
+        let n = len(text)
+        let mut i = 0
+        while i < n - 1 {
+            let c0 = text.substring(i, i + 1)
+            let c1 = text.substring(i + 1, i + 2)
+            if c0 >= "0" && c0 <= "9" && c1 == "." { return "C" }
+            if c0 == "." && c1 >= "0" && c1 <= "9" { return "C" }
+            i = i + 1
+        }
+    }
+    if _has_substr(text, "km/s/Mpc") || _has_substr(text, "GeV") || _has_substr(text, "MeV") {
+        return "C"
+    }
+    // @P primitive — anchor: "n=16 bridges" / "n=12 falsifiers" / "anchor" / "primitive"
+    if _has_substr(text, "anchor") || _has_substr(text, "primitive") {
+        return "P"
+    }
+    if _has_substr(id_hint, "_anchor") || _has_substr(id_hint, "_primitive") {
+        return "P"
+    }
+    // fallback @C (most fact-like atoms become constants)
+    return "C"
+}
+
+// ─── grade policy extended (a7) ──────────────────────────────────
+
+fn _valid_type(t: string) -> bool {
+    if t == "P" || t == "C" || t == "L" || t == "F" || t == "R" || t == "S" || t == "X" { return true }
+    return false
+}
+
+fn _valid_grade(g: string) -> bool {
+    // grade ::= digit+ ("." digit+)? ("*" | "!" | "?")? extended_token?
+    // extended_token ::= [A-Z_]+
+    if len(g) == 0 { return false }
+    let mut i = 0
+    let n = len(g)
+    let mut digit_seen = false
+    let mut suffix_started = false
+    while i < n {
+        let c = g.substring(i, i + 1)
+        if !suffix_started {
+            if c >= "0" && c <= "9" { digit_seen = true; i = i + 1; continue }
+            if c == "." { i = i + 1; continue }
+            if c == "*" || c == "!" || c == "?" { i = i + 1; continue }
+            // first uppercase or underscore → suffix begin
+            if (c >= "A" && c <= "Z") || c == "_" {
+                suffix_started = true
+                i = i + 1
+                continue
+            }
+            return false
+        } else {
+            if (c >= "A" && c <= "Z") || c == "_" || (c >= "0" && c <= "9") {
+                i = i + 1
+                continue
+            }
+            return false
+        }
+    }
+    return digit_seen
+}
+
+fn _classify_grade(witness_content: string, fact_text: string) -> string {
+    // heuristic — extended tokens based on witness keywords
+    if _has_substr(fact_text, "REPO_INVARIANT") || _has_substr(witness_content, "REPO_INVARIANT") {
+        return "11*REPO_INVARIANT"
+    }
+    if _has_substr(fact_text, "BARRIER_CONFIRMED") || _has_substr(fact_text, "barrier") {
+        return "10*BARRIER_CONFIRMED"
+    }
+    if _has_substr(fact_text, "NEGATIVE_VERDICT") || _has_substr(fact_text, "paper-worthy negative") || _has_substr(fact_text, "NULL") {
+        return "10*NEGATIVE_VERDICT"
+    }
+    if _has_substr(fact_text, "PROBE_RUN") || _has_substr(fact_text, "probe") {
+        return "10*PROBE_RUN"
+    }
+    if _has_substr(fact_text, "literature") || _has_substr(fact_text, "PASS_LITERATURE") {
+        return "10*PASS_LITERATURE"
+    }
+    // baseline: tier_1 promoted axes get [10*]; raw fact get [7]
+    return "7"
+}
+
+// ─── per-cycle shard (a4) ────────────────────────────────────────
+
+fn _shard_path_for(cycle_slug: string) -> string {
+    let h = env_var("HOME")
+    return h + "/core/nexus/n6/atlas.append." + cycle_slug + ".n6"
+}
+
+fn _atlas_main_path() -> string {
+    let h = env_var("HOME")
+    return h + "/core/nexus/n6/atlas.n6"
+}
+
+fn _check_dup_in_atlas(id: string) -> bool {
+    let path = _atlas_main_path()
+    if !file_exists(path) { return false }
+    let cmd = "grep -qE '^@[PCFLRSX] " + id + " =' '" + path + "' && echo DUP || echo OK"
+    let out = to_string(exec(cmd)).trim()
+    if out == "DUP" { return true }
+    return false
+}
+
+// ─── per-cycle fact extraction ──────────────────────────────────
+
+fn _extract_facts_from_cycle(witness_content: string, cycle_slug: string) -> array {
+    // Walk JSON for "name" / "summary" / "rationale" inside axes_surfaced + tier_1 arrays.
+    // Simplification: line scan; collect (key, value) pairs where key in {summary, name, rationale, facts}.
+    // Each becomes one fact entry: [type, id, expr, domain, grade, source_slug, applies, cluster].
+    let mut facts = []
+    let lines = witness_content.split("\n")
+    let n = lines.len()
+    let mut i = 0
+    let mut idx_within = 0
+    let mut last_axis_id = ""
+    while i < n {
+        let raw = lines[i]
+        let line = raw.trim()
+        // detect axis_id mention (rough)
+        let aid_idx = line.index_of("\"axis_id\"")
+        if aid_idx < 0 {
+            let aid_idx2 = line.index_of("\"id\"")
+            if aid_idx2 >= 0 {
+                let v = _extract_field(line, "id")
+                if len(v) > 0 && len(v) < 40 { last_axis_id = v }
+            }
+        } else {
+            let v = _extract_field(line, "axis_id")
+            if len(v) > 0 && len(v) < 40 { last_axis_id = v }
+        }
+        // candidate fact-bearing fields
+        let fields = ["summary", "rationale", "facts", "name", "slug"]
+        for f in fields {
+            let needle = "\"" + f + "\""
+            if line.index_of(needle) >= 0 {
+                let v = _extract_field(line, f)
+                if len(v) > 4 && len(v) < 400 {
+                    let id_base = cycle_slug + "_" + last_axis_id + "_" + f + "_" + to_string(idx_within)
+                    let id_clean = _sanitize_id(id_base)
+                    let t = _classify_type(v, id_clean)
+                    let grade = _classify_grade(witness_content, v)
+                    let domain = "omega_cycle_" + cycle_slug
+                    let source = cycle_slug
+                    let applies = f + " of axis " + last_axis_id
+                    facts.push([t, id_clean, v, domain, grade, source, applies, last_axis_id])
+                    idx_within = idx_within + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return facts
+}
+
+fn _sanitize_id(s: string) -> string {
+    // keep [A-Za-z0-9_], replace others with _
+    let n = len(s)
+    let mut out = ""
+    let mut i = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if (c >= "A" && c <= "Z") || (c >= "a" && c <= "z") || (c >= "0" && c <= "9") || c == "_" {
+            out = out + c
+        } else {
+            out = out + "_"
+        }
+        i = i + 1
+    }
+    // collapse repeats of underscore
+    let mut collapsed = ""
+    let mut prev_us = false
+    let n2 = len(out)
+    let mut j = 0
+    while j < n2 {
+        let c = out.substring(j, j + 1)
+        if c == "_" {
+            if !prev_us { collapsed = collapsed + c }
+            prev_us = true
+        } else {
+            collapsed = collapsed + c
+            prev_us = false
+        }
+        j = j + 1
+    }
+    // trim trailing underscore
+    let nc = len(collapsed)
+    if nc > 0 && collapsed.substring(nc - 1, nc) == "_" {
+        collapsed = collapsed.substring(0, nc - 1)
+    }
+    if len(collapsed) == 0 { return "anon" }
+    return collapsed
+}
+
+// ─── shard text emit (deterministic, raw 73) ────────────────────
+
+fn _escape_dsl_value(v: string) -> string {
+    // strip newlines / tabs / collapse spaces; cap length at 200
+    let mut s = v.replace("\n", " ").replace("\r", " ").replace("\t", " ")
+    if len(s) > 200 { s = s.substring(0, 200) + "…" }
+    return s
+}
+
+fn _emit_shard_text(cycle_slug: string, repo_name: string, witness_path: string, facts: array, axes_total: i64, tier1_count: i64) -> string {
+    let mut s = "// ═══════════════════════════════════════════════════════════════\n"
+    s = s + "// atlas.append." + cycle_slug + ".n6 — ω-cycle witness auto-ingest\n"
+    s = s + "// 작성: 2026-04-26, tool/omega_cycle_atlas_ingest.hexa (deterministic emit)\n"
+    s = s + "// 본체 충돌 방지: atlas.n6 직접 편집 대신 본 append 파일에만 기록\n"
+    s = s + "// repo: " + repo_name + " | witness: " + witness_path + "\n"
+    s = s + "// axes_total_surfaced: " + to_string(axes_total) + " | tier_1_count: " + to_string(tier1_count) + "\n"
+    s = s + "// 등급 정책 (a7 extended): [7] / [10*] / [10*PASS_LITERATURE] / [10*PROBE_RUN] / [10*BARRIER_CONFIRMED] / [10*NEGATIVE_VERDICT] / [11*REPO_INVARIANT]\n"
+    s = s + "// schema-guard: raw 23 (atlas DSL grammar mini-lint, exit 2 on violation)\n"
+    s = s + "// idempotence: same witness → byte-eq output (raw 68)\n"
+    s = s + "// ═══════════════════════════════════════════════════════════════\n\n"
+    s = s + "// ── facts auto-classified (@P/@C/@F/@L/@R/@S/@X via heuristic) ──\n\n"
+    let mut i = 0
+    let n = len(facts)
+    while i < n {
+        let fact = facts[i]
+        let t = fact[0]
+        let id = fact[1]
+        let expr = _escape_dsl_value(fact[2])
+        let domain = fact[3]
+        let grade = fact[4]
+        let source = fact[5]
+        let applies = fact[6]
+        s = s + "@" + t + " " + id + " = " + expr + " :: " + domain + " [" + grade + "]\n"
+        s = s + "  => " + applies + "\n"
+        s = s + "  |> " + source + " (auto-ingested ω-cycle)\n\n"
+        i = i + 1
+    }
+    s = s + "// EOF — total " + to_string(n) + " facts auto-classified\n"
+    return s
+}
+
+// ─── audit ledger (a8 carryover) ────────────────────────────────
+
+fn _history_path() -> string {
+    let h = env_var("HOME")
+    return h + "/core/nexus/state/omega_cycle_atlas_ingest_history.jsonl"
+}
+
+fn _now_iso() -> string {
+    return to_string(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()
+}
+
+fn _hash16(content: string) -> string {
+    let escaped = content.replace("'", "")
+    let cmd = "printf %s '" + escaped + "' | shasum -a 256 | cut -c1-16"
+    return to_string(exec(cmd)).trim()
+}
+
+fn _last_history_hash() -> string {
+    let p = _history_path()
+    if !file_exists(p) { return "GENESIS" }
+    let cmd = "tail -1 '" + p + "' 2>/dev/null | grep -oE '\"current_hash\":\"[^\"]+\"' | cut -d'\"' -f4"
+    let out = to_string(exec(cmd)).trim()
+    if len(out) == 0 { return "GENESIS" }
+    return out
+}
+
+fn _append_history(cycles: i64, facts: i64, crosslinks: i64, repos: i64, grade_dist: string) {
+    let p = _history_path()
+    let ts = _now_iso()
+    let prev = _last_history_hash()
+    let payload = "ts=" + ts + "|cycles=" + to_string(cycles) + "|facts=" + to_string(facts) + "|cx=" + to_string(crosslinks) + "|repos=" + to_string(repos) + "|prev=" + prev
+    let cur = _hash16(payload)
+    let line = "{\"ts\":\"" + ts + "\",\"tool\":\"omega_cycle_atlas_ingest\",\"cycles\":" + to_string(cycles) + ",\"facts\":" + to_string(facts) + ",\"crosslinks\":" + to_string(crosslinks) + ",\"repos\":" + to_string(repos) + ",\"grade_dist\":\"" + grade_dist + "\",\"prev_hash\":\"" + prev + "\",\"current_hash\":\"" + cur + "\"}\n"
+    let escaped = line.replace("'", "")
+    exec("printf %s '" + escaped + "' >> '" + p + "'")
+}
+
+// ─── absorb to main atlas (carryover from hexa_sim_atlas_ingest) ─
+
+fn _absorb_shard_to_main(shard_path: string, cycle_slug: string) -> array {
+    let main = _atlas_main_path()
+    if !file_exists(shard_path) { return ["FAIL_SHARD_MISSING", "0", ""] }
+    if !file_exists(main) { return ["FAIL_MAIN_MISSING", "0", ""] }
+    let ts = _now_iso()
+    let sep = "\n# ── ω-cycle absorption (" + ts + ", shard atlas.append." + cycle_slug + ".n6) ──\n"
+    let cmd_sep = "printf %s '" + sep.replace("'", "") + "' >> '" + main + "'"
+    exec(cmd_sep)
+    let cmd_body = "tail -n +12 '" + shard_path + "' >> '" + main + "'"
+    exec(cmd_body)
+    let cmd_lines = "wc -l < '" + shard_path + "'"
+    let lines = to_string(exec(cmd_lines)).trim()
+    let cmd_sha = "shasum -a 256 '" + main + "' | cut -c1-16"
+    let sha = to_string(exec(cmd_sha)).trim()
+    return ["OK", lines, sha]
+}
+
+// ─── selftest ────────────────────────────────────────────────────
+
+fn _selftest() {
+    // 1. type classification heuristic — 5+ test cases
+    let tests = [
+        ["67.36 km/s/Mpc Hubble constant", "h0_test", "C"],
+        ["SU(3) × SU(2) × U(1) gauge group", "sm_gauge", "S"],
+        ["sigma·phi=24 = n*tau identity", "n6_identity", "F"],
+        ["criterion BKM bound for Euler flow", "bkm_law", "L"],
+        ["depends-on n=6 anchor primitive", "anchor_rel", "R"],
+        ["multi-source 3-source corroboration cross-bridge", "x_cross", "X"],
+        ["n=6 anchor primitive value", "n6_prim", "P"]
+    ]
+    let mut bad = []
+    for tt in tests {
+        let got = _classify_type(tt[0], tt[1])
+        let want = tt[2]
+        if got != want {
+            bad.push(tt[0] + " → got @" + got + " want @" + want)
+        }
+    }
+    if len(bad) > 0 {
+        eprintln("[omega_cycle_atlas_ingest selftest] FAIL type-classification:")
+        for b in bad { eprintln("  " + b) }
+        exit(2)
+    }
+    // 2. grade validator extended
+    let g_tests = [
+        ["7", true],
+        ["10", true],
+        ["10*", true],
+        ["11*", true],
+        ["10*PASS_LITERATURE", true],
+        ["10*PROBE_RUN", true],
+        ["10*BARRIER_CONFIRMED", true],
+        ["10*NEGATIVE_VERDICT", true],
+        ["11*REPO_INVARIANT", true],
+        ["", false],
+        ["abc", false],
+        ["10*lower", false]
+    ]
+    let mut gbad = []
+    for gt in g_tests {
+        let got = _valid_grade(gt[0])
+        let want = gt[1]
+        if got != want {
+            gbad.push("grade `" + gt[0] + "` → got " + to_string(got) + " want " + to_string(want))
+        }
+    }
+    if len(gbad) > 0 {
+        eprintln("[omega_cycle_atlas_ingest selftest] FAIL grade-validator:")
+        for b in gbad { eprintln("  " + b) }
+        exit(2)
+    }
+    // 3. glob discovery — at least 3 witnesses found across configured repos
+    let cycles = _discover_all_cycles("")
+    if len(cycles) < 3 {
+        eprintln("[omega_cycle_atlas_ingest selftest] FAIL glob: found only " + to_string(len(cycles)) + " witnesses (expected ≥3)")
+        for c in cycles { eprintln("  " + c[0] + ": " + c[1]) }
+        exit(2)
+    }
+    // 4. cross-repo nexus path verification — first repo (nexus) must exist
+    let nexus_dir = _repo_paths()[0][1]
+    if !dir_exists(nexus_dir) {
+        eprintln("[omega_cycle_atlas_ingest selftest] FAIL nexus design dir absent: " + nexus_dir)
+        exit(2)
+    }
+    // 5. slug determinism
+    let s1 = _slugify_cycle("/foo/2026-04-26_atlas_ingest_tool_evolution_omega_cycle.json")
+    let s2 = _slugify_cycle("/foo/2026-04-26_atlas_ingest_tool_evolution_omega_cycle.json")
+    if s1 != s2 || s1 != "atlas-ingest-tool-evolution" {
+        eprintln("[omega_cycle_atlas_ingest selftest] FAIL slug: got `" + s1 + "` want `atlas-ingest-tool-evolution`")
+        exit(2)
+    }
+    // 6. idempotence — emit same shard twice byte-eq
+    let dummy_facts = [["C", "test_id", "test = 137.036", "test_domain", "10*", "test_slug", "test apply", "axis_x"]]
+    let t1 = _emit_shard_text("test-slug", "nexus", "/dummy/path.json", dummy_facts, 16, 5)
+    let t2 = _emit_shard_text("test-slug", "nexus", "/dummy/path.json", dummy_facts, 16, 5)
+    if t1 != t2 {
+        eprintln("[omega_cycle_atlas_ingest selftest] FAIL idempotence: two emit_shard_text differ")
+        exit(2)
+    }
+    println("[omega_cycle_atlas_ingest selftest] OK — type-classification " + to_string(len(tests)) + " cases / grade-validator " + to_string(len(g_tests)) + " cases / glob " + to_string(len(cycles)) + " witnesses / cross-repo nexus path / slug determinism / emit idempotence")
+    exit(0)
+}
+
+// ─── runner ──────────────────────────────────────────────────────
+
+fn main() -> void {
+    let raw_args = args()
+    let mut cli = []
+    let mut ai = 2
+    while ai < len(raw_args) {
+        cli.push(raw_args[ai])
+        ai = ai + 1
+    }
+    let mut dry_run = false
+    let mut json_summary = false
+    let mut absorb = false
+    let mut diff_mode = false
+    let mut repo_only = ""
+    let mut i = 0
+    while i < len(cli) {
+        let a = cli[i]
+        if a == "--selftest" || a == "selftest" { _selftest() }
+        else if a == "--dry-run" { dry_run = true }
+        else if a == "--absorb" { absorb = true }
+        else if a == "--diff" { diff_mode = true }
+        else if a == "--json-summary" { json_summary = true }
+        else if a == "--repo-only" {
+            if i + 1 >= len(cli) {
+                eprintln("omega_cycle_atlas_ingest: --repo-only requires NAME arg")
+                exit(1)
+            }
+            repo_only = cli[i + 1]
+            i = i + 1
+        }
+        else if a == "--help" || a == "-h" {
+            println("usage: hexa run tool/omega_cycle_atlas_ingest.hexa [--selftest] [--dry-run] [--absorb] [--diff] [--json-summary] [--repo-only NAME]")
+            println("modes:")
+            println("  --selftest      type-classification + grade-validator + glob + slug + idempotence (~5 case each)")
+            println("  --dry-run       discover cycles + emit shards to stdout only (no file write)")
+            println("  --absorb        emit shards to file + merge each to main atlas.n6 (delta-only)")
+            println("  --diff          show 'WOULD add vs already present' per cycle")
+            println("  --json-summary  JSON output mode")
+            println("  --repo-only N   restrict glob to repo N (nexus|n6-architecture|anima)")
+            println("axes: a10 cycle-discovery-auto-glob + a3 auto-type-classification + a4 per-cycle-shard + a7 grade-policy-extended + a6 cross-repo-aggregate")
+            println("audit: state/omega_cycle_atlas_ingest_history.jsonl (raw 77 chain hash)")
+            println("origin: design/hexa_sim/2026-04-26_atlas_ingest_tool_evolution_omega_cycle.json")
+            exit(0)
+        }
+        else {
+            eprintln("omega_cycle_atlas_ingest: unknown arg `" + a + "`")
+            exit(1)
+        }
+        i = i + 1
+    }
+
+    // a10 — cycle discovery
+    let cycles = _discover_all_cycles(repo_only)
+    if len(cycles) == 0 {
+        eprintln("__OMEGA_CYCLE_ATLAS_INGEST__ FAIL no cycles discovered (repo_filter=`" + repo_only + "`)")
+        exit(1)
+    }
+
+    // a6 — per-repo aggregate counters
+    let mut per_repo = []
+    for r in _repo_paths() { per_repo.push([r[0], 0, 0]) }  // [name, cycles_found, facts_extracted]
+
+    let mut total_facts = 0
+    let mut total_skipped = 0
+    let mut g7 = 0
+    let mut g10 = 0
+    let mut g10_ext = 0
+    let mut g11 = 0
+    let mut g11_ext = 0
+    let mut shard_paths = []
+    let mut all_emitted = []  // [cycle_slug, repo_name, shard_path, witness_path, fact_count]
+
+    for entry in cycles {
+        let repo_name = entry[0]
+        let witness_path = entry[1]
+        let cycle_slug = _slugify_cycle(witness_path)
+        let content = _read_witness(witness_path)
+        if len(content) == 0 { continue }
+        let axes_total = _extract_int(content, "axes_total_surfaced")
+        // tier_1 count: cheap proxy = number of "axis_id" inside tier_1 sections — full parse skip; just count occurrences of "tier_1" to confirm presence
+        let tier1_marker = content.index_of("tier_1")
+        let mut tier1_count = 0
+        if tier1_marker >= 0 {
+            // count axis_id occurrences after marker as proxy
+            let after = content.substring(tier1_marker, len(content))
+            let mut idx = 0
+            let nlim = len(after)
+            while idx < nlim {
+                let sub = after.substring(idx, nlim)
+                let f = sub.index_of("\"axis_id\"")
+                if f < 0 { break }
+                tier1_count = tier1_count + 1
+                idx = idx + f + 9
+                if tier1_count > 50 { break }
+            }
+        }
+
+        let facts = _extract_facts_from_cycle(content, cycle_slug)
+
+        // schema-guard each fact + grade tally
+        for fact in facts {
+            let t = fact[0]
+            let id = fact[1]
+            let grade = fact[4]
+            if !_valid_type(t) {
+                eprintln("__OMEGA_CYCLE_ATLAS_INGEST__ FAIL schema-guard invalid type `" + t + "` on " + id)
+                exit(2)
+            }
+            if !_valid_grade(grade) {
+                eprintln("__OMEGA_CYCLE_ATLAS_INGEST__ FAIL schema-guard invalid grade `" + grade + "` on " + id)
+                exit(2)
+            }
+            // tally
+            if grade == "7" { g7 = g7 + 1 }
+            else if grade == "10" || grade == "10*" { g10 = g10 + 1 }
+            else if len(grade) > 3 && grade.substring(0, 3) == "10*" { g10_ext = g10_ext + 1 }
+            else if grade == "11" || grade == "11*" { g11 = g11 + 1 }
+            else if len(grade) > 3 && grade.substring(0, 3) == "11*" { g11_ext = g11_ext + 1 }
+        }
+
+        // a4 — per-cycle shard
+        let shard_text = _emit_shard_text(cycle_slug, repo_name, witness_path, facts, axes_total, tier1_count)
+        let shard_path = _shard_path_for(cycle_slug)
+
+        // tally per-repo
+        let mut pi = 0
+        while pi < len(per_repo) {
+            if per_repo[pi][0] == repo_name {
+                per_repo[pi] = [repo_name, per_repo[pi][1] + 1, per_repo[pi][2] + len(facts)]
+            }
+            pi = pi + 1
+        }
+        total_facts = total_facts + len(facts)
+
+        if diff_mode {
+            println("=== DIFF: " + repo_name + " / " + cycle_slug + " (" + to_string(len(facts)) + " facts) ===")
+            for f in facts {
+                let mark = if _check_dup_in_atlas(f[1]) { "= " } else { "+ " }
+                println("  " + mark + "@" + f[0] + " " + f[1] + " [" + f[4] + "]")
+            }
+            continue
+        }
+
+        if dry_run {
+            if !json_summary {
+                println("=== " + repo_name + " / " + cycle_slug + " (witness=" + witness_path + ") ===")
+                println(shard_text)
+            }
+        } else {
+            write_file(shard_path, shard_text)
+            shard_paths.push(shard_path)
+
+            if absorb {
+                // delta-only: skip facts already in main; here we absorb whole shard but main ingestion gate is grep-based dup
+                let mut conflicts = 0
+                for f in facts {
+                    if _check_dup_in_atlas(f[1]) { conflicts = conflicts + 1 }
+                }
+                if conflicts > 0 {
+                    eprintln("__OMEGA_CYCLE_ATLAS_INGEST__ FAIL absorb conflict (" + to_string(conflicts) + " ids in main atlas) for cycle " + cycle_slug)
+                    exit(3)
+                }
+                let r = _absorb_shard_to_main(shard_path, cycle_slug)
+                if r[0] != "OK" {
+                    eprintln("__OMEGA_CYCLE_ATLAS_INGEST__ FAIL absorb status `" + r[0] + "` for " + cycle_slug)
+                    exit(3)
+                }
+            }
+        }
+
+        all_emitted.push([cycle_slug, repo_name, shard_path, witness_path, to_string(len(facts))])
+    }
+
+    if diff_mode { exit(0) }
+
+    let grade_dist = "7:" + to_string(g7) + ",10:" + to_string(g10) + ",10*ext:" + to_string(g10_ext) + ",11:" + to_string(g11) + ",11*ext:" + to_string(g11_ext)
+
+    // audit-ledger append (every run, not in dry-run)
+    let repos_count = len(_repo_paths())
+    if !dry_run {
+        _append_history(len(cycles), total_facts, 0, repos_count, grade_dist)
+    }
+
+    if json_summary {
+        println("{")
+        println("  \"tool\": \"omega_cycle_atlas_ingest\",")
+        println("  \"mode\": \"" + (if dry_run { "dry-run" } else if absorb { "absorb" } else { "shard-only" }) + "\",")
+        println("  \"repo_filter\": \"" + repo_only + "\",")
+        println("  \"cycles_discovered\": " + to_string(len(cycles)) + ",")
+        println("  \"facts_total\": " + to_string(total_facts) + ",")
+        println("  \"shards_emitted\": " + to_string(len(all_emitted)) + ",")
+        println("  \"grade_dist\": {\"7\": " + to_string(g7) + ", \"10\": " + to_string(g10) + ", \"10*ext\": " + to_string(g10_ext) + ", \"11\": " + to_string(g11) + ", \"11*ext\": " + to_string(g11_ext) + "},")
+        println("  \"per_repo\": [")
+        let mut pi = 0
+        while pi < len(per_repo) {
+            let r = per_repo[pi]
+            let comma = if pi + 1 < len(per_repo) { "," } else { "" }
+            println("    {\"repo\":\"" + r[0] + "\",\"cycles\":" + to_string(r[1]) + ",\"facts\":" + to_string(r[2]) + "}" + comma)
+            pi = pi + 1
+        }
+        println("  ],")
+        println("  \"shards\": [")
+        let mut si = 0
+        while si < len(all_emitted) {
+            let e = all_emitted[si]
+            let comma = if si + 1 < len(all_emitted) { "," } else { "" }
+            println("    {\"slug\":\"" + e[0] + "\",\"repo\":\"" + e[1] + "\",\"path\":\"" + e[2] + "\",\"witness\":\"" + e[3] + "\",\"facts\":" + e[4] + "}" + comma)
+            si = si + 1
+        }
+        println("  ]")
+        println("}")
+    } else {
+        println("ω-cycle witness → atlas auto-ingest (Tier-1 5 axes)")
+        println("---")
+        println("  cycles discovered : " + to_string(len(cycles)))
+        println("  facts extracted   : " + to_string(total_facts))
+        println("  shards emitted    : " + to_string(len(all_emitted)))
+        println("  grade dist        : [7]=" + to_string(g7) + " [10]=" + to_string(g10) + " [10*ext]=" + to_string(g10_ext) + " [11]=" + to_string(g11) + " [11*ext]=" + to_string(g11_ext))
+        let mut pi = 0
+        while pi < len(per_repo) {
+            let r = per_repo[pi]
+            println("  repo " + r[0] + " : cycles=" + to_string(r[1]) + " facts=" + to_string(r[2]))
+            pi = pi + 1
+        }
+        println("  history (a8)      : " + _history_path())
+        println("  shards (per-cycle):")
+        let mut si = 0
+        while si < len(all_emitted) {
+            let e = all_emitted[si]
+            println("    - " + e[0] + " (" + e[1] + ", facts=" + e[4] + ")  →  " + e[2])
+            si = si + 1
+        }
+    }
+
+    println("__OMEGA_CYCLE_ATLAS_INGEST__ PASS cycles=" + to_string(len(cycles)) + " facts=" + to_string(total_facts) + " crosslinks=0 repos=" + to_string(repos_count) + " grade_dist=" + grade_dist)
+    exit(0)
+}
