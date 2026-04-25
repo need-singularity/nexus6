@@ -50,3 +50,15 @@ This triad is verified by 3-of-3 KEEP_AS_IS audits in n6-architecture (2026-04-2
 
 Plus nexus-side cross-repo audit verified KEEP/KEEP_BUT_ADAPT verdicts at:
 - `reports/sessions/omega-audit-nexus-honesty-triad-portability-2026-04-25.md`
+
+## hexa-lang exception (appended 2026-04-26, raw 77 audit-append-only)
+
+The 4-repo Honesty triad ω-cycle preconditions {a git-tracked SSOT, b design corpus, c tool ecosystem, d atlas SSOT, e LLM agents indicator} score nexus / n6-architecture / anima at 5/5. hexa-lang scores **4/5**, missing only (d).
+
+**Decision: accept 4/5 as architectural ceiling — precondition (d) is N/A by role for hexa-lang.**
+
+Reason: hexa-lang is a language implementation repo (parser, self-host, runtime), not a knowledge corpus. The atlas role is owned by nexus (`~/core/nexus/n6/atlas.n6`); cross-repo raw rules are owned by hive (`~/core/hive/.raw`); hexa-lang owns only an L0 parser-owner self-host SSOT (`~/core/hexa-lang/.raw`, 30 lines). Adding an atlas to hexa-lang would duplicate the L0 .raw or import nexus knowledge churn — both degrade the role separation that makes the triad legible.
+
+Effective triad: 4 repos all at ceiling for their role.
+
+Full decision doc: `~/core/nexus/design/hexa_sim/hexa_lang_atlas_ssot_decision.md`
