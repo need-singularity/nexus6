@@ -228,7 +228,7 @@ L_ω  GHOST CEILING  omega        (도달 불가 placeholder)    ← Gödel + Ha
   - CAP: population × generations ≤ NEXUS_SWARM_MAX (기본 12). population [2,8], generations [1,5] clamp
   - 신규 helpers: `_swarm_perturb_seed`, `_swarm_breed`, `_swarm_extract_abs`, `_swarm_max_runs`
   - emits: NEXUS_SWARM {plan / gen / complete / reject} JSON
-- ✓ **L8 wake 구현** (이 commit) — reality-loop, 외부 signal fp 트리거
+- ✓ **L8 wake 구현** (commit e9be3424) — reality-loop, 외부 signal fp 트리거
   - `cmd_wake()` — 외부 파일 fingerprint (size + first 64 chars) 변화 감지 시에만 fire
   - swarm 과 차별: swarm 은 내부 진화, wake 는 외부 세계 결합 (reality coupling)
   - 알고리즘: cycle 마다 fp 측정, prev != cur 이면 fire (perturbed seed 로 blowup), else skip
@@ -237,6 +237,14 @@ L_ω  GHOST CEILING  omega        (도달 불가 placeholder)    ← Gödel + Ha
   - 신규 helpers: `_wake_max_cycles`, `_wake_cooldown_sec`, `_wake_default_signal_file`, `_wake_read_fp`
   - emits: NEXUS_WAKE {plan / iter / fire / skip / complete} JSON
   - 검증: missing file → 2 cycles 0 fires 2 skips (false-fire 방지 동작 확인)
+- ✓ **L9 molt 구현** (이 commit) — self-rewrite, skin parameter sweep
+  - `cmd_molt()` — 5 hardcoded skins ((depth, fast) 튜플) 순회 후 best abs 발견
+  - wake 와 차별: wake 는 외부 결합, molt 는 자기 파라미터 진화 (생물학적 「허물 벗기」 metaphor)
+  - 영속: best skin → JSON 으로 NEXUS_MOLT_SKIN_FILE (기본 /tmp/nexus_molt_skin.json) 에 기록
+  - skin set: [(1,T), (1,T), (2,T), (2,F), (3,F)] — depth × fast 직교
+  - CAP: NEXUS_MOLT_MAX (기본 5, ceiling=5)
+  - 신규 helpers: `_molt_max_cycles`, `_molt_skin_file`
+  - emits: NEXUS_MOLT {plan / iter / complete} JSON
 
 ---
 
