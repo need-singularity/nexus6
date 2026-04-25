@@ -182,6 +182,8 @@ fn cmd_help() -> void {
     println("  smash --seed \"...\" [--depth N]  blowup 9-phase 돌파 (발견)")
     println("  free --seed \"...\" [--dfs N]     compose DFS 탐색 (6-core 체인)")
     println("  absolute --seed \"...\"           Mk.VIII Δ₀-absolute 검증 ([10*]→[11*])")
+    println("  swarm --seed \"...\" [--population N] [--generations G]  L7 ecology — N×G evaluation, top-2 elite + breeding. cap=NEXUS_SWARM_MAX (기본 12)")
+    println("        emits: NEXUS_SWARM JSON (plan/gen/complete) — reign 과 차별 = 다중 에이전트 군집")
     println("  reign --seed \"...\" [--max-cycles N]    L6 autonomous — signal stagnation K=2 시 자동 STOP. cap=NEXUS_REIGN_MAX (기본 10, 최대 20)")
     println("        emits: NEXUS_REIGN JSON (plan/iter/saturation/complete) — dream 과 차별 = 자기 종료 결정")
     println("  dream --seed \"...\" [--iterations N]   L5 self-seed loop — seed_(i+1)=f(output_i). cap=NEXUS_DREAM_MAX (기본 3, 최대 10)")
@@ -4260,6 +4262,187 @@ fn cmd_reign(seed: str, max_cycles_flag: str) -> void {
     println("⊚ reign complete — cycles=" + to_string(cycles_run) + " saturated=" + (if saturated { "true" } else { "false" }))
 }
 
+// ─── swarm — L7 population orchestrator (2026-04-25) ───
+// 사다리 위치: L7 (reign 위 ecology 층). 단일 에이전트 (reign) 가 아닌 군집 N 개체가
+//   동시 진화 — perturbed population × generations × elitism. fittest survives.
+// 명명: design/abstraction_ceiling.md — 군집 동시성, 자연 선택 metaphor.
+//
+// 차별:
+//   - reign (L6) : 단일 에이전트 자율 종료
+//   - swarm (L7) : 다중 에이전트 군집, generation 별 elitism + breeding
+//
+// 알고리즘 (간이 evolutionary):
+//   gen 1: population[i] = perturb(seed, i) for i in 0..N
+//   gen g: scores = [run_blowup(p).abs for p in population]
+//          sort population by score desc
+//          elite = top N/2
+//          children = breed(elite[0], elite[1]) ... 채워서 N
+//          population = elite + children
+//
+// CAP: population × generations ≤ NEXUS_SWARM_MAX (기본 12).
+//      population [2,8], generations [1,5].
+// emits:
+//   NEXUS_SWARM {"event":"plan","population":N,"generations":G,"total_runs":N×G}
+//   NEXUS_SWARM {"event":"gen","g":i/G,"scores":[s1,s2,...],"best":max}
+//   NEXUS_SWARM {"event":"complete","best_score":N,"best_seed_idx":i}
+fn _swarm_max_runs() -> int {
+    let v = env("NEXUS_SWARM_MAX")
+    if v.len() == 0 { return 12 }
+    let mut n = 12
+    try { n = to_int(v) } catch e { n = 12 }
+    if n < 1 { return 1 }
+    return n
+}
+
+fn _swarm_perturb_seed(orig: str, idx: i64) -> str {
+    // gen 1 의 i 번째 individual 생성 — orig 에 deterministic suffix 추가.
+    let suffix = " #swarm-i=" + to_string(idx)
+    let max_main = 200 - suffix.len()
+    let mut main = orig
+    if main.len() > max_main {
+        if max_main < 1 { main = "" } else { main = main.substring(0, max_main) }
+    }
+    return main + suffix
+}
+
+fn _swarm_breed(orig: str, gen: i64, child_idx: i64, parent1_score: i64, parent2_score: i64) -> str {
+    // 두 부모 score 를 결합한 deterministic suffix.
+    let suffix = " #swarm-g=" + to_string(gen) + "-c=" + to_string(child_idx) + "-p=" + to_string(parent1_score) + "+" + to_string(parent2_score)
+    let max_main = 200 - suffix.len()
+    let mut main = orig
+    if main.len() > max_main {
+        if max_main < 1 { main = "" } else { main = main.substring(0, max_main) }
+    }
+    return main + suffix
+}
+
+fn _swarm_extract_abs(signal: str) -> int {
+    // signal = "abs=K,ex=M,ne=L" — abs 값만 추출
+    let idx = str_find(signal, "abs=")
+    if idx < 0 { return 0 }
+    let mut i = idx + 4
+    let n = signal.len()
+    let mut buf = ""
+    let mut neg = false
+    if i < n && char_code(signal, i) == 45 { neg = true; i = i + 1 }  // '-'
+    while i < n {
+        let cc = char_code(signal, i)
+        if cc >= 48 && cc <= 57 {
+            buf = buf + signal.substring(i, i + 1)
+            i = i + 1
+        } else { break }
+    }
+    if buf.len() == 0 { return 0 }
+    let mut v: i64 = 0
+    try { v = to_int(buf) } catch e { v = 0 }
+    if neg { v = 0 - v }
+    return v
+}
+
+fn cmd_swarm(seed: str, population_flag: str, generations_flag: str) -> void {
+    let _seed_t = seed.trim()
+    if _seed_t.len() == 0 {
+        eprintln("nexus swarm: --seed required")
+        return
+    }
+    let cap = _swarm_max_runs()
+    let mut pop_n: i64 = 4
+    if population_flag.len() > 0 {
+        try { pop_n = to_int(population_flag) } catch e { pop_n = 4 }
+    }
+    if pop_n < 2 { pop_n = 2 }
+    if pop_n > 8 { pop_n = 8 }
+    let mut gens: i64 = 3
+    if generations_flag.len() > 0 {
+        try { gens = to_int(generations_flag) } catch e { gens = 3 }
+    }
+    if gens < 1 { gens = 1 }
+    if gens > 5 { gens = 5 }
+    let total = pop_n * gens
+    if total > cap {
+        eprintln("NEXUS_SWARM {\"event\":\"reject\",\"reason\":\"total_runs_exceeds_cap\",\"total\":" + to_string(total) + ",\"cap\":" + to_string(cap) + "}")
+        println("nexus swarm: " + to_string(total) + " > cap " + to_string(cap) + " — population/generations 축소 또는 NEXUS_SWARM_MAX 상향")
+        return
+    }
+    println("⌬ swarm — L7 population orchestration (population=" + to_string(pop_n) + ", generations=" + to_string(gens) + ", total=" + to_string(total) + ")")
+    eprintln("NEXUS_SWARM {\"event\":\"plan\",\"population\":" + to_string(pop_n) + ",\"generations\":" + to_string(gens) + ",\"total_runs\":" + to_string(total) + ",\"cap\":" + to_string(cap) + "}")
+    let core = nexus_root() + "/cli/blowup/core/blowup.hexa"
+    // gen 1 population: perturb(seed, i) for i in 0..N
+    let mut population: [str] = []
+    let mut scores: [int] = []
+    let mut k: i64 = 0
+    while k < pop_n {
+        population = population + [_swarm_perturb_seed(_seed_t, k)]
+        scores = scores + [0]
+        k = k + 1
+    }
+    let mut best_score: i64 = 0
+    let mut best_seed: str = population[0]
+    let mut best_gen: i64 = 0
+    let mut g: i64 = 0
+    while g < gens {
+        g = g + 1
+        println("─── swarm generation " + to_string(g) + "/" + to_string(gens) + " ───")
+        // evaluate each individual
+        let mut i: i64 = 0
+        while i < pop_n {
+            let qs = shell_quote(population[i])
+            let cmd = shell_quote(hexa_bin()) + " run " + shell_quote(core) + " " + qs + " 1 --fast 2>&1"
+            let out = exec(cmd)
+            let signal = _dream_extract_signal(out)
+            let abs_v = _swarm_extract_abs(signal)
+            scores[i] = abs_v
+            if abs_v > best_score {
+                best_score = abs_v
+                best_seed = population[i]
+                best_gen = g
+            }
+            println("  individual " + to_string(i) + ": signal=" + signal + " abs=" + to_string(abs_v))
+            i = i + 1
+        }
+        // emit gen scores
+        let mut sj = ""
+        let mut sij: i64 = 0
+        while sij < pop_n {
+            if sj.len() > 0 { sj = sj + "," }
+            sj = sj + to_string(scores[sij])
+            sij = sij + 1
+        }
+        eprintln("NEXUS_SWARM {\"event\":\"gen\",\"g\":" + to_string(g) + ",\"of\":" + to_string(gens) + ",\"scores\":[" + sj + "],\"best\":" + to_string(best_score) + "}")
+        if g >= gens { continue }  // 마지막 세대는 breeding 없이 종료
+        // selection + breeding: 단순 sorting bypass (hexa array sort 미보장) — best 2 만 추출 후 자녀 재합성
+        let mut top1_idx: i64 = 0
+        let mut top1_score: i64 = scores[0]
+        let mut top2_idx: i64 = 0
+        let mut top2_score: i64 = -1
+        let mut p: i64 = 1
+        while p < pop_n {
+            if scores[p] > top1_score {
+                top2_idx = top1_idx
+                top2_score = top1_score
+                top1_idx = p
+                top1_score = scores[p]
+            } else if scores[p] > top2_score {
+                top2_idx = p
+                top2_score = scores[p]
+            }
+            p = p + 1
+        }
+        // 새 population = [top1, top2] + breed(top1, top2) × (N-2)
+        let mut new_pop: [str] = []
+        new_pop = new_pop + [population[top1_idx]]
+        new_pop = new_pop + [population[top2_idx]]
+        let mut c: i64 = 0
+        while len(new_pop) < pop_n {
+            new_pop = new_pop + [_swarm_breed(_seed_t, g + 1, c, top1_score, top2_score + c)]
+            c = c + 1
+        }
+        population = new_pop
+    }
+    eprintln("NEXUS_SWARM {\"event\":\"complete\",\"best_score\":" + to_string(best_score) + ",\"best_gen\":" + to_string(best_gen) + ",\"generations_run\":" + to_string(gens) + "}")
+    println("⌬ swarm complete — best_score=" + to_string(best_score) + " best_gen=" + to_string(best_gen) + " generations=" + to_string(gens))
+}
+
 // ─── E12 batch drill wrapper (2026-04-21) ───
 // SSOT: shared/config/drill.json .seed_batch
 // Sequential iterate — seed N 개를 순차 cmd_drill 호출. engine_daemon 미구현 시 naive 반복.
@@ -4855,6 +5038,15 @@ fn main() -> void {
     }
     if sub == "absolute" {
         cmd_absolute(find_flag(a, "--seed", ""))
+        return
+    }
+    if sub == "swarm" {
+        // L7 population — perturbed N × generations G, elitism + breeding.
+        cmd_swarm(
+            find_flag(a, "--seed", ""),
+            find_flag(a, "--population", ""),
+            find_flag(a, "--generations", "")
+        )
         return
     }
     if sub == "reign" {

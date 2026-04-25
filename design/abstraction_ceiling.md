@@ -212,7 +212,7 @@ L_ω  GHOST CEILING  omega        (도달 불가 placeholder)    ← Gödel + Ha
   - next seed = `trunc(orig, 200-len) + " #dream-iter=N <signal>"`, [30, 200] 범위 강제
   - CAP: iterations 기본 3, NEXUS_DREAM_MAX env 으로 override (안전 cap=10)
   - emits: NEXUS_DREAM {plan / iter / complete} JSON
-- ✓ **L6 reign 구현** (이 commit) — autonomous saturation-stop
+- ✓ **L6 reign 구현** (commit 4bb7063c) — autonomous saturation-stop
   - `cmd_reign()` — max_cycles 는 cap, 실제 종료는 「signal stagnation」 자동 판정
   - dream 과 차별: dream 은 fixed iter, reign 은 자기 종료 결정 (자율)
   - stagnation 판정: 최근 K (기본 2) cycle 동안 signal 동일 → saturation
@@ -221,6 +221,13 @@ L_ω  GHOST CEILING  omega        (도달 불가 placeholder)    ← Gödel + Ha
   - signal extraction: `_dream_extract_signal` 재사용
   - 신규 helper: `_reign_max_cycles`, `_reign_stagnation_k`, `_reign_signal_stagnant`
   - emits: NEXUS_REIGN {plan / iter / saturation / complete} JSON
+- ✓ **L7 swarm 구현** (이 commit) — population dynamics with elitism
+  - `cmd_swarm()` — N individuals × G generations, top-2 elite + breeding
+  - reign 과 차별: reign 단일 에이전트, swarm 다중 에이전트 군집
+  - 알고리즘: gen 1 perturb seed → gen g evaluate → top-2 by abs score → breed children
+  - CAP: population × generations ≤ NEXUS_SWARM_MAX (기본 12). population [2,8], generations [1,5] clamp
+  - 신규 helpers: `_swarm_perturb_seed`, `_swarm_breed`, `_swarm_extract_abs`, `_swarm_max_runs`
+  - emits: NEXUS_SWARM {plan / gen / complete / reject} JSON
 
 ---
 
