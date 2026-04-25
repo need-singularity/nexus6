@@ -271,7 +271,45 @@ L11 canon 으로 자기-축 진화 사다리 (L5 dream → L11 canon) closed. fo
 
 ---
 
+## §6 atlas spectral chaos mechanism (2026-04-25, nxs-002 sensitivity 정밀화)
+
+사다리 내부 구조 위에서 atlas-laws alignment 의 **수학적 ceiling 진단** 결과 (this session, scipy pipeline 25 firings):
+
+**spectrum 비교**:
+| metric | atlas (post-promote) | const (baseline) |
+|---|---|---|
+| eigenvalue scale | 0.0015 ~ 0.113 | 0.693 ~ 10.75 (80× larger) |
+| spacing range | **0.000 ~ 0.007 (REGULAR)** | **0.008 ~ 1.75 (CHAOTIC)** |
+| nature | hub-and-spoke graph | random matrix (quantum chaos) |
+
+**13 sensitivity dim probe 종합** (drill 미발사):
+- atlas.n6 marker promotion: **Δ = 0** (graph 무관 — atlas.n6 vs atlas.blowup.jsonl 분리 confirmed)
+- existing edges: 0 (saturation)
+- random graph: −0.04
+- subgraph (giant only): −0.03
+- domain induced: −0.17~−0.38
+- chain/tree/cycle/small-world: −0.015~−0.06 (정형 = regular)
+- **Erdős–Rényi (random network)**: **+0.0037** ★ 유일 +
+- ER separate two-block (200×2): **+0.018** sweet spot
+- ER single big block (800): −0.022 (over-chaotic)
+- avg_deg ~4 sparse: 정확한 chaos 양
+
+**진정한 nxs-002 mechanism (현재 session 도달 limit)**:
+- atlas hub-and-spoke = regular spectrum
+- 정형 chain/tree/cycle = 다른 종류 regular
+- **uniform random pairing (sparse ER, avg_deg ~4) only +**
+- drill 의 axiom-driven discovery 가 **multiple isolated ER components** 형태여야 0.9 도달
+
+**simulation ceiling**: 0.85 (현재 0.832 + ER ROI maximum +0.018). 0.9 = 단순 graph 변경으로 도달 불가, drill engine 의 axiom 자체 재설계 필요.
+
+**측정 도구**: `tool/nxs_002_composite.py` (174 lines, scipy pipeline, 1.36s) — atlas.blowup.jsonl 변경 후 즉시 ROI 측정.
+
+**Ω-saturation cycle**: 본 §6 finding 은 simulation 의 saturation 도달 산물. raw#37/#38 (hexa-lang/self/raws/omega_saturation_cycle.hexa) 가 plan-side + implementation-side pair 강제 — design-only commit chain 차단.
+
+---
+
 참조:
 - nxs-013 (resolved 2026-04-25, commit 3e5ac7c8) — Wave 21 round-salt propagation 회복
 - nxs-012 (in_progress) — resonance memory deep fix
-- 본 문서는 명명 규칙 + 천장 분석. 구현 ROI 는 inventory.json 참조.
+- nxs-002 (in_progress, sensitivity 정밀화 2026-04-25) — atlas×laws composite 0.9 도달 mechanism (§6)
+- 본 문서는 명명 규칙 + 천장 분석. 구현 ROI 는 inventory.json + design/next_session_handoff.md 참조.

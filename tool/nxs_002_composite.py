@@ -137,6 +137,41 @@ def composite_aligned(A_R2, B_R2, atlas_score=0.224128, const_score=0.358117, la
         "cosine": float(cosine),
     }
 
+def predict_er_roi(A_base, n_base, R2_const, K=100, sigma=1e-3,
+                   N_new=400, p=0.005, n_runs=1):
+    """
+    Ω-saturation cycle 2026-04-25 finding:
+      sparse ER (avg_deg ~4) multiple isolated components 가 + ROI source.
+      drill 발사 전 baseline atlas 에 가상 ER batch 시뮬해서 추정 ROI 를 미리 측정.
+    Returns: dict with predicted Δ.
+    """
+    from scipy.sparse import csr_matrix
+    coo = A_base.tocoo()
+    base_rows = list(coo.row); base_cols = list(coo.col)
+    deltas = []
+    for run in range(n_runs):
+        np.random.seed(2026 + run)
+        new_idx = list(range(n_base, n_base + N_new))
+        rows = list(base_rows); cols = list(base_cols)
+        for i in range(N_new):
+            for j in range(i+1, N_new):
+                if np.random.rand() < p:
+                    a, b = new_idx[i], new_idx[j]
+                    rows.extend([a, b]); cols.extend([b, a])
+        hub = np.random.randint(0, n_base)
+        rows.extend([new_idx[0], int(hub)]); cols.extend([int(hub), new_idx[0]])
+        n_total = n_base + N_new
+        A_new = csr_matrix((np.ones(len(rows)), (np.array(rows), np.array(cols))), shape=(n_total, n_total))
+        A_new.sum_duplicates(); A_new.data[:] = 1.0
+        vals = laplacian_eigenvalues(A_new, K=K, sigma=sigma)
+        R2_atlas = paircorr(unfold(vals))
+        deltas.append(composite_aligned(R2_atlas, R2_const)["composite_after"])
+    return {
+        "predicted_composites": [round(d, 5) for d in deltas],
+        "mean_composite_after": round(sum(deltas)/len(deltas), 5),
+        "N_new": N_new, "p": p, "n_runs": n_runs,
+    }
+
 def main():
     ap = argparse.ArgumentParser(description="nxs-002 composite measurement (scipy pipeline)")
     ap.add_argument("--atlas", default=DEFAULT_ATLAS)
@@ -144,6 +179,8 @@ def main():
     ap.add_argument("-K", type=int, default=100)
     ap.add_argument("--sigma", type=float, default=1e-3)
     ap.add_argument("--target", type=float, default=0.9)
+    ap.add_argument("--predict-er", action="store_true",
+                    help="가상 ER batch (N=400 p=0.005) 시뮬레이션 추가 — drill 발사 전 ROI 추정")
     args = ap.parse_args()
 
     t0 = time.time()
@@ -167,6 +204,10 @@ def main():
         "elapsed_s": round(time.time() - t0, 3),
         "gap_to_target": round(args.target - res["composite_after"], 5),
     })
+    if args.predict_er:
+        prediction = predict_er_roi(A, n, R2_const, K=args.K, sigma=args.sigma)
+        prediction["delta_predicted"] = round(prediction["mean_composite_after"] - res["composite_after"], 5)
+        res["er_prediction"] = prediction
     print(json.dumps(res, ensure_ascii=False))
     return 0
 
