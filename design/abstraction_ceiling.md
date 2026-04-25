@@ -1027,6 +1027,78 @@ raw 37/38 enforce 4-step self-correction: "raw V4 finding" → "discriminating f
 
 ---
 
+## §18 cycle 64~ — Maslov-Sneppen rewire universality class (2026-04-25, nxs-20260425-001 phase8)
+
+§14 cycle 24/32 finding (C4 Maslov-Sneppen 만 V3' breaker, std 0.012, 5 seeds 모두 < 0.9) 의 universality 검증.
+§17 (axiom combinatorial matrix, additive class) 의 dual axis: mutative class 의 systematic null-model sweep.
+
+**핵심 질문**: C4 가 왜 V3' 의 unique breaker?
+- 다른 rewire variants (double-edge swap, no-degree random) 도 같은 break 보이나?
+- 다른 random null model (configuration model, ER, BA, WS) 도 같은 break?
+- 진짜 mechanism 은?
+
+**도구**: `tool/nxs_002_rewire_mechanism.py` (5 seeds × 11 configs, eigsh K=100, sigma=1e-3, V3'/V1/sff_align/spectral_gap/n_cc/giant_frac 측정).
+
+### A. Maslov-Sneppen rewire fraction sweep (frac ∈ {0.01 .. 1.0})
+
+| frac | V3' mean | V3' std | sff_align | V1 | spectral_gap | passes 0.9 |
+|---|---|---|---|---|---|---|
+| 0.01 | **0.91758** | 0.0065 | 0.99501 | 0.80144 | 0.0048 | **5/5** |
+| 0.05 | **0.91229** | 0.0026 | 0.99586 | 0.78694 | 0.0156 | **5/5** |
+| 0.10 | 0.89743 | 0.0119 | 0.98626 | 0.76420 | 0.0337 | 2/5 (transition) |
+| 0.20 | 0.87614 | 0.0096 | 0.94502 | 0.77283 | 0.0546 | 0/5 |
+| 0.30 | 0.82486 | 0.0284 | 0.89595 | 0.71822 | 0.1128 | 0/5 |
+| 0.50 | 0.76608 | 0.0212 | 0.83595 | 0.66128 | 0.1382 | 0/5 |
+| 0.70 | 0.81025 | 0.0239 | 0.86313 | 0.73092 | 0.1330 | 0/5 |
+| 1.00 | 0.77855 | 0.0316 | 0.82924 | 0.70252 | 0.1860 | 0/5 |
+
+**Phase transition at frac ≈ 0.10**: backbone 보존 한계점. frac ≤ 0.05 모두 통과, frac ≥ 0.20 모두 fail. spectral_gap 도 0.005 → 0.18 (37×) 폭증 — backbone 깨지면서 low-eigenvalue structure 의 spread 가 변함.
+
+### B. Rewire variants at frac=0.50 (degree preservation 효과)
+
+| variant | V3' mean | V3' std | sff_align | giant_frac | spectral_gap | n_cc |
+|---|---|---|---|---|---|---|
+| Maslov-Sneppen (degree-pres) | 0.77088 | 0.0247 | 0.83951 | 0.99917 | 0.1382 | 18 |
+| nx double_edge_swap (degree-pres) | 0.75611 | 0.0169 | 0.81553 | 0.99911 | 0.1467 | ~18 |
+| random no-degree-pres | 0.79449 | 0.0335 | 0.78613 | 0.97006 | 0.1256 | ~315 |
+
+**Universality**: 3 variants 모두 V3' < 0.80 — degree preservation 여부 무관 break. 단 random no-degree 는 giant 깨짐 (97% vs 99.9%) → V1 보존 (0.81 vs 0.67) 이지만 sff_align drop (0.79 vs 0.84) 이 V3' 깸. degree-pres rewire 는 V1+sff 둘 다 깸.
+
+### C. Random graph null models (atlas 전체 교체)
+
+| null model | V3' mean | V3' std | sff_align | V1 | giant_frac | spectral_gap |
+|---|---|---|---|---|---|---|
+| Configuration (degree-seq match) | 0.79179 | 0.0067 | 0.78921 | 0.79567 | 0.99913 | 0.1229 |
+| Erdős–Rényi (avg_deg=4.97) | 0.81075 | 0.0325 | 0.82156 | 0.79453 | 0.98268 | 0.1492 |
+| Barabási–Albert (m=2) | **0.63284** | 0.0064 | **0.51632** | 0.80743 | 1.00000 | **0.51883** |
+| Watts–Strogatz (k=4, p=0.10) | 0.75151 | 0.0066 | 0.71595 | 0.80483 | 1.00000 | 0.0429 |
+
+**Configuration model = ∞-rewire limit** (degree sequence 보존). V3' = 0.79 이 MS_frac=1.0 (0.78) 와 정확히 일치 — Maslov-Sneppen 의 saturation point.
+
+**BA scale-free 가 sff_align 을 제일 강하게 깸** (0.99 → 0.52). BA hub 의 power-law degree 분포 가 spectrum 의 dominant gap 0.519 (base 0.0048 의 100×) 을 만들어 SFF 의 short-time dynamics 를 const-spectrum 와 완전히 misalign. 단 V1 (paircorr) 는 0.81 보존 — long-range correlation 은 살아있음.
+
+**WS small-world 도 V3' break** (0.75) — clustering coefficient 보존이 V3' 보존과 무관함을 입증.
+
+### Universality class verdict
+
+- **Class definition**: any rewire/null model 가 atlas 의 "structured backbone" 을 깨면 V3' breakdown.
+- **anti-hub (C1) 와 차이**: anti-hub 는 base graph 위에 ER component 추가 (additive), backbone 그대로 → §14 cycle 33 ER giant+singletons K-cut invariance → V3' 보존.
+- **rewire 는 mutative**: edges 자체를 재배치 → backbone 의 hub-and-spoke 구조 파괴 → spectrum 의 low-eigenvalue dynamics (SFF) 가 변함.
+- **paper-grade general principle**: V3' 의 robustness ≡ "graph backbone preservation". additive perturbations (anti-hub, block, cap subset) 모두 robust, mutative perturbations (rewire, configuration model) 모두 break.
+
+### Mechanism: spectral_gap 가 phase transition indicator
+
+`spectral_gap_mean` 이 frac sweep 에서 monotonic 상승 (0.005 → 0.18, 37×). frac ≈ 0.10 transition 에서 spectral gap 0.034 — base graph K=100 last eigenvalue (0.11) 와 같은 order. **rewire 가 spectral_gap > base_K_cut 으로 push 하면 V3' break** — base spectrum 의 "low-eigenvalue tail" 이 rewired spectrum 으로 dominated.
+
+### Output artifact
+
+- `state/rewire_universality_phase8.jsonl` — 5 seeds × 11 configs, full V3'/V1/sff_align/gap/giant 기록
+- `tool/nxs_002_rewire_mechanism.py` — reproducible probe (`--quick` 3 seeds 옵션)
+
+**Ω-saturation cycle 64 ~ 66**: §14 cycle 33 의 "C4 unique breaker" finding 의 universality 검증 → 답: rewire/null-model class 전체 가 break, additive class (anti-hub/block) 가 robust. paper-grade general 원칙 정립 (mutative vs additive perturbation dichotomy).
+
+---
+
 **Ω-saturation cycle**: 본 §6 finding 은 simulation 의 saturation 도달 산물. raw#37/#38 (hexa-lang/self/raws/omega_saturation_cycle.hexa) 가 plan-side + implementation-side pair 강제 — design-only commit chain 차단.
 
 ---
