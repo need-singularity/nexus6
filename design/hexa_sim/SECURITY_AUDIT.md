@@ -62,3 +62,30 @@ Five-layer defense chain validated end-to-end. R1 (cmd/bridge SHA256) catches si
 - `/tmp/baseline_strict.bak` — removed (Stage 5 end); `state/falsifier_registry.sha256` restored
 - `git status --short` post-audit identical to pre-audit (only pre-existing uncommitted files: cross_repo_dashboard.md, atlas_health_timeline.jsonl, omega_cycle_atlas_ingest.hexa, ω-cycle JSONs, m5/r4 tools — all unrelated to this audit)
 - No commits made (raw 71 — REPORT only)
+
+## 8. R5 update 2026-04-26 — hash-chained ledger + SSH signature stub
+
+**Closes**: §4 "Does NOT defend against" item 2 — *coordinated registry+baseline mutation with unsigned ledger*.
+
+**OPT-D (primary, shipped)**: hash-chained ledger via SHA256 prev_hash. Each rotation entry now includes `"prev_hash":"<sha256_of_prev_line>"` (or `"genesis"` for the first chain entry). Implemented in `.githooks/pre-commit` (lines 60–75); verified by new `tool/ledger_verify.sh` which walks the chain top-to-bottom and reports `__LEDGER_VERIFY__ <PASS|FAIL|EMPTY|PRE_R5> entries=N broken_at=<line_or_none>`. Modes: default / `--quiet` / `--json`. Back-compat: pre-R5 entries (no `prev_hash` field) are grandfathered as `PRE_R5` status.
+
+**OPT-B (stub, ready)**: SSH-key detached signature via `ssh-keygen -Y sign/verify`. `tool/registry_sign.sh {sign|verify|status}` skips with `__REGISTRY_SIGN__ SKIPPED reason=no_signing_key_configured` (rc=0, non-blocking) until user authorizes a signing key via `SIGNING_KEY=/path/to/ssh_key` env or `git config user.signingkey`. Activation steps documented in tool header.
+
+**Test results (Phase 3, 2026-04-26)**:
+| Test                                  | Expected                          | Actual                                                              | Status |
+|---------------------------------------|-----------------------------------|---------------------------------------------------------------------|--------|
+| ledger_verify on absent log           | EMPTY rc=0                        | `__LEDGER_VERIFY__ EMPTY entries=0 broken_at=none` rc=0             | PASS   |
+| Hook rotation chain (2 sequential)    | 2 entries, entry-2 prev_hash≡sha(entry-1) | entries=2, chain intact (`a5a949af…` ≡ sha256(line-1))      | PASS   |
+| Forgery detection (mid-injection)     | FAIL broken_at=line of break      | `FAIL broken_at=2`; even with line-2 patched, line-3 still FAIL'd at line 3 | PASS   |
+| SSH stub (status/sign/verify, no key) | SKIPPED rc=0 (3/3)                | all three modes → SKIPPED with reason+fix trailer, rc=0             | PASS   |
+
+**Forgery cost**: rewriting any single mid-chain entry forces rewriting *every* subsequent entry's `prev_hash` (and the entries depending on those, recursively). Trail length grows linearly with each commit-driven rotation, so attacker forgery cost = O(N) re-hash ops AND requires write access to the ledger. Without OPT-B signature this is still tampering-detectable only after-the-fact (forensic), but ledger rewrite is no longer a single-line edit.
+
+**Confidence elevation**: §5 "high — single-vector / multi-vector with ledger trace" → **HIGH (multi-vector preventive on R1+R3, multi-vector forensic on coordinated mutation; OPT-B activation upgrades to preventive when SSH signing key is provisioned)**. The remaining hard-gap is "attacker has write to {falsifiers.jsonl, baseline.sha256, rotation_log.jsonl} AND can recompute the entire chain" — defeats the chain but a fresh `ledger_verify` against a remote-mirrored or signed snapshot detects the rewrite.
+
+**Files shipped**:
+- `.githooks/pre-commit` (modified — added 11 lines for prev_hash computation + emission)
+- `tool/ledger_verify.sh` (new, ~140 lines incl. python walker, 3 output modes)
+- `tool/registry_sign.sh` (new, ~140 lines, sign/verify/status modes, skip-by-default)
+
+**Witness**: `design/hexa_sim/2026-04-26_R5_detached_signature_omega_cycle.json`
