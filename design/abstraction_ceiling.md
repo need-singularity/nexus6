@@ -426,7 +426,17 @@ L11 canon 으로 자기-축 진화 사다리 (L5 dream → L11 canon) closed. fo
   - ⚠ `drill_zero_yield` — probe preset 이 0 absorption (harness chain blocker, 별개 issue). round 2/3 timeout 검증 미완.
 - cycle 8 진단 emit 보강: main 의 `--anti-hub` 분기에 sanity check — `setenv` 직후 `env()` 재호출. `NEXUS_DRILL_SETENV_BUG` (intended != actual) 또는 `NEXUS_DRILL_SETENV_OK` emit. 다음 발사에서 hexa setenv 의 두 가능성 분리: (a) internal map only → BUG (b) libc setenv OK + child fork inherit 문제.
 
-**Ω-saturation cycle 6 → 7 → 8**: cycle 6 = §8 omega 한계 진단 + Phase 1 history hook. cycle 7 = Phase 2 adaptive helper + backfill. cycle 8 = Phase 3 1차 시도 (env propagation 가설 확정 + drill_zero_yield blocker 발견 + setenv sanity emit 보강). 누적 8 cycle fixpoint chain.
+**Ω-saturation cycle 9 (2026-04-25, env propagation 가설 기각 — 진단 갱신)**:
+- cycle 8 의 drill 명령에 `--anti-hub` flag 빠져 setenv 미실행 → env_active="" 가 자연스러운 결과 (가설 입증 아님). cycle 9 = `--anti-hub` 추가 발사로 진정 검증.
+- 결과:
+  - ✅ `NEXUS_DRILL_SETENV_OK {ANTI_HUB:"1", THRESHOLD:""}` — main process env 정상 set (hexa setenv = libc setenv 정상 호출)
+  - ✅ `NEXUS_DRILL_ANTI_HUB_TRACE {cmd_drill_entry:true, env_active:"1", env_threshold:""}` — **cmd_drill 안에서도 env 정상 inherit**
+  - ⚠ `drill_zero_yield` (smash 6ms, 0 absorption) — Mac local fallback (모든 host PSI>70% preflight reject) 시 harness chain 미작동
+- **결론**: env propagation **정상 확정**. cycle 5/8 가설 기각.
+- **갱신 가설**: cycle 6 drill 의 atlas 0 변경 원인은 별개 — (a) `blowup.hexa _ah_init` 미발동 (cycle 4 코드 sync lag) 또는 (b) drill 모듈이 `graph_append_edge` 미경유 (다른 generation entry).
+- **다음 진단**: hetzner PSI 정상화 대기 → drill `--anti-hub` 재발사 → stderr 에 `anti_hub: active threshold=1000 hubs=8` init log 확인. 보이면 (b), 안 보이면 (a).
+
+**Ω-saturation cycle 6 → 7 → 8 → 9**: cycle 6 = §8 omega 한계 진단 + Phase 1 history hook. cycle 7 = Phase 2 adaptive helper + backfill. cycle 8 = Phase 3 1차 시도 + setenv sanity emit (가설 미검증). cycle 9 = sanity emit 검증 (env 정상 확정, 가설 기각, blowup.hexa 측 미발동 가설로 갱신). 누적 9 cycle fixpoint chain.
 
 ---
 
