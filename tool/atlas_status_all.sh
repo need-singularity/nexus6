@@ -108,6 +108,47 @@ COLLISION_DUP=$(echo "$COLLISION_OUT" | grep -oE "dup=[0-9]+" | head -1 | cut -d
 COLLISION_CONF=$(echo "$COLLISION_OUT" | grep -oE "conflict=[0-9]+" | head -1 | cut -d= -f2)
 [ -z "$COLLISION_CONF" ] && COLLISION_CONF=0
 
+# ─── 7. defense system (R1 cmd_sha256 + bridge_sha256 + R3-full hook + R4 rotation) ───
+echo ""
+echo "▶ 7. defense system (R1/R3/R4 — Ω-cycle 2026-04-26)"
+DEF_FAL_SHA="missing"
+if [ -f "$NEXUS_ROOT/state/falsifier_registry.sha256" ]; then
+    DEF_FAL_SHA=$(cut -c1-12 "$NEXUS_ROOT/state/falsifier_registry.sha256" 2>/dev/null | head -1)
+    [ -z "$DEF_FAL_SHA" ] && DEF_FAL_SHA="empty"
+fi
+DEF_BRIDGE_COUNT=0; DEF_BRIDGE_OLDEST=""
+if [ -f "$NEXUS_ROOT/state/bridge_sha256.tsv" ]; then
+    DEF_BRIDGE_COUNT=$(grep -cvE '^(#|$)' "$NEXUS_ROOT/state/bridge_sha256.tsv" 2>/dev/null || echo 0)
+    DEF_BRIDGE_OLDEST=$(grep -vE '^(#|$)' "$NEXUS_ROOT/state/bridge_sha256.tsv" 2>/dev/null | awk -F'\t' '{print $4}' | sort | head -1)
+    [ -z "$DEF_BRIDGE_OLDEST" ] && DEF_BRIDGE_OLDEST="-"
+fi
+DEF_R3_HOOK="no"
+if [ -f "$NEXUS_ROOT/.githooks/pre-commit" ] && grep -q "R3 full\|R3-full\|r3_full" "$NEXUS_ROOT/.githooks/pre-commit" 2>/dev/null; then
+    DEF_R3_HOOK="yes"
+fi
+DEF_R4_ROT=0
+if [ -f "$NEXUS_ROOT/state/falsifier_registry_rotation_log.jsonl" ]; then
+    DEF_R4_ROT=$(wc -l < "$NEXUS_ROOT/state/falsifier_registry_rotation_log.jsonl" | tr -d ' ')
+fi
+echo "  R1 falsifier baseline sha:  $DEF_FAL_SHA"
+echo "  R1 bridge sha entries:      $DEF_BRIDGE_COUNT (oldest=$DEF_BRIDGE_OLDEST)"
+echo "  R3-full pre-commit hook:    $DEF_R3_HOOK"
+echo "  R4 rotation log entries:    $DEF_R4_ROT"
+
+# ─── 8. timeline status (atlas_health_timeline rotation watch) ───
+echo ""
+echo "▶ 8. timeline status (atlas_health_timeline.jsonl)"
+TL_LINES=0; TL_LAST_ROT="-"
+if [ -f "$NEXUS_ROOT/state/atlas_health_timeline.jsonl" ]; then
+    TL_LINES=$(wc -l < "$NEXUS_ROOT/state/atlas_health_timeline.jsonl" | tr -d ' ')
+fi
+if [ -f "$NEXUS_ROOT/state/atlas_health_timeline.rotation.log" ]; then
+    TL_LAST_ROT=$(tail -1 "$NEXUS_ROOT/state/atlas_health_timeline.rotation.log" 2>/dev/null | sed -nE 's/.*"ts":"([^"]+)".*/\1/p')
+    [ -z "$TL_LAST_ROT" ] && TL_LAST_ROT="-"
+fi
+echo "  timeline lines:             $TL_LINES"
+echo "  last rotation ts:           $TL_LAST_ROT"
+
 # ─── aggregate sentinel ──────────────────────────────────────
 echo ""
 echo "═════════════════════════════════════════════════════════════"
@@ -120,10 +161,12 @@ printf "  4-repo cum facts:  %s\n" "$DASHBOARD_FACTS"
 printf "  recent commits:    %s atlas-touching, +%s additions\n" "$DIFF_COMMITS" "$DIFF_ADD"
 printf "  staged atlas:      %s entries pending\n" "$PRECOMMIT_STAGED"
 printf "  cross-shard:       %s HARMLESS_DUP, %s CONFLICT\n" "$COLLISION_DUP" "$COLLISION_CONF"
+printf "  defense R1/R3/R4:  fal_sha=%s bridge=%s r3_hook=%s rotations=%s\n" "$DEF_FAL_SHA" "$DEF_BRIDGE_COUNT" "$DEF_R3_HOOK" "$DEF_R4_ROT"
+printf "  timeline:          %s lines (last_rot=%s)\n" "$TL_LINES" "$TL_LAST_ROT"
 echo "═════════════════════════════════════════════════════════════"
 
 EXIT_CODE=0
 [ "$RUNTIME_HEALTHY" = "0" ] && EXIT_CODE=2
 [ "$COLLISION_CONF" -gt 0 ] && EXIT_CODE=2
-echo "__ATLAS_STATUS_ALL__ runtime=$RUNTIME_STATUS dashboard_h=$DASHBOARD_HONESTY facts=$STATS_TOTAL shards=$STATS_SHARDS staged_atlas=$PRECOMMIT_STAGED collision_dup=$COLLISION_DUP collision_conflict=$COLLISION_CONF"
+echo "__ATLAS_STATUS_ALL__ runtime=$RUNTIME_STATUS dashboard_h=$DASHBOARD_HONESTY facts=$STATS_TOTAL shards=$STATS_SHARDS staged_atlas=$PRECOMMIT_STAGED collision_dup=$COLLISION_DUP collision_conflict=$COLLISION_CONF defense_r1_falsifier=$DEF_FAL_SHA defense_r1_bridge=$DEF_BRIDGE_COUNT defense_r3_full=$DEF_R3_HOOK defense_r4_rotations=$DEF_R4_ROT timeline_lines=$TL_LINES timeline_last_rot=$TL_LAST_ROT"
 exit $EXIT_CODE
