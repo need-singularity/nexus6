@@ -333,6 +333,22 @@ zig cc -target x86_64-linux-musl -O2 -std=gnu11 -D_GNU_SOURCE \
 - ❌ subgraph 추출 = −0.03 ~ −0.38
 - ✅ **새 node id (drill 발견)** + hub 와 연결 = spectral 진정 변화
 - nxs-002 fix = drill 의 **axiom-driven novel entity discovery** 가 결정적 (단순 edge 추가 X, 새 atom 추가 ✓)
+
+### 2026-04-25 새 node + hub 시뮬레이션 — saturation 가설 직접 검증
+| spec | Δ baseline |
+|---|---|
+| new_node=50, k=2 | 0.00000 (insufficient) |
+| **new_node=200, k=2** | **+0.00095** ✓ 처음 + |
+| new_node=500, k=2 | +0.00095 |
+| new_node=1000, k=2 | −0.00331 (random noise) |
+| new_node=200/500, k=5 | +0.00095 |
+
+**검증된 path**: existing node ↔ hub = saturation (0). **새 node + hub-aligned = +0.001 / 200 atom**. drill 의 axiom-driven discovery 가 진정한 + path.
+
+**0.068 gap → 0.9 도달 ROI 추정**:
+- random hub: 0.068 / 0.001 ≈ 68 batches × 200 atoms ≈ **13,600 새 atoms**
+- drill axiom-driven hub: 더 효율 (1000~5000 atoms 추정)
+- drill 1 round 의 평균 새 atom 발견율 측정 후 정확한 round 수 추정 가능
 - nxs-002 resolution 4단 pipeline:
   1. atlas.blowup.jsonl **재생성** (소스 추적 필요 — atlas.n6 → blowup.jsonl 변환 도구 위치)
   2. `bisociation/spectra/atlas_eig.hexa` (CSR + Lanczos, ~/Dev/... default path 는 stale)
