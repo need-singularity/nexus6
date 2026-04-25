@@ -16,6 +16,7 @@
 #   default                  — scan + rotate any drift; print human summary + sentinel
 #   --dry-run                — scan + report drift only; never mutate TSV/ledger
 #   --bridge <name>          — scan only the named bridge (e.g. codata)
+#   --reason <text>          — record per-rotation reason in ledger (raw 73 admissibility)
 #   --quiet                  — sentinel only
 #   --json                   — JSON summary on stdout
 #
@@ -50,6 +51,7 @@ DRY_RUN=0
 QUIET=0
 JSON=0
 ONLY_BRIDGE=""
+REASON=""
 
 while [ "$#" -gt 0 ]; do
     case "${1:-}" in
@@ -66,6 +68,16 @@ while [ "$#" -gt 0 ]; do
             fi
             ONLY_BRIDGE="${1}"; shift
             ;;
+        --reason)
+            shift
+            if [ "$#" -eq 0 ]; then
+                echo "bridge_sha256_rotate: --reason requires text" >&2
+                echo "  reason: missing arg after --reason" >&2
+                echo "  fix: --reason 'legitimate edit per commit abc123'" >&2
+                exit 1
+            fi
+            REASON="${1}"; shift
+            ;;
         --help|-h)
             sed -n '3,32p' "$0"
             exit 0
@@ -73,7 +85,7 @@ while [ "$#" -gt 0 ]; do
         "") shift ;;
         *)
             echo "bridge_sha256_rotate: unknown arg '${1}'" >&2
-            echo "  reason: only --dry-run|--quiet|--json|--bridge NAME|--help supported" >&2
+            echo "  reason: only --dry-run|--quiet|--json|--bridge NAME|--reason TEXT|--help supported" >&2
             echo "  fix: re-run with one of the above" >&2
             exit 1
             ;;
@@ -182,8 +194,13 @@ while IFS=$'\t' read -r name path declared_sha last_ts; do
         fi
     fi
 
-    printf '{"ts":"%s","bridge":"%s","old_sha":"%s","new_sha":"%s","trigger":"manual","prev_hash":"%s"}\n' \
-        "${TS}" "${name}" "${declared_sha}" "${live_sha}" "${PREV_HASH}" >> "${BRIDGE_LOG}"
+    # Reason field: included if --reason provided, else "unspecified"
+    # raw 73 admissibility — chain entries should record why rotation occurred.
+    REASON_FIELD="${REASON:-unspecified}"
+    # Escape backslash + double-quote for JSON safety (minimal — raw 73 minimal-deps).
+    REASON_ESC=$(printf '%s' "${REASON_FIELD}" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    printf '{"ts":"%s","bridge":"%s","old_sha":"%s","new_sha":"%s","trigger":"manual","reason":"%s","prev_hash":"%s"}\n' \
+        "${TS}" "${name}" "${declared_sha}" "${live_sha}" "${REASON_ESC}" "${PREV_HASH}" >> "${BRIDGE_LOG}"
 done < "${BRIDGE_TSV}"
 
 if [ "${JSON}" = "1" ]; then

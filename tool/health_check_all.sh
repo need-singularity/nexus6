@@ -41,7 +41,14 @@ case "${1:-}" in
 esac
 
 # Run each subcheck quietly (it appends its own timeline + emits its own sentinel).
-F_OUT=$(bash "$TOOL_DIR/falsifier_health.sh" --quiet 2>&1); F_EC=$?
+# FALSIFIER_HEALTH_TOOL env (default = parallel; set to falsifier_health.sh for legacy
+# sequential fallback) — Ω-cycle 2026-04-26 falsifier_health_parallelize.
+FALSIFIER_HEALTH_TOOL="${FALSIFIER_HEALTH_TOOL:-falsifier_health_parallel.sh}"
+if [ ! -f "$TOOL_DIR/$FALSIFIER_HEALTH_TOOL" ]; then
+    # Safety: fall back to sequential if requested tool missing
+    FALSIFIER_HEALTH_TOOL="falsifier_health.sh"
+fi
+F_OUT=$(bash "$TOOL_DIR/$FALSIFIER_HEALTH_TOOL" --quiet 2>&1); F_EC=$?
 F_LINE=$(printf '%s\n' "$F_OUT" | grep '__FALSIFIER_HEALTH__' | tail -1)
 F_TOTAL=$(printf '%s' "$F_LINE" | sed -nE 's/.*total=([0-9]+).*/\1/p'); F_TOTAL=${F_TOTAL:-0}
 F_CLEAN=$(printf '%s' "$F_LINE" | sed -nE 's/.*clean=([0-9]+).*/\1/p'); F_CLEAN=${F_CLEAN:-0}
