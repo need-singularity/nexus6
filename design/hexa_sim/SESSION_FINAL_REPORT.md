@@ -4,17 +4,19 @@
 
 ---
 
-## Topline 수치
+## Topline 수치 (final, 2026-04-26 00:50 closure)
 
-- **81 atomic commits** (hexa-sim cycle 한정, 2026-04-25 16:00 ~ 2026-04-26 00:15)
+- **~90 atomic commits** (hexa-sim cycle 한정, 2026-04-25 16:00 ~ 2026-04-26 00:50)
 - **16 bridge tools** (Tier-1 5 + Tier-2 11, 외부 API binding 100%)
-- **16 atlas tools** (4 core hexa + 4 atlas-ingest hexa + 8 bash + 1 meta)
-- **12 falsifier registry entries** (F1-F12, 모두 CLEAN)
-- **12 ω-cycle witnesses** (각각 axes ideation + Tier 분류 + fixpoint)
+- **20 atlas tools** (8 hexa-based + 12 bash + 1 meta-aggregator)
+- **12 falsifier registry entries** (F1-F12, 모두 CLEAN; F13-F17 candidates spawned)
+- **12 ω-cycle witnesses** (각 axes ideation + Tier 분류 + fixpoint)
 - **309 historical facts** absorbed (4-repo cross: anima 75 + nexus 95 + hexa-lang 88 + n6-arch 51)
-- **Honesty 3/4 REPO_INVARIANT** (nexus 5/5 + n6 5/5 + anima 5/5 + hexa-lang 4/5)
-- **18 nexus CLI subcommands** under `nexus hexa-sim`
+- **Honesty 3/4 REPO_INVARIANT** (nexus 5/5 + n6 5/5 + anima 5/5 + hexa-lang 4/5 architectural)
+- **22 nexus CLI subcommands** under `nexus hexa-sim`
 - **65,450 cumulative atlas lines / 28,848 cumulative facts** (4-repo 합)
+- **improvement_ideas Tier-1 5/5 + Tier-2 9/9 = 14/14 100% close**
+- **atlas DSL v2 backward-compat 7/7 layers PASS** (i16 catch + serializer fix)
 
 ---
 
