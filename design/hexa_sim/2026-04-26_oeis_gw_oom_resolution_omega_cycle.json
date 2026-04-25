@@ -1,0 +1,101 @@
+{
+  "schema": "omega_cycle.witness.v1",
+  "ts": "2026-04-26",
+  "title": "oeis_live + gw_observatory bridge OOM resolution via shell-side payload trim",
+  "trigger": {
+    "kind": "remaining_blocker_carried_forward",
+    "source": "design/hexa_sim/2026-04-26_dockerfile_curl_patch_omega_cycle.json#remaining_blockers.oom_during_json_parse",
+    "summary": "after dockerfile curl patch landed 14/16 bridges PASS, oeis (rc=137 SIGKILL) and gw (timeout/OOM) remained as the 2 holdouts; both blocked by 4GB cgroup OOM during interp text-walk on multi-MB payloads"
+  },
+  "axes": {
+    "diagnose": {
+      "payload_sizes_measured": {
+        "oeis_A000396": "1.8KB (fine in isolation)",
+        "oeis_A000203_sigma": "1.21MB (~120K lines)",
+        "oeis_A000005_tau": "828KB (~80K lines)",
+        "oeis_A000010_phi": "1.17MB (~115K lines)",
+        "gw_allevents_jsonfull": "2.74MB (368 events × ~7.3KB strain[] payload each)"
+      },
+      "parser_hot_path": {
+        "oeis": "parse_b_file does text.split(\"\\n\") then per-line raw.substring/raw.index_of in a while loop; on 1.2MB / 120K lines the interp string allocator pressure spikes well past the 4GB cgroup cap (oom_kill=4 in /sys/fs/cgroup/memory.events)",
+        "gw": "extract_event_keys + _find_event_anchor + _extract_field_after each do per-byte text.substring(j, j+1) walks across the full 2.74MB string; for 368 events × 5 fields × 60K-char span scan = O(10^8) substring allocs, blowing the 4GB cap"
+      },
+      "container_cap_reaffirmed": "cpus=4 / mem=4g / memory-swap=4g per project_mac_hard_landing_policy 2026-04-25 — NOT changed (canonical Linux equivalent of darwin no-cgroup state)",
+      "root_cause_one_liner": "interp's per-byte string scanning via .substring(j, j+1) is quadratic-ish in total bytes allocated; 1MB+ inputs blow the 4GB cap"
+    },
+    "fix_chosen": {
+      "option": "OPT-A — shell-side payload trim BEFORE bytes reach interp",
+      "rejected_options": {
+        "OPT-B_streaming_parser": "would require interp string-stream API not present; large refactor outside raw 73 admissibility (surgical-only)",
+        "OPT-C_hardcoded_fallback": "would lose live-fetch semantics; bridges would silently degrade to static data when upstream changes (raw 71 risk: bridge claim drift unnoticed). reserved for true network failure path."
+      },
+      "rationale": "shell pipe runs in the same docker container, completes in <1s, and reduces oeis 1.2MB→~2KB (head -n 100, only first 6 anchor terms needed) and gw 2.74MB→~60KB (grep -E '\"commonName\"|\"GPS\":|\"mass_1_source\"|\"mass_2_source\"|\"luminosity_distance\"', strips strain[] which is 95%+ of bytes). live semantics PRESERVED — real OEIS / GWOSC servers, real bytes, just bounded."
+    },
+    "patch": {
+      "files_modified": [
+        "tool/oeis_live_bridge.hexa",
+        "tool/gw_observatory_bridge.hexa"
+      ],
+      "oeis_diff_summary": {
+        "fetch_b_file": "added ' | head -n 100' to curl pipeline — caps selftest fetch at first 100 lines (~2KB regardless of upstream size)",
+        "fetch_sequence_full": "new function for --seq mode — uses 'head -c 200000' (200KB cap, ~13K terms — safe upper bound for any practical use)",
+        "run_single_callsite": "switched from fetch_sequence to fetch_sequence_full for --seq mode",
+        "comment_block": "+13 lines explaining ω-cycle, OOM signature, fix choice; reason+fix trailer (raw 66 ai-native-error)",
+        "lines_changed": "+27 -3"
+      },
+      "gw_diff_summary": {
+        "fetch_catalog": "added ' | grep -E ...' filter to curl pipeline — keeps only commonName/GPS/mass_1_source/mass_2_source/luminosity_distance lines, drops strain[] tuples (97% of bytes)",
+        "comment_block": "+15 lines explaining ω-cycle, OOM signature, parser tolerance to brace-less filtered text; reason+fix trailer (raw 66)",
+        "lines_changed": "+18 -3"
+      },
+      "raw_73_admissibility": "PASS — only added 1 grep stage to gw curl, 1 head stage to oeis curl, 1 helper fn, 1 callsite swap; no parser logic modified, no JSON parser written, no interp change",
+      "raw_66_ai_native_error": "PASS — both fetch fn comment blocks include explicit reason+fix trailer (cgroup OOM signature + shell-trim fix)"
+    },
+    "verify": {
+      "before": {
+        "oeis_live": "FAIL rc=137 (SIGKILL OOM during parse_b_file on 1.2MB sigma sequence)",
+        "gw_observatory": "FAIL timeout or OOM (no stdout produced before 90s wall, container oom_kill counter increments)"
+      },
+      "after": {
+        "oeis_live": "PASS — sentinel: __OEIS_LIVE_BRIDGE__ PASS A000396_first=6 sigma6=12 tau6=4 phi6=2 axis_oeis_consistent=true (cross-check vs hexa_sim_verify_grid axis_oeis static table OK)",
+        "gw_observatory": "PASS — sentinel: __GW_BRIDGE__ PASS events_total=263 latest_event=GW250114_082203 first_event=GW150914 (anchor present, count above >=90 threshold)"
+      },
+      "full_bridge_health": {
+        "scope": "all 16 bridges sequentially via gtimeout 90 hexa run tool/<X>_bridge.hexa --selftest",
+        "wall_time_s": 47,
+        "pass": 16,
+        "fail": 0,
+        "delta_vs_dockerfile_cycle": "+2 (oeis + gw), 14 → 16",
+        "delta_vs_pre_dockerfile_cycle": "+7 (curl patch + oom fix combined), 9 → 16"
+      },
+      "data_quirk_noted": "GW150914's first catalog entry (O1_O2-Preliminary v1) lacks mass_1_source/mass_2_source/luminosity_distance fields entirely — they are not present in upstream JSON. brief shows 'm1=null m2=null d_L=null'. NOT a fix-induced regression; same data quirk would have appeared in original 2.7MB parse path. event count + anchor presence (selftest's actual gates) both pass."
+    }
+  },
+  "before_after": {
+    "scope": "bridge_registry",
+    "before_pass": 14,
+    "before_fail": 2,
+    "after_pass": 16,
+    "after_fail": 0,
+    "duration_ms_after": 47000,
+    "duration_ms_before": 22000,
+    "duration_delta_explanation": "47s vs 22s — slower because oeis + gw now actually run end-to-end (previously they died fast; now they fetch + trim + parse + emit). sustainable for ω-cycle cadence."
+  },
+  "tier_1": [
+    "oeis_live_bridge OOM resolved — head -n 100 cap on b-file fetch, full live semantics preserved, all 4 OEIS sequences cross-check against axis_oeis static table",
+    "gw_observatory_bridge OOM resolved — grep -E 5-field filter strips 97% of jsonfull payload, 263 events parsed, GW150914 anchor present, n=6 SE(3) DOF binding intact",
+    "bridge health: 14/16 PASS → 16/16 PASS (100%); zero remaining live-fetch blockers in registry"
+  ],
+  "tier_2": [
+    "atlas_health_timeline.jsonl appended with new entry (16/16 PASS, fix attribution)",
+    "shell-side trim is now a reusable pattern for any future bridge whose upstream payload exceeds ~500KB — document in next-cycle review of bridge-tool authoring guide",
+    "underlying interp text.substring O(n) hot path remains — flagged but out-of-scope for this surgical cycle (would require interp string-slice optimization or bytestring API)"
+  ],
+  "raw_admissibility": {
+    "raw_73_minimum_add": "PASS — 2 shell pipeline stages added, 1 helper fn, 1 callsite swap; zero parser logic change, zero interp change, zero container cap change",
+    "raw_66_ai_native_error": "PASS — fetch fn comment blocks document reason (4GB cgroup OOM signature) + fix (shell-side trim) trailer; consumer error messages unchanged",
+    "raw_71_no_premature_retire": "PASS — bridge claims (OEIS perfect-number anchor, GW150914 anchor) UNCHANGED; live fetch path UNCHANGED in semantics, just bounded in size; if upstream data ever moves we'll see real fetch-empty failures, not silent fallback masking",
+    "project_mac_hard_landing_policy": "PASS — container cpus=4/mem=4g cap UNCHANGED; problem solved at the bridge layer, not by raising the cap"
+  },
+  "fixpoint_marker": "OK"
+}
