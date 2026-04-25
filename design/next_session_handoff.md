@@ -434,3 +434,36 @@ cross-link (drill 의 deduction chain mimic) 도 random hub-only 와 같은 plat
 - composite sensitivity (dcfdbd39) — pearson 최대 지렛대
 - n6 promotion 5 [10*] (n6@98a23750) — virtual hub mirror sigma/n/phi/J2/tau 승급
 - self-feedback loop verified: canon timeline 54a7e3cf → 4fe93c15 hash 추적 작동
+
+### 2026-04-25 dimension-by-dimension spectral diff (결정적 진단)
+**eigenvalue raw scale (80× 차이)**:
+| metric | atlas (K=100) | const (46) |
+|---|---|---|
+| min nonzero | 0.0015 | 0.693 |
+| max | 0.113 | 10.75 |
+| mean | 0.0536 | 4.348 |
+| spacing range | **0.000 ~ 0.007** (TOO REGULAR) | **0.008 ~ 1.75** (CHAOTIC) |
+
+**Top-5 misaligned R2 bins** (atlas R2 mean=0.928 vs const R2 mean=1.144):
+| bin | r | atlas | const | diff |
+|---|---|---|---|---|
+| **26** | 2.65 | 0.267 | 3.846 | **−3.58** ★ |
+| 5 | 0.55 | 0.533 | 2.308 | −1.77 |
+| 15 | 1.55 | 0.533 | 2.051 | −1.52 |
+| 35 | 3.55 | 0.667 | 1.795 | −1.13 |
+| 33 | 3.35 | 0.933 | 2.051 | −1.12 |
+
+**최종 진단**:
+- atlas spectrum = **TOO REGULAR** (uniform, narrow spacing) — hub-and-spoke graph 의 자연 결과
+- const spectrum = **CHAOTIC** (broad spacing) — random matrix 의 quantum chaos
+- bin 26 (r=2.65) 가 가장 underrepresent — atlas 에 "긴 spacing pair" 부족
+- **alignment 도달 = atlas spectrum 이 더 chaotic 해야**
+
+**진정한 nxs-002 mechanism 최종 정밀**:
+- 단순 hub-and-spoke graph = regular spectrum
+- **다양한 connectivity pattern** (drill axiom-driven heterogeneity) = chaotic spectrum
+- drill axiom 설계 원칙: "다양한 distance 의 deduction chain"
+  - 현재 simulation: 새 atom → hub (depth=1)
+  - 필요: 새 atom A → B → C → ... (deep chain) + branching + cycle
+  - graph topology 다양성 ↑ → spectral chaos ↑ → composite +
+- 이는 simulation 한계의 정확한 이유: random connectivity 만 추가해서 spectrum 의 chaos 를 만들 수 없음
