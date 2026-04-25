@@ -379,7 +379,32 @@ L11 canon 으로 자기-축 진화 사다리 (L5 dream → L11 canon) closed. fo
 - emit 보임 + env_active="" → setenv 가 child 로 forward 안 됨, hexa_remote env 정책 변경 필요
 - emit 안 보임 → main 우회 또는 cmd_drill 호출 안 됨
 
-**Ω-saturation cycle 3 → 4 → 5**: cycle 3 = axiom 발견 + probe. cycle 4 = engine 구현 + flag wiring. cycle 5 = Phase 3 1차 검증 (negative) + 진단 emit. raw#37/#38 enforce 가 매 cycle 마다 design+impl 동시 적용 강제 — 누적 5 cycle 째 fixpoint chain.
+**Phase 3 cycle 6 재발사 (2026-04-25, partial)**:
+- `NEXUS_DRILL_ANTI_HUB` JSON emit **확정 보임** → main dispatch + `--anti-hub` flag 분기 정상.
+- `NEXUS_DRILL_ANTI_HUB_TRACE` (cycle 5 추가, cmd_drill 진입) **안 보임** → remote container 의 `cli/run.hexa` 가 cycle 5 commit `e70ae889` 미반영 가능성 (push 됐지만 remote rsync 미발생).
+- **부수 발견**: smash elapsed 183010 ms — wrapper 180s hard-cap 직전 통과. round 2 였다면 SIGTERM 확정. → §8 omega 한계 cycle 의 직접 증거.
+
+**Ω-saturation cycle 3 → 4 → 5 → 6**: cycle 3 = axiom 발견 + probe. cycle 4 = engine 구현 + flag wiring. cycle 5 = Phase 3 1차 검증 (negative) + 진단 emit. cycle 6 = Phase 3 재발사 (partial — main 정상, remote sync 가설). raw#37/#38 enforce 가 매 cycle 마다 design+impl 동시 적용 강제 — 누적 6 cycle 째 fixpoint chain.
+
+---
+
+## §8 omega 한계 — `_stage_timeout_prefix` 180s hard-cap 진단 (2026-04-25, nxs-20260425-002)
+
+**증거**:
+- Agent B omega run #3 round 2: smash event=start → Terminated rc=143 SIGTERM (hetzner). round 1 elapsed 386~486s, round 1 score 1036.
+- §7 cycle 6 anti-hub drill: smash elapsed 183010 ms — 180s 한계 1.67% 여유로 통과. round 2 였다면 SIGTERM 확정.
+- root: `cli/run.hexa:398-405` `_stage_timeout_prefix()` 가 모든 stage 에 **180s hard-cap** (Wave 18 fix 잔재). `drill.json stages.{name}.timeout_sec` (45/60/30) 는 superseded.
+
+**한계 mechanism**: round 1 fresh seed → smash 183~486s 통과. round 2 fresh seed (anti-replay LRU 우회) → cumulative state (graph append, atlas grow) 누적으로 같은 stage 더 오래 걸림 → 180s timeout 초과 → SIGTERM. Wave 18 의 30s→180s 일괄 상향은 round 1 만 통과시키고 round 2+ 는 같은 한계.
+
+**saturation phase 후보 axiom 5종** (next cycle 측정):
+- C1 fixed-up: hard-cap 180s → 600s (+233%)
+- C2 adaptive linear: round (i+1) timeout = max(180, round_i_elapsed × 1.5)
+- C3 adaptive exp: timeout = base × 1.3^round
+- C4 stage-specific from history: `state/drill_stage_elapsed_history.jsonl` p95 × 2
+- C5 hard-cap 1800s (drill.json `overall_drill_budget`) — round 늘어나도 budget 내
+
+**impl phase**: Phase 1 = history recording → Phase 2 = adaptive `_stage_timeout_prefix` (env `NEXUS_DRILL_TIMEOUT_ADAPTIVE=1`) → Phase 3 = Agent B omega run #4 검증 → Phase 4 = optimal default + drill.json schema v2.
 
 ---
 
