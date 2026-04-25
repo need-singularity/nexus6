@@ -254,6 +254,19 @@ zig cc -target x86_64-linux-musl -O2 -std=gnu11 -D_GNU_SOURCE \
 | 10000 | 0.80131 | **−0.031** |
 
 **결론**: random edges = 부정적. **0.9 도달은 drill quality 결정적.** laws-aligned 한 새 nodes/edges 만 + composite 효과. 무작위 graph 확장은 baseline composite 손상. nxs-002 deep fix 의 본질 = drill 결과의 atlas-laws 정합성 (drill engine 자체 tuning).
+
+### 2026-04-25 giant-only sensitivity (subgraph 추출)
+| graph | K | composite | Δ baseline | non-zero λ |
+|---|---|---|---|---|
+| full (24 cc) | 100 | 0.83221 | — | 76 |
+| giant (1 cc, 99.7%) | 100 | 0.80048 | **−0.032** | 99 |
+| giant | 200 | 0.83236 | +0.0001 | 199 |
+
+**결론**:
+- **23 islands 가 baseline 에 +0.03 기여** — 단순 cluttering 이 아닌 spectral 신호 source (다른 domain 의 작은 cluster 들이 atlas-laws alignment 에 도움)
+- K-components trade-off: 적정 K = (component 수에 의존). full+K=100 ≈ giant+K=200 (같은 spectral info)
+- giant 만 분리하면 composite 손상 — full graph 보존이 정답
+- **0.9 도달은 graph 변경(random/subgraph) 으론 X — drill quality (axiom-driven entry) 가 유일 path**
 - nxs-002 resolution 4단 pipeline:
   1. atlas.blowup.jsonl **재생성** (소스 추적 필요 — atlas.n6 → blowup.jsonl 변환 도구 위치)
   2. `bisociation/spectra/atlas_eig.hexa` (CSR + Lanczos, ~/Dev/... default path 는 stale)
