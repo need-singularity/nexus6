@@ -33,7 +33,18 @@ if [ -z "${NEXUS_ROOT}" ] || [ ! -d "${NEXUS_ROOT}" ]; then
     NEXUS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 fi
 
-REGISTRY="${NEXUS_ROOT}/design/hexa_sim/falsifiers.jsonl"
+# --target {falsifier|bridge|atlas|PATH} — propagation across 3 R5 domains (2026-04-26)
+TARGET="${REGISTRY_TARGET:-falsifier}"
+# Allow positional --target before mode for env-free usage:
+if [ "${1:-}" = "--target" ] && [ $# -ge 2 ]; then
+    TARGET="$2"; shift 2
+fi
+case "${TARGET}" in
+    falsifier) REGISTRY="${NEXUS_ROOT}/design/hexa_sim/falsifiers.jsonl" ;;
+    bridge)    REGISTRY="${NEXUS_ROOT}/state/bridge_sha256.tsv" ;;
+    atlas)     REGISTRY="${NEXUS_ROOT}/state/atlas_sha256.tsv" ;;
+    *)         REGISTRY="${TARGET}" ;;  # custom path
+esac
 SIG="${REGISTRY}.sig"
 ALLOWED_SIGNERS="${ALLOWED_SIGNERS:-${HOME}/.ssh/allowed_signers}"
 NAMESPACE="file"
