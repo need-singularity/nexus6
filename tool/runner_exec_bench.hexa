@@ -1,0 +1,155 @@
+// tool/runner_exec_bench.hexa — empirical docker-exec floor benchmark (ω-runner-13 Phase A)
+//
+// Purpose: produce a *measured* per-pattern latency baseline before any persistent-mode
+// transport is introduced. Brief carried a 103ms floor figure; this tool re-measures
+// against the running hexa-runner container and reports p50/min/max/mean across N runs
+// for three exec patterns. Output drives runner-13 Phase B (persistent-exec) sizing.
+//
+// raw 9 hexa-only-suffix (sweeper-safe .hexa). raw 71 report-only.
+//
+// @tool(slug="runner_exec_bench", desc="docker exec floor distribution measurement")
+// @usage:
+//   hexa run tool/runner_exec_bench.hexa                                # default container=hexa-exec, runs=30
+//   HEXA_ARGV='--container hive-exec' hexa run tool/runner_exec_bench.hexa
+//   HEXA_ARGV='--runs 50 --quiet' hexa run tool/runner_exec_bench.hexa
+//   HEXA_ARGV='--help' hexa run tool/runner_exec_bench.hexa
+//
+// sentinel (raw 80) — one per pattern:
+//   __RUNNER_BENCH__ pattern=<NAME> runs=N p50_ms=X min_ms=Y max_ms=Z mean_ms=M overhead_corrected=true
+//
+// patterns measured:
+//   bare           — docker exec $C /bin/true
+//   bash_c         — docker exec $C bash -c /bin/true
+//   bash_lc        — docker exec $C bash -lc /bin/true   (login-shell, what hexa_remote uses)
+//
+// timing strategy:
+//   We bracket each docker-exec call with two `gdate +%s%3N` exec()s. Each gdate call
+//   is itself an exec() with fork+exec cost (~1-3ms). We pre-measure this overhead by
+//   running a tight gdate/gdate pair N times and taking the median; then subtract that
+//   overhead from each docker-exec sample before stats.
+//
+// no-side-effects guarantee:
+//   /bin/true inside the container has zero filesystem effect. The container itself is
+//   not modified. This script reads no state and writes nothing to disk.
+
+let DEFAULT_CONTAINER = "hexa-exec"
+let DEFAULT_RUNS = "30"
+let mut QUIET = false
+
+fn _argv() -> array {
+    let raw = to_string(exec("printf '%s' \"${HEXA_ARGV:-}\""))
+    let parts = split(raw, " ")
+    let mut out = []
+    let mut k = 0
+    while k < len(parts) {
+        if len(parts[k]) > 0 { out.push(parts[k]) }
+        k = k + 1
+    }
+    return out
+}
+
+fn _say(msg: string) { if !QUIET { println(msg) } }
+
+let args = _argv()
+let mut container = DEFAULT_CONTAINER
+let mut runs_str = DEFAULT_RUNS
+let mut i = 0
+while i < len(args) {
+    let a = args[i]
+    if a == "--quiet" { QUIET = true }
+    if a == "--container" && i + 1 < len(args) { container = args[i+1]; i = i + 1 }
+    if a == "--runs" && i + 1 < len(args) { runs_str = args[i+1]; i = i + 1 }
+    if a == "--help" || a == "-h" {
+        println("usage: HEXA_ARGV='[--container NAME] [--runs N] [--quiet]' hexa run tool/runner_exec_bench.hexa")
+        println("  defaults: --container hexa-exec --runs 30")
+        println("  measures p50/min/max/mean ms per docker-exec pattern (bare, bash_c, bash_lc)")
+        println("  emits __RUNNER_BENCH__ sentinel per pattern (raw 80)")
+        return
+    }
+    i = i + 1
+}
+
+// ─── pre-flight: container reachable? ────────────────────────────────────────
+let probe = to_string(exec("docker ps --format '{{.Names}}' 2>/dev/null | grep -Fx '" + container + "' | head -1")).trim()
+if probe != container {
+    println("__RUNNER_BENCH__ SKIP reason=container_not_running container=" + container)
+    println("  fix:    docker ps; pick a running container or start hexa-runner")
+    return
+}
+
+// ─── timing-overhead pre-measurement ─────────────────────────────────────────
+// Each docker-exec sample is bracketed by 2 gdate calls. We measure the gdate-pair
+// overhead and subtract it from each docker sample. 30 paired samples → median.
+let overhead_n = "30"
+let overhead_cmd = "" +
+    "n=" + overhead_n + "; out=''; " +
+    "for k in $(seq 1 $n); do " +
+    "  a=$(gdate +%s%3N); b=$(gdate +%s%3N); " +
+    "  out=\"$out$((b-a))\\n\"; " +
+    "done; " +
+    "printf '%b' \"$out\" | sort -n | awk -v n=$n 'NR==int((n+1)/2){print; exit}'"
+let overhead_str = to_string(exec(overhead_cmd)).trim()
+let overhead_ms = if len(overhead_str) > 0 { overhead_str } else { "0" }
+
+_say("═══ runner_exec_bench — container=" + container + " runs=" + runs_str)
+_say("  timing-pair overhead (median over " + overhead_n + " samples) = " + overhead_ms + "ms")
+_say("  ─── per-pattern distribution (overhead-corrected)")
+
+// ─── pattern bench ───────────────────────────────────────────────────────────
+fn _bench_pattern(label: string, container: string, runs_str: string, overhead_ms: string) -> string {
+    // Run N docker-exec calls, capture per-call delta, sort, compute stats.
+    let inner = if label == "bare" {
+        "docker exec " + container + " /bin/true"
+    } else if label == "bash_c" {
+        "docker exec " + container + " bash -c /bin/true"
+    } else {
+        "docker exec " + container + " bash -lc /bin/true"
+    }
+    let cmd = "" +
+        "n=" + runs_str + "; ovh=" + overhead_ms + "; out=''; " +
+        "for k in $(seq 1 $n); do " +
+        "  a=$(gdate +%s%3N); " +
+        "  " + inner + " >/dev/null 2>&1; " +
+        "  b=$(gdate +%s%3N); " +
+        "  d=$((b-a-ovh)); " +
+        "  if [ $d -lt 0 ]; then d=0; fi; " +
+        "  out=\"$out$d\\n\"; " +
+        "done; " +
+        "printf '%b' \"$out\" | sort -n | awk -v n=$n '" +
+        "  { a[NR]=$1+0 } " +
+        "  END { " +
+        "    if (n==0) { print \"0 0 0 0\"; exit } " +
+        "    p50=(n%2==1)?a[(n+1)/2]:(a[n/2]+a[n/2+1])/2; " +
+        "    s=0; for(i=1;i<=n;i++) s+=a[i]; " +
+        "    printf \"%d %d %d %.1f\\n\", p50, a[1], a[n], s/n; " +
+        "  }'"
+    return to_string(exec(cmd)).trim()
+}
+
+let labels = ["bare", "bash_c", "bash_lc"]
+let mut li = 0
+while li < len(labels) {
+    let lbl = labels[li]
+    let res = _bench_pattern(lbl, container, runs_str, overhead_ms)
+    let parts = split(res, " ")
+    if len(parts) >= 4 {
+        let p50 = parts[0]
+        let mn  = parts[1]
+        let mx  = parts[2]
+        let mean = parts[3]
+        if !QUIET {
+            println("    " + lbl + ":  p50=" + p50 + "ms  min=" + mn + "ms  max=" + mx + "ms  mean=" + mean + "ms")
+        }
+        println("__RUNNER_BENCH__ pattern=" + lbl + " runs=" + runs_str + " p50_ms=" + p50 + " min_ms=" + mn + " max_ms=" + mx + " mean_ms=" + mean + " overhead_corrected=true")
+    } else {
+        println("__RUNNER_BENCH__ pattern=" + lbl + " ERROR raw=\"" + res + "\"")
+    }
+    li = li + 1
+}
+
+if !QUIET {
+    println("  ─── interpretation")
+    println("  bash_lc is the path hexa_remote takes (Wave 21 docker mode, hexa_remote.sh L1237).")
+    println("  Phase B (runner-13b) target: amortize this floor via long-lived `docker exec -i $C bash`")
+    println("  with line-protocol request framing → expected savings ≈ p50 - protocol_overhead.")
+}
