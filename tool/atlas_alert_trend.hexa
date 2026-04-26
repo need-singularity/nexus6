@@ -1,0 +1,406 @@
+// tool/atlas_alert_trend.hexa — alert history trend analyzer (ω-bridge-22)
+//
+// raw 9 hexa-only-suffix (sweeper-safe .hexa). ω-bridge-21 introduced
+// state/atlas_alert_history.tsv as the canonical FIRED-event log emitted by
+// tool/atlas_alert_subscriber.hexa. Today the file accumulates rows but no
+// tool reasons over them. This cycle introduces the analyzer.
+//
+// Read-only on the history TSV (raw 71 / raw 77 — never rewrite, never edit
+// existing rows). Parallel-session may be appending while we read; we tolerate
+// this — read_file is a single fs syscall snapshot and any mid-read append is
+// just truncated past EOF, fine for trend semantics.
+//
+// schema (recap, set by ω-bridge-21):
+//   ts<TAB>rule<TAB>ratio<TAB>threshold<TAB>last_n<TAB>sampled<TAB>extra
+//   # lines (and blank lines) skipped on parse.
+//
+// @tool(slug="atlas_alert_trend", desc="alert history trend metrics analyzer")
+// @usage:
+//   hexa run tool/atlas_alert_trend.hexa                                          # default
+//   HEXA_ARGV='--history /tmp/foo.tsv' hexa run tool/atlas_alert_trend.hexa
+//   HEXA_ARGV='--window-hours 48' hexa run tool/atlas_alert_trend.hexa
+//   HEXA_ARGV='--json' hexa run tool/atlas_alert_trend.hexa
+//   HEXA_ARGV='--quiet' hexa run tool/atlas_alert_trend.hexa
+//   HEXA_ARGV='--help' hexa run tool/atlas_alert_trend.hexa
+//
+// metrics:
+//   1. alert_count_total      — total FIRED rows lifetime
+//   2. alert_count_last_24h   — events in last --window-hours (default 24)
+//   3. per_rule_count         — fires per rule
+//   4. mtba_per_rule          — mean time between alerts per rule (seconds)
+//   5. top_rule_24h           — most-fired rule in last --window-hours
+//   6. fire_rate_per_hour     — total fires / wall-time-span-hours
+//
+// sentinel (raw 80):
+//   __ALERT_TREND__ <PASS|EMPTY|INSUFFICIENT> total=N last_window=W top_rule=R fire_rate_per_hour=X
+//   __ALERT_TREND__ SKIP reason=history_missing path=PATH    (file absent — exit 0)
+//
+// verdict semantics:
+//   PASS         — file exists + ≥3 rows
+//   INSUFFICIENT — file exists but <3 rows (network-3 deferred-recommendation pattern)
+//   EMPTY        — file exists with header only (zero data rows)
+//   SKIP         — file missing (exit 0)
+//
+// raw compliance: 71 read-only-on-history / 73 admissibility / 77 append-only
+//                 / 80 sentinel
+//
+// Origin: design/hexa_sim/cross_repo_dashboard.md ω-bridge-22 entry
+//         /Users/ghost/core/anima/state/omega_bridge_22_*.json
+
+let NEXUS = "/Users/ghost/core/nexus"
+let DEFAULT_HISTORY = NEXUS + "/state/atlas_alert_history.tsv"
+let DEFAULT_WINDOW_HOURS = "24"
+
+let mut QUIET = false
+
+fn _argv() -> array {
+    let raw = to_string(exec("printf '%s' \"${HEXA_ARGV:-}\""))
+    let parts = split(raw, " ")
+    let mut out = []
+    let mut k = 0
+    while k < len(parts) {
+        if len(parts[k]) > 0 { out.push(parts[k]) }
+        k = k + 1
+    }
+    return out
+}
+
+fn _say(msg: string) { if !QUIET { println(msg) } }
+
+fn _index_of(arr: array, key: string) -> i64 {
+    let mut k = 0
+    while k < len(arr) {
+        if arr[k] == key { return k }
+        k = k + 1
+    }
+    return -1
+}
+
+let args = _argv()
+let mut history_path = DEFAULT_HISTORY
+let mut window_hours_str = DEFAULT_WINDOW_HOURS
+let mut json_mode = false
+let mut i = 0
+while i < len(args) {
+    let a = args[i]
+    if a == "--quiet" { QUIET = true }
+    if a == "--json" { json_mode = true }
+    if a == "--history" && i + 1 < len(args) { history_path = args[i+1]; i = i + 1 }
+    if a == "--window-hours" && i + 1 < len(args) { window_hours_str = args[i+1]; i = i + 1 }
+    if a == "--help" || a == "-h" {
+        println("usage: HEXA_ARGV='[--history PATH] [--window-hours H] [--json] [--quiet]' hexa run tool/atlas_alert_trend.hexa")
+        println("  default: read state/atlas_alert_history.tsv, window=24h")
+        println("  --history PATH       override history TSV path (default: state/atlas_alert_history.tsv)")
+        println("  --window-hours H     scope for last_N + top_rule metrics (default 24)")
+        println("  --json               machine-readable JSON output (still emits sentinel last)")
+        println("  --quiet              emit __ALERT_TREND__ sentinel only (suppresses human summary)")
+        println("verdicts: PASS (>=3 rows) | INSUFFICIENT (<3 rows) | EMPTY (header only) | SKIP (file missing)")
+        return
+    }
+    i = i + 1
+}
+
+// ─── pre-flight ──────────────────────────────────────────────────────────────
+if !file_exists(history_path) {
+    println("__ALERT_TREND__ SKIP reason=history_missing path=" + history_path)
+    return
+}
+
+// ─── load + parse ────────────────────────────────────────────────────────────
+let raw_content = to_string(read_file(history_path))
+let lines = split(raw_content, "\n")
+
+// Parallel arrays per parsed row.
+let mut row_ts = []          // ISO-8601 string
+let mut row_rule = []        // rule name
+let mut malformed_rows = 0
+
+for line in lines {
+    let t = line.trim()
+    if len(t) == 0 { continue }
+    if t.substring(0, 1) == "#" { continue }
+    let parts = split(t, "\t")
+    // Schema is 7 fields, but `extra` is often empty (warn_ratio /
+    // insufficient_ratio). Some splitters drop trailing empties — accept
+    // >=6 fields and treat the missing 7th as empty extra. Need ts + rule
+    // + ratio + threshold + last_n + sampled at minimum.
+    if len(parts) < 6 {
+        malformed_rows = malformed_rows + 1
+        if !QUIET {
+            println("warn: malformed row skipped (fields=" + to_string(len(parts)) + "): " + t)
+        }
+        continue
+    }
+    let ts = parts[0]
+    let rule = parts[1]
+    if len(ts) == 0 || len(rule) == 0 {
+        malformed_rows = malformed_rows + 1
+        if !QUIET {
+            println("warn: malformed row skipped (empty ts or rule): " + t)
+        }
+        continue
+    }
+    row_ts.push(ts)
+    row_rule.push(rule)
+}
+
+let total = len(row_ts)
+
+// ─── EMPTY verdict (header-only) ─────────────────────────────────────────────
+if total == 0 {
+    if !QUIET {
+        println("═══ ATLAS ALERT TREND — history=" + history_path)
+        println("  rows=0  malformed=" + to_string(malformed_rows) + "  window_hours=" + window_hours_str)
+        println("  verdict=EMPTY  (file present, no data rows)")
+    }
+    if json_mode {
+        println("{\"verdict\":\"EMPTY\",\"history\":\"" + history_path + "\",\"total\":0,\"malformed\":" + to_string(malformed_rows) + ",\"window_hours\":" + window_hours_str + "}")
+    }
+    println("__ALERT_TREND__ EMPTY total=0 last_window=0 top_rule=none fire_rate_per_hour=0.0000")
+    return
+}
+
+// ─── INSUFFICIENT verdict (<3 rows) ──────────────────────────────────────────
+if total < 3 {
+    if !QUIET {
+        println("═══ ATLAS ALERT TREND — history=" + history_path)
+        println("  rows=" + to_string(total) + "  malformed=" + to_string(malformed_rows) + "  window_hours=" + window_hours_str)
+        println("  verdict=INSUFFICIENT  (need >=3 rows for trend metrics; deferred-recommendation pattern)")
+        println("  fix:    accumulate more FIRED events or pass --history PATH with a richer dataset")
+    }
+    if json_mode {
+        println("{\"verdict\":\"INSUFFICIENT\",\"history\":\"" + history_path + "\",\"total\":" + to_string(total) + ",\"malformed\":" + to_string(malformed_rows) + ",\"window_hours\":" + window_hours_str + "}")
+    }
+    println("__ALERT_TREND__ INSUFFICIENT total=" + to_string(total) + " last_window=0 top_rule=none fire_rate_per_hour=0.0000")
+    return
+}
+
+// ─── per_rule_count + first/last ts per rule ─────────────────────────────────
+let mut rule_names = []
+let mut rule_counts = []         // parallel: count per rule
+let mut rule_first_ts = []       // parallel: earliest ts per rule
+let mut rule_last_ts = []        // parallel: latest ts per rule
+
+let mut ri = 0
+while ri < total {
+    let rule = row_rule[ri]
+    let ts = row_ts[ri]
+    let idx = _index_of(rule_names, rule)
+    if idx < 0 {
+        rule_names.push(rule)
+        rule_counts.push(1)
+        rule_first_ts.push(ts)
+        rule_last_ts.push(ts)
+    } else {
+        rule_counts[idx] = rule_counts[idx] + 1
+        // String compare is OK for ISO-8601 (lexical == chronological).
+        if ts < rule_first_ts[idx] { rule_first_ts[idx] = ts }
+        if ts > rule_last_ts[idx]  { rule_last_ts[idx]  = ts }
+    }
+    ri = ri + 1
+}
+
+// ─── overall first/last ts (wall-time span) ──────────────────────────────────
+let mut first_ts = row_ts[0]
+let mut last_ts = row_ts[0]
+let mut wi = 1
+while wi < total {
+    let ts = row_ts[wi]
+    if ts < first_ts { first_ts = ts }
+    if ts > last_ts  { last_ts = ts }
+    wi = wi + 1
+}
+
+// ─── now (system clock UTC) ──────────────────────────────────────────────────
+let now_iso = to_string(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()
+
+// ─── compute time deltas via single python3 call (avoids per-row exec) ───────
+// We hand python:
+//   - now ISO
+//   - window_hours
+//   - all rows (ts<TAB>rule, one per line)
+//   - per-rule first|last ts (one per line, "rule|first|last")
+//   - overall first/last
+// python emits structured key=value lines we parse back. Single shell-out.
+// All ISO-8601 strings we receive came from `date -u +%Y-%m-%dT%H:%M:%SZ`
+// (raw 77 emitter) so the format is fixed.
+
+let mut rows_blob = ""
+let mut bi = 0
+while bi < total {
+    rows_blob = rows_blob + row_ts[bi] + "\t" + row_rule[bi] + "\n"
+    bi = bi + 1
+}
+let mut rule_meta_blob = ""
+let mut mi = 0
+while mi < len(rule_names) {
+    rule_meta_blob = rule_meta_blob + rule_names[mi] + "|" + rule_first_ts[mi] + "|" + rule_last_ts[mi] + "|" + to_string(rule_counts[mi]) + "\n"
+    mi = mi + 1
+}
+
+let tmp_rows = "/tmp/atlas_alert_trend_rows_" + to_string(timestamp()) + "_" + to_string(total) + ".tsv"
+let tmp_meta = "/tmp/atlas_alert_trend_meta_" + to_string(timestamp()) + "_" + to_string(len(rule_names)) + ".tsv"
+write_file(tmp_rows, rows_blob)
+write_file(tmp_meta, rule_meta_blob)
+
+let py = "import sys, datetime\n" +
+         "FMT='%Y-%m-%dT%H:%M:%SZ'\n" +
+         "now = datetime.datetime.strptime('" + now_iso + "', FMT).replace(tzinfo=datetime.timezone.utc)\n" +
+         "window_h = " + window_hours_str + "\n" +
+         "cutoff = now - datetime.timedelta(hours=window_h)\n" +
+         "rows = []\n" +
+         "with open('" + tmp_rows + "') as f:\n" +
+         "    for ln in f:\n" +
+         "        ln = ln.rstrip('\\n')\n" +
+         "        if not ln: continue\n" +
+         "        try:\n" +
+         "            ts_s, rule = ln.split('\\t', 1)\n" +
+         "            t = datetime.datetime.strptime(ts_s, FMT).replace(tzinfo=datetime.timezone.utc)\n" +
+         "        except Exception:\n" +
+         "            continue\n" +
+         "        rows.append((t, rule))\n" +
+         "win_total = 0\n" +
+         "win_per_rule = {}\n" +
+         "for (t, rule) in rows:\n" +
+         "    if t >= cutoff and t <= now:\n" +
+         "        win_total += 1\n" +
+         "        win_per_rule[rule] = win_per_rule.get(rule, 0) + 1\n" +
+         "top_rule = 'none'\n" +
+         "top_count = 0\n" +
+         "for r, c in sorted(win_per_rule.items()):\n" +
+         "    if c > top_count:\n" +
+         "        top_rule = r\n" +
+         "        top_count = c\n" +
+         "first_t = min(t for (t, _) in rows)\n" +
+         "last_t = max(t for (t, _) in rows)\n" +
+         "span_s = (last_t - first_t).total_seconds()\n" +
+         "span_h = span_s / 3600.0 if span_s > 0 else 0.0\n" +
+         "fire_rate = (len(rows) / span_h) if span_h > 0 else 0.0\n" +
+         "print('WIN_TOTAL=%d' % win_total)\n" +
+         "print('TOP_RULE=%s' % top_rule)\n" +
+         "print('TOP_COUNT=%d' % top_count)\n" +
+         "print('SPAN_HOURS=%.4f' % span_h)\n" +
+         "print('FIRE_RATE=%.4f' % fire_rate)\n" +
+         "for r, c in sorted(win_per_rule.items()):\n" +
+         "    print('WIN_RULE=%s=%d' % (r, c))\n" +
+         "# MTBA: mean gap between consecutive fires per rule (seconds).\n" +
+         "by_rule = {}\n" +
+         "for (t, rule) in rows:\n" +
+         "    by_rule.setdefault(rule, []).append(t)\n" +
+         "for rule, ts_list in sorted(by_rule.items()):\n" +
+         "    ts_list.sort()\n" +
+         "    if len(ts_list) < 2:\n" +
+         "        print('MTBA=%s=NA' % rule)\n" +
+         "        continue\n" +
+         "    gaps = [(ts_list[k+1]-ts_list[k]).total_seconds() for k in range(len(ts_list)-1)]\n" +
+         "    mean_gap = sum(gaps) / len(gaps)\n" +
+         "    print('MTBA=%s=%.4f' % (rule, mean_gap))\n"
+
+let py_cmd = "/usr/bin/env python3 -c \"" + py.replace("\"", "\\\"") + "\" 2>/dev/null"
+let py_out = to_string(exec(py_cmd))
+exec("rm -f '" + tmp_rows + "' '" + tmp_meta + "' 2>/dev/null")
+
+let py_lines = split(py_out, "\n")
+let mut win_total = 0
+let mut top_rule = "none"
+let mut top_count = 0
+let mut span_hours_s = "0.0000"
+let mut fire_rate_s = "0.0000"
+let mut win_rule_names = []
+let mut win_rule_counts = []
+let mut mtba_rule_names = []
+let mut mtba_rule_values = []   // string: "NA" or seconds float
+
+let mut pi = 0
+while pi < len(py_lines) {
+    let pl = py_lines[pi].trim()
+    if len(pl) == 0 { pi = pi + 1; continue }
+    if pl.substring(0, 10) == "WIN_TOTAL=" {
+        win_total = to_int(pl.substring(10, len(pl)))
+    } else if pl.substring(0, 9) == "TOP_RULE=" {
+        top_rule = pl.substring(9, len(pl))
+    } else if pl.substring(0, 10) == "TOP_COUNT=" {
+        top_count = to_int(pl.substring(10, len(pl)))
+    } else if pl.substring(0, 11) == "SPAN_HOURS=" {
+        span_hours_s = pl.substring(11, len(pl))
+    } else if pl.substring(0, 10) == "FIRE_RATE=" {
+        fire_rate_s = pl.substring(10, len(pl))
+    } else if pl.substring(0, 9) == "WIN_RULE=" {
+        let body = pl.substring(9, len(pl))
+        let parts = split(body, "=")
+        if len(parts) == 2 {
+            win_rule_names.push(parts[0])
+            win_rule_counts.push(to_int(parts[1]))
+        }
+    } else if pl.substring(0, 5) == "MTBA=" {
+        let body = pl.substring(5, len(pl))
+        let parts = split(body, "=")
+        if len(parts) == 2 {
+            mtba_rule_names.push(parts[0])
+            mtba_rule_values.push(parts[1])
+        }
+    }
+    pi = pi + 1
+}
+
+// ─── human-readable summary ──────────────────────────────────────────────────
+if !QUIET && !json_mode {
+    println("═══ ATLAS ALERT TREND — history=" + history_path)
+    println("  total=" + to_string(total) + "  malformed=" + to_string(malformed_rows) + "  rules_seen=" + to_string(len(rule_names)))
+    println("  span: first=" + first_ts + "  last=" + last_ts + "  hours=" + span_hours_s)
+    println("  window_hours=" + window_hours_str + "  alert_count_last_window=" + to_string(win_total) + "  top_rule=" + top_rule + " (" + to_string(top_count) + ")")
+    println("  fire_rate_per_hour=" + fire_rate_s)
+    println("  per_rule_count:")
+    let mut pr = 0
+    while pr < len(rule_names) {
+        println("    " + rule_names[pr] + " = " + to_string(rule_counts[pr]))
+        pr = pr + 1
+    }
+    println("  mtba_per_rule (seconds):")
+    let mut mt = 0
+    while mt < len(mtba_rule_names) {
+        println("    " + mtba_rule_names[mt] + " = " + mtba_rule_values[mt])
+        mt = mt + 1
+    }
+}
+
+// ─── JSON output (machine-readable, before the sentinel) ─────────────────────
+if json_mode {
+    let mut json = "{"
+    json = json + "\"verdict\":\"PASS\","
+    json = json + "\"history\":\"" + history_path + "\","
+    json = json + "\"total\":" + to_string(total) + ","
+    json = json + "\"malformed\":" + to_string(malformed_rows) + ","
+    json = json + "\"window_hours\":" + window_hours_str + ","
+    json = json + "\"alert_count_last_window\":" + to_string(win_total) + ","
+    json = json + "\"top_rule\":\"" + top_rule + "\","
+    json = json + "\"top_rule_count\":" + to_string(top_count) + ","
+    json = json + "\"span_hours\":" + span_hours_s + ","
+    json = json + "\"fire_rate_per_hour\":" + fire_rate_s + ","
+    json = json + "\"first_ts\":\"" + first_ts + "\","
+    json = json + "\"last_ts\":\"" + last_ts + "\","
+    json = json + "\"per_rule_count\":{"
+    let mut jr = 0
+    while jr < len(rule_names) {
+        if jr > 0 { json = json + "," }
+        json = json + "\"" + rule_names[jr] + "\":" + to_string(rule_counts[jr])
+        jr = jr + 1
+    }
+    json = json + "},\"mtba_per_rule\":{"
+    let mut jm = 0
+    while jm < len(mtba_rule_names) {
+        if jm > 0 { json = json + "," }
+        let v = mtba_rule_values[jm]
+        if v == "NA" {
+            json = json + "\"" + mtba_rule_names[jm] + "\":null"
+        } else {
+            json = json + "\"" + mtba_rule_names[jm] + "\":" + v
+        }
+        jm = jm + 1
+    }
+    json = json + "}}"
+    println(json)
+}
+
+// ─── sentinel emission (raw 80) ──────────────────────────────────────────────
+println("__ALERT_TREND__ PASS total=" + to_string(total) + " last_window=" + to_string(win_total) + " top_rule=" + top_rule + " fire_rate_per_hour=" + fire_rate_s)
