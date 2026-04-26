@@ -7,10 +7,12 @@
 # Append timeline JSONL line to state/atlas_health_timeline.jsonl.
 #
 # usage:
-#   tool/bridge_health.sh           # human-readable + sentinel + timeline append
-#   tool/bridge_health.sh --quiet   # only sentinel line
-#   tool/bridge_health.sh --json    # JSONL summary on stdout (no timeline)
-#   tool/bridge_health.sh --strict  # also verify each bridge file SHA256 vs pinned baseline
+#   tool/bridge_health.sh                       # human-readable + sentinel + timeline append
+#   tool/bridge_health.sh --quiet               # only sentinel line
+#   tool/bridge_health.sh --json                # JSONL summary on stdout (no timeline)
+#   tool/bridge_health.sh --strict              # also verify each bridge file SHA256 vs pinned baseline
+#   tool/bridge_health.sh --fingerprint-check   # after each PASS, schema-fingerprint via bridge_helper
+#   tool/bridge_health.sh -F                    # short form of --fingerprint-check
 #
 # Exit:
 #   0 if all PASS
@@ -27,6 +29,17 @@
 #   Defeats silent .hexa rewrite (e.g. selftest sentinel injected into mutated body).
 #   Bridges face higher attack risk than falsifiers because external API selftest
 #   paths could be subverted. Propagated from falsifier_health.sh R1 (Ω-cycle).
+# ω-bridge-7 (2026-04-26): --fingerprint-check opt-in flag.
+#   After each bridge PASSES selftest, optionally invoke
+#     bash tool/bridge_helper.sh fingerprint-check <bridge> <url>
+#   to detect upstream JSON schema drift (top-level key set change). Emits a
+#   per-sweep tally line:
+#     __BRIDGE_FINGERPRINT__ checked=N matched=M drift=D non_json=NJ baseline_recorded=BR
+#   Default OFF (backward compat). Drift events are also printed individually.
+#   URL lookup table is hardcoded below (BRIDGE_FP_URLS) — one canonical fetch
+#   URL per registered bridge. Non-JSON bridges (text/HTML/CSV) yield NON_JSON
+#   and are tallied in non_json (expected for ~half of the registry).
+#   See state/omega_bridge_7_health_integration.json.
 # Origin: design/hexa_sim/2026-04-26_bridge_health_check.md (productionised runner)
 #         design/hexa_sim/2026-04-26_bridge_health_R1_propagation_omega_cycle.json
 
@@ -59,21 +72,54 @@ TIMEOUT_SECS="${BRIDGE_TIMEOUT:-30}"
 QUIET=0
 JSON=0
 STRICT=0
+FP_CHECK=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --quiet)  QUIET=1; shift ;;
         --json)   JSON=1; shift ;;
         --strict) STRICT=1; shift ;;
-        --help|-h) sed -n '3,32p' "$0"; exit 0 ;;
+        --fingerprint-check|-F) FP_CHECK=1; shift ;;
+        --help|-h) sed -n '3,44p' "$0"; exit 0 ;;
         *)
             echo "usage error: unknown flag: $1" >&2
             echo "  reason: unrecognised CLI argument" >&2
-            echo "  fix:    use --quiet | --json | --strict | --help" >&2
+            echo "  fix:    use --quiet | --json | --strict | --fingerprint-check | --help" >&2
             exit 1
             ;;
     esac
 done
+
+BRIDGE_HELPER="${BRIDGE_HELPER:-$NEXUS_ROOT/tool/bridge_helper.sh}"
+
+# ω-bridge-7 URL table — one canonical fetch URL per registered bridge.
+# Used only when --fingerprint-check is set. Bridges whose canonical URLs are
+# not JSON (text / HTML / CSV / ASCII / XML-Atom) will return NON_JSON_BODY
+# from bridge_helper fingerprint-check and be tallied separately. That is
+# expected: drift detection is a JSON-only signal by design (see ω-bridge-6).
+BRIDGE_FP_URLS="
+codata|https://physics.nist.gov/cuu/Constants/Table/allascii.txt
+oeis|https://oeis.org/A000396/b000396.txt
+gw|https://gwosc.org/eventapi/jsonfull/allevents/
+horizons|https://ssd.jpl.nasa.gov/api/horizons.api?format=text&COMMAND=499&CENTER=%27%40399%27
+arxiv|https://export.arxiv.org/api/query?search_query=cat:gr-qc&start=0&max_results=5&sortBy=submittedDate&sortOrder=descending
+cmb|https://en.wikipedia.org/wiki/Planck_(spacecraft)
+nanograv|https://arxiv.org/abs/2306.16213
+simbad|https://simbad.cds.unistra.fr/simbad/sim-id?Ident=Sirius&output.format=ASCII
+icecube|https://gcn.gsfc.nasa.gov/amon_icecube_gold_bronze_events.html
+nist_atomic|https://physics.nist.gov/cuu/Constants/Table/allascii.txt
+wikipedia|https://en.wikipedia.org/api/rest_v1/page/summary/Perfect_number
+openalex|https://api.openalex.org/works?search=perfect+number&per-page=3&mailto=noreply@local
+gaia|https://gea.esac.esa.int/tap-server/tap/sync?REQUEST=doQuery&LANG=ADQL&FORMAT=csv&QUERY=SELECT+TOP+1+source_id+FROM+gaiadr3.gaia_source
+lhc|https://opendata.cern.ch/api/records/?type=Dataset&page=1&size=2
+pubchem|https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/water/property/MolecularFormula,MolecularWeight,CanonicalSMILES,InChI/JSON
+uniprot|https://rest.uniprot.org/uniprotkb/P68871.json
+"
+
+fp_url_for() {
+    local _name="$1"
+    printf '%s\n' "$BRIDGE_FP_URLS" | awk -F'|' -v n="$_name" '$1==n {print $2; exit}'
+}
 
 # Helper: SHA256 of a file (first 16 hex chars). Tries shasum (BSD) then sha256sum (GNU).
 sha256_file_16() {
@@ -115,6 +161,9 @@ uniprot:tool/uniprot_bridge.hexa
 NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 WALL_START=$(date +%s)
 TOTAL=0; PASS=0; FAIL=0; OFFLINE=0; TAMPERED=0
+# ω-bridge-7 fingerprint tally
+FP_CHECKED=0; FP_MATCHED=0; FP_DRIFT=0; FP_NON_JSON=0; FP_BASELINE=0; FP_FETCH_FAIL=0
+FP_DRIFT_LINES=""
 
 if [ "$QUIET" = "0" ] && [ "$JSON" = "0" ]; then
     echo "═══ BRIDGE HEALTH — $NOW (UTC)"
@@ -194,6 +243,57 @@ for entry in $BRIDGES; do
             printf '  %-12s  %-9s  ec=%-3s  %3ss\n' "$NAME" "$STATUS" "$EC" "$DUR"
         fi
     fi
+
+    # ω-bridge-7 fingerprint-check (opt-in, only after PASS, only if URL registered)
+    if [ "$FP_CHECK" = "1" ] && [ "$STATUS" = "PASS" ]; then
+        FP_URL=$(fp_url_for "$NAME")
+        if [ -z "$FP_URL" ]; then
+            if [ "$QUIET" = "0" ] && [ "$JSON" = "0" ]; then
+                printf '    └─ fp:        SKIP       reason=no_url_registered\n'
+            fi
+        elif [ ! -x "$BRIDGE_HELPER" ] && [ ! -f "$BRIDGE_HELPER" ]; then
+            if [ "$QUIET" = "0" ] && [ "$JSON" = "0" ]; then
+                printf '    └─ fp:        SKIP       reason=helper_missing path=%s\n' "$BRIDGE_HELPER"
+            fi
+        else
+            # BRIDGE_FP_TTL lets ops force long cache (e.g. 86400 for cached-only
+            # validation runs); default 3600 matches bridge_helper default.
+            FP_TTL="${BRIDGE_FP_TTL:-3600}"
+            FP_OUT=$(bash "$BRIDGE_HELPER" fingerprint-check "$NAME" "$FP_URL" "$FP_TTL" 1 2>/dev/null)
+            FP_EC=$?
+            FP_CHECKED=$((FP_CHECKED+1))
+            case "$FP_OUT" in
+                BASELINE_RECORDED*)
+                    FP_BASELINE=$((FP_BASELINE+1))
+                    FP_TAG="BASELINE"
+                    ;;
+                MATCH*)
+                    FP_MATCHED=$((FP_MATCHED+1))
+                    FP_TAG="MATCH"
+                    ;;
+                DRIFT_DETECTED*)
+                    FP_DRIFT=$((FP_DRIFT+1))
+                    FP_TAG="DRIFT"
+                    FP_DRIFT_LINES="${FP_DRIFT_LINES}__BRIDGE_FINGERPRINT_DRIFT__ bridge=${NAME} ${FP_OUT#DRIFT_DETECTED }
+"
+                    ;;
+                NON_JSON_BODY*)
+                    FP_NON_JSON=$((FP_NON_JSON+1))
+                    FP_TAG="NON_JSON"
+                    ;;
+                FETCH_FAIL*)
+                    FP_FETCH_FAIL=$((FP_FETCH_FAIL+1))
+                    FP_TAG="FETCH_FAIL"
+                    ;;
+                *)
+                    FP_TAG="UNKNOWN(ec=$FP_EC)"
+                    ;;
+            esac
+            if [ "$QUIET" = "0" ] && [ "$JSON" = "0" ]; then
+                printf '    └─ fp:        %-10s %s\n' "$FP_TAG" "$FP_OUT"
+            fi
+        fi
+    fi
 done
 
 WALL_END=$(date +%s)
@@ -219,6 +319,10 @@ if [ "$QUIET" = "0" ] && [ "$JSON" = "0" ]; then
     echo "─── summary"
     printf '  total=%d  pass=%d  fail=%d  offline_fallback=%d  tampered=%d  wall=%dms\n' \
         "$TOTAL" "$PASS" "$FAIL" "$OFFLINE" "$TAMPERED" "$DURATION_MS"
+    if [ "$FP_CHECK" = "1" ]; then
+        printf '  fp:  checked=%d matched=%d drift=%d non_json=%d baseline_recorded=%d fetch_fail=%d\n' \
+            "$FP_CHECKED" "$FP_MATCHED" "$FP_DRIFT" "$FP_NON_JSON" "$FP_BASELINE" "$FP_FETCH_FAIL"
+    fi
     if [ "$EXIT_CODE" = "76" ]; then
         echo "  reason: $FAIL bridge(s) failed selftest ($TAMPERED tampered)"
         echo "  fix:    bash $NEXUS_ROOT/tool/bridge_health.sh (verbose); consult design/hexa_sim/2026-04-26_bridge_health_check.md"
@@ -228,5 +332,13 @@ if [ "$QUIET" = "0" ] && [ "$JSON" = "0" ]; then
     fi
 fi
 
+# ω-bridge-7: per-drift sentinel lines (one per drift event, for log-grepping)
+if [ "$FP_CHECK" = "1" ] && [ -n "$FP_DRIFT_LINES" ]; then
+    printf '%s' "$FP_DRIFT_LINES"
+fi
+
 echo "__BRIDGE_HEALTH__ $VERDICT total=$TOTAL pass=$PASS fail=$FAIL tampered=$TAMPERED duration_ms=$DURATION_MS"
+if [ "$FP_CHECK" = "1" ]; then
+    echo "__BRIDGE_FINGERPRINT__ checked=$FP_CHECKED matched=$FP_MATCHED drift=$FP_DRIFT non_json=$FP_NON_JSON baseline_recorded=$FP_BASELINE"
+fi
 exit $EXIT_CODE
