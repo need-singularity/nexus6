@@ -1,0 +1,519 @@
+// tool/psi_calibration_drift.hexa — ω-network-8: PSI calibration drift detector.
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+//
+// Compares the cached per-host PSI thresholds (state/psi_calibration_active.tsv,
+// produced by ω-network-6 commit 3506aa14) against what the threshold WOULD be
+// if recomputed from the current /tmp/hexa_remote_psi.log distribution using the
+// SAME formula as ω-network-5's psi_calibrate_emit.hexa (commit 97c65c8a).
+//
+// Why:
+//   ω-network-6b added a 24h auto-refresh launchd plist so the cache stays
+//   "fresh" by age. But age-fresh ≠ distribution-fresh: today's load pattern
+//   may already have diverged from yesterday's calibration. This tool detects
+//   that *semantic* staleness.
+//
+// Drift formula (per host present in BOTH cache and log):
+//   recomputed = same _suggest() pipeline as psi_calibrate_emit.hexa
+//                (p95+5 with 95-cap when rej_ratio>0.10, max+10 floor 30 when
+//                 generous, KEEP/current(80) otherwise; op-clamp ubu1/ubu2≤70)
+//   drift_pct  = |cached - recomputed| / cached * 100
+//
+// Verdict thresholds (defaults; override via --drift-threshold / --stale-threshold):
+//   all hosts ≤10%                          → __PSI_DRIFT__ FRESH
+//   any host >10% but <30%                   → __PSI_DRIFT__ DRIFT
+//   any host >30% OR new host in log not in
+//   cache OR cache mtime older than log span → __PSI_DRIFT__ STALE
+//
+// Pre-flight (sweeper-safe degradations, all exit 0):
+//   cache file missing  → __PSI_DRIFT__ SKIP reason=cache_missing path=PATH
+//   log   file missing  → __PSI_DRIFT__ SKIP reason=log_missing   path=PATH
+//   cache has 0 rows    → __PSI_DRIFT__ SKIP reason=cache_empty
+//   per-host samples<50 → __PSI_DRIFT__ INSUFFICIENT host=H samples=K (skip
+//                          that host from drift calc, others still reported)
+//
+// CLI (HEXA_ARGV pattern, mirrors psi_calibrate_emit.hexa):
+//   --cache PATH          override cache (default state/psi_calibration_active.tsv)
+//   --log PATH            override psi log (default /tmp/hexa_remote_psi.log)
+//   --drift-threshold P   percent above which a host is "drift" (default 10)
+//   --stale-threshold P   percent above which a host is "stale" (default 30)
+//   --quiet               suppress per-host table; only sentinel
+//   --json                emit JSON object (per-host detail) instead of table
+//   --help                usage + exit 0
+//
+// Exit codes:
+//   0 in all sentinel modes (FRESH/DRIFT/STALE/SKIP/INSUFFICIENT-only)
+//   2 --help/--json malformed input parse fault (defensive only)
+//
+// SSOT references:
+//   formula: tool/psi_calibrate_emit.hexa (ω-network-5)
+//   cache:   state/psi_calibration_active.tsv (ω-network-6)
+//   log:     /tmp/hexa_remote_psi.log (READ-ONLY per parallel-session policy)
+
+fn _repo_root() -> string {
+    let r = exec("git -C /Users/ghost/core/nexus rev-parse --show-toplevel 2>/dev/null").trim()
+    if r.len() > 0 { return r }
+    return "/Users/ghost/core/nexus"
+}
+
+fn _arg_value(flag: string, default_v: string) -> string {
+    let av = args()
+    let mut i = 0
+    while i < av.len() {
+        if av[i] == flag {
+            if i + 1 < av.len() { return av[i + 1] }
+            return default_v
+        }
+        i = i + 1
+    }
+    return default_v
+}
+
+fn _has_flag(needle: string) -> bool {
+    let av = args()
+    let mut i = 0
+    while i < av.len() {
+        if av[i] == needle { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _cache_path() -> string {
+    let p = _arg_value("--cache", "")
+    if p.len() > 0 { return p }
+    let e = env("PSI_CALIBRATION_CACHE")
+    if e.len() > 0 { return e }
+    return _repo_root() + "/state/psi_calibration_active.tsv"
+}
+
+fn _log_path() -> string {
+    let p = _arg_value("--log", "")
+    if p.len() > 0 { return p }
+    let e = env("HEXA_REMOTE_PSI_LOG")
+    if e.len() > 0 { return e }
+    return "/tmp/hexa_remote_psi.log"
+}
+
+fn _drift_threshold() -> float {
+    let s = _arg_value("--drift-threshold", "10")
+    let mut v = 10.0
+    try { v = to_float(s) } catch e {}
+    return v
+}
+
+fn _stale_threshold() -> float {
+    let s = _arg_value("--stale-threshold", "30")
+    let mut v = 30.0
+    try { v = to_float(s) } catch e {}
+    return v
+}
+
+// ---- formula helpers (kept identical to psi_calibrate_emit.hexa) -----------
+
+fn _round(x: float) -> int {
+    let mut n = 0
+    try { n = to_int(x + 0.5) } catch e {}
+    return n
+}
+
+fn _max_int(a: int, b: int) -> int { if a >= b { return a } else { return b } }
+fn _min_int(a: int, b: int) -> int { if a <= b { return a } else { return b } }
+
+// Per ω-network-4 op-knowledge clamp (mirror of emit tool).
+fn _op_ceiling(host: string) -> int {
+    if host == "ubu1" { return 70 }
+    if host == "ubu2" { return 70 }
+    return 100
+}
+
+// Returns suggested int threshold (the "recomputed" value) for a host.
+// `current` is the global default (80) the emit tool uses as its baseline.
+fn _suggest_int(host: string, count: int, p95: float, maxv: float, rej_ratio: float, current: int) -> int {
+    let min_samples = 50
+    if count < min_samples { return current }   // caller treats INSUFFICIENT separately
+    let mut suggested = current
+    let generous_cut = current - 20
+    if rej_ratio > 0.10 {
+        let cap = 95
+        let raw = _round(p95 + 5.0)
+        suggested = _min_int(cap, _max_int(current, raw))
+    } else if maxv < (generous_cut + 0.0) {
+        let raw = _round(maxv + 10.0)
+        suggested = _max_int(30, raw)
+    }
+    let ceil = _op_ceiling(host)
+    if suggested > ceil { suggested = ceil }
+    return suggested
+}
+
+// Single-pass awk: per-host count, p95, max, rej_ratio (ts host psi thr outcome reason src).
+fn _stats_tsv(log: string) -> string {
+    let awk_prog =
+        "BEGIN { OFS=\"\\t\" }\n" +
+        "{\n" +
+        "  h=$2; psi=$3+0.0; oc=$5;\n" +
+        "  cnt[h]++; vals[h, cnt[h]] = psi;\n" +
+        "  if (oc==\"accept\") acc[h]++; if (oc==\"reject\") rej[h]++;\n" +
+        "  if (cnt[h]==1 || psi>maxv[h]) maxv[h]=psi;\n" +
+        "}\n" +
+        "function pct(arr, n, p,    idx) {\n" +
+        "  idx = int((p/100.0) * (n-1)) + 1;\n" +
+        "  if (idx<1) idx=1; if (idx>n) idx=n;\n" +
+        "  return arr[idx];\n" +
+        "}\n" +
+        "END {\n" +
+        "  for (h in cnt) {\n" +
+        "    n=cnt[h];\n" +
+        "    delete a;\n" +
+        "    for (i=1; i<=n; i++) a[i]=vals[h,i];\n" +
+        "    for (i=2; i<=n; i++) { v=a[i]; j=i-1;\n" +
+        "      while (j>=1 && a[j]>v) { a[j+1]=a[j]; j--; } a[j+1]=v; }\n" +
+        "    print h, n, pct(a,n,95), maxv[h], acc[h]+0, rej[h]+0;\n" +
+        "  }\n" +
+        "}\n"
+    let awk_file = "/tmp/psi_calibration_drift_" + exec("date +%s").trim() + "_" + exec("printf %d $$").trim() + ".awk"
+    exec("cat > " + awk_file + " <<'__PCD_EOF__'\n" + awk_prog + "__PCD_EOF__")
+    let out = exec("awk -F '\\t' -f " + awk_file + " " + log + " 2>/dev/null")
+    exec("rm -f " + awk_file)
+    return out
+}
+
+fn _now_epoch() -> int {
+    let s = exec("date +%s").trim()
+    let mut v = 0
+    try { v = to_int(s) } catch e {}
+    return v
+}
+
+fn _mtime(path: string) -> int {
+    let exists = exec("test -f " + path + " && echo 1 || echo 0").trim()
+    if exists != "1" { return 0 }
+    let bsd = exec("stat -f %m " + path + " 2>/dev/null").trim()
+    if bsd.len() > 0 {
+        let mut v = 0
+        try { v = to_int(bsd) } catch e {}
+        if v > 0 { return v }
+    }
+    let gnu = exec("stat -c %Y " + path + " 2>/dev/null").trim()
+    let mut v = 0
+    try { v = to_int(gnu) } catch e {}
+    return v
+}
+
+// Lowercase a string via tr.
+fn _lower(s: string) -> string {
+    return exec("printf '%s' '" + s + "' | tr '[:upper:]' '[:lower:]'").trim()
+}
+
+// Latest log timestamp in epoch seconds. Returns 0 if log empty / unparseable.
+fn _log_max_ts(log: string) -> int {
+    // ts is column 1 in ISO-8601 UTC ("...Z"). Use sort + tail + date -j -f.
+    let last = exec("awk -F '\\t' '{print $1}' " + log + " 2>/dev/null | sort | tail -n 1").trim()
+    if last.len() == 0 { return 0 }
+    // BSD date: -j -f "%Y-%m-%dT%H:%M:%SZ" -u
+    let bsd = exec("date -j -u -f '%Y-%m-%dT%H:%M:%SZ' '" + last + "' '+%s' 2>/dev/null").trim()
+    if bsd.len() > 0 {
+        let mut v = 0
+        try { v = to_int(bsd) } catch e {}
+        if v > 0 { return v }
+    }
+    // GNU date fallback.
+    let gnu = exec("date -u -d '" + last + "' '+%s' 2>/dev/null").trim()
+    let mut v = 0
+    try { v = to_int(gnu) } catch e {}
+    return v
+}
+
+fn _print_help() {
+    println("psi_calibration_drift.hexa — ω-network-8 PSI calibration drift detector")
+    println("")
+    println("USAGE:")
+    println("  hexa run tool/psi_calibration_drift.hexa")
+    println("  hexa run tool/psi_calibration_drift.hexa --json")
+    println("  hexa run tool/psi_calibration_drift.hexa --cache PATH --log PATH")
+    println("  hexa run tool/psi_calibration_drift.hexa --drift-threshold 15 --stale-threshold 40")
+    println("")
+    println("FLAGS:")
+    println("  --cache PATH          cache TSV (default state/psi_calibration_active.tsv)")
+    println("  --log PATH            psi log (default /tmp/hexa_remote_psi.log)")
+    println("  --drift-threshold P   pct above which a host is 'drift'  (default 10)")
+    println("  --stale-threshold P   pct above which a host is 'stale'  (default 30)")
+    println("  --quiet               suppress per-host table")
+    println("  --json                emit JSON object instead of table")
+    println("  --help                this help")
+    println("")
+    println("Sentinel (always last line of stdout):")
+    println("  __PSI_DRIFT__ <FRESH|DRIFT|STALE|SKIP|INSUFFICIENT> hosts=N max_drift_pct=X [...]")
+}
+
+fn _abs_f(x: float) -> float { if x < 0.0 { return 0.0 - x } else { return x } }
+
+// Format a float to 2 decimals.
+fn _fmt2(x: float) -> string {
+    return exec("awk 'BEGIN{printf \"%.2f\", " + to_string(x) + "}'").trim()
+}
+
+fn main() {
+    if _has_flag("--help") || _has_flag("-h") {
+        _print_help()
+        return
+    }
+    let cache = _cache_path()
+    let log = _log_path()
+    let drift_thr = _drift_threshold()
+    let stale_thr = _stale_threshold()
+    let quiet = _has_flag("--quiet")
+    let json_out = _has_flag("--json")
+
+    let cache_exists = exec("test -f " + cache + " && echo 1 || echo 0").trim()
+    if cache_exists != "1" {
+        println("__PSI_DRIFT__ SKIP reason=cache_missing path=" + cache)
+        return
+    }
+    let log_exists = exec("test -f " + log + " && echo 1 || echo 0").trim()
+    if log_exists != "1" {
+        println("__PSI_DRIFT__ SKIP reason=log_missing path=" + log)
+        return
+    }
+
+    // Read cache → map host_lower → cached threshold int (skip "*" default + comments).
+    let body = exec("cat " + cache + " 2>/dev/null")
+    let lines = body.split("\n")
+    let mut cache_hosts: [str] = []         // lowercased host names
+    let mut cache_thr: [str] = []           // parallel array of cached thr (string-int)
+    let mut cache_orig_host: [str] = []     // parallel array of as-stored case
+    let mut idx = 0
+    while idx < lines.len() {
+        let ln = lines[idx]
+        idx = idx + 1
+        if ln.len() == 0 { continue }
+        if ln.starts_with("#") { continue }
+        let f = ln.split("\t")
+        if f.len() < 4 { continue }
+        let host = f[1]
+        if host == "*" { continue }
+        let thr_s = f[2]
+        cache_orig_host = cache_orig_host + [host]
+        cache_hosts = cache_hosts + [_lower(host)]
+        cache_thr = cache_thr + [thr_s]
+    }
+    if cache_hosts.len() == 0 {
+        println("__PSI_DRIFT__ SKIP reason=cache_empty path=" + cache)
+        return
+    }
+
+    // Read log stats.
+    let stats = _stats_tsv(log)
+    let stat_lines = stats.split("\n")
+    let mut log_hosts: [str] = []           // lowercased
+    let mut log_count: [str] = []
+    let mut log_p95: [str] = []
+    let mut log_max: [str] = []
+    let mut log_acc: [str] = []
+    let mut log_rej: [str] = []
+    let mut k = 0
+    while k < stat_lines.len() {
+        let ln = stat_lines[k]
+        k = k + 1
+        if ln.len() == 0 { continue }
+        let f = ln.split("\t")
+        if f.len() < 6 { continue }
+        log_hosts = log_hosts + [_lower(f[0])]
+        log_count = log_count + [f[1]]
+        log_p95 = log_p95 + [f[2]]
+        log_max = log_max + [f[3]]
+        log_acc = log_acc + [f[4]]
+        log_rej = log_rej + [f[5]]
+    }
+
+    // Cache age vs log span check (STALE if cache older than newest log row).
+    let cache_mt = _mtime(cache)
+    let log_max_ts = _log_max_ts(log)
+    let cache_older_than_log = cache_mt > 0 && log_max_ts > 0 && cache_mt < log_max_ts
+
+    // Per-host drift table.
+    let mut max_drift = 0.0
+    let mut stale_hosts: [str] = []
+    let mut drift_hosts: [str] = []
+    let mut insufficient_hosts: [str] = []
+    let mut json_entries: [str] = []
+    let mut new_hosts: [str] = []
+    let mut table_rows: [str] = []
+
+    // Iterate cache hosts (primary axis).
+    let mut i = 0
+    while i < cache_hosts.len() {
+        let host_lc = cache_hosts[i]
+        let host_disp = cache_orig_host[i]
+        let mut cached_thr = 80
+        try { cached_thr = to_int(cache_thr[i]) } catch e {}
+
+        // Look up matching log host.
+        let mut found = -1
+        let mut j = 0
+        while j < log_hosts.len() {
+            if log_hosts[j] == host_lc { found = j; j = log_hosts.len() } else { j = j + 1 }
+        }
+
+        if found < 0 {
+            // Host in cache but not in current log → can't compute drift; treat as
+            // insufficient (still reported in table).
+            insufficient_hosts = insufficient_hosts + [host_lc]
+            if !quiet && !json_out {
+                table_rows = table_rows + [host_disp + "\t" + to_string(cached_thr) + "\t-\t-\tinsufficient(no_log_rows)"]
+            }
+            if json_out {
+                json_entries = json_entries + ["{\"host\":\"" + host_lc + "\",\"cached\":" + to_string(cached_thr) + ",\"recomputed\":null,\"drift_pct\":null,\"verdict\":\"insufficient\",\"reason\":\"no_log_rows\"}"]
+            }
+            i = i + 1
+            continue
+        }
+
+        let mut count = 0; try { count = to_int(log_count[found]) } catch e {}
+        let mut p95 = 0.0; try { p95 = to_float(log_p95[found]) } catch e {}
+        let mut maxv = 0.0; try { maxv = to_float(log_max[found]) } catch e {}
+        let mut acc_c = 0; try { acc_c = to_int(log_acc[found]) } catch e {}
+        let mut rej_c = 0; try { rej_c = to_int(log_rej[found]) } catch e {}
+        let rr = if count > 0 { (rej_c + 0.0) / (count + 0.0) } else { 0.0 }
+
+        if count < 50 {
+            insufficient_hosts = insufficient_hosts + [host_lc]
+            if !quiet && !json_out {
+                table_rows = table_rows + [host_disp + "\t" + to_string(cached_thr) + "\t-\t-\tinsufficient(samples=" + to_string(count) + ")"]
+            }
+            if json_out {
+                json_entries = json_entries + ["{\"host\":\"" + host_lc + "\",\"cached\":" + to_string(cached_thr) + ",\"recomputed\":null,\"drift_pct\":null,\"samples\":" + to_string(count) + ",\"verdict\":\"insufficient\",\"reason\":\"samples<50\"}"]
+            }
+            i = i + 1
+            continue
+        }
+
+        let recomputed = _suggest_int(host_lc, count, p95, maxv, rr, 80)
+        let cached_f = cached_thr + 0.0
+        let recomp_f = recomputed + 0.0
+        let drift_pct = if cached_f > 0.0 { _abs_f(cached_f - recomp_f) / cached_f * 100.0 } else { 0.0 }
+        if drift_pct > max_drift { max_drift = drift_pct }
+
+        let mut verdict = "ok"
+        if drift_pct > stale_thr {
+            verdict = "stale"
+            stale_hosts = stale_hosts + [host_lc]
+        } else if drift_pct > drift_thr {
+            verdict = "drift"
+            drift_hosts = drift_hosts + [host_lc]
+        }
+
+        if !quiet && !json_out {
+            table_rows = table_rows + [host_disp + "\t" + to_string(cached_thr) + "\t" + to_string(recomputed) + "\t" + _fmt2(drift_pct) + "%\t" + verdict]
+        }
+        if json_out {
+            json_entries = json_entries + ["{\"host\":\"" + host_lc + "\",\"cached\":" + to_string(cached_thr) + ",\"recomputed\":" + to_string(recomputed) + ",\"drift_pct\":" + _fmt2(drift_pct) + ",\"samples\":" + to_string(count) + ",\"verdict\":\"" + verdict + "\"}"]
+        }
+        i = i + 1
+    }
+
+    // Detect new hosts in log not in cache (with sufficient samples).
+    let mut li = 0
+    while li < log_hosts.len() {
+        let lh = log_hosts[li]
+        let mut in_cache = false
+        let mut ci = 0
+        while ci < cache_hosts.len() {
+            if cache_hosts[ci] == lh { in_cache = true; ci = cache_hosts.len() } else { ci = ci + 1 }
+        }
+        if !in_cache {
+            let mut cnt = 0; try { cnt = to_int(log_count[li]) } catch e {}
+            if cnt >= 50 {
+                new_hosts = new_hosts + [lh]
+                if !quiet && !json_out {
+                    table_rows = table_rows + [lh + "\t-\t-\t-\tnew_in_log(samples=" + to_string(cnt) + ")"]
+                }
+                if json_out {
+                    json_entries = json_entries + ["{\"host\":\"" + lh + "\",\"cached\":null,\"recomputed\":null,\"drift_pct\":null,\"samples\":" + to_string(cnt) + ",\"verdict\":\"new_in_log\"}"]
+                }
+            }
+        }
+        li = li + 1
+    }
+
+    // ---- Render table (non-quiet, non-json) -----------------------------------
+    if !quiet && !json_out {
+        println("# psi_calibration_drift (ω-network-8) — cache=" + cache + " log=" + log)
+        println("# drift_threshold=" + _fmt2(drift_thr) + "% stale_threshold=" + _fmt2(stale_thr) + "%")
+        println("HOST\tCACHED\tRECOMPUTED\tDRIFT_PCT\tVERDICT")
+        let mut t = 0
+        while t < table_rows.len() {
+            println(table_rows[t])
+            t = t + 1
+        }
+    }
+
+    // ---- Compute final verdict ------------------------------------------------
+    let mut final_verdict = "FRESH"
+    let mut reasons: [str] = []
+    if stale_hosts.len() > 0 {
+        final_verdict = "STALE"
+        reasons = reasons + ["drift>stale_thr"]
+    }
+    if new_hosts.len() > 0 {
+        final_verdict = "STALE"
+        reasons = reasons + ["new_hosts_in_log"]
+    }
+    if cache_older_than_log {
+        // Only escalate to STALE if not already STALE; this is a soft signal.
+        if final_verdict == "FRESH" || final_verdict == "DRIFT" {
+            final_verdict = "STALE"
+        }
+        reasons = reasons + ["cache_mtime<log_max_ts"]
+    }
+    if final_verdict == "FRESH" && drift_hosts.len() > 0 {
+        final_verdict = "DRIFT"
+    }
+
+    let total_hosts = cache_hosts.len()
+    let mut sentinel = "__PSI_DRIFT__ " + final_verdict + " hosts=" + to_string(total_hosts) +
+        " max_drift_pct=" + _fmt2(max_drift)
+    if drift_hosts.len() > 0 {
+        sentinel = sentinel + " drift_hosts=" + to_string(drift_hosts.len())
+    }
+    if stale_hosts.len() > 0 {
+        sentinel = sentinel + " stale_hosts=" + to_string(stale_hosts.len())
+    }
+    if insufficient_hosts.len() > 0 {
+        sentinel = sentinel + " insufficient_hosts=" + to_string(insufficient_hosts.len())
+    }
+    if new_hosts.len() > 0 {
+        sentinel = sentinel + " new_hosts=" + to_string(new_hosts.len())
+    }
+    if reasons.len() > 0 {
+        let mut r = ""
+        let mut ri = 0
+        while ri < reasons.len() {
+            if ri > 0 { r = r + "," }
+            r = r + reasons[ri]
+            ri = ri + 1
+        }
+        sentinel = sentinel + " reason=" + r
+    }
+
+    // ---- JSON emission --------------------------------------------------------
+    if json_out {
+        let mut s = "{\"cycle\":\"omega-network-8\",\"cache\":\"" + cache +
+            "\",\"log\":\"" + log + "\",\"drift_threshold_pct\":" + _fmt2(drift_thr) +
+            ",\"stale_threshold_pct\":" + _fmt2(stale_thr) +
+            ",\"max_drift_pct\":" + _fmt2(max_drift) +
+            ",\"verdict\":\"" + final_verdict + "\",\"hosts\":["
+        let mut k2 = 0
+        while k2 < json_entries.len() {
+            if k2 > 0 { s = s + "," }
+            s = s + json_entries[k2]
+            k2 = k2 + 1
+        }
+        s = s + "]}"
+        println(s)
+    }
+
+    println(sentinel)
+}
