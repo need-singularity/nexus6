@@ -1,0 +1,342 @@
+// tool/psi_calibration_cache.hexa — ω-network-6: cached PSI calibration applier.
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+//
+// Wraps tool/psi_calibrate_emit.hexa (ω-network-5, commit 97c65c8a) so per-host
+// calibration can be applied WITHOUT operators manually re-running the analyzer.
+// Maintains a cached applied-calibration TSV (state/psi_calibration_active.tsv)
+// that is the SSOT for "what thresholds are currently in force" — separate from
+// hexa_remote so we can iterate without parallel-session collision.
+//
+// Cache file (state/psi_calibration_active.tsv):
+//   # psi_calibration_active.tsv — applied per-host PSI thresholds (ω-network-6)
+//   # ts<TAB>host<TAB>threshold<TAB>source
+//   2026-04-26T11:30:00Z	ubu1	64	calibrated
+//   2026-04-26T11:30:00Z	*	80	default
+// `source` ∈ {calibrated, default, fallback}.
+//
+// Subcommands (parsed positionally; flags accepted at any position):
+//   (default)        Refresh cache if stale (>24h) or missing, then emit env exports.
+//   --refresh-force  Force refresh regardless of cache age.
+//   --print-only     Emit current cache contents as env exports without refreshing.
+//   --json           Emit cache as JSON object to stdout.
+//   --help           Usage text + exit 0.
+//
+// Sentinel (printed to stdout AFTER env exports unless --print-only/--json suppress):
+//   __PSI_CALIBRATION__ <FRESH|STALE|REFRESHED|FALLBACK> hosts=<N> cache_age_min=<M>
+//
+// Pre-flight failures (psi_calibrate_emit.hexa missing OR /tmp/hexa_remote_psi.log
+// missing/empty) → degrade to FALLBACK mode emitting only the global default
+// (HEXA_REMOTE_PSI_THRESHOLD=80) and STALE/FALLBACK sentinel.
+//
+// Scope:
+//   - hexa-only-suffix compliant (.hexa).
+//   - NO modification of scripts/bin/hexa_remote (parallel-session-active per brief).
+//   - NO writes to /tmp/hexa_remote_psi.log (READ-ONLY per constraints).
+//   - Cache TSV write is the only mutation.
+//
+// Operator usage (intended end state):
+//   eval "$(hexa run tool/psi_calibration_cache.hexa)"      # auto-refresh-if-stale
+//   hexa run tool/psi_calibration_cache.hexa --refresh-force # force regen + emit
+//   hexa run tool/psi_calibration_cache.hexa --print-only   # cheap re-source
+//
+// Exit codes:
+//   0 success (env exports + sentinel emitted; FRESH/STALE/REFRESHED/FALLBACK)
+//   2 --print-only requested but cache file missing
+//   3 --json requested but cache file missing AND refresh failed
+
+fn _repo_root() -> string {
+    // Tool resolves paths relative to the nexus repo root regardless of CWD.
+    let r = exec("git -C /Users/ghost/core/nexus rev-parse --show-toplevel 2>/dev/null").trim()
+    if r.len() > 0 { return r }
+    return "/Users/ghost/core/nexus"
+}
+
+fn _cache_path() -> string {
+    let p = env("PSI_CALIBRATION_CACHE")
+    if p.len() > 0 { return p }
+    return _repo_root() + "/state/psi_calibration_active.tsv"
+}
+
+fn _emit_tool_path() -> string {
+    return _repo_root() + "/tool/psi_calibrate_emit.hexa"
+}
+
+fn _psi_log_path() -> string {
+    let p = env("HEXA_REMOTE_PSI_LOG")
+    if p.len() > 0 { return p }
+    return "/tmp/hexa_remote_psi.log"
+}
+
+fn _hexa_bin() -> string {
+    let h = env("HEXA_BIN")
+    if h.len() > 0 { return h }
+    let w = exec("command -v hexa 2>/dev/null").trim()
+    if w.len() > 0 { return w }
+    return "/Users/ghost/core/hexa-lang/hexa"
+}
+
+fn _has_flag(needle: string) -> bool {
+    let av = args()
+    let mut i = 0
+    while i < av.len() {
+        if av[i] == needle { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _ttl_seconds() -> int {
+    let s = env("PSI_CALIBRATION_TTL_SEC")
+    if s.len() > 0 {
+        let mut v = 0
+        try { v = to_int(s) } catch e {}
+        if v > 0 { return v }
+    }
+    return 86400  // 24h default
+}
+
+fn _now_iso() -> string {
+    return exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+// Returns mtime epoch seconds (0 if file missing).
+fn _mtime(path: string) -> int {
+    let exists = exec("test -f " + path + " && echo 1 || echo 0").trim()
+    if exists != "1" { return 0 }
+    // BSD stat (macOS) and GNU stat differ; use date-portable wrapper.
+    let bsd = exec("stat -f %m " + path + " 2>/dev/null").trim()
+    if bsd.len() > 0 {
+        let mut v = 0
+        try { v = to_int(bsd) } catch e {}
+        if v > 0 { return v }
+    }
+    let gnu = exec("stat -c %Y " + path + " 2>/dev/null").trim()
+    let mut v = 0
+    try { v = to_int(gnu) } catch e {}
+    return v
+}
+
+fn _now_epoch() -> int {
+    let s = exec("date +%s").trim()
+    let mut v = 0
+    try { v = to_int(s) } catch e {}
+    return v
+}
+
+// Normalize a host name to ENV-var-safe upper alnum/_ token (mirrors emit tool).
+fn _host_norm(h: string) -> string {
+    return exec("printf '%s' '" + h + "' | tr '[:lower:]' '[:upper:]' | tr -c '[:alnum:]_' '_'").trim()
+}
+
+// Run psi_calibrate_emit --env-only and write the active TSV. Returns row count
+// (0 means refresh failed / no exports; caller decides FALLBACK vs error).
+fn _refresh_cache() -> int {
+    let emit_tool = _emit_tool_path()
+    let log = _psi_log_path()
+    let cache = _cache_path()
+
+    let emit_exists = exec("test -f " + emit_tool + " && echo 1 || echo 0").trim()
+    let log_exists = exec("test -f " + log + " && echo 1 || echo 0").trim()
+    if emit_exists != "1" || log_exists != "1" {
+        // Pre-flight failure → write fallback cache row (default80 only) and return 0.
+        let now = _now_iso()
+        let mut buf = "# psi_calibration_active.tsv — applied per-host PSI thresholds (ω-network-6)\n"
+        buf = buf + "# ts\thost\tthreshold\tsource\n"
+        buf = buf + now + "\t*\t80\tfallback\n"
+        // mkdir -p and write atomically.
+        let dir = exec("dirname " + cache).trim()
+        exec("mkdir -p " + dir)
+        let tmp = cache + ".tmp." + to_string(_now_epoch())
+        exec("cat > " + tmp + " <<'__PCC_EOF__'\n" + buf + "__PCC_EOF__")
+        exec("mv " + tmp + " " + cache)
+        return 0
+    }
+
+    let bin = _hexa_bin()
+    let env_out = exec(bin + " run " + emit_tool + " --env-only 2>/dev/null")
+    let lines = env_out.split("\n")
+
+    let now = _now_iso()
+    let mut buf = "# psi_calibration_active.tsv — applied per-host PSI thresholds (ω-network-6)\n"
+    buf = buf + "# ts\thost\tthreshold\tsource\n"
+    // Always write a "*" default row first so consumers have a guaranteed fallback.
+    buf = buf + now + "\t*\t80\tdefault\n"
+    let mut rows = 0
+    let mut idx = 0
+    while idx < lines.len() {
+        let ln = lines[idx]
+        idx = idx + 1
+        if ln.len() == 0 { continue }
+        // Expected line shape: export HEXA_REMOTE_PSI_THRESHOLD_<HOST>=<int>  # <flag> <reason>
+        if !ln.contains("HEXA_REMOTE_PSI_THRESHOLD_") { continue }
+        // Extract HOST and INT via shell parameter expansion (sweeper-safe — read-only ops).
+        let host_norm = exec("printf '%s' '" + ln + "' | sed -n 's/^export HEXA_REMOTE_PSI_THRESHOLD_\\([A-Z0-9_]*\\)=.*/\\1/p'").trim()
+        let val = exec("printf '%s' '" + ln + "' | sed -n 's/^export HEXA_REMOTE_PSI_THRESHOLD_[A-Z0-9_]*=\\([0-9]*\\).*/\\1/p'").trim()
+        if host_norm.len() == 0 { continue }
+        if val.len() == 0 { continue }
+        buf = buf + now + "\t" + host_norm + "\t" + val + "\tcalibrated\n"
+        rows = rows + 1
+    }
+
+    let dir = exec("dirname " + cache).trim()
+    exec("mkdir -p " + dir)
+    let tmp = cache + ".tmp." + to_string(_now_epoch())
+    exec("cat > " + tmp + " <<'__PCC_EOF__'\n" + buf + "__PCC_EOF__")
+    exec("mv " + tmp + " " + cache)
+    return rows
+}
+
+// Read cache, emit env exports for sourceable use. Returns [host_count, has_default].
+fn _emit_from_cache() -> [str] {
+    let cache = _cache_path()
+    let exists = exec("test -f " + cache + " && echo 1 || echo 0").trim()
+    if exists != "1" { return ["0", "0"] }
+    let body = exec("cat " + cache + " 2>/dev/null")
+    let lines = body.split("\n")
+    let mut hosts = 0
+    let mut has_default = 0
+    let mut idx = 0
+    while idx < lines.len() {
+        let ln = lines[idx]
+        idx = idx + 1
+        if ln.len() == 0 { continue }
+        if ln.starts_with("#") { continue }
+        let f = ln.split("\t")
+        if f.len() < 4 { continue }
+        let host = f[1]
+        let thr = f[2]
+        let src = f[3]
+        if host == "*" {
+            // Emit global default only when source is default/fallback (NEVER override existing).
+            if src == "default" || src == "fallback" {
+                println("export HEXA_REMOTE_PSI_THRESHOLD=" + thr + "  # ω-network-6 " + src)
+                has_default = 1
+            }
+            continue
+        }
+        println("export HEXA_REMOTE_PSI_THRESHOLD_" + host + "=" + thr + "  # ω-network-6 " + src)
+        hosts = hosts + 1
+    }
+    return [to_string(hosts), to_string(has_default)]
+}
+
+fn _emit_json() -> bool {
+    let cache = _cache_path()
+    let exists = exec("test -f " + cache + " && echo 1 || echo 0").trim()
+    if exists != "1" { return false }
+    let body = exec("cat " + cache + " 2>/dev/null")
+    let lines = body.split("\n")
+    let mut entries: [str] = []
+    let mut ts_first = ""
+    let mut idx = 0
+    while idx < lines.len() {
+        let ln = lines[idx]
+        idx = idx + 1
+        if ln.len() == 0 { continue }
+        if ln.starts_with("#") { continue }
+        let f = ln.split("\t")
+        if f.len() < 4 { continue }
+        if ts_first.len() == 0 { ts_first = f[0] }
+        let je = "{\"ts\":\"" + f[0] + "\",\"host\":\"" + f[1] +
+            "\",\"threshold\":" + f[2] + ",\"source\":\"" + f[3] + "\"}"
+        entries = entries + [je]
+    }
+    let mut s = "{\"cycle\":\"omega-network-6\",\"cache_path\":\"" + cache +
+        "\",\"ts\":\"" + ts_first + "\",\"entries\":["
+    let mut k = 0
+    while k < entries.len() {
+        if k > 0 { s = s + "," }
+        s = s + entries[k]
+        k = k + 1
+    }
+    s = s + "]}"
+    println(s)
+    return true
+}
+
+fn _print_help() {
+    println("psi_calibration_cache.hexa — ω-network-6 cached PSI calibration applier")
+    println("")
+    println("USAGE:")
+    println("  eval \"$(hexa run tool/psi_calibration_cache.hexa)\"           # auto-refresh-if-stale")
+    println("  hexa run tool/psi_calibration_cache.hexa --refresh-force      # force regen")
+    println("  hexa run tool/psi_calibration_cache.hexa --print-only         # emit cached exports only")
+    println("  hexa run tool/psi_calibration_cache.hexa --json               # emit cache as JSON")
+    println("  hexa run tool/psi_calibration_cache.hexa --help               # this help")
+    println("")
+    println("ENV:")
+    println("  PSI_CALIBRATION_CACHE      override cache path (default state/psi_calibration_active.tsv)")
+    println("  PSI_CALIBRATION_TTL_SEC    cache TTL in seconds (default 86400 = 24h)")
+    println("  HEXA_REMOTE_PSI_LOG        override psi log (default /tmp/hexa_remote_psi.log)")
+    println("  HEXA_BIN                   override hexa binary path")
+    println("")
+    println("Sentinel (stderr-style stdout marker, AFTER exports, except --print-only/--json):")
+    println("  __PSI_CALIBRATION__ <FRESH|STALE|REFRESHED|FALLBACK> hosts=<N> cache_age_min=<M>")
+}
+
+fn main() {
+    if _has_flag("--help") || _has_flag("-h") {
+        _print_help()
+        return
+    }
+    let force = _has_flag("--refresh-force")
+    let print_only = _has_flag("--print-only")
+    let json_out = _has_flag("--json")
+
+    let cache = _cache_path()
+    let now = _now_epoch()
+    let mt = _mtime(cache)
+    let age_sec = if mt > 0 { now - mt } else { -1 }
+    let ttl = _ttl_seconds()
+
+    if json_out {
+        // For JSON: refresh if missing; otherwise emit current.
+        if mt == 0 {
+            let r = _refresh_cache()
+            // r==0 → FALLBACK row written; still emit JSON below.
+            let _u = r
+        }
+        let ok = _emit_json()
+        if !ok { exit(3) }
+        return
+    }
+
+    if print_only {
+        if mt == 0 {
+            eprintln("psi_calibration_cache: cache missing and --print-only requested: " + cache)
+            exit(2)
+        }
+        let res = _emit_from_cache()
+        let hosts = res[0]
+        let age_min = if age_sec >= 0 { age_sec / 60 } else { -1 }
+        let verdict = if age_sec >= 0 && age_sec <= ttl { "FRESH" } else { "STALE" }
+        println("__PSI_CALIBRATION__ " + verdict + " hosts=" + hosts + " cache_age_min=" + to_string(age_min))
+        return
+    }
+
+    // Default flow — refresh if missing, stale, or forced.
+    let need_refresh = force || mt == 0 || age_sec > ttl
+    let mut verdict = "FRESH"
+    if need_refresh {
+        let rows = _refresh_cache()
+        if rows == 0 {
+            // Refresh ran but no calibrated rows (pre-flight failure or empty emit) → FALLBACK.
+            verdict = "FALLBACK"
+        } else {
+            verdict = "REFRESHED"
+        }
+    } else if age_sec > ttl {
+        verdict = "STALE"
+    }
+
+    let res = _emit_from_cache()
+    let hosts = res[0]
+    let new_mt = _mtime(cache)
+    let new_age_sec = if new_mt > 0 { _now_epoch() - new_mt } else { -1 }
+    let age_min = if new_age_sec >= 0 { new_age_sec / 60 } else { -1 }
+    println("__PSI_CALIBRATION__ " + verdict + " hosts=" + hosts + " cache_age_min=" + to_string(age_min))
+}
+
+main()
