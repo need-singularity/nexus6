@@ -1,0 +1,502 @@
+// tool/kick_bench.hexa — kick(ω-cycle) cross-backend perf bench.
+//
+// @tool(slug="kick_bench", desc="run the same topic across all registered backends, capture 5 perf axes (wall_time_ms, cost_usd, tier_1_count, falsifier_coverage_pct, dedup_ratio_vs_prior), write state/kick/bench/<date>_<topic-slug>.jsonl")
+// @usage(hexa /Users/ghost/core/nexus/tool/kick_bench.hexa <topic> [--backends a,b,c] [--dry-run] [--parent-sid <sid>])
+// @omega-saturation-exempt("benchmarking utility — single-pass measurement; convergence is the kicks, not the bench")
+// @exit_codes(0=ok, 1=usage/io error, 2=bench-fired-with-failures)
+//
+// raw 80 sentinel: __KICK_BENCH__ <PASS|FAIL> backends=<N> witnesses=<N>
+// raw 66 err:     reason=<slug> fix=<directive>
+//
+// Dedup ratio = 1.0 - jaccard(this_witness.tier_1_slugs, last_witness_for_same_topic.tier_1_slugs).
+// Inside-the-well detector: a backend that re-promotes the same Tier-1s on repeated kicks
+// has dedup_ratio ≈ 0 (recombination, not exploration).
+
+fn _now_iso_utc() -> str { return exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim() }
+fn _now_unix_ms() -> i64 {
+    let s = exec("date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))'").trim()
+    let mut v: i64 = 0
+    try { v = to_int(s) } catch e { v = 0 }
+    return v
+}
+
+fn _file_exists(path: str) -> bool { return exec("test -f '" + path + "' && echo y || echo n").trim() == "y" }
+fn _dir_exists(path: str) -> bool { return exec("test -d '" + path + "' && echo y || echo n").trim() == "y" }
+fn _ensure_dir(path: str) { let _ = exec("mkdir -p '" + path + "'") }
+fn _shell_quote(s: str) -> str { return "'" + s.replace("'", "'\\''") + "'" }
+
+fn _hexa_bin() -> str {
+    let h = env("HEXA")
+    if h.len() > 0 { return h }
+    let cands = [env("HOME") + "/.hx/bin/hexa", env("HOME") + "/core/hexa-lang/hexa"]
+    let mut i: i64 = 0
+    while i < len(cands) {
+        let c = cands[i]
+        if exec("[ -x '" + c + "' ] && echo y || echo n").trim() == "y" { return c }
+        i = i + 1
+    }
+    return "hexa"
+}
+
+fn _nexus_root() -> str {
+    let n = env("NEXUS")
+    if n.len() > 0 { return n }
+    let h = env("HOME") + "/core/nexus"
+    if _dir_exists(h) { return h }
+    return env("HOME") + "/Dev/nexus"
+}
+
+fn _registry_root() -> str { return _nexus_root() + "/state/kick/registry" }
+
+fn _list_files(dir: str) -> [str] {
+    if !_dir_exists(dir) { return [] }
+    let raw = exec("ls -1 '" + dir + "' 2>/dev/null | grep -v '^\\.' | sort").trim()
+    if raw.len() == 0 { return [] }
+    let parts = raw.split("\n")
+    let mut out: [str] = []
+    let mut i: i64 = 0
+    while i < len(parts) {
+        let p = parts[i].trim()
+        if p.len() > 0 && p.ends_with(".hexa") { out = out + [p] }
+        i = i + 1
+    }
+    return out
+}
+
+fn _registry_field(path: str, key: str) -> str {
+    if !_file_exists(path) { return "" }
+    let raw = read_file(path)
+    let lines = raw.split("\n")
+    let mut i: i64 = 0
+    while i < len(lines) {
+        let line = lines[i]
+        let trimmed = line.trim_start()
+        if trimmed.starts_with(key + " ") {
+            return trimmed.substring(key.len() + 1, trimmed.len()).trim()
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _slugify(s: str) -> str {
+    let lower = s.to_lower()
+    let mut out = ""
+    let mut i: i64 = 0
+    while i < lower.len() {
+        let c = lower.substring(i, i + 1)
+        let is_alnum = (c >= "a" && c <= "z") || (c >= "0" && c <= "9")
+        if is_alnum { out = out + c }
+        else { if out.len() > 0 && !out.ends_with("-") { out = out + "-" } }
+        i = i + 1
+    }
+    while out.ends_with("-") { out = out.substring(0, out.len() - 1) }
+    if out.len() > 60 { out = out.substring(0, 60) }
+    if out.len() == 0 { out = "topic" }
+    return out
+}
+
+// ─── dedup_ratio_vs_prior — jaccard over prior witnesses' Tier-1 sets ──
+// Algorithm (F17 dedup-jaccard-actual carry-forward):
+//   1. Glob design/kick/*_<topic-slug>_omega_cycle.json (any prior dates, any
+//      _vN suffix), exclude the current run's witness if present.
+//   2. For each prior witness, extract tier_1_promotions[*].id ∪ tier_1_implemented[*].id.
+//   3. Compute union of all prior Tier-1 ids = U_prior.
+//   4. ratio = |current ∩ U_prior| / |current ∪ U_prior|.
+//   5. If U_prior is empty (no prior witnesses for this slug): ratio = 0.0
+//      (fully novel — no overlap possible).
+//   6. If current Tier-1 set is empty: ratio = 0.0 (witness emitted no Tier-1s
+//      — nothing to compare; raw 66 trailer note attached by caller).
+//   7. Malformed prior witness (cannot extract trawl_id): silently skipped
+//      (graceful per raw 66 — non-blocking degradation).
+
+fn _slice_top_array_b(text: str, key: str) -> str {
+    let needle = "\"" + key + "\":"
+    let i = text.index_of(needle)
+    if i < 0 { return "" }
+    let mut j = i + needle.len()
+    while j < text.len() {
+        let c = text.substring(j, j + 1)
+        if c == "[" { break }
+        j = j + 1
+    }
+    if j >= text.len() { return "" }
+    let mut depth: i64 = 0
+    let mut k: i64 = j
+    let mut in_str = false
+    let mut esc = false
+    while k < text.len() {
+        let c = text.substring(k, k + 1)
+        if esc { esc = false; k = k + 1; continue }
+        if c == "\\" { esc = true; k = k + 1; continue }
+        if c == "\"" { in_str = !in_str; k = k + 1; continue }
+        if !in_str {
+            if c == "[" { depth = depth + 1 }
+            if c == "]" {
+                depth = depth - 1
+                if depth == 0 { return text.substring(j, k + 1) }
+            }
+        }
+        k = k + 1
+    }
+    return ""
+}
+
+fn _split_array_elements_b(arr_text: str) -> [str] {
+    let mut out: [str] = []
+    if arr_text.len() < 2 { return out }
+    let inner = arr_text.substring(1, arr_text.len() - 1)
+    let mut depth: i64 = 0
+    let mut start: i64 = -1
+    let mut i: i64 = 0
+    let mut in_str = false
+    let mut esc = false
+    while i < inner.len() {
+        let c = inner.substring(i, i + 1)
+        if esc { esc = false; i = i + 1; continue }
+        if c == "\\" { esc = true; i = i + 1; continue }
+        if c == "\"" { in_str = !in_str; i = i + 1; continue }
+        if !in_str {
+            if c == "{" {
+                if depth == 0 { start = i }
+                depth = depth + 1
+            } else if c == "}" {
+                depth = depth - 1
+                if depth == 0 && start >= 0 {
+                    out = out + [inner.substring(start, i + 1)]
+                    start = -1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _json_field_b(obj: str, key: str) -> str {
+    let needle = "\"" + key + "\":"
+    let i = obj.index_of(needle)
+    if i < 0 { return "" }
+    let mut j = i + needle.len()
+    while j < obj.len() {
+        let c = obj.substring(j, j + 1)
+        if c == " " || c == "\t" { j = j + 1 } else { break }
+    }
+    if j >= obj.len() { return "" }
+    let first = obj.substring(j, j + 1)
+    if first == "\"" {
+        let mut k = j + 1
+        let mut esc = false
+        while k < obj.len() {
+            let c = obj.substring(k, k + 1)
+            if esc { esc = false; k = k + 1; continue }
+            if c == "\\" { esc = true; k = k + 1; continue }
+            if c == "\"" { break }
+            k = k + 1
+        }
+        return obj.substring(j + 1, k)
+    }
+    let mut k = j
+    while k < obj.len() {
+        let c = obj.substring(k, k + 1)
+        if c == "," || c == "}" || c == "\n" { break }
+        k = k + 1
+    }
+    return obj.substring(j, k).trim()
+}
+
+fn _tier1_ids_from_witness(path: str) -> [str] {
+    let mut out: [str] = []
+    if !_file_exists(path) { return out }
+    let text = read_file(path)
+    let mut arr = _slice_top_array_b(text, "tier_1_promotions")
+    if arr.len() == 0 { arr = _slice_top_array_b(text, "tier_1_implemented") }
+    if arr.len() == 0 { return out }
+    let elems = _split_array_elements_b(arr)
+    let mut i: i64 = 0
+    while i < len(elems) {
+        let id = _json_field_b(elems[i], "id")
+        if id.len() > 0 { out = out + [id] }
+        i = i + 1
+    }
+    return out
+}
+
+// Glob design/kick/*_<topic_slug>_omega_cycle*.json — return absolute paths.
+// Excludes self_path if non-empty.
+fn _prior_witnesses(topic_slug: str, self_path: str) -> [str] {
+    let dir = _nexus_root() + "/design/kick"
+    if !_dir_exists(dir) { return [] }
+    // ls -1 + grep — match `*_<topic_slug>_omega_cycle*.json` (allow _vN suffix).
+    let pattern = topic_slug + "_omega_cycle"
+    let cmd = "ls -1 " + _shell_quote(dir) + " 2>/dev/null | grep -F " + _shell_quote(pattern) + " | grep -E '\\.json$' | sort"
+    let raw = exec(cmd).trim()
+    if raw.len() == 0 { return [] }
+    let parts = raw.split("\n")
+    let mut out: [str] = []
+    let mut i: i64 = 0
+    while i < len(parts) {
+        let p = parts[i].trim()
+        if p.len() == 0 { i = i + 1; continue }
+        let full = dir + "/" + p
+        if self_path.len() > 0 && full == self_path { i = i + 1; continue }
+        out = out + [full]
+        i = i + 1
+    }
+    return out
+}
+
+fn _str_in_set(s: str, set: [str]) -> bool {
+    let mut i: i64 = 0
+    while i < len(set) {
+        if set[i] == s { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _set_union(a: [str], b: [str]) -> [str] {
+    let mut out: [str] = a
+    let mut i: i64 = 0
+    while i < len(b) {
+        if !_str_in_set(b[i], out) { out = out + [b[i]] }
+        i = i + 1
+    }
+    return out
+}
+
+fn _set_intersection(a: [str], b: [str]) -> [str] {
+    let mut out: [str] = []
+    let mut i: i64 = 0
+    while i < len(a) {
+        if _str_in_set(a[i], b) { out = out + [a[i]] }
+        i = i + 1
+    }
+    return out
+}
+
+// dedup_ratio_vs_prior(topic_slug, current_witness_path) -> str (formatted float).
+// current_witness_path may be "" (live witness not yet landed) → ratio "0.0".
+fn _dedup_ratio_jaccard(topic_slug: str, current_witness_path: str) -> str {
+    let mut current_ids: [str] = []
+    if current_witness_path.len() > 0 {
+        current_ids = _tier1_ids_from_witness(current_witness_path)
+    }
+    let priors = _prior_witnesses(topic_slug, current_witness_path)
+    if len(priors) == 0 { return "0.0" }
+    let mut union_prior: [str] = []
+    let mut i: i64 = 0
+    while i < len(priors) {
+        let ids = _tier1_ids_from_witness(priors[i])
+        union_prior = _set_union(union_prior, ids)
+        i = i + 1
+    }
+    if len(current_ids) == 0 && len(union_prior) == 0 { return "0.0" }
+    let inter = _set_intersection(current_ids, union_prior)
+    let uni = _set_union(current_ids, union_prior)
+    if len(uni) == 0 { return "0.0" }
+    // Format as decimal with 4-digit precision: ratio = |inter| / |uni|.
+    let num = len(inter) * 10000
+    let denom = len(uni)
+    let q = num / denom
+    let whole = q / 10000
+    let frac = q - whole * 10000
+    let mut frac_s = to_string(frac)
+    while frac_s.len() < 4 { frac_s = "0" + frac_s }
+    return to_string(whole) + "." + frac_s
+}
+
+fn _all_backend_slugs() -> [str] {
+    let dir = _registry_root() + "/backends"
+    let files = _list_files(dir)
+    let mut out: [str] = []
+    let mut i: i64 = 0
+    while i < len(files) {
+        let path = dir + "/" + files[i]
+        let slug = _registry_field(path, "slug")
+        if slug.len() > 0 { out = out + [slug] }
+        i = i + 1
+    }
+    return out
+}
+
+fn _esc_json(s: str) -> str {
+    let mut r = s.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", "\\n")
+    r = r.replace("\r", "")
+    r = r.replace("\t", " ")
+    return r
+}
+
+fn _bench_record(topic: str, topic_slug: str, backend: str, wall_time_ms: i64, cost_usd: str, tier_1_count: i64, falsifier_coverage_pct: i64, dedup_ratio_vs_prior: str, status: str, witness: str, ts: str) -> str {
+    let mut p = "{"
+    p = p + "\"ts\":\"" + ts + "\""
+    p = p + ",\"topic\":\"" + _esc_json(topic) + "\""
+    p = p + ",\"topic_slug\":\"" + topic_slug + "\""
+    p = p + ",\"backend\":\"" + backend + "\""
+    p = p + ",\"wall_time_ms\":" + to_string(wall_time_ms)
+    p = p + ",\"cost_usd\":\"" + cost_usd + "\""
+    p = p + ",\"tier_1_count\":" + to_string(tier_1_count)
+    p = p + ",\"falsifier_coverage_pct\":" + to_string(falsifier_coverage_pct)
+    p = p + ",\"dedup_ratio_vs_prior\":\"" + dedup_ratio_vs_prior + "\""
+    p = p + ",\"status\":\"" + status + "\""
+    p = p + ",\"witness\":\"" + _esc_json(witness) + "\""
+    p = p + "}"
+    return p
+}
+
+fn _append_log(path: str, line: str) {
+    let dir_end = path.last_index_of("/")
+    if dir_end > 0 { _ensure_dir(path.substring(0, dir_end)) }
+    let tmp = path + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat " + _shell_quote(tmp) + " >> " + _shell_quote(path) + " && rm -f " + _shell_quote(tmp))
+}
+
+fn _usage() {
+    eprintln("usage: hexa tool/kick_bench.hexa <topic> [--backends a,b,c] [--dry-run] [--parent-sid <sid>]")
+    eprintln("  defaults: --backends auto-discovered from state/kick/registry/backends/")
+    eprintln("  raw 80: __KICK_BENCH__ <PASS|FAIL> backends=<N> witnesses=<N>")
+    eprintln("  raw 66: reason=<slug> fix=<directive>")
+}
+
+fn main() -> void {
+    let raw_args = args()
+    let mut user_start = 2
+    if raw_args.len() >= 3 && raw_args[1] == "run" { user_start = 3 }
+    let mut topic = ""
+    let mut backends_csv = ""
+    let mut dry_run = false
+    let mut parent_sid = env("HIVE_PARENT_SID")
+    let mut i = user_start
+    while i < raw_args.len() {
+        let a = raw_args[i]
+        if a == "--backends" { if i + 1 < raw_args.len() { backends_csv = raw_args[i + 1] }; i = i + 2; continue }
+        if a == "--dry-run" { dry_run = true; i = i + 1; continue }
+        if a == "--parent-sid" { if i + 1 < raw_args.len() { parent_sid = raw_args[i + 1] }; i = i + 2; continue }
+        if a == "--help" || a == "-h" { _usage(); exit(0) }
+        if a.starts_with("--") { i = i + 2; continue }
+        if topic.len() == 0 { topic = a }
+        i = i + 1
+    }
+    if topic.len() == 0 {
+        _usage()
+        eprintln("__KICK_BENCH__ FAIL backends=0 witnesses=0")
+        eprintln("reason=missing-topic fix=hexa tool/kick_bench.hexa \"<topic>\" [--dry-run]")
+        exit(1)
+    }
+
+    let mut backends: [str] = []
+    if backends_csv.len() > 0 {
+        let parts = backends_csv.split(",")
+        let mut k: i64 = 0
+        while k < len(parts) {
+            let p = parts[k].trim()
+            if p.len() > 0 { backends = backends + [p] }
+            k = k + 1
+        }
+    } else {
+        backends = _all_backend_slugs()
+    }
+    if len(backends) == 0 {
+        eprintln("__KICK_BENCH__ FAIL backends=0 witnesses=0")
+        eprintln("reason=no-backends-registered fix=ls " + _registry_root() + "/backends/   # registry empty")
+        exit(1)
+    }
+
+    let topic_slug = _slugify(topic)
+    let date_str = exec("date -u +%Y-%m-%d").trim()
+    let bench_log = _nexus_root() + "/state/kick/bench/" + date_str + "_" + topic_slug + ".jsonl"
+    _ensure_dir(_nexus_root() + "/state/kick/bench")
+
+    let dispatch_tool = _nexus_root() + "/tool/kick_dispatch.hexa"
+    if !_file_exists(dispatch_tool) {
+        eprintln("__KICK_BENCH__ FAIL backends=" + to_string(len(backends)) + " witnesses=0")
+        eprintln("reason=missing-kick-dispatch fix=verify " + dispatch_tool)
+        exit(1)
+    }
+
+    let mut witnesses_landed: i64 = 0
+    let mut bi: i64 = 0
+    while bi < len(backends) {
+        let backend = backends[bi]
+        let backend_path = _registry_root() + "/backends/" + backend + ".hexa"
+        if !_file_exists(backend_path) {
+            let rec = _bench_record(topic, topic_slug, backend, 0, "n/a", 0, 0, "n/a", "skip-unknown-backend", "", _now_iso_utc())
+            _append_log(bench_log, rec)
+            println(rec)
+            bi = bi + 1
+            continue
+        }
+        let cli_bin = _registry_field(backend_path, "cli-binary")
+
+        if dry_run {
+            // Show what we WOULD measure. Compute jaccard against on-disk priors
+            // even in dry-run — the algorithm is read-only and gives a real
+            // baseline number for F17 verification.
+            let dedup = _dedup_ratio_jaccard(topic_slug, "")
+            let rec = _bench_record(topic, topic_slug, backend, 0, "?", 0, 0, dedup, "dry-run", "", _now_iso_utc())
+            println("__KICK_BENCH_DRY__ backend=" + backend + " cli=" + cli_bin + " bench_log=" + bench_log + " dedup_ratio_vs_prior=" + dedup)
+            _append_log(bench_log, rec)
+            bi = bi + 1
+            continue
+        }
+
+        // Live run — invoke kick_dispatch.hexa with this backend slug.
+        let t0 = _now_unix_ms()
+        let mut cmd = _hexa_bin() + " run " + _shell_quote(dispatch_tool) + " " + _shell_quote(topic) + " --backend " + backend
+        if parent_sid.len() > 0 { cmd = cmd + " --parent-sid " + _shell_quote(parent_sid) }
+        let out = exec(cmd + " 2>&1; echo __RC=$?")
+        let t1 = _now_unix_ms()
+        let wall_ms = t1 - t0
+        // Parse rc and witness path from output.
+        let rc_idx = out.last_index_of("__RC=")
+        let mut rc: i64 = 0
+        if rc_idx >= 0 {
+            let tail = out.substring(rc_idx + 5, out.len()).trim()
+            try { rc = to_int(tail) } catch e { rc = 0 }
+        }
+        let mut witness_path = ""
+        let kw = "__KICK_RESULT__"
+        let ki = out.last_index_of(kw)
+        if ki >= 0 {
+            let after = out.substring(ki, out.len())
+            let wkey = "witness="
+            let wi = after.index_of(wkey)
+            if wi >= 0 {
+                let rest = after.substring(wi + wkey.len(), after.len())
+                let mut ee: i64 = 0
+                while ee < rest.len() {
+                    let c = rest.substring(ee, ee + 1)
+                    if c == " " || c == "\n" || c == "\t" { break }
+                    ee = ee + 1
+                }
+                witness_path = rest.substring(0, ee)
+            }
+        }
+        let status = if rc == 0 { "fire" } else { "fail" }
+        if witness_path.len() > 0 && _file_exists(witness_path) { witnesses_landed = witnesses_landed + 1 }
+        // dedup_ratio_vs_prior — F17 carry-forward. Real jaccard over prior
+        // witnesses for the same topic-slug. tier1_count + falsifier_coverage
+        // still deferred to post-hoc decoder (witness schema is JSON, hexa
+        // parser can be added in next cycle).
+        let dedup = _dedup_ratio_jaccard(topic_slug, witness_path)
+        let rec = _bench_record(topic, topic_slug, backend, wall_ms, "n/a", 0, 0, dedup, status, witness_path, _now_iso_utc())
+        _append_log(bench_log, rec)
+        println(rec)
+        bi = bi + 1
+    }
+
+    if dry_run {
+        println("__KICK_BENCH__ PASS backends=" + to_string(len(backends)) + " witnesses=0  (dry-run; bench_log=" + bench_log + ")")
+        exit(0)
+    }
+    if witnesses_landed < len(backends) {
+        println("__KICK_BENCH__ FAIL backends=" + to_string(len(backends)) + " witnesses=" + to_string(witnesses_landed))
+        eprintln("reason=partial-witness-landing fix=tail " + bench_log + "; check per-backend status field")
+        exit(2)
+    }
+    println("__KICK_BENCH__ PASS backends=" + to_string(len(backends)) + " witnesses=" + to_string(witnesses_landed))
+    exit(0)
+}

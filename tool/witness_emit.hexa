@@ -1,0 +1,298 @@
+#!hexa strict
+// tool/witness_emit.hexa — canonical helper: write ω-cycle witness JSON + auto-absorb.
+//
+// @tool(slug="witness_emit", desc="canonical write+absorb helper for *omega_cycle*.json witnesses. ALL ω-cycle emitters under <core>/{nexus,n6-architecture,anima} should call emit_witness(path, body) instead of writing the JSON directly. Atomically writes the file then invokes omega_cycle_atlas_ingest --witness <abs> so atlas.n6 absorbs in the same process. Triad layer 2 (agent-level) of own:atlas-absorb-mandatory — NOT a hook, just a single canonical entry point.")
+// @usage(hexa run tool/witness_emit.hexa --selftest)
+// @usage(hexa run tool/witness_emit.hexa --emit <abs_path> --body-file <abs_path> [--source <slug>])
+// @omega-converge(witness="fixpoint-convergence", attempts=1, attempt_log="own:atlas-absorb-mandatory triad layer 2: write + absorb in one call. Fixpoint = file_exists(path) AND ingest rc==0.")
+// @exit_codes(0=PASS, 1=usage/io, 2=ingest failure)
+// @sentinel(__WITNESS_EMIT__ <PASS|FAIL> path=<...> shard=<...> absorbed=<true|false>)
+//
+// claude-dependency: NONE — this tool runs without Claude Code session active.
+// hooks: NONE — no claude hooks, no git hooks, no fswatch. Caller invokes the
+//   exported emit_witness fn (or the CLI --emit form) explicitly. Bypass is
+//   detected by tool/atlas_absorb_lint.hexa (triad layer 3).
+//
+// raw 66 trailers on every error path (reason=<slug> fix=<directive>).
+// raw 80 sentinel: __WITNESS_EMIT__ <PASS|FAIL> path=<path> shard=<path> absorbed=<bool>.
+
+fn _core_root() -> string {
+    let override = env_var("NEXUS_CORE_ROOT")
+    if len(override) > 0 { return override }
+    let h = env_var("HOME")
+    return h + "/core"
+}
+
+fn _ingest_tool_path() -> string {
+    return _core_root() + "/nexus/tool/omega_cycle_atlas_ingest.hexa"
+}
+
+fn _atlas_main_path() -> string {
+    return _core_root() + "/nexus/n6/atlas.n6"
+}
+
+fn _shell_quote(s: string) -> string {
+    let mut r = s.replace("'", "'\\''")
+    return "'" + r + "'"
+}
+
+fn _basename_no_ext(path: string) -> string {
+    let cmd = "basename '" + path + "' .json"
+    return to_string(exec(cmd)).trim()
+}
+
+// Mirror omega_cycle_atlas_ingest._slugify_cycle (raw 65 idempotence).
+fn _slugify_cycle(witness_path: string) -> string {
+    let base = _basename_no_ext(witness_path)
+    let mut s = base
+    if len(s) > 11 {
+        let dash1 = s.substring(4, 5)
+        let dash2 = s.substring(7, 8)
+        let under = s.substring(10, 11)
+        if dash1 == "-" && dash2 == "-" && under == "_" {
+            s = s.substring(11, len(s))
+        }
+    }
+    let suffix = "_omega_cycle"
+    if len(s) > len(suffix) {
+        let tail = s.substring(len(s) - len(suffix), len(s))
+        if tail == suffix { s = s.substring(0, len(s) - len(suffix)) }
+    }
+    let mut out = ""
+    let n = len(s)
+    let mut i = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "_" { out = out + "-" } else { out = out + c }
+        i = i + 1
+    }
+    return out
+}
+
+fn _shard_path_for(cycle_slug: string) -> string {
+    return _core_root() + "/nexus/n6/atlas.append." + cycle_slug + ".n6"
+}
+
+fn _is_omega_cycle_witness(path: string) -> bool {
+    if path.index_of("omega_cycle") < 0 { return false }
+    let n = len(path)
+    if n < 5 { return false }
+    let tail = path.substring(n - 5, n)
+    if tail != ".json" { return false }
+    return true
+}
+
+fn _sha256_file(path: string) -> string {
+    let cmd = "shasum -a 256 " + _shell_quote(path) + " 2>/dev/null | cut -c1-64"
+    return to_string(exec(cmd)).trim()
+}
+
+// ─── canonical emit_witness ──────────────────────────────────────
+//
+// Returns array: [verdict, path, sha256, shard_path, absorbed_bool_str, errors_csv]
+//   verdict ∈ {"PASS", "FAIL"}
+//   absorbed ∈ {"true", "false"}
+//
+// Atomic semantics: write file → call ingest --witness → return verdict.
+// If ingest fails, emit_witness returns FAIL with absorbed=false; caller
+// decides whether to surface as error or continue. No partial-write rollback
+// (raw 77 append-only — emitted witness JSON is itself the audit record).
+//
+// PUBLIC ENTRY POINT — all ω-cycle emitters MUST go through this fn.
+
+pub fn emit_witness(path: string, body: string) -> array {
+    return emit_witness_with_source(path, body, "unknown")
+}
+
+pub fn emit_witness_with_source(path: string, body: string, source: string) -> array {
+    let mut errors = []
+
+    if !_is_omega_cycle_witness(path) {
+        errors.push("not_omega_cycle_witness_path")
+        return ["FAIL", path, "", "", "false", errors.join(",")]
+    }
+
+    // ensure parent dir exists
+    let dir_end = path.last_index_of("/")
+    if dir_end > 0 {
+        let dir = path.substring(0, dir_end)
+        let _ = exec("mkdir -p " + _shell_quote(dir))
+    }
+
+    // write the witness JSON
+    write_file(path, body)
+
+    let test_w = to_string(exec("test -f '" + path + "' && echo y || echo n")).trim()
+    if test_w != "y" {
+        errors.push("write_failed")
+        return ["FAIL", path, "", "", "false", errors.join(",")]
+    }
+
+    let sha = _sha256_file(path)
+    let cycle_slug = _slugify_cycle(path)
+    let shard = _shard_path_for(cycle_slug)
+
+    // invoke ingest tool (single-witness scope, idempotent)
+    let ingest = _ingest_tool_path()
+    let test_i = to_string(exec("test -f '" + ingest + "' && echo y || echo n")).trim()
+    if test_i != "y" {
+        errors.push("ingest-tool-missing")
+        return ["FAIL", path, sha, shard, "false", errors.join(",")]
+    }
+    let cmd = "env HEXA_RESOLVER_NO_REROUTE=1 hexa run " + _shell_quote(ingest) + " --witness " + _shell_quote(path) + " 2>&1; echo __RC=$?"
+    let out = to_string(exec(cmd))
+    let rc_idx = out.last_index_of("__RC=")
+    let mut rc_str = "0"
+    if rc_idx >= 0 {
+        rc_str = out.substring(rc_idx + 5, len(out)).trim()
+    }
+    if rc_str != "0" {
+        errors.push("ingest-rc-" + rc_str)
+        return ["FAIL", path, sha, shard, "false", errors.join(",")]
+    }
+
+    // detect already-absorbed (idempotent re-emit) vs newly-absorbed
+    let absorbed_str = if out.index_of("__OMEGA_CYCLE_ATLAS_INGEST__ SKIP") >= 0 { "true" } else { "true" }
+    // Both SKIP (already-absorbed) and PASS (newly-absorbed) qualify as
+    // absorbed=true from the rule's perspective. Distinction is observable
+    // via the ingest tool's own sentinel in its stdout.
+
+    let _suppress_unused_source = source
+    return ["PASS", path, sha, shard, absorbed_str, ""]
+}
+
+// ─── selftest ────────────────────────────────────────────────────
+
+fn _selftest() -> void {
+    println("[witness_emit selftest]")
+
+    // 1. classifier rejects non-omega_cycle paths
+    let r1 = emit_witness("/tmp/not_a_witness.json", "{}")
+    if r1[0] != "FAIL" {
+        eprintln("selftest FAIL classifier should reject non-omega_cycle path")
+        eprintln("reason=classifier-false-positive fix=verify _is_omega_cycle_witness")
+        exit(1)
+    }
+
+    // 2. classifier rejects non-json
+    let r2 = emit_witness("/tmp/foo_omega_cycle.txt", "{}")
+    if r2[0] != "FAIL" {
+        eprintln("selftest FAIL classifier should reject non-json")
+        eprintln("reason=classifier-extension-check fix=verify .json check")
+        exit(1)
+    }
+
+    // 3. happy path — synthetic witness write + absorb
+    let synth_dir = "/tmp/witness_emit_selftest"
+    let _ = exec("mkdir -p '" + synth_dir + "'")
+    let synth_path = synth_dir + "/2026-04-26_witness-emit-selftest_synthetic_omega_cycle.json"
+    let body = "{\"trawl_id\":\"witness-emit-selftest-synthetic\",\"axes_surfaced\":[{\"axis_id\":\"a1\",\"name\":\"selftest synthetic axis\",\"summary\":\"witness_emit selftest fact extraction\"}]}"
+    let r3 = emit_witness(synth_path, body)
+    let verdict3 = r3[0]
+    let test_synth = to_string(exec("test -f '" + synth_path + "' && echo y || echo n")).trim()
+    if test_synth != "y" {
+        eprintln("selftest FAIL synthetic witness file not written")
+        eprintln("reason=write-file-failed fix=verify write_file builtin + parent-dir create")
+        exit(1)
+    }
+    if verdict3 != "PASS" {
+        eprintln("selftest FAIL emit verdict expected PASS got " + verdict3 + " errors=" + r3[5])
+        eprintln("reason=emit-failure-" + r3[5] + " fix=hexa run " + _ingest_tool_path() + " --witness " + synth_path + "   # inspect")
+        let _ = exec("rm -rf '" + synth_dir + "'")
+        exit(1)
+    }
+
+    // 4. idempotent re-emit (same witness, same body)
+    let r4 = emit_witness(synth_path, body)
+    if r4[0] != "PASS" {
+        eprintln("selftest FAIL idempotent re-emit expected PASS got " + r4[0] + " errors=" + r4[5])
+        eprintln("reason=idempotence-broken fix=verify omega_cycle_atlas_ingest --witness skip path")
+        let _ = exec("rm -rf '" + synth_dir + "'")
+        exit(1)
+    }
+
+    let _ = exec("rm -rf '" + synth_dir + "'")
+    println("[witness_emit selftest] OK — classifier 2 cases / happy-path emit / idempotent re-emit")
+    exit(0)
+}
+
+// ─── CLI runner ──────────────────────────────────────────────────
+
+fn main() -> void {
+    let raw_args = args()
+    let mut cli = []
+    let mut ai = 2
+    while ai < len(raw_args) {
+        cli.push(raw_args[ai])
+        ai = ai + 1
+    }
+    if len(cli) >= 1 && (cli[0] == "--selftest" || cli[0] == "selftest") {
+        _selftest()
+    }
+
+    let mut emit_path = ""
+    let mut body_file = ""
+    let mut source = "cli"
+    let mut i = 0
+    while i < len(cli) {
+        let a = cli[i]
+        if a == "--emit" {
+            i = i + 1
+            if i >= len(cli) {
+                eprintln("__WITNESS_EMIT__ FAIL path= shard= absorbed=false reason=missing-emit-arg fix=--emit /abs/path/foo_omega_cycle.json")
+                exit(1)
+            }
+            emit_path = cli[i]
+        } else if a == "--body-file" {
+            i = i + 1
+            if i >= len(cli) {
+                eprintln("__WITNESS_EMIT__ FAIL path= shard= absorbed=false reason=missing-body-file-arg fix=--body-file /abs/path/body.json")
+                exit(1)
+            }
+            body_file = cli[i]
+        } else if a == "--source" {
+            i = i + 1
+            if i >= len(cli) {
+                eprintln("__WITNESS_EMIT__ FAIL path= shard= absorbed=false reason=missing-source-arg fix=--source <slug>")
+                exit(1)
+            }
+            source = cli[i]
+        } else if a == "--help" || a == "-h" {
+            println("usage: hexa run tool/witness_emit.hexa --emit <abs_path> --body-file <abs_path> [--source <slug>]")
+            println("       hexa run tool/witness_emit.hexa --selftest")
+            println("  canonical emit_witness(path, body) helper for ω-cycle witnesses")
+            println("  raw 80 sentinel: __WITNESS_EMIT__ <PASS|FAIL> path=<path> shard=<path> absorbed=<true|false>")
+            println("  raw 66 err:     reason=<slug> fix=<directive>")
+            println("  triad layer 2 (agent-level, own:atlas-absorb-mandatory)")
+            println("  claude-dependency: NONE  hooks: NONE")
+            exit(0)
+        } else {
+            eprintln("__WITNESS_EMIT__ FAIL path= shard= absorbed=false reason=unknown-arg-" + a + " fix=hexa run tool/witness_emit.hexa --help")
+            exit(1)
+        }
+        i = i + 1
+    }
+
+    if len(emit_path) == 0 || len(body_file) == 0 {
+        eprintln("__WITNESS_EMIT__ FAIL path=" + emit_path + " shard= absorbed=false reason=missing-args fix=--emit <path> --body-file <path>")
+        exit(1)
+    }
+    let test_b = to_string(exec("test -f '" + body_file + "' && echo y || echo n")).trim()
+    if test_b != "y" {
+        eprintln("__WITNESS_EMIT__ FAIL path=" + emit_path + " shard= absorbed=false reason=body-file-missing fix=verify --body-file path")
+        exit(1)
+    }
+    let body = to_string(read_file(body_file))
+    let r = emit_witness_with_source(emit_path, body, source)
+    let verdict = r[0]
+    let path_v = r[1]
+    let shard = r[3]
+    let absorbed = r[4]
+    let errs = r[5]
+    if verdict == "PASS" {
+        println("__WITNESS_EMIT__ PASS path=" + path_v + " shard=" + shard + " absorbed=" + absorbed)
+        exit(0)
+    }
+    eprintln("__WITNESS_EMIT__ FAIL path=" + path_v + " shard=" + shard + " absorbed=" + absorbed + " reason=" + errs + " fix=hexa run " + _ingest_tool_path() + " --witness " + path_v + "   # inspect")
+    exit(2)
+}

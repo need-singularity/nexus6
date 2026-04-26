@@ -1,0 +1,329 @@
+#!hexa strict
+// tool/atlas_absorb_sweeper.hexa — own:atlas-absorb-mandatory triad B.1 (os-level sweeper).
+//
+// @tool(slug="atlas_absorb_sweeper", desc="periodic catch-all sweeper for ω-cycle witness absorption — discovers all *omega_cycle*.json under {nexus,n6-architecture,anima}/design/**, identifies orphans, invokes omega_cycle_atlas_ingest --witness <abs> for each. Designed for launchd StartInterval execution.")
+// @usage(hexa run tool/atlas_absorb_sweeper.hexa [--once] [--dry-run] [--selftest] [--repo-only NAME])
+// @omega-converge(witness="fixpoint-convergence", attempts=many, attempt_log="own:atlas-absorb-mandatory triad B.1 layer: each tick re-discovers witnesses; orphans are absorbed via ingest tool. Fixpoint = orphan_count==0 across consecutive ticks (idempotence-stable).")
+// @exit_codes(0=PASS, 1=usage/io, 2=any orphan-absorb FAIL during sweep)
+// @sentinel(__ATLAS_ABSORB_SWEEP__ <PASS|FAIL> total=<N> already_absorbed=<N> newly_absorbed=<N> errors=<N>)
+//
+// Triad B.1 — first (os-level) enforcement layer. Independent of agent-level
+// hooks (B.2) and lint (B.3). launchd plist (nexus/launchd/dev.hexa-lang.atlas-absorb-sweeper.plist)
+// invokes this tool every ATLAS_ABSORB_SWEEP_INTERVAL seconds (default 600 = 10min).
+//
+// One-shot mode (--once) is the default for launchd StartInterval (each tick is
+// one process). The tool does not loop internally — it sweeps once and exits.
+// (--once is currently a no-op affirmation flag; future continuous mode would
+// add an internal loop, but launchd-driven cadence is the SSOT.)
+//
+// JSONL audit trail: state/atlas_absorb_sweeper.jsonl (one record per sweep).
+// raw 66 trailers on every error path (reason=<slug> fix=<directive>).
+// raw 80 sentinel: __ATLAS_ABSORB_SWEEP__ <PASS|FAIL> total=N already=N newly=N errors=N.
+
+fn _core_root() -> string {
+    let override = env_var("NEXUS_CORE_ROOT")
+    if len(override) > 0 { return override }
+    let h = env_var("HOME")
+    return h + "/core"
+}
+
+fn _atlas_main_path() -> string {
+    return _core_root() + "/nexus/n6/atlas.n6"
+}
+
+fn _ingest_tool_path() -> string {
+    return _core_root() + "/nexus/tool/omega_cycle_atlas_ingest.hexa"
+}
+
+fn _sweep_log_path() -> string {
+    return _core_root() + "/nexus/state/atlas_absorb_sweeper.jsonl"
+}
+
+fn _basename_no_ext(path: string) -> string {
+    let cmd = "basename '" + path + "' .json"
+    return to_string(exec(cmd)).trim()
+}
+
+fn _slugify_cycle(witness_path: string) -> string {
+    let base = _basename_no_ext(witness_path)
+    let mut s = base
+    if len(s) > 11 {
+        let dash1 = s.substring(4, 5)
+        let dash2 = s.substring(7, 8)
+        let under = s.substring(10, 11)
+        if dash1 == "-" && dash2 == "-" && under == "_" {
+            s = s.substring(11, len(s))
+        }
+    }
+    let suffix = "_omega_cycle"
+    if len(s) > len(suffix) {
+        let tail = s.substring(len(s) - len(suffix), len(s))
+        if tail == suffix { s = s.substring(0, len(s) - len(suffix)) }
+    }
+    let mut out = ""
+    let n = len(s)
+    let mut i = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "_" { out = out + "-" } else { out = out + c }
+        i = i + 1
+    }
+    return out
+}
+
+fn _shard_path_for(cycle_slug: string) -> string {
+    return _core_root() + "/nexus/n6/atlas.append." + cycle_slug + ".n6"
+}
+
+fn _repo_design_dirs() -> array {
+    let r = _core_root()
+    return [
+        ["nexus", r + "/nexus/design"],
+        ["n6-architecture", r + "/n6-architecture/design"],
+        ["anima", r + "/anima/design"]
+    ]
+}
+
+fn _glob_witnesses(repo_filter: string) -> array {
+    let mut all = []
+    for entry in _repo_design_dirs() {
+        let name = entry[0]
+        let dpath = entry[1]
+        if len(repo_filter) > 0 && repo_filter != name { continue }
+        let test_d = to_string(exec("test -d '" + dpath + "' && echo y || echo n")).trim()
+        if test_d != "y" { continue }
+        let cmd = "find '" + dpath + "' -name '*omega_cycle*.json' -type f 2>/dev/null | sort"
+        let out = to_string(exec(cmd)).trim()
+        if len(out) == 0 { continue }
+        let parts = split(out, "\n")
+        for p in parts {
+            let pt = p.trim()
+            if len(pt) > 0 { all.push([name, pt]) }
+        }
+    }
+    return all
+}
+
+fn _shard_exists_nonempty(shard_path: string) -> bool {
+    let cmd = "test -s '" + shard_path + "' && echo y || echo n"
+    let out = to_string(exec(cmd)).trim()
+    if out == "y" { return true }
+    return false
+}
+
+fn _slug_present_in_atlas(cycle_slug: string) -> bool {
+    let atlas = _atlas_main_path()
+    let cmd = "grep -qF '" + cycle_slug + "' '" + atlas + "' 2>/dev/null && echo y || echo n"
+    let out = to_string(exec(cmd)).trim()
+    if out == "y" { return true }
+    return false
+}
+
+fn _is_already_absorbed(cycle_slug: string) -> bool {
+    let shard_path = _shard_path_for(cycle_slug)
+    if _shard_exists_nonempty(shard_path) { return true }
+    if _slug_present_in_atlas(cycle_slug) { return true }
+    return false
+}
+
+fn _shell_quote(s: string) -> string {
+    let mut r = s.replace("'", "'\\''")
+    return "'" + r + "'"
+}
+
+fn _absorb_witness(witness_path: string, dry_run: bool) -> array {
+    // returns [verdict_slug, rc_or_zero, stdout_excerpt]
+    if dry_run {
+        return ["DRY_RUN", "0", "would-absorb"]
+    }
+    let ingest = _ingest_tool_path()
+    let cmd = "env HEXA_RESOLVER_NO_REROUTE=1 hexa run " + _shell_quote(ingest) + " --witness " + _shell_quote(witness_path) + " 2>&1; echo __RC=$?"
+    let out = to_string(exec(cmd))
+    let rc_idx = out.last_index_of("__RC=")
+    let mut rc_str = "0"
+    if rc_idx >= 0 {
+        rc_str = out.substring(rc_idx + 5, len(out)).trim()
+    }
+    if rc_str != "0" {
+        return ["ABSORB_FAIL", rc_str, out.substring(0, len(out)).trim()]
+    }
+    if out.index_of("__OMEGA_CYCLE_ATLAS_INGEST__ SKIP") >= 0 {
+        return ["ALREADY_ABSORBED", "0", "skip-already-absorbed"]
+    }
+    return ["NEWLY_ABSORBED", "0", "ok"]
+}
+
+fn _esc(s: string) -> string {
+    let mut r = s.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", "\\n")
+    r = r.replace("\r", "")
+    r = r.replace("\t", " ")
+    return r
+}
+
+fn _now_iso() -> string {
+    return to_string(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()
+}
+
+fn _append_jsonl(path: string, line: string) -> void {
+    // ensure dir
+    let dir_end = path.last_index_of("/")
+    if dir_end > 0 {
+        let dir = path.substring(0, dir_end)
+        let _ = exec("mkdir -p " + _shell_quote(dir))
+    }
+    let _ = exec("printf '%s\\n' " + _shell_quote(line) + " >> " + _shell_quote(path))
+}
+
+fn _selftest() -> void {
+    println("[atlas_absorb_sweeper selftest]")
+    let s1 = _slugify_cycle("/foo/2026-04-26_test_synth_omega_cycle.json")
+    if s1 != "test-synth" {
+        eprintln("selftest FAIL slugify expected test-synth got " + s1)
+        eprintln("reason=slugify-mismatch fix=verify _slugify_cycle mirrors omega_cycle_atlas_ingest")
+        exit(1)
+    }
+    let sp = _shard_path_for("synth-x")
+    if sp.index_of("/nexus/n6/atlas.append.synth-x.n6") < 0 {
+        eprintln("selftest FAIL shard_path got " + sp)
+        eprintln("reason=shard-path-derivation fix=verify _shard_path_for + _core_root")
+        exit(1)
+    }
+    let ingest = _ingest_tool_path()
+    let test_i = to_string(exec("test -f '" + ingest + "' && echo y || echo n")).trim()
+    if test_i != "y" {
+        eprintln("selftest FAIL ingest tool not found at " + ingest)
+        eprintln("reason=ingest-tool-missing fix=verify nexus/tool/omega_cycle_atlas_ingest.hexa exists")
+        exit(1)
+    }
+    println("[atlas_absorb_sweeper selftest] OK")
+    exit(0)
+}
+
+fn main() -> void {
+    let raw_args = args()
+    let mut cli = []
+    let mut ai = 2
+    while ai < len(raw_args) {
+        cli.push(raw_args[ai])
+        ai = ai + 1
+    }
+    if len(cli) >= 1 && (cli[0] == "--selftest" || cli[0] == "selftest") {
+        _selftest()
+    }
+
+    let mut once = false
+    let mut dry_run = false
+    let mut repo_filter = ""
+    let mut i = 0
+    while i < len(cli) {
+        let a = cli[i]
+        if a == "--once" { once = true }
+        else if a == "--dry-run" { dry_run = true }
+        else if a == "--repo-only" {
+            i = i + 1
+            if i >= len(cli) {
+                eprintln("__ATLAS_ABSORB_SWEEP__ FAIL reason=missing-repo-only-arg fix=--repo-only {nexus|n6-architecture|anima}")
+                exit(1)
+            }
+            repo_filter = cli[i]
+        }
+        else if a == "--help" || a == "-h" {
+            println("usage: hexa run tool/atlas_absorb_sweeper.hexa [--once] [--dry-run] [--selftest] [--repo-only NAME]")
+            println("  --once     single sweep (default; launchd StartInterval drives cadence)")
+            println("  --dry-run  list orphans without invoking ingest")
+            println("  --repo-only restrict glob to one of {nexus|n6-architecture|anima}")
+            println("  raw 80 sentinel: __ATLAS_ABSORB_SWEEP__ <PASS|FAIL> total=<N> already_absorbed=<N> newly_absorbed=<N> errors=<N>")
+            println("  raw 66 err:     reason=<slug> fix=<directive>")
+            println("  audit:          state/atlas_absorb_sweeper.jsonl (per-sweep JSONL append)")
+            exit(0)
+        }
+        else {
+            eprintln("__ATLAS_ABSORB_SWEEP__ FAIL reason=unknown-arg-" + a + " fix=hexa run tool/atlas_absorb_sweeper.hexa --help")
+            exit(1)
+        }
+        i = i + 1
+    }
+    // once flag is currently informational — single-sweep is the default.
+    let _suppress_unused = once
+
+    let witnesses = _glob_witnesses(repo_filter)
+    let total = len(witnesses)
+    let mut already = 0
+    let mut newly = 0
+    let mut errors = 0
+    let mut newly_list = []
+    let mut error_list = []
+    let mut would_list = []
+
+    for entry in witnesses {
+        let repo = entry[0]
+        let wpath = entry[1]
+        let cycle_slug = _slugify_cycle(wpath)
+        if _is_already_absorbed(cycle_slug) {
+            already = already + 1
+            continue
+        }
+        // orphan — attempt absorb (or list if dry-run)
+        if dry_run {
+            would_list.push([repo, wpath, cycle_slug])
+            continue
+        }
+        let r = _absorb_witness(wpath, false)
+        let verdict = r[0]
+        if verdict == "NEWLY_ABSORBED" {
+            newly = newly + 1
+            newly_list.push([repo, wpath, cycle_slug])
+            println("__ATLAS_ABSORB_SWEEP__ ABSORBED witness=" + wpath + " slug=" + cycle_slug)
+        } else if verdict == "ALREADY_ABSORBED" {
+            // ingest reported already-absorbed even though our pre-check missed it (race / stale shard)
+            already = already + 1
+        } else {
+            errors = errors + 1
+            error_list.push([repo, wpath, cycle_slug, r[1]])
+            eprintln("__ATLAS_ABSORB_SWEEP__ ERR witness=" + wpath + " slug=" + cycle_slug + " rc=" + r[1] + " reason=ingest-rc-" + r[1] + " fix=hexa run " + _ingest_tool_path() + " --witness " + wpath + " 2>&1   # inspect")
+        }
+    }
+
+    if dry_run {
+        for w in would_list {
+            println("__ATLAS_ABSORB_SWEEP__ WOULD_ABSORB witness=" + w[1] + " slug=" + w[2] + " repo=" + w[0])
+        }
+        println("__ATLAS_ABSORB_SWEEP__ DRY_RUN total=" + to_string(total) + " already_absorbed=" + to_string(already) + " would_absorb=" + to_string(len(would_list)))
+        exit(0)
+    }
+
+    let verdict = if errors == 0 { "PASS" } else { "FAIL" }
+    println("__ATLAS_ABSORB_SWEEP__ " + verdict + " total=" + to_string(total) + " already_absorbed=" + to_string(already) + " newly_absorbed=" + to_string(newly) + " errors=" + to_string(errors))
+
+    // JSONL audit append (raw 77 audit-append-only)
+    let mut p = []
+    p.push("{\"ts\":\"" + _now_iso() + "\"")
+    p.push(",\"verdict\":\"" + verdict + "\"")
+    p.push(",\"total\":" + to_string(total))
+    p.push(",\"already_absorbed\":" + to_string(already))
+    p.push(",\"newly_absorbed\":" + to_string(newly))
+    p.push(",\"errors\":" + to_string(errors))
+    p.push(",\"repo_filter\":\"" + _esc(repo_filter) + "\"")
+    p.push(",\"newly_list\":[")
+    let mut k = 0
+    for n_entry in newly_list {
+        if k > 0 { p.push(",") }
+        p.push("{\"repo\":\"" + _esc(n_entry[0]) + "\",\"witness\":\"" + _esc(n_entry[1]) + "\",\"slug\":\"" + _esc(n_entry[2]) + "\"}")
+        k = k + 1
+    }
+    p.push("]")
+    p.push(",\"error_list\":[")
+    let mut k2 = 0
+    for e_entry in error_list {
+        if k2 > 0 { p.push(",") }
+        p.push("{\"repo\":\"" + _esc(e_entry[0]) + "\",\"witness\":\"" + _esc(e_entry[1]) + "\",\"slug\":\"" + _esc(e_entry[2]) + "\",\"rc\":\"" + _esc(e_entry[3]) + "\"}")
+        k2 = k2 + 1
+    }
+    p.push("]}")
+    _append_jsonl(_sweep_log_path(), p.join(""))
+
+    if errors > 0 { exit(2) }
+    exit(0)
+}

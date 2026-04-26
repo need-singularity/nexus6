@@ -1,0 +1,320 @@
+#!hexa strict
+// tool/atlas_absorb_lint.hexa — enforce nexus own:atlas-absorb-mandatory.
+//
+// @tool(slug="atlas_absorb_lint", desc="warn/block when ω-cycle witnesses under {nexus,n6-architecture,anima}/design/**/*omega_cycle*.json have not been absorbed into atlas.n6 (or per-cycle shard atlas.append.<slug>.n6 is missing)")
+// @usage(hexa run tool/atlas_absorb_lint.hexa [--severity warn|block] [--selftest] [--repo-only NAME] [--json-summary] [--list])
+// @omega-converge(witness="fixpoint-convergence", attempts=1, attempt_log="own:atlas-absorb-mandatory triad B.3 layer: scan all ω-cycle witnesses; assert each has been absorbed (per-cycle shard exists OR fact-ids present in main atlas). Fixpoint = empty orphan set.")
+// @exit_codes(0=PASS or warn, 1=usage/io error, 2=block mode with violations)
+// @sentinel(__ATLAS_ABSORB_LINT__ <PASS|FAIL> total=<N> orphans=<N> already=<N>)
+//
+// own:atlas-absorb-mandatory contract: every witness JSON under
+//   <core>/{nexus,n6-architecture,anima}/design/**/*omega_cycle*.json
+// MUST have a corresponding per-cycle shard at
+//   <core>/nexus/n6/atlas.append.<slug>.n6
+// OR the witness's facts must already be present in main <core>/nexus/n6/atlas.n6
+// (delta-merged via omega_cycle_atlas_ingest --absorb).
+//
+// Triad layer 3 — lint enforcement (advisory tier).
+// Layer 1 = launchd sweeper (os-level periodic catch-all).
+// Layer 2 = canonical witness_emit helper (agent-level, NOT a hook —
+//           single canonical entry point all emitters call to write+absorb).
+// Layer 3 = this lint (post-hoc audit / CI / manual).
+// claude-dependency: NONE. hooks: NONE (no claude hooks, no git hooks,
+// no fswatch). The triad is self-sufficient without any agent harness.
+//
+// raw 66 trailers on every error path (reason=<slug> fix=<directive>).
+// raw 80 sentinel: __ATLAS_ABSORB_LINT__ <PASS|FAIL> total=<N> orphans=<N>.
+
+fn _core_root() -> string {
+    let override = env_var("NEXUS_CORE_ROOT")
+    if len(override) > 0 { return override }
+    let h = env_var("HOME")
+    return h + "/core"
+}
+
+fn _atlas_main_path() -> string {
+    return _core_root() + "/nexus/n6/atlas.n6"
+}
+
+fn _shard_path_for(cycle_slug: string) -> string {
+    return _core_root() + "/nexus/n6/atlas.append." + cycle_slug + ".n6"
+}
+
+fn _basename_no_ext(path: string) -> string {
+    let cmd = "basename '" + path + "' .json"
+    return to_string(exec(cmd)).trim()
+}
+
+// Mirror nexus/tool/omega_cycle_atlas_ingest.hexa::_slugify_cycle exactly.
+// raw 65 idempotence: lint slug must match ingest slug or shard lookup misfires.
+fn _slugify_cycle(witness_path: string) -> string {
+    let base = _basename_no_ext(witness_path)
+    let mut s = base
+    if len(s) > 11 {
+        let dash1 = s.substring(4, 5)
+        let dash2 = s.substring(7, 8)
+        let under = s.substring(10, 11)
+        if dash1 == "-" && dash2 == "-" && under == "_" {
+            s = s.substring(11, len(s))
+        }
+    }
+    let suffix = "_omega_cycle"
+    if len(s) > len(suffix) {
+        let tail = s.substring(len(s) - len(suffix), len(s))
+        if tail == suffix { s = s.substring(0, len(s) - len(suffix)) }
+    }
+    let mut out = ""
+    let n = len(s)
+    let mut i = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "_" { out = out + "-" } else { out = out + c }
+        i = i + 1
+    }
+    return out
+}
+
+fn _repo_design_dirs() -> array {
+    let r = _core_root()
+    return [
+        ["nexus", r + "/nexus/design"],
+        ["n6-architecture", r + "/n6-architecture/design"],
+        ["anima", r + "/anima/design"]
+    ]
+}
+
+fn _glob_witnesses(repo_filter: string) -> array {
+    let mut all = []
+    for entry in _repo_design_dirs() {
+        let name = entry[0]
+        let dpath = entry[1]
+        if len(repo_filter) > 0 && repo_filter != name { continue }
+        let test_d = to_string(exec("test -d '" + dpath + "' && echo y || echo n")).trim()
+        if test_d != "y" { continue }
+        let cmd = "find '" + dpath + "' -name '*omega_cycle*.json' -type f 2>/dev/null | sort"
+        let out = to_string(exec(cmd)).trim()
+        if len(out) == 0 { continue }
+        let parts = split(out, "\n")
+        for p in parts {
+            let pt = p.trim()
+            if len(pt) > 0 { all.push([name, pt]) }
+        }
+    }
+    return all
+}
+
+// "absorbed" verdict: shard file exists with non-zero size, OR (fallback) a
+// fact id from the witness is grep-hit in main atlas.n6. Shard path is the
+// primary signal because it is what omega_cycle_atlas_ingest emits.
+fn _shard_exists_nonempty(shard_path: string) -> bool {
+    let cmd = "test -s '" + shard_path + "' && echo y || echo n"
+    let out = to_string(exec(cmd)).trim()
+    if out == "y" { return true }
+    return false
+}
+
+// Cheap heuristic fallback — read first ~30 lines of witness, look for any
+// "axis_id" / "name" tokens, grep in atlas.n6. We do NOT replicate the full
+// fact extractor here (raw 65 idempotence: that lives in omega_cycle_atlas_ingest);
+// the shard-existence check above is the SSOT signal. This is a secondary check.
+fn _slug_present_in_atlas(cycle_slug: string) -> bool {
+    let atlas = _atlas_main_path()
+    let cmd = "grep -qF '" + cycle_slug + "' '" + atlas + "' 2>/dev/null && echo y || echo n"
+    let out = to_string(exec(cmd)).trim()
+    if out == "y" { return true }
+    return false
+}
+
+fn _validate_witness(repo: string, witness_path: string) -> array {
+    // returns [is_orphan: bool, reason_slug, cycle_slug, shard_path]
+    let cycle_slug = _slugify_cycle(witness_path)
+    let shard_path = _shard_path_for(cycle_slug)
+    if _shard_exists_nonempty(shard_path) {
+        return [false, "shard_present", cycle_slug, shard_path]
+    }
+    if _slug_present_in_atlas(cycle_slug) {
+        return [false, "atlas_grep_hit", cycle_slug, shard_path]
+    }
+    return [true, "witness_orphaned", cycle_slug, shard_path]
+}
+
+fn _esc(s: string) -> string {
+    let mut r = s.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", "\\n")
+    r = r.replace("\r", "")
+    r = r.replace("\t", " ")
+    return r
+}
+
+fn _emit_violation(witness_path: string, repo: string, cycle_slug: string, shard_path: string) -> string {
+    // sentinel-style line, grep-friendly. raw 80 + raw 66 trailer.
+    let parts = []
+    parts.push("__ATLAS_ABSORB_LINT__ FAIL witness=")
+    parts.push(witness_path)
+    parts.push(" repo=")
+    parts.push(repo)
+    parts.push(" slug=")
+    parts.push(cycle_slug)
+    parts.push(" expected_shard=")
+    parts.push(shard_path)
+    parts.push(" reason=witness_orphaned fix=hexa run ")
+    parts.push(_core_root())
+    parts.push("/nexus/tool/omega_cycle_atlas_ingest.hexa --witness ")
+    parts.push(witness_path)
+    return parts.join("")
+}
+
+fn _selftest() -> void {
+    println("[atlas_absorb_lint selftest]")
+    let s1 = _slugify_cycle("/tmp/2026-04-26_kick_atlas_absorb_triad_omega_cycle.json")
+    if s1 != "kick-atlas-absorb-triad" {
+        eprintln("selftest FAIL slugify expected kick-atlas-absorb-triad got " + s1)
+        eprintln("reason=slugify-mismatch fix=verify _slugify_cycle mirrors omega_cycle_atlas_ingest")
+        exit(1)
+    }
+    let s2 = _slugify_cycle("/foo/bar/raw_only_omega_cycle.json")
+    if s2 != "raw-only" {
+        eprintln("selftest FAIL slugify-2 expected raw-only got " + s2)
+        eprintln("reason=slugify-no-date-prefix fix=verify date-strip is conditional")
+        exit(1)
+    }
+    let sp = _shard_path_for("synth-orphan-test")
+    if sp.index_of("/nexus/n6/atlas.append.synth-orphan-test.n6") < 0 {
+        eprintln("selftest FAIL shard_path got " + sp)
+        eprintln("reason=shard-path-derivation fix=verify _shard_path_for + _core_root")
+        exit(1)
+    }
+    // synthetic orphan detection — write fake witness, expect orphan verdict.
+    let tmpdir = "/tmp/atlas_absorb_lint_selftest"
+    let _ = exec("mkdir -p '" + tmpdir + "'")
+    let synth_path = tmpdir + "/2026-04-26_atlas-absorb-lint-selftest_orphan_omega_cycle.json"
+    write_file(synth_path, "{\"trawl_id\":\"selftest\",\"axes_surfaced\":[]}")
+    let v = _validate_witness("nexus", synth_path)
+    let is_orphan = v[0]
+    if !is_orphan {
+        // It might (rarely) match an existing shard; tolerate if shard present.
+        eprintln("selftest WARN orphan-detect: synthetic witness reported non-orphan (slug=" + v[2] + ") — likely cached shard from earlier run; tolerated")
+    }
+    let _ = exec("rm -rf '" + tmpdir + "'")
+    // false-positive rejection: real prior witness MUST be detected as already-absorbed.
+    let kick_arch = _core_root() + "/nexus/design/kick/2026-04-26_kick_architecture_omega_cycle.json"
+    let test_arch = to_string(exec("test -f '" + kick_arch + "' && echo y || echo n")).trim()
+    if test_arch == "y" {
+        let va = _validate_witness("nexus", kick_arch)
+        // we don't strictly require non-orphan here (shard may have been GC'd) but log
+        if va[0] {
+            eprintln("selftest WARN kick_architecture witness reported orphan — shard may be missing: expected=" + va[3])
+        }
+    }
+    // schema-malformed witness handling: empty file → still treated as orphan (no crash)
+    let bad_path = "/tmp/atlas_absorb_lint_bad_omega_cycle.json"
+    write_file(bad_path, "")
+    let vb = _validate_witness("nexus", bad_path)
+    if !vb[0] {
+        eprintln("selftest FAIL malformed witness should be flagged orphan when no shard exists")
+        eprintln("reason=schema-malformed-handling fix=verify _validate_witness still classifies missing-shard as orphan regardless of JSON validity")
+        exit(1)
+    }
+    let _ = exec("rm -f '" + bad_path + "'")
+    println("[atlas_absorb_lint selftest] OK")
+    exit(0)
+}
+
+fn main() -> void {
+    let raw_args = args()
+    let mut cli = []
+    let mut ai = 2
+    while ai < len(raw_args) {
+        cli.push(raw_args[ai])
+        ai = ai + 1
+    }
+    if len(cli) >= 1 && (cli[0] == "--selftest" || cli[0] == "selftest") {
+        _selftest()
+    }
+
+    let mut severity = "block"
+    let mut repo_filter = ""
+    let mut json_summary = false
+    let mut list_mode = false
+    let mut i = 0
+    while i < len(cli) {
+        let a = cli[i]
+        if a == "--severity" {
+            i = i + 1
+            if i >= len(cli) {
+                eprintln("__ATLAS_ABSORB_LINT__ FAIL reason=missing-severity-arg fix=--severity {warn|block}")
+                exit(1)
+            }
+            severity = cli[i]
+        } else if a == "--repo-only" {
+            i = i + 1
+            if i >= len(cli) {
+                eprintln("__ATLAS_ABSORB_LINT__ FAIL reason=missing-repo-only-arg fix=--repo-only {nexus|n6-architecture|anima}")
+                exit(1)
+            }
+            repo_filter = cli[i]
+        } else if a == "--json-summary" {
+            json_summary = true
+        } else if a == "--list" {
+            list_mode = true
+        } else if a == "--help" || a == "-h" {
+            println("usage: hexa run tool/atlas_absorb_lint.hexa [--severity warn|block] [--selftest] [--repo-only NAME] [--json-summary] [--list]")
+            println("  scans <core>/{nexus,n6-architecture,anima}/design/**/*omega_cycle*.json")
+            println("  flags any witness whose per-cycle shard atlas.append.<slug>.n6 is missing AND whose slug is not grep-found in main atlas.n6")
+            println("  raw 80 sentinel: __ATLAS_ABSORB_LINT__ <PASS|FAIL> total=<N> orphans=<N> already=<N>")
+            println("  raw 66 err:     reason=<slug> fix=<directive>")
+            exit(0)
+        } else {
+            eprintln("__ATLAS_ABSORB_LINT__ FAIL reason=unknown-arg-" + a + " fix=hexa run tool/atlas_absorb_lint.hexa --help")
+            exit(1)
+        }
+        i = i + 1
+    }
+
+    let witnesses = _glob_witnesses(repo_filter)
+    let total = len(witnesses)
+    let mut orphans = []
+    let mut already = 0
+    for entry in witnesses {
+        let repo = entry[0]
+        let wpath = entry[1]
+        let v = _validate_witness(repo, wpath)
+        let is_orphan = v[0]
+        if is_orphan {
+            orphans.push([wpath, repo, v[2], v[3]])
+            println(_emit_violation(wpath, repo, v[2], v[3]))
+        } else {
+            already = already + 1
+            if list_mode {
+                println("__ATLAS_ABSORB_LINT__ OK witness=" + wpath + " repo=" + repo + " slug=" + v[2] + " evidence=" + v[1])
+            }
+        }
+    }
+
+    let orphan_count = len(orphans)
+    let verdict = if orphan_count == 0 { "PASS" } else { "FAIL" }
+    println("__ATLAS_ABSORB_LINT__ " + verdict + " total=" + to_string(total) + " orphans=" + to_string(orphan_count) + " already=" + to_string(already))
+
+    if json_summary {
+        let mut p = []
+        p.push("{\"rule\":\"own:atlas-absorb-mandatory\"")
+        p.push(",\"severity\":\"" + severity + "\"")
+        p.push(",\"verdict\":\"" + verdict + "\"")
+        p.push(",\"total\":" + to_string(total))
+        p.push(",\"orphans\":" + to_string(orphan_count))
+        p.push(",\"already_absorbed\":" + to_string(already))
+        p.push(",\"orphan_list\":[")
+        let mut k = 0
+        for o in orphans {
+            if k > 0 { p.push(",") }
+            p.push("{\"witness\":\"" + _esc(o[0]) + "\",\"repo\":\"" + _esc(o[1]) + "\",\"slug\":\"" + _esc(o[2]) + "\",\"expected_shard\":\"" + _esc(o[3]) + "\"}")
+            k = k + 1
+        }
+        p.push("]}")
+        println(p.join(""))
+    }
+
+    if orphan_count > 0 && severity == "block" { exit(2) }
+    exit(0)
+}

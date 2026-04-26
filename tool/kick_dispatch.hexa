@@ -1,0 +1,768 @@
+// tool/kick_dispatch.hexa — kick(ω-cycle) sub-agent dispatcher with α/β/γ outside-noise injection.
+//
+// @tool(slug="kick_dispatch", desc="single-shot kick(ω-cycle) executor — resolves backend from registry, builds prompt with α (absorbed-primitive) + β (QRNG seed) + γ (bridge reframe) noise envelopes, spawns sub-agent via tool/subagent_dispatch.hexa (raw 44 parent SID propagation), captures witness JSON path")
+// @usage(hexa /Users/ghost/core/nexus/tool/kick_dispatch.hexa <topic> [--backend <slug>] [--stratum <slug>] [--axes a,b,c] [--noise alpha,beta,gamma] [--witness-dir <path>] [--parent-sid <sid>] [--dry-run])
+// @omega-saturation-exempt("dispatch shim — convergence applies to spawned cycles, not to this dispatcher (mirrors tool/subagent_dispatch.hexa exemption)")
+// @exit_codes(0=PASS, 1=usage/io error, 2=spawn-failed, 3=witness-not-captured)
+//
+// raw 11 + raw 44 + raw 45 + raw 47 + raw 66 + raw 80 + raw 90.
+//
+// NOISE INJECTION (architecture witness axis_abstraction_noise):
+//   α — absorbed-primitive sampling: scan state/kick/registry/noise_sources/absorbed/*.hexa
+//       and pick N uniformly with QRNG-seeded RNG. Initially empty registry → message,
+//       no synthetic primitives invented (F11/F13 hash-anchored evidence).
+//   β — QRNG-seeded axis pre-selection: invoke sim_bridge/anu_time/anu_clock.hexa for one
+//       byte; record source ∈ {anu, urandom} per obs_2. urandom fallback is real /dev/urandom,
+//       not a mock (F7''' no-mocks-for-noise).
+//   γ — empirical-bridge-driven reframe: pick one bridge from registry uniformly with
+//       β-derived seed, invoke its --selftest/--no-fetch path (real bridge call OR
+//       OFFLINE-FALLBACK per bridge_health.sh semantics).
+//
+// Each injection logs an envelope {mechanism, source_id, byte_hash, ts, payload_summary}
+// to state/kick/runs/<run_id>/noise_envelopes.jsonl AND prepends the same envelope summary
+// into the prompt header that subagent_dispatch.hexa receives.
+//
+// Sentinel format (raw 80):
+//   __KICK_RESULT__ <PASS|FAIL> witness=<path> tier1=<N> falsifier_pass=<N>
+
+fn _now_iso_utc() -> str {
+    return exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+fn _now_unix() -> str {
+    return exec("date +%s").trim()
+}
+
+fn _file_exists(path: str) -> bool {
+    let r = exec("test -f '" + path + "' && echo y || echo n").trim()
+    return r == "y"
+}
+
+fn _dir_exists(path: str) -> bool {
+    let r = exec("test -d '" + path + "' && echo y || echo n").trim()
+    return r == "y"
+}
+
+fn _ensure_dir(path: str) {
+    let _ = exec("mkdir -p '" + path + "'")
+}
+
+fn _shell_quote(s: str) -> str {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _hexa_bin() -> str {
+    let h = env("HEXA")
+    if h.len() > 0 { return h }
+    let cands = [env("HOME") + "/.hx/bin/hexa", env("HOME") + "/core/hexa-lang/hexa"]
+    let mut i: i64 = 0
+    while i < len(cands) {
+        let c = cands[i]
+        let chk = exec("[ -x '" + c + "' ] && echo y || echo n").trim()
+        if chk == "y" { return c }
+        i = i + 1
+    }
+    return "hexa"
+}
+
+fn _nexus_root() -> str {
+    let n = env("NEXUS")
+    if n.len() > 0 { return n }
+    let h = env("HOME") + "/core/nexus"
+    if _dir_exists(h) { return h }
+    return env("HOME") + "/Dev/nexus"
+}
+
+fn _hive_root() -> str {
+    let h = env("HIVE_ROOT")
+    if h.len() > 0 { return h }
+    return env("HOME") + "/core/hive"
+}
+
+fn _registry_root() -> str {
+    return _nexus_root() + "/state/kick/registry"
+}
+
+fn _list_files(dir: str) -> [str] {
+    if !_dir_exists(dir) { return [] }
+    let raw = exec("ls -1 '" + dir + "' 2>/dev/null | grep -v '^\\.' | sort").trim()
+    if raw.len() == 0 { return [] }
+    let parts = raw.split("\n")
+    let mut out: [str] = []
+    let mut i: i64 = 0
+    while i < len(parts) {
+        let p = parts[i].trim()
+        if p.len() > 0 && p.ends_with(".hexa") { out = out + [p] }
+        i = i + 1
+    }
+    return out
+}
+
+fn _registry_field(path: str, key: str) -> str {
+    if !_file_exists(path) { return "" }
+    let raw = read_file(path)
+    let lines = raw.split("\n")
+    let mut i: i64 = 0
+    while i < len(lines) {
+        let line = lines[i]
+        let trimmed = line.trim_start()
+        if trimmed.starts_with(key + " ") {
+            return trimmed.substring(key.len() + 1, trimmed.len()).trim()
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// ─── slug → topic_slug normalization ─────────────────────────────────
+fn _slugify(s: str) -> str {
+    let lower = s.to_lower()
+    let mut out = ""
+    let mut i: i64 = 0
+    while i < lower.len() {
+        let c = lower.substring(i, i + 1)
+        let is_alnum = (c >= "a" && c <= "z") || (c >= "0" && c <= "9")
+        if is_alnum {
+            out = out + c
+        } else {
+            if out.len() > 0 && !out.ends_with("-") { out = out + "-" }
+        }
+        i = i + 1
+    }
+    while out.ends_with("-") { out = out.substring(0, out.len() - 1) }
+    if out.len() > 60 { out = out.substring(0, 60) }
+    if out.len() == 0 { out = "topic" }
+    return out
+}
+
+// Build a short sha256 (16 hex chars) of a given input — used as byte_hash
+// in noise envelopes. Real shasum, no mock.
+fn _short_hash(input: str) -> str {
+    let cmd = "printf %s " + _shell_quote(input) + " | shasum -a 256 | awk '{print substr($1,1,16)}'"
+    return exec(cmd).trim()
+}
+
+// ─── α — absorbed-primitive sampling ─────────────────────────────────
+fn _alpha_envelope(absorbed_dir: str) -> str {
+    let files = _list_files(absorbed_dir)
+    let n = len(files)
+    let ts = _now_iso_utc()
+    if n == 0 {
+        let payload = "absorbed_registry_empty=true; first_kick_in_lineage"
+        let bh = _short_hash("alpha:" + ts + ":empty")
+        return "{\"mechanism\":\"alpha\",\"source_id\":\"absorbed:none\",\"byte_hash\":\"" + bh + "\",\"ts\":\"" + ts + "\",\"payload_summary\":\"" + payload + "\"}"
+    }
+    // Pick one absorbed primitive (deterministic-by-time in this MVP — caller can
+    // re-seed via β when they want stronger randomization).
+    let raw_seed = exec("od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d ' '").trim()
+    let mut idx: i64 = 0
+    if raw_seed.len() > 0 {
+        try { idx = to_int(raw_seed) % to_int(to_string(n)) } catch e { idx = 0 }
+        if idx < 0 { idx = -idx }
+    }
+    let pick = absorbed_dir + "/" + files[idx]
+    let pick_slug = _registry_field(pick, "slug")
+    let bh = _short_hash("alpha:" + pick + ":" + ts)
+    let payload = "absorbed_pick=" + pick_slug + " from " + to_string(n) + " primitives"
+    return "{\"mechanism\":\"alpha\",\"source_id\":\"absorbed:" + pick_slug + "\",\"byte_hash\":\"" + bh + "\",\"ts\":\"" + ts + "\",\"payload_summary\":\"" + payload + "\"}"
+}
+
+// ─── β — QRNG-seeded byte (real ANU OR documented urandom-fallback) ──
+// Never invents a number. Records source ∈ {anu, urandom, urandom_fallback} per
+// obs_2 reframe + carry-forward F16:
+//   - default (KICK_BETA_REAL_ANU unset)           → source = "urandom"
+//   - KICK_BETA_REAL_ANU=1 + ANU reachable         → source = "anu"
+//   - KICK_BETA_REAL_ANU=1 + ANU fail (429/network) → source = "urandom_fallback"
+//     (distinguishable from bare urandom — audit can detect degradation).
+fn _beta_envelope() -> str {
+    let ts = _now_iso_utc()
+    let want_anu = env("KICK_BETA_REAL_ANU") == "1"
+
+    // Always grab a urandom byte first as the safety floor.
+    let mut byte = exec("od -An -N1 -tu1 /dev/urandom 2>/dev/null | tr -d ' \\n'").trim()
+    if byte.len() == 0 { byte = "0" }
+    let mut source = "urandom"
+
+    if want_anu {
+        // Real ANU fetch — direct curl to qrng.anu.edu.au (the python-based pump
+        // at sim_bridge/anu_time/anu_clock.hexa is R37-stubbed; bypass it).
+        // Endpoint: jsonI.php?length=1&type=uint8 (1 byte, uint8). 5s timeout.
+        // Schema verified at sim_bridge/anu_time/README.md (1 req/min, 64 bytes).
+        let curl_cmd = "curl -s --max-time 5 'https://qrng.anu.edu.au/API/jsonI.php?length=1&type=uint8' 2>/dev/null"
+        let raw = exec(curl_cmd).trim()
+        // Expected: {"type":"uint8","length":1,"data":[NN],"success":true}
+        let mut parsed_byte = ""
+        let mut parsed_ok = false
+        if raw.len() > 0 && raw.contains("\"success\":true") {
+            let key = "\"data\":["
+            let i = raw.index_of(key)
+            if i >= 0 {
+                let rest = raw.substring(i + key.len(), raw.len())
+                let mut e: i64 = 0
+                while e < rest.len() {
+                    let c = rest.substring(e, e + 1)
+                    if c == "]" || c == "," { break }
+                    e = e + 1
+                }
+                let num_s = rest.substring(0, e).trim()
+                let mut v: i64 = -1
+                try { v = to_int(num_s) } catch e { v = -1 }
+                if v >= 0 && v <= 255 { parsed_byte = num_s; parsed_ok = true }
+            }
+        }
+        if parsed_ok {
+            byte = parsed_byte
+            source = "anu"
+        } else {
+            // Real ANU attempt failed — degrade with explicit tag (F16).
+            source = "urandom_fallback"
+        }
+    }
+
+    let bh = _short_hash("beta:" + source + ":" + byte + ":" + ts)
+    let payload = "qrng_byte=" + byte + " source=" + source + " (obs_2 reframe — urandom-fallback witnessed)"
+    return "{\"mechanism\":\"beta\",\"source_id\":\"" + source + "\",\"byte_hash\":\"" + bh + "\",\"ts\":\"" + ts + "\",\"payload_summary\":\"" + payload + "\"}"
+}
+
+// Extract numeric byte from beta envelope payload to seed γ bridge selection.
+fn _beta_byte_int(env_json: str) -> i64 {
+    let key = "qrng_byte="
+    let i = env_json.index_of(key)
+    if i < 0 { return 0 }
+    let rest = env_json.substring(i + key.len(), env_json.len())
+    let mut end: i64 = 0
+    while end < rest.len() {
+        let c = rest.substring(end, end + 1)
+        if c == " " || c == "\"" { break }
+        end = end + 1
+    }
+    let num_s = rest.substring(0, end)
+    let mut v: i64 = 0
+    try { v = to_int(num_s) } catch e { v = 0 }
+    if v < 0 { v = -v }
+    return v
+}
+
+// ─── γ — empirical-bridge-driven reframe ─────────────────────────────
+fn _gamma_envelope(bridges_dir: str, beta_byte: i64) -> str {
+    let ts = _now_iso_utc()
+    let files = _list_files(bridges_dir)
+    let n = len(files)
+    if n == 0 {
+        let bh = _short_hash("gamma:" + ts + ":empty")
+        return "{\"mechanism\":\"gamma\",\"source_id\":\"bridge:none\",\"byte_hash\":\"" + bh + "\",\"ts\":\"" + ts + "\",\"payload_summary\":\"bridges_registry_empty=true\"}"
+    }
+    let idx = beta_byte % to_int(to_string(n))
+    let pick = bridges_dir + "/" + files[idx]
+    let pick_slug = _registry_field(pick, "slug")
+    let pick_invocation = _registry_field(pick, "invocation")
+    let bh = _short_hash("gamma:" + pick_slug + ":" + ts)
+    // We do NOT execute the bridge fetch here in dry-run mode — that's the
+    // job of the spawned sub-agent (real bridge call when not dry-run).
+    let payload = "bridge_pick=" + pick_slug + " invocation=" + pick_invocation + " (real fetch deferred to sub-agent or OFFLINE-FALLBACK)"
+    return "{\"mechanism\":\"gamma\",\"source_id\":\"bridge:" + pick_slug + "\",\"byte_hash\":\"" + bh + "\",\"ts\":\"" + ts + "\",\"payload_summary\":\"" + payload + "\"}"
+}
+
+// ─── prompt builder ──────────────────────────────────────────────────
+fn _build_prompt(topic: str, stratum: str, axes_csv: str, alpha: str, beta: str, gamma: str, witness_path: str) -> str {
+    let mut buf = ""
+    buf = buf + "# kick(ω-cycle) — topic: " + topic + "\n"
+    buf = buf + "# stratum: " + stratum + "\n"
+    buf = buf + "# axes: " + axes_csv + "\n"
+    buf = buf + "# witness landing path: " + witness_path + "\n"
+    buf = buf + "# noise envelopes (raw 47 cross-repo-trawl-witness; raw 80 sentinel format):\n"
+    buf = buf + "#   alpha: " + alpha + "\n"
+    buf = buf + "#   beta : " + beta + "\n"
+    buf = buf + "#   gamma: " + gamma + "\n"
+    buf = buf + "# core 5-op kernel (architecture Tier-1):\n"
+    buf = buf + "#   1) intake topic\n"
+    buf = buf + "#   2) pre-register falsifiers\n"
+    buf = buf + "#   3) fan out K≥3 orthogonal axes (raw 48 correlation < 0.7)\n"
+    buf = buf + "#   4) gate Tier-1 promotion via falsifier-pass-pattern\n"
+    buf = buf + "#   5) emit witness JSON to declared landing path\n"
+    buf = buf + "#\n"
+    buf = buf + "Fire kick(ω-cycle) on the topic above. Land witness JSON at the declared path.\n"
+    buf = buf + "On completion print the sentinel line: __KICK_RESULT__ <PASS|FAIL> witness=<path> tier1=<N> falsifier_pass=<N>\n"
+    buf = buf + "On error print: reason=<slug> fix=<directive>\n"
+    return buf
+}
+
+// ─── absorbed-feedback writeback (NEXUS Absorb stage / F18) ──────────
+// After a successful kick(ω-cycle) emits Tier-1s, write one registry entry per
+// Tier-1 to state/kick/registry/noise_sources/absorbed/<witness_trawl_id>__<tier1_id>.hexa.
+// These entries are then sampled by α-mechanism on subsequent kicks, physically
+// closing the Blowup → Contract → Emerge → Absorb → next-cycle loop.
+//
+// Schema (mirrors noise_sources/bridges/<name>.hexa header + indented k/v body):
+//   noise-source <auto> active "absorbed:<tier1_id> from <witness_trawl_id>"
+//     slug <witness_trawl_id>__<tier1_id>
+//     kind absorbed
+//     source-witness <abs path to witness JSON>
+//     tier1-id <tier1_id>
+//     axis <parent axis>
+//     ts <ISO8601 +09:00>
+//     payload-summary <one-line rationale>
+//     hash <sha256-16 of payload-summary>
+//     registry-of-record state/kick/registry/noise_sources/absorbed/<filename>
+//     evidence-source <witness_trawl_id> Tier-1 entry
+
+fn _now_iso_kst() -> str {
+    return exec("TZ=Asia/Seoul date +%Y-%m-%dT%H:%M:%S+09:00").trim()
+}
+
+// Parse `[ ... ]` JSON-array of objects (best-effort, simple) and yield the
+// substring between matched brackets at top-level depth-1. Hexa-lang lacks a
+// JSON parser; we hand-scan tier_1_promotions / tier_1_implemented arrays.
+fn _slice_top_array(text: str, key: str) -> str {
+    let needle = "\"" + key + "\":"
+    let i = text.index_of(needle)
+    if i < 0 { return "" }
+    let mut j = i + needle.len()
+    while j < text.len() {
+        let c = text.substring(j, j + 1)
+        if c == "[" { break }
+        j = j + 1
+    }
+    if j >= text.len() { return "" }
+    // depth-aware scan; ignore brackets inside double-quoted strings.
+    let mut depth: i64 = 0
+    let mut k: i64 = j
+    let mut in_str = false
+    let mut esc = false
+    while k < text.len() {
+        let c = text.substring(k, k + 1)
+        if esc { esc = false; k = k + 1; continue }
+        if c == "\\" { esc = true; k = k + 1; continue }
+        if c == "\"" { in_str = !in_str; k = k + 1; continue }
+        if !in_str {
+            if c == "[" { depth = depth + 1 }
+            if c == "]" {
+                depth = depth - 1
+                if depth == 0 { return text.substring(j, k + 1) }
+            }
+        }
+        k = k + 1
+    }
+    return ""
+}
+
+// Split a top-level JSON array string `[ {...}, {...} ]` into element substrings.
+// Depth-1 element = each {...} object at depth 1 inside the outer brackets.
+fn _split_array_elements(arr_text: str) -> [str] {
+    let mut out: [str] = []
+    if arr_text.len() < 2 { return out }
+    // strip outer [ ]
+    let inner = arr_text.substring(1, arr_text.len() - 1)
+    let mut depth: i64 = 0
+    let mut start: i64 = -1
+    let mut i: i64 = 0
+    let mut in_str = false
+    let mut esc = false
+    while i < inner.len() {
+        let c = inner.substring(i, i + 1)
+        if esc { esc = false; i = i + 1; continue }
+        if c == "\\" { esc = true; i = i + 1; continue }
+        if c == "\"" { in_str = !in_str; i = i + 1; continue }
+        if !in_str {
+            if c == "{" {
+                if depth == 0 { start = i }
+                depth = depth + 1
+            } else if c == "}" {
+                depth = depth - 1
+                if depth == 0 && start >= 0 {
+                    out = out + [inner.substring(start, i + 1)]
+                    start = -1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Extract a flat string field from a JSON object substring. Best-effort —
+// handles only top-level "key":"value" pairs (what the Tier-1 records use).
+fn _json_field(obj: str, key: str) -> str {
+    let needle = "\"" + key + "\":"
+    let i = obj.index_of(needle)
+    if i < 0 { return "" }
+    let mut j = i + needle.len()
+    // skip whitespace
+    while j < obj.len() {
+        let c = obj.substring(j, j + 1)
+        if c == " " || c == "\t" { j = j + 1 } else { break }
+    }
+    if j >= obj.len() { return "" }
+    let first = obj.substring(j, j + 1)
+    if first == "\"" {
+        // string value
+        let mut k = j + 1
+        let mut esc = false
+        while k < obj.len() {
+            let c = obj.substring(k, k + 1)
+            if esc { esc = false; k = k + 1; continue }
+            if c == "\\" { esc = true; k = k + 1; continue }
+            if c == "\"" { break }
+            k = k + 1
+        }
+        return obj.substring(j + 1, k)
+    }
+    // primitive (int/bool/null) — read until comma or closing brace
+    let mut k = j
+    while k < obj.len() {
+        let c = obj.substring(k, k + 1)
+        if c == "," || c == "}" || c == "\n" { break }
+        k = k + 1
+    }
+    return obj.substring(j, k).trim()
+}
+
+fn _absorbed_filename_safe(s: str) -> str {
+    let mut out = ""
+    let mut i: i64 = 0
+    while i < s.len() {
+        let c = s.substring(i, i + 1)
+        let is_ok = (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9") || c == "-" || c == "_"
+        if is_ok { out = out + c } else { out = out + "_" }
+        i = i + 1
+    }
+    return out
+}
+
+// Public-by-convention: write one absorbed entry. Returns the path written.
+// (Internal helper; called by _writeback_absorbed_from_witness and the
+// standalone --writeback-only smoke entry.)
+fn _write_absorbed_entry(witness_path: str, trawl_id: str, tier1_id: str, axis: str, rationale: str) -> str {
+    let registry_dir = _registry_root() + "/noise_sources/absorbed"
+    _ensure_dir(registry_dir)
+    let raw_slug = trawl_id + "__" + tier1_id
+    let safe_slug = _absorbed_filename_safe(raw_slug)
+    let path = registry_dir + "/" + safe_slug + ".hexa"
+    let ts = _now_iso_kst()
+    // sha256-16 of the rationale payload (raw 73 honesty triad — real shasum).
+    let h = _short_hash(rationale)
+    let mut buf = ""
+    buf = buf + "# state/kick/registry/noise_sources/absorbed/" + safe_slug + ".hexa\n"
+    buf = buf + "# kick(ω-cycle) absorbed-primitive registry entry — written by tool/kick_dispatch.hexa\n"
+    buf = buf + "# NEXUS Blowup → Contract → Emerge → Absorb (F14/F18 carry-forward 2026-04-26).\n"
+    buf = buf + "# Source witness: " + witness_path + "\n"
+    buf = buf + "\n"
+    buf = buf + "noise-source absorbed active \"absorbed:" + tier1_id + " from " + trawl_id + "\"\n"
+    buf = buf + "  slug " + safe_slug + "\n"
+    buf = buf + "  kind absorbed\n"
+    buf = buf + "  source-witness " + witness_path + "\n"
+    buf = buf + "  tier1-id " + tier1_id + "\n"
+    buf = buf + "  axis " + axis + "\n"
+    buf = buf + "  ts " + ts + "\n"
+    buf = buf + "  payload-summary " + rationale + "\n"
+    buf = buf + "  hash " + h + "\n"
+    buf = buf + "  registry-of-record state/kick/registry/noise_sources/absorbed/" + safe_slug + ".hexa\n"
+    buf = buf + "  evidence-source " + trawl_id + " Tier-1 entry " + tier1_id + "\n"
+    write_file(path, buf)
+    return path
+}
+
+// Read a witness JSON, find tier_1_promotions or tier_1_implemented, write one
+// absorbed entry per Tier-1. Returns count written. Idempotent: if a target
+// file already exists it is rewritten (timestamps/hash refresh, but slug+content
+// stable).
+fn _writeback_absorbed_from_witness(witness_path: str) -> i64 {
+    if !_file_exists(witness_path) { return 0 }
+    let text = read_file(witness_path)
+    let trawl_id = _json_field(text, "trawl_id")
+    if trawl_id.len() == 0 { return 0 }
+    // Try tier_1_promotions first (architecture witness key); fall back to
+    // tier_1_implemented (code-emission witness key).
+    let mut arr = _slice_top_array(text, "tier_1_promotions")
+    if arr.len() == 0 { arr = _slice_top_array(text, "tier_1_implemented") }
+    if arr.len() == 0 { return 0 }
+    let elems = _split_array_elements(arr)
+    let mut count: i64 = 0
+    let mut i: i64 = 0
+    while i < len(elems) {
+        let obj = elems[i]
+        let tier1_id = _json_field(obj, "id")
+        if tier1_id.len() > 0 {
+            let axis = _json_field(obj, "axis")
+            let rationale = _json_field(obj, "rationale")
+            let summary = if rationale.len() > 0 { rationale } else { "no-rationale-field" }
+            // 1-line cap: collapse newlines + cap at 240 chars
+            let mut one = summary.replace("\n", " ").replace("\r", " ").trim()
+            if one.len() > 240 { one = one.substring(0, 240) }
+            let _ = _write_absorbed_entry(witness_path, trawl_id, tier1_id, axis, one)
+            count = count + 1
+        }
+        i = i + 1
+    }
+    return count
+}
+
+// ─── auto-absorb (Layer 1, F20 — canonical witness_emit semantics) ─────
+// After a successful witness JSON lands on disk (real-spawn success path or
+// --writeback-only standalone path), automatically invoke
+// tool/omega_cycle_atlas_ingest.hexa with --witness <path> so atlas.n6
+// absorbs the cycle's facts immediately. Option A (single-witness scope) was
+// chosen over Option B (broad re-ingest) because the underlying tool's batch
+// absorb mode exits 3 on conflict whenever ANY fact id is already in main
+// atlas.n6 — broad mode would fail-loud after the first kick. The new
+// --witness flag combined with the F21 idempotence-skip path makes
+// per-witness re-runs safe.
+//
+// own:atlas-absorb-mandatory (triad layer 2): this fn IS the canonical
+// post-write absorb path for kick witnesses — semantic equivalent of
+// tool/witness_emit.hexa::emit_witness, specialized to the post-spawn case
+// where the witness JSON is already written by the sub-agent. New emitters
+// that produce the witness body in-process should call witness_emit directly
+// instead of duplicating this fn. claude-dependency: NONE. hooks: NONE.
+//
+// Opt-out: KICK_NO_AUTO_ABSORB=1 disables auto-absorb (tests / odd states).
+// --dry-run path skips this entirely (writeback also skipped in dry-run).
+//
+// Sentinels (raw 80):
+//   __KICK_AUTO_ABSORB__ PASS    witness=<path> shards=<N> new_lines=<N>
+//   __KICK_AUTO_ABSORB__ SKIP    witness=<path> reason=opt_out_env
+//   __KICK_AUTO_ABSORB__ SKIP    witness=<path> reason=already_absorbed
+//   __KICK_AUTO_ABSORB__ FAIL    witness=<path> reason=<slug> fix=<directive>
+fn _auto_absorb_witness(witness_path: str) {
+    if env("KICK_NO_AUTO_ABSORB") == "1" {
+        println("__KICK_AUTO_ABSORB__ SKIP witness=" + witness_path + " reason=opt_out_env")
+        return
+    }
+    if !_file_exists(witness_path) {
+        eprintln("__KICK_AUTO_ABSORB__ FAIL witness=" + witness_path + " reason=witness-missing fix=verify witness JSON landed before auto-absorb")
+        return
+    }
+    let ingest_tool = _nexus_root() + "/tool/omega_cycle_atlas_ingest.hexa"
+    if !_file_exists(ingest_tool) {
+        eprintln("__KICK_AUTO_ABSORB__ FAIL witness=" + witness_path + " reason=ingest-tool-missing fix=verify " + ingest_tool)
+        return
+    }
+    // Snapshot atlas.n6 line count for new_lines delta. Use HOME-rooted path
+    // (mirrors omega_cycle_atlas_ingest._atlas_main_path).
+    let atlas_main = env("HOME") + "/core/nexus/n6/atlas.n6"
+    let pre_lines_str = exec("wc -l < " + _shell_quote(atlas_main) + " 2>/dev/null | tr -d ' '").trim()
+    let mut pre_lines: i64 = 0
+    try { pre_lines = to_int(pre_lines_str) } catch e { pre_lines = 0 }
+
+    let cmd = _hexa_bin() + " run " + _shell_quote(ingest_tool) + " --witness " + _shell_quote(witness_path) + " 2>&1; echo __RC=$?"
+    let out = exec(cmd).trim()
+    let rc_idx = out.last_index_of("__RC=")
+    let mut rc: i64 = -1
+    if rc_idx >= 0 {
+        let tail = out.substring(rc_idx + 5, out.len()).trim()
+        try { rc = to_int(tail) } catch e { rc = -1 }
+    }
+
+    if rc != 0 {
+        // raw 66 trailer
+        eprintln("__KICK_AUTO_ABSORB__ FAIL witness=" + witness_path + " reason=ingest-rc-" + to_string(rc) + " fix=hexa run " + ingest_tool + " --witness " + witness_path + " 2>&1   # inspect")
+        return
+    }
+
+    // Detect SKIP (already-absorbed) sentinel in output to differentiate
+    // genuine new-line absorb from F21 idempotence skip.
+    if out.index_of("__OMEGA_CYCLE_ATLAS_INGEST__ SKIP") >= 0 {
+        println("__KICK_AUTO_ABSORB__ SKIP witness=" + witness_path + " reason=already_absorbed")
+        return
+    }
+
+    let post_lines_str = exec("wc -l < " + _shell_quote(atlas_main) + " 2>/dev/null | tr -d ' '").trim()
+    let mut post_lines: i64 = 0
+    try { post_lines = to_int(post_lines_str) } catch e { post_lines = 0 }
+    let new_lines = post_lines - pre_lines
+    println("__KICK_AUTO_ABSORB__ PASS witness=" + witness_path + " shards=1 new_lines=" + to_string(new_lines))
+}
+
+fn _append_envelope_log(path: str, line: str) {
+    let dir_end = path.last_index_of("/")
+    if dir_end > 0 {
+        _ensure_dir(path.substring(0, dir_end))
+    }
+    let tmp = path + ".tmp"
+    write_file(tmp, line + "\n")
+    let _ = exec("cat " + _shell_quote(tmp) + " >> " + _shell_quote(path) + " && rm -f " + _shell_quote(tmp))
+}
+
+fn _usage() {
+    eprintln("usage: hexa tool/kick_dispatch.hexa <topic> [--backend <slug>] [--stratum <slug>] [--axes a,b,c] [--noise alpha,beta,gamma] [--witness-dir <path>] [--parent-sid <sid>] [--dry-run]")
+    eprintln("       hexa tool/kick_dispatch.hexa --writeback-only <witness.json>   # F18 absorbed-loop-closes standalone")
+    eprintln("  defaults: backend=claude_code stratum=drill axes=design-strategy,falsifier-coverage noise=alpha,beta,gamma witness-dir=design/kick/")
+    eprintln("  KICK_BETA_REAL_ANU=1 enables real ANU QRNG byte fetch (else /dev/urandom; rate-limit fallback tagged source=urandom_fallback per obs_2)")
+    eprintln("  KICK_NO_AUTO_ABSORB=1 disables auto-absorb to atlas.n6 (F20 default ON; raw 77 idempotent-skip via --witness flag).")
+    eprintln("  raw 80 sentinel: __KICK_RESULT__ <PASS|FAIL> witness=<path> tier1=<N> falsifier_pass=<N>")
+    eprintln("  raw 80 sentinel: __KICK_AUTO_ABSORB__ <PASS|SKIP|FAIL> witness=<path> [shards=<N> new_lines=<N> | reason=<slug>]")
+    eprintln("  raw 66 err:     reason=<slug> fix=<directive>")
+}
+
+fn main() -> void {
+    let raw_args = args()
+    let mut user_start = 2
+    if raw_args.len() >= 3 && raw_args[1] == "run" { user_start = 3 }
+    // collect positional + flags
+    let mut topic = ""
+    let mut backend_slug = "claude_code"
+    let mut stratum_slug = "drill"
+    let mut axes_csv = "design-strategy,falsifier-coverage"
+    let mut noise_csv = "alpha,beta,gamma"
+    let mut witness_dir = "design/kick/"
+    let mut parent_sid = env("HIVE_PARENT_SID")
+    let mut dry_run = false
+    let mut writeback_only = ""
+    let mut i = user_start
+    while i < raw_args.len() {
+        let a = raw_args[i]
+        if a == "--backend" { if i + 1 < raw_args.len() { backend_slug = raw_args[i + 1] }; i = i + 2; continue }
+        if a == "--stratum" { if i + 1 < raw_args.len() { stratum_slug = raw_args[i + 1] }; i = i + 2; continue }
+        if a == "--axes" { if i + 1 < raw_args.len() { axes_csv = raw_args[i + 1] }; i = i + 2; continue }
+        if a == "--noise" { if i + 1 < raw_args.len() { noise_csv = raw_args[i + 1] }; i = i + 2; continue }
+        if a == "--witness-dir" { if i + 1 < raw_args.len() { witness_dir = raw_args[i + 1] }; i = i + 2; continue }
+        if a == "--parent-sid" { if i + 1 < raw_args.len() { parent_sid = raw_args[i + 1] }; i = i + 2; continue }
+        if a == "--writeback-only" { if i + 1 < raw_args.len() { writeback_only = raw_args[i + 1] }; i = i + 2; continue }
+        if a == "--dry-run" { dry_run = true; i = i + 1; continue }
+        if a == "--help" || a == "-h" { _usage(); exit(0) }
+        if a.starts_with("--") { i = i + 2; continue }
+        if topic.len() == 0 { topic = a }
+        i = i + 1
+    }
+    // Standalone writeback path — used by F18 absorbed-loop-closes smoke test
+    // when $HIVE_PARENT_SID is unset (no real spawn possible). Reads a witness
+    // JSON, emits one absorbed/<...>.hexa per Tier-1, prints sentinel + exits.
+    if writeback_only.len() > 0 {
+        if !_file_exists(writeback_only) {
+            eprintln("__KICK_RESULT__ FAIL witness=" + writeback_only + " tier1=0 falsifier_pass=0")
+            eprintln("reason=witness-not-found fix=verify path; --writeback-only requires an existing witness JSON")
+            exit(1)
+        }
+        let n = _writeback_absorbed_from_witness(writeback_only)
+        println("__KICK_WRITEBACK__ PASS witness=" + writeback_only + " absorbed_written=" + to_string(n))
+        // F20 — auto-absorb the witness into atlas.n6 so atlas absorb stage
+        // closes in the same process. Opt-out via KICK_NO_AUTO_ABSORB=1.
+        _auto_absorb_witness(writeback_only)
+        exit(0)
+    }
+    if topic.len() == 0 {
+        _usage()
+        eprintln("__KICK_RESULT__ FAIL witness=<missing> tier1=0 falsifier_pass=0")
+        eprintln("reason=missing-topic fix=hexa tool/kick_dispatch.hexa \"<topic-string>\"")
+        exit(1)
+    }
+
+    // Verify backend slot exists in registry.
+    let backend_path = _registry_root() + "/backends/" + backend_slug + ".hexa"
+    if !_file_exists(backend_path) {
+        eprintln("__KICK_RESULT__ FAIL witness=<missing> tier1=0 falsifier_pass=0")
+        eprintln("reason=unknown-backend fix=ls " + _registry_root() + "/backends/   # available backend slots")
+        exit(1)
+    }
+    let backend_status_field = _registry_field(backend_path, "cli-binary")
+    // obs_1 RESOLVED 2026-04-26 carry-forward — codex_cli registry now carries a real
+    // adapter shape (installed=true, installed-path=/opt/homebrew/bin/codex, version
+    // codex-cli 0.121.0). Backends with `installed false` are the new placeholder gate.
+    let installed_flag = _registry_field(backend_path, "installed")
+    if installed_flag == "false" && !dry_run {
+        eprintln("__KICK_RESULT__ FAIL witness=<missing> tier1=0 falsifier_pass=0")
+        eprintln("reason=backend-not-installed-" + backend_slug + " fix=cat " + backend_path + "   # see install hint in registry header; or use --backend claude_code")
+        exit(1)
+    }
+
+    // run_id = <ts>_<topic_slug>
+    let topic_slug = _slugify(topic)
+    let date_str = exec("date -u +%Y-%m-%d").trim()
+    let run_id = date_str + "_" + topic_slug
+    let runs_root = _nexus_root() + "/state/kick/runs/" + run_id
+    _ensure_dir(runs_root)
+    let envelope_log = runs_root + "/noise_envelopes.jsonl"
+
+    // Resolve witness landing path.
+    let mut wd = witness_dir
+    if !wd.starts_with("/") { wd = _nexus_root() + "/" + wd }
+    _ensure_dir(wd)
+    let witness_path = wd + "/" + run_id + "_omega_cycle.json"
+
+    // ─── α / β / γ envelopes ───────────────────────────────────────────
+    let want_alpha = noise_csv.contains("alpha")
+    let want_beta = noise_csv.contains("beta")
+    let want_gamma = noise_csv.contains("gamma")
+
+    let absorbed_dir = _registry_root() + "/noise_sources/absorbed"
+    let bridges_dir = _registry_root() + "/noise_sources/bridges"
+
+    let alpha_env = if want_alpha { _alpha_envelope(absorbed_dir) } else { "{\"mechanism\":\"alpha\",\"source_id\":\"disabled\",\"byte_hash\":\"-\",\"ts\":\"" + _now_iso_utc() + "\",\"payload_summary\":\"alpha-disabled\"}" }
+    let beta_env = if want_beta { _beta_envelope() } else { "{\"mechanism\":\"beta\",\"source_id\":\"disabled\",\"byte_hash\":\"-\",\"ts\":\"" + _now_iso_utc() + "\",\"payload_summary\":\"beta-disabled\"}" }
+    let beta_byte = _beta_byte_int(beta_env)
+    let gamma_env = if want_gamma { _gamma_envelope(bridges_dir, beta_byte) } else { "{\"mechanism\":\"gamma\",\"source_id\":\"disabled\",\"byte_hash\":\"-\",\"ts\":\"" + _now_iso_utc() + "\",\"payload_summary\":\"gamma-disabled\"}" }
+
+    _append_envelope_log(envelope_log, alpha_env)
+    _append_envelope_log(envelope_log, beta_env)
+    _append_envelope_log(envelope_log, gamma_env)
+
+    let prompt = _build_prompt(topic, stratum_slug, axes_csv, alpha_env, beta_env, gamma_env, witness_path)
+
+    if dry_run {
+        println("__KICK_DRY_RUN__ topic=" + topic + " run_id=" + run_id)
+        println("backend: " + backend_slug + " (cli-binary: " + backend_status_field + ")")
+        println("stratum: " + stratum_slug)
+        println("axes:    " + axes_csv)
+        println("noise:   " + noise_csv)
+        println("witness: " + witness_path)
+        println("envelopes_log: " + envelope_log)
+        println("--- noise envelopes ---")
+        println("alpha: " + alpha_env)
+        println("beta : " + beta_env)
+        println("gamma: " + gamma_env)
+        println("--- prompt header (first 20 lines) ---")
+        let plines = prompt.split("\n")
+        let mut k: i64 = 0
+        while k < 20 && k < len(plines) {
+            println(plines[k])
+            k = k + 1
+        }
+        println("__KICK_RESULT__ PASS witness=" + witness_path + " tier1=0 falsifier_pass=0  (dry-run; no spawn)")
+        exit(0)
+    }
+
+    // Live spawn — route through hive subagent_dispatch when parent SID present.
+    if parent_sid.len() == 0 {
+        eprintln("__KICK_RESULT__ FAIL witness=" + witness_path + " tier1=0 falsifier_pass=0")
+        eprintln("reason=no-parent-sid fix=set $HIVE_PARENT_SID or pass --parent-sid <id>; subagent dispatch requires raw 44 contract")
+        exit(2)
+    }
+    let dispatch_tool = _hive_root() + "/tool/subagent_dispatch.hexa"
+    if !_file_exists(dispatch_tool) {
+        eprintln("__KICK_RESULT__ FAIL witness=" + witness_path + " tier1=0 falsifier_pass=0")
+        eprintln("reason=missing-subagent-dispatch fix=verify hive checkout at " + dispatch_tool)
+        exit(2)
+    }
+    // Persist prompt to a sidecar so caller can review.
+    let prompt_path = runs_root + "/prompt.txt"
+    write_file(prompt_path, prompt)
+    let cmd = _hexa_bin() + " run " + _shell_quote(dispatch_tool) + " " + _shell_quote(parent_sid) + " " + _shell_quote(prompt)
+    let rc_str = exec(cmd + " 2>&1; echo __RC=$?").trim()
+    let rc_idx = rc_str.last_index_of("__RC=")
+    let mut rc: i64 = 0
+    if rc_idx >= 0 {
+        let tail = rc_str.substring(rc_idx + 5, rc_str.len()).trim()
+        try { rc = to_int(tail) } catch e { rc = 0 }
+    }
+    print(rc_str)
+    if rc != 0 {
+        eprintln("__KICK_RESULT__ FAIL witness=" + witness_path + " tier1=0 falsifier_pass=0")
+        eprintln("reason=spawn-failed-rc-" + to_string(rc) + " fix=tail " + runs_root + "/prompt.txt; check hive subagent state at ~/.hive/subagent-state")
+        exit(2)
+    }
+    if !_file_exists(witness_path) {
+        eprintln("__KICK_RESULT__ FAIL witness=" + witness_path + " tier1=0 falsifier_pass=0")
+        eprintln("reason=witness-not-captured fix=re-run with shorter topic or inspect " + runs_root + "/prompt.txt; sub-agent did not land witness")
+        exit(3)
+    }
+    // F18 absorbed-loop-closes — physically write back Tier-1s as α-mechanism
+    // primitives for subsequent kicks. Skipped under --dry-run (registry must
+    // not be polluted by dry-run smoke). Counted as best-effort: a 0-count
+    // result is non-fatal (witness may have produced no Tier-1s).
+    let absorbed_n = _writeback_absorbed_from_witness(witness_path)
+    // F20 — auto-absorb to atlas.n6 in same process. Gated by --dry-run (this
+    // branch is non-dry-run by construction) and by KICK_NO_AUTO_ABSORB=1.
+    _auto_absorb_witness(witness_path)
+    println("__KICK_RESULT__ PASS witness=" + witness_path + " tier1=? falsifier_pass=?  absorbed_written=" + to_string(absorbed_n) + "  (decode tier1/falsifier_pass from witness JSON post-hoc)")
+    exit(0)
+}
