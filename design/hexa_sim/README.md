@@ -16,7 +16,8 @@
 | **Atlas SSOT decision** (hexa-lang) | [`hexa_lang_atlas_ssot_decision.md`](hexa_lang_atlas_ssot_decision.md) |
 | **Atlas function-call notation convention** | [`../atlas_function_call_convention.md`](../atlas_function_call_convention.md) |
 | **Semantic-gap audit** + script | [`2026-04-26_atlas_semantic_gap_audit.md`](2026-04-26_atlas_semantic_gap_audit.md) · [`2026-04-26_atlas_semantic_gap_audit.py`](2026-04-26_atlas_semantic_gap_audit.py) |
-| **Health-check tools** | [`../../tool/falsifier_health.sh`](../../tool/falsifier_health.sh) · [`../../tool/bridge_health.sh`](../../tool/bridge_health.sh) · [`../../tool/health_check_all.sh`](../../tool/health_check_all.sh) |
+| **Health-check tools** | seq: [`../../tool/falsifier_health.sh`](../../tool/falsifier_health.sh) · [`../../tool/bridge_health.sh`](../../tool/bridge_health.sh) · [`../../tool/atlas_health.sh`](../../tool/atlas_health.sh) · [`../../tool/health_check_all.sh`](../../tool/health_check_all.sh) — parallel (3.6×/2.4×): [`../../tool/falsifier_health_parallel.sh`](../../tool/falsifier_health_parallel.sh) · [`../../tool/bridge_health_parallel.sh`](../../tool/bridge_health_parallel.sh) (env switch: `FALSIFIER_HEALTH_TOOL` / `BRIDGE_HEALTH_TOOL`) |
+| **Defense ops tools** | [`../../tool/ledger_verify.sh`](../../tool/ledger_verify.sh) · [`../../tool/registry_sign.sh`](../../tool/registry_sign.sh) · [`../../tool/bridge_sha256_rotate.sh`](../../tool/bridge_sha256_rotate.sh) · [`../../tool/atlas_sha256_rotate.sh`](../../tool/atlas_sha256_rotate.sh) · [`../../tool/timeline_rotate.sh`](../../tool/timeline_rotate.sh) |
 | **Paper-grade synthesis** (n=6 program) | [`SYNTHESIS_2026-04-26.md`](SYNTHESIS_2026-04-26.md) |
 | **Session handoff** (next session start here) | [`NEXT_SESSION_HANDOFF.md`](NEXT_SESSION_HANDOFF.md) · [`SESSION_FINAL_REPORT.md`](SESSION_FINAL_REPORT.md) |
 | **Per-file index** (auto-generatable) | [`INDEX.md`](INDEX.md) |
@@ -113,8 +114,10 @@ Layered defenses against silent registry tampering / drift. Each layer is indepe
 | **R1** | Per-entry `cmd_sha256` (each falsifier carries its own command hash; mutation flips the hash) | live | `falsifiers.jsonl` (`cmd_sha256` field) |
 | **R2** | Anti-spoof lint (`cmd` must end in sentinel matched by `pass` exactly; rejects literal-only commands) | live | [`../../tool/falsifier_health.sh`](../../tool/falsifier_health.sh) |
 | **R3 lite** | Whole-registry SHA256 baseline checked under `--strict` (any drift → warn) | live | `state/falsifier_registry.sha256` |
-| **R3 full** | **Pre-commit hook auto-rotates baseline** when `falsifiers.jsonl` is staged; idempotent (no-op when sha unchanged); raw 66 trailers on failure paths | this iteration | [`../../.githooks/pre-commit`](../../.githooks/pre-commit) (enable: `git config core.hooksPath .githooks`) |
-| **R4** | Forensic ledger — every rotation appended JSONL `{ts, old_sha, new_sha, trigger}` (gitignored, local-only) | this iteration | `state/falsifier_registry_rotation_log.jsonl` |
+| **R3 full** | Pre-commit hook auto-rotation — **intentionally retired** by user (commits `e3137be2`+`fa1de8e2` chflags uchg + `582f791e` AI-native deny category); manual rotation via `tool/bridge_sha256_rotate.sh` / `tool/atlas_sha256_rotate.sh` | retired (OS-locked) | n/a |
+| **R4** | Forensic ledger — every rotation appended JSONL `{ts, old_sha, new_sha, trigger, prev_hash}` (gitignored, local-only) | live | `state/{falsifier|bridge_sha256|atlas_sha256}_rotation_log.jsonl` |
+| **R5 chain** | Hash-chained ledger — each entry includes `prev_hash:sha256(prev_line) or genesis`; forward-propagation forgery detection via [`../../tool/ledger_verify.sh`](../../tool/ledger_verify.sh) `--ledger {falsifier|bridge|atlas|PATH}` | live (registry+bridge+atlas) | `state/*_rotation_log.jsonl` |
+| **R5 SSH** | Detached SSH signature stub — skip-by-default until `SIGNING_KEY` env or `git config user.signingkey` set; runbook ready | stub | [`../../tool/registry_sign.sh`](../../tool/registry_sign.sh) + [`R5_SSH_ACTIVATION_RUNBOOK.md`](R5_SSH_ACTIVATION_RUNBOOK.md) |
 
 **Threat model**: an entry's `cmd` is silently swapped → R1 catches the per-entry hash flip. The whole file is replaced → R3 lite catches the baseline drift. A developer adds a legitimate F102+ entry but forgets `shasum -a 256 falsifiers.jsonl > state/falsifier_registry.sha256` → R3 full rotates the baseline at commit time and R4 records the rotation.
 
@@ -127,7 +130,17 @@ Layered defenses against silent registry tampering / drift. Each layer is indepe
 | [`F13_F22_candidate_review.md`](F13_F22_candidate_review.md) | F13–F22 + F23 |
 | [`F24_F30_candidate_review.md`](F24_F30_candidate_review.md) | F24–F30 chemistry / biology |
 | [`F31_F37_candidate_review.md`](F31_F37_candidate_review.md) | F31–F37 cross-domain |
-| [`F38_F44_candidate_review.md`](F38_F44_candidate_review.md) | F38–F44 L-prefix bridges |
+| [`F38_F44_candidate_review.md`](F38_F44_candidate_review.md) | F38–F44 L-prefix bridges (F45 declined) |
+| [`F50_F56_candidate_review.md`](F50_F56_candidate_review.md) | F50–F56 -cont absorption shards |
+| [`F57_F63_candidate_review.md`](F57_F63_candidate_review.md) | F57–F63 L4–L6 prefix |
+| [`F64_F70_candidate_review.md`](F64_F70_candidate_review.md) | F64–F70 particle_SM coverage gap |
+| [`F71_F77_candidate_review.md`](F71_F77_candidate_review.md) | F71–F77 @C/@S deeper |
+| [`F81_F87_candidate_review.md`](F81_F87_candidate_review.md) | F81–F87 @M/@T/@R |
+| [`F88_F94_candidate_review.md`](F88_F94_candidate_review.md) | F88–F94 @P/@F deeper |
+| [`F95_F101_candidate_review.md`](F95_F101_candidate_review.md) | F95–F101 math + bridge [11*] + L4 + n6-arch |
+| [`F102_F108_candidate_review.md`](F102_F108_candidate_review.md) | F102–F108 quality-gated (F108 [11!] sole) |
+| [`F109_F114_candidate_review.md`](F109_F114_candidate_review.md) | F109–F114 foundations + universality + paradigm |
+| [`2026-04-26_cross_engine_integration_audit.md`](2026-04-26_cross_engine_integration_audit.md) | F126–F132 cross-engine (proposal, awaiting user merge) |
 
 ---
 
