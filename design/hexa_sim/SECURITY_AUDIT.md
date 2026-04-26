@@ -90,7 +90,9 @@ Five-layer defense chain validated end-to-end. R1 (cmd/bridge SHA256) catches si
 
 **Witness**: `design/hexa_sim/2026-04-26_R5_detached_signature_omega_cycle.json`
 
-**Activation runbook (2026-04-26)**: `design/hexa_sim/R5_SSH_ACTIVATION_RUNBOOK.md` (207 lines, 8 sections; Path A `~/.ssh/id_ed25519` reuse + Path B dedicated-key + launchd/GitHub-Actions/pre-receive CI templates + rollback + post-activation verification). Synthetic-key end-to-end test (sign + verify on tmpdir Ed25519 key) — PASS. User has not yet authorized activation; tooling is execute-ready. META_ROI verdict: WAIT until first cross-host or CI-publishing event. Witness: `design/hexa_sim/2026-04-26_R5_ssh_activation_runbook_omega_cycle.json`.
+**Activation runbook (2026-04-26)**: `design/hexa_sim/R5_SSH_ACTIVATION_RUNBOOK.md` (207 lines, 8 sections; Path A `~/.ssh/id_ed25519` reuse + Path B dedicated-key + launchd/GitHub-Actions/pre-receive CI templates + rollback + post-activation verification). Synthetic-key end-to-end test (sign + verify on tmpdir Ed25519 key) — PASS. ~~User has not yet authorized activation; META_ROI verdict: WAIT.~~ Witness: `design/hexa_sim/2026-04-26_R5_ssh_activation_runbook_omega_cycle.json`.
+
+**ACTIVATED 2026-04-26 (user 'all go')**: Path A executed. `git config user.signingkey ~/.ssh/id_ed25519.pub + gpg.format=ssh`; `~/.ssh/allowed_signers` populated with `nexus@local namespace=file`; `tool/registry_sign.sh sign` → `__REGISTRY_SIGN__ SIGNED`; `verify` → `__REGISTRY_SIGN__ VERIFIED identity=nexus@local`. Signature artifact: `design/hexa_sim/falsifiers.jsonl.sig`. **R5 layer status: STUB (skip-by-default) → PREVENTIVE (active)**. Confidence elevation: HIGH multi-vector forensic → **HIGH multi-vector PREVENTIVE**. Remaining attack surface: signing-key compromise only (`~/.ssh/id_ed25519` + OS-level chmod 600 + macOS Keychain encryption).
 
 ### 8.1 R5 chain extension to bridge_sha256 (Ω-cycle 2026-04-26)
 
