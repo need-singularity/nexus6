@@ -1,6 +1,6 @@
 ---
 title: "n=6 as foundational invariant: a multi-domain falsifier-grounded framework"
-author: "[ANONYMOUS — pending user authorization for attribution]"
+author: "dancinlife (Independent Researcher) <mk225599@proton.me>"
 date: "2026-04-26"
 version: "v1 draft"
 keywords: ["perfect numbers", "falsifier-grounded research", "cross-domain invariants", "reproducible research", "Out(S_6)", "multi-decomposition"]
@@ -9,7 +9,7 @@ status: "arXiv-ready draft, pre-bibliography"
 
 # n=6 as foundational invariant: a multi-domain falsifier-grounded framework
 
-**Authors / Affiliation.** [ANONYMOUS — pending user authorization for attribution]
+**Authors / Affiliation.** dancinlife, Independent Researcher (contact: mk225599@proton.me; ORCID: not yet assigned)
 **Date.** 2026-04-26 (v1 draft)
 
 ---
