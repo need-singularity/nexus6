@@ -22,10 +22,12 @@ MODE="brief"
 case "${1:-}" in
     --full) MODE="full" ;;
     --brief|"") MODE="brief" ;;
+    --quiet) MODE="quiet" ;;
     --help|-h)
-        echo "usage: $0 [--brief|--full]"
+        echo "usage: $0 [--brief|--full|--quiet]"
         echo "  --brief  핵심 sentinel 만 + summary (default)"
         echo "  --full   각 도구 전체 출력"
+        echo "  --quiet  마지막 sentinel 라인만 (cron-friendly)"
         exit 0
         ;;
     *) echo "unknown: $1" >&2; exit 1 ;;
