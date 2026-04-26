@@ -1,0 +1,781 @@
+// tool/chflags_lock_native.hexa — ai-native chflags uchg wrapper with metadata sidecar.
+//
+// @no-lock-needed
+// @no-sandbox
+// @resolver-bypass(reason="chflags uchg/nouchg are BSD-only syscalls — must land on bare Mac inode, not container bind-mount")
+// @omega-saturation-exempt("static OS-level enforcement primitive — single-shot lock/unlock is idempotent per raw 65")
+// @chflags-lock-wrapper — only authorized bare chflags caller (audited by tool/chflags_lock_audit.hexa)
+//
+// PURPOSE
+//   Replaces bare `chflags uchg <path>` / `chflags nouchg <path>` calls
+//   across nexus + sister repos. Bare callers leave no record of WHY the
+//   path was locked, leaving downstream agents with kernel EPERM and no
+//   reason/fix surface. raw#66 (ai-native-error-message) demands every
+//   error site emit reason+fix in machine-readable form.
+//
+//   This wrapper:
+//     1. requires reason+fix at lock time (raw 66 hard-fail if missing)
+//     2. writes metadata sidecar at ~/.local/state/chflags_locks/<path-sha>.json
+//     3. lookup helper returns the ai-native error string for any locked path
+//     4. unlock helper GC's the metadata sidecar (no orphans)
+//     5. self-references — wrapper records its own metadata for its own
+//        chflags syscalls (audit-grade dogfood)
+//
+// SUBCOMMANDS
+//   lock    --path <p> --reason <r> --fix <f> [--guidance <g>] [--actor <id>]
+//   unlock  --path <p>
+//   lookup  --path <p>           — emits ai-native error string if locked, exit 0; null+exit 0 if not
+//   status  --path <p>           — pretty-print state + metadata
+//   list                         — list all metadata sidecars
+//   selftest                     — falsifier suite (raw 66 + raw 80 + GC + self-ref)
+//
+// EXIT CODES
+//   0 = success (also for lookup-unlocked-null)
+//   1 = io / chflags failure
+//   2 = required arg missing → ai-native raw 66 hard-fail
+//   3 = lock attempt collided with existing lock (different reason)
+//   4 = path missing
+//
+// SENTINEL (raw 80)
+//   stdout LAST line: __CHFLAGS_LOCK_NATIVE_RESULT__ <PASS|FAIL> <op>
+//
+// SCHEMA — ~/.local/state/chflags_locks/<sha>.json
+//   {"path":"<abs>","reason":"<>","fix":"<>","guidance":"<>",
+//    "locked_at":"<UTC iso8601>","locked_by_pid":<int>,
+//    "locked_by_session":"<HEXA_SESSION_ID or hostname-pid>"}
+
+let HOME = env("HOME")
+let META_DIR = HOME + "/.local/state/chflags_locks"
+let SENTINEL_TAG = "__CHFLAGS_LOCK_NATIVE_RESULT__"
+
+// ─── void-safe coercion ─────────────────────────────────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _to_int0(s: string) -> i64 {
+    if s == "" { return 0 }
+    let first = _str(s.split("\n")[0]).trim()
+    if first == "" { return 0 }
+    return to_int(first)
+}
+
+fn _utc_iso() -> string {
+    return _str(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()
+}
+
+fn _pid() -> string {
+    return _str(exec("echo $$")).trim()
+}
+
+fn _hostname() -> string {
+    return _str(exec("hostname -s 2>/dev/null")).trim()
+}
+
+fn _session() -> string {
+    let s = env("HEXA_SESSION_ID")
+    if s != "" { return s }
+    let s2 = env("CLAUDE_SESSION_ID")
+    if s2 != "" { return s2 }
+    return _hostname() + "-" + _pid()
+}
+
+fn _is_darwin() -> bool {
+    return _str(exec("uname -s")).trim() == "Darwin"
+}
+
+fn _is_linux() -> bool {
+    return _str(exec("uname -s")).trim() == "Linux"
+}
+
+fn _path_exists(p: string) -> bool {
+    if p == "" { return false }
+    return file_exists(p)
+}
+
+// Resolve to absolute path — chflags + sidecar key must be canonical.
+fn _abs(p: string) -> string {
+    if p == "" { return "" }
+    let esc = p.replace("'", "'\\''")
+    let r = _str(exec("python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' '" + esc + "' 2>/dev/null")).trim()
+    if r != "" { return r }
+    // python3 unavailable → fallback to readlink -f / realpath
+    let r2 = _str(exec("readlink -f '" + esc + "' 2>/dev/null")).trim()
+    if r2 != "" { return r2 }
+    // last resort: prepend pwd if relative
+    if p.substring(0, 1) == "/" { return p }
+    let pwd = _str(exec("pwd")).trim()
+    return pwd + "/" + p
+}
+
+fn _path_sha(p: string) -> string {
+    let esc = p.replace("'", "'\\''")
+    let cmd = "printf '%s' '" + esc + "' | /usr/bin/shasum -a 256 2>/dev/null | cut -c1-32"
+    let r = _str(exec(cmd)).trim()
+    return r
+}
+
+fn _meta_path(abs_path: string) -> string {
+    return META_DIR + "/" + _path_sha(abs_path) + ".json"
+}
+
+fn _ensure_meta_dir() -> int {
+    let r = exec_with_status("mkdir -p '" + META_DIR + "' 2>&1")
+    return r[1]
+}
+
+// ─── chflags primitives (the ONLY authorized bare chflags calls) ────
+// @chflags-lock-wrapper-call-site
+
+fn _darwin_has_uchg(path: string) -> bool {
+    let r = exec_with_status("ls -lOd '" + path + "' 2>/dev/null")
+    if r[1] != 0 { return false }
+    let line = _str(r[0])
+    if line.contains(" uchg ") { return true }
+    if line.contains(" uchg,") { return true }
+    if line.contains(",uchg ") { return true }
+    if line.contains(",uchg,") { return true }
+    return false
+}
+
+fn _linux_has_immutable(path: string) -> bool {
+    let r = exec_with_status("lsattr -d '" + path + "' 2>/dev/null")
+    if r[1] != 0 { return false }
+    let line = _str(r[0])
+    let mut i = 0
+    while i < len(line) {
+        let c = line.substring(i, i + 1)
+        if c == " " || c == "\t" { break }
+        if c == "i" { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _is_locked_now(path: string) -> bool {
+    if !_path_exists(path) { return false }
+    if _is_darwin() { return _darwin_has_uchg(path) }
+    if _is_linux()  { return _linux_has_immutable(path) }
+    return false
+}
+
+fn _apply_uchg(path: string) -> int {
+    if _is_darwin() {
+        let r = exec_with_status("chflags uchg '" + path + "' 2>&1")
+        return r[1]
+    }
+    if _is_linux() {
+        let r = exec_with_status("chattr +i '" + path + "' 2>/dev/null")
+        if r[1] == 0 { return 0 }
+        let r2 = exec_with_status("sudo -n chattr +i '" + path + "' 2>&1")
+        return r2[1]
+    }
+    return 0
+}
+
+fn _remove_uchg(path: string) -> int {
+    if _is_darwin() {
+        let r = exec_with_status("chflags nouchg '" + path + "' 2>&1")
+        return r[1]
+    }
+    if _is_linux() {
+        let r = exec_with_status("chattr -i '" + path + "' 2>/dev/null")
+        if r[1] == 0 { return 0 }
+        let r2 = exec_with_status("sudo -n chattr -i '" + path + "' 2>&1")
+        return r2[1]
+    }
+    return 0
+}
+
+// ─── JSON encoding (no jq dependency) ───────────────────────────────
+
+fn _json_escape(s: string) -> string {
+    let mut out = ""
+    let mut i = 0
+    while i < len(s) {
+        let c = s.substring(i, i + 1)
+        if      c == "\"" { out = out + "\\\"" }
+        else if c == "\\" { out = out + "\\\\" }
+        else if c == "\n" { out = out + "\\n" }
+        else if c == "\r" { out = out + "\\r" }
+        else if c == "\t" { out = out + "\\t" }
+        else { out = out + c }
+        i = i + 1
+    }
+    return out
+}
+
+// naive single-key extractor — JSON value must be a quoted string with no
+// escaped quotes inside the value. Sidecar writer uses _json_escape so
+// embedded quotes are \" — unescape on read.
+fn _json_get_str(body: string, key: string) -> string {
+    let k = "\"" + key + "\":\""
+    let idx = body.index_of(k)
+    if idx < 0 { return "" }
+    let mut i = idx + len(k)
+    let mut out = ""
+    while i < len(body) {
+        let c = body.substring(i, i + 1)
+        if c == "\\" && i + 1 < len(body) {
+            let n = body.substring(i + 1, i + 2)
+            if      n == "\"" { out = out + "\"" }
+            else if n == "\\" { out = out + "\\" }
+            else if n == "n"  { out = out + "\n" }
+            else if n == "r"  { out = out + "\r" }
+            else if n == "t"  { out = out + "\t" }
+            else { out = out + n }
+            i = i + 2
+            continue
+        }
+        if c == "\"" { break }
+        out = out + c
+        i = i + 1
+    }
+    return out
+}
+
+fn _json_get_int(body: string, key: string) -> i64 {
+    let k = "\"" + key + "\":"
+    let idx = body.index_of(k)
+    if idx < 0 { return 0 }
+    let mut i = idx + len(k)
+    while i < len(body) {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" { i = i + 1; continue }
+        break
+    }
+    let mut sign: i64 = 1
+    if i < len(body) && body.substring(i, i + 1) == "-" {
+        sign = -1
+        i = i + 1
+    }
+    let mut n: i64 = 0
+    let mut saw = false
+    while i < len(body) {
+        let c = body.substring(i, i + 1)
+        if c >= "0" && c <= "9" {
+            n = n * 10 + to_int(c)
+            saw = true
+            i = i + 1
+            continue
+        }
+        break
+    }
+    if !saw { return 0 }
+    return n * sign
+}
+
+// ─── metadata sidecar I/O ───────────────────────────────────────────
+
+fn _write_meta(abs_path: string, reason: string, fix: string,
+               guidance: string, actor: string) -> int {
+    let _ = _ensure_meta_dir()
+    let mp = _meta_path(abs_path)
+    let body = "{\"path\":\"" + _json_escape(abs_path) + "\","
+             + "\"reason\":\"" + _json_escape(reason) + "\","
+             + "\"fix\":\"" + _json_escape(fix) + "\","
+             + "\"guidance\":\"" + _json_escape(guidance) + "\","
+             + "\"locked_at\":\"" + _utc_iso() + "\","
+             + "\"locked_by_pid\":" + _pid() + ","
+             + "\"locked_by_session\":\"" + _json_escape(_session()) + "\","
+             + "\"locked_by_actor\":\"" + _json_escape(actor) + "\"}\n"
+    try {
+        write_file(mp, body)
+    } catch e {
+        return 1
+    }
+    return 0
+}
+
+fn _read_meta(abs_path: string) -> string {
+    let mp = _meta_path(abs_path)
+    if !_path_exists(mp) { return "" }
+    return _str(read_file(mp))
+}
+
+fn _delete_meta(abs_path: string) -> int {
+    let mp = _meta_path(abs_path)
+    if !_path_exists(mp) { return 0 }
+    let r = exec_with_status("rm -f '" + mp + "' 2>&1")
+    return r[1]
+}
+
+// ─── ai-native error string (raw 66 trailer) ────────────────────────
+// Format mandated by raw 66 pattern field:
+//   <original-error-line>
+//   reason: <class>: <specifics>
+//   fix: <numbered candidate list>
+//   guidance: <optional trailer>      ← raw 66 allows extra structured keys
+//
+// Returned as a single multi-line string; caller emits to stderr (raw 12
+// silent-error-ban also satisfied because stderr surfaces the trailer).
+
+fn ai_native_error_string(abs_path: string, meta_body: string) -> string {
+    let reason = _json_get_str(meta_body, "reason")
+    let fix = _json_get_str(meta_body, "fix")
+    let guidance = _json_get_str(meta_body, "guidance")
+    let actor = _json_get_str(meta_body, "locked_by_actor")
+    let locked_at = _json_get_str(meta_body, "locked_at")
+
+    let mut out = "EPERM: chflags-uchg-lock at " + abs_path + "\n"
+    out = out + "reason: chflags-uchg-lock: " + reason + "\n"
+    out = out + "fix: " + fix + "\n"
+    if guidance != "" {
+        out = out + "guidance: " + guidance + "\n"
+    }
+    out = out + "ref: raw:ai-native-error-message (raw#66)\n"
+    out = out + "locked_at: " + locked_at + "\n"
+    if actor != "" {
+        out = out + "locked_by_actor: " + actor + "\n"
+    }
+    return out
+}
+
+// ─── argv parsing ───────────────────────────────────────────────────
+
+fn _argv() -> [string] {
+    return argv()
+}
+
+fn _arg_kv(av: [string], key: string) -> string {
+    let mut i = 2
+    while i < av.len() {
+        if av[i] == key && i + 1 < av.len() {
+            return _str(av[i + 1])
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _arg_flag(av: [string], key: string) -> bool {
+    let mut i = 2
+    while i < av.len() {
+        if av[i] == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _emit_sentinel(status: string, op: string) {
+    println("")
+    println(SENTINEL_TAG + " " + status + " " + op)
+}
+
+// raw 66 hard-fail emitter — required arg missing; ai-native error to stderr.
+fn _hard_fail_arg(missing: string, op: string) -> i64 {
+    eprintln("EPERM: chflags-lock-native required-arg missing")
+    eprintln("reason: validation-fail: required-arg-missing (key=" + missing + ", op=" + op + ")")
+    eprintln("fix: 1) supply --" + missing + " <value>  2) hexa tool/chflags_lock_native.hexa lock --path <p> --reason <r> --fix <f> [--guidance <g>]  3) consult tool/chflags_lock_native.hexa header for full schema")
+    eprintln("ref: raw:ai-native-error-message (raw#66)")
+    eprintln("")
+    _emit_sentinel("FAIL", "required-arg-missing/" + missing)
+    return 2
+}
+
+// ─── self-reference: wrapper records own metadata for own chflags ───
+//
+// When the wrapper itself locks a path with chflags uchg, it writes a
+// sidecar — that's the dogfood case (cmd_lock). For the META_DIR itself
+// or any ad-hoc internal lock, the wrapper still goes through cmd_lock
+// flow (no internal escape hatch). The audit lint enforces that there
+// are NO bare chflags calls outside this file's authorized call-sites.
+
+// ─── subcommands ────────────────────────────────────────────────────
+
+fn cmd_lock(av: [string]) -> i64 {
+    let path = _arg_kv(av, "--path")
+    let reason = _arg_kv(av, "--reason")
+    let fix = _arg_kv(av, "--fix")
+    let guidance = _arg_kv(av, "--guidance")
+    let actor = _arg_kv(av, "--actor")
+
+    if path == ""   { return _hard_fail_arg("path",   "lock") }
+    if reason == "" { return _hard_fail_arg("reason", "lock") }
+    if fix == ""    { return _hard_fail_arg("fix",    "lock") }
+
+    let abs = _abs(path)
+    if !_path_exists(abs) {
+        eprintln("EPERM: chflags-lock-native target-missing")
+        eprintln("reason: validation-fail: path-not-found (path=" + abs + ")")
+        eprintln("fix: 1) ls -la '" + abs + "'  2) create the target before locking  3) confirm path resolution (relative paths resolve against PWD)")
+        eprintln("ref: raw:ai-native-error-message (raw#66)")
+        eprintln("")
+        _emit_sentinel("FAIL", "target-missing")
+        return 4
+    }
+
+    // Idempotent collision check — if already locked AND same reason → success.
+    let prev_meta = _read_meta(abs)
+    if _is_locked_now(abs) && prev_meta != "" {
+        let prev_reason = _json_get_str(prev_meta, "reason")
+        if prev_reason == reason {
+            // refresh sidecar (timestamp, actor, fix/guidance updates)
+            let w = _write_meta(abs, reason, fix, guidance, actor)
+            if w != 0 {
+                eprintln("EPERM: chflags-lock-native sidecar-refresh-failed")
+                eprintln("reason: io-fail: meta-write (path=" + _meta_path(abs) + ")")
+                eprintln("fix: 1) ls -la '" + META_DIR + "'  2) df -h " + META_DIR + "  3) chmod -R u+w " + META_DIR)
+                eprintln("ref: raw:ai-native-error-message (raw#66)")
+                eprintln("")
+                _emit_sentinel("FAIL", "sidecar-refresh")
+                return 1
+            }
+            println("ok already-locked  " + abs + "  (reason matches; sidecar refreshed)")
+            _emit_sentinel("PASS", "lock-idempotent")
+            return 0
+        }
+        // collision — different reason → exit 3 (caller must unlock first)
+        eprintln("EPERM: chflags-lock-native lock-collision")
+        eprintln("reason: validation-fail: existing-lock-different-reason (existing=" + prev_reason + ", new=" + reason + ")")
+        eprintln("fix: 1) hexa tool/chflags_lock_native.hexa lookup --path '" + abs + "'  2) hexa tool/chflags_lock_native.hexa unlock --path '" + abs + "'  3) re-issue lock with the correct reason")
+        eprintln("ref: raw:ai-native-error-message (raw#66)")
+        eprintln("")
+        _emit_sentinel("FAIL", "lock-collision")
+        return 3
+    }
+
+    // Write sidecar BEFORE chflags (fail-closed: if sidecar write fails,
+    // the path stays unlocked — never lock without metadata).
+    let w = _write_meta(abs, reason, fix, guidance, actor)
+    if w != 0 {
+        eprintln("EPERM: chflags-lock-native sidecar-write-failed")
+        eprintln("reason: io-fail: meta-write (path=" + _meta_path(abs) + ")")
+        eprintln("fix: 1) mkdir -p '" + META_DIR + "'  2) ls -la '" + META_DIR + "'  3) df -h " + META_DIR)
+        eprintln("ref: raw:ai-native-error-message (raw#66)")
+        eprintln("")
+        _emit_sentinel("FAIL", "sidecar-write")
+        return 1
+    }
+
+    // Apply chflags uchg.
+    let rc = _apply_uchg(abs)
+    if rc != 0 {
+        // Roll back sidecar — keep state coherent (no orphan metadata).
+        let _ = _delete_meta(abs)
+        eprintln("EPERM: chflags-lock-native chflags-apply-failed")
+        eprintln("reason: chflags-uchg-lock: chflags-uchg exited " + to_string(rc) + " (path=" + abs + ")")
+        eprintln("fix: 1) ls -lOd '" + abs + "'  2) sudo chflags uchg '" + abs + "'  3) HEXA_RESOLVER_NO_REROUTE=1 hexa tool/chflags_lock_native.hexa lock --path '" + abs + "' --reason '" + reason + "' --fix '" + fix + "'")
+        eprintln("ref: raw:ai-native-error-message (raw#66)")
+        eprintln("")
+        _emit_sentinel("FAIL", "chflags-apply")
+        return 1
+    }
+
+    println("ok locked  " + abs)
+    println("  reason: " + reason)
+    println("  fix:    " + fix)
+    if guidance != "" { println("  guidance: " + guidance) }
+    println("  meta:   " + _meta_path(abs))
+    _emit_sentinel("PASS", "lock")
+    return 0
+}
+
+fn cmd_unlock(av: [string]) -> i64 {
+    let path = _arg_kv(av, "--path")
+    if path == "" { return _hard_fail_arg("path", "unlock") }
+
+    let abs = _abs(path)
+    let was_locked = _is_locked_now(abs)
+    let mut rc: i64 = 0
+
+    if was_locked {
+        let r = _remove_uchg(abs)
+        if r != 0 {
+            eprintln("EPERM: chflags-lock-native chflags-remove-failed")
+            eprintln("reason: chflags-uchg-lock: chflags-nouchg exited " + to_string(r) + " (path=" + abs + ")")
+            eprintln("fix: 1) ls -lOd '" + abs + "'  2) sudo chflags nouchg '" + abs + "'  3) HEXA_RESOLVER_NO_REROUTE=1 hexa tool/chflags_lock_native.hexa unlock --path '" + abs + "'")
+            eprintln("ref: raw:ai-native-error-message (raw#66)")
+            eprintln("")
+            _emit_sentinel("FAIL", "chflags-remove")
+            return 1
+        }
+    }
+
+    // Metadata GC (always — even if path was already unlocked, sweep stale sidecar).
+    let _g = _delete_meta(abs)
+
+    if was_locked {
+        println("ok unlocked  " + abs + "  (sidecar GC'd)")
+    } else {
+        println("ok already-unlocked  " + abs + "  (sidecar GC'd if present)")
+    }
+    _emit_sentinel("PASS", "unlock")
+    return rc
+}
+
+// lookup: emits ai-native error string if locked; null + exit 0 if not.
+// Falsifier: lookup unlocked path → null (no estimates).
+fn cmd_lookup(av: [string]) -> i64 {
+    let path = _arg_kv(av, "--path")
+    if path == "" { return _hard_fail_arg("path", "lookup") }
+
+    let abs = _abs(path)
+    let meta = _read_meta(abs)
+    if meta == "" {
+        // honest null — no estimate, no fabrication.
+        println("null")
+        _emit_sentinel("PASS", "lookup-unlocked")
+        return 0
+    }
+
+    let s = ai_native_error_string(abs, meta)
+    print(s)
+    _emit_sentinel("PASS", "lookup-locked")
+    return 0
+}
+
+fn cmd_status(av: [string]) -> i64 {
+    let path = _arg_kv(av, "--path")
+    if path == "" { return _hard_fail_arg("path", "status") }
+
+    let abs = _abs(path)
+    let kernel_locked = _is_locked_now(abs)
+    let meta = _read_meta(abs)
+
+    println("chflags_lock_native status — " + abs)
+    println("  exists:        " + to_string(_path_exists(abs)))
+    println("  kernel-locked: " + to_string(kernel_locked))
+    println("  sidecar:       " + _meta_path(abs))
+    if meta == "" {
+        println("  metadata:      <none>")
+    } else {
+        println("  reason:        " + _json_get_str(meta, "reason"))
+        println("  fix:           " + _json_get_str(meta, "fix"))
+        let g = _json_get_str(meta, "guidance")
+        if g != "" { println("  guidance:      " + g) }
+        println("  locked_at:     " + _json_get_str(meta, "locked_at"))
+        println("  locked_by_pid: " + to_string(_json_get_int(meta, "locked_by_pid")))
+        println("  session:       " + _json_get_str(meta, "locked_by_session"))
+        let actor = _json_get_str(meta, "locked_by_actor")
+        if actor != "" { println("  actor:         " + actor) }
+    }
+    _emit_sentinel("PASS", "status")
+    return 0
+}
+
+fn cmd_list() -> i64 {
+    if !_path_exists(META_DIR) {
+        println("(empty) " + META_DIR)
+        _emit_sentinel("PASS", "list-empty")
+        return 0
+    }
+    let listing = _str(exec("ls -1 '" + META_DIR + "'/*.json 2>/dev/null"))
+    if listing.trim() == "" {
+        println("(empty) " + META_DIR)
+        _emit_sentinel("PASS", "list-empty")
+        return 0
+    }
+    let lines = listing.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let f = _str(lines[i]).trim()
+        if f == "" { i = i + 1; continue }
+        let body = _str(read_file(f))
+        let p = _json_get_str(body, "path")
+        let r = _json_get_str(body, "reason")
+        let lock_state = if _path_exists(p) && _is_locked_now(p) { "uchg" } else { "STALE" }
+        println("  [" + lock_state + "] " + p + "  — reason: " + r)
+        i = i + 1
+    }
+    _emit_sentinel("PASS", "list")
+    return 0
+}
+
+// ─── selftest (falsifier suite) ─────────────────────────────────────
+//
+// Falsifiers per spec:
+//   1. required args missing → raw 66 hard-fail (exit 2)
+//   2. lookup unlocked path → null
+//   3. nouchg → metadata GC (sidecar removed)
+//   4. locked-path write attempt surfaces ai-native error (lookup confirms)
+//   5. self-reference: wrapper own metadata for own chflags calls
+//   6. raw 80 sentinel emitted on every result
+
+fn _selftest_fail(name: string, msg: string) -> i64 {
+    eprintln("selftest FAIL: " + name)
+    eprintln("  " + msg)
+    return 1
+}
+
+fn _selftest_pass(name: string) {
+    println("  PASS  " + name)
+}
+
+fn cmd_selftest() -> i64 {
+    println("=== chflags_lock_native selftest ===")
+    let mut fails: i64 = 0
+
+    // tmp target (regular file we can lock/unlock without affecting SSOT)
+    let tmp = "/tmp/chflags_lock_native_selftest_" + _pid() + ".tmp"
+    let _ = exec("rm -f '" + tmp + "' 2>/dev/null")
+    let _ = exec("touch '" + tmp + "'")
+
+    // F1 — lookup unlocked → "null"
+    let r1 = exec_with_status("hexa /Users/ghost/core/nexus/tool/chflags_lock_native.hexa lookup --path '" + tmp + "' 2>/dev/null")
+    let out1 = _str(r1[0])
+    if out1.contains("\nnull\n") || out1.substring(0, 5) == "null\n" || out1.trim().contains("null") && !out1.contains("EPERM") {
+        _selftest_pass("F1 lookup-unlocked-null")
+    } else {
+        fails = fails + _selftest_fail("F1 lookup-unlocked-null", "expected 'null' got: " + out1)
+    }
+
+    // F2 — required args missing on lock → exit 2 + raw 66 trailer
+    let r2 = exec_with_status("hexa /Users/ghost/core/nexus/tool/chflags_lock_native.hexa lock --path '" + tmp + "' 2>&1")
+    let out2 = _str(r2[0])
+    if r2[1] == 2 && out2.contains("required-arg-missing") && out2.contains("reason:") && out2.contains("fix:") {
+        _selftest_pass("F2 required-arg-missing-raw66")
+    } else {
+        fails = fails + _selftest_fail("F2 required-arg-missing-raw66", "rc=" + to_string(r2[1]) + " out=" + out2)
+    }
+
+    // F3 — lock applies chflags uchg + writes sidecar; lookup returns ai-native error
+    let r3a = exec_with_status("hexa /Users/ghost/core/nexus/tool/chflags_lock_native.hexa lock --path '" + tmp + "' --reason selftest-f3 --fix 'hexa tool/chflags_lock_native.hexa unlock --path " + tmp + "' --guidance 'selftest synthetic lock' 2>&1")
+    if r3a[1] != 0 {
+        fails = fails + _selftest_fail("F3 lock-apply", "rc=" + to_string(r3a[1]) + " out=" + _str(r3a[0]))
+    } else {
+        if !_is_locked_now(tmp) {
+            fails = fails + _selftest_fail("F3 kernel-uchg-applied", "expected uchg flag set on " + tmp)
+        } else {
+            _selftest_pass("F3 kernel-uchg-applied")
+        }
+        let r3b = exec_with_status("hexa /Users/ghost/core/nexus/tool/chflags_lock_native.hexa lookup --path '" + tmp + "' 2>&1")
+        let out3b = _str(r3b[0])
+        if out3b.contains("EPERM: chflags-uchg-lock") && out3b.contains("reason: chflags-uchg-lock: selftest-f3") && out3b.contains("fix: hexa tool/chflags_lock_native.hexa unlock") && out3b.contains("guidance: selftest synthetic lock") {
+            _selftest_pass("F3 lookup-locked-ai-native")
+        } else {
+            fails = fails + _selftest_fail("F3 lookup-locked-ai-native", "out=" + out3b)
+        }
+
+        // F4 — locked-path write attempt surfaces ai-native error.
+        // Direct write should EPERM at kernel; wrapper consumer (e.g. agent)
+        // should call lookup to retrieve the trailer. Here we emulate the
+        // consumer flow with `touch -a` (updates atime; fails on uchg).
+        // 2>/dev/null + own copy to wprobe[0] keeps the parent stderr clean.
+        let wprobe = exec_with_status("sh -c 'printf x >> \"" + tmp + "\"' 2>/dev/null")
+        if wprobe[1] == 0 {
+            fails = fails + _selftest_fail("F4 write-attempt-eperm", "expected EPERM on write to uchg file; rc=0")
+        } else {
+            _selftest_pass("F4 write-attempt-eperm-kernel")
+        }
+        // Then lookup yields the structured trailer (already verified in F3 lookup)
+    }
+
+    // F5 — unlock → metadata GC
+    let r4 = exec_with_status("hexa /Users/ghost/core/nexus/tool/chflags_lock_native.hexa unlock --path '" + tmp + "' 2>&1")
+    if r4[1] != 0 {
+        fails = fails + _selftest_fail("F5 unlock-rc", "rc=" + to_string(r4[1]) + " out=" + _str(r4[0]))
+    } else {
+        if _is_locked_now(tmp) {
+            fails = fails + _selftest_fail("F5 unlock-kernel", "uchg flag still set after unlock")
+        } else {
+            _selftest_pass("F5 unlock-kernel-cleared")
+        }
+        let mp = _meta_path(_abs(tmp))
+        if _path_exists(mp) {
+            fails = fails + _selftest_fail("F5 metadata-GC", "sidecar still present at " + mp)
+        } else {
+            _selftest_pass("F5 metadata-GC")
+        }
+    }
+
+    // F6 — sentinel emitted on every result (raw 80).
+    // We've been capturing stdout above; check the lock command's stdout
+    // ended with __CHFLAGS_LOCK_NATIVE_RESULT__ <PASS|FAIL> ...
+    let probe = _str(r3a[0])
+    if probe.contains(SENTINEL_TAG) {
+        _selftest_pass("F6 sentinel-emitted (raw 80)")
+    } else {
+        fails = fails + _selftest_fail("F6 sentinel-emitted", "tag missing: " + probe)
+    }
+
+    // F7 — self-reference: wrapper records its own metadata for its own
+    // chflags calls. Lock + lookup; sidecar must contain ALL required
+    // schema keys (path, reason, fix, locked_at, locked_by_pid,
+    // locked_by_session). Re-lock briefly to verify and clean up.
+    let _ = exec("rm -f '" + tmp + "' 2>/dev/null")
+    let _ = exec("touch '" + tmp + "'")
+    let r5 = exec_with_status("hexa /Users/ghost/core/nexus/tool/chflags_lock_native.hexa lock --path '" + tmp + "' --reason selftest-self-ref --fix 'hexa tool/chflags_lock_native.hexa unlock' 2>&1")
+    if r5[1] == 0 {
+        let mp = _meta_path(_abs(tmp))
+        let body = _str(read_file(mp))
+        let mut missing: [string] = []
+        if _json_get_str(body, "path") == ""              { missing = missing + ["path"] }
+        if _json_get_str(body, "reason") == ""            { missing = missing + ["reason"] }
+        if _json_get_str(body, "fix") == ""               { missing = missing + ["fix"] }
+        if _json_get_str(body, "locked_at") == ""         { missing = missing + ["locked_at"] }
+        if _json_get_int(body, "locked_by_pid") == 0      { missing = missing + ["locked_by_pid"] }
+        if _json_get_str(body, "locked_by_session") == "" { missing = missing + ["locked_by_session"] }
+        if missing.len() == 0 {
+            _selftest_pass("F7 self-ref-schema-complete")
+        } else {
+            let mut s = ""
+            let mut k = 0
+            while k < missing.len() {
+                if k > 0 { s = s + "," }
+                s = s + missing[k]
+                k = k + 1
+            }
+            fails = fails + _selftest_fail("F7 self-ref-schema-complete", "missing keys: " + s)
+        }
+        let _ = exec_with_status("hexa /Users/ghost/core/nexus/tool/chflags_lock_native.hexa unlock --path '" + tmp + "' 2>/dev/null")
+    } else {
+        fails = fails + _selftest_fail("F7 self-ref-lock", "rc=" + to_string(r5[1]) + " out=" + _str(r5[0]))
+    }
+
+    let _ = exec("rm -f '" + tmp + "' 2>/dev/null")
+
+    println("=== " + to_string(fails) + " selftest fail(s) ===")
+    if fails > 0 {
+        _emit_sentinel("FAIL", "selftest fails=" + to_string(fails))
+        return 1
+    }
+    _emit_sentinel("PASS", "selftest")
+    return 0
+}
+
+// ─── usage ──────────────────────────────────────────────────────────
+
+fn _usage() {
+    eprintln("usage: hexa tool/chflags_lock_native.hexa <subcmd> [opts]")
+    eprintln("  lock    --path <p> --reason <r> --fix <f> [--guidance <g>] [--actor <id>]")
+    eprintln("  unlock  --path <p>")
+    eprintln("  lookup  --path <p>          (locked → ai-native trailer; unlocked → 'null')")
+    eprintln("  status  --path <p>")
+    eprintln("  list")
+    eprintln("  selftest")
+    eprintln("")
+    eprintln("required args missing → raw 66 hard-fail (exit 2)")
+    eprintln("metadata at " + META_DIR + "/<path-sha>.json")
+}
+
+// ─── main dispatcher ────────────────────────────────────────────────
+
+fn main() {
+    let av = _argv()
+    if av.len() < 3 {
+        _usage()
+        _emit_sentinel("FAIL", "usage")
+        exit(1)
+    }
+    let mode = av[2]
+    let mut rc: i64 = 0
+    if      mode == "lock"     { rc = cmd_lock(av) }
+    else if mode == "unlock"   { rc = cmd_unlock(av) }
+    else if mode == "lookup"   { rc = cmd_lookup(av) }
+    else if mode == "status"   { rc = cmd_status(av) }
+    else if mode == "list"     { rc = cmd_list() }
+    else if mode == "selftest" { rc = cmd_selftest() }
+    else {
+        eprintln("unknown subcmd: " + mode)
+        _usage()
+        _emit_sentinel("FAIL", "unknown-subcmd/" + mode)
+        exit(1)
+    }
+    exit(to_int(to_string(rc)))
+}
+
+main()

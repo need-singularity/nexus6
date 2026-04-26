@@ -1,0 +1,275 @@
+// tool/chflags_lock_audit.hexa — bare chflags uchg/nouchg caller audit.
+//
+// @no-lock-needed
+// @no-sandbox
+// @resolver-bypass(reason="grep across the working tree — must run on the host filesystem regardless of darwin-bypass routing decisions")
+//
+// PURPOSE
+//   raw#66 (ai-native-error-message) demands every error site emit
+//   reason+fix in machine-readable form. Bare `chflags uchg <p>` callers
+//   leave kernel EPERM with no metadata sidecar — downstream agents see
+//   "Operation not permitted" with no reason/fix surface.
+//
+//   This audit lint scans tool/*.hexa for bare chflags exec calls. The
+//   only authorized site is tool/chflags_lock_native.hexa itself
+//   (annotated `@chflags-lock-wrapper`). Migrated callers must invoke
+//   `hexa tool/chflags_lock_native.hexa lock --path <p> --reason <r>
+//   --fix <f>` instead of `exec("chflags uchg ...")`.
+//
+// USAGE
+//   hexa tool/chflags_lock_audit.hexa [--root <dir>] [--severity warn|block]
+//                                     [--include-remedy]
+//
+//   --root <dir>          repo root to scan (default: nexus repo of this tool;
+//                         pass /Users/ghost/core/hive to audit hive)
+//   --severity block      exit non-zero on any bare caller (CI gate)
+//   --severity warn       always exit 0 (default; surface counts only)
+//   --include-remedy      also flag chflags strings inside `["remedy", ...]`
+//                         arrays (default: only flag exec/exec_with_status
+//                         live invocations)
+//
+// FALSIFIER
+//   "0 bare chflags after migration" — once raw13_seal + os_level_lock +
+//   raw81_default_model_lock + hx_unlock + design_strategy_phase_f_flip
+//   are all migrated to chflags_lock_native, this audit must report 0
+//   live violations.
+//
+// SENTINEL (raw 80)
+//   stdout LAST line: __CHFLAGS_LOCK_AUDIT_RESULT__ <PASS|FAIL> <count>
+
+let SENTINEL_TAG = "__CHFLAGS_LOCK_AUDIT_RESULT__"
+let WRAPPER_MARKER = "@chflags-lock-wrapper"
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _emit_sentinel(status: string, count: i64) {
+    println("")
+    println(SENTINEL_TAG + " " + status + " " + to_string(count))
+}
+
+fn _arg_kv(av: [string], key: string) -> string {
+    let mut i = 2
+    while i < av.len() {
+        if av[i] == key && i + 1 < av.len() {
+            return _str(av[i + 1])
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _arg_flag(av: [string], key: string) -> bool {
+    let mut i = 2
+    while i < av.len() {
+        if av[i] == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── line classifier ────────────────────────────────────────────────
+//
+// A "bare chflags caller" is a literal exec/exec_with_status invocation
+// whose command string contains `chflags uchg` or `chflags nouchg`. We
+// distinguish:
+//   - LIVE: exec("...chflags uchg...") / exec_with_status("...chflags ...")
+//   - REMEDY: ["remedy", "...chflags ..."]   ← human-facing text in ai_err
+//   - DOC: comment lines (// or #) — informational, not executed
+//
+// Default mode flags only LIVE. --include-remedy adds REMEDY (audit
+// stricter — even ai_err remedy strings should reference the wrapper).
+
+fn _is_comment_line(line: string) -> bool {
+    let t = line.trim()
+    if t.substring(0, 2) == "//" { return true }
+    if t.substring(0, 1) == "#"  { return true }
+    return false
+}
+
+fn _is_remedy_line(line: string) -> bool {
+    if line.contains("[\"remedy\"") { return true }
+    if line.contains("['remedy'") { return true }
+    return false
+}
+
+fn _is_live_call(line: string) -> bool {
+    if line.contains("exec(\"") && line.contains("chflags ") { return true }
+    if line.contains("exec_with_status(\"") && line.contains("chflags ") { return true }
+    if line.contains("exec_with_status(\"chflags") { return true }
+    return false
+}
+
+// ─── file scanner ───────────────────────────────────────────────────
+
+fn _collect_hexa_files(root: string) -> [string] {
+    let cmd = "find '" + root + "/tool' -maxdepth 2 -type f -name '*.hexa' 2>/dev/null | sort"
+    let out = _str(exec(cmd))
+    let mut files: [string] = []
+    let lines = out.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let f = _str(lines[i]).trim()
+        if f != "" { files = files + [f] }
+        i = i + 1
+    }
+    return files
+}
+
+fn _file_has_wrapper_marker(body: string) -> bool {
+    // first 100 lines only — header zone (raw 82 convention)
+    let lines = body.split("\n")
+    let mut i = 0
+    let lim = if lines.len() < 100 { lines.len() } else { 100 }
+    while i < lim {
+        if _str(lines[i]).contains(WRAPPER_MARKER) { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _scan_file(path: string, include_remedy: bool) -> [array] {
+    let body = _str(read_file(path))
+    if body == "" { return [] }
+    if _file_has_wrapper_marker(body) {
+        // authorized site — skip entirely
+        return []
+    }
+    let mut hits: [array] = []
+    let lines = body.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let line = _str(lines[i])
+        let lineno = i + 1
+        if !line.contains("chflags") {
+            i = i + 1
+            continue
+        }
+        if _is_comment_line(line) {
+            i = i + 1
+            continue
+        }
+        if !line.contains("uchg") && !line.contains("nouchg") {
+            i = i + 1
+            continue
+        }
+        let is_remedy = _is_remedy_line(line)
+        let is_live = _is_live_call(line)
+        let mut kind = ""
+        if is_live { kind = "LIVE" }
+        else if is_remedy { kind = "REMEDY" }
+        else if line.contains("chflags") { kind = "OTHER" }
+        if kind == "" { i = i + 1; continue }
+        if kind == "REMEDY" && !include_remedy { i = i + 1; continue }
+        if kind == "OTHER" { i = i + 1; continue }
+        hits = hits + [[path, to_string(lineno), kind, line.trim()]]
+        i = i + 1
+    }
+    return hits
+}
+
+// ─── main ───────────────────────────────────────────────────────────
+
+fn _self_root() -> string {
+    // tool is at <root>/tool/chflags_lock_audit.hexa — derive root from argv[1].
+    let av = argv()
+    if av.len() < 2 { return "/Users/ghost/core/nexus" }
+    let s = _str(av[1])
+    let idx = s.last_index_of("/tool/")
+    if idx < 0 { return "/Users/ghost/core/nexus" }
+    return s.substring(0, idx)
+}
+
+fn _usage() {
+    eprintln("usage: hexa tool/chflags_lock_audit.hexa [--root <dir>] [--severity warn|block] [--include-remedy]")
+    eprintln("  --root <dir>         repo root to scan (default: this tool's parent)")
+    eprintln("  --severity block     exit non-zero on any bare caller")
+    eprintln("  --severity warn      always exit 0 (default)")
+    eprintln("  --include-remedy     also flag chflags inside [\"remedy\", ...] arrays")
+}
+
+fn main() {
+    let av = argv()
+    if _arg_flag(av, "--help") || _arg_flag(av, "-h") {
+        _usage()
+        _emit_sentinel("PASS", 0)
+        exit(0)
+    }
+
+    let root_arg = _arg_kv(av, "--root")
+    let root = if root_arg == "" { _self_root() } else { root_arg }
+    let severity = _arg_kv(av, "--severity")
+    let block = severity == "block"
+    let include_remedy = _arg_flag(av, "--include-remedy")
+
+    println("=== chflags_lock_audit — root=" + root + "  severity=" + (if block { "block" } else { "warn" }) + " ===")
+
+    let files = _collect_hexa_files(root)
+    let mut total_hits: i64 = 0
+    let mut live_hits: i64 = 0
+    let mut remedy_hits: i64 = 0
+    let mut authorized_files: [string] = []
+
+    let mut fi = 0
+    while fi < files.len() {
+        let f = _str(files[fi])
+        let body = _str(read_file(f))
+        if _file_has_wrapper_marker(body) {
+            authorized_files = authorized_files + [f]
+            fi = fi + 1
+            continue
+        }
+        let hits = _scan_file(f, include_remedy)
+        let mut hi = 0
+        while hi < hits.len() {
+            let row = hits[hi]
+            let kind = _str(row[2])
+            if kind == "LIVE"   { live_hits = live_hits + 1 }
+            if kind == "REMEDY" { remedy_hits = remedy_hits + 1 }
+            total_hits = total_hits + 1
+            println("  [" + kind + "] " + _str(row[0]) + ":" + _str(row[1]) + "  " + _str(row[3]))
+            hi = hi + 1
+        }
+        fi = fi + 1
+    }
+
+    println("")
+    println("scanned files:     " + to_string(files.len()))
+    println("authorized (skip): " + to_string(authorized_files.len()))
+    let mut afi = 0
+    while afi < authorized_files.len() {
+        println("  ✓ " + authorized_files[afi])
+        afi = afi + 1
+    }
+    println("LIVE hits:         " + to_string(live_hits))
+    println("REMEDY hits:       " + to_string(remedy_hits))
+
+    let count_for_gate: i64 = if include_remedy { total_hits } else { live_hits }
+
+    if count_for_gate == 0 {
+        println("")
+        println("✅ chflags_lock_audit PASS — 0 bare chflags callers")
+        _emit_sentinel("PASS", 0)
+        exit(0)
+    }
+
+    // raw 66 trailer when violations present
+    eprintln("")
+    eprintln("EPERM: chflags_lock_audit detected " + to_string(count_for_gate) + " bare caller(s)")
+    eprintln("reason: lint-violation: bare-chflags-caller (callers must use the wrapper to attach metadata sidecar)")
+    eprintln("fix: 1) replace exec(\"chflags uchg <p>\") with exec(\"hexa /Users/ghost/core/nexus/tool/chflags_lock_native.hexa lock --path <p> --reason <r> --fix <f>\")  2) replace exec(\"chflags nouchg <p>\") with the unlock equivalent  3) re-run `hexa tool/chflags_lock_audit.hexa --severity block` to confirm 0 hits")
+    eprintln("ref: raw:ai-native-error-message (raw#66)")
+    eprintln("")
+
+    if block {
+        _emit_sentinel("FAIL", count_for_gate)
+        exit(1)
+    }
+    _emit_sentinel("PASS", count_for_gate)
+    exit(0)
+}
+
+main()
