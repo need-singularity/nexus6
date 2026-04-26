@@ -1,0 +1,256 @@
+// tool/psi_calibrate_emit.hexa — ω-network-5: per-host PSI threshold calibration emitter.
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+//
+// Reads /tmp/hexa_remote_psi.log (override via HEXA_REMOTE_PSI_LOG) and emits
+// sourceable env-var lines (HEXA_REMOTE_PSI_THRESHOLD_<HOST>=<int>) per the
+// ω-network-3 calibration policy + ω-network-4 env-override schema.
+//
+// Calibration policy (from omega_network_3_psi_analyzer.json):
+//   tight    (rej_ratio > 0.10)        → suggested = round(p95 + 5), cap 95, ≥ current(80)
+//   generous (max < threshold - 20)    → suggested = round(max + 10), floor 30
+//   ok       (otherwise)               → KEEP (no override emitted)
+//   gate     (count < min_samples=50)  → KEEP, reason=insufficient_data
+//
+// Operational override (per ω-network-4 recommendation block): for hosts whose
+// hardware/cgroup memory ceiling forces an OOM-kill window BELOW psi=80, we
+// floor-clamp the emitted threshold at the operational ceiling regardless of
+// the formula output. Currently: ubu1/ubu2 → ≤ 70 (32GB host + 20G cgroup).
+// hetzner/htz (128GB, anima-ax102) → formula value retained.
+//
+// Usage:
+//   hexa run tool/psi_calibrate_emit.hexa            # human table + env block to stdout
+//   hexa run tool/psi_calibrate_emit.hexa --env-only # ONLY export lines (sourceable)
+//   hexa run tool/psi_calibrate_emit.hexa --json     # JSON object (per-host stats + suggestion)
+//
+// SSOT for log: /tmp/hexa_remote_psi.log (TSV: ts host psi thr outcome reason src)
+// SSOT for policy: /Users/ghost/core/anima/state/omega_network_3_psi_analyzer.json
+// SSOT for env contract: /Users/ghost/core/anima/state/omega_network_4_per_host_threshold.json
+//
+// Exit:
+//   0 ok (data sufficient OR data insufficient with audit-only output)
+//   2 log file missing
+//   3 log file empty
+
+fn _log_path() -> string {
+    let p = env("HEXA_REMOTE_PSI_LOG")
+    if p.len() > 0 { return p }
+    return "/tmp/hexa_remote_psi.log"
+}
+
+fn _has_flag(needle: string) -> bool {
+    let av = args()
+    let mut i = 0
+    while i < av.len() {
+        if av[i] == needle { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// Single-pass awk: per-host count, mean, p50/p95, max, accept/reject
+fn _stats_tsv(log: string) -> string {
+    let awk_prog =
+        "BEGIN { OFS=\"\\t\" }\n" +
+        "{\n" +
+        "  h=$2; psi=$3+0.0; oc=$5;\n" +
+        "  cnt[h]++; vals[h, cnt[h]] = psi; sum[h] += psi;\n" +
+        "  if (oc==\"accept\") acc[h]++; if (oc==\"reject\") rej[h]++;\n" +
+        "  if (cnt[h]==1 || psi>maxv[h]) maxv[h]=psi;\n" +
+        "  if (cnt[h]==1 || psi<minv[h]) minv[h]=psi;\n" +
+        "}\n" +
+        "function pct(arr, n, p,    idx) {\n" +
+        "  idx = int((p/100.0) * (n-1)) + 1;\n" +
+        "  if (idx<1) idx=1; if (idx>n) idx=n;\n" +
+        "  return arr[idx];\n" +
+        "}\n" +
+        "END {\n" +
+        "  for (h in cnt) {\n" +
+        "    n=cnt[h];\n" +
+        "    delete a;\n" +
+        "    for (i=1; i<=n; i++) a[i]=vals[h,i];\n" +
+        "    for (i=2; i<=n; i++) { v=a[i]; j=i-1;\n" +
+        "      while (j>=1 && a[j]>v) { a[j+1]=a[j]; j--; } a[j+1]=v; }\n" +
+        "    print h, n, minv[h], pct(a,n,50), pct(a,n,95), maxv[h], sum[h]/n, acc[h]+0, rej[h]+0;\n" +
+        "  }\n" +
+        "}\n"
+    // Write awk program to temp file to dodge quoting issues.
+    let awk_file = "/tmp/psi_calibrate_emit_" + exec("date +%s").trim() + ".awk"
+    exec("cat > " + awk_file + " <<'__PCE_EOF__'\n" + awk_prog + "__PCE_EOF__")
+    let out = exec("awk -F '\\t' -f " + awk_file + " " + log + " 2>/dev/null")
+    exec("rm -f " + awk_file)
+    return out
+}
+
+fn _round(x: float) -> int {
+    // banker's rounding not needed; round-half-up sufficient.
+    let mut n = 0
+    try { n = to_int(x + 0.5) } catch e {}
+    return n
+}
+
+fn _max_int(a: int, b: int) -> int { if a >= b { return a } else { return b } }
+fn _min_int(a: int, b: int) -> int { if a <= b { return a } else { return b } }
+
+// Per ω-network-4 op-knowledge clamp: hosts with cgroup memory ceiling
+// where OOM happens before psi=80 must NEVER receive a threshold above 70.
+fn _op_ceiling(host: string) -> int {
+    if host == "ubu1" { return 70 }
+    if host == "ubu2" { return 70 }
+    return 100  // no clamp
+}
+
+fn _suggest(host: string, count: int, p95: float, maxv: float, rej_ratio: float, current: int) -> [str] {
+    // returns [flag, suggested_str, reason]
+    let min_samples = 50
+    if count < min_samples {
+        return ["insufficient", "KEEP", "insufficient_data(count=" + to_string(count) + "<" + to_string(min_samples) + ")"]
+    }
+    let mut flag = "ok"
+    let mut suggested = current
+    let mut reason = "ok(no_action)"
+    let generous_cut = current - 20
+    if rej_ratio > 0.10 {
+        flag = "tight"
+        let cap = 95
+        let raw = _round(p95 + 5.0)
+        suggested = _min_int(cap, _max_int(current, raw))
+        reason = "tight(rej_ratio=" + to_string(rej_ratio) + ")_p95+5=" + to_string(raw) + "_capped=" + to_string(suggested)
+    } else if maxv < (generous_cut + 0.0) {
+        flag = "generous"
+        let raw = _round(maxv + 10.0)
+        suggested = _max_int(30, raw)
+        reason = "generous(max=" + to_string(maxv) + "<<" + to_string(current) + ")_max+10=" + to_string(suggested)
+    }
+    // Op-ceiling clamp (ω-network-4 hetzner/ubu split rationale).
+    let ceil = _op_ceiling(host)
+    if suggested > ceil {
+        let pre = suggested
+        suggested = ceil
+        reason = reason + ";op_clamp(" + host + ":" + to_string(pre) + "→" + to_string(ceil) + ")"
+        flag = flag + "+clamped"
+    }
+    if suggested == current && flag == "ok" {
+        return [flag, "KEEP", reason]
+    }
+    return [flag, to_string(suggested), reason]
+}
+
+fn main() {
+    let log = _log_path()
+    let exists = exec("test -f " + log + " && echo 1 || echo 0").trim()
+    if exists != "1" {
+        eprintln("psi_calibrate_emit: log file not found: " + log)
+        exit(2)
+    }
+    let rows_str = exec("wc -l < " + log + " 2>/dev/null").trim()
+    let mut rows = 0
+    try { rows = to_int(rows_str) } catch e {}
+    if rows == 0 {
+        eprintln("psi_calibrate_emit: log file empty: " + log)
+        exit(3)
+    }
+    let env_only = _has_flag("--env-only")
+    let json_out = _has_flag("--json")
+    let current_default = 80
+
+    let stats = _stats_tsv(log)
+    let lines = stats.split("\n")
+
+    if !env_only && !json_out {
+        println("# psi_calibrate_emit (ω-network-5) — log=" + log + " rows=" + to_string(rows))
+        println("# host\tcount\tmin\tp50\tp95\tmax\tmean\tacc\trej\trej_ratio\tflag\tsuggested\treason")
+    }
+
+    let mut env_block: [str] = []
+    let mut json_entries: [str] = []
+    let mut sufficient_hosts = 0
+
+    let mut idx = 0
+    while idx < lines.len() {
+        let ln = lines[idx]
+        idx = idx + 1
+        if ln.len() == 0 { continue }
+        let f = ln.split("\t")
+        if f.len() < 9 { continue }
+        let host = f[0]
+        let mut count = 0; try { count = to_int(f[1]) } catch e {}
+        let mut minv = 0.0; try { minv = to_float(f[2]) } catch e {}
+        let mut p50 = 0.0;  try { p50  = to_float(f[3]) } catch e {}
+        let mut p95 = 0.0;  try { p95  = to_float(f[4]) } catch e {}
+        let mut maxv = 0.0; try { maxv = to_float(f[5]) } catch e {}
+        let mut mean = 0.0; try { mean = to_float(f[6]) } catch e {}
+        let mut acc_c = 0;  try { acc_c = to_int(f[7]) } catch e {}
+        let mut rej_c = 0;  try { rej_c = to_int(f[8]) } catch e {}
+        let rr = if count > 0 { (rej_c + 0.0) / (count + 0.0) } else { 0.0 }
+
+        let res = _suggest(host, count, p95, maxv, rr, current_default)
+        let flag = res[0]
+        let suggested = res[1]
+        let reason = res[2]
+
+        if count >= 50 { sufficient_hosts = sufficient_hosts + 1 }
+
+        if !env_only && !json_out {
+            println(host + "\t" + to_string(count) + "\t" + to_string(minv) + "\t" + to_string(p50) +
+                "\t" + to_string(p95) + "\t" + to_string(maxv) + "\t" + to_string(mean) +
+                "\t" + to_string(acc_c) + "\t" + to_string(rej_c) + "\t" + to_string(rr) +
+                "\t" + flag + "\t" + suggested + "\t" + reason)
+        }
+
+        if json_out {
+            let je = "{\"host\":\"" + host + "\",\"count\":" + to_string(count) +
+                ",\"min\":" + to_string(minv) + ",\"p50\":" + to_string(p50) +
+                ",\"p95\":" + to_string(p95) + ",\"max\":" + to_string(maxv) +
+                ",\"mean\":" + to_string(mean) + ",\"accept\":" + to_string(acc_c) +
+                ",\"reject\":" + to_string(rej_c) + ",\"rej_ratio\":" + to_string(rr) +
+                ",\"flag\":\"" + flag + "\",\"suggested\":\"" + suggested +
+                "\",\"reason\":\"" + reason + "\"}"
+            json_entries = json_entries + [je]
+        }
+
+        if suggested != "KEEP" {
+            // Normalize host to upper / non-alnum→_ per ω-network-4 schema.
+            let norm = exec("printf '%s' '" + host + "' | tr '[:lower:]' '[:upper:]' | tr -c '[:alnum:]_' '_'").trim()
+            env_block = env_block + ["export HEXA_REMOTE_PSI_THRESHOLD_" + norm + "=" + suggested + "  # " + flag + " " + reason]
+        }
+    }
+
+    if json_out {
+        let mut s = "{\"cycle\":\"omega-network-5\",\"log\":\"" + log + "\",\"rows\":" + to_string(rows) +
+            ",\"sufficient_hosts\":" + to_string(sufficient_hosts) + ",\"hosts\":["
+        let mut k = 0
+        while k < json_entries.len() {
+            if k > 0 { s = s + "," }
+            s = s + json_entries[k]
+            k = k + 1
+        }
+        s = s + "]}"
+        println(s)
+        return
+    }
+
+    if env_only {
+        let mut k = 0
+        while k < env_block.len() {
+            println(env_block[k])
+            k = k + 1
+        }
+        return
+    }
+
+    println("")
+    println("# Sourceable env block (apply via: eval \"$(hexa run tool/psi_calibrate_emit.hexa --env-only)\")")
+    if env_block.len() == 0 {
+        println("# (no overrides — all hosts at KEEP/ok or insufficient_data)")
+    } else {
+        let mut k = 0
+        while k < env_block.len() {
+            println(env_block[k])
+            k = k + 1
+        }
+    }
+}
+
+main()
