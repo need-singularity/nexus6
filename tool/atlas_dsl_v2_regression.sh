@@ -47,7 +47,24 @@ if [ ! -f "$SERIALIZER" ]; then
     echo "serializer not found: $SERIALIZER" >&2
     exit 1
 fi
-HEXA_BIN="${HEXA:-$HOME/core/hexa-lang/hexa}"
+# HEXA_BIN container-context resolution (ω-bridge-9 fix, mirror of bridge-8):
+#   On host (Mac): default is the wrapper at $HOME/core/hexa-lang/hexa which
+#     routes through the resolver/build/hexa.real (Mach-O).
+#   Inside Linux container (hexa-runner): the wrapper would exec the Mach-O
+#     hexa.real → "Exec format error". The container ships a native ELF
+#     dispatcher at /usr/local/bin/hexa — prefer it when container markers
+#     are present (/.dockerenv exists, or HEXA_IN_CONTAINER=1, or the host
+#     wrapper path is absent while the container path exists).
+#   Override always wins via explicit HEXA env var (legacy name preserved).
+_default_hexa_bin="$HOME/core/hexa-lang/hexa"
+if [ -z "${HEXA:-}" ]; then
+    if [ -f /.dockerenv ] || [ "${HEXA_IN_CONTAINER:-0}" = "1" ]; then
+        [ -x /usr/local/bin/hexa ] && _default_hexa_bin=/usr/local/bin/hexa
+    elif [ ! -x "$_default_hexa_bin" ] && [ -x /usr/local/bin/hexa ]; then
+        _default_hexa_bin=/usr/local/bin/hexa
+    fi
+fi
+HEXA_BIN="${HEXA:-$_default_hexa_bin}"
 if [ ! -x "$HEXA_BIN" ]; then
     echo "hexa runtime not found: $HEXA_BIN" >&2
     exit 1
