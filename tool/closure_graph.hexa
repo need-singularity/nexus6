@@ -1,0 +1,844 @@
+// tool/closure_graph.hexa — ω-meta-2: closure-DAG builder for PSC-loop closure JSONs
+//
+// raw 9 hexa-only-suffix (sweeper-safe .hexa). Builds on ω-meta-1's flat
+// closure_index by surfacing the IMPLICIT DAG of cycle dependencies encoded
+// in `context.predecessors` (dict or list) and `next_followups` (array of
+// strings). Successors are computed by inversion across the whole corpus.
+//
+// @tool(slug="closure_graph", desc="ω-meta-2 closure-DAG builder for omega_*.json PSC-loop closure JSONs")
+// @usage(hexa run tool/closure_graph.hexa [--json] [--cycle NAME] [--orphans] [--unrealized] [--namespace NS] [--anima-state DIR] [--quiet] [--help])
+// @sentinel(__CLOSURE_GRAPH__ scanned=N nodes=I edges=E orphans=O unrealized=U)
+//
+// flags:
+//   --json                emit DAG as {nodes:[...], edges:[...]} JSON object
+//   --cycle NAME          subgraph for one cycle (predecessors, successors, follow-ups)
+//   --orphans             list closures with NO predecessors AND NO successors (pure leaves)
+//   --unrealized          list `next_followups` cycle-references that don't match any known cycle name
+//   --namespace NS        filter nodes by axis namespace prefix (mirrors closure_index)
+//   --anima-state DIR     override scan directory (default /Users/ghost/core/anima/state)
+//   --quiet               sentinel only
+//   --help, -h            usage
+//
+// default mode (text):
+//   cycle_name (axis)
+//     ← predecessors: a, b, c
+//     → realized_successors: x, y
+//     → planned_followups: foo, bar (not yet closed)
+//
+// parsing robustness:
+//   - context.predecessors as object → keys
+//   - context.predecessors as array  → raw cycle names
+//   - top-level predecessors fallback (object or array)
+//   - next_followups as array of strings or array of objects (rare)
+//   - cycle-name normalization: strip "ω-" → "omega_", "-" → "_", lowercase
+//   - cross-reference match uses normalized form
+//   - malformed JSON: skip + warn, count toward malformed_rows
+//
+// output sinks: stdout / /tmp; never anima/state.
+//
+// raw compliance: 9 hexa-suffix / 71 read-only-on-anima / 73 admissibility / 80 sentinel
+//
+// origin: ω-meta-2 PSC-loop cycle (2026-04-26), follow-on from ω-meta-1 (a39d14e0)
+//
+// @allow-bare-exec
+// @no-lock-needed
+// @no-sandbox
+
+let DEFAULT_ANIMA_STATE = "/Users/ghost/core/anima/state"
+
+// ─── argv parsing ────────────────────────────────────────────────────────────
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+let argv = args()
+let mut json_mode = false
+let mut quiet = false
+let mut help = false
+let mut want_orphans = false
+let mut want_unrealized = false
+let mut cycle_filter = ""
+let mut namespace_pat = ""
+let mut scan_dir = DEFAULT_ANIMA_STATE
+let mut i = 2
+while i < argv.len() {
+    let a = _str(argv[i])
+    if a == "--json" { json_mode = true }
+    else if a == "--quiet" { quiet = true }
+    else if a == "--help" || a == "-h" { help = true }
+    else if a == "--orphans" { want_orphans = true }
+    else if a == "--unrealized" { want_unrealized = true }
+    else if a == "--cycle" && i + 1 < argv.len() {
+        cycle_filter = _str(argv[i+1])
+        i = i + 1
+    }
+    else if a == "--namespace" && i + 1 < argv.len() {
+        namespace_pat = _str(argv[i+1])
+        i = i + 1
+    }
+    else if a == "--anima-state" && i + 1 < argv.len() {
+        scan_dir = _str(argv[i+1])
+        i = i + 1
+    }
+    i = i + 1
+}
+
+if help {
+    println("closure_graph — ω-meta-2 DAG builder for PSC-loop closure JSONs")
+    println("")
+    println("usage:")
+    println("  hexa run tool/closure_graph.hexa [flags]")
+    println("")
+    println("flags:")
+    println("  --json                emit DAG as {nodes:[...], edges:[...]} JSON")
+    println("  --cycle NAME          subgraph for one cycle (preds, succs, followups)")
+    println("  --orphans             list closures with no predecessors AND no successors")
+    println("  --unrealized          list next_followups not matching any known cycle")
+    println("  --namespace NS        filter nodes by axis namespace prefix")
+    println("  --anima-state DIR     override scan directory (default " + DEFAULT_ANIMA_STATE + ")")
+    println("  --quiet               sentinel only")
+    println("  --help, -h            this message")
+    println("")
+    println("default text:")
+    println("  cycle (axis)")
+    println("    ← predecessors: a, b")
+    println("    → realized_successors: x")
+    println("    → planned_followups: foo (not yet closed)")
+    println("")
+    println("sentinel: __CLOSURE_GRAPH__ scanned=N nodes=I edges=E orphans=O unrealized=U")
+    return
+}
+
+// ─── pre-flight: dir existence ───────────────────────────────────────────────
+let dir_check = to_string(exec("[ -d '" + scan_dir + "' ] && echo Y || echo N")).trim()
+if dir_check != "Y" {
+    println("__CLOSURE_GRAPH__ SKIP reason=dir_missing path=" + scan_dir)
+    return
+}
+
+// ─── scan + parse via single python3 invocation ──────────────────────────────
+// Python script extracts per-closure: cycle, axis, title, timestamp,
+// predecessors[] (raw + normalized), followups_text[] (raw strings) and
+// followups_refs[] (extracted cycle-like tokens, normalized).
+//
+// Output protocol on stdout:
+//   N\tcycle\taxis\ttitle\ttimestamp\tnorm_cycle\tpath
+//   P\tnorm_cycle\tnorm_pred                     (one per pred edge, may repeat)
+//   F\tnorm_cycle\tnorm_followup_ref\trawref     (one per followup ref)
+//   T\tnorm_cycle\trawtext                       (raw followup text — for display)
+//   S\tscanned\tindexed\tmalformed
+// All TABs in field values are squashed to spaces by the writer.
+//
+// Followup-ref extraction:
+//   regex over followup string for tokens matching:
+//     ω-<a-zA-Z0-9_-]+   (e.g. ω-runner-13d)
+//     omega[_-][a-zA-Z0-9_-]+ (e.g. omega_bridge_22)
+//   Each captured token is normalized; if non-empty, emitted as F-line.
+//   Raw text always emitted as T-line (so display is faithful).
+//
+// Normalization:
+//   s = s.lower()
+//   replace "ω-" prefix with "omega_"   (also "ω" → "omega" if mid-string, rare)
+//   replace "-" → "_"
+//   strip non [a-z0-9_] tail noise
+//   collapse repeated underscores
+
+let py = "import json, os, glob, sys, re\n" +
+    "scan_dir = '" + scan_dir.replace("'", "") + "'\n" +
+    "scanned = 0\n" +
+    "indexed = 0\n" +
+    "malformed = 0\n" +
+    "node_lines = []\n" +
+    "pred_lines = []\n" +
+    "fref_lines = []\n" +
+    "ftext_lines = []\n" +
+    "warnings = []\n" +
+    "def norm(s):\n" +
+    "    if not isinstance(s, str): return ''\n" +
+    "    s = s.strip()\n" +
+    "    if not s: return ''\n" +
+    "    # ω- prefix → omega_; bare ω → omega\n" +
+    "    s = s.replace('\\u03c9-', 'omega_').replace('\\u03c9_', 'omega_').replace('\\u03c9', 'omega')\n" +
+    "    s = s.lower()\n" +
+    "    s = s.replace('-', '_')\n" +
+    "    # keep [a-z0-9_]; trim trailing non-word\n" +
+    "    s = re.sub(r'[^a-z0-9_]+$', '', s)\n" +
+    "    s = re.sub(r'^[^a-z0-9_]+', '', s)\n" +
+    "    s = re.sub(r'_+', '_', s)\n" +
+    "    return s\n" +
+    "def clean(s, n=None):\n" +
+    "    if not isinstance(s, str): s = str(s) if s is not None else ''\n" +
+    "    s = s.replace('\\t', ' ').replace('\\n', ' ').replace('\\r', ' ')\n" +
+    "    s = ' '.join(s.split())\n" +
+    "    if n is not None and len(s) > n: s = s[:n]\n" +
+    "    return s\n" +
+    "REF_PAT = re.compile(r'(\\u03c9[\\-_][A-Za-z0-9][A-Za-z0-9_\\-]*|omega[_\\-][A-Za-z0-9][A-Za-z0-9_\\-]*)')\n" +
+    "for path in sorted(glob.glob(os.path.join(scan_dir, 'omega_*.json'))):\n" +
+    "    scanned += 1\n" +
+    "    try:\n" +
+    "        with open(path, 'r', encoding='utf-8') as f:\n" +
+    "            d = json.load(f)\n" +
+    "    except Exception as e:\n" +
+    "        warnings.append('warn: skip ' + path + ' (parse failed: ' + str(e)[:80] + ')')\n" +
+    "        malformed += 1\n" +
+    "        continue\n" +
+    "    if not isinstance(d, dict):\n" +
+    "        warnings.append('warn: skip ' + path + ' (not an object)')\n" +
+    "        malformed += 1\n" +
+    "        continue\n" +
+    "    cycle = clean(str(d.get('cycle') or ''), 80)\n" +
+    "    if not cycle:\n" +
+    "        base = os.path.basename(path)\n" +
+    "        if base.startswith('omega_') and base.endswith('.json'):\n" +
+    "            cycle = base[:-5]\n" +
+    "    axis = clean(str(d.get('axis') or d.get('scope') or ''), 80)\n" +
+    "    title = clean(str(d.get('title') or d.get('headline') or d.get('approach') or ''), 100)\n" +
+    "    timestamp = clean(str(d.get('timestamp') or ''), 32)\n" +
+    "    n_cycle = norm(cycle)\n" +
+    "    if not n_cycle:\n" +
+    "        warnings.append('warn: skip ' + path + ' (empty normalized cycle)')\n" +
+    "        malformed += 1\n" +
+    "        continue\n" +
+    "    indexed += 1\n" +
+    "    node_lines.append('N\\t' + cycle + '\\t' + axis + '\\t' + title + '\\t' + timestamp + '\\t' + n_cycle + '\\t' + path)\n" +
+    "    # predecessors: context.predecessors first (dict keys or list), else top-level\n" +
+    "    preds_raw = []\n" +
+    "    ctx = d.get('context')\n" +
+    "    if isinstance(ctx, dict):\n" +
+    "        cp = ctx.get('predecessors')\n" +
+    "        if isinstance(cp, dict): preds_raw = list(cp.keys())\n" +
+    "        elif isinstance(cp, list): preds_raw = [x for x in cp if isinstance(x,(str,int))]\n" +
+    "    if not preds_raw:\n" +
+    "        tp = d.get('predecessors')\n" +
+    "        if isinstance(tp, dict): preds_raw = list(tp.keys())\n" +
+    "        elif isinstance(tp, list): preds_raw = [x for x in tp if isinstance(x,(str,int))]\n" +
+    "    seen = set()\n" +
+    "    for p in preds_raw:\n" +
+    "        np_ = norm(str(p))\n" +
+    "        if np_ and np_ != n_cycle and np_ not in seen:\n" +
+    "            seen.add(np_)\n" +
+    "            pred_lines.append('P\\t' + n_cycle + '\\t' + np_ + '\\t' + clean(str(p), 80))\n" +
+    "    # followups\n" +
+    "    nf = d.get('next_followups')\n" +
+    "    if isinstance(nf, list):\n" +
+    "        for it in nf:\n" +
+    "            txt = ''\n" +
+    "            if isinstance(it, str): txt = it\n" +
+    "            elif isinstance(it, dict):\n" +
+    "                for k in ('cycle','ref','axis','title','desc','description'):\n" +
+    "                    v = it.get(k)\n" +
+    "                    if isinstance(v, str) and v: txt = v; break\n" +
+    "                if not txt: txt = json.dumps(it)[:200]\n" +
+    "            else:\n" +
+    "                txt = str(it)\n" +
+    "            ctxt = clean(txt, 200)\n" +
+    "            if ctxt:\n" +
+    "                ftext_lines.append('T\\t' + n_cycle + '\\t' + ctxt)\n" +
+    "                refs_seen = set()\n" +
+    "                for m in REF_PAT.findall(txt):\n" +
+    "                    nm = norm(m)\n" +
+    "                    if nm and nm != n_cycle and nm not in refs_seen:\n" +
+    "                        refs_seen.add(nm)\n" +
+    "                        fref_lines.append('F\\t' + n_cycle + '\\t' + nm + '\\t' + clean(m, 80))\n" +
+    "for w in warnings:\n" +
+    "    sys.stderr.write(w + '\\n')\n" +
+    "out = sys.stdout\n" +
+    "for ln in node_lines: out.write(ln + '\\n')\n" +
+    "for ln in pred_lines: out.write(ln + '\\n')\n" +
+    "for ln in fref_lines: out.write(ln + '\\n')\n" +
+    "for ln in ftext_lines: out.write(ln + '\\n')\n" +
+    "out.write('S\\t' + str(scanned) + '\\t' + str(indexed) + '\\t' + str(malformed) + '\\n')\n"
+
+let pid_tag = to_string(exec("echo $$")).trim()
+let py_tmp = "/tmp/closure_graph_" + pid_tag + ".py"
+let stdout_capture = "/tmp/closure_graph_" + pid_tag + "_stdout.txt"
+let stderr_capture = "/tmp/closure_graph_" + pid_tag + "_stderr.txt"
+write_file(py_tmp, py)
+let _ = exec("python3 " + py_tmp + " > " + stdout_capture + " 2> " + stderr_capture)
+let _ = exec("rm -f " + py_tmp)
+
+let data_raw = to_string(read_file(stdout_capture))
+let warn_raw = to_string(read_file(stderr_capture))
+let _ = exec("rm -f " + stdout_capture + " " + stderr_capture)
+
+let warn_lines = split(warn_raw, "\n")
+let mut wi = 0
+while wi < len(warn_lines) {
+    let wl = warn_lines[wi]
+    if len(wl.trim()) > 0 { eprintln(wl) }
+    wi = wi + 1
+}
+
+// ─── parse data lines ────────────────────────────────────────────────────────
+// nodes[] = [cycle, axis, title, timestamp, n_cycle, path]
+// preds[] = [n_from, n_pred, raw_pred]   (edge n_from → n_pred, semantically: from depends on pred)
+// frefs[] = [n_from, n_followup, raw_ref]
+// ftexts[] = [n_from, raw_text]
+let mut nodes = []
+let mut preds = []
+let mut frefs = []
+let mut ftexts = []
+let mut scanned_str = "0"
+let mut indexed_str = "0"
+let mut malformed_str = "0"
+
+let data_lines = split(data_raw, "\n")
+let mut di = 0
+while di < len(data_lines) {
+    let dl = data_lines[di]
+    if len(dl) == 0 { di = di + 1; continue }
+    let parts = split(dl, "\t")
+    let kind = parts[0]
+    if kind == "N" && len(parts) >= 7 {
+        nodes.push([parts[1], parts[2], parts[3], parts[4], parts[5], parts[6]])
+    } else if kind == "P" && len(parts) >= 4 {
+        preds.push([parts[1], parts[2], parts[3]])
+    } else if kind == "F" && len(parts) >= 4 {
+        frefs.push([parts[1], parts[2], parts[3]])
+    } else if kind == "T" && len(parts) >= 3 {
+        ftexts.push([parts[1], parts[2]])
+    } else if kind == "S" && len(parts) >= 4 {
+        scanned_str = parts[1]
+        indexed_str = parts[2]
+        malformed_str = parts[3]
+    }
+    di = di + 1
+}
+
+// ─── build node lookup by normalized cycle ───────────────────────────────────
+// We use parallel arrays: keys[] of n_cycle, vals[] of node-row index.
+let mut node_keys = []
+let mut ni = 0
+while ni < len(nodes) {
+    node_keys.push(nodes[ni][4])  // n_cycle
+    ni = ni + 1
+}
+fn _index_of(arr, key: string) -> i64 {
+    let mut k = 0
+    while k < len(arr) {
+        if arr[k] == key { return k }
+        k = k + 1
+    }
+    return -1
+}
+
+// Sanitize edges: a "predecessor edge" only counts as a graph edge if the
+// predecessor is itself a known node. Unknown preds are still kept as raw refs
+// for display, but don't add to edge-count.
+let mut edge_pred_known = []   // [n_from, n_pred]
+let mut pi = 0
+while pi < len(preds) {
+    let e = preds[pi]
+    if _index_of(node_keys, e[1]) >= 0 {
+        edge_pred_known.push([e[0], e[1]])
+    }
+    pi = pi + 1
+}
+
+// followup refs: split into known (realized — add as planned-realized edges?)
+// and unknown (unrealized). Per spec, edges in JSON are emitted for both
+// "predecessor" and "followup" types; "followup" edges may point to non-nodes
+// when they're unrealized.
+let mut frefs_known = []     // [n_from, n_to]
+let mut frefs_unknown = []   // [n_from, raw_ref, n_to]
+let mut fi = 0
+while fi < len(frefs) {
+    let e = frefs[fi]
+    if _index_of(node_keys, e[1]) >= 0 {
+        frefs_known.push([e[0], e[1]])
+    } else {
+        frefs_unknown.push([e[0], e[2], e[1]])
+    }
+    fi = fi + 1
+}
+
+// ─── compute successors by inversion ─────────────────────────────────────────
+// successors[n_cycle] = [n_other ...] where n_other has n_cycle in its predecessors
+// We store as parallel: succ_of_keys[] (one row per node) = comma-joined string of
+// successor n_cycles. Use list of lists for clarity.
+let mut successors_of = []
+let mut sk = 0
+while sk < len(nodes) {
+    successors_of.push([])
+    sk = sk + 1
+}
+let mut ek = 0
+while ek < len(edge_pred_known) {
+    let e = edge_pred_known[ek]
+    // e[0] depends on e[1] → e[1] has e[0] as a successor
+    let idx = _index_of(node_keys, e[1])
+    if idx >= 0 {
+        // dedupe per row
+        let row = successors_of[idx]
+        let mut found = false
+        let mut rj = 0
+        while rj < len(row) {
+            if row[rj] == e[0] { found = true; break }
+            rj = rj + 1
+        }
+        if !found {
+            row.push(e[0])
+            successors_of[idx] = row
+        }
+    }
+    ek = ek + 1
+}
+
+// predecessors map: row → [n_pred ...]  (only known preds for this map; we
+// also keep raw preds for display)
+let mut predecessors_of = []
+let mut raw_preds_of = []
+let mut sk2 = 0
+while sk2 < len(nodes) {
+    predecessors_of.push([])
+    raw_preds_of.push([])
+    sk2 = sk2 + 1
+}
+let mut pi2 = 0
+while pi2 < len(preds) {
+    let e = preds[pi2]
+    let idx = _index_of(node_keys, e[0])
+    if idx >= 0 {
+        let raw_row = raw_preds_of[idx]
+        // dedupe by raw ref
+        let mut rfound = false
+        let mut rj2 = 0
+        while rj2 < len(raw_row) {
+            if raw_row[rj2] == e[2] { rfound = true; break }
+            rj2 = rj2 + 1
+        }
+        if !rfound {
+            raw_row.push(e[2])
+            raw_preds_of[idx] = raw_row
+        }
+        // known-pred map
+        if _index_of(node_keys, e[1]) >= 0 {
+            let row = predecessors_of[idx]
+            let mut found = false
+            let mut rj = 0
+            while rj < len(row) {
+                if row[rj] == e[1] { found = true; break }
+                rj = rj + 1
+            }
+            if !found {
+                row.push(e[1])
+                predecessors_of[idx] = row
+            }
+        }
+    }
+    pi2 = pi2 + 1
+}
+
+// followups (raw text per node) and unrealized refs per node
+let mut followups_text_of = []
+let mut unrealized_of = []
+let mut sk3 = 0
+while sk3 < len(nodes) {
+    followups_text_of.push([])
+    unrealized_of.push([])
+    sk3 = sk3 + 1
+}
+let mut ti = 0
+while ti < len(ftexts) {
+    let t = ftexts[ti]
+    let idx = _index_of(node_keys, t[0])
+    if idx >= 0 {
+        let row = followups_text_of[idx]
+        row.push(t[1])
+        followups_text_of[idx] = row
+    }
+    ti = ti + 1
+}
+let mut ui = 0
+while ui < len(frefs_unknown) {
+    let u = frefs_unknown[ui]
+    let idx = _index_of(node_keys, u[0])
+    if idx >= 0 {
+        let row = unrealized_of[idx]
+        // dedupe by raw ref
+        let mut found = false
+        let mut rj = 0
+        while rj < len(row) {
+            if row[rj] == u[1] { found = true; break }
+            rj = rj + 1
+        }
+        if !found {
+            row.push(u[1])
+            unrealized_of[idx] = row
+        }
+    }
+    ui = ui + 1
+}
+
+// global dedupe of unrealized refs (for sentinel U= count and --unrealized list)
+let mut unrealized_global_keys = []   // n_to (normalized)
+let mut unrealized_global_raw = []    // raw label
+let mut unrealized_global_from = []   // source n_cycle
+let mut ug = 0
+while ug < len(frefs_unknown) {
+    let u = frefs_unknown[ug]
+    let mut k = 0
+    let mut found = false
+    while k < len(unrealized_global_keys) {
+        if unrealized_global_keys[k] == u[2] { found = true; break }
+        k = k + 1
+    }
+    if !found {
+        unrealized_global_keys.push(u[2])
+        unrealized_global_raw.push(u[1])
+        unrealized_global_from.push(u[0])
+    }
+    ug = ug + 1
+}
+
+// ─── namespace filter ────────────────────────────────────────────────────────
+fn _lcase(s: string) -> string {
+    if len(s) == 0 { return "" }
+    let escaped = s.replace("'", "")
+    return to_string(exec("printf %s '" + escaped + "' | tr '[:upper:]' '[:lower:]'")).trim()
+}
+
+let ns_lc = _lcase(namespace_pat)
+
+fn _node_in_ns(cycle: string, axis: string, ns_lc: string) -> bool {
+    if len(ns_lc) == 0 { return true }
+    let cycle_lc_esc = cycle.replace("'", "")
+    let axis_lc_esc = axis.replace("'", "")
+    let cycle_lc = to_string(exec("printf %s '" + cycle_lc_esc + "' | tr '[:upper:]' '[:lower:]'")).trim()
+    let axis_lc = to_string(exec("printf %s '" + axis_lc_esc + "' | tr '[:upper:]' '[:lower:]'")).trim()
+    let token_a = "omega_" + ns_lc
+    let token_b = "omega-" + ns_lc
+    if cycle_lc.contains(token_a) { return true }
+    if cycle_lc.contains(token_b) { return true }
+    if axis_lc == ns_lc { return true }
+    if len(axis_lc) > len(ns_lc) {
+        let head = axis_lc.substring(0, len(ns_lc))
+        if head == ns_lc {
+            let next = axis_lc.substring(len(ns_lc), len(ns_lc)+1)
+            if next == " " || next == "/" || next == "-" || next == "_" { return true }
+        }
+    }
+    return false
+}
+
+// build "kept" mask — indices into nodes[] that pass the namespace filter
+let mut kept = []
+let mut nk = 0
+while nk < len(nodes) {
+    let n = nodes[nk]
+    if _node_in_ns(n[0], n[1], ns_lc) { kept.push(nk) }
+    nk = nk + 1
+}
+
+// ─── helpers ─────────────────────────────────────────────────────────────────
+fn _join(items, sep: string) -> string {
+    if len(items) == 0 { return "" }
+    let mut out = items[0]
+    let mut k = 1
+    while k < len(items) {
+        out = out + sep + items[k]
+        k = k + 1
+    }
+    return out
+}
+
+fn _json_escape(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", " ")
+    r = r.replace("\r", " ")
+    r = r.replace("\t", " ")
+    return r
+}
+
+// ─── derive cycle filter target (normalized) ─────────────────────────────────
+fn _normalize(s: string) -> string {
+    if len(s) == 0 { return "" }
+    // shell-out to python normalization (mirrors the indexer's norm())
+    let escaped = s.replace("'", "")
+    let cmd = "python3 -c \"import sys,re; s=sys.argv[1].strip(); s=s.replace('\\u03c9-','omega_').replace('\\u03c9_','omega_').replace('\\u03c9','omega'); s=s.lower().replace('-','_'); s=re.sub(r'[^a-z0-9_]+\\$','',s); s=re.sub(r'^[^a-z0-9_]+','',s); s=re.sub(r'_+','_',s); print(s)\" '" + escaped + "'"
+    return to_string(exec(cmd)).trim()
+}
+
+let cycle_filter_norm = if len(cycle_filter) > 0 { _normalize(cycle_filter) } else { "" }
+
+// ─── compute global edge count (for sentinel) ────────────────────────────────
+// Edge types contributing to E:
+//   - predecessor edges (known) — edge_pred_known
+//   - followup edges to known nodes — frefs_known
+// Dedupe pairs.
+let mut edge_pairs = []   // ["from|to|type", ...]
+let mut ep = 0
+while ep < len(edge_pred_known) {
+    let e = edge_pred_known[ep]
+    let key = e[0] + "|" + e[1] + "|p"
+    let mut found = false
+    let mut k = 0
+    while k < len(edge_pairs) {
+        if edge_pairs[k] == key { found = true; break }
+        k = k + 1
+    }
+    if !found { edge_pairs.push(key) }
+    ep = ep + 1
+}
+let mut ef = 0
+while ef < len(frefs_known) {
+    let e = frefs_known[ef]
+    let key = e[0] + "|" + e[1] + "|f"
+    let mut found = false
+    let mut k = 0
+    while k < len(edge_pairs) {
+        if edge_pairs[k] == key { found = true; break }
+        k = k + 1
+    }
+    if !found { edge_pairs.push(key) }
+    ef = ef + 1
+}
+let edge_count = len(edge_pairs)
+
+// ─── compute orphan set (no preds known AND no successors) ───────────────────
+let mut orphan_indices = []
+let mut oi = 0
+while oi < len(nodes) {
+    let p_count = len(predecessors_of[oi])
+    let s_count = len(successors_of[oi])
+    if p_count == 0 && s_count == 0 {
+        orphan_indices.push(oi)
+    }
+    oi = oi + 1
+}
+
+// ─── EMIT ────────────────────────────────────────────────────────────────────
+let nodes_count = len(nodes)
+let unrealized_count = len(unrealized_global_keys)
+let orphan_count = len(orphan_indices)
+
+if !quiet {
+    if json_mode {
+        // {nodes:[{cycle,axis,title,timestamp}], edges:[{from,to,type}]}
+        // Note: cycle in JSON output uses the canonical "cycle" field (raw, not normalized).
+        // edges use normalized names so they cross-reference cleanly.
+        println("{")
+        // nodes
+        println("  \"nodes\": [")
+        let mut k = 0
+        let nk_count = len(nodes)
+        while k < nk_count {
+            let n = nodes[k]
+            // namespace filter applies to JSON nodes too
+            if !_node_in_ns(n[0], n[1], ns_lc) { k = k + 1; continue }
+            // determine if last kept node — peek ahead
+            let mut next_k = k + 1
+            let mut has_more = false
+            while next_k < nk_count {
+                let nn = nodes[next_k]
+                if _node_in_ns(nn[0], nn[1], ns_lc) { has_more = true; break }
+                next_k = next_k + 1
+            }
+            let comma = if has_more { "," } else { "" }
+            let obj = "    {" +
+                "\"cycle\":\"" + _json_escape(n[0]) + "\"," +
+                "\"axis\":\"" + _json_escape(n[1]) + "\"," +
+                "\"title\":\"" + _json_escape(n[2]) + "\"," +
+                "\"timestamp\":\"" + _json_escape(n[3]) + "\"," +
+                "\"norm\":\"" + _json_escape(n[4]) + "\"" +
+                "}" + comma
+            println(obj)
+            k = k + 1
+        }
+        println("  ],")
+        // edges
+        println("  \"edges\": [")
+        // build a flat list of (from, to, type) keeping kept-node membership
+        // For namespace filter, only emit edge if BOTH endpoints kept (or to is unknown but from kept — applies to followup type only when --json doesn't include unknown destinations).
+        // Spec says edges array entries are {from,to,type:"predecessor"|"followup"}. We emit only edges where both endpoints exist as nodes (resolvable refs).
+        let mut all_edges = []  // [from_norm, to_norm, type]
+        let mut ek = 0
+        while ek < len(edge_pred_known) {
+            let e = edge_pred_known[ek]
+            all_edges.push([e[0], e[1], "predecessor"])
+            ek = ek + 1
+        }
+        let mut ef = 0
+        while ef < len(frefs_known) {
+            let e = frefs_known[ef]
+            all_edges.push([e[0], e[1], "followup"])
+            ef = ef + 1
+        }
+        // dedupe (from|to|type)
+        let mut seen_keys = []
+        let mut dedup_edges = []
+        let mut de = 0
+        while de < len(all_edges) {
+            let e = all_edges[de]
+            let key = e[0] + "|" + e[1] + "|" + e[2]
+            let mut found = false
+            let mut k2 = 0
+            while k2 < len(seen_keys) {
+                if seen_keys[k2] == key { found = true; break }
+                k2 = k2 + 1
+            }
+            if !found {
+                seen_keys.push(key)
+                dedup_edges.push(e)
+            }
+            de = de + 1
+        }
+        // namespace filter on edges
+        let mut filt_edges = []
+        let mut fek = 0
+        while fek < len(dedup_edges) {
+            let e = dedup_edges[fek]
+            let ifr = _index_of(node_keys, e[0])
+            let ito = _index_of(node_keys, e[1])
+            let mut keep = true
+            if ifr < 0 || ito < 0 { keep = false }
+            if keep && len(ns_lc) > 0 {
+                let nf_ = nodes[ifr]
+                let nt_ = nodes[ito]
+                if !_node_in_ns(nf_[0], nf_[1], ns_lc) { keep = false }
+                if keep && !_node_in_ns(nt_[0], nt_[1], ns_lc) { keep = false }
+            }
+            if keep { filt_edges.push(e) }
+            fek = fek + 1
+        }
+        let mut k = 0
+        while k < len(filt_edges) {
+            let e = filt_edges[k]
+            let comma = if k + 1 < len(filt_edges) { "," } else { "" }
+            println("    {\"from\":\"" + _json_escape(e[0]) + "\",\"to\":\"" + _json_escape(e[1]) + "\",\"type\":\"" + e[2] + "\"}" + comma)
+            k = k + 1
+        }
+        println("  ]")
+        println("}")
+    } else if want_orphans {
+        if len(orphan_indices) == 0 {
+            println("EMPTY: no orphan cycles")
+        } else {
+            let mut k = 0
+            while k < len(orphan_indices) {
+                let idx = orphan_indices[k]
+                let n = nodes[idx]
+                if _node_in_ns(n[0], n[1], ns_lc) {
+                    println(n[0] + "  (" + n[1] + ")")
+                }
+                k = k + 1
+            }
+        }
+    } else if want_unrealized {
+        if len(unrealized_global_keys) == 0 {
+            println("EMPTY: no unrealized followups")
+        } else {
+            let mut k = 0
+            while k < len(unrealized_global_keys) {
+                // namespace filter on the SOURCE node
+                let src = unrealized_global_from[k]
+                let src_idx = _index_of(node_keys, src)
+                let mut keep = true
+                if src_idx >= 0 {
+                    let sn = nodes[src_idx]
+                    if !_node_in_ns(sn[0], sn[1], ns_lc) { keep = false }
+                }
+                if keep {
+                    let raw = unrealized_global_raw[k]
+                    let norm = unrealized_global_keys[k]
+                    println(raw + "  (norm=" + norm + ", from=" + src + ")")
+                }
+                k = k + 1
+            }
+        }
+    } else if len(cycle_filter) > 0 {
+        // subgraph for one cycle
+        let idx = _index_of(node_keys, cycle_filter_norm)
+        if idx < 0 {
+            println("NOT_FOUND: cycle=" + cycle_filter + " (normalized=" + cycle_filter_norm + ")")
+        } else {
+            let n = nodes[idx]
+            println(n[0] + "  (" + n[1] + ")")
+            // predecessors (raw labels from original closure)
+            let raw_preds = raw_preds_of[idx]
+            if len(raw_preds) > 0 {
+                println("  ← predecessors: " + _join(raw_preds, ", "))
+            } else {
+                println("  ← predecessors: (none)")
+            }
+            // realized successors (other cycles whose preds include this one)
+            let succs = successors_of[idx]
+            // map normalized successors back to raw cycle field for display
+            let mut succ_disp = []
+            let mut sj = 0
+            while sj < len(succs) {
+                let si = _index_of(node_keys, succs[sj])
+                if si >= 0 {
+                    let sn = nodes[si]
+                    succ_disp.push(sn[0])
+                }
+                sj = sj + 1
+            }
+            if len(succ_disp) > 0 {
+                println("  → realized_successors: " + _join(succ_disp, ", "))
+            } else {
+                println("  → realized_successors: (none)")
+            }
+            // planned followups: all raw text
+            let ftexts_row = followups_text_of[idx]
+            let unreal_row = unrealized_of[idx]
+            if len(ftexts_row) > 0 {
+                println("  → planned_followups:")
+                let mut fj = 0
+                while fj < len(ftexts_row) {
+                    println("      - " + ftexts_row[fj])
+                    fj = fj + 1
+                }
+            }
+            if len(unreal_row) > 0 {
+                println("    (unrealized refs: " + _join(unreal_row, ", ") + ")")
+            }
+        }
+    } else {
+        // default text mode: one node block per kept cycle
+        if len(kept) == 0 {
+            println("EMPTY: no cycles matched (scan_dir=" + scan_dir + (if len(namespace_pat) > 0 { ", namespace=" + namespace_pat } else { "" }) + ")")
+        } else {
+            let mut k = 0
+            while k < len(kept) {
+                let idx = kept[k]
+                let n = nodes[idx]
+                println(n[0] + "  (" + n[1] + ")")
+                let raw_preds = raw_preds_of[idx]
+                if len(raw_preds) > 0 {
+                    println("  ← predecessors: " + _join(raw_preds, ", "))
+                }
+                let succs = successors_of[idx]
+                let mut succ_disp = []
+                let mut sj = 0
+                while sj < len(succs) {
+                    let si = _index_of(node_keys, succs[sj])
+                    if si >= 0 {
+                        let sn = nodes[si]
+                        succ_disp.push(sn[0])
+                    }
+                    sj = sj + 1
+                }
+                if len(succ_disp) > 0 {
+                    println("  → realized_successors: " + _join(succ_disp, ", "))
+                }
+                let unreal_row = unrealized_of[idx]
+                if len(unreal_row) > 0 {
+                    println("  → planned_followups: " + _join(unreal_row, ", ") + " (not yet closed)")
+                }
+                k = k + 1
+            }
+        }
+    }
+}
+
+// ─── sentinel (raw 80) ───────────────────────────────────────────────────────
+if nodes_count == 0 {
+    println("__CLOSURE_GRAPH__ scanned=" + scanned_str + " nodes=0 edges=0 orphans=0 unrealized=0 EMPTY")
+} else {
+    println("__CLOSURE_GRAPH__ scanned=" + scanned_str + " nodes=" + to_string(nodes_count) + " edges=" + to_string(edge_count) + " orphans=" + to_string(orphan_count) + " unrealized=" + to_string(unrealized_count))
+}
