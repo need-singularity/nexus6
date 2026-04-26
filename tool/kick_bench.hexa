@@ -14,13 +14,34 @@
 
 fn _now_iso_utc() -> str { return exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim() }
 fn _now_unix_ms() -> i64 {
-    let s = exec("date +%s%3N 2>/dev/null || python3 -c 'import time;print(int(time.time()*1000))'").trim()
+    // macOS-correctness fix (2026-04-27 carry-forward): BSD `date +%s%3N` emits
+    // a literal "...N" (the BSD date(1) does not support %3N), and the OR-fallback
+    // shell short-circuit kept the bogus output, which to_int then rejected,
+    // collapsing this fn to 0. With v=0 the freshness guard's t0_s=0 made every
+    // mtime >= 0 appear "fresh" → guard silently bypassed on macOS.
+    // Order: try BSD date → fall to python3 ms → fall to date +%s * 1000.
+    let s = exec("date +%s%3N 2>/dev/null").trim()
     let mut v: i64 = 0
     try { v = to_int(s) } catch e { v = 0 }
+    if v <= 0 {
+        let s2 = exec("python3 -c 'import time;print(int(time.time()*1000))'").trim()
+        try { v = to_int(s2) } catch e2 { v = 0 }
+    }
+    if v <= 0 {
+        let s3 = exec("date +%s").trim()
+        try { let sec = to_int(s3); v = sec * 1000 } catch e3 { v = 0 }
+    }
     return v
 }
 
 fn _file_exists(path: str) -> bool { return exec("test -f '" + path + "' && echo y || echo n").trim() == "y" }
+fn _file_mtime_s(path: str) -> i64 {
+    if !_file_exists(path) { return 0 }
+    let raw = exec("stat -f %m '" + path + "' 2>/dev/null || stat -c %Y '" + path + "' 2>/dev/null").trim()
+    let mut v: i64 = 0
+    try { v = to_int(raw) } catch e { v = 0 }
+    return v
+}
 fn _dir_exists(path: str) -> bool { return exec("test -d '" + path + "' && echo y || echo n").trim() == "y" }
 fn _ensure_dir(path: str) { let _ = exec("mkdir -p '" + path + "'") }
 fn _shell_quote(s: str) -> str { return "'" + s.replace("'", "'\\''") + "'" }
@@ -475,8 +496,18 @@ fn main() -> void {
                 witness_path = rest.substring(0, ee)
             }
         }
-        let status = if rc == 0 { "fire" } else { "fail" }
-        if witness_path.len() > 0 && _file_exists(witness_path) { witnesses_landed = witnesses_landed + 1 }
+        // Freshness guard (self-reported bug 2026-04-26): pre-existing witness
+        // files from prior runs would falsely bump the counter even on rc!=0.
+        // Require rc==0 AND witness mtime within this iteration's window.
+        let mut status = if rc == 0 { "fire" } else { "fail" }
+        let t0_s = t0 / 1000
+        let mtime_s = if witness_path.len() > 0 { _file_mtime_s(witness_path) } else { 0 }
+        let fresh = witness_path.len() > 0 && mtime_s >= t0_s
+        if status == "fire" && fresh {
+            witnesses_landed = witnesses_landed + 1
+        } else if status == "fire" && witness_path.len() > 0 && !fresh {
+            status = "fail-stale-witness"
+        }
         // dedup_ratio_vs_prior — F17 carry-forward. Real jaccard over prior
         // witnesses for the same topic-slug. tier1_count + falsifier_coverage
         // still deferred to post-hoc decoder (witness schema is JSON, hexa
