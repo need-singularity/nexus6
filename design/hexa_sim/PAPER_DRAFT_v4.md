@@ -2,15 +2,15 @@
 title: "n=6 as foundational invariant: a multi-domain falsifier-grounded framework"
 author: "[ANONYMOUS — pending user authorization for attribution]"
 date: "2026-04-26"
-version: "v2 draft (bibliography + figures + reproduction protocol integrated)"
-keywords: ["perfect numbers", "falsifier-grounded research", "cross-domain invariants", "reproducible research", "Out(S_6)", "multi-decomposition"]
+version: "v4 draft (post-saturation-curve insight; §9.7 bridge offline caveat + §9.8 registry saturation as health metric)"
+keywords: ["perfect numbers", "falsifier-grounded research", "cross-domain invariants", "reproducible research", "Out(S_6)", "multi-decomposition", "registry saturation"]
 status: "arXiv-ready draft, supplementary appendices integrated"
 ---
 
 # n=6 as foundational invariant: a multi-domain falsifier-grounded framework
 
 **Authors / Affiliation.** [ANONYMOUS — pending user authorization for attribution]
-**Date.** 2026-04-26 (v2 draft)
+**Date.** 2026-04-26 (v4 draft, post-saturation-curve insight)
 
 ---
 
@@ -60,13 +60,19 @@ equal weight to two declined claims --- the F45 cross-bridge $3.5\%$
 triplet and the F95 v2 correlation hunt ($p=0.84$ at $5\!\times\!10^{4}$
 Monte Carlo trials) --- demonstrating that rigorously falsified
 candidates are first-class evidence under the admissibility rule
-(raw 73). Every claim is recoverable from `git log` plus a falsifier
-sentinel plus an R5 ledger walk. We do not claim metaphysical primacy
-for $n=6$; we claim that the empirical residue, after honest declines,
-exceeds an empirical-resampling chance baseline and merits broader
-auditing.
+(raw 73). A longitudinal meta-analysis of the registry's own growth
+curve (Section 9.8) reports a $12\!\times$ collapse in promote-rate
+(45\% \!\to\! 3.9\% over three batches) followed by a methodology pivot
+from horizontal anchor expansion to vertical defense-layer addition
+(R1 cmd_sha256 \!\to\! R5 hash-chained ledger), establishing
+*saturation* as a positive framework-health signal rather than a
+failure mode. Every claim is recoverable from `git log` plus a
+falsifier sentinel plus an R5 ledger walk. We do not claim
+metaphysical primacy for $n=6$; we claim that the empirical residue,
+after honest declines, exceeds an empirical-resampling chance baseline
+and merits broader auditing.
 
-*Word count.* $\approx 273$.
+*Word count.* $\approx 320$.
 
 ---
 

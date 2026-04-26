@@ -131,3 +131,24 @@ provenance-degraded. A formal OFFLINE-FALLBACK contract (cached-payload
 \texttt{cmd\_sha256} + freshness window + degraded-mode marker) across all
 $16$ bridges is enumerated in \texttt{PAPER\_OUTLINE\_v1.md} \S 10.4 as a
 next-cycle hardening item.
+
+## §9.8 Saturation curve and methodology pivot
+
+A longitudinal walk over the falsifier registry
+(\texttt{2026-04-26\_registry\_meta\_evolution\_analysis.md},
+commit \texttt{db956091}) decomposed $115$ entries into seven phases and
+quantified per-batch promote-rate decay across four auto-spawn batches:
+$45\% \to 30\% \to 14\% \to 3.9\%$ (F13--F22 through F38--F44), a
+$\sim\!12\times$ collapse. Phase~6 (commits F88--F114) coincides with the
+emergence of the R1--R5 defense layer and exhibits an anti-correlated
+methodology pivot: vertical depth (\texttt{cmd\_sha256} fingerprint, R5
+hash-chain, SSH PREVENTIVE) substituted for horizontal breadth (per-F\#
+novelty). The $53$ pending F133--F185 candidates (cross-engine integration
+plus new-domain extensions) signal the boundary of one-axis (per-bridge,
+per-function) coverage. Under raw 73 admissibility, saturation is read as a
+\emph{positive} framework-completeness signal, not a negative result: a
+registry that cannot saturate has unstable admissibility. The empirical
+decline floor at $1.7\%$ (F45 plus F95~v2 over $115$ entries; cross-ref
+\texttt{META\_OMEGA\_CYCLE\_ROI.md} and
+\texttt{2026-04-26\_registry\_quality\_audit\_v2.md} PAUSE at F125) is
+recorded as a non-trivial honest-disclosure rate.
