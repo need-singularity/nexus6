@@ -30,12 +30,17 @@
 //   __ATLAS_ALERT__ SKIP reason=no_matching_rows scope=bridge_anomaly
 //   __ATLAS_ALERT__ FIRED rule=warn_ratio        ratio=R threshold=T last_n=N sampled=S
 //   __ATLAS_ALERT__ FIRED rule=insufficient_ratio ratio=R threshold=T last_n=N sampled=S
+//   __ATLAS_ALERT__ FIRED rule=consecutive_warn  streak=K observed=K last_n=N sampled=S       (ω-bridge-19)
+//   __ATLAS_ALERT__ FIRED rule=recent_warn_ratio ratio=R threshold=T window_minutes=M sampled=S (ω-bridge-19)
 //   __ATLAS_ALERT__ PASS sampled=S rules_evaluated=R
 //
 // rules (configurable via HEXA_ARGV):
 //   --last N                          inspect last N matching rows                     (default 10)
 //   --warn-threshold R                fire if WARN ratio of last N >= R                (default 0.4)
 //   --insufficient-threshold R        fire if INSUFFICIENT_DATA ratio >= R             (default 0.6)
+//   --streak-threshold K              fire if last K matching rows are ALL WARN        (default 0 = disabled, ω-bridge-19)
+//   --window-minutes M                fire if WARN-ratio over last M minutes (by ts)
+//                                     >= --warn-threshold                              (default 0 = disabled, ω-bridge-19)
 //   --timeline PATH                   override timeline path (testing fixtures)
 //   --quiet                           sentinel-only output
 //
@@ -44,12 +49,15 @@
 //
 // Origin: design/hexa_sim/cross_repo_dashboard.md ω-bridge-17 entry
 //         /Users/ghost/core/anima/state/omega_bridge_17_*.json
+//         /Users/ghost/core/anima/state/omega_bridge_19_*.json (time-shape rules)
 
 let NEXUS = "/Users/ghost/core/nexus"
 let DEFAULT_TIMELINE = NEXUS + "/state/atlas_health_timeline.jsonl"
 let DEFAULT_LAST = "10"
 let DEFAULT_WARN_THR = "0.4"
 let DEFAULT_INSUF_THR = "0.6"
+let DEFAULT_STREAK = "0"        // ω-bridge-19 — 0 = disabled (existing-behaviour preserved)
+let DEFAULT_WINDOW_MIN = "0"    // ω-bridge-19 — 0 = disabled
 let TARGET_SCOPE = "bridge_anomaly"
 
 let mut QUIET = false
@@ -73,6 +81,8 @@ let mut timeline_path = DEFAULT_TIMELINE
 let mut last_str = DEFAULT_LAST
 let mut warn_thr_str = DEFAULT_WARN_THR
 let mut insuf_thr_str = DEFAULT_INSUF_THR
+let mut streak_str = DEFAULT_STREAK            // ω-bridge-19
+let mut window_min_str = DEFAULT_WINDOW_MIN    // ω-bridge-19
 let mut i = 0
 while i < len(args) {
     let a = args[i]
@@ -81,12 +91,16 @@ while i < len(args) {
     if a == "--last" && i + 1 < len(args) { last_str = args[i+1]; i = i + 1 }
     if a == "--warn-threshold" && i + 1 < len(args) { warn_thr_str = args[i+1]; i = i + 1 }
     if a == "--insufficient-threshold" && i + 1 < len(args) { insuf_thr_str = args[i+1]; i = i + 1 }
+    if a == "--streak-threshold" && i + 1 < len(args) { streak_str = args[i+1]; i = i + 1 }
+    if a == "--window-minutes" && i + 1 < len(args) { window_min_str = args[i+1]; i = i + 1 }
     if a == "--help" || a == "-h" {
-        println("usage: HEXA_ARGV='[--timeline PATH] [--last N] [--warn-threshold R] [--insufficient-threshold R] [--quiet]' hexa run tool/atlas_alert_subscriber.hexa")
+        println("usage: HEXA_ARGV='[--timeline PATH] [--last N] [--warn-threshold R] [--insufficient-threshold R] [--streak-threshold K] [--window-minutes M] [--quiet]' hexa run tool/atlas_alert_subscriber.hexa")
         println("  default: scan state/atlas_health_timeline.jsonl, last 10 bridge_anomaly rows")
         println("  --last N                       inspect last N matching rows  (default 10)")
         println("  --warn-threshold R             fire if WARN/N >= R           (default 0.4)")
         println("  --insufficient-threshold R     fire if INSUFFICIENT_DATA/N >= R (default 0.6)")
+        println("  --streak-threshold K           fire consecutive_warn if last K matching rows are ALL WARN (default 0 = off)")
+        println("  --window-minutes M             fire recent_warn_ratio if WARN-ratio over last M minutes (by ts) >= --warn-threshold (default 0 = off)")
         println("  --timeline PATH                override timeline path (fixtures)")
         println("  --quiet                        emit __ATLAS_ALERT__ sentinel only")
         return
@@ -185,7 +199,7 @@ if len(rparts) >= 2 {
 }
 
 // ─── rule evaluation (awk for >= compare on floats) ──────────────────────────
-let rules_evaluated = 2
+let mut rules_evaluated = 2
 
 let warn_cmp = to_string(exec("awk 'BEGIN { print ((" + warn_ratio_s + "+0) >= (" + warn_thr_str + "+0)) ? 1 : 0 }' </dev/null")).trim()
 let insuf_cmp = to_string(exec("awk 'BEGIN { print ((" + insuf_ratio_s + "+0) >= (" + insuf_thr_str + "+0)) ? 1 : 0 }' </dev/null")).trim()
@@ -196,6 +210,88 @@ if warn_cmp == "1" {
 }
 if insuf_cmp == "1" {
     fired.push("__ATLAS_ALERT__ FIRED rule=insufficient_ratio ratio=" + insuf_ratio_s + " threshold=" + insuf_thr_str + " last_n=" + last_str + " sampled=" + to_string(sampled))
+}
+
+// ─── ω-bridge-19: consecutive WARN streak (time-shape rule, hot-anomaly) ─────
+// Walks tail_lines from end; counts how many consecutive trailing rows are WARN.
+// All entries in tail_lines are already filtered to scope=bridge_anomaly (matched
+// above) — so the "skip non-matching to compute streak only on matching rows"
+// edge case is satisfied automatically.
+let streak_int = to_string(exec("printf '%d' " + streak_str + " 2>/dev/null || printf 0")).trim()
+let streak_k = to_string(exec("awk 'BEGIN { print (" + streak_int + "+0) }' </dev/null")).trim()
+if streak_k != "0" {
+    rules_evaluated = rules_evaluated + 1
+    // Count trailing consecutive WARN — break on first non-WARN.
+    let mut observed = 0
+    let mut walk = len(tail_lines) - 1
+    while walk >= 0 {
+        let row = tail_lines[walk]
+        if row.contains(warn_marker) {
+            observed = observed + 1
+        } else {
+            walk = -1  // break
+        }
+        walk = walk - 1
+    }
+    let cmp = to_string(exec("awk 'BEGIN { print ((" + to_string(observed) + "+0) >= (" + streak_k + "+0)) ? 1 : 0 }' </dev/null")).trim()
+    if cmp == "1" {
+        fired.push("__ATLAS_ALERT__ FIRED rule=consecutive_warn streak=" + streak_k + " observed=" + to_string(observed) + " last_n=" + last_str + " sampled=" + to_string(sampled))
+    }
+}
+
+// ─── ω-bridge-19: time-decay window (recent WARN-ratio over last M minutes) ──
+// Filters `matched` (NOT tail_lines — window is time-bounded, not count-bounded)
+// to rows whose ts is within [now - M*60, now]. Future-dated rows excluded
+// defensively. Parse failures skipped silently (raw 71). Ratio computed via
+// python3 (single shell-out) to avoid duplicating ISO-8601 parsing per-row.
+let window_min_int = to_string(exec("printf '%d' " + window_min_str + " 2>/dev/null || printf 0")).trim()
+let window_m = to_string(exec("awk 'BEGIN { print (" + window_min_int + "+0) }' </dev/null")).trim()
+if window_m != "0" {
+    rules_evaluated = rules_evaluated + 1
+    // Build joined matched rows for python3. Reuse `joined` from the earlier
+    // tail compute — it already contains every matched row, newline-terminated.
+    // Write to a temp file to avoid quoting hell with embedded JSON.
+    let tmpf = "/tmp/atlas_alert_window_" + to_string(timestamp()) + "_" + to_string(len(matched)) + ".jsonl"
+    write_file(tmpf, joined)
+    let py = "import sys, json, datetime, re\n" +
+             "now = datetime.datetime.now(datetime.timezone.utc)\n" +
+             "cutoff = now - datetime.timedelta(minutes=" + window_m + ")\n" +
+             "warn = 0; total = 0\n" +
+             "with open('" + tmpf + "') as f:\n" +
+             "    for ln in f:\n" +
+             "        ln = ln.strip()\n" +
+             "        if not ln: continue\n" +
+             "        try:\n" +
+             "            obj = json.loads(ln)\n" +
+             "            ts = obj.get('ts','')\n" +
+             "            t = datetime.datetime.strptime(ts, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=datetime.timezone.utc)\n" +
+             "        except Exception:\n" +
+             "            continue\n" +
+             "        if t > now: continue   # future-dated, defensive\n" +
+             "        if t < cutoff: continue\n" +
+             "        total += 1\n" +
+             "        if obj.get('verdict','') == 'WARN': warn += 1\n" +
+             "ratio = (warn/total) if total > 0 else 0.0\n" +
+             "print('%d %d %.4f' % (warn, total, ratio))\n"
+    let cmd = "/usr/bin/env python3 -c \"" + py.replace("\"", "\\\"") + "\" 2>/dev/null"
+    let out = to_string(exec(cmd)).trim()
+    let parts = split(out, " ")
+    let mut win_warn_n = 0
+    let mut win_total = 0
+    let mut win_ratio_s = "0.0000"
+    if len(parts) >= 3 {
+        win_warn_n = to_int(parts[0])
+        win_total = to_int(parts[1])
+        win_ratio_s = parts[2]
+    }
+    // Best-effort cleanup of the fixture-tmp file (raw 71: tmp dir, no state).
+    exec("rm -f '" + tmpf + "' 2>/dev/null")
+    if win_total > 0 {
+        let cmp = to_string(exec("awk 'BEGIN { print ((" + win_ratio_s + "+0) >= (" + warn_thr_str + "+0)) ? 1 : 0 }' </dev/null")).trim()
+        if cmp == "1" {
+            fired.push("__ATLAS_ALERT__ FIRED rule=recent_warn_ratio ratio=" + win_ratio_s + " threshold=" + warn_thr_str + " window_minutes=" + window_m + " sampled=" + to_string(win_total))
+        }
+    }
 }
 
 // ─── human-readable summary (suppressed when --quiet) ────────────────────────
