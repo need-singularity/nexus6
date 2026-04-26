@@ -22,6 +22,8 @@
 //   HEXA_ARGV='--warn-threshold 0.3' hexa run tool/atlas_alert_subscriber.hexa
 //   HEXA_ARGV='--insufficient-threshold 0.7' hexa run tool/atlas_alert_subscriber.hexa
 //   HEXA_ARGV='--timeline /tmp/fixture.jsonl' hexa run tool/atlas_alert_subscriber.hexa
+//   HEXA_ARGV='--no-history' hexa run tool/atlas_alert_subscriber.hexa            (ω-bridge-21)
+//   ATLAS_ALERT_HISTORY_TSV=/tmp/foo.tsv hexa run tool/atlas_alert_subscriber.hexa (ω-bridge-21)
 //   HEXA_ARGV='--quiet' hexa run tool/atlas_alert_subscriber.hexa
 //   HEXA_ARGV='--help' hexa run tool/atlas_alert_subscriber.hexa
 //
@@ -33,6 +35,7 @@
 //   __ATLAS_ALERT__ FIRED rule=consecutive_warn  streak=K observed=K last_n=N sampled=S       (ω-bridge-19)
 //   __ATLAS_ALERT__ FIRED rule=recent_warn_ratio ratio=R threshold=T window_minutes=M sampled=S (ω-bridge-19)
 //   __ATLAS_ALERT__ PASS sampled=S rules_evaluated=R
+//   __ATLAS_ALERT__ HISTORY_WRITE_FAIL path=PATH reason=...                            (ω-bridge-21)
 //
 // rules (configurable via HEXA_ARGV):
 //   --last N                          inspect last N matching rows                     (default 10)
@@ -42,17 +45,21 @@
 //   --window-minutes M                fire if WARN-ratio over last M minutes (by ts)
 //                                     >= --warn-threshold                              (default 0 = disabled, ω-bridge-19)
 //   --timeline PATH                   override timeline path (testing fixtures)
+//   --no-history                      do NOT append firing events to atlas_alert_history.tsv (ω-bridge-21)
 //   --quiet                           sentinel-only output
 //
-// raw compliance: 71 read-only / 73 admissibility / 77 append-only-respect /
+// raw compliance: 71 read-only-on-timeline / 73 admissibility / 77 append-only /
 //                 80 sentinel
 //
 // Origin: design/hexa_sim/cross_repo_dashboard.md ω-bridge-17 entry
 //         /Users/ghost/core/anima/state/omega_bridge_17_*.json
 //         /Users/ghost/core/anima/state/omega_bridge_19_*.json (time-shape rules)
+//         /Users/ghost/core/anima/state/omega_bridge_21_*.json (history persistence)
 
 let NEXUS = "/Users/ghost/core/nexus"
 let DEFAULT_TIMELINE = NEXUS + "/state/atlas_health_timeline.jsonl"
+let DEFAULT_HISTORY_TSV = NEXUS + "/state/atlas_alert_history.tsv"   // ω-bridge-21
+let HISTORY_HEADER = "# atlas_alert_history.tsv — alert firing event log (raw 77 append-only)\n# ts\trule\tratio\tthreshold\tlast_n\tsampled\textra\n"  // ω-bridge-21
 let DEFAULT_LAST = "10"
 let DEFAULT_WARN_THR = "0.4"
 let DEFAULT_INSUF_THR = "0.6"
@@ -83,10 +90,12 @@ let mut warn_thr_str = DEFAULT_WARN_THR
 let mut insuf_thr_str = DEFAULT_INSUF_THR
 let mut streak_str = DEFAULT_STREAK            // ω-bridge-19
 let mut window_min_str = DEFAULT_WINDOW_MIN    // ω-bridge-19
+let mut write_history = true                   // ω-bridge-21 — default ON
 let mut i = 0
 while i < len(args) {
     let a = args[i]
     if a == "--quiet" { QUIET = true }
+    if a == "--no-history" { write_history = false }   // ω-bridge-21
     if a == "--timeline" && i + 1 < len(args) { timeline_path = args[i+1]; i = i + 1 }
     if a == "--last" && i + 1 < len(args) { last_str = args[i+1]; i = i + 1 }
     if a == "--warn-threshold" && i + 1 < len(args) { warn_thr_str = args[i+1]; i = i + 1 }
@@ -94,7 +103,7 @@ while i < len(args) {
     if a == "--streak-threshold" && i + 1 < len(args) { streak_str = args[i+1]; i = i + 1 }
     if a == "--window-minutes" && i + 1 < len(args) { window_min_str = args[i+1]; i = i + 1 }
     if a == "--help" || a == "-h" {
-        println("usage: HEXA_ARGV='[--timeline PATH] [--last N] [--warn-threshold R] [--insufficient-threshold R] [--streak-threshold K] [--window-minutes M] [--quiet]' hexa run tool/atlas_alert_subscriber.hexa")
+        println("usage: HEXA_ARGV='[--timeline PATH] [--last N] [--warn-threshold R] [--insufficient-threshold R] [--streak-threshold K] [--window-minutes M] [--no-history] [--quiet]' hexa run tool/atlas_alert_subscriber.hexa")
         println("  default: scan state/atlas_health_timeline.jsonl, last 10 bridge_anomaly rows")
         println("  --last N                       inspect last N matching rows  (default 10)")
         println("  --warn-threshold R             fire if WARN/N >= R           (default 0.4)")
@@ -102,11 +111,18 @@ while i < len(args) {
         println("  --streak-threshold K           fire consecutive_warn if last K matching rows are ALL WARN (default 0 = off)")
         println("  --window-minutes M             fire recent_warn_ratio if WARN-ratio over last M minutes (by ts) >= --warn-threshold (default 0 = off)")
         println("  --timeline PATH                override timeline path (fixtures)")
+        println("  --no-history                   skip appending firing events to atlas_alert_history.tsv (default: write)")
         println("  --quiet                        emit __ATLAS_ALERT__ sentinel only")
+        println("env: ATLAS_ALERT_HISTORY_TSV=PATH  override history TSV path (default: state/atlas_alert_history.tsv)")
         return
     }
     i = i + 1
 }
+
+// ω-bridge-21 — resolve history TSV path (env override > default)
+let env_history = to_string(exec("printf '%s' \"${ATLAS_ALERT_HISTORY_TSV:-}\"")).trim()
+let mut history_path = DEFAULT_HISTORY_TSV
+if len(env_history) > 0 { history_path = env_history }
 
 // ─── pre-flight ──────────────────────────────────────────────────────────────
 if !file_exists(timeline_path) {
@@ -205,11 +221,18 @@ let warn_cmp = to_string(exec("awk 'BEGIN { print ((" + warn_ratio_s + "+0) >= (
 let insuf_cmp = to_string(exec("awk 'BEGIN { print ((" + insuf_ratio_s + "+0) >= (" + insuf_thr_str + "+0)) ? 1 : 0 }' </dev/null")).trim()
 
 let mut fired = []
+// ω-bridge-21 — parallel event records for history TSV. Each fired sentinel
+// pushes one TSV row (TAB-separated) into `event_rows` in lockstep. Schema:
+//   ts<TAB>rule<TAB>ratio<TAB>threshold<TAB>last_n<TAB>sampled<TAB>extra
+// The ts is filled in at write time (system clock at emit, not row ts).
+let mut event_rows = []
 if warn_cmp == "1" {
     fired.push("__ATLAS_ALERT__ FIRED rule=warn_ratio ratio=" + warn_ratio_s + " threshold=" + warn_thr_str + " last_n=" + last_str + " sampled=" + to_string(sampled))
+    event_rows.push("warn_ratio\t" + warn_ratio_s + "\t" + warn_thr_str + "\t" + last_str + "\t" + to_string(sampled) + "\t")
 }
 if insuf_cmp == "1" {
     fired.push("__ATLAS_ALERT__ FIRED rule=insufficient_ratio ratio=" + insuf_ratio_s + " threshold=" + insuf_thr_str + " last_n=" + last_str + " sampled=" + to_string(sampled))
+    event_rows.push("insufficient_ratio\t" + insuf_ratio_s + "\t" + insuf_thr_str + "\t" + last_str + "\t" + to_string(sampled) + "\t")
 }
 
 // ─── ω-bridge-19: consecutive WARN streak (time-shape rule, hot-anomaly) ─────
@@ -236,6 +259,8 @@ if streak_k != "0" {
     let cmp = to_string(exec("awk 'BEGIN { print ((" + to_string(observed) + "+0) >= (" + streak_k + "+0)) ? 1 : 0 }' </dev/null")).trim()
     if cmp == "1" {
         fired.push("__ATLAS_ALERT__ FIRED rule=consecutive_warn streak=" + streak_k + " observed=" + to_string(observed) + " last_n=" + last_str + " sampled=" + to_string(sampled))
+        // ω-bridge-21 — streak rule has no ratio/threshold; encode 0 / extra=streak=K
+        event_rows.push("consecutive_warn\t0.0000\t0\t" + last_str + "\t" + to_string(sampled) + "\tstreak=" + streak_k)
     }
 }
 
@@ -290,6 +315,8 @@ if window_m != "0" {
         let cmp = to_string(exec("awk 'BEGIN { print ((" + win_ratio_s + "+0) >= (" + warn_thr_str + "+0)) ? 1 : 0 }' </dev/null")).trim()
         if cmp == "1" {
             fired.push("__ATLAS_ALERT__ FIRED rule=recent_warn_ratio ratio=" + win_ratio_s + " threshold=" + warn_thr_str + " window_minutes=" + window_m + " sampled=" + to_string(win_total))
+            // ω-bridge-21 — window rule has no last_n; encode 0 / extra=window_minutes=M
+            event_rows.push("recent_warn_ratio\t" + win_ratio_s + "\t" + warn_thr_str + "\t0\t" + to_string(win_total) + "\twindow_minutes=" + window_m)
         }
     }
 }
@@ -310,6 +337,33 @@ if !QUIET {
         println("  fix:    investigate analyzer output / bridge_health_history.tsv freshness / upstream API outage")
     } else {
         println("  no rules fired")
+    }
+}
+
+// ─── ω-bridge-21: history persistence (FIRED outcomes only) ──────────────────
+// Append-only TSV row per fired rule. PASS/SKIP outcomes deliberately not
+// recorded — the file is an event log of *firings* (raw 77 / append-only).
+// Pre-flight: if the file is missing, seed it with the canonical header before
+// the first append. Failures are report-only (raw 71): emit a sentinel and
+// continue (we still want stdout sentinels of the firings to surface).
+if write_history && len(event_rows) > 0 {
+    let now_iso = to_string(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()
+    if !file_exists(history_path) {
+        try { write_file(history_path, HISTORY_HEADER) } catch e {
+            println("__ATLAS_ALERT__ HISTORY_WRITE_FAIL path=" + history_path + " reason=header_init_failed")
+            write_history = false
+        }
+    }
+    if write_history {
+        let mut ei = 0
+        while ei < len(event_rows) {
+            let row = now_iso + "\t" + event_rows[ei] + "\n"
+            try { append_file(history_path, row) } catch e {
+                println("__ATLAS_ALERT__ HISTORY_WRITE_FAIL path=" + history_path + " reason=append_failed")
+                ei = len(event_rows)  // break — don't retry remaining rows
+            }
+            ei = ei + 1
+        }
     }
 }
 
