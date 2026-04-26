@@ -1,0 +1,513 @@
+// tool/bak_audit.hexa — backup-file accumulation auditor (ω-cleanup-2)
+//
+// Hexa raw-9 sweeper-safe (.hexa-only-suffix). Read-only audit: enumerates
+// .bak / .backup / .pre_* style files across one or more repository roots and
+// emits a categorized report + sentinel. NEVER deletes (raw 71 report-only).
+//
+// Defaults to scanning the four canonical roots:
+//   /Users/ghost/.hx                  (toolchain bin)
+//   /Users/ghost/core/nexus           (this repo)
+//   /Users/ghost/core/hexa-lang       (interpreter / stdlib)
+//   /Users/ghost/core/anima           (closures / training)
+//
+// Pattern (file-basename match, OR'd):
+//   *.bak               *.bak.*            *.bak_*
+//   *.backup            *.backup_*
+//   *.pre_*
+//
+// Note: deliberately conservative. We do NOT match `*_pre_*` mid-name because
+// that catches non-backup originals (e.g. `quantum_anomaly_pre_screen.hexa`,
+// `l3_pre_launch_validate.hexa`). The leading `.pre_` (with dot) anchors the
+// suffix to actual backup conventions used in this codebase.
+//
+// @tool(slug="bak_audit", desc="audits .bak/.backup/.pre_ accumulation across roots; categorizes by age/size/pattern; sweeper-safe")
+// @usage:
+//   hexa run tool/bak_audit.hexa                                          # default 4 roots, human-readable
+//   HEXA_ARGV='--quiet'  /Users/ghost/core/hexa-lang/build/hexa_interp run tool/bak_audit.hexa
+//   HEXA_ARGV='--json'   /Users/ghost/core/hexa-lang/build/hexa_interp run tool/bak_audit.hexa
+//   HEXA_ARGV='--root /Users/ghost/core/nexus' hexa run tool/bak_audit.hexa
+//   HEXA_ARGV='--root /a --root /b'            hexa run tool/bak_audit.hexa
+//   HEXA_ARGV='--help'                         hexa run tool/bak_audit.hexa
+//
+// sentinel (raw 80):
+//   __BAK_AUDIT__ scanned=N total_bytes=B oldest=PATH(mtime=ISO) largest=PATH(size=BYTES) categories=C
+//
+// raw compliance: 9 hexa-only-suffix / 71 report-only / 73 admissibility /
+//                 77 append-only-respect / 80 sentinel
+//
+// Origin: design/kick/2026-04-26 ω-cleanup-2 audit cycle
+//         /Users/ghost/core/anima/state/omega_cleanup_2_*.json
+
+let DEFAULT_ROOTS = [
+    "/Users/ghost/.hx",
+    "/Users/ghost/core/nexus",
+    "/Users/ghost/core/hexa-lang",
+    "/Users/ghost/core/anima",
+]
+
+let mut QUIET = false
+let mut EMIT_JSON = false
+
+fn _str(x: any) -> string { return to_string(x) }
+
+fn _shq(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _argv() -> array {
+    let raw = _str(exec("printf '%s' \"${HEXA_ARGV:-}\""))
+    let parts = split(raw, " ")
+    let mut out = []
+    let mut k = 0
+    while k < len(parts) {
+        if len(parts[k]) > 0 { out.push(parts[k]) }
+        k = k + 1
+    }
+    return out
+}
+
+fn _say(msg: string) { if !QUIET { println(msg) } }
+
+fn _to_int_safe(s: string) -> i64 {
+    let t = s.trim()
+    if len(t) == 0 { return 0 }
+    let first = split(t, "\n")[0].trim()
+    if len(first) == 0 { return 0 }
+    return to_int(first)
+}
+
+fn _now_unix() -> i64 {
+    return _to_int_safe(_str(exec("date +%s")).trim())
+}
+
+fn _iso(unix_ts: i64) -> string {
+    if unix_ts <= 0 { return "1970-01-01T00:00:00Z" }
+    let cmd = "date -u -r " + to_string(unix_ts) + " +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d @" + to_string(unix_ts) + " +%Y-%m-%dT%H:%M:%SZ 2>/dev/null"
+    return _str(exec(cmd)).trim()
+}
+
+fn _dir_exists(path: string) -> bool {
+    let r = _str(exec("test -d " + _shq(path) + " && echo y || echo n")).trim()
+    return r == "y"
+}
+
+// classify a basename into one of:
+//   bak_dated      *.bak.YYYYMMDD or *.bak.<digits>
+//   bak_pre        *.bak_pre_*
+//   bak_plain      *.bak (or *.bak.<non-numeric>)
+//   pre_omega      *.pre_omega_*  /  *.pre_omega
+//   pre_other      *.pre_*  (catch-all)
+//   backup         *.backup or *.backup_*
+fn _classify(basename: string) -> string {
+    // bak_pre takes precedence over bak_dated (e.g. ".bak_pre_omega_20260426_010127")
+    if basename.contains(".bak_pre_") { return "bak_pre" }
+    // pre_omega before pre_other
+    if basename.contains(".pre_omega") { return "pre_omega" }
+    if basename.contains(".pre_") { return "pre_other" }
+    if basename.contains(".backup") { return "backup" }
+    // *.bak.<digits> ⇒ dated
+    let idx = _last_index_of(basename, ".bak.")
+    if idx >= 0 {
+        let tail = basename.substring(idx + 5, len(basename))
+        // dated if first 8+ chars include digits
+        if _has_digit_prefix(tail) { return "bak_dated" }
+        return "bak_plain"
+    }
+    if basename.ends_with(".bak") { return "bak_plain" }
+    if basename.contains(".bak_") { return "bak_pre" }
+    return "bak_plain"
+}
+
+fn _last_index_of(s: string, needle: string) -> i64 {
+    let n = len(s)
+    let m = len(needle)
+    if m == 0 || m > n { return -1 }
+    let mut i = n - m
+    while i >= 0 {
+        if s.substring(i, i + m) == needle { return i }
+        i = i - 1
+    }
+    return -1
+}
+
+fn _has_digit_prefix(s: string) -> bool {
+    if len(s) == 0 { return false }
+    let c = s.substring(0, 1)
+    return c == "0" || c == "1" || c == "2" || c == "3" || c == "4" || c == "5" || c == "6" || c == "7" || c == "8" || c == "9"
+}
+
+fn _basename(path: string) -> string {
+    let idx = _last_index_of(path, "/")
+    if idx < 0 { return path }
+    return path.substring(idx + 1, len(path))
+}
+
+fn _size_bucket(bytes: i64) -> string {
+    if bytes < 10240 { return "small" }
+    if bytes < 1048576 { return "medium" }
+    return "large"
+}
+
+fn _age_bucket(now: i64, mtime: i64) -> string {
+    let age = now - mtime
+    if age < 0 { return "future" }   // clock skew; treat as recent
+    if age <= 604800 { return "lt7d" }       // <= 7d
+    if age <= 2592000 { return "8to30d" }    // 8..30d
+    return "gt30d"
+}
+
+// ─── parse argv ────────────────────────────────────────────────────────────
+let args = _argv()
+let mut roots = []
+let mut want_help = false
+let mut i = 0
+while i < len(args) {
+    let a = args[i]
+    if a == "--quiet" { QUIET = true }
+    if a == "--json"  { EMIT_JSON = true }
+    if a == "--help" || a == "-h" { want_help = true }
+    if a == "--root" && i + 1 < len(args) { roots.push(args[i + 1]); i = i + 1 }
+    i = i + 1
+}
+
+if want_help {
+    println("usage: HEXA_ARGV='[--root DIR ...] [--quiet] [--json]' hexa run tool/bak_audit.hexa")
+    println("")
+    println("  --root DIR    repeatable; default = ~/.hx, ~/core/nexus, ~/core/hexa-lang, ~/core/anima")
+    println("  --quiet       suppress human-readable summary; only emit sentinel")
+    println("  --json        emit JSON document (single line) to stdout instead of human report")
+    println("")
+    println("  scans for: *.bak, *.bak.*, *.bak_*, *.backup, *.backup_*, *.pre_*")
+    println("  excludes:  .git/ subtrees")
+    println("  read-only: NEVER deletes anything (raw 71 report-only)")
+    println("  sentinel:  __BAK_AUDIT__ scanned=N total_bytes=B ...")
+    return
+}
+
+if len(roots) == 0 {
+    let mut d = 0
+    while d < len(DEFAULT_ROOTS) {
+        roots.push(DEFAULT_ROOTS[d])
+        d = d + 1
+    }
+}
+
+// ─── enumerate files via single find pass per root ────────────────────────
+// Output format per line: "<mtime>\t<size>\t<path>"
+let now = _now_unix()
+
+// Per-root counters: parallel arrays.
+let mut root_names = []
+let mut root_counts = []
+let mut root_bytes  = []
+let mut root_missing = []   // 1 if dir doesn't exist
+
+// Per-category counters (across all roots): parallel arrays.
+let mut cat_names = []
+let mut cat_counts = []
+
+// Per-age-bucket and per-size-bucket counters: parallel arrays.
+let mut age_names = ["lt7d", "8to30d", "gt30d", "future"]
+let mut age_counts = [0, 0, 0, 0]
+let mut size_names = ["small", "medium", "large"]
+let mut size_counts = [0, 0, 0]
+
+// All entries (path, mtime, size, root, category) — parallel arrays so we
+// can sort for top-N reports. We anticipate ~1500 entries; keep linear-scan
+// approach (raw 73 admissibility — simple; no big-O panic).
+let mut e_paths = []
+let mut e_mtimes = []
+let mut e_sizes = []
+let mut e_roots = []
+let mut e_cats = []
+
+let mut total_files = 0
+let mut total_bytes: i64 = 0
+
+let find_pattern = "\\( -name '*.bak' -o -name '*.bak.*' -o -name '*.bak_*' -o -name '*.backup' -o -name '*.backup_*' -o -name '*.pre_*' \\)"
+
+let mut ri = 0
+while ri < len(roots) {
+    let root = roots[ri]
+    if !_dir_exists(root) {
+        root_names.push(root)
+        root_counts.push(0)
+        root_bytes.push(0)
+        root_missing.push(1)
+        ri = ri + 1
+        continue
+    }
+
+    // single find pass; -printf isn't portable on macOS BSD find, so use stat per
+    // line. We funnel through a shell loop that prints "mtime<TAB>size<TAB>path".
+    // Tested: this handles ~700 entries in <1s on local SSD.
+    let cmd = "find " + _shq(root) + " -not -path '*/.git/*' -type f " + find_pattern + " -print0 2>/dev/null" +
+              " | xargs -0 stat -f '%m\t%z\t%N' 2>/dev/null"
+    let raw = _str(exec(cmd))
+    let lines = split(raw, "\n")
+
+    let mut r_count = 0
+    let mut r_bytes: i64 = 0
+    let mut li = 0
+    while li < len(lines) {
+        let line = lines[li]
+        if len(line) == 0 { li = li + 1; continue }
+        let parts = split(line, "\t")
+        if len(parts) < 3 { li = li + 1; continue }
+        let mtime = _to_int_safe(parts[0])
+        let size  = _to_int_safe(parts[1])
+        let path  = parts[2]
+        let bn = _basename(path)
+        let cat = _classify(bn)
+        let ageb = _age_bucket(now, mtime)
+        let szb  = _size_bucket(size)
+
+        r_count = r_count + 1
+        r_bytes = r_bytes + size
+        total_files = total_files + 1
+        total_bytes = total_bytes + size
+
+        e_paths.push(path)
+        e_mtimes.push(mtime)
+        e_sizes.push(size)
+        e_roots.push(root)
+        e_cats.push(cat)
+
+        // category bump
+        let mut ci = 0
+        let mut found = false
+        while ci < len(cat_names) {
+            if cat_names[ci] == cat { cat_counts[ci] = cat_counts[ci] + 1; found = true; break }
+            ci = ci + 1
+        }
+        if !found {
+            cat_names.push(cat)
+            cat_counts.push(1)
+        }
+
+        // age bump
+        let mut ai = 0
+        while ai < len(age_names) {
+            if age_names[ai] == ageb { age_counts[ai] = age_counts[ai] + 1; break }
+            ai = ai + 1
+        }
+
+        // size bump
+        let mut si = 0
+        while si < len(size_names) {
+            if size_names[si] == szb { size_counts[si] = size_counts[si] + 1; break }
+            si = si + 1
+        }
+
+        li = li + 1
+    }
+
+    root_names.push(root)
+    root_counts.push(r_count)
+    root_bytes.push(r_bytes)
+    root_missing.push(0)
+    ri = ri + 1
+}
+
+// ─── compute top-5 oldest + top-5 largest ─────────────────────────────────
+// Selection sort approach: pick min mtime / max size 5 times. O(5*N).
+fn _topN_oldest(mtimes: array, n_target: i64) -> array {
+    let mut taken = []
+    let mut t = 0
+    while t < n_target {
+        let mut best_i: i64 = -1
+        let mut best_m: i64 = 9999999999
+        let mut k = 0
+        while k < len(mtimes) {
+            // skip already-taken
+            let mut already = false
+            let mut tk = 0
+            while tk < len(taken) {
+                if taken[tk] == k { already = true; break }
+                tk = tk + 1
+            }
+            if !already && mtimes[k] < best_m && mtimes[k] > 0 {
+                best_m = mtimes[k]
+                best_i = k
+            }
+            k = k + 1
+        }
+        if best_i < 0 { break }
+        taken.push(best_i)
+        t = t + 1
+    }
+    return taken
+}
+
+fn _topN_largest(sizes: array, n_target: i64) -> array {
+    let mut taken = []
+    let mut t = 0
+    while t < n_target {
+        let mut best_i: i64 = -1
+        let mut best_s: i64 = -1
+        let mut k = 0
+        while k < len(sizes) {
+            let mut already = false
+            let mut tk = 0
+            while tk < len(taken) {
+                if taken[tk] == k { already = true; break }
+                tk = tk + 1
+            }
+            if !already && sizes[k] > best_s {
+                best_s = sizes[k]
+                best_i = k
+            }
+            k = k + 1
+        }
+        if best_i < 0 { break }
+        taken.push(best_i)
+        t = t + 1
+    }
+    return taken
+}
+
+let oldest_idx = _topN_oldest(e_mtimes, 5)
+let largest_idx = _topN_largest(e_sizes, 5)
+
+let mut oldest_path = ""
+let mut oldest_mt: i64 = 0
+if len(oldest_idx) > 0 {
+    oldest_path = e_paths[oldest_idx[0]]
+    oldest_mt = e_mtimes[oldest_idx[0]]
+}
+let mut largest_path = ""
+let mut largest_sz: i64 = 0
+if len(largest_idx) > 0 {
+    largest_path = e_paths[largest_idx[0]]
+    largest_sz = e_sizes[largest_idx[0]]
+}
+
+// ─── emit ─────────────────────────────────────────────────────────────────
+fn _json_escape(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", " ")
+    r = r.replace("\r", " ")
+    r = r.replace("\t", " ")
+    return r
+}
+
+fn _fmt_kv_array_str(names: array, counts: array) -> string {
+    let mut out = "{"
+    let mut first = true
+    let mut i = 0
+    while i < len(names) {
+        if !first { out = out + "," }
+        out = out + "\"" + _json_escape(names[i]) + "\":" + to_string(counts[i])
+        first = false
+        i = i + 1
+    }
+    return out + "}"
+}
+
+if EMIT_JSON {
+    let mut j = "{"
+    j = j + "\"scanned\":" + to_string(total_files)
+    j = j + ",\"total_bytes\":" + to_string(total_bytes)
+    j = j + ",\"now\":" + to_string(now)
+    j = j + ",\"roots\":["
+    let mut ri2 = 0
+    while ri2 < len(root_names) {
+        if ri2 > 0 { j = j + "," }
+        j = j + "{\"path\":\"" + _json_escape(root_names[ri2]) + "\""
+        j = j + ",\"missing\":" + to_string(root_missing[ri2])
+        j = j + ",\"count\":" + to_string(root_counts[ri2])
+        j = j + ",\"bytes\":" + to_string(root_bytes[ri2]) + "}"
+        ri2 = ri2 + 1
+    }
+    j = j + "],\"categories\":" + _fmt_kv_array_str(cat_names, cat_counts)
+    j = j + ",\"age_buckets\":" + _fmt_kv_array_str(age_names, age_counts)
+    j = j + ",\"size_buckets\":" + _fmt_kv_array_str(size_names, size_counts)
+
+    j = j + ",\"oldest5\":["
+    let mut oi = 0
+    while oi < len(oldest_idx) {
+        if oi > 0 { j = j + "," }
+        let idx = oldest_idx[oi]
+        j = j + "{\"path\":\"" + _json_escape(e_paths[idx]) + "\""
+        j = j + ",\"mtime\":" + to_string(e_mtimes[idx])
+        j = j + ",\"mtime_iso\":\"" + _iso(e_mtimes[idx]) + "\""
+        j = j + ",\"size\":" + to_string(e_sizes[idx]) + "}"
+        oi = oi + 1
+    }
+    j = j + "],\"largest5\":["
+    let mut li = 0
+    while li < len(largest_idx) {
+        if li > 0 { j = j + "," }
+        let idx = largest_idx[li]
+        j = j + "{\"path\":\"" + _json_escape(e_paths[idx]) + "\""
+        j = j + ",\"size\":" + to_string(e_sizes[idx])
+        j = j + ",\"mtime\":" + to_string(e_mtimes[idx])
+        j = j + ",\"mtime_iso\":\"" + _iso(e_mtimes[idx]) + "\"}"
+        li = li + 1
+    }
+    j = j + "]}"
+    println(j)
+} else {
+    if !QUIET {
+        println("═══ BAK AUDIT — read-only enumeration of backup files (raw 71)")
+        println("  scanned=" + to_string(total_files) + "  total_bytes=" + to_string(total_bytes))
+        println("")
+        println("  per-root:")
+        let mut ri3 = 0
+        while ri3 < len(root_names) {
+            let suffix = if root_missing[ri3] == 1 { "  (MISSING)" } else { "" }
+            println("    " + root_names[ri3] + "  count=" + to_string(root_counts[ri3]) + "  bytes=" + to_string(root_bytes[ri3]) + suffix)
+            ri3 = ri3 + 1
+        }
+        println("")
+        println("  by-category:")
+        let mut ci2 = 0
+        while ci2 < len(cat_names) {
+            println("    " + cat_names[ci2] + ": " + to_string(cat_counts[ci2]))
+            ci2 = ci2 + 1
+        }
+        println("")
+        println("  by-age:")
+        let mut ai2 = 0
+        while ai2 < len(age_names) {
+            println("    " + age_names[ai2] + ": " + to_string(age_counts[ai2]))
+            ai2 = ai2 + 1
+        }
+        println("")
+        println("  by-size:")
+        let mut si2 = 0
+        while si2 < len(size_names) {
+            println("    " + size_names[si2] + ": " + to_string(size_counts[si2]))
+            si2 = si2 + 1
+        }
+        println("")
+        println("  top-5 oldest:")
+        let mut oi2 = 0
+        while oi2 < len(oldest_idx) {
+            let idx = oldest_idx[oi2]
+            println("    " + _iso(e_mtimes[idx]) + "  " + to_string(e_sizes[idx]) + "B  " + e_paths[idx])
+            oi2 = oi2 + 1
+        }
+        println("")
+        println("  top-5 largest:")
+        let mut li2 = 0
+        while li2 < len(largest_idx) {
+            let idx = largest_idx[li2]
+            println("    " + to_string(e_sizes[idx]) + "B  " + _iso(e_mtimes[idx]) + "  " + e_paths[idx])
+            li2 = li2 + 1
+        }
+        println("")
+    }
+}
+
+// sentinel always emitted (even with --quiet)
+let oldest_iso = if oldest_mt > 0 { _iso(oldest_mt) } else { "n/a" }
+let oldest_p_show = if len(oldest_path) > 0 { oldest_path } else { "n/a" }
+let largest_p_show = if len(largest_path) > 0 { largest_path } else { "n/a" }
+println("__BAK_AUDIT__ scanned=" + to_string(total_files) +
+        " total_bytes=" + to_string(total_bytes) +
+        " oldest=" + oldest_p_show + "(mtime=" + oldest_iso + ")" +
+        " largest=" + largest_p_show + "(size=" + to_string(largest_sz) + ")" +
+        " categories=" + to_string(len(cat_names)))
