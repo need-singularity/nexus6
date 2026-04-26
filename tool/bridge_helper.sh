@@ -60,6 +60,20 @@
 #   1/GC_PROBABILITY probability (default 1/100 → ~1% overhead). See
 #   state/omega_bridge_5_cache_gc.json.
 #
+# ω-bridge-12 (2026-04-26): per-bridge config table — replaces scattered per-bridge
+#   env exports with a single tracked TSV at state/bridge_config.tsv.
+#   Columns: bridge<TAB>ttl_s<TAB>min_interval_s<TAB>ua<TAB>accept   ('-' = unset)
+#   New env: BRIDGE_HELPER_CONFIG_FILE (override path; default $NEXUS_ROOT/state/bridge_config.tsv).
+#   Precedence chain (per-field):
+#     ttl / min_interval : CLI arg > config-file row > compiled default (3600 / 1)
+#     ua                 : BRIDGE_HELPER_UA env > config-file ua > unset
+#     accept             : BRIDGE_HELPER_HEADERS env > "accept: <config-row-accept>" > unset
+#   Backward-compat: when config file absent OR bridge row missing, behaviour is
+#   identical to ω-bridge-11. Per-bridge .hexa callers are unchanged. The config
+#   table is opt-in via the loader function — explicit args still win, so today's
+#   hardcoded TTLs in the .hexa files keep working until a future cycle simplifies
+#   them. See state/omega_bridge_12_config_table.json.
+#
 # ω-bridge-11 (2026-04-26): secrets / API-key support.
 #   New env: BRIDGE_HELPER_AUTH (full Authorization header value, e.g. "Bearer eyJ…").
 #   When set:
@@ -105,6 +119,8 @@ CACHE_GC_AGE_S="${BRIDGE_HELPER_CACHE_GC_AGE_S:-7200}"
 CACHE_MAX_BYTES="${BRIDGE_HELPER_CACHE_MAX_BYTES:-50000000}"
 GC_PROBABILITY="${BRIDGE_HELPER_GC_PROBABILITY:-100}"
 SCHEMA_FP_TSV="${BRIDGE_HELPER_SCHEMA_FP_TSV:-$NEXUS_ROOT/state/bridge_schema_fingerprint.tsv}"
+# ω-bridge-12: per-bridge config table (TTL / min_interval / UA / accept). See header.
+CONFIG_FILE="${BRIDGE_HELPER_CONFIG_FILE:-$NEXUS_ROOT/state/bridge_config.tsv}"
 
 _log() {
     if [ "$VERBOSE" = "1" ]; then
@@ -135,11 +151,57 @@ _url_hash() {
 
 _now_epoch() { date +%s; }
 
+# ω-bridge-12: lookup per-bridge config row from $CONFIG_FILE.
+# Sets globals: CFG_TTL CFG_MIN_INT CFG_UA CFG_ACCEPT (empty when absent or '-').
+# Silent no-op when config file missing or no row matches the bridge name.
+_load_bridge_config() {
+    CFG_TTL=""; CFG_MIN_INT=""; CFG_UA=""; CFG_ACCEPT=""
+    local bridge_name="${1:-}"
+    [ -z "$bridge_name" ] && return 0
+    [ -f "$CONFIG_FILE" ] || return 0
+    # awk: skip comments + blanks, match column 1 exactly, emit TAB-separated fields.
+    local row
+    row=$(awk -F'\t' -v b="$bridge_name" '
+        /^[[:space:]]*#/ {next}
+        NF == 0 {next}
+        $1 == b { printf "%s\t%s\t%s\t%s", $2, $3, $4, $5; exit }
+    ' "$CONFIG_FILE" 2>/dev/null)
+    [ -z "$row" ] && return 0
+    # parse the 4 TAB-separated fields
+    IFS=$'\t' read -r CFG_TTL CFG_MIN_INT CFG_UA CFG_ACCEPT <<< "$row"
+    # treat literal '-' as unset
+    [ "$CFG_TTL" = "-" ] && CFG_TTL=""
+    [ "$CFG_MIN_INT" = "-" ] && CFG_MIN_INT=""
+    [ "$CFG_UA" = "-" ] && CFG_UA=""
+    [ "$CFG_ACCEPT" = "-" ] && CFG_ACCEPT=""
+    _log "config: bridge=$bridge_name ttl=${CFG_TTL:-<unset>} min_int=${CFG_MIN_INT:-<unset>} ua=${CFG_UA:-<unset>} accept=${CFG_ACCEPT:-<unset>} (source=$CONFIG_FILE)"
+    return 0
+}
+
 cmd_fetch() {
     local bridge="$1"
     local url="$2"
-    local ttl="${3:-3600}"
-    local min_interval="${4:-1}"
+    # ω-bridge-12: precedence — CLI arg > config-file row > compiled default.
+    # Capture whether caller passed an explicit ttl/min_interval (positional 3/4).
+    local cli_ttl="${3:-}"
+    local cli_min_interval="${4:-}"
+    _load_bridge_config "$bridge"
+    local ttl="${cli_ttl:-${CFG_TTL:-3600}}"
+    local min_interval="${cli_min_interval:-${CFG_MIN_INT:-1}}"
+    if [ -n "$cli_ttl" ]; then
+        _log "ttl source=CLI val=$ttl"
+    elif [ -n "$CFG_TTL" ]; then
+        _log "ttl source=CONFIG val=$ttl"
+    else
+        _log "ttl source=DEFAULT val=$ttl"
+    fi
+    if [ -n "$cli_min_interval" ]; then
+        _log "min_interval source=CLI val=$min_interval"
+    elif [ -n "$CFG_MIN_INT" ]; then
+        _log "min_interval source=CONFIG val=$min_interval"
+    else
+        _log "min_interval source=DEFAULT val=$min_interval"
+    fi
 
     if [ -z "$bridge" ] || [ -z "$url" ]; then
         echo "bridge_helper: usage: fetch <bridge> <url> [ttl_sec] [min_interval_sec]" >&2
@@ -150,15 +212,28 @@ cmd_fetch() {
 
     # ω-bridge-4: assemble caller-supplied extras (UA / headers / per-call timeout) once.
     # Empty arrays ⇒ no behavioural change; backward-compat with ω-bridge-3 callers.
+    # ω-bridge-12: fall back to config-table UA/accept when env vars unset.
     local -a extra_args=()
-    if [ -n "${BRIDGE_HELPER_UA:-}" ]; then
-        extra_args+=(-A "$BRIDGE_HELPER_UA")
-        _log "UA set: $BRIDGE_HELPER_UA"
+    local effective_ua="${BRIDGE_HELPER_UA:-}"
+    local ua_source=""
+    if [ -n "$effective_ua" ]; then
+        ua_source="ENV"
+    elif [ -n "${CFG_UA:-}" ]; then
+        effective_ua="$CFG_UA"
+        ua_source="CONFIG"
+    fi
+    if [ -n "$effective_ua" ]; then
+        extra_args+=(-A "$effective_ua")
+        _log "UA set (source=$ua_source): $effective_ua"
     fi
     if [ -n "${BRIDGE_HELPER_HEADERS:-}" ]; then
         while IFS= read -r hdr; do
-            [ -n "$hdr" ] && extra_args+=(-H "$hdr") && _log "header set: $hdr"
+            [ -n "$hdr" ] && extra_args+=(-H "$hdr") && _log "header set (source=ENV): $hdr"
         done <<< "$BRIDGE_HELPER_HEADERS"
+    elif [ -n "${CFG_ACCEPT:-}" ]; then
+        # config-table accept value → synthesize "accept: <value>" header.
+        extra_args+=(-H "accept: $CFG_ACCEPT")
+        _log "header set (source=CONFIG): accept: $CFG_ACCEPT"
     fi
     local effective_max_time="$MAX_TIME"
     if [ -n "${BRIDGE_HELPER_TIMEOUT:-}" ]; then

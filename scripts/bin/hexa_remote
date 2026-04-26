@@ -14,6 +14,14 @@
 #   HEXA_REMOTE_NO_SYNC          skip rsync (assume tree already fresh)
 #   HEXA_REMOTE_CONNECT_TIMEOUT  ssh ConnectTimeout seconds (default: 8)
 #   HEXA_REMOTE_PROBE_RETRY      probe retry count on fail (default: 1)
+#   HEXA_REMOTE_PSI_THRESHOLD            global PSI*100 reject ceiling (default: 80 → 8000)
+#   HEXA_REMOTE_PSI_THRESHOLD_<HOST>     per-host override (HOST uppercased, e.g.
+#                                        HEXA_REMOTE_PSI_THRESHOLD_HETZNER=95,
+#                                        HEXA_REMOTE_PSI_THRESHOLD_UBU1=70). Lookup
+#                                        precedence: per-host → global → 80. Added by
+#                                        ω-network-4 (2026-04-26) so operators can
+#                                        calibrate without re-deploying once the PSI log
+#                                        accumulates per-host distribution.
 #
 # Exit 64 → caller should fall back to local (cwd not mappable).
 
@@ -131,25 +139,51 @@ _probe_host() {
                 # outcome ∈ {reject, accept}. reason: human-readable.
                 # ω-network-3 next round: 누적 분포 기반 per-host 임계값 제안.
                 # Disable: HEXA_REMOTE_PSI_LOG_OFF=1.
-                local _psi_threshold="${HEXA_REMOTE_PSI_THRESHOLD:-80}"
+                # ω-network-4 (2026-04-26): per-host env override —
+                # HEXA_REMOTE_PSI_THRESHOLD_<HOST_UPPER> (e.g.
+                # HEXA_REMOTE_PSI_THRESHOLD_HETZNER=95) wins over the global
+                # HEXA_REMOTE_PSI_THRESHOLD; both fall back to 80. Allows operators
+                # to calibrate without re-deploying once the analyzer suggests
+                # per-host values from the accumulated log. _psi_src is recorded in
+                # the PSI emit row so the effective env source is debuggable.
+                local _h_upper _psi_threshold _psi_src
+                _h_upper="$(printf '%s' "$cand" | tr '[:lower:]' '[:upper:]' | tr -c '[:alnum:]_' '_')"
+                local _per_host_var="HEXA_REMOTE_PSI_THRESHOLD_${_h_upper}"
+                local _per_host_val="${!_per_host_var:-}"
+                if [ -n "$_per_host_val" ]; then
+                    _psi_threshold="$_per_host_val"
+                    _psi_src="$_per_host_var"
+                elif [ -n "${HEXA_REMOTE_PSI_THRESHOLD:-}" ]; then
+                    _psi_threshold="$HEXA_REMOTE_PSI_THRESHOLD"
+                    _psi_src="HEXA_REMOTE_PSI_THRESHOLD"
+                else
+                    _psi_threshold="80"
+                    _psi_src="default80"
+                fi
+                local _psi_threshold_int
+                _psi_threshold_int="$(awk -v t="$_psi_threshold" 'BEGIN{printf "%d", t*100}')"
                 local _psi_log="${HEXA_REMOTE_PSI_LOG:-/tmp/hexa_remote_psi.log}"
                 local _psi_log_on="${HEXA_REMOTE_PSI_LOG_OFF:-0}"
                 _psi_emit() {
                     [ "$_psi_log_on" = "1" ] && return 0
                     local _ts
                     _ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo 'unknown')"
-                    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-                        "$_ts" "$cand" "$psi" "$_psi_threshold" "$1" "$2" \
+                    # ω-network-4: append _psi_src as 7th column so the effective
+                    # env source ("HEXA_REMOTE_PSI_THRESHOLD_HETZNER" |
+                    # "HEXA_REMOTE_PSI_THRESHOLD" | "default80") is recoverable per
+                    # row without re-deriving from environment state.
+                    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                        "$_ts" "$cand" "$psi" "$_psi_threshold" "$1" "$2" "$_psi_src" \
                         >> "$_psi_log" 2>/dev/null || true
                 }
-                if [ "$_psi_int" -gt 8000 ] 2>/dev/null; then
-                    _psi_emit "reject" "PSI avg10=$psi > $_psi_threshold (R5.4)"
-                    echo "hexa_remote: host=$cand PSI avg10=$psi > 80 (R5.4 ω-hexa-5) — skipping saturated host" >&2
-                    reason="PSI saturated (avg10=$psi > 80)"
+                if [ "$_psi_int" -gt "$_psi_threshold_int" ] 2>/dev/null; then
+                    _psi_emit "reject" "PSI avg10=$psi > $_psi_threshold (R5.4 src=$_psi_src)"
+                    echo "hexa_remote: host=$cand PSI avg10=$psi > $_psi_threshold (R5.4 ω-hexa-5 src=$_psi_src) — skipping saturated host" >&2
+                    reason="PSI saturated (avg10=$psi > $_psi_threshold)"
                     rc=1
                     break
                 else
-                    _psi_emit "accept" "PSI avg10=$psi <= $_psi_threshold"
+                    _psi_emit "accept" "PSI avg10=$psi <= $_psi_threshold (src=$_psi_src)"
                 fi
             fi
             # Accept if RAM check disabled OR avail >= threshold.
