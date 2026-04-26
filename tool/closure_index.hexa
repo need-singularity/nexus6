@@ -1,0 +1,388 @@
+// tool/closure_index.hexa — ω-meta-1: indexer for PSC-loop closure JSONs
+//
+// raw 9 hexa-only-suffix (sweeper-safe .hexa). The PSC-loop produces closure
+// JSONs at /Users/ghost/core/anima/state/omega_*.json — they are untracked,
+// scattered, and lack a navigable index. This tool scans that directory (or
+// a custom one) and emits either a human-readable table or a JSON array.
+//
+// @tool(slug="closure_index", desc="ω-meta-1 indexer for omega_*.json PSC-loop closure JSONs")
+// @usage(hexa run tool/closure_index.hexa [--json] [--filter PATTERN] [--namespace NS] [--anima-state DIR] [--quiet] [--help])
+// @sentinel(__CLOSURE_INDEX__ scanned=N indexed=I skipped=S)
+//
+// flags:
+//   --json                emit JSON array (one object per closure)
+//   --filter PATTERN      substring-match (case-insensitive) against cycle/axis/title
+//   --namespace NS        filter by axis namespace prefix (e.g. bridge, stdlib, runner, network)
+//   --anima-state DIR     override scan directory (default /Users/ghost/core/anima/state)
+//   --quiet               sentinel only, suppress table
+//   --help, -h            usage
+//
+// table mode (default): one row per closure, sorted by timestamp DESC
+//   cycle | axis | title | timestamp | size_bytes
+//
+// json mode: array of {cycle, axis, title, timestamp, path, size_bytes, summary_first_120_chars}
+//
+// robustness:
+//   - empty dir       → __CLOSURE_INDEX__ scanned=0 indexed=0 skipped=0   + EMPTY message
+//   - dir missing     → __CLOSURE_INDEX__ SKIP reason=dir_missing path=PATH
+//   - perm denied     → skip + warn
+//   - mid-write race  → skip + warn (parallel sessions append concurrently)
+//   - malformed JSON  → skip + warn
+//
+// raw compliance: 9 hexa-suffix / 71 read-only-on-anima / 73 admissibility / 80 sentinel
+//
+// origin: ω-meta-1 PSC-loop cycle (2026-04-26)
+//
+// @allow-bare-exec
+// @no-lock-needed
+// @no-sandbox
+
+let DEFAULT_ANIMA_STATE = "/Users/ghost/core/anima/state"
+
+// ─── argv parsing ────────────────────────────────────────────────────────────
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+let argv = args()
+let mut json_mode = false
+let mut quiet = false
+let mut filter_pat = ""
+let mut namespace_pat = ""
+let mut scan_dir = DEFAULT_ANIMA_STATE
+let mut help = false
+let mut i = 2  // skip [0]=interp [1]=script
+while i < argv.len() {
+    let a = _str(argv[i])
+    if a == "--json" { json_mode = true }
+    else if a == "--quiet" { quiet = true }
+    else if a == "--help" || a == "-h" { help = true }
+    else if a == "--filter" && i + 1 < argv.len() {
+        filter_pat = _str(argv[i+1])
+        i = i + 1
+    }
+    else if a == "--namespace" && i + 1 < argv.len() {
+        namespace_pat = _str(argv[i+1])
+        i = i + 1
+    }
+    else if a == "--anima-state" && i + 1 < argv.len() {
+        scan_dir = _str(argv[i+1])
+        i = i + 1
+    }
+    i = i + 1
+}
+
+if help {
+    println("closure_index — ω-meta-1 indexer for PSC-loop closure JSONs")
+    println("")
+    println("usage:")
+    println("  hexa run tool/closure_index.hexa [flags]")
+    println("")
+    println("flags:")
+    println("  --json                emit JSON array (one object per closure)")
+    println("  --filter PATTERN      case-insensitive substring filter against cycle/axis/title")
+    println("  --namespace NS        filter by axis namespace prefix (bridge, stdlib, runner, network, ...)")
+    println("  --anima-state DIR     override scan directory (default " + DEFAULT_ANIMA_STATE + ")")
+    println("  --quiet               sentinel only")
+    println("  --help, -h            this message")
+    println("")
+    println("default mode: human table sorted by timestamp DESC")
+    println("  cycle | axis | title | timestamp | size_bytes")
+    println("")
+    println("sentinel: __CLOSURE_INDEX__ scanned=N indexed=I skipped=S")
+    return
+}
+
+// ─── pre-flight: dir existence ───────────────────────────────────────────────
+let dir_check = to_string(exec("[ -d '" + scan_dir + "' ] && echo Y || echo N")).trim()
+if dir_check != "Y" {
+    println("__CLOSURE_INDEX__ SKIP reason=dir_missing path=" + scan_dir)
+    return
+}
+
+// ─── scan + parse via single python3 invocation ──────────────────────────────
+// We shell-out to python3 because hexa stage1 has no native JSON parser. The
+// python script:
+//   1. globs scan_dir/omega_*.json
+//   2. for each file, attempts json.load (skip on failure / mid-write race)
+//   3. extracts cycle, axis, title, timestamp, summary, size_bytes, path
+//   4. emits one TAB-separated record per indexed file (newlines in fields
+//      stripped to spaces). Sentinel-style header at end with counts.
+//
+// Robustness: file sizes, perm errors, mid-write truncations all caught by
+// the per-file try/except — we never crash the whole scan over one bad file.
+
+let py = "import json, os, glob, sys\n" +
+    "scan_dir = '" + scan_dir.replace("'", "") + "'\n" +
+    "scanned = 0\n" +
+    "skipped = 0\n" +
+    "rows = []\n" +
+    "warnings = []\n" +
+    "for path in sorted(glob.glob(os.path.join(scan_dir, 'omega_*.json'))):\n" +
+    "    scanned += 1\n" +
+    "    try:\n" +
+    "        st = os.stat(path)\n" +
+    "        size_bytes = st.st_size\n" +
+    "        mtime_iso = ''\n" +
+    "        try:\n" +
+    "            import datetime as _dt\n" +
+    "            mtime_iso = _dt.datetime.fromtimestamp(st.st_mtime, _dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')\n" +
+    "        except Exception:\n" +
+    "            mtime_iso = ''\n" +
+    "    except Exception as e:\n" +
+    "        warnings.append('warn: skip ' + path + ' (stat failed: ' + str(e)[:60] + ')')\n" +
+    "        skipped += 1\n" +
+    "        continue\n" +
+    "    try:\n" +
+    "        with open(path, 'r', encoding='utf-8') as f:\n" +
+    "            d = json.load(f)\n" +
+    "    except Exception:\n" +
+    "        warnings.append('warn: skip ' + path + ' (parse failed)')\n" +
+    "        skipped += 1\n" +
+    "        continue\n" +
+    "    if not isinstance(d, dict):\n" +
+    "        warnings.append('warn: skip ' + path + ' (not an object)')\n" +
+    "        skipped += 1\n" +
+    "        continue\n" +
+    "    cycle = str(d.get('cycle') or '')\n" +
+    "    axis = str(d.get('axis') or d.get('scope') or '')\n" +
+    "    title = str(d.get('title') or d.get('headline') or d.get('approach') or '')\n" +
+    "    summary = str(d.get('summary') or d.get('verdict') or '')\n" +
+    "    timestamp = str(d.get('timestamp') or '')\n" +
+    "    if not timestamp:\n" +
+    "        timestamp = mtime_iso  # fall back to file mtime\n" +
+    "    if not cycle:\n" +
+    "        # derive from filename: omega_<rest>.json\n" +
+    "        base = os.path.basename(path)\n" +
+    "        if base.startswith('omega_') and base.endswith('.json'):\n" +
+    "            cycle = base[:-5]\n" +
+    "    def clean(s, n=None):\n" +
+    "        s = s.replace('\\t', ' ').replace('\\n', ' ').replace('\\r', ' ')\n" +
+    "        s = ' '.join(s.split())\n" +
+    "        if n is not None and len(s) > n:\n" +
+    "            s = s[:n]\n" +
+    "        return s\n" +
+    "    cycle_c = clean(cycle, 60)\n" +
+    "    axis_c = clean(axis, 60)\n" +
+    "    title_c = clean(title, 100)\n" +
+    "    summary_c = clean(summary, 120)\n" +
+    "    timestamp_c = clean(timestamp, 32)\n" +
+    "    rows.append((cycle_c, axis_c, title_c, timestamp_c, str(size_bytes), path, summary_c))\n" +
+    "# emit header sentinel + warnings to stderr\n" +
+    "for w in warnings:\n" +
+    "    sys.stderr.write(w + '\\n')\n" +
+    "# emit data rows to stdout\n" +
+    "for r in rows:\n" +
+    "    sys.stdout.write('R\\t' + '\\t'.join(r) + '\\n')\n" +
+    "sys.stdout.write('S\\t' + str(scanned) + '\\t' + str(skipped) + '\\n')\n"
+
+// Write py to a tmp file (avoid escaping nightmare)
+let pid_tag = to_string(exec("echo $$")).trim()
+let py_tmp = "/tmp/closure_index_" + pid_tag + ".py"
+let stdout_capture = "/tmp/closure_index_" + pid_tag + "_stdout.txt"
+let stderr_capture = "/tmp/closure_index_" + pid_tag + "_stderr.txt"
+write_file(py_tmp, py)
+let _ = exec("python3 " + py_tmp + " > " + stdout_capture + " 2> " + stderr_capture)
+let _ = exec("rm -f " + py_tmp)
+
+let data_raw = to_string(read_file(stdout_capture))
+let warn_raw = to_string(read_file(stderr_capture))
+let _ = exec("rm -f " + stdout_capture + " " + stderr_capture)
+
+// Forward warnings to stderr unconditionally (they are part of the contract).
+let warn_lines = split(warn_raw, "\n")
+let mut wi = 0
+while wi < len(warn_lines) {
+    let wl = warn_lines[wi]
+    if len(wl.trim()) > 0 { eprintln(wl) }
+    wi = wi + 1
+}
+
+// ─── parse data lines ────────────────────────────────────────────────────────
+// Format:
+//   R<TAB>cycle<TAB>axis<TAB>title<TAB>timestamp<TAB>size<TAB>path<TAB>summary
+//   S<TAB>scanned<TAB>skipped
+let data_lines = split(data_raw, "\n")
+let mut rows = []   // each row = [cycle, axis, title, timestamp, size, path, summary]
+let mut scanned_str = "0"
+let mut skipped_str = "0"
+let mut di = 0
+while di < len(data_lines) {
+    let dl = data_lines[di]
+    if len(dl) == 0 { di = di + 1; continue }
+    let parts = split(dl, "\t")
+    if len(parts) >= 1 && parts[0] == "S" && len(parts) >= 3 {
+        scanned_str = parts[1]
+        skipped_str = parts[2]
+    } else if len(parts) >= 1 && parts[0] == "R" && len(parts) >= 8 {
+        let row = [parts[1], parts[2], parts[3], parts[4], parts[5], parts[6], parts[7]]
+        rows.push(row)
+    }
+    di = di + 1
+}
+
+// ─── filter (case-insensitive substring on cycle|axis|title) ─────────────────
+// Use shell tr for reliable lowercasing (avoids fragile ascii arith in stage1).
+fn _lcase(s: string) -> string {
+    if len(s) == 0 { return "" }
+    let escaped = s.replace("'", "")
+    return to_string(exec("printf %s '" + escaped + "' | tr '[:upper:]' '[:lower:]'")).trim()
+}
+
+let filter_lc = _lcase(filter_pat)
+let ns_lc = _lcase(namespace_pat)
+
+let mut filtered = []
+let mut ri = 0
+while ri < len(rows) {
+    let r = rows[ri]
+    let cycle = r[0]
+    let axis = r[1]
+    let title = r[2]
+    let mut keep = true
+    if len(filter_lc) > 0 {
+        let hay = _lcase(cycle + " " + axis + " " + title)
+        if !hay.contains(filter_lc) { keep = false }
+    }
+    if keep && len(ns_lc) > 0 {
+        // namespace match: axis must start with ns OR contain ns/ token OR cycle contains ns
+        // Heuristic: closures use axis like "bridge / hexa-sim ..." or
+        // "bridge / hexa-sim live-data infrastructure"; cycle is like "omega_bridge_14".
+        // Match if cycle (lowercased) contains "omega_<ns>" or "omega-<ns>" OR
+        // the axis (lowercased) starts with the ns word.
+        let cycle_lc = _lcase(cycle)
+        let axis_lc = _lcase(axis)
+        let token_a = "omega_" + ns_lc
+        let token_b = "omega-" + ns_lc
+        let mut hit = false
+        if cycle_lc.contains(token_a) { hit = true }
+        if cycle_lc.contains(token_b) { hit = true }
+        // axis namespace prefix: starts with "<ns>" or "<ns> /" or "<ns>/"
+        if !hit {
+            if axis_lc == ns_lc { hit = true }
+            else if len(axis_lc) > len(ns_lc) {
+                let head = axis_lc.substring(0, len(ns_lc))
+                if head == ns_lc {
+                    let next = axis_lc.substring(len(ns_lc), len(ns_lc)+1)
+                    if next == " " || next == "/" || next == "-" || next == "_" { hit = true }
+                }
+            }
+        }
+        if !hit { keep = false }
+    }
+    if keep { filtered.push(r) }
+    ri = ri + 1
+}
+
+// ─── sort by timestamp DESC (string compare on ISO-8601 = chronological) ─────
+// stage1 hexa has no in-place sort that takes a comparator on arrays-of-arrays
+// reliably. We delegate to shell sort: emit rows TAB-joined with timestamp first,
+// sort -r, then re-split.
+let mut blob = ""
+let mut bi = 0
+while bi < len(filtered) {
+    let r = filtered[bi]
+    // ts<TAB>cycle<TAB>axis<TAB>title<TAB>size<TAB>path<TAB>summary
+    blob = blob + r[3] + "\t" + r[0] + "\t" + r[1] + "\t" + r[2] + "\t" + r[4] + "\t" + r[5] + "\t" + r[6] + "\n"
+    bi = bi + 1
+}
+let sort_input_path = "/tmp/closure_index_sort_in.txt"
+let sort_output_path = "/tmp/closure_index_sort_out.txt"
+write_file(sort_input_path, blob)
+let _ = exec("LC_ALL=C sort -r " + sort_input_path + " > " + sort_output_path)
+let sorted_blob = to_string(read_file(sort_output_path))
+let _ = exec("rm -f " + sort_input_path + " " + sort_output_path)
+
+let mut sorted_rows = []
+let sb_lines = split(sorted_blob, "\n")
+let mut sli = 0
+while sli < len(sb_lines) {
+    let sl = sb_lines[sli]
+    if len(sl) == 0 { sli = sli + 1; continue }
+    let p = split(sl, "\t")
+    if len(p) >= 7 {
+        // re-order back to [cycle, axis, title, timestamp, size, path, summary]
+        sorted_rows.push([p[1], p[2], p[3], p[0], p[4], p[5], p[6]])
+    }
+    sli = sli + 1
+}
+
+let indexed = len(sorted_rows)
+let scanned_int = scanned_str
+let skipped_int = skipped_str
+
+// ─── emit ────────────────────────────────────────────────────────────────────
+fn _pad_right(s: string, n: i64) -> string {
+    if len(s) >= n { return s }
+    let mut out = s
+    let mut k = len(s)
+    while k < n {
+        out = out + " "
+        k = k + 1
+    }
+    return out
+}
+
+fn _truncate(s: string, n: i64) -> string {
+    if len(s) <= n { return s }
+    if n < 4 { return s.substring(0, n) }
+    return s.substring(0, n-1) + "…"
+}
+
+fn _json_escape(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", " ")
+    r = r.replace("\r", " ")
+    r = r.replace("\t", " ")
+    return r
+}
+
+if !quiet {
+    if json_mode {
+        println("[")
+        let mut k = 0
+        while k < len(sorted_rows) {
+            let r = sorted_rows[k]
+            let comma = if k + 1 < len(sorted_rows) { "," } else { "" }
+            let obj = "  {" +
+                "\"cycle\":\"" + _json_escape(r[0]) + "\"," +
+                "\"axis\":\"" + _json_escape(r[1]) + "\"," +
+                "\"title\":\"" + _json_escape(r[2]) + "\"," +
+                "\"timestamp\":\"" + _json_escape(r[3]) + "\"," +
+                "\"size_bytes\":" + r[4] + "," +
+                "\"path\":\"" + _json_escape(r[5]) + "\"," +
+                "\"summary_first_120_chars\":\"" + _json_escape(r[6]) + "\"" +
+                "}" + comma
+            println(obj)
+            k = k + 1
+        }
+        println("]")
+    } else {
+        if len(sorted_rows) == 0 {
+            println("EMPTY: no closures matched (scan_dir=" + scan_dir + (if len(filter_pat) > 0 { ", filter=" + filter_pat } else { "" }) + (if len(namespace_pat) > 0 { ", namespace=" + namespace_pat } else { "" }) + ")")
+        } else {
+            // Header
+            println(_pad_right("CYCLE", 32) + "  " + _pad_right("AXIS", 38) + "  " + _pad_right("TITLE", 50) + "  " + _pad_right("TIMESTAMP", 22) + "  SIZE")
+            println(_pad_right("-----", 32) + "  " + _pad_right("----", 38) + "  " + _pad_right("-----", 50) + "  " + _pad_right("---------", 22) + "  ----")
+            let mut k = 0
+            while k < len(sorted_rows) {
+                let r = sorted_rows[k]
+                println(
+                    _pad_right(_truncate(r[0], 32), 32) + "  " +
+                    _pad_right(_truncate(r[1], 38), 38) + "  " +
+                    _pad_right(_truncate(r[2], 50), 50) + "  " +
+                    _pad_right(_truncate(r[3], 22), 22) + "  " +
+                    r[4]
+                )
+                k = k + 1
+            }
+        }
+    }
+}
+
+// ─── sentinel (raw 80) ───────────────────────────────────────────────────────
+println("__CLOSURE_INDEX__ scanned=" + scanned_int + " indexed=" + to_string(indexed) + " skipped=" + skipped_int)
