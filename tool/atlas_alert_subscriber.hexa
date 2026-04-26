@@ -24,6 +24,9 @@
 //   HEXA_ARGV='--timeline /tmp/fixture.jsonl' hexa run tool/atlas_alert_subscriber.hexa
 //   HEXA_ARGV='--no-history' hexa run tool/atlas_alert_subscriber.hexa            (ω-bridge-21)
 //   ATLAS_ALERT_HISTORY_TSV=/tmp/foo.tsv hexa run tool/atlas_alert_subscriber.hexa (ω-bridge-21)
+//   ATLAS_ALERT_HISTORY_JSONL=/tmp/foo.jsonl hexa run tool/atlas_alert_subscriber.hexa (ω-bridge-23)
+//   HEXA_ARGV='--cooldown-minutes 10' hexa run tool/atlas_alert_subscriber.hexa  (ω-bridge-24)
+//   ATLAS_ALERT_COOLDOWN=10 hexa run tool/atlas_alert_subscriber.hexa             (ω-bridge-24)
 //   HEXA_ARGV='--quiet' hexa run tool/atlas_alert_subscriber.hexa
 //   HEXA_ARGV='--help' hexa run tool/atlas_alert_subscriber.hexa
 //
@@ -34,8 +37,10 @@
 //   __ATLAS_ALERT__ FIRED rule=insufficient_ratio ratio=R threshold=T last_n=N sampled=S
 //   __ATLAS_ALERT__ FIRED rule=consecutive_warn  streak=K observed=K last_n=N sampled=S       (ω-bridge-19)
 //   __ATLAS_ALERT__ FIRED rule=recent_warn_ratio ratio=R threshold=T window_minutes=M sampled=S (ω-bridge-19)
+//   __ATLAS_ALERT__ SUPPRESSED rule=R reason=cooldown last_fired_ago_min=X cooldown_minutes=M (ω-bridge-24)
 //   __ATLAS_ALERT__ PASS sampled=S rules_evaluated=R
 //   __ATLAS_ALERT__ HISTORY_WRITE_FAIL path=PATH reason=...                            (ω-bridge-21)
+//   __ATLAS_ALERT__ HISTORY_WRITE_FAIL path=PATH reason=jsonl_append_failed             (ω-bridge-23)
 //
 // rules (configurable via HEXA_ARGV):
 //   --last N                          inspect last N matching rows                     (default 10)
@@ -44,6 +49,7 @@
 //   --streak-threshold K              fire if last K matching rows are ALL WARN        (default 0 = disabled, ω-bridge-19)
 //   --window-minutes M                fire if WARN-ratio over last M minutes (by ts)
 //                                     >= --warn-threshold                              (default 0 = disabled, ω-bridge-19)
+//   --cooldown-minutes M              suppress same-rule re-firings within M minutes   (default 0 = disabled, ω-bridge-24)
 //   --timeline PATH                   override timeline path (testing fixtures)
 //   --no-history                      do NOT append firing events to atlas_alert_history.tsv (ω-bridge-21)
 //   --quiet                           sentinel-only output
@@ -55,17 +61,22 @@
 //         /Users/ghost/core/anima/state/omega_bridge_17_*.json
 //         /Users/ghost/core/anima/state/omega_bridge_19_*.json (time-shape rules)
 //         /Users/ghost/core/anima/state/omega_bridge_21_*.json (history persistence)
+//         /Users/ghost/core/anima/state/omega_bridge_23_24_*.json (JSONL sibling + cooldown dedup)
 
 let NEXUS = "/Users/ghost/core/nexus"
 let DEFAULT_TIMELINE = NEXUS + "/state/atlas_health_timeline.jsonl"
 let DEFAULT_HISTORY_TSV = NEXUS + "/state/atlas_alert_history.tsv"   // ω-bridge-21
+let DEFAULT_HISTORY_JSONL = NEXUS + "/state/atlas_alert_history.jsonl"  // ω-bridge-23
 let HISTORY_HEADER = "# atlas_alert_history.tsv — alert firing event log (raw 77 append-only)\n# ts\trule\tratio\tthreshold\tlast_n\tsampled\textra\n"  // ω-bridge-21
 let DEFAULT_LAST = "10"
 let DEFAULT_WARN_THR = "0.4"
 let DEFAULT_INSUF_THR = "0.6"
 let DEFAULT_STREAK = "0"        // ω-bridge-19 — 0 = disabled (existing-behaviour preserved)
 let DEFAULT_WINDOW_MIN = "0"    // ω-bridge-19 — 0 = disabled
+let DEFAULT_COOLDOWN_MIN = "0"  // ω-bridge-24 — 0 = disabled (full backward compat)
+let DEDUP_TAIL_K = "20"         // ω-bridge-24 — perf bound on TSV tail-scan for dedup
 let TARGET_SCOPE = "bridge_anomaly"
+let ALERT_SCOPE = "atlas_alert"  // ω-bridge-23 — discriminator for our own JSONL rows
 
 let mut QUIET = false
 
@@ -91,6 +102,7 @@ let mut insuf_thr_str = DEFAULT_INSUF_THR
 let mut streak_str = DEFAULT_STREAK            // ω-bridge-19
 let mut window_min_str = DEFAULT_WINDOW_MIN    // ω-bridge-19
 let mut write_history = true                   // ω-bridge-21 — default ON
+let mut cooldown_str = DEFAULT_COOLDOWN_MIN    // ω-bridge-24
 let mut i = 0
 while i < len(args) {
     let a = args[i]
@@ -102,18 +114,22 @@ while i < len(args) {
     if a == "--insufficient-threshold" && i + 1 < len(args) { insuf_thr_str = args[i+1]; i = i + 1 }
     if a == "--streak-threshold" && i + 1 < len(args) { streak_str = args[i+1]; i = i + 1 }
     if a == "--window-minutes" && i + 1 < len(args) { window_min_str = args[i+1]; i = i + 1 }
+    if a == "--cooldown-minutes" && i + 1 < len(args) { cooldown_str = args[i+1]; i = i + 1 }  // ω-bridge-24
     if a == "--help" || a == "-h" {
-        println("usage: HEXA_ARGV='[--timeline PATH] [--last N] [--warn-threshold R] [--insufficient-threshold R] [--streak-threshold K] [--window-minutes M] [--no-history] [--quiet]' hexa run tool/atlas_alert_subscriber.hexa")
+        println("usage: HEXA_ARGV='[--timeline PATH] [--last N] [--warn-threshold R] [--insufficient-threshold R] [--streak-threshold K] [--window-minutes M] [--cooldown-minutes M] [--no-history] [--quiet]' hexa run tool/atlas_alert_subscriber.hexa")
         println("  default: scan state/atlas_health_timeline.jsonl, last 10 bridge_anomaly rows")
         println("  --last N                       inspect last N matching rows  (default 10)")
         println("  --warn-threshold R             fire if WARN/N >= R           (default 0.4)")
         println("  --insufficient-threshold R     fire if INSUFFICIENT_DATA/N >= R (default 0.6)")
         println("  --streak-threshold K           fire consecutive_warn if last K matching rows are ALL WARN (default 0 = off)")
         println("  --window-minutes M             fire recent_warn_ratio if WARN-ratio over last M minutes (by ts) >= --warn-threshold (default 0 = off)")
+        println("  --cooldown-minutes M           suppress same-rule re-firings within M minutes (default 0 = off, ω-bridge-24)")
         println("  --timeline PATH                override timeline path (fixtures)")
         println("  --no-history                   skip appending firing events to atlas_alert_history.tsv (default: write)")
         println("  --quiet                        emit __ATLAS_ALERT__ sentinel only")
-        println("env: ATLAS_ALERT_HISTORY_TSV=PATH  override history TSV path (default: state/atlas_alert_history.tsv)")
+        println("env: ATLAS_ALERT_HISTORY_TSV=PATH    override history TSV path (default: state/atlas_alert_history.tsv)")
+        println("env: ATLAS_ALERT_HISTORY_JSONL=PATH  override history JSONL path (default: state/atlas_alert_history.jsonl, ω-bridge-23)")
+        println("env: ATLAS_ALERT_COOLDOWN=M          cooldown minutes (overrides --cooldown-minutes, ω-bridge-24)")
         return
     }
     i = i + 1
@@ -123,6 +139,18 @@ while i < len(args) {
 let env_history = to_string(exec("printf '%s' \"${ATLAS_ALERT_HISTORY_TSV:-}\"")).trim()
 let mut history_path = DEFAULT_HISTORY_TSV
 if len(env_history) > 0 { history_path = env_history }
+
+// ω-bridge-23 — resolve history JSONL sibling path (env override > default)
+let env_history_jsonl = to_string(exec("printf '%s' \"${ATLAS_ALERT_HISTORY_JSONL:-}\"")).trim()
+let mut history_jsonl_path = DEFAULT_HISTORY_JSONL
+if len(env_history_jsonl) > 0 { history_jsonl_path = env_history_jsonl }
+
+// ω-bridge-24 — resolve cooldown minutes (env override > flag > default 0).
+// Negative values clamped to 0; non-numeric strings collapse to 0 via awk's
+// implicit numeric coercion. cooldown_min is the canonical value used below.
+let env_cooldown = to_string(exec("printf '%s' \"${ATLAS_ALERT_COOLDOWN:-}\"")).trim()
+if len(env_cooldown) > 0 { cooldown_str = env_cooldown }
+let cooldown_min = to_string(exec("awk 'BEGIN { v = (\"" + cooldown_str + "\"+0); if (v < 0) v = 0; print v }' </dev/null")).trim()
 
 // ─── pre-flight ──────────────────────────────────────────────────────────────
 if !file_exists(timeline_path) {
@@ -226,13 +254,26 @@ let mut fired = []
 //   ts<TAB>rule<TAB>ratio<TAB>threshold<TAB>last_n<TAB>sampled<TAB>extra
 // The ts is filled in at write time (system clock at emit, not row ts).
 let mut event_rows = []
+// ω-bridge-23 — parallel JSONL row fragments (sans ts; ts is injected at write
+// time alongside the TSV ts so they line up exactly). Each entry is the inner
+// body of the JSON object, ready to be wrapped as
+//   {"ts":"...","scope":"atlas_alert",<body>}
+let mut event_jsonl_bodies = []
+// ω-bridge-24 — parallel rule-name list for cooldown dedup. Indices stay in
+// lockstep with `fired` / `event_rows` / `event_jsonl_bodies` so post-hoc
+// suppression can drop matched indices uniformly across all four arrays.
+let mut fired_rules = []
 if warn_cmp == "1" {
     fired.push("__ATLAS_ALERT__ FIRED rule=warn_ratio ratio=" + warn_ratio_s + " threshold=" + warn_thr_str + " last_n=" + last_str + " sampled=" + to_string(sampled))
     event_rows.push("warn_ratio\t" + warn_ratio_s + "\t" + warn_thr_str + "\t" + last_str + "\t" + to_string(sampled) + "\t")
+    event_jsonl_bodies.push("\"rule\":\"warn_ratio\",\"ratio\":" + warn_ratio_s + ",\"threshold\":" + warn_thr_str + ",\"last_n\":" + last_str + ",\"sampled\":" + to_string(sampled) + ",\"extra\":\"\"")
+    fired_rules.push("warn_ratio")
 }
 if insuf_cmp == "1" {
     fired.push("__ATLAS_ALERT__ FIRED rule=insufficient_ratio ratio=" + insuf_ratio_s + " threshold=" + insuf_thr_str + " last_n=" + last_str + " sampled=" + to_string(sampled))
     event_rows.push("insufficient_ratio\t" + insuf_ratio_s + "\t" + insuf_thr_str + "\t" + last_str + "\t" + to_string(sampled) + "\t")
+    event_jsonl_bodies.push("\"rule\":\"insufficient_ratio\",\"ratio\":" + insuf_ratio_s + ",\"threshold\":" + insuf_thr_str + ",\"last_n\":" + last_str + ",\"sampled\":" + to_string(sampled) + ",\"extra\":\"\"")
+    fired_rules.push("insufficient_ratio")
 }
 
 // ─── ω-bridge-19: consecutive WARN streak (time-shape rule, hot-anomaly) ─────
@@ -261,6 +302,9 @@ if streak_k != "0" {
         fired.push("__ATLAS_ALERT__ FIRED rule=consecutive_warn streak=" + streak_k + " observed=" + to_string(observed) + " last_n=" + last_str + " sampled=" + to_string(sampled))
         // ω-bridge-21 — streak rule has no ratio/threshold; encode 0 / extra=streak=K
         event_rows.push("consecutive_warn\t0.0000\t0\t" + last_str + "\t" + to_string(sampled) + "\tstreak=" + streak_k)
+        // ω-bridge-23 — JSONL body. Streak rule: ratio=0.0, threshold=0, extra="streak=K"
+        event_jsonl_bodies.push("\"rule\":\"consecutive_warn\",\"ratio\":0.0,\"threshold\":0,\"last_n\":" + last_str + ",\"sampled\":" + to_string(sampled) + ",\"extra\":\"streak=" + streak_k + "\"")
+        fired_rules.push("consecutive_warn")
     }
 }
 
@@ -317,8 +361,88 @@ if window_m != "0" {
             fired.push("__ATLAS_ALERT__ FIRED rule=recent_warn_ratio ratio=" + win_ratio_s + " threshold=" + warn_thr_str + " window_minutes=" + window_m + " sampled=" + to_string(win_total))
             // ω-bridge-21 — window rule has no last_n; encode 0 / extra=window_minutes=M
             event_rows.push("recent_warn_ratio\t" + win_ratio_s + "\t" + warn_thr_str + "\t0\t" + to_string(win_total) + "\twindow_minutes=" + window_m)
+            // ω-bridge-23 — JSONL body. Window rule: last_n=0, extra="window_minutes=M"
+            event_jsonl_bodies.push("\"rule\":\"recent_warn_ratio\",\"ratio\":" + win_ratio_s + ",\"threshold\":" + warn_thr_str + ",\"last_n\":0,\"sampled\":" + to_string(win_total) + ",\"extra\":\"window_minutes=" + window_m + "\"")
+            fired_rules.push("recent_warn_ratio")
         }
     }
+}
+
+// ─── ω-bridge-24: cooldown dedup ─────────────────────────────────────────────
+// For each candidate firing, check the LAST K=20 rows of history_path for a
+// row with the same rule. If found within cooldown_min minutes of NOW, drop
+// the candidate from `fired` / `event_rows` / `event_jsonl_bodies` and emit a
+// SUPPRESSED sentinel instead. cooldown_min=0 → fully disabled (skip pass).
+// Missing OR header-only TSV → skip dedup (treat as "no prior firing").
+// One python3 shell-out per candidate (small N — at most 4 rules); the parse
+// is cheap. We avoid one big shell-out batched across all rules to keep the
+// SUPPRESSED sentinel emission ordering trivial and per-rule diagnostics clean.
+let mut suppressed_sentinels = []
+if cooldown_min != "0" && len(fired) > 0 && file_exists(history_path) {
+    // Tail K rows for perf bound. -K does NOT include header lines (`#`-prefixed)
+    // — we strip those in awk for safety since `tail -K` counts raw lines.
+    let tail_cmd2 = "tail -" + DEDUP_TAIL_K + " '" + history_path + "' 2>/dev/null | awk -F '\\t' '!/^#/ && NF >= 2 { print $0 }'"
+    let dedup_tail = to_string(exec(tail_cmd2))
+    let dedup_lines = split(dedup_tail, "\n")
+    let now_epoch = to_string(exec("date -u +%s")).trim()
+    let mut new_fired = []
+    let mut new_event_rows = []
+    let mut new_event_jsonl_bodies = []
+    let mut new_fired_rules = []
+    let mut fi2 = 0
+    while fi2 < len(fired_rules) {
+        let rule_name = fired_rules[fi2]
+        // Walk dedup_lines from end → start; first row matching this rule wins.
+        let mut last_ts = ""
+        let mut dl = len(dedup_lines) - 1
+        while dl >= 0 {
+            let dline = dedup_lines[dl].trim()
+            if len(dline) == 0 { dl = dl - 1; continue }
+            let dparts = split(dline, "\t")
+            if len(dparts) >= 2 {
+                if dparts[1] == rule_name {
+                    last_ts = dparts[0]
+                    dl = -1  // break
+                }
+            }
+            dl = dl - 1
+        }
+        let mut suppress = false
+        let mut ago_min_s = "0"
+        if len(last_ts) > 0 {
+            // Compute (NOW - last_ts) in minutes via date(1). On macOS BSD `date`
+            // we use `-j -f` to parse, falling back to GNU `date -d`. The
+            // fallback chain is awk-driven from python3 to dodge platform skew.
+            let py_diff = "import sys, datetime\n" +
+                          "try:\n" +
+                          "    t = datetime.datetime.strptime('" + last_ts + "', '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=datetime.timezone.utc)\n" +
+                          "    now = datetime.datetime.now(datetime.timezone.utc)\n" +
+                          "    delta_s = (now - t).total_seconds()\n" +
+                          "    if delta_s < 0: delta_s = 0\n" +
+                          "    print('%.4f' % (delta_s / 60.0))\n" +
+                          "except Exception:\n" +
+                          "    print('-1')\n"
+            let cmd_diff = "/usr/bin/env python3 -c \"" + py_diff.replace("\"", "\\\"") + "\" 2>/dev/null"
+            ago_min_s = to_string(exec(cmd_diff)).trim()
+            // suppress if 0 <= ago < cooldown_min  (parse error → ago=-1 → don't suppress)
+            let cmp_sup = to_string(exec("awk 'BEGIN { a = (\"" + ago_min_s + "\"+0); c = (\"" + cooldown_min + "\"+0); print (a >= 0 && a < c) ? 1 : 0 }' </dev/null")).trim()
+            if cmp_sup == "1" { suppress = true }
+        }
+        if suppress {
+            // Render ago_min as a clean number (4dp from python).
+            suppressed_sentinels.push("__ATLAS_ALERT__ SUPPRESSED rule=" + rule_name + " reason=cooldown last_fired_ago_min=" + ago_min_s + " cooldown_minutes=" + cooldown_min)
+        } else {
+            new_fired.push(fired[fi2])
+            new_event_rows.push(event_rows[fi2])
+            new_event_jsonl_bodies.push(event_jsonl_bodies[fi2])
+            new_fired_rules.push(rule_name)
+        }
+        fi2 = fi2 + 1
+    }
+    fired = new_fired
+    event_rows = new_event_rows
+    event_jsonl_bodies = new_event_jsonl_bodies
+    fired_rules = new_fired_rules
 }
 
 // ─── human-readable summary (suppressed when --quiet) ────────────────────────
@@ -338,14 +462,26 @@ if !QUIET {
     } else {
         println("  no rules fired")
     }
+    if len(suppressed_sentinels) > 0 {
+        println("  ALERT(S) SUPPRESSED (cooldown):")
+        let mut si = 0
+        while si < len(suppressed_sentinels) {
+            println("    " + suppressed_sentinels[si])
+            si = si + 1
+        }
+    }
 }
 
-// ─── ω-bridge-21: history persistence (FIRED outcomes only) ──────────────────
-// Append-only TSV row per fired rule. PASS/SKIP outcomes deliberately not
-// recorded — the file is an event log of *firings* (raw 77 / append-only).
-// Pre-flight: if the file is missing, seed it with the canonical header before
-// the first append. Failures are report-only (raw 71): emit a sentinel and
-// continue (we still want stdout sentinels of the firings to surface).
+// ─── ω-bridge-21 + ω-bridge-23: history persistence (FIRED outcomes only) ────
+// Append-only TSV + sibling JSONL row per fired rule. PASS/SKIP outcomes
+// deliberately not recorded — the file is an event log of *firings*
+// (raw 77 / append-only). SUPPRESSED outcomes are also NOT persisted (raw 71:
+// suppression is fully ephemeral by design).
+// Pre-flight: if the TSV is missing, seed it with the canonical header before
+// the first append. JSONL has no header (one object per line). Failures are
+// report-only (raw 71): emit a sentinel and continue (we still want stdout
+// sentinels of the firings to surface, and the JSONL failure must not block
+// the TSV append or vice versa).
 if write_history && len(event_rows) > 0 {
     let now_iso = to_string(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()
     if !file_exists(history_path) {
@@ -365,15 +501,42 @@ if write_history && len(event_rows) > 0 {
             ei = ei + 1
         }
     }
+    // ω-bridge-23 — JSONL sibling append. Independent failure handling so a
+    // JSONL write fault does not invalidate the TSV that just succeeded
+    // (or vice versa). Each line is one self-describing JSON object with
+    // scope="atlas_alert" to discriminate from other JSONL rows downstream.
+    let mut ji = 0
+    let mut jsonl_ok = true
+    while ji < len(event_jsonl_bodies) && jsonl_ok {
+        let jline = "{\"ts\":\"" + now_iso + "\",\"scope\":\"" + ALERT_SCOPE + "\"," + event_jsonl_bodies[ji] + "}\n"
+        try { append_file(history_jsonl_path, jline) } catch e {
+            println("__ATLAS_ALERT__ HISTORY_WRITE_FAIL path=" + history_jsonl_path + " reason=jsonl_append_failed")
+            jsonl_ok = false  // skip remaining (raw 71 report-only — never abort)
+        }
+        ji = ji + 1
+    }
 }
 
 // ─── sentinel emission (always) ──────────────────────────────────────────────
+// Order:  FIRED (per surviving candidate) → SUPPRESSED (per dedup'd candidate)
+//         → PASS (only if no fired AND no suppressed — the "truly nothing"
+//         signal). Operators tooling on stdout can distinguish the three
+//         verdict classes without parsing structured fields.
 if len(fired) > 0 {
     let mut fi = 0
     while fi < len(fired) {
         println(fired[fi])
         fi = fi + 1
     }
-} else {
+}
+// ω-bridge-24 — emit suppressed sentinels (always, even when other rules fired)
+if len(suppressed_sentinels) > 0 {
+    let mut si = 0
+    while si < len(suppressed_sentinels) {
+        println(suppressed_sentinels[si])
+        si = si + 1
+    }
+}
+if len(fired) == 0 && len(suppressed_sentinels) == 0 {
     println("__ATLAS_ALERT__ PASS sampled=" + to_string(sampled) + " rules_evaluated=" + to_string(rules_evaluated))
 }
