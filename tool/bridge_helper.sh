@@ -55,6 +55,24 @@
 #   1/GC_PROBABILITY probability (default 1/100 → ~1% overhead). See
 #   state/omega_bridge_5_cache_gc.json.
 #
+# ω-bridge-6 (2026-04-26): JSON schema-drift detection.
+#   Addresses latent regression risk for the 9 silently-PASS bridges in
+#   state/omega_bridge_baseline.json: when an upstream API renames/removes/retypes a
+#   top-level field, the curl fetch still returns 2xx and the bridge silently produces
+#   malformed downstream output. This cycle adds a cheap deterministic fingerprint:
+#       sha1( join("|", sort(top_level_keys(json_body))) )
+#   stored per-bridge in state/bridge_schema_fingerprint.tsv (bridge \t fp \t iso_ts).
+#   New subcommand:
+#       fingerprint-check <bridge> <url> [<ttl>] [<min_interval>]
+#         - On first run for a bridge → records baseline + emits "BASELINE_RECORDED <fp>"
+#         - On subsequent runs → "MATCH <fp>"  (exit 0)
+#                              or "DRIFT_DETECTED bridge=B expected=A actual=B" (exit 1)
+#                              and writes a candidate row (does NOT overwrite baseline).
+#         - On non-JSON / parse failure → "NON_JSON_BODY <bridge>" (exit 2)
+#   Algorithm prefers `jq` (jq '. | keys'); if jq absent, falls back to grep over body for
+#   /"<word>"\s*:/ then sort -u then sha1. Top-level only (cheap; doesn't catch nested
+#   type changes — see omega_bridge_6_schema_drift.json for known limits).
+#
 # Compliance: raw 66 (reason+fix on diags), raw 71 (report-only diagnostics on stderr,
 #             body unchanged on stdout), raw 73 (deterministic 4xx no-retry).
 
@@ -68,6 +86,7 @@ VERBOSE="${BRIDGE_HELPER_VERBOSE:-0}"
 CACHE_GC_AGE_S="${BRIDGE_HELPER_CACHE_GC_AGE_S:-7200}"
 CACHE_MAX_BYTES="${BRIDGE_HELPER_CACHE_MAX_BYTES:-50000000}"
 GC_PROBABILITY="${BRIDGE_HELPER_GC_PROBABILITY:-100}"
+SCHEMA_FP_TSV="${BRIDGE_HELPER_SCHEMA_FP_TSV:-$NEXUS_ROOT/state/bridge_schema_fingerprint.tsv}"
 
 _log() {
     [ "$VERBOSE" = "1" ] && echo "[bridge_helper] $*" >&2
@@ -368,6 +387,137 @@ cmd_cache_stat() {
     return 0
 }
 
+_compute_schema_fingerprint() {
+    # Reads JSON body from $1 (file path). Emits sha1 of sorted top-level keys joined by '|'.
+    # Empty string on parse failure (caller treats as NON_JSON).
+    local body_file="$1"
+    [ -f "$body_file" ] || { printf ''; return 1; }
+    local size
+    size=$(_file_size "$body_file")
+    [ -z "$size" ] || [ "$size" -le 0 ] && { printf ''; return 1; }
+
+    local keys=""
+    if command -v jq >/dev/null 2>&1; then
+        # jq: only valid for top-level object; arrays/scalars → use synthetic marker
+        local first_byte
+        first_byte=$(head -c 1 "$body_file" 2>/dev/null)
+        if [ "$first_byte" = "{" ]; then
+            keys=$(jq -r 'keys | sort | join("|")' "$body_file" 2>/dev/null)
+        elif [ "$first_byte" = "[" ]; then
+            # array: fingerprint the keys of the first element if it's an object
+            keys=$(jq -r '(.[0] // {}) | if type == "object" then "__array__:" + (keys | sort | join("|")) else "__array_of_" + type + "__" end' "$body_file" 2>/dev/null)
+        else
+            # scalar / non-JSON
+            printf ''
+            return 1
+        fi
+    else
+        # grep fallback: extract /"<word>"\s*:/ matches near the start of the body.
+        # Crude — picks up nested keys too — but deterministic and catches gross drift.
+        keys=$(grep -oE '"[A-Za-z_][A-Za-z0-9_]*"[[:space:]]*:' "$body_file" 2>/dev/null \
+            | sed -E 's/"([^"]+)".*/\1/' | sort -u | tr '\n' '|' | sed 's/|$//')
+    fi
+
+    if [ -z "$keys" ]; then
+        printf ''
+        return 1
+    fi
+    printf '%s' "$keys" | shasum -a 1 2>/dev/null | awk '{print substr($1,1,16)}'
+    return 0
+}
+
+_lookup_baseline_fp() {
+    # Reads baseline fp for bridge $1 from $SCHEMA_FP_TSV. Emits fp on stdout (empty if none).
+    local bridge="$1"
+    [ -f "$SCHEMA_FP_TSV" ] || return 0
+    awk -F'\t' -v b="$bridge" '$1 == b && $2 !~ /^candidate:/ {print $2; exit}' "$SCHEMA_FP_TSV" 2>/dev/null
+    return 0
+}
+
+_record_baseline_fp() {
+    # Append baseline row for bridge $1, fp $2.
+    local bridge="$1" fp="$2"
+    local ts; ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    mkdir -p "$(dirname "$SCHEMA_FP_TSV")" 2>/dev/null
+    printf '%s\t%s\t%s\n' "$bridge" "$fp" "$ts" >> "$SCHEMA_FP_TSV"
+    return 0
+}
+
+_record_candidate_fp() {
+    # Append candidate (drift) row for operator-approved rotation. Tagged with prefix.
+    local bridge="$1" fp="$2"
+    local ts; ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    mkdir -p "$(dirname "$SCHEMA_FP_TSV")" 2>/dev/null
+    printf '%s\tcandidate:%s\t%s\n' "$bridge" "$fp" "$ts" >> "$SCHEMA_FP_TSV"
+    return 0
+}
+
+cmd_fingerprint_check() {
+    # fingerprint-check <bridge> <url> [<ttl>] [<min_interval>]
+    # Wraps cmd_fetch via a tmp body file so we can fingerprint without polluting stdout.
+    # Stdout: status line; Stderr: diagnostics. Body itself is NOT echoed.
+    local bridge="${1:-}"
+    local url="${2:-}"
+    local ttl="${3:-3600}"
+    local min_interval="${4:-1}"
+
+    if [ -z "$bridge" ] || [ -z "$url" ]; then
+        echo "bridge_helper: usage: fingerprint-check <bridge> <url> [ttl] [min_interval]" >&2
+        echo "  reason: missing required arg" >&2
+        echo "  fix:    bash tool/bridge_helper.sh fingerprint-check codata https://... 3600 1" >&2
+        return 2
+    fi
+
+    local tmp_body
+    tmp_body=$(mktemp 2>/dev/null) || tmp_body="/tmp/bridge_helper_fp_$$_${RANDOM}.tmp"
+
+    # cmd_fetch emits body to stdout — capture into tmp file
+    if ! cmd_fetch "$bridge" "$url" "$ttl" "$min_interval" > "$tmp_body" 2>/dev/null; then
+        rm -f "$tmp_body" 2>/dev/null
+        echo "FETCH_FAIL bridge=$bridge url=$url"
+        echo "bridge_helper: fingerprint-check fetch failed for $bridge" >&2
+        echo "  reason: cmd_fetch returned non-zero (network/4xx/persistent fail)" >&2
+        echo "  fix:    inspect bridge cache + upstream API status" >&2
+        return 2
+    fi
+
+    local actual_fp
+    actual_fp=$(_compute_schema_fingerprint "$tmp_body")
+    rm -f "$tmp_body" 2>/dev/null
+
+    if [ -z "$actual_fp" ]; then
+        echo "NON_JSON_BODY bridge=$bridge"
+        echo "bridge_helper: fingerprint-check: body is not parseable JSON for $bridge" >&2
+        echo "  reason: top-level is scalar / empty / not JSON object-or-array" >&2
+        echo "  fix:    use this bridge with text-based monitoring instead of fingerprint-check" >&2
+        return 2
+    fi
+
+    local baseline_fp
+    baseline_fp=$(_lookup_baseline_fp "$bridge")
+
+    if [ -z "$baseline_fp" ]; then
+        _record_baseline_fp "$bridge" "$actual_fp"
+        echo "BASELINE_RECORDED bridge=$bridge fp=$actual_fp"
+        return 0
+    fi
+
+    if [ "$actual_fp" = "$baseline_fp" ]; then
+        echo "MATCH bridge=$bridge fp=$actual_fp"
+        return 0
+    fi
+
+    _record_candidate_fp "$bridge" "$actual_fp"
+    # to stderr per design (drift = actionable signal for ops)
+    echo "DRIFT_DETECTED bridge=$bridge expected=$baseline_fp actual=$actual_fp" >&2
+    echo "bridge_helper: schema drift on bridge=$bridge" >&2
+    echo "  reason: top-level field set changed since baseline (rename/add/remove)" >&2
+    echo "  fix:    inspect upstream API; if intentional, manually rotate baseline in $SCHEMA_FP_TSV" >&2
+    # also emit a DRIFT line on stdout so callers piping stdout still see status
+    echo "DRIFT_DETECTED bridge=$bridge expected=$baseline_fp actual=$actual_fp"
+    return 1
+}
+
 case "${1:-}" in
     fetch)
         shift
@@ -384,13 +534,17 @@ case "${1:-}" in
         shift
         cmd_cache_gc "$@"
         ;;
+    fingerprint-check)
+        shift
+        cmd_fingerprint_check "$@"
+        ;;
     --help|-h|"")
-        sed -n '3,60p' "$0"
+        sed -n '3,75p' "$0"
         exit 0
         ;;
     *)
         echo "bridge_helper: unknown subcommand: $1" >&2
-        echo "  reason: not in {fetch, cache-clear, cache-stat, cache-gc, --help}" >&2
+        echo "  reason: not in {fetch, cache-clear, cache-stat, cache-gc, fingerprint-check, --help}" >&2
         echo "  fix:    bash tool/bridge_helper.sh --help" >&2
         exit 1
         ;;
