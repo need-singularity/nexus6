@@ -14,9 +14,9 @@ is used (M3-style). For 'leading number then unit' like
 
 | Class | Count |
 |---|---|
-| Total candidates audited | 531 |
+| Total candidates audited | 512 |
 | MATCH (atlas correct) | 11 |
-| MISMATCH (label wrong / load-bearing review) | 21 |
+| MISMATCH (label wrong / load-bearing review) | 2 |
 | UNKNOWN (func not in canon) | 499 |
 | PARSE_FAIL | 0 |
 
@@ -29,27 +29,8 @@ conflation: load-bearing value is correct, parenthetical is wrong.
 
 | File:Line | ID | Claimed `func(N)=V` | Canonical V | Deps | Suggested fix |
 |---|---|---|---|---|---|
-| atlas.n6:16834 | `xpoll-sigma-music` | `sigma(12)=12` | 28 | 0 | rewrite as `sigma(6) = 12` (or `sigma = 12` shorthand); arg=12 is the count, not σ-arg |
-| atlas.n6:16837 | `xpoll-sigma-biology` | `sigma(12)=12` | 28 | 0 | rewrite as `sigma(6) = 12` (or `sigma = 12` shorthand); arg=12 is the count, not σ-arg |
-| atlas.n6:16840 | `xpoll-sigma-economics` | `sigma(12)=12` | 28 | 0 | rewrite as `sigma(6) = 12` (or `sigma = 12` shorthand); arg=12 is the count, not σ-arg |
-| atlas.n6:16843 | `xpoll-sigma-celestial` | `sigma(12)=12` | 28 | 0 | rewrite as `sigma(6) = 12` (or `sigma = 12` shorthand); arg=12 is the count, not σ-arg |
-| atlas.n6:16846 | `xpoll-sigma-linguistics` | `sigma(12)=12` | 28 | 0 | rewrite as `sigma(6) = 12` (or `sigma = 12` shorthand); arg=12 is the count, not σ-arg |
-| atlas.n6:16848 | `xpoll-sigma-material` | `sigma(12)=12` | 28 | 0 | rewrite as `sigma(6) = 12` (or `sigma = 12` shorthand); arg=12 is the count, not σ-arg |
-| atlas.n6:16855 | `xpoll-sigma-consciousness` | `sigma(12)=12` | 28 | 0 | rewrite as `sigma(6) = 12` (or `sigma = 12` shorthand); arg=12 is the count, not σ-arg |
-| atlas.n6:16858 | `xpoll-sigma-genetics` | `sigma(12)=12` | 28 | 0 | rewrite as `sigma(6) = 12` (or `sigma = 12` shorthand); arg=12 is the count, not σ-arg |
-| atlas.n6:16861 | `xpoll-sigma-computing` | `sigma(12)=12` | 28 | 0 | rewrite as `sigma(6) = 12` (or `sigma = 12` shorthand); arg=12 is the count, not σ-arg |
-| atlas.n6:16916 | `xpoll-tau-chemistry` | `tau(4)=4` | 3 | 0 | rewrite as `tau(6) = 4` (or `tau = 4` shorthand); arg=4 is the count, not τ-arg |
-| atlas.n6:16918 | `xpoll-tau-biology` | `tau(4)=4` | 3 | 0 | rewrite as `tau(6) = 4` (or `tau = 4` shorthand); arg=4 is the count, not τ-arg |
-| atlas.n6:16921 | `xpoll-tau-geology` | `tau(4)=4` | 3 | 0 | rewrite as `tau(6) = 4` (or `tau = 4` shorthand); arg=4 is the count, not τ-arg |
-| atlas.n6:16923 | `xpoll-tau-economics` | `tau(4)=4` | 3 | 0 | rewrite as `tau(6) = 4` (or `tau = 4` shorthand); arg=4 is the count, not τ-arg |
-| atlas.n6:16925 | `xpoll-tau-material` | `tau(4)=4` | 3 | 0 | rewrite as `tau(6) = 4` (or `tau = 4` shorthand); arg=4 is the count, not τ-arg |
-| atlas.n6:16928 | `xpoll-tau-music` | `tau(4)=4` | 3 | 0 | rewrite as `tau(6) = 4` (or `tau = 4` shorthand); arg=4 is the count, not τ-arg |
-| atlas.n6:16930 | `xpoll-tau-celestial` | `tau(4)=4` | 3 | 0 | rewrite as `tau(6) = 4` (or `tau = 4` shorthand); arg=4 is the count, not τ-arg |
-| atlas.n6:16932 | `xpoll-tau-linguistics` | `tau(4)=4` | 3 | 0 | rewrite as `tau(6) = 4` (or `tau = 4` shorthand); arg=4 is the count, not τ-arg |
-| atlas.n6:16934 | `xpoll-tau-computing` | `tau(4)=4` | 3 | 0 | rewrite as `tau(6) = 4` (or `tau = 4` shorthand); arg=4 is the count, not τ-arg |
-| atlas.n6:16936 | `xpoll-tau-genetic` | `tau(4)=4` | 3 | 0 | rewrite as `tau(6) = 4` (or `tau = 4` shorthand); arg=4 is the count, not τ-arg |
-| atlas.n6:16938 | `xpoll-tau-ecology` | `tau(4)=4` | 3 | 0 | rewrite as `tau(6) = 4` (or `tau = 4` shorthand); arg=4 is the count, not τ-arg |
-| atlas.n6:18228 | `MILL-DFS23-12-p6-11-double-decomp` | `p(6)=11` | 13 | 0 | rename func `p` → `partition` (p(6)=11 means partition(6); `p` collides with prime alias) |
+| atlas.n6:16852 | `xpoll-sigma-material` | `sigma(12)=12` | 28 | 0 | rewrite as `sigma(6) = 12` (or `sigma = 12` shorthand); arg=12 is the count, not σ-arg |
+| atlas.n6:18232 | `MILL-DFS23-12-p6-11-double-decomp` | `p(6)=11` | 13 | 0 | rename func `p` → `partition` (p(6)=11 means partition(6); `p` collides with prime alias) |
 
 ## MATCH Confirmations (audit-passing entries)
 
@@ -61,11 +42,11 @@ conflation: load-bearing value is correct, parenthetical is wrong.
 | atlas.n6:44 | `sopfr` | `sum_prime_factors(6)=5` |
 | atlas.n6:51 | `mu` | `mobius(6)=1` |
 | atlas.n6:53 | `M3` | `mersenne(3)=7` |
-| atlas.n6:16967 | `n6-sigma` | `divisor_sum(6)=12` |
-| atlas.n6:16976 | `n6-phi` | `euler_totient(6)=2` |
-| atlas.n6:17025 | `n6-tau` | `divisor_count(6)=4` |
-| atlas.n6:20703 | `LEARN-02-backprop-tau-stages` | `tau(6)=4` |
-| atlas.n6:20712 | `LEARN-05-MAML-inner-tau` | `tau(6)=4` |
+| atlas.n6:16971 | `n6-sigma` | `divisor_sum(6)=12` |
+| atlas.n6:16980 | `n6-phi` | `euler_totient(6)=2` |
+| atlas.n6:17029 | `n6-tau` | `divisor_count(6)=4` |
+| atlas.n6:20707 | `LEARN-02-backprop-tau-stages` | `tau(6)=4` |
+| atlas.n6:20716 | `LEARN-05-MAML-inner-tau` | `tau(6)=4` |
 
 ## UNKNOWN funcs (not in canonical set)
 
