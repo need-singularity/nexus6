@@ -1,0 +1,350 @@
+// tool/psi_log_retention.hexa — ω-network-7: PSI log retention/rotation policy
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+//
+// raw 9 hexa-only-suffix (sweeper-safe .hexa).
+//
+// Background:
+//   The canonical PSI log at /tmp/hexa_remote_psi.log (ω-network-1..6) is
+//   append-only and unbounded. It accumulates ~75 rows/h at sustained ops.
+//   Without rotation it grows into MB territory and slows the per-host
+//   calibrator (psi_calibrate_emit.hexa) which sorts every row in awk.
+//
+// Goal:
+//   Prune old rows by configurable policy. Default DRY-RUN; only --apply
+//   actually writes. Atomic write via tmp+rename. Pre-apply backup is always
+//   created.  Removed rows must remain parseable IF restored from backup —
+//   i.e. the rewrite preserves: (1) chronological order (raw 77 append-only
+//   respect, no reordering), (2) commented header lines (#-prefixed) if any,
+//   (3) full TSV row format (no field mutation).
+//
+// Schema (from ω-network-1 psi_calibrate_emit.hexa):
+//   ts<TAB>host<TAB>psi<TAB>thr<TAB>outcome<TAB>reason  [<TAB>src...]
+//   ts is ISO8601 UTC: 2026-04-26T06:40:42Z
+//
+// Policies (mutually exclusive):
+//   --keep-days D   keep rows whose ts is within last D days  (default: 7)
+//   --keep-rows N   keep last N rows (after any header preservation)
+//
+// Design principles:
+//   - DEFAULT DRY-RUN. No file modification without --apply.
+//   - Atomicity: write to /tmp/psi_log_retention.tmp.<pid>, mv -f to dest.
+//   - Backup: before --apply, copy original to
+//     /tmp/hexa_remote_psi.log.bak.<unix_ts>. Validated writable on dry-run too.
+//   - Pre-flight: log must exist + have ≥1 data row, else SKIP verdict.
+//   - Sentinel (raw 80):
+//     __PSI_LOG_RETENTION__ <DRY_RUN|APPLIED|SKIP> kept=K removed=R total=T policy=<keep-days|keep-rows> param=P backup=PATH
+//
+// raw compliance: 9 hexa-only / 71 report-only-on-dry / 73 admissibility /
+//                 77 append-only-respect (chronological order preserved) /
+//                 80 sentinel
+//
+// CLI:
+//   HEXA_ARGV='[--keep-days D | --keep-rows N] [--apply] [--quiet] [--json] [--help]'
+//
+// JSON shape (--json):
+//   {"dry_run":bool,"kept":K,"removed":R,"total":T,"policy":"keep-days|keep-rows",
+//    "param":P,"backup_path":"...","log_path":"..."}
+//
+// Origin:
+//   /Users/ghost/core/anima/state/omega_network_7_psi_log_retention.json (UNTRACKED)
+
+let DEFAULT_LOG = "/tmp/hexa_remote_psi.log"
+let BACKUP_DIR = "/tmp"
+let TMP_DIR = "/tmp"
+
+let mut QUIET = false
+
+fn _sh(cmd: str) -> str {
+    let mut out = ""
+    try { out = to_string(exec(cmd)) } catch e { out = "" }
+    return out.trim()
+}
+
+fn _shq(s: str) -> str {
+    let mut out = "'"
+    let n = s.len()
+    let mut i: i64 = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "'" { out = out + "'\\''" }
+        else { out = out + c }
+        i = i + 1
+    }
+    out = out + "'"
+    return out
+}
+
+fn _say(msg: string) { if !QUIET { println(msg) } }
+
+fn _argv() -> array {
+    let raw = to_string(exec("printf '%s' \"${HEXA_ARGV:-}\""))
+    let parts = split(raw, " ")
+    let mut out = []
+    let mut k = 0
+    while k < len(parts) {
+        if len(parts[k]) > 0 { out.push(parts[k]) }
+        k = k + 1
+    }
+    return out
+}
+
+fn _now_epoch() -> i64 {
+    let s = _sh("date +%s")
+    let mut n: i64 = 0
+    try { n = to_i64(s) } catch e {}
+    return n
+}
+
+// ISO8601 "2026-04-26T06:40:42Z" → epoch seconds. BSD first, GNU fallback.
+fn iso_to_epoch(iso: str) -> i64 {
+    if iso.len() == 0 { return -1 }
+    let bsd = _sh("date -u -jf '%Y-%m-%dT%H:%M:%SZ' " + _shq(iso) + " +%s 2>/dev/null")
+    if bsd.len() > 0 {
+        let mut n: i64 = -1
+        try { n = to_i64(bsd) } catch e {}
+        if n > 0 { return n }
+    }
+    let gnu = _sh("date -u -d " + _shq(iso) + " +%s 2>/dev/null")
+    if gnu.len() > 0 {
+        let mut n: i64 = -1
+        try { n = to_i64(gnu) } catch e {}
+        if n > 0 { return n }
+    }
+    return -1
+}
+
+fn _help() {
+    println("usage: HEXA_ARGV='[--keep-days D | --keep-rows N] [--apply] [--quiet] [--json] [--help]' hexa run tool/psi_log_retention.hexa")
+    println("")
+    println("  Defaults: --keep-days 7, dry-run (no --apply).")
+    println("  Policies:")
+    println("    --keep-days D   keep rows whose ts is within last D days")
+    println("    --keep-rows N   keep last N rows (mutually exclusive with --keep-days)")
+    println("  Behavior:")
+    println("    DRY-RUN (default): print what WOULD be removed; no file write.  (raw 71)")
+    println("    --apply:           atomic rewrite via tmp+rename; backup created first.")
+    println("    Comment header lines (#-prefixed) are preserved unconditionally.")
+    println("    Chronological order is preserved (no reordering — raw 77 append-only respect).")
+    println("  PSI log path:")
+    println("    /tmp/hexa_remote_psi.log  (override via PSI_LOG_PATH env)")
+    println("  Sentinel (raw 80):")
+    println("    __PSI_LOG_RETENTION__ <DRY_RUN|APPLIED|SKIP> kept=K removed=R total=T policy=<...> param=P backup=PATH")
+}
+
+fn _emit_json(dry_run: bool, kept: i64, removed: i64, total: i64, policy: string, param: string, backup_path: string, log_path: string) {
+    let mut s = "{"
+    if dry_run { s = s + "\"dry_run\":true" } else { s = s + "\"dry_run\":false" }
+    s = s + ",\"kept\":" + to_string(kept)
+    s = s + ",\"removed\":" + to_string(removed)
+    s = s + ",\"total\":" + to_string(total)
+    s = s + ",\"policy\":\"" + policy + "\""
+    s = s + ",\"param\":" + param
+    s = s + ",\"backup_path\":\"" + backup_path + "\""
+    s = s + ",\"log_path\":\"" + log_path + "\""
+    s = s + "}"
+    println(s)
+}
+
+// ─── argv parse ──────────────────────────────────────────────────────────────
+let args = _argv()
+let mut keep_days: i64 = 7
+let mut keep_rows: i64 = -1
+let mut apply = false
+let mut json_out = false
+let mut keep_days_set = false
+let mut keep_rows_set = false
+
+let mut ai = 0
+while ai < len(args) {
+    let a = args[ai]
+    if a == "--quiet" { QUIET = true }
+    else if a == "--apply" { apply = true }
+    else if a == "--json" { json_out = true }
+    else if a == "--help" || a == "-h" { _help(); return }
+    else if a == "--keep-days" && ai + 1 < len(args) {
+        keep_days_set = true
+        try { keep_days = to_i64(args[ai+1]) } catch e {}
+        ai = ai + 1
+    }
+    else if a == "--keep-rows" && ai + 1 < len(args) {
+        keep_rows_set = true
+        try { keep_rows = to_i64(args[ai+1]) } catch e {}
+        ai = ai + 1
+    }
+    ai = ai + 1
+}
+
+if keep_days_set && keep_rows_set {
+    eprintln("psi_log_retention: error: --keep-days and --keep-rows are mutually exclusive")
+    eprintln("  fix: pass exactly one policy flag")
+    exit(1)
+}
+
+let policy = if keep_rows_set { "keep-rows" } else { "keep-days" }
+let param_str = if keep_rows_set { to_string(keep_rows) } else { to_string(keep_days) }
+
+// ─── log path resolution ─────────────────────────────────────────────────────
+let mut LOG_PATH = env("PSI_LOG_PATH")
+if LOG_PATH.len() == 0 { LOG_PATH = DEFAULT_LOG }
+
+// ─── pre-flight: existence + non-empty data ──────────────────────────────────
+if !file_exists(LOG_PATH) {
+    if json_out {
+        _emit_json(!apply, 0, 0, 0, policy, param_str, "", LOG_PATH)
+    }
+    println("__PSI_LOG_RETENTION__ SKIP kept=0 removed=0 total=0 policy=" + policy + " param=" + param_str + " backup=- reason=log_missing path=" + LOG_PATH)
+    return
+}
+
+let raw = to_string(read_file(LOG_PATH))
+let all_lines = split(raw, "\n")
+
+// Separate header (#-prefixed contiguous from top) from data; drop trailing empty.
+let mut header_lines = []
+let mut data_lines = []
+let mut header_phase = true
+let mut li = 0
+while li < len(all_lines) {
+    let ln = all_lines[li]
+    if header_phase && ln.len() > 0 && ln.substring(0, 1) == "#" {
+        header_lines.push(ln)
+    } else {
+        if ln.len() > 0 { header_phase = false; data_lines.push(ln) }
+        else { header_phase = false }
+    }
+    li = li + 1
+}
+
+let total: i64 = len(data_lines)
+
+if total == 0 {
+    if json_out {
+        _emit_json(!apply, 0, 0, 0, policy, param_str, "", LOG_PATH)
+    }
+    println("__PSI_LOG_RETENTION__ SKIP kept=0 removed=0 total=0 policy=" + policy + " param=" + param_str + " backup=- reason=no_data_rows path=" + LOG_PATH)
+    return
+}
+
+// ─── selection: which data rows to KEEP ──────────────────────────────────────
+// Chronological order is trusted (raw 77 append-only). We keep a contiguous
+// SUFFIX of data_lines, never a non-contiguous subset.
+let mut keep_from: i64 = 0  // index of first kept row in data_lines
+
+if keep_rows_set {
+    if keep_rows < 0 { keep_rows = 0 }
+    if keep_rows >= total {
+        keep_from = 0
+    } else {
+        keep_from = total - keep_rows
+    }
+} else {
+    // keep-days: rows whose ts >= now - D*86400
+    if keep_days < 0 { keep_days = 0 }
+    let cutoff: i64 = _now_epoch() - keep_days * 86400
+    // walk from oldest to newest, find first index whose ts >= cutoff.
+    let mut idx: i64 = total  // default: keep none
+    let mut k = 0
+    while k < total {
+        let row = data_lines[k]
+        let f = split(row, "\t")
+        if len(f) >= 1 {
+            let ts_iso = f[0]
+            let ep = iso_to_epoch(ts_iso)
+            if ep > 0 && ep >= cutoff {
+                idx = k
+                k = total  // break
+            }
+        }
+        k = k + 1
+    }
+    keep_from = idx
+}
+
+let kept: i64 = total - keep_from
+let removed: i64 = keep_from
+
+// ─── backup-path validation (always — even dry-run) ──────────────────────────
+let backup_ts = _sh("date +%s")
+let backup_path = LOG_PATH + ".bak." + backup_ts
+
+// Validate backup dir is writable. (touch + rm a dummy.)
+let probe = BACKUP_DIR + "/.psi_log_retention_probe." + backup_ts
+let probe_ok = _sh("touch " + _shq(probe) + " 2>/dev/null && rm -f " + _shq(probe) + " && echo y || echo n")
+if probe_ok != "y" {
+    if json_out {
+        _emit_json(!apply, kept, removed, total, policy, param_str, "", LOG_PATH)
+    }
+    println("__PSI_LOG_RETENTION__ SKIP kept=" + to_string(kept) + " removed=" + to_string(removed) + " total=" + to_string(total) + " policy=" + policy + " param=" + param_str + " backup=- reason=backup_dir_not_writable")
+    return
+}
+
+// ─── DRY-RUN report ──────────────────────────────────────────────────────────
+if !apply {
+    _say("═══ PSI log retention (DRY-RUN) — log=" + LOG_PATH)
+    _say("  policy=" + policy + " param=" + param_str)
+    _say("  total=" + to_string(total) + "  kept=" + to_string(kept) + "  removed=" + to_string(removed))
+    _say("  header_lines_preserved=" + to_string(len(header_lines)))
+    if removed > 0 && !QUIET {
+        let preview_n: i64 = if removed < 3 { removed } else { 3 }
+        _say("  would-remove preview (first " + to_string(preview_n) + " of " + to_string(removed) + "):")
+        let mut pi = 0
+        while pi < preview_n {
+            _say("    - " + data_lines[pi])
+            pi = pi + 1
+        }
+    }
+    _say("  backup-on-apply: " + backup_path + "  (dir writable)")
+    if json_out {
+        _emit_json(true, kept, removed, total, policy, param_str, backup_path, LOG_PATH)
+    }
+    println("__PSI_LOG_RETENTION__ DRY_RUN kept=" + to_string(kept) + " removed=" + to_string(removed) + " total=" + to_string(total) + " policy=" + policy + " param=" + param_str + " backup=" + backup_path)
+    return
+}
+
+// ─── --apply: backup, atomic write ───────────────────────────────────────────
+let cp_rc = _sh("cp -p " + _shq(LOG_PATH) + " " + _shq(backup_path) + " 2>/dev/null && echo y || echo n")
+if cp_rc != "y" {
+    eprintln("psi_log_retention: backup failed: " + backup_path)
+    exit(2)
+}
+
+// Build new content: header (verbatim) + kept data rows + trailing \n.
+let mut buf = ""
+let mut hi = 0
+while hi < len(header_lines) {
+    buf = buf + header_lines[hi] + "\n"
+    hi = hi + 1
+}
+let mut di = keep_from
+while di < total {
+    buf = buf + data_lines[di] + "\n"
+    di = di + 1
+}
+
+let pid = _sh("sh -c 'echo $PPID'")
+let tmp_path = TMP_DIR + "/psi_log_retention.tmp." + pid + "." + backup_ts
+
+let mut wrote = true
+try { write_file(tmp_path, buf) } catch e { wrote = false }
+if !wrote {
+    eprintln("psi_log_retention: write_tmp failed: " + tmp_path)
+    exit(3)
+}
+
+let mv_rc = _sh("mv -f " + _shq(tmp_path) + " " + _shq(LOG_PATH) + " 2>/dev/null && echo y || echo n")
+if mv_rc != "y" {
+    eprintln("psi_log_retention: atomic rename failed: " + tmp_path + " -> " + LOG_PATH)
+    try { exec("rm -f " + _shq(tmp_path)) } catch e {}
+    exit(4)
+}
+
+_say("═══ PSI log retention (APPLIED) — log=" + LOG_PATH)
+_say("  policy=" + policy + " param=" + param_str)
+_say("  total=" + to_string(total) + "  kept=" + to_string(kept) + "  removed=" + to_string(removed))
+_say("  backup=" + backup_path)
+if json_out {
+    _emit_json(false, kept, removed, total, policy, param_str, backup_path, LOG_PATH)
+}
+println("__PSI_LOG_RETENTION__ APPLIED kept=" + to_string(kept) + " removed=" + to_string(removed) + " total=" + to_string(total) + " policy=" + policy + " param=" + param_str + " backup=" + backup_path)
