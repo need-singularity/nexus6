@@ -1,0 +1,229 @@
+// tool/atlas_alert_subscriber.hexa — JSONL stream subscriber for bridge_anomaly verdicts (ω-bridge-17)
+//
+// raw 9 hexa-only-suffix (sweeper-safe .hexa). ω-bridge-16 promoted the
+// __BRIDGE_ANOMALY__ sentinel into a structured sibling row in
+// state/atlas_health_timeline.jsonl scoped 'bridge_anomaly'. With persistence
+// in place we can now reason over verdict *trends* across sweeps rather than
+// reacting to a single sentinel in isolation.
+//
+// This tool is a one-shot poller (NOT continuous tail -F — kept simple for
+// stage1): it reads the timeline up to current EOF, filters scope==bridge_anomaly,
+// keeps the last N matching rows, and evaluates configurable alert rules.
+//
+// Read-only on the timeline (raw 71 / raw 77). Parallel-session may be
+// appending while we read; we tolerate this — read_file is a single fs syscall
+// snapshot and any mid-read append is just truncated past EOF, not a problem
+// for "last N" tail semantics.
+//
+// @tool(slug="atlas_alert_subscriber", desc="bridge_anomaly JSONL trend alerter")
+// @usage:
+//   hexa run tool/atlas_alert_subscriber.hexa                                        # default
+//   HEXA_ARGV='--last 20' hexa run tool/atlas_alert_subscriber.hexa
+//   HEXA_ARGV='--warn-threshold 0.3' hexa run tool/atlas_alert_subscriber.hexa
+//   HEXA_ARGV='--insufficient-threshold 0.7' hexa run tool/atlas_alert_subscriber.hexa
+//   HEXA_ARGV='--timeline /tmp/fixture.jsonl' hexa run tool/atlas_alert_subscriber.hexa
+//   HEXA_ARGV='--quiet' hexa run tool/atlas_alert_subscriber.hexa
+//   HEXA_ARGV='--help' hexa run tool/atlas_alert_subscriber.hexa
+//
+// sentinels (raw 80):
+//   __ATLAS_ALERT__ SKIP reason=timeline_missing path=...
+//   __ATLAS_ALERT__ SKIP reason=no_matching_rows scope=bridge_anomaly
+//   __ATLAS_ALERT__ FIRED rule=warn_ratio        ratio=R threshold=T last_n=N sampled=S
+//   __ATLAS_ALERT__ FIRED rule=insufficient_ratio ratio=R threshold=T last_n=N sampled=S
+//   __ATLAS_ALERT__ PASS sampled=S rules_evaluated=R
+//
+// rules (configurable via HEXA_ARGV):
+//   --last N                          inspect last N matching rows                     (default 10)
+//   --warn-threshold R                fire if WARN ratio of last N >= R                (default 0.4)
+//   --insufficient-threshold R        fire if INSUFFICIENT_DATA ratio >= R             (default 0.6)
+//   --timeline PATH                   override timeline path (testing fixtures)
+//   --quiet                           sentinel-only output
+//
+// raw compliance: 71 read-only / 73 admissibility / 77 append-only-respect /
+//                 80 sentinel
+//
+// Origin: design/hexa_sim/cross_repo_dashboard.md ω-bridge-17 entry
+//         /Users/ghost/core/anima/state/omega_bridge_17_*.json
+
+let NEXUS = "/Users/ghost/core/nexus"
+let DEFAULT_TIMELINE = NEXUS + "/state/atlas_health_timeline.jsonl"
+let DEFAULT_LAST = "10"
+let DEFAULT_WARN_THR = "0.4"
+let DEFAULT_INSUF_THR = "0.6"
+let TARGET_SCOPE = "bridge_anomaly"
+
+let mut QUIET = false
+
+fn _argv() -> array {
+    let raw = to_string(exec("printf '%s' \"${HEXA_ARGV:-}\""))
+    let parts = split(raw, " ")
+    let mut out = []
+    let mut k = 0
+    while k < len(parts) {
+        if len(parts[k]) > 0 { out.push(parts[k]) }
+        k = k + 1
+    }
+    return out
+}
+
+fn _say(msg: string) { if !QUIET { println(msg) } }
+
+let args = _argv()
+let mut timeline_path = DEFAULT_TIMELINE
+let mut last_str = DEFAULT_LAST
+let mut warn_thr_str = DEFAULT_WARN_THR
+let mut insuf_thr_str = DEFAULT_INSUF_THR
+let mut i = 0
+while i < len(args) {
+    let a = args[i]
+    if a == "--quiet" { QUIET = true }
+    if a == "--timeline" && i + 1 < len(args) { timeline_path = args[i+1]; i = i + 1 }
+    if a == "--last" && i + 1 < len(args) { last_str = args[i+1]; i = i + 1 }
+    if a == "--warn-threshold" && i + 1 < len(args) { warn_thr_str = args[i+1]; i = i + 1 }
+    if a == "--insufficient-threshold" && i + 1 < len(args) { insuf_thr_str = args[i+1]; i = i + 1 }
+    if a == "--help" || a == "-h" {
+        println("usage: HEXA_ARGV='[--timeline PATH] [--last N] [--warn-threshold R] [--insufficient-threshold R] [--quiet]' hexa run tool/atlas_alert_subscriber.hexa")
+        println("  default: scan state/atlas_health_timeline.jsonl, last 10 bridge_anomaly rows")
+        println("  --last N                       inspect last N matching rows  (default 10)")
+        println("  --warn-threshold R             fire if WARN/N >= R           (default 0.4)")
+        println("  --insufficient-threshold R     fire if INSUFFICIENT_DATA/N >= R (default 0.6)")
+        println("  --timeline PATH                override timeline path (fixtures)")
+        println("  --quiet                        emit __ATLAS_ALERT__ sentinel only")
+        return
+    }
+    i = i + 1
+}
+
+// ─── pre-flight ──────────────────────────────────────────────────────────────
+if !file_exists(timeline_path) {
+    println("__ATLAS_ALERT__ SKIP reason=timeline_missing path=" + timeline_path)
+    return
+}
+
+// ─── load + filter ───────────────────────────────────────────────────────────
+// JSONL parse via shell tooling is overkill here — we only need:
+//   1. presence of "scope":"bridge_anomaly"
+//   2. extracted verdict in {PASS, WARN, INSUFFICIENT_DATA}
+// A naive substring scan suffices for the controlled schema (raw 73): the
+// timeline writer is bridge_health.sh (ω-bridge-16), single producer, fixed
+// field order, no escaping concerns inside the fields we read.
+
+let raw_content = to_string(read_file(timeline_path))
+let lines = split(raw_content, "\n")
+
+let scope_marker = "\"scope\":\"" + TARGET_SCOPE + "\""
+
+let mut matched = []
+for line in lines {
+    let t = line.trim()
+    if len(t) == 0 { continue }
+    if !t.contains(scope_marker) { continue }
+    matched.push(t)
+}
+
+let total_matched = len(matched)
+if total_matched == 0 {
+    println("__ATLAS_ALERT__ SKIP reason=no_matching_rows scope=" + TARGET_SCOPE + " path=" + timeline_path)
+    return
+}
+
+// Tail to last N rows. last_str is a small int; use shell tail so we don't
+// re-implement integer parse + slice in hexa.
+let last_int = to_string(exec("printf '%d' " + last_str)).trim()
+let mut joined = ""
+let mut s = 0
+while s < len(matched) {
+    joined = joined + matched[s] + "\n"
+    s = s + 1
+}
+let tail_cmd = "printf '%s' '" + joined + "' | tail -" + last_int
+let tail_out = to_string(exec(tail_cmd)).trim()
+let tail_lines = split(tail_out, "\n")
+let sampled = len(tail_lines)
+
+// ─── verdict tally ───────────────────────────────────────────────────────────
+let mut warn_n = 0
+let mut insuf_n = 0
+let mut pass_n = 0
+let mut other_n = 0
+
+let warn_marker  = "\"verdict\":\"WARN\""
+let insuf_marker = "\"verdict\":\"INSUFFICIENT_DATA\""
+let pass_marker  = "\"verdict\":\"PASS\""
+
+let mut li = 0
+while li < len(tail_lines) {
+    let row = tail_lines[li]
+    if row.contains(warn_marker) {
+        warn_n = warn_n + 1
+    } else if row.contains(insuf_marker) {
+        insuf_n = insuf_n + 1
+    } else if row.contains(pass_marker) {
+        pass_n = pass_n + 1
+    } else {
+        other_n = other_n + 1
+    }
+    li = li + 1
+}
+
+// ─── ratio compute (single awk call — avoids hexa float parse) ───────────────
+// Output: "<warn_ratio> <insuf_ratio>" formatted to 4 decimals.
+let ratio_prog = "BEGIN { " +
+    "  s=" + to_string(sampled) + "+0; " +
+    "  if (s==0) { printf \"0.0000 0.0000\\n\"; exit } " +
+    "  wr=(" + to_string(warn_n) + "+0)/s; " +
+    "  ir=(" + to_string(insuf_n) + "+0)/s; " +
+    "  printf \"%.4f %.4f\\n\", wr, ir; " +
+    "}"
+let ratios_out = to_string(exec("awk '" + ratio_prog + "' </dev/null")).trim()
+let rparts = split(ratios_out, " ")
+let mut warn_ratio_s = "0.0000"
+let mut insuf_ratio_s = "0.0000"
+if len(rparts) >= 2 {
+    warn_ratio_s = rparts[0]
+    insuf_ratio_s = rparts[1]
+}
+
+// ─── rule evaluation (awk for >= compare on floats) ──────────────────────────
+let rules_evaluated = 2
+
+let warn_cmp = to_string(exec("awk 'BEGIN { print ((" + warn_ratio_s + "+0) >= (" + warn_thr_str + "+0)) ? 1 : 0 }' </dev/null")).trim()
+let insuf_cmp = to_string(exec("awk 'BEGIN { print ((" + insuf_ratio_s + "+0) >= (" + insuf_thr_str + "+0)) ? 1 : 0 }' </dev/null")).trim()
+
+let mut fired = []
+if warn_cmp == "1" {
+    fired.push("__ATLAS_ALERT__ FIRED rule=warn_ratio ratio=" + warn_ratio_s + " threshold=" + warn_thr_str + " last_n=" + last_str + " sampled=" + to_string(sampled))
+}
+if insuf_cmp == "1" {
+    fired.push("__ATLAS_ALERT__ FIRED rule=insufficient_ratio ratio=" + insuf_ratio_s + " threshold=" + insuf_thr_str + " last_n=" + last_str + " sampled=" + to_string(sampled))
+}
+
+// ─── human-readable summary (suppressed when --quiet) ────────────────────────
+if !QUIET {
+    println("═══ ATLAS ALERT SUBSCRIBER — timeline=" + timeline_path)
+    println("  scope=" + TARGET_SCOPE + "  total_matched=" + to_string(total_matched) + "  last_n_requested=" + last_str + "  sampled=" + to_string(sampled))
+    println("  tally: PASS=" + to_string(pass_n) + " WARN=" + to_string(warn_n) + " INSUFFICIENT_DATA=" + to_string(insuf_n) + " other=" + to_string(other_n))
+    println("  ratios: warn=" + warn_ratio_s + " (thr=" + warn_thr_str + ")  insufficient=" + insuf_ratio_s + " (thr=" + insuf_thr_str + ")")
+    if len(fired) > 0 {
+        println("  ALERT(S) FIRED:")
+        let mut fi = 0
+        while fi < len(fired) {
+            println("    " + fired[fi])
+            fi = fi + 1
+        }
+        println("  fix:    investigate analyzer output / bridge_health_history.tsv freshness / upstream API outage")
+    } else {
+        println("  no rules fired")
+    }
+}
+
+// ─── sentinel emission (always) ──────────────────────────────────────────────
+if len(fired) > 0 {
+    let mut fi = 0
+    while fi < len(fired) {
+        println(fired[fi])
+        fi = fi + 1
+    }
+} else {
+    println("__ATLAS_ALERT__ PASS sampled=" + to_string(sampled) + " rules_evaluated=" + to_string(rules_evaluated))
+}
