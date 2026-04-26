@@ -33,6 +33,16 @@
 #   BRIDGE_HELPER_MAX_RETRY   : override retry count (default 3)
 #   BRIDGE_HELPER_MAX_TIME    : per-request curl --max-time (default 12)
 #   BRIDGE_HELPER_VERBOSE     : if "1", emit diagnostic trace to stderr
+#   BRIDGE_HELPER_UA          : if set, passed to curl as `-A "$BRIDGE_HELPER_UA"` (polite User-Agent)
+#   BRIDGE_HELPER_HEADERS     : if set, multi-line newline-separated; each non-empty line passed as `-H "$line"`
+#                                (e.g. "accept: application/json", "Authorization: Bearer ...")
+#   BRIDGE_HELPER_TIMEOUT     : if set, passed as `--max-time "$BRIDGE_HELPER_TIMEOUT"` (overrides MAX_TIME for caller-scoped tightening)
+#
+# ω-bridge-4 (2026-04-26): UA / extra-headers / per-call-timeout pass-through restored
+#   for the 8 bridges that lost them in the ω-bridge-3 sweep (cmb/nanograv/icecube/arxiv/
+#   openalex/lhc previously sent polite-UA; wikipedia/uniprot previously sent Accept).
+#   Default behaviour unchanged when env vars unset (backward-compat with the 16 already
+#   migrated bridges). See state/omega_bridge_4_header_passthrough.json.
 #
 # Compliance: raw 66 (reason+fix on diags), raw 71 (report-only diagnostics on stderr,
 #             body unchanged on stdout), raw 73 (deterministic 4xx no-retry).
@@ -70,10 +80,28 @@ cmd_fetch() {
         return 1
     fi
 
+    # ω-bridge-4: assemble caller-supplied extras (UA / headers / per-call timeout) once.
+    # Empty arrays ⇒ no behavioural change; backward-compat with ω-bridge-3 callers.
+    local -a extra_args=()
+    if [ -n "${BRIDGE_HELPER_UA:-}" ]; then
+        extra_args+=(-A "$BRIDGE_HELPER_UA")
+        _log "UA set: $BRIDGE_HELPER_UA"
+    fi
+    if [ -n "${BRIDGE_HELPER_HEADERS:-}" ]; then
+        while IFS= read -r hdr; do
+            [ -n "$hdr" ] && extra_args+=(-H "$hdr") && _log "header set: $hdr"
+        done <<< "$BRIDGE_HELPER_HEADERS"
+    fi
+    local effective_max_time="$MAX_TIME"
+    if [ -n "${BRIDGE_HELPER_TIMEOUT:-}" ]; then
+        effective_max_time="$BRIDGE_HELPER_TIMEOUT"
+        _log "timeout override: $effective_max_time"
+    fi
+
     # bypass mode = raw passthrough (preserves legacy single-attempt behaviour for debug)
     if [ "${BRIDGE_HELPER_DISABLE:-0}" = "1" ]; then
         _log "DISABLE=1, raw curl passthrough"
-        curl -s --max-time "$MAX_TIME" "$url" 2>/dev/null
+        curl -s --max-time "$effective_max_time" ${extra_args[@]+"${extra_args[@]}"} "$url" 2>/dev/null
         return $?
     fi
 
@@ -143,7 +171,7 @@ cmd_fetch() {
     while [ "$attempt" -le "$MAX_RETRY" ]; do
         echo "$(_now_epoch)" > "$lock_file" 2>/dev/null
         # write body to tmp file; capture http_code separately so the stdout body stays clean
-        http_code=$(curl -sS -o "$tmp_out" -w '%{http_code}' --max-time "$MAX_TIME" "$url" 2>/dev/null)
+        http_code=$(curl -sS -o "$tmp_out" -w '%{http_code}' --max-time "$effective_max_time" ${extra_args[@]+"${extra_args[@]}"} "$url" 2>/dev/null)
         local curl_ec=$?
         body=$(cat "$tmp_out" 2>/dev/null)
         _log "attempt=$attempt curl_ec=$curl_ec http_code=$http_code body_bytes=${#body}"
