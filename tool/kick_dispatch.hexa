@@ -573,6 +573,120 @@ fn _auto_absorb_witness(witness_path: str) {
     println("__KICK_AUTO_ABSORB__ PASS witness=" + witness_path + " shards=1 new_lines=" + to_string(new_lines))
 }
 
+// ─── claude_code multi-slot helper bridge (raw 80 + raw 66) ──────────
+// Decision: route claude_code spawns through tool/claude_slot_pick.hexa so
+// that limit-hit (rate_limit_event in stream-json OR "Claude Pro/Max plan
+// quota exhausted" terminal-error from hive child) auto-rotates to the
+// next slot. codex_cli + gemini_cli backends remain on the single-shot
+// path (their CLI auth model is different — no multi-account env switch).
+fn _slot_pick_tool() -> str {
+    return _nexus_root() + "/tool/claude_slot_pick.hexa"
+}
+
+fn _slot_id_from_dir(dir: str) -> str {
+    let prefix = env("HOME") + "/.claude-claude"
+    if !dir.starts_with(prefix) { return "" }
+    return dir.substring(prefix.len(), dir.len())
+}
+
+fn _claude_pick_slot(exclude_csv: str) -> str {
+    let tool = _slot_pick_tool()
+    if !_file_exists(tool) { return "" }
+    let mut cmd = _hexa_bin() + " run " + _shell_quote(tool) + " --pick"
+    if exclude_csv.len() > 0 { cmd = cmd + " --exclude " + _shell_quote(exclude_csv) }
+    return exec(cmd + " 2>/dev/null").trim()
+}
+
+fn _claude_mark_cooldown(slot_id: str, kind: str, until_epoch: i64) -> void {
+    let tool = _slot_pick_tool()
+    if !_file_exists(tool) { return }
+    let cmd = _hexa_bin() + " run " + _shell_quote(tool) +
+        " --mark-cooldown " + _shell_quote(slot_id) +
+        " --kind " + _shell_quote(kind) +
+        " --until-epoch " + to_string(until_epoch) +
+        " --source stream_json_signal"
+    let _ = exec(cmd + " >/dev/null 2>&1")
+}
+
+fn _claude_touch_slot(slot_id: str) -> void {
+    let tool = _slot_pick_tool()
+    if !_file_exists(tool) { return }
+    let cmd = _hexa_bin() + " run " + _shell_quote(tool) + " --touch " + _shell_quote(slot_id)
+    let _ = exec(cmd + " >/dev/null 2>&1")
+}
+
+fn _detect_rate_limit_kind(out: str) -> str {
+    // Returns "five_hour" | "seven_day" | "" (no rate-limit detected).
+    // Two captured signal sources:
+    //   (a) raw stream-json passthrough — `"type":"rate_limit_event"` + `"status":"rejected"`
+    //   (b) hive child terminal-error — "Claude Pro/Max plan quota exhausted (<window> window)"
+    let has_raw = out.index_of("rate_limit_event") >= 0 && out.index_of("\"status\":\"rejected\"") >= 0
+    let has_terminal = out.index_of("Claude Pro/Max plan quota exhausted") >= 0
+    if !has_raw && !has_terminal { return "" }
+    if out.index_of("seven_day") >= 0 { return "seven_day" }
+    if out.index_of("five_hour") >= 0 { return "five_hour" }
+    // Unknown window → conservative: treat as session (5h).
+    return "five_hour"
+}
+
+fn _detect_resets_epoch(out: str) -> i64 {
+    // Try numeric resetsAt first (claude CLI emits seconds — index.ts:1933).
+    let key1 = "\"resetsAt\":"
+    let i1 = out.index_of(key1)
+    if i1 >= 0 {
+        let mut j = i1 + key1.len()
+        while j < out.len() {
+            let c = out.substring(j, j + 1)
+            if c == " " || c == "\t" { j = j + 1 } else { break }
+        }
+        let mut end = j
+        while end < out.len() {
+            let c = out.substring(end, end + 1)
+            if c < "0" || c > "9" { break }
+            end = end + 1
+        }
+        if end > j {
+            let num_s = out.substring(j, end)
+            let mut v: i64 = 0
+            try { v = to_int(num_s) } catch e { v = 0 }
+            if v > 0 { return v }
+        }
+    }
+    // Try "Resets at <ISO>" from terminal-error message.
+    let key2 = "Resets at "
+    let i2 = out.index_of(key2)
+    if i2 >= 0 {
+        let rest = out.substring(i2 + key2.len(), out.len())
+        let mut e: i64 = 0
+        while e < rest.len() {
+            let c = rest.substring(e, e + 1)
+            if c == " " || c == "\n" || c == "\r" { break }
+            e = e + 1
+        }
+        let mut iso = rest.substring(0, e).trim()
+        // Trim trailing "."
+        if iso.ends_with(".") { iso = iso.substring(0, iso.len() - 1) }
+        // Strip milliseconds (".000Z" → "Z") since BSD date can't parse them in -f.
+        let dot = iso.index_of(".")
+        if dot >= 0 && iso.ends_with("Z") { iso = iso.substring(0, dot) + "Z" }
+        if iso.ends_with("Z") {
+            let cmd = "TZ=UTC date -j -u -f '%Y-%m-%dT%H:%M:%SZ' " + _shell_quote(iso) + " +%s 2>/dev/null"
+            let r = exec(cmd).trim()
+            let mut v: i64 = 0
+            try { v = to_int(r) } catch e { v = 0 }
+            if v > 0 { return v }
+        }
+    }
+    return 0
+}
+
+fn _now_unix_int() -> i64 {
+    let s = exec("date +%s").trim()
+    let mut v: i64 = 0
+    try { v = to_int(s) } catch e { v = 0 }
+    return v
+}
+
 fn _append_envelope_log(path: str, line: str) {
     let dir_end = path.last_index_of("/")
     if dir_end > 0 {
@@ -741,15 +855,74 @@ fn main() -> void {
     // bash -c when the prompt had ω/em-dash + parens — observed 2026-04-26
     // first live-spawn smoke). subagent_dispatch reads the file content as
     // the task atomically, preserving newlines + multibyte verbatim.
-    let cmd = _hexa_bin() + " run " + _shell_quote(dispatch_tool) + " " + _shell_quote(parent_sid) + " --task-file " + _shell_quote(prompt_path)
-    let rc_str = exec(cmd + " 2>&1; echo __RC=$?").trim()
-    let rc_idx = rc_str.last_index_of("__RC=")
     let mut rc: i64 = 0
-    if rc_idx >= 0 {
-        let tail = rc_str.substring(rc_idx + 5, rc_str.len()).trim()
-        try { rc = to_int(tail) } catch e { rc = 0 }
+    if backend_slug == "claude_code" {
+        // Multi-slot loop: pick LRU available slot, spawn, scan output for
+        // rate_limit_event signal, mark cooldown + retry next slot. Hard-fail
+        // (raw 66 reason+fix) when pool exhausted.
+        let mut tried: [str] = []
+        let mut attempts: i64 = 0
+        let max_attempts: i64 = 16
+        while true {
+            attempts = attempts + 1
+            if attempts > max_attempts {
+                eprintln("__KICK_RESULT__ FAIL witness=" + witness_path + " tier1=0 falsifier_pass=0")
+                eprintln("reason=slot-rotation-overflow fix=hexa run " + _slot_pick_tool() + " --list   # rotated " + to_string(max_attempts) + "× without success")
+                exit(2)
+            }
+            let mut excl = ""
+            let mut t: i64 = 0
+            while t < len(tried) {
+                if excl.len() > 0 { excl = excl + "," }
+                excl = excl + tried[t]
+                t = t + 1
+            }
+            let cfg_dir = _claude_pick_slot(excl)
+            if cfg_dir.len() == 0 {
+                eprintln("__KICK_RESULT__ FAIL witness=" + witness_path + " tier1=0 falsifier_pass=0")
+                eprintln("reason=all-claude-slots-exhausted fix=hexa run " + _slot_pick_tool() + " --list   # all slots in cooldown or pool empty; rm ~/.claude-claude*/.kick_limit_until if you believe limits have reset")
+                exit(2)
+            }
+            let slot_id = _slot_id_from_dir(cfg_dir)
+            let cmd = "CLAUDE_CONFIG_DIR=" + _shell_quote(cfg_dir) + " " +
+                _hexa_bin() + " run " + _shell_quote(dispatch_tool) + " " +
+                _shell_quote(parent_sid) + " --task-file " + _shell_quote(prompt_path)
+            let out = exec(cmd + " 2>&1; echo __RC=$?")
+            let rc_idx = out.last_index_of("__RC=")
+            let mut local_rc: i64 = 0
+            if rc_idx >= 0 {
+                let tail = out.substring(rc_idx + 5, out.len()).trim()
+                try { local_rc = to_int(tail) } catch e { local_rc = 0 }
+            }
+            print(out)
+            rc = local_rc
+            let rl_kind = _detect_rate_limit_kind(out)
+            if rl_kind.len() > 0 {
+                let mut cooldown_until = _detect_resets_epoch(out)
+                if cooldown_until <= 0 {
+                    let now_e = _now_unix_int()
+                    cooldown_until = if rl_kind == "seven_day" { now_e + 7 * 24 * 3600 } else { now_e + 5 * 3600 }
+                }
+                let kind_kw = if rl_kind == "seven_day" { "weekly" } else { "session" }
+                _claude_mark_cooldown(slot_id, kind_kw, cooldown_until)
+                tried = tried + [slot_id]
+                eprintln("# kick_dispatch: slot=" + slot_id + " rate-limited (" + rl_kind + "); cooldown until epoch=" + to_string(cooldown_until) + "; rotating to next slot")
+                continue
+            }
+            if local_rc == 0 { _claude_touch_slot(slot_id) }
+            break
+        }
+    } else {
+        // codex_cli / gemini_cli — unchanged single-shot path.
+        let cmd = _hexa_bin() + " run " + _shell_quote(dispatch_tool) + " " + _shell_quote(parent_sid) + " --task-file " + _shell_quote(prompt_path)
+        let rc_str = exec(cmd + " 2>&1; echo __RC=$?").trim()
+        let rc_idx = rc_str.last_index_of("__RC=")
+        if rc_idx >= 0 {
+            let tail = rc_str.substring(rc_idx + 5, rc_str.len()).trim()
+            try { rc = to_int(tail) } catch e { rc = 0 }
+        }
+        print(rc_str)
     }
-    print(rc_str)
     if rc != 0 {
         eprintln("__KICK_RESULT__ FAIL witness=" + witness_path + " tier1=0 falsifier_pass=0")
         eprintln("reason=spawn-failed-rc-" + to_string(rc) + " fix=tail " + runs_root + "/prompt.txt; check hive subagent state at ~/.hive/subagent-state")
