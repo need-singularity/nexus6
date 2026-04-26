@@ -1,0 +1,138 @@
+// tool/grep_c_fallback_audit.hexa — block the `grep -c X || echo N` antipattern.
+//
+// @tool(slug="grep_c_fallback_audit", desc="lint scan for the `grep -c X 2>/dev/null || echo N` antipattern that emits multi-line `N\\n0` to caller, tripping bare to_int() with 'trailing garbage'. Severity-block exits non-zero on any hit (CI / pre-commit usable). Excludes _safety_test self-files and explicitly-allowed callsites tagged `// @grep-c-fallback-audit-allow=<reason>`.")
+// @usage(hexa /Users/ghost/core/nexus/tool/grep_c_fallback_audit.hexa [--severity block|warn] [--root <dir>...] [--quiet])
+// @exit_codes(0=PASS_or_warn, 1=BLOCK_violation_present, 2=usage)
+//
+// raw 80 sentinel: __GREPC_AUDIT__ <PASS|FAIL> hits=<N> severity=<block|warn>
+// raw 66 err:     reason=<slug> fix=<directive>
+//
+// Default scan roots: nexus/tool, nexus/cli, hive/tool.
+// Pattern (ERE):    (grep -c|grep -cE|grep -cF|grep -c -[EF])[^|]*\|\|[[:space:]]*echo[[:space:]]+[0-9]+
+//                   — anchored on `grep -c` so we don't false-positive on the
+//                   harmless `test -f X && echo 1 || echo 0` boolean idiom.
+//
+// Allow-tag:        a `// @grep-c-fallback-audit-allow=<reason>` comment on the
+//                   same line is honoured (escape hatch for code-emission
+//                   templates).  Reason is REQUIRED.
+
+fn _str(x: any) -> string { return to_string(x) }
+
+fn _shq(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _file_exists(path: string) -> bool {
+    let r = _str(exec("test -f " + _shq(path) + " && echo y || echo n")).trim()
+    return r == "y"
+}
+
+fn _dir_exists(path: string) -> bool {
+    let r = _str(exec("test -d " + _shq(path) + " && echo y || echo n")).trim()
+    return r == "y"
+}
+
+fn _arg_value(argv: [string], flag: string, default: string) -> string {
+    let mut i: i64 = 0
+    while i < argv.len() {
+        if argv[i] == flag && (i + 1) < argv.len() { return argv[i + 1] }
+        i = i + 1
+    }
+    return default
+}
+
+fn _has_flag(argv: [string], flag: string) -> bool {
+    let mut i: i64 = 0
+    while i < argv.len() {
+        if argv[i] == flag { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _collect_roots(argv: [string]) -> [string] {
+    let mut out: [string] = []
+    let mut i: i64 = 0
+    while i < argv.len() {
+        if argv[i] == "--root" && (i + 1) < argv.len() { out = out.push(argv[i + 1]); i = i + 2; continue }
+        i = i + 1
+    }
+    if out.len() == 0 {
+        let home = env("HOME")
+        out = out.push(home + "/core/nexus/tool")
+        out = out.push(home + "/core/nexus/cli")
+        out = out.push(home + "/core/hive/tool")
+    }
+    return out
+}
+
+fn main() -> void {
+    let argv = args()
+    if _has_flag(argv, "--help") || _has_flag(argv, "-h") {
+        println("usage: hexa grep_c_fallback_audit.hexa [--severity block|warn] [--root DIR ...] [--quiet]")
+        println("scans for `grep -c X || echo N` antipattern; severity=block exits 1 on any hit")
+        exit(0)
+    }
+    let severity = _arg_value(argv, "--severity", "block")
+    let quiet = _has_flag(argv, "--quiet")
+    let roots = _collect_roots(argv)
+
+    // Build a single grep ERE pass across all roots that exist.
+    let pattern = "(grep -c|grep -cE|grep -cF|grep -c -E|grep -c -F)[^|]*\\|\\|[[:space:]]*echo[[:space:]]+[0-9]+"
+    let mut existing: [string] = []
+    let mut i: i64 = 0
+    while i < roots.len() {
+        if _dir_exists(roots[i]) { existing = existing.push(roots[i]) }
+        i = i + 1
+    }
+    if existing.len() == 0 {
+        eprintln("# grep_c_fallback_audit: reason=no-scan-roots fix=pass --root <dir> or ensure HOME/core/{nexus,hive} exist")
+        println("__GREPC_AUDIT__ PASS hits=0 severity=" + severity)
+        exit(0)
+    }
+
+    let mut roots_arg = ""
+    let mut j: i64 = 0
+    while j < existing.len() { roots_arg = roots_arg + " " + _shq(existing[j]); j = j + 1 }
+
+    // -E for ERE. -n for line numbers. -r recursive.  Suppress its own non-zero
+    // exit (1 = no matches) via `|| true` — we ARE the lint, can't loop forever.
+    let cmd = "{ grep -rnE " + _shq(pattern) + roots_arg + " 2>/dev/null || true; }"
+    let raw = _str(exec(cmd))
+    let lines = raw.split("\n")
+
+    let mut hits: i64 = 0
+    let mut allowed: i64 = 0
+    let mut k: i64 = 0
+    while k < lines.len() {
+        let ln = lines[k]
+        if ln.len() == 0 { k = k + 1; continue }
+        // Skip self + the regression test files (they MENTION the pattern in
+        // strings/docs, not as live code).  Anchor on basename.
+        let is_self = ln.contains("grep_c_fallback_audit.hexa") ||
+                      ln.contains("grep_c_fallback_safety_test.hexa") ||
+                      ln.contains("kick_to_int_safety_test.hexa")
+        if is_self { k = k + 1; continue }
+        // Honour explicit allow-tag on the same line.
+        if ln.contains("@grep-c-fallback-audit-allow=") {
+            allowed = allowed + 1
+            if !quiet { println("ALLOWED " + ln) }
+            k = k + 1; continue
+        }
+        hits = hits + 1
+        if !quiet { println("HIT " + ln) }
+        k = k + 1
+    }
+
+    if hits > 0 {
+        if severity == "block" {
+            println("__GREPC_AUDIT__ FAIL hits=" + to_string(hits) + " allowed=" + to_string(allowed) + " severity=block")
+            eprintln("reason=grep-c-fallback-antipattern-present fix=convert each hit to '{ grep -c X 2>/dev/null || true; }' and add caller-side empty→default + first-line guard (mirrors omega-cycle 31-hit sweep + tool/grep_c_fallback_safety_test.hexa)")
+            exit(1)
+        }
+        println("__GREPC_AUDIT__ WARN hits=" + to_string(hits) + " allowed=" + to_string(allowed) + " severity=warn")
+        exit(0)
+    }
+    println("__GREPC_AUDIT__ PASS hits=0 allowed=" + to_string(allowed) + " severity=" + severity)
+    exit(0)
+}

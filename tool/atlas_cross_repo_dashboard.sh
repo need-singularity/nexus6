@@ -151,7 +151,8 @@ for entry in "${REPOS[@]}"; do
     last_commit_ts=""
     if [ -f "$atlas_path" ]; then
         lines=$(wc -l < "$atlas_path" | tr -d ' ')
-        entries=$(grep -cE '^@[PCFLRSXMTE] ' "$atlas_path" 2>/dev/null || echo 0)
+        entries=$({ grep -cE '^@[PCFLRSXMTE] ' "$atlas_path" 2>/dev/null || true; } | head -n1)
+        entries=${entries:-0}
         last_commit_short=$(cd "$path" && git log -n 1 --format="%h" -- "$atlas_rel" 2>/dev/null)
         last_commit_ts=$(cd "$path" && git log -n 1 --format="%ai" -- "$atlas_rel" 2>/dev/null | cut -c1-16)
     fi

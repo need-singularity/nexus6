@@ -299,7 +299,8 @@ fn check_git_destruction_cmd(tool: str, arg: str) -> str {
                         tail.contains(" -a") || tail.contains(" --all")
             if has_u == false {
                 // untracked 실제 존재 검사 (없으면 통과 — 무해한 stash)
-                let untracked_count = to_string(exec("git status --porcelain 2>/dev/null | grep -c '^??' || echo 0")).trim()  // @allow-bare-exec
+                let untracked_count_raw = to_string(exec("{ git status --porcelain 2>/dev/null | grep -c '^??' || true; }")).trim()  // @allow-bare-exec
+                let untracked_count = if untracked_count_raw == "" { "0" } else { untracked_count_raw.split("\n")[0] }
                 if untracked_count != "0" && untracked_count != "" {
                     return "REJECT: git stash without -u 차단 (H-NO-GIT-DESTRUCT, 2026-04-17 사건) — untracked " + untracked_count + "개 존재 시 stash 보존 안 됨, 후속 reset/checkout 으로 영구 소실 위험. 안전대안: git stash --include-untracked 또는 git add 선행. 우회: NEXUS_GIT_OK=1 prefix"
                 }

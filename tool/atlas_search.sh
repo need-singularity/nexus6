@@ -84,7 +84,8 @@ if [ "$LIST_SHARDS" = "1" ]; then
     echo "atlas shards (${#SHARDS[@]} total):"
     for s in "${SHARDS[@]}"; do
         local_lines=$(wc -l < "$s" 2>/dev/null | tr -d ' ')
-        local_entries=$(grep -cE '^@[PCFLRSXMTE] ' "$s" 2>/dev/null || echo 0)
+        local_entries=$({ grep -cE '^@[PCFLRSXMTE] ' "$s" 2>/dev/null || true; } | head -n1)
+        local_entries=${local_entries:-0}
         printf "  %6d lines  %4d entries  %s\n" "$local_lines" "$local_entries" "$(basename "$s")"
     done
     echo "__ATLAS_SEARCH__ shards=${#SHARDS[@]}"

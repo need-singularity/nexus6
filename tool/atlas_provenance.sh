@@ -117,7 +117,8 @@ shard_provenance() {
     fi
     local rel_shard="${shard#$NEXUS_ROOT/}"
     local total
-    total=$(grep -cE '^@[PCFLRSXMTE] ' "$shard" 2>/dev/null || echo 0)
+    total=$({ grep -cE '^@[PCFLRSXMTE] ' "$shard" 2>/dev/null || true; } | head -n1)
+    total=${total:-0}
     local first_hash last_hash last_author last_ts
     first_hash=$(cd "$NEXUS_ROOT" && git log --reverse --format="%h" -- "$rel_shard" 2>/dev/null | head -1)
     last_hash=$(cd "$NEXUS_ROOT" && git log -n 1 --format="%h" -- "$rel_shard" 2>/dev/null)

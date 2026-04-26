@@ -87,7 +87,8 @@ if [ -f "$FALSIFIERS" ]; then
         [ -n "$atlas_id" ] && existing_ids="$existing_ids|$atlas_id|"
     done < "$FALSIFIERS"
 fi
-EXISTING_COUNT=$(grep -cE '^\{"id":"F' "$FALSIFIERS" 2>/dev/null || echo 0)
+EXISTING_COUNT=$({ grep -cE '^\{"id":"F' "$FALSIFIERS" 2>/dev/null || true; } | head -n1)
+EXISTING_COUNT=${EXISTING_COUNT:-0}
 
 # Step 2: scan high-grade entries (use atlas_search shard reading)
 SCANNED=0

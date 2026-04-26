@@ -64,8 +64,11 @@ echo "stderr=$SINK_ERR ($(wc -l < "$SINK_ERR") lines)"
 echo "--- NEXUS_OMEGA emits in stderr ---"
 grep "NEXUS_OMEGA " "$SINK_ERR" || echo "(none)"
 
-APPROACH_COUNT=$(grep -c '"event":"ghost_ceiling_approach"' "$SINK_ERR" 2>/dev/null || echo 0)
-DISPATCH_COUNT=$(grep -c '"event":"dispatch"' "$SINK_ERR" 2>/dev/null || echo 0)
-COMPLETE_COUNT=$(grep -c '"event":"complete"' "$SINK_ERR" 2>/dev/null || echo 0)
+APPROACH_COUNT=$({ grep -c '"event":"ghost_ceiling_approach"' "$SINK_ERR" 2>/dev/null || true; } | head -n1)
+DISPATCH_COUNT=$({ grep -c '"event":"dispatch"' "$SINK_ERR" 2>/dev/null || true; } | head -n1)
+COMPLETE_COUNT=$({ grep -c '"event":"complete"' "$SINK_ERR" 2>/dev/null || true; } | head -n1)
+APPROACH_COUNT=${APPROACH_COUNT:-0}
+DISPATCH_COUNT=${DISPATCH_COUNT:-0}
+COMPLETE_COUNT=${COMPLETE_COUNT:-0}
 echo "--- counts ---"
 echo "dispatch=$DISPATCH_COUNT approach=$APPROACH_COUNT complete=$COMPLETE_COUNT"

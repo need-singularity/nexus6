@@ -113,7 +113,8 @@ layer_2_entry_count() {
     local shard="$1"
     local name="$(basename "$shard")"
     local n6_count
-    n6_count=$(grep -cE '^@[PCFLRSXMTE] [^ ]+ =' "$shard" 2>/dev/null || echo 0)
+    n6_count=$({ grep -cE '^@[PCFLRSXMTE] [^ ]+ =' "$shard" 2>/dev/null || true; } | head -n1)
+    n6_count=${n6_count:-0}
     local json_out
     json_out=$(HEXA_RESOLVER_NO_REROUTE=1 "$HEXA_BIN" run "$SERIALIZER" --read-n6 "$shard" 2>/dev/null)
     # parse "primitives=N constants=M ..." from sentinel OR count "id" appearances in JSON

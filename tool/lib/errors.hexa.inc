@@ -24,7 +24,7 @@ fn _err_str(x) -> string {
     return ""
 }
 
-// ─── 첫 줄 기반 int 파싱 (grep -c || echo 0 이중출력 방어, R33) ───
+// ─── 첫 줄 기반 int 파싱 (grep -c || echo 0 이중출력 방어, R33) ───  // @grep-c-fallback-audit-allow=doc-comment-only
 fn _err_to_int0(s: string) -> i64 {
     if s == "" { return 0 }
     let first = _err_str(s.split("\n")[0]).trim()
