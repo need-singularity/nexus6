@@ -1215,14 +1215,39 @@ _run_ssh_once() {
 # Backoff: 1s → 2s → 4s, max 3 retries. Total worst case ≈ 7s + ssh setup.
 # Disable: HEXA_REMOTE_NO_RECONNECT=1 (debug, or when caller has its own retry).
 # Tunable: HEXA_REMOTE_RECONNECT_MAX=N (default 3).
+#
+# ω-network-1 (2026-04-26): instrumentation only — appends one TSV line per
+# attempt (success OR retry OR non-retry exit) to /tmp/hexa_remote_reconnect.log.
+# Format: <iso_ts>\t<host>\t<attempt_n>\t<max>\t<rc>\t<err_class>\t<outcome>\t<backoff_s>
+#   err_class ∈ {NONE, TIMEOUT, UNREACHABLE, RESET, KEX, DNS, OTHER}
+#   outcome   ∈ {SUCCESS, RETRY, NONRETRY_EXIT, EXHAUSTED}
+# Disable: HEXA_REMOTE_RECONNECT_LOG=0. Path override: HEXA_REMOTE_RECONNECT_LOG_PATH.
+# No behavior change — calibration left as 1s/2s/4s × 3 pending data accumulation
+# (raw#41). Future cycle (omega-network-1.next) reads this log to decide A/B tune.
 _run_ssh_with_reconnect() {
     local _host="$1"
     local _max="${HEXA_REMOTE_RECONNECT_MAX:-3}"
     local _attempt=0 _backoff=1 _rc _err_tmp
+    local _recon_log="${HEXA_REMOTE_RECONNECT_LOG_PATH:-/tmp/hexa_remote_reconnect.log}"
+    local _recon_log_on="${HEXA_REMOTE_RECONNECT_LOG:-1}"
+
+    # Emit one TSV row. Args: attempt, rc, err_class, outcome, backoff_s.
+    # Failures (disk full, perm) are silently swallowed — instrumentation must
+    # never break the dispatch path.
+    _recon_log_emit() {
+        [ "$_recon_log_on" = "1" ] || return 0
+        local _ts
+        _ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo 'unknown')"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$_ts" "$_host" "$1" "$_max" "$2" "$3" "$4" "$5" \
+            >> "$_recon_log" 2>/dev/null || true
+    }
 
     if [ "${HEXA_REMOTE_NO_RECONNECT:-0}" = "1" ]; then
         _run_ssh_once "$_host"
-        return $?
+        local _rc_one=$?
+        _recon_log_emit 0 "$_rc_one" "NONE" "DISABLED" 0
+        return "$_rc_one"
     fi
 
     while :; do
@@ -1238,27 +1263,37 @@ _run_ssh_with_reconnect() {
         _rc=$?
         wait 2>/dev/null || true
 
-        # Success or already exhausted retries → done.
-        if [ "$_rc" = "0" ] || [ "$_attempt" -ge "$_max" ]; then
+        # Success → log + done.
+        if [ "$_rc" = "0" ]; then
+            _recon_log_emit "$_attempt" "$_rc" "NONE" "SUCCESS" 0
             rm -f "$_err_tmp" 2>/dev/null || true
             return "$_rc"
         fi
 
         # Inspect stderr for network-class signatures. Anything else (auth,
         # remote rc!=0, SIGKILL on remote) is NOT a reconnect candidate.
-        local _is_net=0 _err_tail
+        local _is_net=0 _err_tail _err_class="NONE"
         _err_tail="$(tail -n 5 "$_err_tmp" 2>/dev/null)"
         case "$_err_tail" in
-            *"Connection timed out"*|*"Operation timed out"*|*"timed out"*) _is_net=1 ;;
-            *"Network is unreachable"*|*"No route to host"*) _is_net=1 ;;
-            *"Connection reset by peer"*|*"Connection closed by"*) _is_net=1 ;;
-            *"kex_exchange_identification"*|*"banner exchange"*) _is_net=1 ;;
-            *"Could not resolve hostname"*|*"Name or service not known"*) _is_net=1 ;;
+            *"Connection timed out"*|*"Operation timed out"*|*"timed out"*) _is_net=1; _err_class="TIMEOUT" ;;
+            *"Network is unreachable"*|*"No route to host"*) _is_net=1; _err_class="UNREACHABLE" ;;
+            *"Connection reset by peer"*|*"Connection closed by"*) _is_net=1; _err_class="RESET" ;;
+            *"kex_exchange_identification"*|*"banner exchange"*) _is_net=1; _err_class="KEX" ;;
+            *"Could not resolve hostname"*|*"Name or service not known"*) _is_net=1; _err_class="DNS" ;;
+            *) [ "$_rc" = "255" ] && _err_class="OTHER" ;;
         esac
+
+        # Exhausted retries → log EXHAUSTED + return.
+        if [ "$_attempt" -ge "$_max" ]; then
+            _recon_log_emit "$_attempt" "$_rc" "$_err_class" "EXHAUSTED" 0
+            rm -f "$_err_tmp" 2>/dev/null || true
+            return "$_rc"
+        fi
 
         # ssh exit 255 = ssh-side failure (transport/protocol); often network.
         # Combined with stderr signature gives high confidence.
         if [ "$_is_net" = "0" ] && [ "$_rc" != "255" ]; then
+            _recon_log_emit "$_attempt" "$_rc" "$_err_class" "NONRETRY_EXIT" 0
             rm -f "$_err_tmp" 2>/dev/null || true
             return "$_rc"
         fi
@@ -1267,6 +1302,7 @@ _run_ssh_with_reconnect() {
         local _err_short
         _err_short="$(printf '%s' "$_err_tail" | tr '\n' '|' | cut -c 1-120)"
         echo "hexa_remote: auto-reconnect retry $_attempt/$_max after rc=$_rc (${_err_short}) — sleeping ${_backoff}s" >&2
+        _recon_log_emit "$_attempt" "$_rc" "$_err_class" "RETRY" "$_backoff"
         rm -f "$_err_tmp" 2>/dev/null || true
         sleep "$_backoff"
         _backoff=$((_backoff * 2))
