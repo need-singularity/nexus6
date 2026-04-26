@@ -1,4 +1,5 @@
-// tool/chflags_lock_native.hexa — ai-native chflags uchg wrapper with metadata sidecar.
+// tool/chflags_lock_native.hexa — ai-native (raw 66) wrapper for chflags uchg/schg
+//                                  with mandatory reason+fix metadata sidecar.
 //
 // @no-lock-needed
 // @no-sandbox
@@ -6,49 +7,48 @@
 // @omega-saturation-exempt("static OS-level enforcement primitive — single-shot lock/unlock is idempotent per raw 65")
 // @chflags-lock-wrapper — only authorized bare chflags caller (audited by tool/chflags_lock_audit.hexa)
 //
-// PURPOSE
-//   Replaces bare `chflags uchg <path>` / `chflags nouchg <path>` calls
-//   across nexus + sister repos. Bare callers leave no record of WHY the
-//   path was locked, leaving downstream agents with kernel EPERM and no
-//   reason/fix surface. raw#66 (ai-native-error-message) demands every
-//   error site emit reason+fix in machine-readable form.
-//
-//   This wrapper:
-//     1. requires reason+fix at lock time (raw 66 hard-fail if missing)
-//     2. writes metadata sidecar at ~/.local/state/chflags_locks/<path-sha>.json
-//     3. lookup helper returns the ai-native error string for any locked path
-//     4. unlock helper GC's the metadata sidecar (no orphans)
-//     5. self-references — wrapper records its own metadata for its own
-//        chflags syscalls (audit-grade dogfood)
+// architecture witness (4 Tier-1 promotions, 14 falsifiers):
+//   /Users/ghost/core/nexus/design/kick/2026-04-26_chflags-lock-ai-native-error-message-raw-66-reason-fix-guida_omega_cycle.json
+//   commit 81f9e268
 //
 // SUBCOMMANDS
-//   lock    --path <p> --reason <r> --fix <f> [--guidance <g>] [--actor <id>]
-//   unlock  --path <p>
-//   lookup  --path <p>           — emits ai-native error string if locked, exit 0; null+exit 0 if not
-//   status  --path <p>           — pretty-print state + metadata
-//   list                         — list all metadata sidecars
-//   selftest                     — falsifier suite (raw 66 + raw 80 + GC + self-ref)
+//   lock    --path <p> --reason <r> --fix <f> [--fix <f>...] [--guidance <g>...] [--level L1|L2]
+//   unlock  --path <p> [--reason <r>] [--level L1|L2]
+//   lookup  --path <p> [--json]
+//   explain --path <p>     — EPERM-victim helper (emits raw 66 trailer to stderr)
+//   status  --path <p>     — pretty-print state + metadata
+//   list                   — list all sidecars (sibling + central)
+//   selftest               — F1-F7 falsifier suite
 //
 // EXIT CODES
 //   0 = success (also for lookup-unlocked-null)
 //   1 = io / chflags failure
 //   2 = required arg missing → ai-native raw 66 hard-fail
-//   3 = lock attempt collided with existing lock (different reason)
+//   3 = lock collision (different reason on same path)
 //   4 = path missing
 //
-// SENTINEL (raw 80)
-//   stdout LAST line: __CHFLAGS_LOCK_NATIVE_RESULT__ <PASS|FAIL> <op>
+// SENTINEL (raw 80)  — last stdout line:
+//   __CHFLAGS_LOCK_RESULT__ <PASS|FAIL> path=<abs> op=<lock|unlock|lookup|explain|status|list|selftest>
 //
-// SCHEMA — ~/.local/state/chflags_locks/<sha>.json
-//   {"path":"<abs>","reason":"<>","fix":"<>","guidance":"<>",
-//    "locked_at":"<UTC iso8601>","locked_by_pid":<int>,
-//    "locked_by_session":"<HEXA_SESSION_ID or hostname-pid>"}
+// SCHEMA — chflags_lock_native.v1
+//   required:  path, reason, fix[], locked_at, locked_by_pid, locked_by_session,
+//              locker_actor, schema_version
+//   optional:  guidance[], roadmap_ref, parent_lock_ts
+//
+// SIDECAR LOCATION (axis_metadata_sidecar_location decision)
+//   primary:  <abs_path>.lock_meta.json  (sibling — greppable by EPERM victim)
+//   fallback: ~/.local/state/chflags_locks/<sha256(abs)>.json  (when parent dir is itself locked)
 
-let HOME = env("HOME")
-let META_DIR = HOME + "/.local/state/chflags_locks"
-let SENTINEL_TAG = "__CHFLAGS_LOCK_NATIVE_RESULT__"
+let SCHEMA_VERSION = "chflags_lock_native.v1"
+let SENTINEL_TAG = "__CHFLAGS_LOCK_RESULT__"
 
-// ─── void-safe coercion ─────────────────────────────────────────────
+// wrapper-deps: paths that auto-inject canonical reason+fix on self-reference (F7)
+let WRAPPER_DEPS = [
+    "tool/chflags_lock_native.hexa",
+    "tool/chflags_lock_audit.hexa"
+]
+
+// ─── void-safe coercion + tiny helpers ───────────────────────────────────
 
 fn _str(x) -> string {
     let t = type_of(x)
@@ -56,23 +56,31 @@ fn _str(x) -> string {
     return ""
 }
 
-fn _to_int0(s: string) -> i64 {
-    if s == "" { return 0 }
-    let first = _str(s.split("\n")[0]).trim()
-    if first == "" { return 0 }
-    return to_int(first)
+fn _shq(s: string) -> string {
+    let r = s.replace("'", "'\\''")
+    return "'" + r + "'"
+}
+
+fn sh(cmd: string) -> string {
+    return _str(exec(cmd)).trim()
 }
 
 fn _utc_iso() -> string {
-    return _str(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()
+    return sh("date -u +%Y-%m-%dT%H:%M:%SZ")
 }
 
 fn _pid() -> string {
-    return _str(exec("echo $$")).trim()
+    return sh("echo $$")
 }
 
 fn _hostname() -> string {
-    return _str(exec("hostname -s 2>/dev/null")).trim()
+    return sh("hostname -s 2>/dev/null")
+}
+
+fn _actor() -> string {
+    let u = env("USER")
+    if u != "" { return u }
+    return "unknown"
 }
 
 fn _session() -> string {
@@ -80,71 +88,79 @@ fn _session() -> string {
     if s != "" { return s }
     let s2 = env("CLAUDE_SESSION_ID")
     if s2 != "" { return s2 }
+    let s3 = env("HIVE_SESSION_ID")
+    if s3 != "" { return s3 }
     return _hostname() + "-" + _pid()
 }
 
-fn _is_darwin() -> bool {
-    return _str(exec("uname -s")).trim() == "Darwin"
-}
-
-fn _is_linux() -> bool {
-    return _str(exec("uname -s")).trim() == "Linux"
-}
+fn _is_darwin() -> bool { return sh("uname -s") == "Darwin" }
+fn _is_linux()  -> bool { return sh("uname -s") == "Linux" }
 
 fn _path_exists(p: string) -> bool {
     if p == "" { return false }
     return file_exists(p)
 }
 
-// Resolve to absolute path — chflags + sidecar key must be canonical.
 fn _abs(p: string) -> string {
     if p == "" { return "" }
-    let esc = p.replace("'", "'\\''")
-    let r = _str(exec("python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' '" + esc + "' 2>/dev/null")).trim()
+    let r = sh("python3 -c 'import os,sys; print(os.path.abspath(os.path.expanduser(sys.argv[1])))' " + _shq(p) + " 2>/dev/null")
     if r != "" { return r }
-    // python3 unavailable → fallback to readlink -f / realpath
-    let r2 = _str(exec("readlink -f '" + esc + "' 2>/dev/null")).trim()
+    let r2 = sh("readlink -f " + _shq(p) + " 2>/dev/null")
     if r2 != "" { return r2 }
-    // last resort: prepend pwd if relative
     if p.substring(0, 1) == "/" { return p }
-    let pwd = _str(exec("pwd")).trim()
-    return pwd + "/" + p
+    return sh("pwd") + "/" + p
 }
 
 fn _path_sha(p: string) -> string {
-    let esc = p.replace("'", "'\\''")
-    let cmd = "printf '%s' '" + esc + "' | /usr/bin/shasum -a 256 2>/dev/null | cut -c1-32"
-    let r = _str(exec(cmd)).trim()
-    return r
+    return sh("printf '%s' " + _shq(p) + " | shasum -a 256 | awk '{print $1}'")
 }
 
-fn _meta_path(abs_path: string) -> string {
-    return META_DIR + "/" + _path_sha(abs_path) + ".json"
+// ─── sidecar location resolution (sibling primary, central fallback) ─────
+
+fn _central_dir() -> string { return env("HOME") + "/.local/state/chflags_locks" }
+fn _central_path(abs: string) -> string { return _central_dir() + "/" + _path_sha(abs) + ".json" }
+fn _sibling_path(abs: string) -> string { return abs + ".lock_meta.json" }
+
+// resolve which existing sidecar to read (sibling first, central fallback)
+fn _existing_sidecar(abs: string) -> string {
+    let sib = _sibling_path(abs)
+    if _path_exists(sib) { return sib }
+    let cen = _central_path(abs)
+    if _path_exists(cen) { return cen }
+    return ""
 }
 
-fn _ensure_meta_dir() -> int {
-    let r = exec_with_status("mkdir -p '" + META_DIR + "' 2>&1")
-    return r[1]
+// resolve where to write a new sidecar — sibling unless parent dir is locked
+fn _resolve_write_target(abs: string) -> string {
+    let parent = sh("dirname " + _shq(abs))
+    if parent == "" { return _sibling_path(abs) }
+    let pflags = sh("ls -lOd " + _shq(parent) + " 2>/dev/null | awk '{print $5}'")
+    if pflags.contains("uchg") || pflags.contains("schg") {
+        let _ = sh("mkdir -p " + _shq(_central_dir()))
+        return _central_path(abs)
+    }
+    return _sibling_path(abs)
 }
 
-// ─── chflags primitives (the ONLY authorized bare chflags calls) ────
-// @chflags-lock-wrapper-call-site
+// ─── lock-state probe (cross-platform) ───────────────────────────────────
 
-fn _darwin_has_uchg(path: string) -> bool {
-    let r = exec_with_status("ls -lOd '" + path + "' 2>/dev/null")
-    if r[1] != 0 { return false }
-    let line = _str(r[0])
+fn _darwin_locked(p: string) -> bool {
+    let line = sh("ls -lOd " + _shq(p) + " 2>/dev/null")
+    if line == "" { return false }
     if line.contains(" uchg ") { return true }
     if line.contains(" uchg,") { return true }
     if line.contains(",uchg ") { return true }
     if line.contains(",uchg,") { return true }
+    if line.contains(" schg ") { return true }
+    if line.contains(" schg,") { return true }
+    if line.contains(",schg ") { return true }
+    if line.contains(",schg,") { return true }
     return false
 }
 
-fn _linux_has_immutable(path: string) -> bool {
-    let r = exec_with_status("lsattr -d '" + path + "' 2>/dev/null")
-    if r[1] != 0 { return false }
-    let line = _str(r[0])
+fn _linux_locked(p: string) -> bool {
+    let line = sh("lsattr -d " + _shq(p) + " 2>/dev/null")
+    if line == "" { return false }
     let mut i = 0
     while i < len(line) {
         let c = line.substring(i, i + 1)
@@ -155,42 +171,47 @@ fn _linux_has_immutable(path: string) -> bool {
     return false
 }
 
-fn _is_locked_now(path: string) -> bool {
-    if !_path_exists(path) { return false }
-    if _is_darwin() { return _darwin_has_uchg(path) }
-    if _is_linux()  { return _linux_has_immutable(path) }
+fn _is_locked(p: string) -> bool {
+    if !_path_exists(p) { return false }
+    if _is_darwin() { return _darwin_locked(p) }
+    if _is_linux()  { return _linux_locked(p) }
     return false
 }
 
-fn _apply_uchg(path: string) -> int {
+// ─── chflags primitives — ONLY authorized bare chflags call sites ────────
+// @chflags-lock-wrapper-call-site
+
+fn _apply_flag(p: string, level: string) -> i64 {
     if _is_darwin() {
-        let r = exec_with_status("chflags uchg '" + path + "' 2>&1")
+        let cmd = if level == "L2" { "sudo -n chflags schg " + _shq(p) + " 2>&1" } else { "chflags uchg " + _shq(p) + " 2>&1" }
+        let r = exec_with_status(cmd)
         return r[1]
     }
     if _is_linux() {
-        let r = exec_with_status("chattr +i '" + path + "' 2>/dev/null")
+        let r = exec_with_status("chattr +i " + _shq(p) + " 2>/dev/null")
         if r[1] == 0 { return 0 }
-        let r2 = exec_with_status("sudo -n chattr +i '" + path + "' 2>&1")
+        let r2 = exec_with_status("sudo -n chattr +i " + _shq(p) + " 2>&1")
         return r2[1]
     }
     return 0
 }
 
-fn _remove_uchg(path: string) -> int {
+fn _remove_flag(p: string, level: string) -> i64 {
     if _is_darwin() {
-        let r = exec_with_status("chflags nouchg '" + path + "' 2>&1")
+        let cmd = if level == "L2" { "sudo -n chflags noschg " + _shq(p) + " 2>&1" } else { "chflags nouchg " + _shq(p) + " 2>&1" }
+        let r = exec_with_status(cmd)
         return r[1]
     }
     if _is_linux() {
-        let r = exec_with_status("chattr -i '" + path + "' 2>/dev/null")
+        let r = exec_with_status("chattr -i " + _shq(p) + " 2>/dev/null")
         if r[1] == 0 { return 0 }
-        let r2 = exec_with_status("sudo -n chattr -i '" + path + "' 2>&1")
+        let r2 = exec_with_status("sudo -n chattr -i " + _shq(p) + " 2>&1")
         return r2[1]
     }
     return 0
 }
 
-// ─── JSON encoding (no jq dependency) ───────────────────────────────
+// ─── JSON ────────────────────────────────────────────────────────────────
 
 fn _json_escape(s: string) -> string {
     let mut out = ""
@@ -208,9 +229,19 @@ fn _json_escape(s: string) -> string {
     return out
 }
 
-// naive single-key extractor — JSON value must be a quoted string with no
-// escaped quotes inside the value. Sidecar writer uses _json_escape so
-// embedded quotes are \" — unescape on read.
+fn _arr_to_json(arr: [string]) -> string {
+    let mut s = "["
+    let mut i = 0
+    while i < len(arr) {
+        if i > 0 { s = s + "," }
+        s = s + "\"" + _json_escape(arr[i]) + "\""
+        i = i + 1
+    }
+    return s + "]"
+}
+
+// single-key string extractor (sidecar bodies are produced by _json_escape, so
+// only \" \\ \n \r \t escapes are used).
 fn _json_get_str(body: string, key: string) -> string {
     let k = "\"" + key + "\":\""
     let idx = body.index_of(k)
@@ -268,497 +299,751 @@ fn _json_get_int(body: string, key: string) -> i64 {
     return n * sign
 }
 
-// ─── metadata sidecar I/O ───────────────────────────────────────────
-
-fn _write_meta(abs_path: string, reason: string, fix: string,
-               guidance: string, actor: string) -> int {
-    let _ = _ensure_meta_dir()
-    let mp = _meta_path(abs_path)
-    let body = "{\"path\":\"" + _json_escape(abs_path) + "\","
-             + "\"reason\":\"" + _json_escape(reason) + "\","
-             + "\"fix\":\"" + _json_escape(fix) + "\","
-             + "\"guidance\":\"" + _json_escape(guidance) + "\","
-             + "\"locked_at\":\"" + _utc_iso() + "\","
-             + "\"locked_by_pid\":" + _pid() + ","
-             + "\"locked_by_session\":\"" + _json_escape(_session()) + "\","
-             + "\"locked_by_actor\":\"" + _json_escape(actor) + "\"}\n"
-    try {
-        write_file(mp, body)
-    } catch e {
-        return 1
-    }
-    return 0
-}
-
-fn _read_meta(abs_path: string) -> string {
-    let mp = _meta_path(abs_path)
-    if !_path_exists(mp) { return "" }
-    return _str(read_file(mp))
-}
-
-fn _delete_meta(abs_path: string) -> int {
-    let mp = _meta_path(abs_path)
-    if !_path_exists(mp) { return 0 }
-    let r = exec_with_status("rm -f '" + mp + "' 2>&1")
-    return r[1]
-}
-
-// ─── ai-native error string (raw 66 trailer) ────────────────────────
-// Format mandated by raw 66 pattern field:
-//   <original-error-line>
-//   reason: <class>: <specifics>
-//   fix: <numbered candidate list>
-//   guidance: <optional trailer>      ← raw 66 allows extra structured keys
-//
-// Returned as a single multi-line string; caller emits to stderr (raw 12
-// silent-error-ban also satisfied because stderr surfaces the trailer).
-
-fn ai_native_error_string(abs_path: string, meta_body: string) -> string {
-    let reason = _json_get_str(meta_body, "reason")
-    let fix = _json_get_str(meta_body, "fix")
-    let guidance = _json_get_str(meta_body, "guidance")
-    let actor = _json_get_str(meta_body, "locked_by_actor")
-    let locked_at = _json_get_str(meta_body, "locked_at")
-
-    let mut out = "EPERM: chflags-uchg-lock at " + abs_path + "\n"
-    out = out + "reason: chflags-uchg-lock: " + reason + "\n"
-    out = out + "fix: " + fix + "\n"
-    if guidance != "" {
-        out = out + "guidance: " + guidance + "\n"
-    }
-    out = out + "ref: raw:ai-native-error-message (raw#66)\n"
-    out = out + "locked_at: " + locked_at + "\n"
-    if actor != "" {
-        out = out + "locked_by_actor: " + actor + "\n"
+// extract array of strings — assumes simple ["a","b"] form (writer always uses _arr_to_json).
+fn _json_get_arr(body: string, key: string) -> [string] {
+    let k = "\"" + key + "\":["
+    let idx = body.index_of(k)
+    if idx < 0 { return [] }
+    let mut i = idx + len(k)
+    let mut out: [string] = []
+    let mut buf = ""
+    let mut in_s = false
+    while i < len(body) {
+        let c = body.substring(i, i + 1)
+        if in_s {
+            if c == "\\" && i + 1 < len(body) {
+                let n = body.substring(i + 1, i + 2)
+                if      n == "\"" { buf = buf + "\"" }
+                else if n == "\\" { buf = buf + "\\" }
+                else if n == "n"  { buf = buf + "\n" }
+                else if n == "r"  { buf = buf + "\r" }
+                else if n == "t"  { buf = buf + "\t" }
+                else { buf = buf + n }
+                i = i + 2
+                continue
+            }
+            if c == "\"" { in_s = false; out = out + [buf]; buf = ""; i = i + 1; continue }
+            buf = buf + c
+            i = i + 1
+            continue
+        }
+        if c == "\"" { in_s = true; i = i + 1; continue }
+        if c == "]"  { break }
+        i = i + 1
     }
     return out
 }
 
-// ─── argv parsing ───────────────────────────────────────────────────
+// ─── schema validity (F2) ────────────────────────────────────────────────
 
-fn _argv() -> [string] {
-    return argv()
+fn _validate_schema(body: string) -> bool {
+    if body.trim() == "" { return false }
+    if body.index_of("\"path\":") < 0 { return false }
+    if body.index_of("\"reason\":") < 0 { return false }
+    if body.index_of("\"fix\":") < 0 { return false }
+    if body.index_of("\"locked_at\":") < 0 { return false }
+    if body.index_of("\"locked_by_pid\":") < 0 { return false }
+    if body.index_of("\"locked_by_session\":") < 0 { return false }
+    if body.index_of("\"locker_actor\":") < 0 { return false }
+    if body.index_of("\"" + SCHEMA_VERSION + "\"") < 0 { return false }
+    return true
 }
 
-fn _arg_kv(av: [string], key: string) -> string {
+// ─── self-reference detection (F7) ───────────────────────────────────────
+
+fn _is_wrapper_dep(abs: string) -> bool {
+    let mut i = 0
+    while i < len(WRAPPER_DEPS) {
+        let suf = WRAPPER_DEPS[i]
+        let n = len(abs)
+        let m = len(suf)
+        if n >= m && abs.substring(n - m, n) == suf { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _self_reason() -> string {
+    return "raw-66-wrapper-self-reference: locking the locker (tier2_required infra per raw 1 + raw 0 SSOT)"
+}
+
+fn _self_fix() -> [string] {
+    return [
+        "hexa run tool/chflags_lock_native.hexa unlock --path <self> --reason '<amend reason>'",
+        "consult .raw-audit ledger for prior unlock context per raw 85"
+    ]
+}
+
+fn _self_guidance() -> [string] {
+    return [
+        "this wrapper enforces the raw 66 ai-native error message contract — modifying it requires the same unlock-edit-relock ladder as raw 1 5-SSOT"
+    ]
+}
+
+// ─── audit ledger (raw 77/85 .raw-audit append) ──────────────────────────
+
+fn _audit_path() -> string {
+    let pwd = env("PWD")
+    if pwd == "" {
+        return env("HOME") + "/core/nexus/.raw-audit"
+    }
+    let r = sh("git -C " + _shq(pwd) + " rev-parse --show-toplevel 2>/dev/null")
+    if r != "" { return r + "/.raw-audit" }
+    return env("HOME") + "/core/nexus/.raw-audit"
+}
+
+fn _audit_append(op: string, abs: string, reason: string, sidecar_inline: string) {
+    let row = "{\"ts\":\"" + _utc_iso() + "\","
+            + "\"op\":\"" + _json_escape(op) + "\","
+            + "\"path\":\"" + _json_escape(abs) + "\","
+            + "\"reason\":\"" + _json_escape(reason) + "\","
+            + "\"actor\":\"" + _json_escape(_actor()) + "\","
+            + "\"window_sec\":0,"
+            + "\"pid\":" + _pid() + ","
+            + "\"host\":\"" + _json_escape(_hostname()) + "\","
+            + "\"prev_ts\":\"\","
+            + "\"sidecar_metadata_archived\":" + sidecar_inline + "}\n"
+    let p = _audit_path()
+    try { append_file(p, row) } catch e {
+        eprintln("warn: audit append failed path=" + p)
+    }
+}
+
+// ─── sidecar build / read / delete ───────────────────────────────────────
+
+fn _build_sidecar(abs: string, reason: string, fix: [string], guidance: [string]) -> string {
+    let mut s = "{"
+    s = s + "\"path\":\"" + _json_escape(abs) + "\","
+    s = s + "\"reason\":\"" + _json_escape(reason) + "\","
+    s = s + "\"fix\":" + _arr_to_json(fix) + ","
+    if len(guidance) > 0 {
+        s = s + "\"guidance\":" + _arr_to_json(guidance) + ","
+    }
+    s = s + "\"locked_at\":\"" + _utc_iso() + "\","
+    s = s + "\"locked_by_pid\":" + _pid() + ","
+    s = s + "\"locked_by_session\":\"" + _json_escape(_session()) + "\","
+    s = s + "\"locker_actor\":\"" + _json_escape(_actor()) + "\","
+    s = s + "\"schema_version\":\"" + SCHEMA_VERSION + "\""
+    s = s + "}\n"
+    return s
+}
+
+fn _read_sidecar(abs: string) -> string {
+    let p = _existing_sidecar(abs)
+    if p == "" { return "" }
+    return _str(read_file(p))
+}
+
+fn _delete_sidecar(abs: string) -> bool {
+    let p = _existing_sidecar(abs)
+    if p == "" { return true }
+    let r = exec_with_status("rm -f " + _shq(p) + " 2>&1")
+    if r[1] != 0 { return false }
+    if _path_exists(p) { return false }
+    return true
+}
+
+// ─── sentinel + raw 66 emitters ──────────────────────────────────────────
+
+fn _sentinel(verdict: string, abs: string, op: string) {
+    println("")
+    println(SENTINEL_TAG + " " + verdict + " path=" + abs + " op=" + op)
+}
+
+fn _raw66(reason_class: string, specifics: string, fix_list: [string]) {
+    eprintln("reason: " + reason_class + ": " + specifics)
+    let mut s = "fix: "
+    let mut i = 0
+    while i < len(fix_list) {
+        if i > 0 { s = s + "  " }
+        s = s + to_string(i + 1) + ") " + fix_list[i]
+        i = i + 1
+    }
+    eprintln(s)
+    eprintln("ref: raw:ai-native-error-message (raw#66)")
+}
+
+// ─── argv parsing helpers ────────────────────────────────────────────────
+
+fn _argv() -> [string] { return argv() }
+
+// scan all occurrences of --key, returning array of values (repeatable flag)
+fn _arg_list(av: [string], key: string) -> [string] {
+    let mut out: [string] = []
     let mut i = 2
-    while i < av.len() {
-        if av[i] == key && i + 1 < av.len() {
-            return _str(av[i + 1])
+    while i < len(av) {
+        if av[i] == key && i + 1 < len(av) {
+            out = out + [_str(av[i + 1])]
         }
         i = i + 1
     }
+    return out
+}
+
+fn _arg_kv(av: [string], key: string) -> string {
+    let arr = _arg_list(av, key)
+    if len(arr) > 0 { return arr[0] }
     return ""
 }
 
 fn _arg_flag(av: [string], key: string) -> bool {
     let mut i = 2
-    while i < av.len() {
+    while i < len(av) {
         if av[i] == key { return true }
         i = i + 1
     }
     return false
 }
 
-fn _emit_sentinel(status: string, op: string) {
-    println("")
-    println(SENTINEL_TAG + " " + status + " " + op)
-}
-
-// raw 66 hard-fail emitter — required arg missing; ai-native error to stderr.
-fn _hard_fail_arg(missing: string, op: string) -> i64 {
-    eprintln("EPERM: chflags-lock-native required-arg missing")
-    eprintln("reason: validation-fail: required-arg-missing (key=" + missing + ", op=" + op + ")")
-    eprintln("fix: 1) supply --" + missing + " <value>  2) hexa tool/chflags_lock_native.hexa lock --path <p> --reason <r> --fix <f> [--guidance <g>]  3) consult tool/chflags_lock_native.hexa header for full schema")
-    eprintln("ref: raw:ai-native-error-message (raw#66)")
-    eprintln("")
-    _emit_sentinel("FAIL", "required-arg-missing/" + missing)
-    return 2
-}
-
-// ─── self-reference: wrapper records own metadata for own chflags ───
-//
-// When the wrapper itself locks a path with chflags uchg, it writes a
-// sidecar — that's the dogfood case (cmd_lock). For the META_DIR itself
-// or any ad-hoc internal lock, the wrapper still goes through cmd_lock
-// flow (no internal escape hatch). The audit lint enforces that there
-// are NO bare chflags calls outside this file's authorized call-sites.
-
-// ─── subcommands ────────────────────────────────────────────────────
+// ─── subcommand: lock ────────────────────────────────────────────────────
 
 fn cmd_lock(av: [string]) -> i64 {
     let path = _arg_kv(av, "--path")
-    let reason = _arg_kv(av, "--reason")
-    let fix = _arg_kv(av, "--fix")
-    let guidance = _arg_kv(av, "--guidance")
-    let actor = _arg_kv(av, "--actor")
+    let mut reason = _arg_kv(av, "--reason")
+    let mut fixes = _arg_list(av, "--fix")
+    let mut guidance = _arg_list(av, "--guidance")
+    let mut level = _arg_kv(av, "--level")
+    if level == "" { level = "L1" }
 
-    if path == ""   { return _hard_fail_arg("path",   "lock") }
-    if reason == "" { return _hard_fail_arg("reason", "lock") }
-    if fix == ""    { return _hard_fail_arg("fix",    "lock") }
+    let abs = if path == "" { "" } else { _abs(path) }
+    let self_ref = abs != "" && _is_wrapper_dep(abs)
 
-    let abs = _abs(path)
+    // F7 — self-reference auto-injection (canonical defaults bypass required-arg)
+    if self_ref {
+        if reason == "" { reason = _self_reason() }
+        if len(fixes) == 0 { fixes = _self_fix() }
+        if len(guidance) == 0 { guidance = _self_guidance() }
+    }
+
+    // F1 — required args
+    if path == "" {
+        _raw66("validation-fail", "required-arg-missing-path",
+            ["hexa run tool/chflags_lock_native.hexa lock --path <abs> --reason '<r>' --fix '<cmd>' [--fix '<cmd>'] [--guidance '<text>']",
+             "cite raw 66 trailer schema for context"])
+        _sentinel("FAIL", "", "lock")
+        return 2
+    }
+    if reason == "" {
+        _raw66("validation-fail", "required-arg-missing-reason",
+            ["hexa run tool/chflags_lock_native.hexa lock --path " + abs + " --reason '<causal-class>: <specifics>' --fix '<cmd>'",
+             "raw 66: reason = cause-class + specifics; fix = numbered candidate commands"])
+        _sentinel("FAIL", abs, "lock")
+        return 2
+    }
+    if len(fixes) == 0 {
+        _raw66("validation-fail", "required-arg-missing-fix",
+            ["hexa run tool/chflags_lock_native.hexa lock --path " + abs + " --reason '" + reason + "' --fix '<remediation cmd>'",
+             "--fix is repeatable; provide ordered candidate commands the EPERM victim can run"])
+        _sentinel("FAIL", abs, "lock")
+        return 2
+    }
+
     if !_path_exists(abs) {
-        eprintln("EPERM: chflags-lock-native target-missing")
-        eprintln("reason: validation-fail: path-not-found (path=" + abs + ")")
-        eprintln("fix: 1) ls -la '" + abs + "'  2) create the target before locking  3) confirm path resolution (relative paths resolve against PWD)")
-        eprintln("ref: raw:ai-native-error-message (raw#66)")
-        eprintln("")
-        _emit_sentinel("FAIL", "target-missing")
+        _raw66("validation-fail", "path-not-found",
+            ["ls -la " + _shq(abs),
+             "create the target before locking",
+             "verify path resolution (relative paths resolve against PWD)"])
+        _sentinel("FAIL", abs, "lock")
         return 4
     }
 
-    // Idempotent collision check — if already locked AND same reason → success.
-    let prev_meta = _read_meta(abs)
-    if _is_locked_now(abs) && prev_meta != "" {
-        let prev_reason = _json_get_str(prev_meta, "reason")
-        if prev_reason == reason {
-            // refresh sidecar (timestamp, actor, fix/guidance updates)
-            let w = _write_meta(abs, reason, fix, guidance, actor)
-            if w != 0 {
-                eprintln("EPERM: chflags-lock-native sidecar-refresh-failed")
-                eprintln("reason: io-fail: meta-write (path=" + _meta_path(abs) + ")")
-                eprintln("fix: 1) ls -la '" + META_DIR + "'  2) df -h " + META_DIR + "  3) chmod -R u+w " + META_DIR)
-                eprintln("ref: raw:ai-native-error-message (raw#66)")
-                eprintln("")
-                _emit_sentinel("FAIL", "sidecar-refresh")
-                return 1
-            }
-            println("ok already-locked  " + abs + "  (reason matches; sidecar refreshed)")
-            _emit_sentinel("PASS", "lock-idempotent")
-            return 0
+    // collision: already locked AND existing sidecar with different reason → exit 3
+    let prev_body = _read_sidecar(abs)
+    let was_locked = _is_locked(abs)
+    if was_locked && prev_body != "" {
+        let prev_reason = _json_get_str(prev_body, "reason")
+        if prev_reason != "" && prev_reason != reason {
+            _raw66("validation-fail", "lock-collision-different-reason",
+                ["hexa run tool/chflags_lock_native.hexa lookup --path " + _shq(abs),
+                 "hexa run tool/chflags_lock_native.hexa unlock --path " + _shq(abs) + " --reason 'amend before relock'",
+                 "re-issue lock with the correct reason"])
+            eprintln("  existing reason: " + prev_reason)
+            eprintln("  new reason:      " + reason)
+            _sentinel("FAIL", abs, "lock")
+            return 3
         }
-        // collision — different reason → exit 3 (caller must unlock first)
-        eprintln("EPERM: chflags-lock-native lock-collision")
-        eprintln("reason: validation-fail: existing-lock-different-reason (existing=" + prev_reason + ", new=" + reason + ")")
-        eprintln("fix: 1) hexa tool/chflags_lock_native.hexa lookup --path '" + abs + "'  2) hexa tool/chflags_lock_native.hexa unlock --path '" + abs + "'  3) re-issue lock with the correct reason")
-        eprintln("ref: raw:ai-native-error-message (raw#66)")
-        eprintln("")
-        _emit_sentinel("FAIL", "lock-collision")
-        return 3
     }
 
-    // Write sidecar BEFORE chflags (fail-closed: if sidecar write fails,
-    // the path stays unlocked — never lock without metadata).
-    let w = _write_meta(abs, reason, fix, guidance, actor)
-    if w != 0 {
-        eprintln("EPERM: chflags-lock-native sidecar-write-failed")
-        eprintln("reason: io-fail: meta-write (path=" + _meta_path(abs) + ")")
-        eprintln("fix: 1) mkdir -p '" + META_DIR + "'  2) ls -la '" + META_DIR + "'  3) df -h " + META_DIR)
-        eprintln("ref: raw:ai-native-error-message (raw#66)")
-        eprintln("")
-        _emit_sentinel("FAIL", "sidecar-write")
+    // resolve sidecar write target (sibling primary, central fallback)
+    let target = _resolve_write_target(abs)
+    let body = _build_sidecar(abs, reason, fixes, guidance)
+
+    // fail-closed: write sidecar BEFORE applying chflags. If sidecar write fails, do not lock.
+    let mut wrote = true
+    try { write_file(target, body) } catch e { wrote = false }
+    if !wrote {
+        _raw66("io-fail", "sidecar-write-failed",
+            ["mkdir -p " + sh("dirname " + _shq(target)),
+             "ls -la " + sh("dirname " + _shq(target)),
+             "df -h " + sh("dirname " + _shq(target))])
+        _sentinel("FAIL", abs, "lock")
         return 1
     }
 
-    // Apply chflags uchg.
-    let rc = _apply_uchg(abs)
-    if rc != 0 {
-        // Roll back sidecar — keep state coherent (no orphan metadata).
-        let _ = _delete_meta(abs)
-        eprintln("EPERM: chflags-lock-native chflags-apply-failed")
-        eprintln("reason: chflags-uchg-lock: chflags-uchg exited " + to_string(rc) + " (path=" + abs + ")")
-        eprintln("fix: 1) ls -lOd '" + abs + "'  2) sudo chflags uchg '" + abs + "'  3) HEXA_RESOLVER_NO_REROUTE=1 hexa tool/chflags_lock_native.hexa lock --path '" + abs + "' --reason '" + reason + "' --fix '" + fix + "'")
-        eprintln("ref: raw:ai-native-error-message (raw#66)")
-        eprintln("")
-        _emit_sentinel("FAIL", "chflags-apply")
+    // apply chflags
+    let rc = _apply_flag(abs, level)
+    if rc != 0 || !_is_locked(abs) {
+        // rollback sidecar — never leave context-less lock OR orphan sidecar
+        let _ = _delete_sidecar(abs)
+        _raw66("syscall-fail", "chflags-apply-failed-rc-" + to_string(rc),
+            ["ls -lOd " + _shq(abs),
+             "chflags " + (if level == "L2" { "schg" } else { "uchg" }) + " " + _shq(abs) + "  # try manually",
+             "if path is on a volume that does not support BSD flags, chflags will silently no-op"])
+        _sentinel("FAIL", abs, "lock")
         return 1
     }
 
-    println("ok locked  " + abs)
+    let op_label = if was_locked { "relock" } else { "lock" }
+    _audit_append(op_label, abs, reason, body.trim())
+
+    println("locked path=" + abs + " sidecar=" + target + " level=" + level)
     println("  reason: " + reason)
-    println("  fix:    " + fix)
-    if guidance != "" { println("  guidance: " + guidance) }
-    println("  meta:   " + _meta_path(abs))
-    _emit_sentinel("PASS", "lock")
+    let mut fi = 0
+    while fi < len(fixes) { println("  fix " + to_string(fi + 1) + ": " + fixes[fi]); fi = fi + 1 }
+    if len(guidance) > 0 {
+        let mut gi = 0
+        while gi < len(guidance) { println("  guidance " + to_string(gi + 1) + ": " + guidance[gi]); gi = gi + 1 }
+    }
+    _sentinel("PASS", abs, "lock")
     return 0
 }
 
+// ─── subcommand: unlock ──────────────────────────────────────────────────
+
 fn cmd_unlock(av: [string]) -> i64 {
     let path = _arg_kv(av, "--path")
-    if path == "" { return _hard_fail_arg("path", "unlock") }
+    let mut reason = _arg_kv(av, "--reason")
+    let mut level = _arg_kv(av, "--level")
+    if level == "" { level = "L1" }
 
+    if path == "" {
+        _raw66("validation-fail", "required-arg-missing-path",
+            ["hexa run tool/chflags_lock_native.hexa unlock --path <abs> --reason '<r>'"])
+        _sentinel("FAIL", "", "unlock")
+        return 2
+    }
     let abs = _abs(path)
-    let was_locked = _is_locked_now(abs)
-    let mut rc: i64 = 0
+    let self_ref = _is_wrapper_dep(abs)
+    if self_ref && reason == "" { reason = _self_reason() }
+    if reason == "" {
+        // raw 85 mandates escalation reason; but for cleanup convenience, allow "unspecified"
+        // when sidecar is absent (already-unlocked path, just GC'ing).
+        if _existing_sidecar(abs) == "" && !_is_locked(abs) {
+            reason = "unspecified-cleanup"
+        } else {
+            _raw66("validation-fail", "required-arg-missing-reason",
+                ["hexa run tool/chflags_lock_native.hexa unlock --path " + abs + " --reason '<r>'",
+                 "raw 85 mandates escalation reason at every unlock"])
+            _sentinel("FAIL", abs, "unlock")
+            return 2
+        }
+    }
 
+    // capture sidecar BEFORE removal — archived into audit row
+    let sc_path = _existing_sidecar(abs)
+    let mut sc_body = "null"
+    if sc_path != "" {
+        let body = _str(read_file(sc_path))
+        if body.trim() != "" { sc_body = body.trim() }
+    }
+
+    let was_locked = _is_locked(abs)
     if was_locked {
-        let r = _remove_uchg(abs)
-        if r != 0 {
-            eprintln("EPERM: chflags-lock-native chflags-remove-failed")
-            eprintln("reason: chflags-uchg-lock: chflags-nouchg exited " + to_string(r) + " (path=" + abs + ")")
-            eprintln("fix: 1) ls -lOd '" + abs + "'  2) sudo chflags nouchg '" + abs + "'  3) HEXA_RESOLVER_NO_REROUTE=1 hexa tool/chflags_lock_native.hexa unlock --path '" + abs + "'")
-            eprintln("ref: raw:ai-native-error-message (raw#66)")
-            eprintln("")
-            _emit_sentinel("FAIL", "chflags-remove")
+        let rc = _remove_flag(abs, level)
+        if rc != 0 {
+            _raw66("syscall-fail", "chflags-remove-failed-rc-" + to_string(rc),
+                ["ls -lOd " + _shq(abs),
+                 (if level == "L2" { "sudo chflags noschg " } else { "chflags nouchg " }) + _shq(abs)])
+            _sentinel("FAIL", abs, "unlock")
             return 1
         }
     }
 
-    // Metadata GC (always — even if path was already unlocked, sweep stale sidecar).
-    let _g = _delete_meta(abs)
-
-    if was_locked {
-        println("ok unlocked  " + abs + "  (sidecar GC'd)")
-    } else {
-        println("ok already-unlocked  " + abs + "  (sidecar GC'd if present)")
+    // F5 — sidecar GC + audit append (always, even if path was already unlocked → orphan sweep)
+    let gc_ok = _delete_sidecar(abs)
+    if !gc_ok {
+        _raw66("io-fail-partial", "sidecar-gc-orphan",
+            ["rm -f " + _shq(sc_path),
+             "chflags_lock_audit.hexa will flag this orphan; check parent dir flags"])
+        _audit_append("unlock+gc-partial", abs, reason, sc_body)
+        _sentinel("FAIL", abs, "unlock")
+        return 1
     }
-    _emit_sentinel("PASS", "unlock")
-    return rc
-}
+    _audit_append("unlock+gc", abs, reason, sc_body)
 
-// lookup: emits ai-native error string if locked; null + exit 0 if not.
-// Falsifier: lookup unlocked path → null (no estimates).
-fn cmd_lookup(av: [string]) -> i64 {
-    let path = _arg_kv(av, "--path")
-    if path == "" { return _hard_fail_arg("path", "lookup") }
-
-    let abs = _abs(path)
-    let meta = _read_meta(abs)
-    if meta == "" {
-        // honest null — no estimate, no fabrication.
-        println("null")
-        _emit_sentinel("PASS", "lookup-unlocked")
-        return 0
-    }
-
-    let s = ai_native_error_string(abs, meta)
-    print(s)
-    _emit_sentinel("PASS", "lookup-locked")
+    let gc_label = if sc_path != "" { "removed" } else { "none" }
+    println("unlocked path=" + abs + " sidecar_gc=" + gc_label + " reason=" + reason)
+    _sentinel("PASS", abs, "unlock")
     return 0
 }
+
+// ─── subcommand: lookup ──────────────────────────────────────────────────
+// F3: unlocked path → {locked:false, metadata:null}, never inferred.
+
+fn cmd_lookup(av: [string]) -> i64 {
+    let path = _arg_kv(av, "--path")
+    let json_out = _arg_flag(av, "--json")
+    if path == "" {
+        _raw66("validation-fail", "required-arg-missing-path",
+            ["hexa run tool/chflags_lock_native.hexa lookup --path <abs> [--json]"])
+        _sentinel("FAIL", "", "lookup")
+        return 2
+    }
+    let abs = _abs(path)
+    let locked = _is_locked(abs)
+    if !locked {
+        if json_out {
+            println("{\"locked\":false,\"metadata\":null,\"reason\":\"not-locked\"}")
+        } else {
+            println("locked=false metadata=null reason=not-locked path=" + abs)
+        }
+        _sentinel("PASS", abs, "lookup")
+        return 0
+    }
+    let sc = _existing_sidecar(abs)
+    if sc == "" {
+        if json_out {
+            println("{\"locked\":true,\"metadata\":null,\"sidecar_invalid\":false,\"reason\":\"locked-no-sidecar\"}")
+        } else {
+            println("locked=true metadata=null reason=locked-no-sidecar path=" + abs)
+        }
+        _sentinel("PASS", abs, "lookup")
+        return 0
+    }
+    let body = _str(read_file(sc))
+    if !_validate_schema(body) {
+        if json_out {
+            println("{\"locked\":true,\"metadata\":null,\"sidecar_invalid\":true,\"sidecar_path\":\"" + _json_escape(sc) + "\"}")
+        } else {
+            println("locked=true metadata=null sidecar_invalid=true sidecar=" + sc + " path=" + abs)
+        }
+        _sentinel("PASS", abs, "lookup")
+        return 0
+    }
+    if json_out {
+        println("{\"locked\":true,\"metadata\":" + body.trim() + ",\"sidecar_path\":\"" + _json_escape(sc) + "\"}")
+    } else {
+        println("locked=true sidecar=" + sc + " path=" + abs)
+        println(body.trim())
+    }
+    _sentinel("PASS", abs, "lookup")
+    return 0
+}
+
+// ─── subcommand: explain (EPERM-victim helper, raw 66 trailer to stderr) ─
+
+fn cmd_explain(av: [string]) -> i64 {
+    let path = _arg_kv(av, "--path")
+    if path == "" {
+        _raw66("validation-fail", "required-arg-missing-path",
+            ["hexa run tool/chflags_lock_native.hexa explain --path <abs>"])
+        _sentinel("FAIL", "", "explain")
+        return 2
+    }
+    let abs = _abs(path)
+    let locked = _is_locked(abs)
+    if !locked {
+        _raw66("eperm-context", "path-not-chflags-locked",
+            ["ls -lO " + _shq(abs) + "  # inspect actual flag column",
+             "ls -ld " + sh("dirname " + _shq(abs)) + "  # check parent dir",
+             "stat -f '%Sp %Su %Sg' " + _shq(abs) + "  # mode + owner"])
+        _sentinel("PASS", abs, "explain")
+        return 0
+    }
+    let sc = _existing_sidecar(abs)
+    if sc == "" {
+        _raw66("chflags-uchg-lock-no-sidecar", "path-locked-but-no-metadata",
+            ["chflags nouchg " + _shq(abs) + "  # if you own this lock",
+             "check .raw-audit for prior lock-time context",
+             "apply tool/chflags_lock_native.hexa lock --path <p> --reason --fix at the locker site to prevent future generic fallback"])
+        _sentinel("PASS", abs, "explain")
+        return 0
+    }
+    let body = _str(read_file(sc))
+    if !_validate_schema(body) {
+        _raw66("chflags-uchg-lock-sidecar-invalid", "schema-mismatch-or-corrupt",
+            ["jq . < " + _shq(sc),
+             "rm " + _shq(sc) + " && hexa run tool/chflags_lock_native.hexa unlock --path " + _shq(abs) + " --reason 'corrupt sidecar — recover'"])
+        _sentinel("PASS", abs, "explain")
+        return 0
+    }
+    let r = _json_get_str(body, "reason")
+    let fixes = _json_get_arr(body, "fix")
+    let guidance = _json_get_arr(body, "guidance")
+    let actor = _json_get_str(body, "locker_actor")
+    let locked_at = _json_get_str(body, "locked_at")
+    eprintln("EPERM: chflags-uchg-lock at " + abs)
+    eprintln("reason: chflags-uchg-lock: " + r)
+    let mut s = "fix: "
+    let mut i = 0
+    while i < len(fixes) {
+        if i > 0 { s = s + "  " }
+        s = s + to_string(i + 1) + ") " + fixes[i]
+        i = i + 1
+    }
+    eprintln(s)
+    if len(guidance) > 0 {
+        let mut g = "guidance: "
+        let mut j = 0
+        while j < len(guidance) {
+            if j > 0 { g = g + " | " }
+            g = g + guidance[j]
+            j = j + 1
+        }
+        eprintln(g)
+    }
+    eprintln("ref: raw:ai-native-error-message (raw#66)")
+    eprintln("locked_at: " + locked_at)
+    if actor != "" { eprintln("locker_actor: " + actor) }
+    _sentinel("PASS", abs, "explain")
+    return 0
+}
+
+// ─── subcommand: status ──────────────────────────────────────────────────
 
 fn cmd_status(av: [string]) -> i64 {
     let path = _arg_kv(av, "--path")
-    if path == "" { return _hard_fail_arg("path", "status") }
-
+    if path == "" {
+        _raw66("validation-fail", "required-arg-missing-path",
+            ["hexa run tool/chflags_lock_native.hexa status --path <abs>"])
+        _sentinel("FAIL", "", "status")
+        return 2
+    }
     let abs = _abs(path)
-    let kernel_locked = _is_locked_now(abs)
-    let meta = _read_meta(abs)
-
+    let locked = _is_locked(abs)
+    let sc = _existing_sidecar(abs)
     println("chflags_lock_native status — " + abs)
     println("  exists:        " + to_string(_path_exists(abs)))
-    println("  kernel-locked: " + to_string(kernel_locked))
-    println("  sidecar:       " + _meta_path(abs))
-    if meta == "" {
-        println("  metadata:      <none>")
-    } else {
-        println("  reason:        " + _json_get_str(meta, "reason"))
-        println("  fix:           " + _json_get_str(meta, "fix"))
-        let g = _json_get_str(meta, "guidance")
-        if g != "" { println("  guidance:      " + g) }
-        println("  locked_at:     " + _json_get_str(meta, "locked_at"))
-        println("  locked_by_pid: " + to_string(_json_get_int(meta, "locked_by_pid")))
-        println("  session:       " + _json_get_str(meta, "locked_by_session"))
-        let actor = _json_get_str(meta, "locked_by_actor")
-        if actor != "" { println("  actor:         " + actor) }
+    println("  kernel-locked: " + to_string(locked))
+    println("  sidecar:       " + (if sc == "" { "(none)" } else { sc }))
+    if sc != "" {
+        let body = _str(read_file(sc))
+        let valid = _validate_schema(body)
+        println("  schema-valid:  " + to_string(valid))
+        if valid {
+            println("  reason:        " + _json_get_str(body, "reason"))
+            let fixes = _json_get_arr(body, "fix")
+            let mut i = 0
+            while i < len(fixes) { println("  fix " + to_string(i + 1) + ":         " + fixes[i]); i = i + 1 }
+            let g = _json_get_arr(body, "guidance")
+            let mut j = 0
+            while j < len(g) { println("  guidance " + to_string(j + 1) + ":    " + g[j]); j = j + 1 }
+            println("  locked_at:     " + _json_get_str(body, "locked_at"))
+            println("  locked_by_pid: " + to_string(_json_get_int(body, "locked_by_pid")))
+            println("  session:       " + _json_get_str(body, "locked_by_session"))
+            println("  actor:         " + _json_get_str(body, "locker_actor"))
+            println("  schema_ver:    " + _json_get_str(body, "schema_version"))
+        }
     }
-    _emit_sentinel("PASS", "status")
+    _sentinel("PASS", abs, "status")
     return 0
 }
+
+// ─── subcommand: list (sibling .lock_meta.json + central) ───────────────
 
 fn cmd_list() -> i64 {
-    if !_path_exists(META_DIR) {
-        println("(empty) " + META_DIR)
-        _emit_sentinel("PASS", "list-empty")
-        return 0
+    println("chflags_lock_native sidecars:")
+    let cen_dir = _central_dir()
+    if _path_exists(cen_dir) {
+        let listing = _str(exec("ls -1 " + _shq(cen_dir) + "/*.json 2>/dev/null"))
+        let lines = listing.split("\n")
+        let mut i = 0
+        while i < len(lines) {
+            let f = _str(lines[i]).trim()
+            if f != "" {
+                let body = _str(read_file(f))
+                let p = _json_get_str(body, "path")
+                let r = _json_get_str(body, "reason")
+                let lock_state = if p != "" && _is_locked(p) { "uchg" } else { "STALE" }
+                println("  [central " + lock_state + "] " + p + " — " + r)
+            }
+            i = i + 1
+        }
     }
-    let listing = _str(exec("ls -1 '" + META_DIR + "'/*.json 2>/dev/null"))
-    if listing.trim() == "" {
-        println("(empty) " + META_DIR)
-        _emit_sentinel("PASS", "list-empty")
-        return 0
+    // sibling .lock_meta.json scan — best-effort using find
+    let cwd = sh("pwd")
+    let sibs = _str(exec("find " + _shq(cwd) + " -name '*.lock_meta.json' -not -path '*/.git/*' 2>/dev/null"))
+    let lines2 = sibs.split("\n")
+    let mut j = 0
+    while j < len(lines2) {
+        let f = _str(lines2[j]).trim()
+        if f != "" {
+            let body = _str(read_file(f))
+            let p = _json_get_str(body, "path")
+            let r = _json_get_str(body, "reason")
+            let lock_state = if p != "" && _is_locked(p) { "uchg" } else { "STALE" }
+            println("  [sibling " + lock_state + "] " + p + " — " + r)
+        }
+        j = j + 1
     }
-    let lines = listing.split("\n")
-    let mut i = 0
-    while i < len(lines) {
-        let f = _str(lines[i]).trim()
-        if f == "" { i = i + 1; continue }
-        let body = _str(read_file(f))
-        let p = _json_get_str(body, "path")
-        let r = _json_get_str(body, "reason")
-        let lock_state = if _path_exists(p) && _is_locked_now(p) { "uchg" } else { "STALE" }
-        println("  [" + lock_state + "] " + p + "  — reason: " + r)
-        i = i + 1
-    }
-    _emit_sentinel("PASS", "list")
+    _sentinel("PASS", "", "list")
     return 0
 }
 
-// ─── selftest (falsifier suite) ─────────────────────────────────────
-//
-// Falsifiers per spec:
-//   1. required args missing → raw 66 hard-fail (exit 2)
-//   2. lookup unlocked path → null
-//   3. nouchg → metadata GC (sidecar removed)
-//   4. locked-path write attempt surfaces ai-native error (lookup confirms)
-//   5. self-reference: wrapper own metadata for own chflags calls
-//   6. raw 80 sentinel emitted on every result
+// ─── selftest (F1-F7 falsifier suite) ────────────────────────────────────
 
+fn _selftest_pass(name: string) { println("  PASS  " + name) }
 fn _selftest_fail(name: string, msg: string) -> i64 {
-    eprintln("selftest FAIL: " + name)
-    eprintln("  " + msg)
+    eprintln("  FAIL  " + name + " — " + msg)
     return 1
 }
 
-fn _selftest_pass(name: string) {
-    println("  PASS  " + name)
-}
-
 fn cmd_selftest() -> i64 {
-    println("=== chflags_lock_native selftest ===")
+    println("=== chflags_lock_native selftest (F1-F7) ===")
     let mut fails: i64 = 0
+    let pid = _pid()
+    let tmp = "/tmp/chflags_lock_native_selftest_" + pid + ".tmp"
+    let _ = exec("rm -f " + _shq(tmp) + " " + _shq(tmp + ".lock_meta.json") + " 2>/dev/null")
+    let _ = exec("touch " + _shq(tmp))
+    let SELF = "/Users/ghost/core/nexus/tool/chflags_lock_native.hexa"
 
-    // tmp target (regular file we can lock/unlock without affecting SSOT)
-    let tmp = "/tmp/chflags_lock_native_selftest_" + _pid() + ".tmp"
-    let _ = exec("rm -f '" + tmp + "' 2>/dev/null")
-    let _ = exec("touch '" + tmp + "'")
-
-    // F1 — lookup unlocked → "null"
-    let r1 = exec_with_status("hexa /Users/ghost/core/nexus/tool/chflags_lock_native.hexa lookup --path '" + tmp + "' 2>/dev/null")
+    // F1 — required args missing on lock → exit 2 + raw 66 trailer
+    let r1 = exec_with_status("hexa run " + SELF + " lock --path " + _shq(tmp) + " 2>&1")
     let out1 = _str(r1[0])
-    if out1.contains("\nnull\n") || out1.substring(0, 5) == "null\n" || out1.trim().contains("null") && !out1.contains("EPERM") {
-        _selftest_pass("F1 lookup-unlocked-null")
+    if r1[1] == 2 && out1.contains("required-arg-missing") && out1.contains("reason:") && out1.contains("fix:") && out1.contains(SENTINEL_TAG + " FAIL") {
+        _selftest_pass("F1 required-args-hard-fail-raw-66")
     } else {
-        fails = fails + _selftest_fail("F1 lookup-unlocked-null", "expected 'null' got: " + out1)
+        fails = fails + _selftest_fail("F1", "rc=" + to_string(r1[1]) + " out=" + out1)
     }
 
-    // F2 — required args missing on lock → exit 2 + raw 66 trailer
-    let r2 = exec_with_status("hexa /Users/ghost/core/nexus/tool/chflags_lock_native.hexa lock --path '" + tmp + "' 2>&1")
-    let out2 = _str(r2[0])
-    if r2[1] == 2 && out2.contains("required-arg-missing") && out2.contains("reason:") && out2.contains("fix:") {
-        _selftest_pass("F2 required-arg-missing-raw66")
+    // F3 (run before lock) — lookup unlocked = explicit null
+    let r3 = exec_with_status("hexa run " + SELF + " lookup --path " + _shq(tmp) + " --json 2>&1")
+    let out3 = _str(r3[0])
+    if out3.contains("\"locked\":false") && out3.contains("\"metadata\":null") {
+        _selftest_pass("F3 lookup-unlocked-explicit-null")
     } else {
-        fails = fails + _selftest_fail("F2 required-arg-missing-raw66", "rc=" + to_string(r2[1]) + " out=" + out2)
+        fails = fails + _selftest_fail("F3", "out=" + out3)
     }
 
-    // F3 — lock applies chflags uchg + writes sidecar; lookup returns ai-native error
-    let r3a = exec_with_status("hexa /Users/ghost/core/nexus/tool/chflags_lock_native.hexa lock --path '" + tmp + "' --reason selftest-f3 --fix 'hexa tool/chflags_lock_native.hexa unlock --path " + tmp + "' --guidance 'selftest synthetic lock' 2>&1")
-    if r3a[1] != 0 {
-        fails = fails + _selftest_fail("F3 lock-apply", "rc=" + to_string(r3a[1]) + " out=" + _str(r3a[0]))
-    } else {
-        if !_is_locked_now(tmp) {
-            fails = fails + _selftest_fail("F3 kernel-uchg-applied", "expected uchg flag set on " + tmp)
-        } else {
-            _selftest_pass("F3 kernel-uchg-applied")
-        }
-        let r3b = exec_with_status("hexa /Users/ghost/core/nexus/tool/chflags_lock_native.hexa lookup --path '" + tmp + "' 2>&1")
-        let out3b = _str(r3b[0])
-        if out3b.contains("EPERM: chflags-uchg-lock") && out3b.contains("reason: chflags-uchg-lock: selftest-f3") && out3b.contains("fix: hexa tool/chflags_lock_native.hexa unlock") && out3b.contains("guidance: selftest synthetic lock") {
-            _selftest_pass("F3 lookup-locked-ai-native")
-        } else {
-            fails = fails + _selftest_fail("F3 lookup-locked-ai-native", "out=" + out3b)
-        }
-
-        // F4 — locked-path write attempt surfaces ai-native error.
-        // Direct write should EPERM at kernel; wrapper consumer (e.g. agent)
-        // should call lookup to retrieve the trailer. Here we emulate the
-        // consumer flow with `touch -a` (updates atime; fails on uchg).
-        // 2>/dev/null + own copy to wprobe[0] keeps the parent stderr clean.
-        let wprobe = exec_with_status("sh -c 'printf x >> \"" + tmp + "\"' 2>/dev/null")
-        if wprobe[1] == 0 {
-            fails = fails + _selftest_fail("F4 write-attempt-eperm", "expected EPERM on write to uchg file; rc=0")
-        } else {
-            _selftest_pass("F4 write-attempt-eperm-kernel")
-        }
-        // Then lookup yields the structured trailer (already verified in F3 lookup)
+    // Lock OK with --reason + repeatable --fix + --guidance
+    let lock_cmd = "hexa run " + SELF + " lock --path " + _shq(tmp)
+                 + " --reason 'selftest reason: F2/F5/F6 setup'"
+                 + " --fix 'hexa run tool/chflags_lock_native.hexa unlock --path " + tmp + " --reason cleanup'"
+                 + " --fix 'chflags nouchg " + tmp + "  # manual fallback'"
+                 + " --guidance 'F2 schema validity test sidecar' 2>&1"
+    let rL = exec_with_status(lock_cmd)
+    if rL[1] != 0 {
+        fails = fails + _selftest_fail("setup-lock", "rc=" + to_string(rL[1]) + " out=" + _str(rL[0]))
     }
 
-    // F5 — unlock → metadata GC
-    let r4 = exec_with_status("hexa /Users/ghost/core/nexus/tool/chflags_lock_native.hexa unlock --path '" + tmp + "' 2>&1")
-    if r4[1] != 0 {
-        fails = fails + _selftest_fail("F5 unlock-rc", "rc=" + to_string(r4[1]) + " out=" + _str(r4[0]))
+    // F2 — sidecar schema validity
+    let scp = tmp + ".lock_meta.json"
+    if !_path_exists(scp) {
+        fails = fails + _selftest_fail("F2 sidecar-presence", "sidecar missing at " + scp)
     } else {
-        if _is_locked_now(tmp) {
-            fails = fails + _selftest_fail("F5 unlock-kernel", "uchg flag still set after unlock")
+        let body = _str(read_file(scp))
+        if _validate_schema(body) {
+            // and verify required keys
+            let mut all = true
+            if _json_get_str(body, "path") == "" { all = false }
+            if _json_get_str(body, "reason") == "" { all = false }
+            if len(_json_get_arr(body, "fix")) == 0 { all = false }
+            if _json_get_str(body, "locked_at") == "" { all = false }
+            if _json_get_int(body, "locked_by_pid") == 0 { all = false }
+            if _json_get_str(body, "locked_by_session") == "" { all = false }
+            if _json_get_str(body, "locker_actor") == "" { all = false }
+            if _json_get_str(body, "schema_version") != SCHEMA_VERSION { all = false }
+            if all { _selftest_pass("F2 metadata-sidecar-jsonschema") }
+            else { fails = fails + _selftest_fail("F2", "sidecar present but missing required keys") }
         } else {
-            _selftest_pass("F5 unlock-kernel-cleared")
-        }
-        let mp = _meta_path(_abs(tmp))
-        if _path_exists(mp) {
-            fails = fails + _selftest_fail("F5 metadata-GC", "sidecar still present at " + mp)
-        } else {
-            _selftest_pass("F5 metadata-GC")
+            fails = fails + _selftest_fail("F2", "sidecar schema invalid: " + body)
         }
     }
 
-    // F6 — sentinel emitted on every result (raw 80).
-    // We've been capturing stdout above; check the lock command's stdout
-    // ended with __CHFLAGS_LOCK_NATIVE_RESULT__ <PASS|FAIL> ...
-    let probe = _str(r3a[0])
-    if probe.contains(SENTINEL_TAG) {
-        _selftest_pass("F6 sentinel-emitted (raw 80)")
+    // F6 — locked-write attempt → EPERM, then `explain` surfaces ai-native error
+    let wprobe = exec_with_status("sh -c 'printf x >> " + _shq(tmp) + "' 2>/dev/null")
+    if wprobe[1] == 0 {
+        fails = fails + _selftest_fail("F6 write-attempt-eperm", "expected EPERM on write to uchg file; rc=0")
     } else {
-        fails = fails + _selftest_fail("F6 sentinel-emitted", "tag missing: " + probe)
+        let exp = exec_with_status("hexa run " + SELF + " explain --path " + _shq(tmp) + " 2>&1")
+        let outE = _str(exp[0])
+        if outE.contains("reason: chflags-uchg-lock: selftest reason") && outE.contains("fix: 1) ") {
+            _selftest_pass("F6 locked-write-trap-surfaces-ai-native")
+        } else {
+            fails = fails + _selftest_fail("F6 explain", "out=" + outE)
+        }
     }
 
-    // F7 — self-reference: wrapper records its own metadata for its own
-    // chflags calls. Lock + lookup; sidecar must contain ALL required
-    // schema keys (path, reason, fix, locked_at, locked_by_pid,
-    // locked_by_session). Re-lock briefly to verify and clean up.
-    let _ = exec("rm -f '" + tmp + "' 2>/dev/null")
-    let _ = exec("touch '" + tmp + "'")
-    let r5 = exec_with_status("hexa /Users/ghost/core/nexus/tool/chflags_lock_native.hexa lock --path '" + tmp + "' --reason selftest-self-ref --fix 'hexa tool/chflags_lock_native.hexa unlock' 2>&1")
-    if r5[1] == 0 {
-        let mp = _meta_path(_abs(tmp))
-        let body = _str(read_file(mp))
-        let mut missing: [string] = []
-        if _json_get_str(body, "path") == ""              { missing = missing + ["path"] }
-        if _json_get_str(body, "reason") == ""            { missing = missing + ["reason"] }
-        if _json_get_str(body, "fix") == ""               { missing = missing + ["fix"] }
-        if _json_get_str(body, "locked_at") == ""         { missing = missing + ["locked_at"] }
-        if _json_get_int(body, "locked_by_pid") == 0      { missing = missing + ["locked_by_pid"] }
-        if _json_get_str(body, "locked_by_session") == "" { missing = missing + ["locked_by_session"] }
-        if missing.len() == 0 {
-            _selftest_pass("F7 self-ref-schema-complete")
-        } else {
-            let mut s = ""
-            let mut k = 0
-            while k < missing.len() {
-                if k > 0 { s = s + "," }
-                s = s + missing[k]
-                k = k + 1
+    // F5 — unlock GC sidecar
+    let rU = exec_with_status("hexa run " + SELF + " unlock --path " + _shq(tmp) + " --reason 'selftest cleanup' 2>&1")
+    if rU[1] != 0 {
+        fails = fails + _selftest_fail("F5 unlock-rc", "rc=" + to_string(rU[1]) + " out=" + _str(rU[0]))
+    }
+    if _is_locked(tmp) {
+        fails = fails + _selftest_fail("F5 unlock-kernel", "uchg flag still set after unlock")
+    }
+    if _path_exists(scp) {
+        fails = fails + _selftest_fail("F5 nouchg-metadata-gc", "sidecar survived after unlock at " + scp)
+    } else {
+        _selftest_pass("F5 nouchg-metadata-gc")
+    }
+
+    // F7 — self-reference auto-injection (lock with empty reason/fix on a path
+    //      whose suffix matches WRAPPER_DEPS — should auto-inject canonical defaults).
+    let self_dir = "/tmp/chflags_self_selftest_" + pid + "/tool"
+    let _ = exec("rm -rf /tmp/chflags_self_selftest_" + pid + " 2>/dev/null")
+    let _ = exec("mkdir -p " + _shq(self_dir) + " && touch " + _shq(self_dir + "/chflags_lock_native.hexa"))
+    let self_path = self_dir + "/chflags_lock_native.hexa"
+    let r7 = exec_with_status("hexa run " + SELF + " lock --path " + _shq(self_path) + " 2>&1")
+    if r7[1] == 0 {
+        let scs = self_path + ".lock_meta.json"
+        if _path_exists(scs) {
+            let body = _str(read_file(scs))
+            if _validate_schema(body) && _json_get_str(body, "reason").contains("self-reference") {
+                _selftest_pass("F7 self-reference-auto-injection")
+            } else {
+                fails = fails + _selftest_fail("F7 self-ref-canonical", "reason did not auto-inject; body=" + body)
             }
-            fails = fails + _selftest_fail("F7 self-ref-schema-complete", "missing keys: " + s)
+        } else {
+            fails = fails + _selftest_fail("F7 self-ref-sidecar", "sidecar missing at " + scs)
         }
-        let _ = exec_with_status("hexa /Users/ghost/core/nexus/tool/chflags_lock_native.hexa unlock --path '" + tmp + "' 2>/dev/null")
+        let _ = exec_with_status("hexa run " + SELF + " unlock --path " + _shq(self_path) + " 2>/dev/null")
     } else {
-        fails = fails + _selftest_fail("F7 self-ref-lock", "rc=" + to_string(r5[1]) + " out=" + _str(r5[0]))
+        fails = fails + _selftest_fail("F7 self-ref-lock", "rc=" + to_string(r7[1]) + " out=" + _str(r7[0]))
     }
+    let _ = exec("rm -rf /tmp/chflags_self_selftest_" + pid + " " + _shq(tmp))
 
-    let _ = exec("rm -f '" + tmp + "' 2>/dev/null")
+    // F8 — sentinel emitted (raw 80) — examine lock cmd output
+    let probe = _str(rL[0])
+    if probe.contains(SENTINEL_TAG + " PASS path=") && probe.contains("op=lock") {
+        _selftest_pass("F8 raw-80-sentinel-on-completion")
+    } else {
+        fails = fails + _selftest_fail("F8 sentinel", "tag missing in lock output")
+    }
 
     println("=== " + to_string(fails) + " selftest fail(s) ===")
     if fails > 0 {
-        _emit_sentinel("FAIL", "selftest fails=" + to_string(fails))
+        _sentinel("FAIL", "", "selftest")
         return 1
     }
-    _emit_sentinel("PASS", "selftest")
+    _sentinel("PASS", "", "selftest")
     return 0
 }
 
-// ─── usage ──────────────────────────────────────────────────────────
+// ─── usage ───────────────────────────────────────────────────────────────
 
 fn _usage() {
-    eprintln("usage: hexa tool/chflags_lock_native.hexa <subcmd> [opts]")
-    eprintln("  lock    --path <p> --reason <r> --fix <f> [--guidance <g>] [--actor <id>]")
-    eprintln("  unlock  --path <p>")
-    eprintln("  lookup  --path <p>          (locked → ai-native trailer; unlocked → 'null')")
-    eprintln("  status  --path <p>")
+    eprintln("usage: hexa run tool/chflags_lock_native.hexa <subcmd> [opts]")
+    eprintln("  lock    --path <abs> --reason '<r>' --fix '<cmd>' [--fix '<cmd>'...] [--guidance '<text>'...] [--level L1|L2]")
+    eprintln("  unlock  --path <abs> [--reason '<r>'] [--level L1|L2]")
+    eprintln("  lookup  --path <abs> [--json]")
+    eprintln("  explain --path <abs>      (EPERM-victim helper — raw 66 trailer to stderr)")
+    eprintln("  status  --path <abs>")
     eprintln("  list")
-    eprintln("  selftest")
+    eprintln("  selftest                  (F1-F7 falsifier suite)")
     eprintln("")
     eprintln("required args missing → raw 66 hard-fail (exit 2)")
-    eprintln("metadata at " + META_DIR + "/<path-sha>.json")
+    eprintln("sidecar:  <abs>.lock_meta.json (sibling primary) | ~/.local/state/chflags_locks/<sha>.json (central fallback)")
+    eprintln("sentinel: " + SENTINEL_TAG + " <PASS|FAIL> path=<abs> op=<lock|unlock|lookup|explain|status|list|selftest>")
 }
 
-// ─── main dispatcher ────────────────────────────────────────────────
+// ─── main ────────────────────────────────────────────────────────────────
 
 fn main() {
     let av = _argv()
-    if av.len() < 3 {
+    if len(av) < 3 {
         _usage()
-        _emit_sentinel("FAIL", "usage")
+        _sentinel("FAIL", "", "usage")
         exit(1)
     }
     let mode = av[2]
@@ -766,13 +1051,15 @@ fn main() {
     if      mode == "lock"     { rc = cmd_lock(av) }
     else if mode == "unlock"   { rc = cmd_unlock(av) }
     else if mode == "lookup"   { rc = cmd_lookup(av) }
+    else if mode == "explain"  { rc = cmd_explain(av) }
     else if mode == "status"   { rc = cmd_status(av) }
     else if mode == "list"     { rc = cmd_list() }
     else if mode == "selftest" { rc = cmd_selftest() }
+    else if mode == "--help" || mode == "-h" { _usage(); exit(0) }
     else {
         eprintln("unknown subcmd: " + mode)
         _usage()
-        _emit_sentinel("FAIL", "unknown-subcmd/" + mode)
+        _sentinel("FAIL", "", "unknown-subcmd/" + mode)
         exit(1)
     }
     exit(to_int(to_string(rc)))
