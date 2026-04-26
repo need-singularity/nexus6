@@ -1,0 +1,304 @@
+#!hexa strict
+// tool/raw81_omega_cycle_monitor.hexa — hive_test_latency omega cycle falsifier monitor.
+//
+// @resolver-bypass(reason="reads ~/.hive/agent/logs/claude-cli-provider.log on host filesystem; container bind-mount path differs — keep on bare Mac")
+// @omega-saturation-exempt("static monitoring utility — single-shot scan + threshold check, no convergence loop")
+//
+// @tool(slug="raw81_omega_cycle_monitor", desc="hive_test_latency omega cycle 의 raw 71 falsifier monitor — cache_hit_ratio + fdd_p50 윈도우 통계로 early-promotion revert 조건 감시")
+// @usage(hexa ~/core/nexus/tool/raw81_omega_cycle_monitor.hexa [check|report|status])
+// @exit_codes(0=ok within thresholds, 2=falsifier violated, 3=insufficient samples, 4=io error)
+//
+// PURPOSE
+//   omega cycle 'hive_test_latency' (state/design_strategy_trawl/2026-04-25_*)
+//   는 measurement N=4 만으로 new→warn 조기 승격됨. raw 71 falsifier-retire
+//   적용: 승격 유지 조건 30일 윈도우 동안:
+//     - cache_hit_ratio ≥ 0.95
+//     - fdd_p50 ≤ 1500ms
+//   둘 중 하나라도 위반 시 → ai-native error (raw 66) + audit (raw 77) +
+//   cycle JSON 의 status field 를 promotion-revert 로 표기 (실 revert 는 manual).
+//
+// MECHANISM
+//   1) tail -N closed events from ~/.hive/agent/logs/claude-cli-provider.log
+//   2) awk 추출: fdd, usageCacheRead per closed event with code=0
+//   3) compute: hit_ratio = count(cr>0)/N; p50 = median(fdd)
+//   4) threshold check; emit ai-native error if violated
+//
+// LIMITATIONS
+//   N-event window proxy for 30-day window (log retention bound). hive
+//   회전 정책에 따라 N 이 30일보다 짧을 수 있음 — 최소 N=20 미만이면 exit 3
+//   (insufficient samples). cron cadence 일별 1회 호출 권장 (launchd plist).
+
+// (note) self/core/ai_err is the canonical ai_err emitter, but the
+// darwin-bypass resolver path used here does not load that module reliably;
+// the same pattern as tool/raw81_default_model_lock.hexa applies — emit
+// the raw 66 reason/fix trailer directly via eprintln, identical schema.
+
+const LOG_PATH         = "~/.hive/agent/logs/claude-cli-provider.log"
+const SAMPLE_WINDOW    = 1000        // last N closed events to scan
+const MIN_SAMPLES      = 20          // exit 3 if fewer
+const HIT_RATIO_FLOOR  = 0.95        // raw 71 falsifier
+const FDD_P50_CEILING  = 1500        // ms; raw 71 falsifier
+const AUDIT_PATH       = "state/raw81/falsifier_audit.jsonl"
+const AINATIVE_DIR     = "/tmp/hexa_error_ainative"
+
+fn _expand_home(path: string) -> string {
+    if !path.starts_with("~/") { return path }
+    let h = env("HOME")
+    if h == "" { return path }
+    return h + path.substring(1, len(path))
+}
+
+fn _ts_iso() -> string {
+    return to_string(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()
+}
+
+fn _ts_epoch() -> string {
+    return to_string(exec("date +%s")).trim()
+}
+
+// raw 4 (ai-native-algo) — array.push + join (O(n²) → O(n)).
+fn _shell_escape(s: string) -> string {
+    let mut parts = []
+    parts.push("'")
+    let mut i = 0
+    // @triad: atomize
+    while i < len(s) {
+        let c = s.substring(i, i + 1)
+        if c == "'" { parts.push("'\\''") } else { parts.push(c) }
+        i = i + 1
+    }
+    parts.push("'")
+    return parts.join("")
+}
+
+// Two-stage pipeline (BSD awk has no asort): awk emits "fdd cr" per code=0
+// closed event, sort -n provides percentile, final awk aggregates.
+// Output: single line "n=<N> hits=<H> p50=<P> mean=<M>".
+fn _scan_log() -> string {
+    let log = _expand_home(LOG_PATH)
+    if !file_exists(log) { return "" }
+    let pid = to_string(exec("echo $$")).trim()
+    let tmp = "/tmp/raw81_monitor_" + pid + ".raw"
+    let extract_cmd = "grep ' closed ' " + _shell_escape(log) +
+        " | tail -" + to_string(SAMPLE_WINDOW) +
+        " | awk '{" +
+        "  c=-99;" +
+        "  if (match($0, /\"code\":[-0-9]+/)) c = substr($0, RSTART+7, RLENGTH-7) + 0;" +
+        "  if (c != 0) next;" +
+        "  fdd=-1; cr=-1;" +
+        "  if (match($0, /\"firstDataDelta\":[-0-9]+/)) fdd = substr($0, RSTART+18, RLENGTH-18) + 0;" +
+        "  if (match($0, /\"usageCacheRead\":[0-9]+/)) cr = substr($0, RSTART+17, RLENGTH-17) + 0;" +
+        "  if (fdd < 0 || cr < 0) next;" +
+        "  print fdd \" \" cr;" +
+        "}' > " + tmp
+    let _r1 = exec_with_status(extract_cmd)
+    let agg_cmd = "n=$(wc -l < " + tmp + " | tr -d ' ')" +
+        "; hits=$(awk '$2>0' " + tmp + " | wc -l | tr -d ' ')" +
+        "; mean=$(awk 'NR==1{s=0;c=0} {s+=$1;c++} END{if(c>0) print int(s/c); else print 0}' " + tmp + ")" +
+        "; p50=$(awk '{print $1}' " + tmp + " | sort -n | awk -v n=\"$n\" 'NR == int((n+1)/2)')" +
+        "; [ -z \"$p50\" ] && p50=0" +
+        "; printf 'n=%s hits=%s p50=%s mean=%s\\n' \"$n\" \"$hits\" \"$p50\" \"$mean\"" +
+        "; rm -f " + tmp
+    let r = exec_with_status(agg_cmd)
+    if r[1] != 0 { return "" }
+    return to_string(r[0]).trim()
+}
+
+fn _extract_int(s: string, key: string) -> int {
+    let needle = key + "="
+    let idx = s.index_of(needle)
+    if idx < 0 { return -1 }
+    let mut i = idx + len(needle)
+    let mut sign = 1
+    if i < len(s) && s.substring(i, i + 1) == "-" { sign = -1; i = i + 1 }
+    let mut n = 0
+    let mut saw = false
+    // @triad: atomize
+    while i < len(s) {
+        let c = s.substring(i, i + 1)
+        if c >= "0" && c <= "9" {
+            n = n * 10 + parse_int(c)
+            saw = true
+            i = i + 1
+            continue
+        }
+        break
+    }
+    if !saw { return -1 }
+    return n * sign
+}
+
+// raw 4 (ai-native-algo) — array.push + join.
+fn _audit_append(verdict: string, n: int, hits: int, p50: int, mean: int) -> int {
+    let _mk = exec("mkdir -p 'state/raw81' 2>/dev/null")
+    let ts = _ts_iso()
+    let ratio_x100 = if n > 0 { (hits * 100) / n } else { 0 }
+    let mut parts = []
+    parts.push("{\"ts\":\"")
+    parts.push(ts)
+    parts.push("\",\"agent_id\":\"raw81_omega_cycle_monitor\",\"action\":\"falsifier_check\",\"verdict\":\"")
+    parts.push(verdict)
+    parts.push("\",\"samples_n\":")
+    parts.push(to_string(n))
+    parts.push(",\"cache_hits\":")
+    parts.push(to_string(hits))
+    parts.push(",\"hit_ratio_x100\":")
+    parts.push(to_string(ratio_x100))
+    parts.push(",\"fdd_p50_ms\":")
+    parts.push(to_string(p50))
+    parts.push(",\"fdd_mean_ms\":")
+    parts.push(to_string(mean))
+    parts.push(",\"thresholds\":{\"hit_ratio_floor_x100\":95,\"fdd_p50_ceiling_ms\":1500}}\n")
+    let line = parts.join("")
+    let _r = exec("printf '%s' " + _shell_escape(line) + " >> '" + AUDIT_PATH + "' 2>/dev/null")
+    return 0
+}
+
+fn _emit_ainative_log(reason_code: string, n: int, hits: int, p50: int, mean: int) -> int {
+    let _mk = exec("mkdir -p '" + AINATIVE_DIR + "' 2>/dev/null")
+    let ts = _ts_epoch()
+    let mut path_parts = []
+    path_parts.push(AINATIVE_DIR)
+    path_parts.push("/raw81-monitor-")
+    path_parts.push(ts)
+    path_parts.push(".jsonl")
+    let path = path_parts.join("")
+    let ratio_x100 = if n > 0 { (hits * 100) / n } else { 0 }
+    let mut parts = []
+    parts.push("{\"ts\":\"")
+    parts.push(_ts_iso())
+    parts.push("\",\"rule\":\"raw#81-monitor\",\"action\":\"falsifier_violation\",\"reason\":\"")
+    parts.push(reason_code)
+    parts.push("\",\"samples_n\":")
+    parts.push(to_string(n))
+    parts.push(",\"hit_ratio_x100\":")
+    parts.push(to_string(ratio_x100))
+    parts.push(",\"fdd_p50_ms\":")
+    parts.push(to_string(p50))
+    parts.push(",\"fdd_mean_ms\":")
+    parts.push(to_string(mean))
+    parts.push(",\"fix\":[\"hexa ~/core/nexus/tool/raw81_omega_cycle_monitor.hexa report  # 분포 점검\",\"review state/design_strategy_trawl/2026-04-25_hive_test_latency_omega_cycle.json early_promotion\",\"if cache miss spike: investigate sid-map purge cadence (purgeStaleSidMap STALE_TTL_MS)\",\"if fdd_p50 spike: investigate Anthropic API regional latency or claude CLI version\"]}\n")
+    let payload = parts.join("")
+    let _r = exec("printf '%s' " + _shell_escape(payload) + " > '" + path + "' 2>/dev/null")
+    return 0
+}
+
+fn _status_print(n: int, hits: int, p50: int, mean: int, verdict: string) {
+    let ratio_x100 = if n > 0 { (hits * 100) / n } else { 0 }
+    println("raw81 omega cycle monitor — " + _ts_iso())
+    println("  log:                 " + _expand_home(LOG_PATH))
+    println("  sample window:       last " + to_string(SAMPLE_WINDOW) + " closed events (code=0)")
+    println("  samples_n:           " + to_string(n))
+    println("  cache_hits:          " + to_string(hits))
+    println("  cache_hit_ratio:     " + to_string(ratio_x100) + "% (floor: 95%)")
+    println("  fdd_p50:             " + to_string(p50) + "ms (ceiling: 1500ms)")
+    println("  fdd_mean:            " + to_string(mean) + "ms")
+    println("  verdict:             " + verdict)
+}
+
+fn cmd_check() -> int {
+    let result = _scan_log()
+    if result == "" {
+        eprintln("raw81-monitor: log missing or unreadable")
+        eprintln("reason: log-missing-or-unreadable: claude-cli-provider.log not found or grep/awk failed")
+        eprintln("fix: 1) ls -la ~/.hive/agent/logs/claude-cli-provider.log  2) verify hive has been running and producing closed events  3) check raw:default-model-top-tier-mandate")
+        return 4
+    }
+    let n    = _extract_int(result, "n")
+    let hits = _extract_int(result, "hits")
+    let p50  = _extract_int(result, "p50")
+    let mean = _extract_int(result, "mean")
+    if n < MIN_SAMPLES {
+        let _a = _audit_append("insufficient_samples", n, hits, p50, mean)
+        eprintln("raw81-monitor: insufficient samples n=" + to_string(n) + " < " + to_string(MIN_SAMPLES))
+        eprintln("reason: insufficient-samples: samples_n=" + to_string(n) + " < MIN_SAMPLES=" + to_string(MIN_SAMPLES))
+        eprintln("fix: 1) run hive longer to accumulate ≥" + to_string(MIN_SAMPLES) + " happy-path closed events  2) verify ~/.hive/agent/logs/claude-cli-provider.log retention not too aggressive  3) ref raw:default-model-top-tier-mandate")
+        return 3
+    }
+    let mut violated = false
+    let mut reason = ""
+    let ratio_x100 = (hits * 100) / n
+    if ratio_x100 < 95 {
+        violated = true
+        reason = "cache_hit_ratio=" + to_string(ratio_x100) + "% < 95% (raw 71 falsifier)"
+    }
+    if p50 > FDD_P50_CEILING {
+        if violated { reason = reason + "; " }
+        violated = true
+        reason = reason + "fdd_p50=" + to_string(p50) + "ms > " + to_string(FDD_P50_CEILING) + "ms"
+    }
+    if !violated {
+        let _a = _audit_append("ok", n, hits, p50, mean)
+        println("raw81-monitor: ok — n=" + to_string(n) + " hit_ratio=" + to_string(ratio_x100) + "% fdd_p50=" + to_string(p50) + "ms")
+        return 0
+    }
+    let _a = _audit_append("violation", n, hits, p50, mean)
+    let _l = _emit_ainative_log(reason, n, hits, p50, mean)
+    eprintln("raw81-monitor: falsifier violation — " + reason)
+    eprintln("reason: falsifier-violation: " + reason)
+    eprintln("fix: 1) hexa ~/core/nexus/tool/raw81_omega_cycle_monitor.hexa report  2) review state/design_strategy_trawl/2026-04-25_hive_test_latency_omega_cycle.json early_promotion  3) if cache miss spike → purgeStaleSidMap STALE_TTL_MS or sid-map.json drift  4) if fdd_p50 spike → Anthropic API region latency or claude CLI version  ref raw:default-model-top-tier-mandate")
+    return 2
+}
+
+fn cmd_report() -> int {
+    let result = _scan_log()
+    if result == "" {
+        eprintln("raw81-monitor: log empty or unreadable")
+        return 4
+    }
+    let n    = _extract_int(result, "n")
+    let hits = _extract_int(result, "hits")
+    let p50  = _extract_int(result, "p50")
+    let mean = _extract_int(result, "mean")
+    let verdict = if n < MIN_SAMPLES { "insufficient (need " + to_string(MIN_SAMPLES) + ")" }
+        else if (hits * 100) / n < 95 { "violated (hit_ratio < 95%)" }
+        else if p50 > FDD_P50_CEILING { "violated (fdd_p50 > " + to_string(FDD_P50_CEILING) + "ms)" }
+        else { "ok" }
+    _status_print(n, hits, p50, mean, verdict)
+    return 0
+}
+
+fn cmd_status() -> int {
+    return cmd_report()
+}
+
+fn cmd_usage() -> int {
+    eprintln("usage: hexa ~/core/nexus/tool/raw81_omega_cycle_monitor.hexa [check|report|status]")
+    eprintln("  check  — falsifier evaluation (default), exit 2 on violation")
+    eprintln("  report — distribution snapshot")
+    eprintln("  status — alias for report")
+    return 4
+}
+
+// ─── is_main guard ─────────────────────────────────────────────
+let _av = argv()
+
+fn _is_main() -> bool {
+    if len(_av) < 2 { return false }
+    let script = _av[1]
+    if script.ends_with("/raw81_omega_cycle_monitor.hexa") { return true }
+    if script == "raw81_omega_cycle_monitor.hexa" { return true }
+    // hexa-runtime may rewrite _av[1] to a tmp path (/tmp/.hexa-runtime/…tmp.hexa);
+    // fall back to subcommand match.
+    if len(_av) >= 3 {
+        let sub = _av[2]
+        if sub == "check" || sub == "report" || sub == "status" { return true }
+    }
+    return false
+}
+
+if _is_main() {
+    let mut sub = ""
+    let mut i = 2
+    // @triad: atomize
+    while i < len(_av) {
+        let a = _av[i]
+        if a == "check" || a == "report" || a == "status" { sub = a; break }
+        i = i + 1
+    }
+    if sub == "" { sub = "check" }
+    if      sub == "check"  { exit(cmd_check()) }
+    else if sub == "report" { exit(cmd_report()) }
+    else if sub == "status" { exit(cmd_status()) }
+    else { exit(cmd_usage()) }
+}
