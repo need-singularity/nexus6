@@ -372,11 +372,37 @@ fi
 # ω-bridge-15: opt-in anomaly check (CLI-only inter-call into hexa runtime).
 # Reads BRIDGE_HISTORY_TSV (now appended above) and emits __BRIDGE_ANOMALY__.
 # Failure here is non-fatal (raw 71 report-only) — main exit code is preserved.
+# ω-bridge-16: capture analyzer stdout, re-emit, and append a parsed sibling
+# JSONL line to $TIMELINE (scope=bridge_anomaly) so time-series tooling can
+# join health + anomaly without re-parsing per-bridge sentinels. Suppressed
+# under --json (consistent with the bridge_registry JSONL gate at L341-343).
 if [ "$ANOMALY_CHECK" = "1" ]; then
     if [ -x "$HEXA_BIN" ] || [ -f "$HEXA_BIN" ]; then
-        HEXA_ARGV="--quiet --history $BRIDGE_HISTORY_TSV" \
+        ANOMALY_OUT=$(HEXA_ARGV="--quiet --history $BRIDGE_HISTORY_TSV" \
             HEXA_RESOLVER_NO_REROUTE=1 \
-            "$HEXA_BIN" run "$NEXUS_ROOT/tool/bridge_anomaly.hexa" 2>/dev/null || true
+            "$HEXA_BIN" run "$NEXUS_ROOT/tool/bridge_anomaly.hexa" 2>/dev/null) || ANOMALY_OUT=""
+        if [ -n "$ANOMALY_OUT" ]; then
+            printf '%s\n' "$ANOMALY_OUT"
+            ANOMALY_LINE=$(printf '%s\n' "$ANOMALY_OUT" | grep '^__BRIDGE_ANOMALY__' | head -1)
+            if [ -n "$ANOMALY_LINE" ] && [ "$JSON" = "0" ]; then
+                # Sentinel format (raw 80, fixed positional after verdict):
+                #   __BRIDGE_ANOMALY__ <verdict> bridges=B samples=N flagged=F window=W mult=M [reason=... path=...]
+                read -r A_VERDICT A_BRIDGES A_SAMPLES A_FLAGGED A_WINDOW A_MULT <<EOF_PARSE
+$(printf '%s' "$ANOMALY_LINE" | awk '{
+    v=$2
+    sub(/^[^=]*=/,"",$3); b=$3
+    sub(/^[^=]*=/,"",$4); s=$4
+    sub(/^[^=]*=/,"",$5); f=$5
+    sub(/^[^=]*=/,"",$6); w=$6
+    sub(/^[^=]*=/,"",$7); m=$7
+    print v, b, s, f, w, m
+}')
+EOF_PARSE
+                printf '{"ts":"%s","scope":"bridge_anomaly","verdict":"%s","bridges":%s,"samples":%s,"flagged":%s,"window":%s,"multiplier":%s,"checker":"bridge_anomaly.hexa"}\n' \
+                    "$NOW" "${A_VERDICT:-UNKNOWN}" "${A_BRIDGES:-0}" "${A_SAMPLES:-0}" "${A_FLAGGED:-0}" "${A_WINDOW:-0}" "${A_MULT:-0}" \
+                    >> "$TIMELINE"
+            fi
+        fi
     else
         echo "__BRIDGE_ANOMALY__ SKIP reason=hexa_bin_missing path=$HEXA_BIN" >&2
     fi
