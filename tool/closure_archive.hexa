@@ -1,0 +1,378 @@
+// tool/closure_archive.hexa — ω-cleanup-1: archive aged PSC-loop closure JSONs
+//
+// raw 9 hexa-only-suffix (sweeper-safe .hexa). The PSC-loop produces closure
+// JSONs at /Users/ghost/core/anima/state/omega_*.json — by 2026-04-26 there
+// are 126 of them in a single flat directory. Older closures (e.g. early
+// Mk.I floor) are reference material that bloats the active scan path.
+// This tool moves files older than --age-days N (default 7) into
+// anima/state/archive/YYYY-MM/ subdirs (YYYY-MM derived from each file's
+// own mtime).
+//
+// @tool(slug="closure_archive", desc="ω-cleanup-1 archiver for aged omega_*.json closure JSONs")
+// @usage(hexa run tool/closure_archive.hexa [--age-days N] [--apply] [--quiet] [--json] [--source DIR] [--archive-root DIR] [--help])
+// @sentinel(__CLOSURE_ARCHIVE__ <DRY_RUN|APPLIED|EMPTY|SKIP> total=N moved=M kept=K threshold_days=D)
+//
+// flags:
+//   --age-days N         age threshold in days (default 7)
+//   --apply              actually mv files (otherwise DRY-RUN: just print)
+//   --quiet              sentinel only, suppress per-file output
+//   --json               emit JSON array of {path, mtime, action, target}
+//   --source DIR         override source directory (default /Users/ghost/core/anima/state)
+//   --archive-root DIR   override archive root (default <source>/archive)
+//   --help, -h           usage
+//
+// behavior:
+//   - DRY-RUN mode (default): prints what WOULD move; never creates dirs
+//   - --apply mode: creates archive/YYYY-MM/ subdirs as needed; mv (atomic on
+//     same filesystem) into them.
+//
+// parallel-safety:
+//   - Skip files with mtime within last 60s (still being written / race window)
+//   - Skip empty (size 0) files
+//   - NEVER move omega_meta_*.json or omega_cleanup_*.json (self-archiving guard)
+//   - Use mv for atomic same-filesystem rename
+//
+// failure modes:
+//   - source dir missing → __CLOSURE_ARCHIVE__ SKIP reason=source_missing
+//   - empty source dir   → __CLOSURE_ARCHIVE__ EMPTY total=0 ...
+//   - per-file mv error  → warn to stderr, count as kept, continue
+//
+// raw compliance: 9 hexa-suffix / 71 read-only-on-anima (writes only mv, never
+// edits content) / 73 admissibility / 80 sentinel
+//
+// origin: ω-cleanup-1 PSC-loop cycle (2026-04-26)
+//
+// @allow-bare-exec
+// @no-lock-needed
+// @no-sandbox
+
+let DEFAULT_SOURCE = "/Users/ghost/core/anima/state"
+let RACE_WINDOW_SECS = 60
+
+// ─── argv parsing ────────────────────────────────────────────────────────────
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _to_int_safe(s: string, default: i64) -> i64 {
+    if len(s) == 0 { return default }
+    let trimmed = s.trim()
+    if len(trimmed) == 0 { return default }
+    // Reject non-digit (allow leading -)
+    let mut i = 0
+    let mut negative = false
+    if trimmed.substring(0, 1) == "-" {
+        negative = true
+        i = 1
+    }
+    let mut acc = 0
+    while i < len(trimmed) {
+        let c = trimmed.substring(i, i+1)
+        if c == "0" { acc = acc * 10 + 0 }
+        else if c == "1" { acc = acc * 10 + 1 }
+        else if c == "2" { acc = acc * 10 + 2 }
+        else if c == "3" { acc = acc * 10 + 3 }
+        else if c == "4" { acc = acc * 10 + 4 }
+        else if c == "5" { acc = acc * 10 + 5 }
+        else if c == "6" { acc = acc * 10 + 6 }
+        else if c == "7" { acc = acc * 10 + 7 }
+        else if c == "8" { acc = acc * 10 + 8 }
+        else if c == "9" { acc = acc * 10 + 9 }
+        else { return default }
+        i = i + 1
+    }
+    if negative { return -acc }
+    return acc
+}
+
+let argv = args()
+let mut age_days = 7
+let mut apply_mode = false
+let mut quiet = false
+let mut json_mode = false
+let mut source_dir = DEFAULT_SOURCE
+let mut archive_root = ""   // empty → derive as <source>/archive after parsing
+let mut help = false
+let mut i = 2  // skip [0]=interp [1]=script
+while i < argv.len() {
+    let a = _str(argv[i])
+    if a == "--apply" { apply_mode = true }
+    else if a == "--quiet" { quiet = true }
+    else if a == "--json" { json_mode = true }
+    else if a == "--help" || a == "-h" { help = true }
+    else if a == "--age-days" && i + 1 < argv.len() {
+        age_days = _to_int_safe(_str(argv[i+1]), 7)
+        i = i + 1
+    }
+    else if a == "--source" && i + 1 < argv.len() {
+        source_dir = _str(argv[i+1])
+        i = i + 1
+    }
+    else if a == "--archive-root" && i + 1 < argv.len() {
+        archive_root = _str(argv[i+1])
+        i = i + 1
+    }
+    i = i + 1
+}
+
+if help {
+    println("closure_archive — ω-cleanup-1 archiver for aged PSC-loop closure JSONs")
+    println("")
+    println("usage:")
+    println("  hexa run tool/closure_archive.hexa [flags]")
+    println("")
+    println("flags:")
+    println("  --age-days N         age threshold in days (default 7)")
+    println("  --apply              actually mv files (otherwise DRY-RUN)")
+    println("  --quiet              sentinel only, suppress per-file output")
+    println("  --json               emit JSON array of moves/dry-runs")
+    println("  --source DIR         override source dir (default " + DEFAULT_SOURCE + ")")
+    println("  --archive-root DIR   override archive root (default <source>/archive)")
+    println("  --help, -h           this message")
+    println("")
+    println("behavior:")
+    println("  - default DRY-RUN: never creates dirs, never mv")
+    println("  - --apply mode: creates archive/YYYY-MM/ subdirs as needed, then mv")
+    println("  - skips files mtime'd within last " + to_string(RACE_WINDOW_SECS) + "s (race-defensive)")
+    println("  - skips empty files")
+    println("  - skips omega_meta_*.json and omega_cleanup_*.json (self-protection)")
+    println("")
+    println("sentinel: __CLOSURE_ARCHIVE__ <DRY_RUN|APPLIED|EMPTY|SKIP> total=N moved=M kept=K threshold_days=D")
+    return
+}
+
+// derive archive_root if not set
+if len(archive_root) == 0 {
+    archive_root = source_dir + "/archive"
+}
+
+// ─── pre-flight: source dir existence ────────────────────────────────────────
+let dir_check = to_string(exec("[ -d '" + source_dir + "' ] && echo Y || echo N")).trim()
+if dir_check != "Y" {
+    println("__CLOSURE_ARCHIVE__ SKIP reason=source_missing path=" + source_dir)
+    return
+}
+
+// ─── scan + classify via single python3 invocation ───────────────────────────
+// The python script:
+//   1. globs source_dir/omega_*.json (NON-recursive — top-level only)
+//   2. for each file:
+//      a. stat → mtime, size
+//      b. classify:
+//         - empty (size==0)        → SKIP_EMPTY
+//         - mtime within race      → SKIP_RACE
+//         - omega_meta_*           → SKIP_SELF
+//         - omega_cleanup_*        → SKIP_SELF
+//         - mtime older than thr   → MOVE
+//         - otherwise              → KEEP_FRESH
+//   3. emits TAB-separated records: action<TAB>path<TAB>mtime_iso<TAB>target_subdir
+//      (target_subdir = YYYY-MM derived from mtime; "" for non-MOVE)
+//   4. trailing summary: S<TAB>total<TAB>move<TAB>keep
+//
+// We only CLASSIFY in python. The actual mv (or DRY-RUN print) is done by
+// hexa code below — that way --apply gating + atomicity is in one place.
+
+let py = "import os, glob, sys, time, datetime as _dt\n" +
+    "src = '" + source_dir.replace("'", "") + "'\n" +
+    "age_days = " + to_string(age_days) + "\n" +
+    "race = " + to_string(RACE_WINDOW_SECS) + "\n" +
+    "now = time.time()\n" +
+    "thr_old = now - age_days * 86400\n" +
+    "thr_race = now - race\n" +
+    "total = 0\n" +
+    "n_move = 0\n" +
+    "n_keep = 0\n" +
+    "rows = []\n" +
+    "warnings = []\n" +
+    "for path in sorted(glob.glob(os.path.join(src, 'omega_*.json'))):\n" +
+    "    total += 1\n" +
+    "    base = os.path.basename(path)\n" +
+    "    try:\n" +
+    "        st = os.stat(path)\n" +
+    "    except Exception as e:\n" +
+    "        warnings.append('warn: stat failed ' + path + ': ' + str(e)[:60])\n" +
+    "        n_keep += 1\n" +
+    "        rows.append(('SKIP_STAT', path, '', ''))\n" +
+    "        continue\n" +
+    "    size = st.st_size\n" +
+    "    mtime = st.st_mtime\n" +
+    "    mtime_iso = _dt.datetime.fromtimestamp(mtime, _dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')\n" +
+    "    yyyymm = _dt.datetime.fromtimestamp(mtime, _dt.timezone.utc).strftime('%Y-%m')\n" +
+    "    if size == 0:\n" +
+    "        n_keep += 1\n" +
+    "        rows.append(('SKIP_EMPTY', path, mtime_iso, ''))\n" +
+    "        continue\n" +
+    "    if mtime > thr_race:\n" +
+    "        n_keep += 1\n" +
+    "        rows.append(('SKIP_RACE', path, mtime_iso, ''))\n" +
+    "        continue\n" +
+    "    if base.startswith('omega_meta_') or base.startswith('omega_cleanup_'):\n" +
+    "        n_keep += 1\n" +
+    "        rows.append(('SKIP_SELF', path, mtime_iso, ''))\n" +
+    "        continue\n" +
+    "    if mtime <= thr_old:\n" +
+    "        n_move += 1\n" +
+    "        rows.append(('MOVE', path, mtime_iso, yyyymm))\n" +
+    "    else:\n" +
+    "        n_keep += 1\n" +
+    "        rows.append(('KEEP_FRESH', path, mtime_iso, ''))\n" +
+    "for w in warnings:\n" +
+    "    sys.stderr.write(w + '\\n')\n" +
+    "for r in rows:\n" +
+    "    sys.stdout.write('R\\t' + r[0] + '\\t' + r[1] + '\\t' + r[2] + '\\t' + r[3] + '\\n')\n" +
+    "sys.stdout.write('S\\t' + str(total) + '\\t' + str(n_move) + '\\t' + str(n_keep) + '\\n')\n"
+
+let pid_tag = to_string(exec("echo $$")).trim()
+let py_tmp = "/tmp/closure_archive_" + pid_tag + ".py"
+let stdout_capture = "/tmp/closure_archive_" + pid_tag + "_stdout.txt"
+let stderr_capture = "/tmp/closure_archive_" + pid_tag + "_stderr.txt"
+write_file(py_tmp, py)
+let _ = exec("python3 " + py_tmp + " > " + stdout_capture + " 2> " + stderr_capture)
+let _ = exec("rm -f " + py_tmp)
+
+let data_raw = to_string(read_file(stdout_capture))
+let warn_raw = to_string(read_file(stderr_capture))
+let _ = exec("rm -f " + stdout_capture + " " + stderr_capture)
+
+// Forward warnings
+let warn_lines = split(warn_raw, "\n")
+let mut wi = 0
+while wi < len(warn_lines) {
+    let wl = warn_lines[wi]
+    if len(wl.trim()) > 0 { eprintln(wl) }
+    wi = wi + 1
+}
+
+// ─── parse classification ────────────────────────────────────────────────────
+let data_lines = split(data_raw, "\n")
+let mut rows = []  // each row = [action, path, mtime_iso, yyyymm]
+let mut total_str = "0"
+let mut move_str = "0"
+let mut keep_str = "0"
+let mut di = 0
+while di < len(data_lines) {
+    let dl = data_lines[di]
+    if len(dl) == 0 { di = di + 1; continue }
+    let parts = split(dl, "\t")
+    if len(parts) >= 1 && parts[0] == "S" && len(parts) >= 4 {
+        total_str = parts[1]
+        move_str = parts[2]
+        keep_str = parts[3]
+    } else if len(parts) >= 1 && parts[0] == "R" && len(parts) >= 5 {
+        rows.push([parts[1], parts[2], parts[3], parts[4]])
+    }
+    di = di + 1
+}
+
+let total = _to_int_safe(total_str, 0)
+
+// ─── EMPTY shortcut ──────────────────────────────────────────────────────────
+if total == 0 {
+    if json_mode { println("[]") }
+    println("__CLOSURE_ARCHIVE__ EMPTY total=0 moved=0 kept=0 threshold_days=" + to_string(age_days))
+    return
+}
+
+// ─── execute moves (or print dry-run) ────────────────────────────────────────
+fn _json_escape(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", " ")
+    r = r.replace("\r", " ")
+    r = r.replace("\t", " ")
+    return r
+}
+
+let mut moved_count = 0
+let mut kept_count = 0
+let mut json_first = true
+
+if json_mode { println("[") }
+
+let mut ri = 0
+while ri < len(rows) {
+    let r = rows[ri]
+    let action = r[0]
+    let path = r[1]
+    let mtime_iso = r[2]
+    let yyyymm = r[3]
+    let mut final_action = action
+    let mut target = ""
+
+    if action == "MOVE" {
+        let target_dir = archive_root + "/" + yyyymm
+        let basename = to_string(exec("basename '" + path.replace("'", "") + "'")).trim()
+        target = target_dir + "/" + basename
+        if apply_mode {
+            // mkdir -p target_dir
+            let mk_rc = to_string(exec("mkdir -p '" + target_dir.replace("'", "") + "' && echo OK || echo FAIL")).trim()
+            if mk_rc != "OK" {
+                eprintln("warn: mkdir failed for " + target_dir)
+                final_action = "FAIL_MKDIR"
+                kept_count = kept_count + 1
+            } else {
+                // mv (atomic on same fs)
+                let mv_rc = to_string(exec("mv '" + path.replace("'", "") + "' '" + target.replace("'", "") + "' && echo OK || echo FAIL")).trim()
+                if mv_rc != "OK" {
+                    eprintln("warn: mv failed for " + path)
+                    final_action = "FAIL_MV"
+                    kept_count = kept_count + 1
+                } else {
+                    final_action = "MOVED"
+                    moved_count = moved_count + 1
+                }
+            }
+        } else {
+            // DRY-RUN: never create dirs, never mv
+            final_action = "WOULD_MOVE"
+            moved_count = moved_count + 1
+        }
+    } else {
+        kept_count = kept_count + 1
+    }
+
+    if !quiet {
+        if json_mode {
+            let comma = if json_first { "" } else { "," }
+            json_first = false
+            println(comma + "  {" +
+                "\"action\":\"" + _json_escape(final_action) + "\"," +
+                "\"path\":\"" + _json_escape(path) + "\"," +
+                "\"mtime\":\"" + _json_escape(mtime_iso) + "\"," +
+                "\"target\":\"" + _json_escape(target) + "\"" +
+                "}")
+        } else {
+            if final_action == "WOULD_MOVE" {
+                println("WOULD_MOVE  " + path + "  →  " + target + "  (mtime=" + mtime_iso + ")")
+            } else if final_action == "MOVED" {
+                println("MOVED       " + path + "  →  " + target + "  (mtime=" + mtime_iso + ")")
+            } else if final_action == "KEEP_FRESH" {
+                println("KEEP_FRESH  " + path + "  (mtime=" + mtime_iso + ")")
+            } else if final_action == "SKIP_RACE" {
+                println("SKIP_RACE   " + path + "  (mtime=" + mtime_iso + ", within " + to_string(RACE_WINDOW_SECS) + "s)")
+            } else if final_action == "SKIP_EMPTY" {
+                println("SKIP_EMPTY  " + path)
+            } else if final_action == "SKIP_SELF" {
+                println("SKIP_SELF   " + path + "  (omega_meta_/omega_cleanup_ self-protection)")
+            } else if final_action == "SKIP_STAT" {
+                println("SKIP_STAT   " + path)
+            } else if final_action == "FAIL_MKDIR" {
+                println("FAIL_MKDIR  " + path)
+            } else if final_action == "FAIL_MV" {
+                println("FAIL_MV     " + path)
+            } else {
+                println(final_action + "  " + path)
+            }
+        }
+    }
+    ri = ri + 1
+}
+
+if json_mode { println("]") }
+
+// ─── sentinel (raw 80) ───────────────────────────────────────────────────────
+let mode_label = if apply_mode { "APPLIED" } else { "DRY_RUN" }
+println("__CLOSURE_ARCHIVE__ " + mode_label + " total=" + to_string(total) + " moved=" + to_string(moved_count) + " kept=" + to_string(kept_count) + " threshold_days=" + to_string(age_days))
