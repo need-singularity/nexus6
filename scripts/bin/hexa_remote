@@ -295,6 +295,9 @@ PREFERRED="$(pick_preferred_host)"
 # 무시하고 항상 hetzner (128GB RAM) 우선. ubu1/ubu2 는 32GB total + cgroup
 # MemoryMax=20G 에서 smash round peak RSS 가 SIGTERM (rc=137) 유발 — 2026-04-25
 # 관측 (ubu2 에서 smash +917 absorptions 후 OOM). hetzner 는 100GB+ headroom.
+# Sub-AH (2026-04-27): stash original argv for downstream classify
+# (per-host dynamic concurrency needs the same args _classify_job sees).
+_NEXUS_ORIG_ARGV=("$@")
 _IS_HEAVY_COMPUTE=0
 if [ "${1:-}" = "run" ] && [ -n "${2:-}" ]; then
     case "$(basename "$2")" in
@@ -391,14 +394,47 @@ if [ "$_IS_HEAVY_COMPUTE" = "1" ] && [ "${HEXA_REMOTE_NO_CONCURRENCY:-0}" != "1"
     _WAIT_S="${HEXA_REMOTE_CONCURRENCY_WAIT:-300}"
     _SLOT_MAX_HOLD="${HEXA_REMOTE_SLOT_MAX_HOLD:-3600}"
     _ACQUIRED=""
-    # _per_host_max <host> → echo per-host slot limit (env override else default).
+    # _per_host_max <host> → echo per-host slot limit.
+    # Sub-AH (2026-04-27): mathematical-limit dynamic compute. Old code
+    # default=1 wasted hetzner 124GB capacity (only 1 of 4-5 mathematically-
+    # available slots used = 75% capacity dormant). Now: floor((avail_mb -
+    # safety) / class_min_mb), clamped [1, 8].
+    #   Priority: per-host env > global env > dynamic (avail+class) > fallback default 1
+    #   Safety margin: 4096MB headroom for system + interpreter RSS
+    #   Class min: small=2048 / medium=8192 / large=24576 / gpu=8192 (RAM dim only — VRAM is L8 dim)
+    # Examples (live cluster, post-Sub-AF audit):
+    #   hetzner avail=122GB large=24GB  → (122000-4096)/24576 = 4.8 → 4 slots
+    #   ubu1    avail=25GB  medium=8GB  → (25000-4096)/8192   = 2.5 → 2 slots
+    #   ubu2    avail=25GB  medium=8GB  → 2 slots
+    #   hetzner avail=122GB small=2GB   → (122000-4096)/2048  = 57.6 → CLAMPED to 8 (over-saturation guard)
     _per_host_max() {
-        case "$1" in
-            hetzner|htz) printf '%s' "${HEXA_REMOTE_CONCURRENCY_HETZNER:-${HEXA_REMOTE_CONCURRENCY:-1}}" ;;
-            ubu1)        printf '%s' "${HEXA_REMOTE_CONCURRENCY_UBU1:-${HEXA_REMOTE_CONCURRENCY:-1}}" ;;
-            ubu2)        printf '%s' "${HEXA_REMOTE_CONCURRENCY_UBU2:-${HEXA_REMOTE_CONCURRENCY:-1}}" ;;
-            *)           printf '%s' "${HEXA_REMOTE_CONCURRENCY:-1}" ;;
+        local _h="$1"
+        local _h_uc="$(printf '%s' "$_h" | tr '[:lower:]' '[:upper:]')"
+        local _explicit_var="HEXA_REMOTE_CONCURRENCY_${_h_uc}"
+        local _explicit="${!_explicit_var:-}"
+        if [ -n "$_explicit" ]; then printf '%s' "$_explicit"; return; fi
+        if [ -n "${HEXA_REMOTE_CONCURRENCY:-}" ]; then printf '%s' "$HEXA_REMOTE_CONCURRENCY"; return; fi
+        # Dynamic — only when probe set _best_avail (post LB-pick).
+        # Compute class-min inline (avoid relying on _admit_min_mb which is set later in L3).
+        local _cls _cmin
+        _cls="$(_classify_job ${_NEXUS_ORIG_ARGV[@]:-})"
+        case "$_cls" in
+            small)  _cmin=2048 ;;
+            medium) _cmin=8192 ;;
+            large)  _cmin=24576 ;;
+            gpu)    _cmin=8192 ;;
+            *)      _cmin=8192 ;;
         esac
+        local _avail="${_best_avail:-0}"
+        local _safety="${HEXA_REMOTE_PER_HOST_SAFETY_MB:-4096}"
+        if [ "$_avail" -gt "$_safety" ] 2>/dev/null && [ "$_cmin" -gt 0 ] 2>/dev/null; then
+            local _dyn=$(( (_avail - _safety) / _cmin ))
+            [ "$_dyn" -lt 1 ] && _dyn=1
+            [ "$_dyn" -gt 8 ] && _dyn=8
+            printf '%s' "$_dyn"
+            return
+        fi
+        printf '1'
     }
     _acquire_slot() {
         # Args: $1 = host (e.g. hetzner). Sets _ACQUIRED on success.
