@@ -862,6 +862,75 @@ fn _detect_auth_failure(out: str) -> bool {
     return false
 }
 
+// _detect_auth_failure_from_child_log — closed-loop iter-2 honesty fix
+// (2026-04-28). When the outer subprocess `out` does NOT contain the 401
+// signal (because subagent_dispatch on the remote redirects child stderr
+// via `2> /tmp/hive-subagent-<sid>-<port>-<ts>.log` at L568 — the 401 lands
+// in the child log, NOT in the parent stdout), scan that child log
+// directly. Without this the FAIL trailer reports `witness-not-captured`
+// (misleading) instead of the truth (`claude-auth-failure-401`).
+//
+// Strategy: subagent_dispatch raw 66 trailers print `tail <child_log>` as
+// a remedy line on every failure path (relay-failed L1632, missing-child-
+// sid L1590, child-spawn-failed L1561, health-timeout L1576). Extract the
+// /tmp/hive-subagent-*.log path token from `out`, then cat its contents
+// (locally first; ssh hetzner fallback if not present locally — covers the
+// common cross-host kick path where subagent_dispatch ran on hetzner).
+//
+// Returns true iff the child log contains the same 401 / authentication_
+// error / invalid x-api-key signals that _detect_auth_failure(out) checks.
+fn _detect_auth_failure_from_child_log(out: str, parent_sid: str) -> bool {
+    // 1) Extract child_log path token from `out` if any failure trailer
+    //    printed `tail /tmp/hive-subagent-...log`.
+    let key = "/tmp/hive-subagent-"
+    let mut path = ""
+    let i = out.index_of(key)
+    if i >= 0 {
+        // Walk forward until first whitespace / quote / end-of-string,
+        // capturing the token as the candidate child_log path. The token
+        // must end with `.log` to be valid.
+        let mut j = i
+        while j < out.len() {
+            let c = out.substring(j, j + 1)
+            if c == " " || c == "\t" || c == "\n" || c == "\r" || c == "\"" || c == "'" { break }
+            j = j + 1
+        }
+        let cand = out.substring(i, j)
+        if cand.index_of(".log") >= 0 { path = cand }
+    }
+    // 2) If no path found in out, glob-scan /tmp for the parent_sid prefix.
+    //    The sanitize rule (subagent_dispatch L1516) collapses non-
+    //    [A-Za-z0-9._-] chars to '_'; safe sids (auto-<slug>-<ts>-<pid>)
+    //    pass through unchanged. Pick the most recent matching log.
+    if path.len() == 0 {
+        let glob_cmd = "ls -1t /tmp/hive-subagent-" + parent_sid + "-*-*.log 2>/dev/null | head -n1"
+        path = exec(glob_cmd).trim()
+    }
+    if path.len() == 0 { return false }
+    // 3) Read contents — local first, then ssh hetzner fallback for the
+    //    cross-host kick path (most common live-kick route per .resource
+    //    routing). Cat is bounded by file size; child logs are typically
+    //    < 100 KB for a single LLM round-trip.
+    let mut contents = ""
+    let local_chk = exec("[ -r '" + path + "' ] && echo y || echo n").trim()
+    if local_chk == "y" {
+        contents = exec("cat " + _shell_quote(path) + " 2>/dev/null")
+    } else {
+        // Try hetzner — silent fail if unreachable / file absent.
+        contents = exec("ssh -o BatchMode=yes -o ConnectTimeout=5 hetzner cat " + _shell_quote(path) + " 2>/dev/null")
+    }
+    if contents.len() == 0 { return false }
+    // 4) Same predicate as _detect_auth_failure but against child log.
+    if contents.index_of("\"type\":\"authentication_error\"") >= 0 { return true }
+    if contents.index_of("invalid x-api-key") >= 0 { return true }
+    if contents.index_of("401 {\"type\":\"error\"") >= 0 { return true }
+    // Bare "401" + adjacent "x-api-key" on separate lines also counts —
+    // claude CLI sometimes prints them split.
+    if contents.index_of("invalid x-api-key") >= 0 { return true }
+    if contents.index_of("status 401") >= 0 && contents.index_of("x-api-key") >= 0 { return true }
+    return false
+}
+
 fn _detect_resets_epoch(out: str) -> i64 {
     // Try numeric resetsAt first (claude CLI emits seconds — index.ts:1933).
     let key1 = "\"resetsAt\":"
@@ -1122,6 +1191,13 @@ fn main() -> void {
     // first live-spawn smoke). subagent_dispatch reads the file content as
     // the task atomically, preserving newlines + multibyte verbatim.
     let mut rc: i64 = 0
+    // closed-loop iter-2 honesty fix (2026-04-28): hoist captured subprocess
+    // output across both branches so the auth-failure-from-child-log scan at
+    // the witness-not-captured trailer can re-inspect the trailer's
+    // `tail /tmp/hive-subagent-...log` path token. Was previously scoped to
+    // the inner while-loop; child_log path was lost by the time witness
+    // absence was detected → misleading `witness-not-captured` reason.
+    let mut last_subprocess_out = ""
     if backend_slug == "claude_code" {
         // Multi-slot loop: pick LRU available slot, spawn, scan output for
         // rate_limit_event signal, mark cooldown + retry next slot. Hard-fail
@@ -1154,6 +1230,7 @@ fn main() -> void {
                 _hexa_bin() + " run " + _shell_quote(dispatch_tool) + " " +
                 _shell_quote(parent_sid) + " --task-file " + _shell_quote(prompt_path)
             let out = exec(cmd + " 2>&1; echo __RC=$?")
+            last_subprocess_out = out
             // OUTER rc — explicit shell echo.
             let rc_idx = out.last_index_of("__RC=")
             let mut local_rc: i64 = 0
@@ -1202,6 +1279,7 @@ fn main() -> void {
         // codex_cli / gemini_cli — unchanged single-shot path.
         let cmd = _hexa_bin() + " run " + _shell_quote(dispatch_tool) + " " + _shell_quote(parent_sid) + " --task-file " + _shell_quote(prompt_path)
         let rc_str = exec(cmd + " 2>&1; echo __RC=$?").trim()
+        last_subprocess_out = rc_str
         // OUTER rc — explicit shell echo.
         let rc_idx = rc_str.last_index_of("__RC=")
         if rc_idx >= 0 {
@@ -1237,6 +1315,21 @@ fn main() -> void {
         }
     }
     if !_file_exists(witness_path) {
+        // closed-loop iter-2 honesty fix (2026-04-28): before falling back
+        // to the generic `witness-not-captured` trailer, re-scan the child
+        // subagent log for an auth-failure signal. The 401 from Anthropic
+        // is logged to /tmp/hive-subagent-<sid>-<port>-<ts>.log via the
+        // `2> child_log` redirect at hive/tool/subagent_dispatch.hexa:568,
+        // NOT to the parent stdout — so _detect_auth_failure(out) misses it
+        // on the cross-host kick path (subagent_dispatch on hetzner with
+        // expired ~/.claude-claudeN/ creds → 401 lands on hetzner /tmp,
+        // outer kick reports witness absence with no diagnostic). Surface
+        // the truth instead of the misleading reason.
+        if _detect_auth_failure_from_child_log(last_subprocess_out, parent_sid) {
+            eprintln("__KICK_RESULT__ FAIL witness=" + witness_path_emit + " tier1=0 falsifier_pass=0")
+            eprintln("reason=claude-auth-failure-401-from-child-log fix=1) refresh OAuth in ~/.claude-claudeN/ on the host that ran subagent_dispatch (hetzner expected — 13 slots expired ~Apr 21); 2) on Mac: `claude /login` then rsync to hetzner; 3) verify with `ssh hetzner ls -la ~/.claude-claude*/auth_state*`; 4) ref convergence/r4_kick_auth_fail_detection_2026_04_27 + closed-loop iter-2 child-log-scan honesty patch 2026-04-28")
+            exit(2)
+        }
         eprintln("__KICK_RESULT__ FAIL witness=" + witness_path_emit + " tier1=0 falsifier_pass=0")
         eprintln("reason=witness-not-captured fix=re-run with shorter topic or inspect " + runs_root + "/prompt.txt; sub-agent did not land witness")
         exit(3)
