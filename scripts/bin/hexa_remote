@@ -449,23 +449,56 @@ if [ "$_IS_HEAVY_COMPUTE" = "1" ] && [ "${HEXA_REMOTE_NO_CONCURRENCY:-0}" != "1"
     }
 fi
 
-# Build fallback chain — preferred 먼저, 그 다음 ubu1/ubu2/htz (compute host).
-# 2026-04-22: htz 를 체인 말단에 추가. ubu1/ubu2 동시 unreachable (LAN 장애) 시에도
-# remote dispatch 가 hetzner anima-ax102 로 복원되도록. htz alias 는 ssh config
-# (Host hetzner htz htz1) 에서 157.180.8.154 (root) 로 풀림 — airgenome 쪽과 동일.
+# Build fallback chain — preferred 먼저, 그 다음 hive resource JSON 에서
+# scoring_weight DESC 로 정렬한 host 들 (ssh_alias != local).
+#
+# 2026-04-27: dynamic source-of-truth migration — hive-exec resource_lint --json
+# 의 출력에서 kind=host AND ssh_alias != local 만 selecting. scoring_weight DESC
+# 로 chain 순서 결정 (hetzner=0.6 < ubu=1.0 < ubu2=0.8 처럼 weight 가 priority).
+# JSON 가 비거나 hive-exec 부재 시 legacy chain (hetzner ubu1 ubu2 htz) 으로 fallback.
+# Cache: 단일 invocation 동안만 (변수). Override: HEXA_REMOTE_HOST / HEXA_REMOTE_CHAIN.
+#
+# 2026-04-27 (hetzner-first prior): heavy-compute 의 경우 hetzner (128GB RAM) 가
+# OOM 회피에 압도적 우월 — 단순 scoring_weight DESC 가 ubu(1.0) 를 hetzner(0.6) 위로
+# 밀지 않게, heavy 인 경우 PREFERRED 를 hetzner 로 line 305 에서 강제했음. 일반
+# 경우엔 weight DESC 정렬 그대로 사용.
+_HIVE_EXEC_BIN="${HIVE_EXEC:-$HOME/.hx/bin/hive-exec}"
+_RESOURCE_PATH="${HIVE_RESOURCE_PATH:-$HOME/core/hive/.resource}"
+_RESOURCE_JSON=""
+if [ -x "$_HIVE_EXEC_BIN" ] && [ -e "$_RESOURCE_PATH" ]; then
+    _RESOURCE_JSON="$("$_HIVE_EXEC_BIN" resource_lint --path "$_RESOURCE_PATH" --json 2>/dev/null || true)"
+fi
+# Parse out ssh_alias list, weight DESC, kind=host AND ssh_alias!=local.
+_DYNAMIC_HOSTS=""
+if [ -n "$_RESOURCE_JSON" ]; then
+    if command -v jq >/dev/null 2>&1; then
+        _DYNAMIC_HOSTS="$(printf '%s' "$_RESOURCE_JSON" \
+            | jq -r '[.[] | select(.kind=="host" and .ssh_alias!="local")]
+                     | sort_by(-(.scoring_weight // 0))
+                     | .[].ssh_alias' 2>/dev/null | tr '\n' ' ')"
+    elif command -v python3 >/dev/null 2>&1; then
+        _DYNAMIC_HOSTS="$(printf '%s' "$_RESOURCE_JSON" | python3 -c '
+import sys, json
+try:
+    arr = json.load(sys.stdin)
+    rows = [e for e in arr if e.get("kind")=="host" and e.get("ssh_alias")!="local"]
+    rows.sort(key=lambda e: -(e.get("scoring_weight") or 0))
+    print(" ".join(e["ssh_alias"] for e in rows))
+except Exception:
+    pass
+' 2>/dev/null)"
+    fi
+fi
+# Allow operator override (CSV or space-separated). Wins over JSON.
+if [ -n "${HEXA_REMOTE_CHAIN:-}" ]; then
+    _DYNAMIC_HOSTS="$(printf '%s' "$HEXA_REMOTE_CHAIN" | tr ',' ' ')"
+fi
+# Fallback: legacy hard-coded chain. Triggers when JSON empty AND no override.
+if [ -z "$_DYNAMIC_HOSTS" ]; then
+    _DYNAMIC_HOSTS="hetzner ubu1 ubu2 htz"
+fi
 FALLBACK_CHAIN="$PREFERRED"
-# raw#36 fixpoint — 2026-04-24 host priority re-ordered by headroom.
-# hetzner (128GB RAM) > ubu2 (32GB) > ubu1 (32GB, currently flaky with SSH
-# banner timeout). Previous order ubu1 → ubu2 → htz inverted the RAM budget,
-# causing drill to land on ubu2 (32GB) and hit systemd MemoryMax=20G cap
-# (observed SIGTERM rc=137 on round 2 resonance 2026-04-24). By probing
-# hetzner first, the RAM bracket (raw#36 ②) converges on a host with
-# ≥100GB headroom, eliminating the OOM class entirely.
-# Wave 11 (2026-04-25): chain re-order `ubu1 before ubu2` — hetzner busy 시
-# 다음 fallback 은 ubu1 (no sshfs overhead, cleaner). 관측 imbalance: ubu2 가
-# 모든 overflow 흡수 → SSH banner timeout (OOM-killed sshd) 발생.
-# Override: HEXA_REMOTE_HOST / HEXA_REMOTE_CHAIN env vars.
-for cand in hetzner ubu1 ubu2 htz; do
+for cand in $_DYNAMIC_HOSTS; do
     case " $FALLBACK_CHAIN " in
         *" $cand "*) ;;
         *) FALLBACK_CHAIN="$FALLBACK_CHAIN $cand" ;;
