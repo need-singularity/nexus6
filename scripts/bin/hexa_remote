@@ -72,26 +72,14 @@ _probe_host() {
     local retry="${HEXA_REMOTE_PROBE_RETRY:-1}"
     local total=$((retry + 1))
     local reason="unknown"
-    # Wave 11 (2026-04-25): blacklist-on-unreachable. 호스트가 probe 실패하면
-    # /tmp/hexa_remote.blacklist.<host> 파일 mtime 기록. 다음 invocation 은
-    # mtime <300s 면 probe 생략 (fast skip). 300s 초과 시 stale → 재시도.
-    # ubu2 banner timeout 반복 drill 쌓임 방지. HEXA_REMOTE_HOST 직접 지정
-    # 경로는 영향 없음 (이 함수는 fallback chain probe 전용).
-    # Override: HEXA_REMOTE_BLACKLIST_TTL=N (default 300), HEXA_REMOTE_NO_BLACKLIST=1
-    local bl_file="/tmp/hexa_remote.blacklist.$cand"
-    local bl_ttl="${HEXA_REMOTE_BLACKLIST_TTL:-300}"
-    if [ "${HEXA_REMOTE_NO_BLACKLIST:-0}" != "1" ] && [ -f "$bl_file" ]; then
-        local bl_age
-        # stat -f %m for macOS, -c %Y for Linux. Either returns 0 if stat fails.
-        bl_age="$(( $(date +%s) - $(stat -f %m "$bl_file" 2>/dev/null || stat -c %Y "$bl_file" 2>/dev/null || echo 0) ))"
-        if [ "$bl_age" -lt "$bl_ttl" ] 2>/dev/null; then
-            echo "hexa_remote: host=$cand blacklisted ${bl_age}s ago (<${bl_ttl}s TTL) — skipping probe" >&2
-            return 1
-        fi
-        # stale — remove and re-probe (Wave 22: expiry log for observability).
-        echo "hexa_remote: blacklist for $cand expired (${bl_age}s old), retrying" >&2
-        rm -f "$bl_file" 2>/dev/null || true
-    fi
+    # Wave 11 blacklist mechanism RETIRED Sub-AA (2026-04-27).
+    # Rationale: persistent /tmp/hexa_remote.blacklist.<host> files (300s TTL)
+    # blocked legitimate retries on hosts that recovered quickly (esp. PSI
+    # spike artifacts). Per-invocation in-line PSI/RAM probe (below) is the
+    # natural rate limiter — every kick fully re-evaluates every host.
+    # ubu2 banner timeout (the original Wave 11 motivation) is bounded by
+    # HEXA_REMOTE_CONNECT_TIMEOUT (8s) and host-pick fallback chain advances
+    # to the next candidate. No persistent state needed.
     # raw#36 problem-solving-triad — fixpoint(stable host) + bracket(RAM headroom).
     # Per-host minimum available RAM (MB) before accepting as compute target.
     # heavy-compute drills have been observed at ~20GB RSS → 24GB min keeps a 4GB
@@ -284,14 +272,12 @@ _probe_host() {
         *) _ai_class="ssh-fail" ;;
     esac
     echo "reason: ${_ai_class}: ${reason}" >&2
-    echo "fix: 1) ssh -v $cand   # verbose probe  2) ssh-add -l && ssh-add ~/.ssh/id_ed25519   # ensure agent key present  3) rm -f /tmp/hexa_remote.blacklist.$cand && ping -c1 $cand   # clear blacklist + connectivity check" >&2
-    # Wave 11 (2026-04-25): record blacklist on probe failure (SSH/RAM both).
-    # touch creates file with current mtime; subsequent invocations short-circuit
-    # until bl_ttl (default 300s) expires. RAM-insufficient paths also flow here
-    # because `break` jumps out of the retry loop without returning 0.
-    if [ "${HEXA_REMOTE_NO_BLACKLIST:-0}" != "1" ]; then
-        : > "$bl_file" 2>/dev/null || true
-    fi
+    echo "fix: 1) ssh -v $cand   # verbose probe  2) ssh-add -l && ssh-add ~/.ssh/id_ed25519   # ensure agent key present  3) ping -c1 $cand   # connectivity check" >&2
+    # Sub-AA 2026-04-27: blacklist write retired. Probe failure here returns
+    # rc != 0 so caller's fallback chain advances to next host candidate; no
+    # persistent /tmp file needed. Next invocation fully re-probes — if the
+    # underlying issue is transient (PSI spike, banner glitch), recovery is
+    # immediate instead of waiting 300s for blacklist TTL.
     return $rc
 }
 
@@ -525,8 +511,9 @@ done
 # blocked, emit a raw 66 ai-native trailer that tells the operator *exactly*
 # which artifacts to inspect/clear, instead of the historical cryptic
 # 'all-claude-slots-exhausted'. Fields surfaced:
-#   - external_blacklist: per-host /tmp/hexa_remote.blacklist.<host> mtime + age
-#                         (live = file present; stale = present but >TTL)
+#   - external_blacklist: [retired Sub-AA 2026-04-27] row preserved as boilerplate
+#                         pointer so existing operator runbooks parsing the trailer
+#                         schema don't break; no persistent host bans exist.
 #   - docker_neg_cache:   /tmp/hexa_resolver.connectivity presence + ttl_remaining
 #   - slot_pool:          available/cooldown/unknown across the 12 claude slots
 #                         (best-effort summary parse from claude_slot_pick --list --json,
@@ -540,27 +527,10 @@ _emit_all_routes_blocked_trailer() {
     local _chain="$1" _reason="$2"
     local _now
     _now="$(date +%s)"
-    local _bl_ttl="${HEXA_REMOTE_BLACKLIST_TTL:-300}"
     echo "err hexa_remote/all-routes-blocked" >&2
-    # external_blacklist row
-    local _bl_row="" _h _bl_file _bl_mtime _bl_age _bl_state
-    for _h in $_chain; do
-        _bl_file="/tmp/hexa_remote.blacklist.$_h"
-        if [ -f "$_bl_file" ]; then
-            _bl_mtime="$(stat -f %m "$_bl_file" 2>/dev/null || stat -c %Y "$_bl_file" 2>/dev/null || echo 0)"
-            _bl_age="$(( _now - _bl_mtime ))"
-            if [ "$_bl_age" -lt "$_bl_ttl" ] 2>/dev/null; then
-                _bl_state="live(age=${_bl_age}s)"
-            else
-                _bl_state="stale(age=${_bl_age}s)"
-            fi
-        else
-            _bl_state="absent"
-        fi
-        if [ -z "$_bl_row" ]; then _bl_row="$_h=$_bl_state"
-        else _bl_row="$_bl_row, $_h=$_bl_state"; fi
-    done
-    echo "  external_blacklist: $_bl_row  (TTL=${_bl_ttl}s)" >&2
+    # Sub-AA 2026-04-27: external_blacklist row retired.
+    # No persistent host blacklist exists — every invocation fully re-probes.
+    echo "  external_blacklist: [retired Sub-AA 2026-04-27 — no persistent host bans, every kick re-probes]" >&2
     # docker_neg_cache row (the resolver's connectivity neg-cache file).
     local _dc_file="/tmp/hexa_resolver.connectivity"
     local _dc_ttl="${HEXA_RESOLVER_CONNECTIVITY_TTL:-60}"
@@ -599,27 +569,13 @@ _emit_all_routes_blocked_trailer() {
         _slot_row="${_slot_dirs:-0}/12 dirs (helper unreachable)"
     fi
     echo "  slot_pool: $_slot_row" >&2
-    # fix block — ordered remediation. Cite stale hosts so operator can copy-paste.
-    local _stale_hosts=""
-    for _h in $_chain; do
-        _bl_file="/tmp/hexa_remote.blacklist.$_h"
-        if [ -f "$_bl_file" ]; then
-            _bl_mtime="$(stat -f %m "$_bl_file" 2>/dev/null || stat -c %Y "$_bl_file" 2>/dev/null || echo 0)"
-            _bl_age="$(( _now - _bl_mtime ))"
-            if [ "$_bl_age" -ge "$_bl_ttl" ] 2>/dev/null; then
-                if [ -z "$_stale_hosts" ]; then _stale_hosts="$_h"
-                else _stale_hosts="$_stale_hosts $_h"; fi
-            fi
-        fi
-    done
+    # fix block — ordered remediation. Sub-AA: blacklist clear step removed
+    # (no persistent state to clear). Failure path is now: connectivity check
+    # → slot probe → full bypass.
     echo "  fix:" >&2
-    if [ -n "$_stale_hosts" ]; then
-        echo "    1) clear stale: rm -f$(for _sh in $_stale_hosts; do printf ' /tmp/hexa_remote.blacklist.%s' "$_sh"; done)" >&2
-    else
-        echo "    1) clear stale: (none — all blacklist files are within TTL or absent)" >&2
-    fi
-    echo "    2) clear neg_cache: rm -f /tmp/hexa_resolver.connectivity" >&2
-    echo "    3) probe slots: hexa run /Users/ghost/core/hive/tool/claude_slot_pick.hexa --probe-all" >&2
+    echo "    1) clear neg_cache: rm -f /tmp/hexa_resolver.connectivity" >&2
+    echo "    2) probe slots: hexa run /Users/ghost/core/hive/tool/claude_slot_pick.hexa --probe-all" >&2
+    echo "    3) connectivity check: for h in $_chain; do ssh -o ConnectTimeout=5 -o BatchMode=yes \$h 'echo OK' 2>/dev/null && echo \"\$h: OK\" || echo \"\$h: FAIL\"; done" >&2
     echo "    4) full bypass: HEXA_RESOLVER_NO_REROUTE=1 nexus kick run <topic>" >&2
     echo "  ref: raw:ai-native-error-message + nexus/.guide § Cross-host parity matrix" >&2
     # raw 66 trailer
@@ -679,8 +635,9 @@ if [ "$_LB_MODE" = "first" ]; then
         fi
     done
 else
-    # probe-all + argmax(avail). 실패 호스트는 Wave 11 blacklist 가 기록
-    # (다음 invocation 에서 자동 skip), 여기선 in-memory 누적만 수행.
+    # probe-all + argmax(avail). 실패 호스트는 in-memory 누적만 수행 (Sub-AA
+    # 2026-04-27: Wave 11 persistent blacklist 기록 retired — 다음 invocation
+    # 도 fully re-probes, transient 실패 (PSI spike, banner glitch) 즉시 회복).
     # L4 (2026-04-25): probe 가 동시에 수집한 PSI some avg10 도 picked host 의
     # `_picked_psi` 로 보존 → 아래 L4 admission 가드가 사용.
     _best_host=""
@@ -835,7 +792,8 @@ fi
 # 그렇다고 드릴 미세화 없이 reject 하면 ubu1/ubu2 (24GB free) 도 admission 통과
 # 못 해 cluster idle. L2 는 probe 가 측정한 avail RAM (`_best_avail`, MB) 이
 # `HEXA_REMOTE_MIN_AVAIL_MB` (default 4096 — stage0 RSS cap + small drill 여유)
-# 미만이면 slot 즉시 반납 + blacklist 등록 후 exit 64 fallback chain 트리거.
+# 미만이면 slot 즉시 반납 + exit 64 fallback chain 트리거 (Sub-AA 2026-04-27:
+# blacklist 등록 step retired — fallback chain 의 next host 가 fresh-probed).
 # Per-host override: HEXA_REMOTE_MIN_AVAIL_MB_HETZNER / _UBU1 / _UBU2.
 # Bypass:           HEXA_REMOTE_NO_ADMISSION=1
 # Backward-compat:  _best_avail 미세팅 (LB=first 경로 / probe 미실행) 시 skip.
@@ -877,11 +835,9 @@ if [ "$_IS_HEAVY_COMPUTE" = "1" ] \
             rm -rf "$_ACQUIRED" 2>/dev/null || true
             _ACQUIRED=""
         fi
-        # 다음 invocation 이 같은 호스트로 재실험 안 가게 blacklist 등록 (#D TTL 300s).
-        # blacklist 파일 경로는 _probe_host 와 동일 규칙 (host basename).
-        if [ "${HEXA_REMOTE_NO_BLACKLIST:-0}" != "1" ]; then
-            : > "/tmp/hexa_remote.blacklist.$HOST" 2>/dev/null || true
-        fi
+        # Sub-AA 2026-04-27: L3 admission blacklist write retired.
+        # exit 64 below alone triggers fallback chain — caller's next host
+        # pick is fresh-probed, so transient avail spikes don't ban hosts.
         # AI-native JSON emit — caller 가 fallback chain 진입.
         printf 'NEXUS_REMOTE_ERROR {"host":"%s","avail_mb":%s,"min_mb":%s,"job_class":"%s","reason":"l3_admission_insufficient_ram","exit_code":64}\n' \
             "$HOST" "$_best_avail" "$_admit_min_mb" "$_job_class" >&2
@@ -935,17 +891,20 @@ if [ "$_IS_HEAVY_COMPUTE" = "1" ] \
             # Background (cycle 51 진단):
             #   다른 Claude 세션 active drill (round 10+) 시 host PSI 97% →
             #   본 세션 dispatch 도 같은 host 진입 시 L4 PSI reject (Phase 1
-            #   85% 도 부족) → blacklist 모든 host → abort. Phase 1 (PSI
+            #   85% 도 부족) → 모든 host reject → abort. Phase 1 (PSI
             #   threshold) + Phase 4 minimal (lock fast-fail) 만으로 미커버.
+            #   (Sub-AA 2026-04-27: 원 narrative "blacklist 모든 host" 표현은
+            #    Wave 11 persistent ban 가정 — retired, 현재는 exit 64 fallback.)
             #
             # Mechanism (Mac-side, shared file FIFO + per-host PSI poll):
             #   1) L4 PSI reject 시 즉시 exit 64 대신 /tmp/hexa_remote.psi_queue.<host>.tsv
             #      에 self 등록 (mkdir lock atomic enqueue).
             #   2) Polling loop: head pid=self 이고 PSI 가 threshold 아래로
             #      회복했는지 _probe_host 로 재측정 (HEXA_REMOTE_LAST_PSI 갱신).
-            #   3) 회복 시 dequeue + 정상 진행 (blacklist 미등록).
-            #   4) Deadline (default 300s) 초과 시 dequeue + blacklist 등록 +
-            #      기존 exit 64 path (caller 가 fallback chain 진행).
+            #   3) 회복 시 dequeue + 정상 진행.
+            #   4) Deadline (default 300s) 초과 시 dequeue + 기존 exit 64 path
+            #      (caller 가 fallback chain 진행). Sub-AA 2026-04-27: deadline
+            #      후 blacklist 등록 step retired — next invocation re-probes.
             #
             # Fairness: FIFO head pid 우선 (동시 다 세션 이 같은 host 대기 시
             # enqueue 순서대로 진입). 동일 host 자원 직렬화 → cross-session
@@ -1034,14 +993,13 @@ if [ "$_IS_HEAVY_COMPUTE" = "1" ] \
                 if [ "$_psiq_recovered" = "1" ]; then
                     : # fall-through to success path below (skip exit 64).
                 else
-                    # Deadline reached — fallback to original blacklist+exit 64 behavior.
+                    # Sub-AA 2026-04-27: L7 PSI deadline blacklist write retired.
+                    # exit 64 alone triggers fallback chain — next invocation
+                    # gets a fresh PSI snapshot. PSI spikes are by nature transient.
                     echo "hexa_remote: L7 PSI-defer timeout (${_PSI_Q_TTL}s) — host=$HOST psi 회복 실패, fallback chain trigger" >&2
                     if [ -n "${_ACQUIRED:-}" ]; then
                         rm -rf "$_ACQUIRED" 2>/dev/null || true
                         _ACQUIRED=""
-                    fi
-                    if [ "${HEXA_REMOTE_NO_BLACKLIST:-0}" != "1" ]; then
-                        : > "/tmp/hexa_remote.blacklist.$HOST" 2>/dev/null || true
                     fi
                     printf 'NEXUS_REMOTE_ERROR {"host":"%s","psi_avg10":"%s","psi_threshold":%s,"job_class":"%s","reason":"l7_psi_defer_timeout","wait_s":%s,"exit_code":64}\n' \
                         "$HOST" "$_picked_psi" "$_psi_threshold" "$_job_class" "$_PSI_Q_TTL" >&2
@@ -1049,13 +1007,11 @@ if [ "$_IS_HEAVY_COMPUTE" = "1" ] \
                 fi
             else
                 # Original Phase 1 behavior (NO_PSI_QUEUE=1 bypass).
+                # Sub-AA 2026-04-27: L4 PSI reject blacklist write retired.
                 echo "hexa_remote: L4 PSI reject — host=$HOST class=$_job_class psi_avg10=${_picked_psi}% ≥ ${_psi_threshold}%" >&2
                 if [ -n "${_ACQUIRED:-}" ]; then
                     rm -rf "$_ACQUIRED" 2>/dev/null || true
                     _ACQUIRED=""
-                fi
-                if [ "${HEXA_REMOTE_NO_BLACKLIST:-0}" != "1" ]; then
-                    : > "/tmp/hexa_remote.blacklist.$HOST" 2>/dev/null || true
                 fi
                 printf 'NEXUS_REMOTE_ERROR {"host":"%s","psi_avg10":"%s","psi_threshold":%s,"job_class":"%s","reason":"l4_psi_pressure","exit_code":64}\n' \
                     "$HOST" "$_picked_psi" "$_psi_threshold" "$_job_class" >&2
@@ -1125,10 +1081,9 @@ if [ "$_IS_HEAVY_COMPUTE" = "1" ] \
                     rm -rf "$_ACQUIRED" 2>/dev/null || true
                     _ACQUIRED=""
                 fi
-                # blacklist — 다음 invocation 도 같은 호스트 회피 (TTL 300s).
-                if [ "${HEXA_REMOTE_NO_BLACKLIST:-0}" != "1" ]; then
-                    : > "/tmp/hexa_remote.blacklist.$HOST" 2>/dev/null || true
-                fi
+                # Sub-AA 2026-04-27: L5 Bayes reject blacklist write retired.
+                # Bayes window stats (kills/total) provide implicit memory across
+                # invocations without persistent host bans.
                 printf 'NEXUS_REMOTE_ERROR {"host":"%s","p_pct":%s,"kills":%s,"total":%s,"window":%s,"threshold":%s,"job_class":"%s","reason":"l5_bayes_predicted_kill","exit_code":64}\n' \
                     "$HOST" "$_bayes_p_pct" "$_bayes_kills" "$_bayes_total" "$_bayes_window" "$_bayes_threshold" "$_job_class" >&2
                 exit 64
