@@ -1,0 +1,425 @@
+// tool/noise_envelope.hexa — α/β/γ outside-the-well noise envelope generator (standalone module).
+//
+// @tool(slug="noise_envelope", desc="reusable α (absorbed-primitive) / β (QRNG-byte) / γ (bridge-reframe) noise envelope emitter — extracted from tool/kick_dispatch.hexa lines 200-326 per user directive 2026-04-27 'kick 추상화/상상 부분에 노이즈 넣기 — 구현 코드 별도 모듈화, 재사용 용도'. CLI mode + library functions. F7''' no-mocks. raw 47 + raw 80 + raw 95 reuse.")
+// @usage(hexa run /Users/ghost/core/nexus/tool/noise_envelope.hexa <alpha|beta|gamma|--selftest> [--absorbed-dir <path>] [--bridges-dir <path>] [--beta-byte <int>])
+// @omega-saturation-exempt("envelope generator — convergence applies to the kick(ω-cycle) that consumes these envelopes, not to the generator itself")
+// @exit_codes(0=PASS, 1=usage/io error, 66=ai-native-trailer-error)
+//
+// raw 11 + raw 23 + raw 47 + raw 66 + raw 80 + raw 95.
+//
+// SOURCE OF TRUTH PARITY
+//   This module is a byte-equivalent extraction of inline functions in
+//   tool/kick_dispatch.hexa (commit ←r4_hardcode_migration_2026_04_27 +
+//   ←r4_ai_native_error_sweep_2026_04_27). kick_dispatch.hexa retains its
+//   inline copy this cycle (Phase 3 (ii)) to avoid an unlock-cycle every
+//   kick run. ANY change to envelope behaviour MUST be mirrored to BOTH
+//   files + audited via raw 85.
+//
+// SURFACE
+//   CLI mode (this file's main):
+//     hexa run noise_envelope.hexa alpha   --absorbed-dir <path>
+//     hexa run noise_envelope.hexa beta    [KICK_BETA_REAL_ANU=1 env]
+//     hexa run noise_envelope.hexa gamma   --bridges-dir <path> --beta-byte <int>
+//     hexa run noise_envelope.hexa --selftest
+//
+//   Library functions (callable when host runtime supports `use`; CLI is
+//   the portable surface per Sub-N hexa-lang `use` divergence finding):
+//     noise_alpha(absorbed_dir: str) -> str
+//     noise_beta() -> str
+//     noise_byte_from_beta(env_json: str) -> i64
+//     noise_gamma(bridges_dir: str, beta_byte: i64) -> str
+//
+// ENVELOPE SCHEMA (raw 23 schema-guard)
+//   {"mechanism":"<alpha|beta|gamma>",
+//    "source_id":"<absorbed:<slug>|absorbed:none|anu|urandom|urandom_fallback|bridge:<slug>|bridge:none>",
+//    "byte_hash":"<16-hex>",
+//    "ts":"<ISO8601 UTC>",
+//    "payload_summary":"<free-form>"}
+//
+// SENTINEL FORMAT (raw 80)
+//   stdout: one JSON line per invocation
+//   stderr: __NOISE_ENVELOPE__ <PASS|FAIL> mechanism=<a|b|g>
+//   selftest: __NOISE_ENVELOPE_SELFTEST__ <PASS|FAIL>
+
+// ─── helpers (self-contained — zero external dependencies) ───────────
+
+fn _now_iso_utc() -> str {
+    return exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+fn _file_exists(path: str) -> bool {
+    let r = exec("test -f '" + path + "' && echo y || echo n").trim()
+    return r == "y"
+}
+
+fn _dir_exists(path: str) -> bool {
+    let r = exec("test -d '" + path + "' && echo y || echo n").trim()
+    return r == "y"
+}
+
+fn _shell_quote(s: str) -> str {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+// _safe_to_int_line — defensive probe→int parser (raw 66 graceful-degrade).
+// Multi-line subprocess output (e.g. "0\n0" from a flaky probe) used to leak
+// past bare to_int() and trip the runtime "trailing garbage" exception.
+// Identical contract to kick_dispatch.hexa _safe_to_int_line.
+fn _safe_to_int_line(raw: str, default: i64, label: str) -> i64 {
+    let trimmed = raw.trim()
+    if trimmed.len() == 0 { return default }
+    let nl = trimmed.index_of("\n")
+    let first = if nl >= 0 { trimmed.substring(0, nl).trim() } else { trimmed }
+    if first.len() == 0 { return default }
+    let mut v: i64 = default
+    try { v = to_int(first) } catch e {
+        let mut repr = raw.replace("\n", "\\n").replace("\r", "\\r")
+        if repr.len() > 80 { repr = repr.substring(0, 80) + "…" }
+        eprintln("# noise_envelope: reason=to_int-probe-parse-fail-" + label + " fix=audit probe stdout (multiline / non-int) raw=\"" + repr + "\" default=" + to_string(default))
+        v = default
+    }
+    return v
+}
+
+fn _list_files(dir: str) -> [str] {
+    if !_dir_exists(dir) { return [] }
+    let raw = exec("ls -1 '" + dir + "' 2>/dev/null | grep -v '^\\.' | sort").trim()
+    if raw.len() == 0 { return [] }
+    let parts = raw.split("\n")
+    let mut out: [str] = []
+    let mut i: i64 = 0
+    while i < len(parts) {
+        let p = parts[i].trim()
+        if p.len() > 0 && p.ends_with(".hexa") { out = out + [p] }
+        i = i + 1
+    }
+    return out
+}
+
+fn _registry_field(path: str, key: str) -> str {
+    if !_file_exists(path) { return "" }
+    let raw = read_file(path)
+    let lines = raw.split("\n")
+    let mut i: i64 = 0
+    while i < len(lines) {
+        let line = lines[i]
+        let trimmed = line.trim_start()
+        if trimmed.starts_with(key + " ") {
+            return trimmed.substring(key.len() + 1, trimmed.len()).trim()
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// _short_hash — 16-hex sha256 prefix, container-portable cascade
+// (sha256sum 2>/dev/null || shasum -a 256) per commit 59bfc967 (debian
+// container hexa-runner lacks BSD shasum).
+fn _short_hash(input: str) -> str {
+    let cmd = "printf %s " + _shell_quote(input) + " | (sha256sum 2>/dev/null || shasum -a 256) | awk '{print substr($1,1,16)}'"
+    return exec(cmd).trim()
+}
+
+// ─── α — absorbed-primitive sampling ─────────────────────────────────
+// Public library entry: noise_alpha(absorbed_dir).
+fn noise_alpha(absorbed_dir: str) -> str {
+    let files = _list_files(absorbed_dir)
+    let n = len(files)
+    let ts = _now_iso_utc()
+    if n == 0 {
+        let payload = "absorbed_registry_empty=true; first_kick_in_lineage"
+        let bh = _short_hash("alpha:" + ts + ":empty")
+        return "{\"mechanism\":\"alpha\",\"source_id\":\"absorbed:none\",\"byte_hash\":\"" + bh + "\",\"ts\":\"" + ts + "\",\"payload_summary\":\"" + payload + "\"}"
+    }
+    let raw_seed = exec("od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d ' '").trim()
+    let mut idx: i64 = 0
+    if raw_seed.len() > 0 {
+        let seed_i = _safe_to_int_line(raw_seed, 0, "alpha-urandom-seed")
+        idx = seed_i % n
+        if idx < 0 { idx = -idx }
+    }
+    let pick = absorbed_dir + "/" + files[idx]
+    let pick_slug = _registry_field(pick, "slug")
+    let bh = _short_hash("alpha:" + pick + ":" + ts)
+    let payload = "absorbed_pick=" + pick_slug + " from " + to_string(n) + " primitives"
+    return "{\"mechanism\":\"alpha\",\"source_id\":\"absorbed:" + pick_slug + "\",\"byte_hash\":\"" + bh + "\",\"ts\":\"" + ts + "\",\"payload_summary\":\"" + payload + "\"}"
+}
+
+// ─── β — QRNG-seeded byte (real ANU OR documented urandom-fallback) ──
+// Records source ∈ {anu, urandom, urandom_fallback} per obs_2 reframe + F16:
+//   - default (KICK_BETA_REAL_ANU unset)             → source = "urandom"
+//   - KICK_BETA_REAL_ANU=1 + ANU reachable           → source = "anu"
+//   - KICK_BETA_REAL_ANU=1 + ANU fail (429/network)  → source = "urandom_fallback"
+fn noise_beta() -> str {
+    let ts = _now_iso_utc()
+    let want_anu = env("KICK_BETA_REAL_ANU") == "1"
+
+    // Always grab a urandom byte first as the safety floor.
+    let mut byte = exec("od -An -N1 -tu1 /dev/urandom 2>/dev/null | tr -d ' \\n'").trim()
+    if byte.len() == 0 { byte = "0" }
+    let mut source = "urandom"
+
+    if want_anu {
+        // Direct curl to qrng.anu.edu.au (sim_bridge/anu_time/anu_clock.hexa is R37-stubbed).
+        // Endpoint: jsonI.php?length=1&type=uint8 (1 byte, uint8). 5s timeout.
+        let curl_cmd = "curl -s --max-time 5 'https://qrng.anu.edu.au/API/jsonI.php?length=1&type=uint8' 2>/dev/null"
+        let raw = exec(curl_cmd).trim()
+        let mut parsed_byte = ""
+        let mut parsed_ok = false
+        if raw.len() > 0 && raw.contains("\"success\":true") {
+            let key = "\"data\":["
+            let i = raw.index_of(key)
+            if i >= 0 {
+                let rest = raw.substring(i + key.len(), raw.len())
+                let mut e: i64 = 0
+                while e < rest.len() {
+                    let c = rest.substring(e, e + 1)
+                    if c == "]" || c == "," { break }
+                    e = e + 1
+                }
+                let num_s = rest.substring(0, e).trim()
+                let v = _safe_to_int_line(num_s, -1, "beta-anu-byte")
+                if v >= 0 && v <= 255 { parsed_byte = num_s; parsed_ok = true }
+            }
+        }
+        if parsed_ok {
+            byte = parsed_byte
+            source = "anu"
+        } else {
+            source = "urandom_fallback"
+        }
+    }
+
+    let bh = _short_hash("beta:" + source + ":" + byte + ":" + ts)
+    let payload = "qrng_byte=" + byte + " source=" + source + " (obs_2 reframe — urandom-fallback witnessed)"
+    return "{\"mechanism\":\"beta\",\"source_id\":\"" + source + "\",\"byte_hash\":\"" + bh + "\",\"ts\":\"" + ts + "\",\"payload_summary\":\"" + payload + "\"}"
+}
+
+// Extract numeric byte from beta envelope payload to seed γ bridge selection.
+fn noise_byte_from_beta(env_json: str) -> i64 {
+    let key = "qrng_byte="
+    let i = env_json.index_of(key)
+    if i < 0 { return 0 }
+    let rest = env_json.substring(i + key.len(), env_json.len())
+    let mut end: i64 = 0
+    while end < rest.len() {
+        let c = rest.substring(end, end + 1)
+        if c == " " || c == "\"" { break }
+        end = end + 1
+    }
+    let num_s = rest.substring(0, end)
+    let mut v: i64 = _safe_to_int_line(num_s, 0, "beta-byte-extract")
+    if v < 0 { v = -v }
+    return v
+}
+
+// ─── γ — empirical-bridge-driven reframe ─────────────────────────────
+fn noise_gamma(bridges_dir: str, beta_byte: i64) -> str {
+    let ts = _now_iso_utc()
+    let files = _list_files(bridges_dir)
+    let n = len(files)
+    if n == 0 {
+        let bh = _short_hash("gamma:" + ts + ":empty")
+        return "{\"mechanism\":\"gamma\",\"source_id\":\"bridge:none\",\"byte_hash\":\"" + bh + "\",\"ts\":\"" + ts + "\",\"payload_summary\":\"bridges_registry_empty=true\"}"
+    }
+    let mut idx: i64 = beta_byte % n
+    if idx < 0 { idx = -idx }
+    let pick = bridges_dir + "/" + files[idx]
+    let pick_slug = _registry_field(pick, "slug")
+    let pick_invocation = _registry_field(pick, "invocation")
+    let bh = _short_hash("gamma:" + pick_slug + ":" + ts)
+    let payload = "bridge_pick=" + pick_slug + " invocation=" + pick_invocation + " (real fetch deferred to sub-agent or OFFLINE-FALLBACK)"
+    return "{\"mechanism\":\"gamma\",\"source_id\":\"bridge:" + pick_slug + "\",\"byte_hash\":\"" + bh + "\",\"ts\":\"" + ts + "\",\"payload_summary\":\"" + payload + "\"}"
+}
+
+// ─── envelope JSON shape validator (raw 23) ──────────────────────────
+fn _validate_envelope(env_json: str, mech: str) -> bool {
+    if !env_json.starts_with("{") { return false }
+    if !env_json.ends_with("}") { return false }
+    if !env_json.contains("\"mechanism\":\"" + mech + "\"") { return false }
+    if !env_json.contains("\"source_id\":") { return false }
+    if !env_json.contains("\"byte_hash\":") { return false }
+    if !env_json.contains("\"ts\":") { return false }
+    if !env_json.contains("\"payload_summary\":") { return false }
+    return true
+}
+
+// ─── selftest ────────────────────────────────────────────────────────
+fn _selftest() -> i64 {
+    let mut fails: i64 = 0
+
+    // 1. α with empty (non-existent) dir → graceful absorbed:none envelope.
+    let a_empty = noise_alpha("/tmp/nonexistent-noise-empty-dir-xyz")
+    if !_validate_envelope(a_empty, "alpha") {
+        eprintln("# noise_envelope selftest: reason=alpha-empty-shape-invalid fix=check noise_alpha empty-branch JSON quoting raw=\"" + a_empty + "\"")
+        fails = fails + 1
+    }
+    if !a_empty.contains("absorbed:none") {
+        eprintln("# noise_envelope selftest: reason=alpha-empty-source_id-mismatch fix=expected absorbed:none in payload raw=\"" + a_empty + "\"")
+        fails = fails + 1
+    }
+
+    // 2. α with populated fixture dir.
+    let fix_dir = "/tmp/noise_envelope_selftest_alpha"
+    let _ = exec("rm -rf " + _shell_quote(fix_dir) + " && mkdir -p " + _shell_quote(fix_dir))
+    let _ = exec("printf 'noise-source absorbed active \"fixture\"\\n  slug fixture_one\\n  kind absorbed-primitive\\n' > " + _shell_quote(fix_dir + "/fixture_one.hexa"))
+    let _ = exec("printf 'noise-source absorbed active \"fixture\"\\n  slug fixture_two\\n  kind absorbed-primitive\\n' > " + _shell_quote(fix_dir + "/fixture_two.hexa"))
+    let a_pop = noise_alpha(fix_dir)
+    if !_validate_envelope(a_pop, "alpha") {
+        eprintln("# noise_envelope selftest: reason=alpha-populated-shape-invalid fix=inspect noise_alpha non-empty branch raw=\"" + a_pop + "\"")
+        fails = fails + 1
+    }
+    if a_pop.contains("absorbed:none") {
+        eprintln("# noise_envelope selftest: reason=alpha-populated-fell-through-to-none-branch fix=audit _list_files raw=\"" + a_pop + "\"")
+        fails = fails + 1
+    }
+    let _ = exec("rm -rf " + _shell_quote(fix_dir))
+
+    // 3. β default (urandom path) — KICK_BETA_REAL_ANU MUST NOT be set during selftest
+    //    to keep selftest network-independent. We do not unset env from inside the
+    //    process (env() is read-only); caller responsibility documented in --selftest help.
+    let b_def = noise_beta()
+    if !_validate_envelope(b_def, "beta") {
+        eprintln("# noise_envelope selftest: reason=beta-default-shape-invalid fix=inspect noise_beta urandom branch raw=\"" + b_def + "\"")
+        fails = fails + 1
+    }
+    if !b_def.contains("qrng_byte=") {
+        eprintln("# noise_envelope selftest: reason=beta-default-missing-qrng_byte fix=urandom byte extraction failed raw=\"" + b_def + "\"")
+        fails = fails + 1
+    }
+
+    // 4. β byte extractor
+    let bb = noise_byte_from_beta(b_def)
+    if bb < 0 || bb > 255 {
+        eprintln("# noise_envelope selftest: reason=beta-byte-extract-out-of-range fix=audit noise_byte_from_beta parser bb=" + to_string(bb))
+        fails = fails + 1
+    }
+
+    // 5. γ with empty (non-existent) dir → bridge:none.
+    let g_empty = noise_gamma("/tmp/nonexistent-bridges-dir-xyz", 0)
+    if !_validate_envelope(g_empty, "gamma") {
+        eprintln("# noise_envelope selftest: reason=gamma-empty-shape-invalid fix=inspect noise_gamma empty-branch raw=\"" + g_empty + "\"")
+        fails = fails + 1
+    }
+    if !g_empty.contains("bridge:none") {
+        eprintln("# noise_envelope selftest: reason=gamma-empty-source_id-mismatch fix=expected bridge:none raw=\"" + g_empty + "\"")
+        fails = fails + 1
+    }
+
+    // 6. γ with populated fixture dir.
+    let gfix = "/tmp/noise_envelope_selftest_gamma"
+    let _ = exec("rm -rf " + _shell_quote(gfix) + " && mkdir -p " + _shell_quote(gfix))
+    let _ = exec("printf 'noise-source 1 active \"bridge:fixture\"\\n  slug bridge_fixture\\n  kind bridge\\n  invocation tool/fixture_bridge.hexa\\n' > " + _shell_quote(gfix + "/fixture.hexa"))
+    let g_pop = noise_gamma(gfix, bb)
+    if !_validate_envelope(g_pop, "gamma") {
+        eprintln("# noise_envelope selftest: reason=gamma-populated-shape-invalid fix=inspect noise_gamma non-empty branch raw=\"" + g_pop + "\"")
+        fails = fails + 1
+    }
+    if g_pop.contains("bridge:none") {
+        eprintln("# noise_envelope selftest: reason=gamma-populated-fell-through-to-none-branch fix=audit _list_files raw=\"" + g_pop + "\"")
+        fails = fails + 1
+    }
+    let _ = exec("rm -rf " + _shell_quote(gfix))
+
+    if fails == 0 {
+        eprintln("__NOISE_ENVELOPE_SELFTEST__ PASS")
+        return 0
+    }
+    eprintln("__NOISE_ENVELOPE_SELFTEST__ FAIL fails=" + to_string(fails))
+    return 1
+}
+
+// ─── CLI arg parsing ─────────────────────────────────────────────────
+fn _arg_value(args: [str], flag: str, default_val: str) -> str {
+    let mut i: i64 = 0
+    while i < len(args) {
+        if args[i] == flag && i + 1 < len(args) { return args[i + 1] }
+        i = i + 1
+    }
+    return default_val
+}
+
+fn _has_flag(args: [str], flag: str) -> bool {
+    let mut i: i64 = 0
+    while i < len(args) {
+        if args[i] == flag { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _emit_usage_and_fail() -> i64 {
+    eprintln("usage: hexa run noise_envelope.hexa <alpha|beta|gamma|--selftest> [--absorbed-dir <path>] [--bridges-dir <path>] [--beta-byte <int>]")
+    eprintln("# noise_envelope: reason=usage-missing-mechanism fix=pass alpha|beta|gamma|--selftest as first positional arg")
+    eprintln("__NOISE_ENVELOPE__ FAIL mechanism=?")
+    return 1
+}
+
+// ─── main ────────────────────────────────────────────────────────────
+// hexa runtime convention: fn main() -> void + args() + skip-`run` indexing.
+// raw_args[0]=hexa, raw_args[1]="run" (when invoked via `hexa run`), raw_args[2]=script-path,
+// raw_args[3+]=user args. When invoked via `hexa <script>` directly, user args start at [2].
+fn main() -> void {
+    let raw_args = args()
+    let mut user_start = 2
+    if raw_args.len() >= 3 && raw_args[1] == "run" { user_start = 3 }
+
+    // Slice user args into a flat array for downstream parsing.
+    let mut user_args: [str] = []
+    let mut i = user_start
+    while i < raw_args.len() {
+        user_args = user_args + [raw_args[i]]
+        i = i + 1
+    }
+
+    if user_args.len() < 1 {
+        let _ = _emit_usage_and_fail()
+        exit(1)
+    }
+
+    if _has_flag(user_args, "--selftest") || user_args[0] == "--selftest" {
+        let rc = _selftest()
+        exit(rc)
+    }
+
+    let mech = user_args[0]
+
+    if mech == "alpha" {
+        let absorbed_dir = _arg_value(user_args, "--absorbed-dir", "")
+        if absorbed_dir.len() == 0 {
+            eprintln("# noise_envelope: reason=alpha-missing-absorbed-dir fix=pass --absorbed-dir <path-to-noise_sources/absorbed>")
+            eprintln("__NOISE_ENVELOPE__ FAIL mechanism=a")
+            exit(1)
+        }
+        let env_json = noise_alpha(absorbed_dir)
+        println(env_json)
+        eprintln("__NOISE_ENVELOPE__ PASS mechanism=a")
+        exit(0)
+    }
+
+    if mech == "beta" {
+        let env_json = noise_beta()
+        println(env_json)
+        eprintln("__NOISE_ENVELOPE__ PASS mechanism=b")
+        exit(0)
+    }
+
+    if mech == "gamma" {
+        let bridges_dir = _arg_value(user_args, "--bridges-dir", "")
+        if bridges_dir.len() == 0 {
+            eprintln("# noise_envelope: reason=gamma-missing-bridges-dir fix=pass --bridges-dir <path-to-noise_sources/bridges>")
+            eprintln("__NOISE_ENVELOPE__ FAIL mechanism=g")
+            exit(1)
+        }
+        let beta_byte_s = _arg_value(user_args, "--beta-byte", "0")
+        let beta_byte = _safe_to_int_line(beta_byte_s, 0, "cli-beta-byte")
+        let env_json = noise_gamma(bridges_dir, beta_byte)
+        println(env_json)
+        eprintln("__NOISE_ENVELOPE__ PASS mechanism=g")
+        exit(0)
+    }
+
+    eprintln("# noise_envelope: reason=unknown-mechanism-" + mech + " fix=use one of alpha|beta|gamma|--selftest")
+    eprintln("__NOISE_ENVELOPE__ FAIL mechanism=?")
+    exit(1)
+}
