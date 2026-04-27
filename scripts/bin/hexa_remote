@@ -110,7 +110,7 @@ _probe_host() {
         err="$(LC_ALL=C ssh -o ConnectTimeout=$ctimeout -o BatchMode=yes -o ServerAliveInterval=5 \
             -o ServerAliveCountMax=1 \
             -o ControlMaster=no -o ControlPath=none "$cand" \
-            'echo OK $(LC_ALL=C free -m 2>/dev/null | awk "/^Mem:/ {print \$7}" | tr -d "[:space:]"); awk "/^some/ {gsub(/avg10=/,\"\"); print \$2; exit}" /proc/pressure/memory 2>/dev/null || echo "0.00"' 2>&1)"
+            'echo OK $(LC_ALL=C free -m 2>/dev/null | awk "/^Mem:/ {print \$7}" | tr -d "[:space:]" || awk "/MemAvailable:/ {print int(\$2/1024); exit}" /proc/meminfo 2>/dev/null || echo 0); awk "/^some/ {gsub(/avg10=/,\"\"); print \$2; exit}" /proc/pressure/memory 2>/dev/null || echo "0.00"; if command -v nvidia-smi >/dev/null 2>&1; then nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d "[:space:]" || echo 0; else echo 0; fi' 2>&1)"
         rc=$?
         if [ $rc -eq 0 ]; then
             # Parse "OK <avail>" — avail field 2 onwards (robust to extra whitespace).
@@ -118,6 +118,9 @@ _probe_host() {
             avail="$(printf '%s' "$err" | awk '/^OK/ {print $2}' | head -n1)"
             # PSI: 첫 OK 줄을 제외한 다음 줄. 빈 값이면 미지원 (macOS 등) → "" 로 둠.
             psi="$(printf '%s' "$err" | awk 'NR>1 && $0!="" {print; exit}')"
+            # Sub-AG (2026-04-27): GPU avail MB — 3번째 line. 미지원 / 미설치 시 0.
+            # nvidia-smi memory.free (MB unit, --nounits). RTX 5070 12GB → ~11500 MB free idle.
+            gpu_avail="$(printf '%s' "$err" | awk 'NR==3 {print; exit}')"
             # ω-hexa-5 (R5.4): PSI avg10 > 80 hard-reject. 호스트가 심하게
             # saturated 됐는데 RAM avail 만으로 통과시키면 stalls 발생.
             # threshold 80 → integer*100 = 8000 비교. Disable via
@@ -231,6 +234,8 @@ _probe_host() {
                 HEXA_REMOTE_LAST_AVAIL="${avail:-0}"
                 # L4: export PSI some avg10 (string, e.g. "12.34"). 미지원 호스트 = "".
                 HEXA_REMOTE_LAST_PSI="${psi:-}"
+                # Sub-AG: export GPU avail MB. 미지원 호스트 = 0.
+                HEXA_REMOTE_LAST_GPU_AVAIL="${gpu_avail:-0}"
                 return 0
             fi
             echo "hexa_remote: host=$cand SSH OK but RAM avail=${avail:-?}MB < ${min_ram}MB threshold (raw#36 bracket) — skipping" >&2
@@ -321,7 +326,7 @@ fi
 #   - seed length < 100 AND no --depth                       → small
 #   - 그 외                                                  → medium
 _classify_job() {
-    local _cmd="" _seed="" _depth="" _engine="" _spec=""
+    local _cmd="" _seed="" _depth="" _engine="" _spec="" _gpu=0
     local _i _j
     for ((_i=1; _i<=$#; _i++)); do
         case "${!_i}" in
@@ -331,14 +336,18 @@ _classify_job() {
             --depth)    _j=$((_i+1)); _depth="${!_j:-}" ;;
             --engine)   _j=$((_i+1)); _engine="${!_j:-}" ;;
             --speculate) _j=$((_i+1)); _spec="${!_j:-}" ;;
+            --gpu|--cuda) _gpu=1 ;;
         esac
     done
+    # Sub-AG: gpu 트리거 — 명시 --gpu/--cuda 또는 mk10 engine (CUDA 가속 가정).
+    if [ "$_gpu" = "1" ] || [ "$_engine" = "mk10" ]; then
+        echo "gpu"; return
+    fi
     # large 트리거
     case "$_cmd" in
         omega|absolute|meta-closure|hyperarithmetic) echo "large"; return ;;
     esac
     if [ -n "$_depth" ] && [ "$_depth" -ge 8 ] 2>/dev/null; then echo "large"; return; fi
-    if [ "$_engine" = "mk10" ]; then echo "large"; return; fi
     if [ -n "$_spec" ] && [ "$_spec" -ge 3 ] 2>/dev/null; then echo "large"; return; fi
     if [ "${#_seed}" -gt 500 ]; then echo "large"; return; fi
     # small 트리거
@@ -643,18 +652,22 @@ else
     _best_host=""
     _best_avail=-1
     _best_psi=""
+    _best_gpu_avail=0
     _healthy_hosts=""
     for cand in $FALLBACK_CHAIN; do
         HEXA_REMOTE_LAST_AVAIL=""
         HEXA_REMOTE_LAST_PSI=""
+        HEXA_REMOTE_LAST_GPU_AVAIL=""
         if _probe_host "$cand"; then
             _cand_avail="${HEXA_REMOTE_LAST_AVAIL:-0}"
             _cand_psi="${HEXA_REMOTE_LAST_PSI:-}"
-            _healthy_hosts="$_healthy_hosts $cand(avail=${_cand_avail}MB,psi=${_cand_psi:-NA})"
+            _cand_gpu="${HEXA_REMOTE_LAST_GPU_AVAIL:-0}"
+            _healthy_hosts="$_healthy_hosts $cand(avail=${_cand_avail}MB,psi=${_cand_psi:-NA},gpu=${_cand_gpu}MB)"
             # Strict `>` — tie 는 chain 순서 먼저 온 쪽 유지 (PREFERRED stability).
             if [ "$_cand_avail" -gt "$_best_avail" ] 2>/dev/null; then
                 _best_avail="$_cand_avail"
                 _best_psi="$_cand_psi"
+                _best_gpu_avail="$_cand_gpu"
                 _best_host="$cand"
             fi
         fi
@@ -662,7 +675,8 @@ else
     if [ -n "$_best_host" ]; then
         HOST="$_best_host"
         _picked_psi="$_best_psi"
-        echo "hexa_remote: LB=avail pick=$HOST (avail=${_best_avail}MB psi=${_picked_psi:-NA}) among:${_healthy_hosts}" >&2
+        _picked_gpu_avail="$_best_gpu_avail"
+        echo "hexa_remote: LB=avail pick=$HOST (avail=${_best_avail}MB psi=${_picked_psi:-NA} gpu=${_picked_gpu_avail}MB) among:${_healthy_hosts}" >&2
         [ "$PREFERRED" != "$HOST" ] && echo "hexa_remote: $PREFERRED not chosen (load-aware), using $HOST" >&2
     fi
 fi
@@ -842,6 +856,41 @@ if [ "$_IS_HEAVY_COMPUTE" = "1" ] \
         printf 'NEXUS_REMOTE_ERROR {"host":"%s","avail_mb":%s,"min_mb":%s,"job_class":"%s","reason":"l3_admission_insufficient_ram","exit_code":64}\n' \
             "$HOST" "$_best_avail" "$_admit_min_mb" "$_job_class" >&2
         exit 64
+    fi
+    # ──────────────────────────────────────────────────────────────────────
+    # Sub-AG (2026-04-27): L8 GPU class admission. class=gpu 인 경우 host
+    # 의 GPU memory.free (MB) 가 임계 미만이면 reject + fallback chain
+    # trigger. 임계는 _classify_job 의 gpu trigger 와 페어 — RTX 5070 12GB
+    # 기준 default 8192MB (drill+CUDA inference 가 stage0 로 buffer alloc 시
+    # 8GB 여유는 보수). Override:
+    #   HEXA_REMOTE_GPU_MIN_AVAIL_MB              (global)
+    #   HEXA_REMOTE_GPU_MIN_AVAIL_MB_<HOST_UPPER> (per-host)
+    # Bypass: HEXA_REMOTE_NO_GPU_ADMISSION=1
+    # 물리적 한계 정합 (raw 36 fixpoint): RTX 5070 VRAM 12GB - workload 4GB
+    # ≈ 8GB free 임계 → 동시 dispatch ≤ 1 GPU job per host. 더 작은 모델은
+    # HEXA_REMOTE_GPU_MIN_AVAIL_MB=2048 으로 완화.
+    if [ "$_job_class" = "gpu" ] && [ "${HEXA_REMOTE_NO_GPU_ADMISSION:-0}" != "1" ]; then
+        _gpu_admit_default=8192
+        _gpu_admit_host_var="HEXA_REMOTE_GPU_MIN_AVAIL_MB_${_admit_host_uc}"
+        _gpu_admit_min_mb="$(eval "printf '%s' \"\${${_gpu_admit_host_var}:-\${HEXA_REMOTE_GPU_MIN_AVAIL_MB:-$_gpu_admit_default}}\"")"
+        _picked_gpu_safe="${_picked_gpu_avail:-0}"
+        if [ "$_picked_gpu_safe" -lt "$_gpu_admit_min_mb" ] 2>/dev/null; then
+            echo "hexa_remote: L8 GPU admission reject — host=$HOST class=$_job_class gpu_avail=${_picked_gpu_safe}MB < min=${_gpu_admit_min_mb}MB" >&2
+            if [ -n "${_ACQUIRED:-}" ]; then
+                rm -rf "$_ACQUIRED" 2>/dev/null || true
+                _ACQUIRED=""
+            fi
+            # raw 66 ai-native trailer (Sub-W pattern reuse).
+            echo "reason: l8-gpu-insufficient: host=$HOST gpu_free=${_picked_gpu_safe}MB < ${_gpu_admit_min_mb}MB" >&2
+            echo "fix: 1) check ssh $HOST nvidia-smi for active GPU workload" >&2
+            echo "     2) HEXA_REMOTE_GPU_MIN_AVAIL_MB=2048 (smaller model) OR =0 (force-pass)" >&2
+            echo "     3) HEXA_REMOTE_NO_GPU_ADMISSION=1 to bypass entirely (CPU fallback)" >&2
+            echo "     4) wait + retry — RTX 5070 idle baseline ~226MB used / 12000MB free" >&2
+            printf 'NEXUS_REMOTE_ERROR {"host":"%s","gpu_avail_mb":%s,"gpu_min_mb":%s,"job_class":"%s","reason":"l8_gpu_insufficient","exit_code":64}\n' \
+                "$HOST" "$_picked_gpu_safe" "$_gpu_admit_min_mb" "$_job_class" >&2
+            exit 64
+        fi
+        echo "hexa_remote: L8 GPU admission pass — host=$HOST class=$_job_class gpu_avail=${_picked_gpu_safe}MB >= min=${_gpu_admit_min_mb}MB" >&2
     fi
     # ──────────────────────────────────────────────────────────────────────
     # Wave 25 / L4 (2026-04-25): cgroup PSI feedback admission throttle.
