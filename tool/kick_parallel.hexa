@@ -1,0 +1,359 @@
+// tool/kick_parallel.hexa — N-topic fan-out wrapper for `nexus kick`.
+//
+// @tool(slug="kick_parallel", desc="parallel kick dispatcher — fans out N topics
+//   to background `nexus kick` invocations, monitors witness files + per-kick
+//   sentinels, emits aggregate __KICK_PARALLEL__ verdict. Leverages Sub-AB
+//   free-port-pick + Sub-AH multi-slot + Sub-AE 12-slot OAuth pool.")
+// @usage(hexa run /Users/ghost/core/nexus/tool/kick_parallel.hexa
+//   --topics 't1|t2|t3' [--max-parallel N] [--timeout-sec S] [--selftest])
+// @omega-saturation-exempt("dispatcher wrapper — convergence applies to spawned
+//   kicks, not the wrapper itself")
+// @exit_codes(0=all PASS, 1=≥1 FAIL, 2=usage/io error)
+//
+// raw 36 problem-solving-triad atomize + raw 44 + raw 47 + raw 66 + raw 80 + raw 95.
+//
+// FAN-OUT DESIGN
+//   1. Parse --topics 't1|t2|t3' (pipe-delim — `,` reserved for raw 47 axes csv)
+//   2. For each topic: spawn `nexus kick <topic>` in background (& detached)
+//   3. Each kick gets its own port (Sub-AB free-port-pick scan [19877, 20000])
+//      and its own slot from Sub-AH per-host dynamic concurrency.
+//   4. Poll witness files (design/kick/<date>_<slug>_omega_cycle.json) until all
+//      complete OR --timeout-sec deadline.
+//   5. Collect __KICK_RESULT__ sentinel from each kick's stderr capture file.
+//   6. Emit aggregate sentinel: __KICK_PARALLEL__ PASS|FAIL n=<N> passed=<P>
+//      failed=<F> tier1_total=<sum> witnesses=<csv>
+//
+// SLOT-EXHAUSTION FAILURE MODE (Sub-AH guard)
+//   If --max-parallel exceeds aggregate cluster slot capacity, kicks queue up
+//   on per-host gates. Default --max-parallel min(N_topics, 6) keeps within
+//   Sub-AI PSI-aware clamp envelope (8 max under 0% PSI).
+//
+// SENTINEL
+//   stderr: __KICK_PARALLEL__ <PASS|FAIL> n=<N> passed=<P> failed=<F> ...
+//   selftest: __KICK_PARALLEL_SELFTEST__ <PASS|FAIL>
+//
+// AI-NATIVE ERROR (raw 66)
+//   reason=<sub-class>: <details>
+//   fix: 1) <action>  2) <action>  3) <action>
+
+// ─── helpers ─────────────────────────────────────────────────────────
+
+fn _now_iso_utc() -> str {
+    return exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+fn _now_unix() -> i64 {
+    let s = exec("date +%s").trim()
+    let mut v: i64 = 0
+    try { v = to_int(s) } catch e { v = 0 }
+    return v
+}
+
+fn _shell_quote(s: str) -> str {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _slugify(topic: str) -> str {
+    // Mirror cli/run.hexa kick slug generation: lowercase + non-alnum→'-'.
+    let mut out = ""
+    let mut i: i64 = 0
+    while i < topic.len() {
+        let c = topic.substring(i, i + 1)
+        let lc = c.to_lower()
+        let is_alnum = (lc >= "a" && lc <= "z") || (lc >= "0" && lc <= "9")
+        if is_alnum { out = out + lc }
+        else if out.len() > 0 && !out.ends_with("-") { out = out + "-" }
+        i = i + 1
+    }
+    if out.ends_with("-") { out = out.substring(0, out.len() - 1) }
+    return out
+}
+
+fn _file_exists(path: str) -> bool {
+    let r = exec("test -f " + _shell_quote(path) + " && echo y || echo n").trim()
+    return r == "y"
+}
+
+fn _safe_to_int(s: str, default: i64) -> i64 {
+    let trimmed = s.trim()
+    if trimmed.len() == 0 { return default }
+    let mut v: i64 = default
+    try { v = to_int(trimmed) } catch e { v = default }
+    return v
+}
+
+// ─── topic dispatch ──────────────────────────────────────────────────
+
+// Spawn one `nexus kick <topic>` in background. Returns PID as string.
+// stderr+stdout captured to per-topic log file under /tmp/kick_parallel_<sid>/.
+fn _spawn_kick(topic: str, sid: str) -> str {
+    let log_dir = "/tmp/kick_parallel_" + sid
+    let _mkdir = exec("mkdir -p " + _shell_quote(log_dir))
+    let topic_slug = _slugify(topic)
+    let log_path = log_dir + "/kick_" + topic_slug + ".log"
+    let pid_path = log_dir + "/kick_" + topic_slug + ".pid"
+    // Detach via nohup + & — survives this process's exit if needed.
+    // Use `nexus` shim (PATH-installed) so resolver routes properly.
+    let cmd = "nohup nexus kick " + _shell_quote(topic) +
+              " > " + _shell_quote(log_path) + " 2>&1 < /dev/null & echo $! > " + _shell_quote(pid_path)
+    let _ = exec(cmd)
+    let pid = exec("cat " + _shell_quote(pid_path) + " 2>/dev/null").trim()
+    return pid
+}
+
+// Check if a process is alive.
+fn _pid_alive(pid: str) -> bool {
+    if pid.len() == 0 { return false }
+    let r = exec("kill -0 " + pid + " 2>/dev/null && echo y || echo n").trim()
+    return r == "y"
+}
+
+// Read __KICK_RESULT__ sentinel from a log file. Returns "" if not found.
+fn _extract_kick_result(log_path: str) -> str {
+    if !_file_exists(log_path) { return "" }
+    let cmd = "grep '^__KICK_RESULT__' " + _shell_quote(log_path) + " 2>/dev/null | tail -1"
+    return exec(cmd).trim()
+}
+
+// Parse `tier1=<N>` from a __KICK_RESULT__ line. Returns 0 on parse fail.
+fn _parse_tier1(result_line: str) -> i64 {
+    let key = "tier1="
+    let i = result_line.index_of(key)
+    if i < 0 { return 0 }
+    let rest = result_line.substring(i + key.len(), result_line.len())
+    let mut end: i64 = 0
+    while end < rest.len() {
+        let c = rest.substring(end, end + 1)
+        if c < "0" || c > "9" { break }
+        end = end + 1
+    }
+    return _safe_to_int(rest.substring(0, end), 0)
+}
+
+// Parse PASS/FAIL from result line.
+fn _parse_pass(result_line: str) -> bool {
+    return result_line.contains("__KICK_RESULT__ PASS")
+}
+
+// ─── selftest ────────────────────────────────────────────────────────
+
+fn _selftest() -> i64 {
+    let mut fails: i64 = 0
+
+    // Fixture 1: _slugify
+    if _slugify("Hello World 123") != "hello-world-123" {
+        eprintln("# selftest: slugify-basic-fail got=[" + _slugify("Hello World 123") + "]")
+        fails = fails + 1
+    }
+    if _slugify("topic with !!! punctuation...") != "topic-with-punctuation" {
+        eprintln("# selftest: slugify-punct-fail got=[" + _slugify("topic with !!! punctuation...") + "]")
+        fails = fails + 1
+    }
+
+    // Fixture 2: _parse_tier1 / _parse_pass
+    let line_pass = "__KICK_RESULT__ PASS witness=/tmp/x.json tier1=3 falsifier_pass=5"
+    if !_parse_pass(line_pass) { eprintln("# selftest: parse-pass-true-fail"); fails = fails + 1 }
+    if _parse_tier1(line_pass) != 3 { eprintln("# selftest: parse-tier1-3-fail"); fails = fails + 1 }
+    let line_fail = "__KICK_RESULT__ FAIL witness=/tmp/x.json tier1=0 falsifier_pass=0"
+    if _parse_pass(line_fail) { eprintln("# selftest: parse-pass-false-fail"); fails = fails + 1 }
+    if _parse_tier1(line_fail) != 0 { eprintln("# selftest: parse-tier1-0-fail"); fails = fails + 1 }
+
+    // Fixture 3: _safe_to_int defensive
+    if _safe_to_int("", 99) != 99 { eprintln("# selftest: safe-int-empty-default-fail"); fails = fails + 1 }
+    if _safe_to_int("42", 0) != 42 { eprintln("# selftest: safe-int-parse-fail"); fails = fails + 1 }
+    if _safe_to_int("abc", 7) != 7 { eprintln("# selftest: safe-int-bad-default-fail"); fails = fails + 1 }
+
+    // Fixture 4: _pid_alive on a real long-lived background process.
+    // Use nohup + `&` + `disown` semantics; subshell exits leave the child
+    // alive long enough for the kill -0 probe to succeed.
+    let live_pid = exec("nohup sleep 30 >/dev/null 2>&1 & echo $!; sleep 0.2").trim()
+    if !_pid_alive(live_pid) {
+        eprintln("# selftest: pid-alive-live-fail live_pid=" + live_pid)
+        fails = fails + 1
+    }
+    let _ = exec("kill " + live_pid + " 2>/dev/null")  // cleanup
+    if _pid_alive("999999999") {
+        eprintln("# selftest: pid-alive-fake-fail")
+        fails = fails + 1
+    }
+
+    if fails == 0 {
+        eprintln("__KICK_PARALLEL_SELFTEST__ PASS")
+        return 0
+    }
+    eprintln("__KICK_PARALLEL_SELFTEST__ FAIL fails=" + to_string(fails))
+    return 1
+}
+
+// ─── main fan-out loop ───────────────────────────────────────────────
+
+fn _has_flag(args: [str], flag: str) -> bool {
+    let mut i: i64 = 0
+    while i < len(args) { if args[i] == flag { return true }; i = i + 1 }
+    return false
+}
+
+fn _arg_value(args: [str], flag: str, default_val: str) -> str {
+    let mut i: i64 = 0
+    while i < len(args) {
+        if args[i] == flag && i + 1 < len(args) { return args[i + 1] }
+        i = i + 1
+    }
+    return default_val
+}
+
+fn _emit_trailer(reason: str) -> void {
+    eprintln("# kick_parallel: reason=" + reason)
+    eprintln("# fix: 1) hexa run tool/cluster_load_audit.hexa  # check cluster availability")
+    eprintln("       2) reduce --max-parallel  OR  --timeout-sec extension")
+    eprintln("       3) hexa run tool/subagent_dispatch.hexa --reclaim-stale-ports  # Sub-AB stale-port cleanup")
+    eprintln("       4) ref convergence/r4_kick_parallel_2026_04_27 + raw 36 atomize")
+}
+
+fn main() -> void {
+    let raw_args = args()
+    let mut user_start = 2
+    if raw_args.len() >= 3 && raw_args[1] == "run" { user_start = 3 }
+    let mut user_args: [str] = []
+    let mut i = user_start
+    while i < raw_args.len() {
+        user_args = user_args + [raw_args[i]]
+        i = i + 1
+    }
+
+    if _has_flag(user_args, "--selftest") {
+        let rc = _selftest()
+        exit(rc)
+    }
+
+    let topics_csv = _arg_value(user_args, "--topics", "")
+    if topics_csv.len() == 0 {
+        eprintln("usage: hexa run kick_parallel.hexa --topics 't1|t2|t3' [--max-parallel N] [--timeout-sec S]")
+        eprintln("# kick_parallel: reason=usage-missing-topics fix=pass --topics with pipe-delimited topic strings")
+        eprintln("__KICK_PARALLEL__ FAIL n=0 passed=0 failed=0")
+        exit(2)
+    }
+
+    let topics_raw = topics_csv.split("|")
+    let mut topics: [str] = []
+    let mut t: i64 = 0
+    while t < len(topics_raw) {
+        let topic = topics_raw[t].trim()
+        if topic.len() > 0 { topics = topics + [topic] }
+        t = t + 1
+    }
+    let n = len(topics)
+    if n == 0 {
+        eprintln("# kick_parallel: reason=topics-empty-after-parse fix=non-empty pipe-delimited topic list")
+        eprintln("__KICK_PARALLEL__ FAIL n=0 passed=0 failed=0")
+        exit(2)
+    }
+
+    let max_parallel_s = _arg_value(user_args, "--max-parallel", "")
+    let mut max_parallel = if max_parallel_s.len() > 0 { _safe_to_int(max_parallel_s, n) } else {
+        // Default: min(n, 6) — under Sub-AI PSI-aware clamp ceiling 8.
+        if n < 6 { n } else { 6 }
+    }
+    if max_parallel < 1 { max_parallel = 1 }
+
+    let timeout_sec_s = _arg_value(user_args, "--timeout-sec", "1800")  // 30min default
+    let timeout_sec = _safe_to_int(timeout_sec_s, 1800)
+
+    // Session ID for log dir isolation.
+    let sid = exec("date +%s%N | tail -c 8").trim()
+    let log_dir = "/tmp/kick_parallel_" + sid
+    eprintln("# kick_parallel: starting fan-out n=" + to_string(n) +
+             " max_parallel=" + to_string(max_parallel) +
+             " timeout_sec=" + to_string(timeout_sec) +
+             " log_dir=" + log_dir +
+             " ts=" + _now_iso_utc())
+
+    // Spawn loop with concurrency cap. spawned[i] = pid str (or "" if not started).
+    let mut spawned: [str] = []
+    let mut topic_slugs: [str] = []
+    let mut log_paths: [str] = []
+    let mut k: i64 = 0
+    while k < n {
+        spawned = spawned + [""]
+        topic_slugs = topic_slugs + [_slugify(topics[k])]
+        log_paths = log_paths + [log_dir + "/kick_" + _slugify(topics[k]) + ".log"]
+        k = k + 1
+    }
+
+    // Initial fan-out — spawn first max_parallel.
+    let mut pending = n
+    let mut launched: i64 = 0
+    let mut next_to_launch: i64 = 0
+    while next_to_launch < n && launched < max_parallel {
+        let pid = _spawn_kick(topics[next_to_launch], sid)
+        spawned[next_to_launch] = pid
+        eprintln("# kick_parallel: spawn topic=[" + topics[next_to_launch] + "] pid=" + pid + " log=" + log_paths[next_to_launch])
+        launched = launched + 1
+        next_to_launch = next_to_launch + 1
+    }
+
+    // Poll loop — every 5s check each spawned PID + log sentinel; spawn next when one completes.
+    let start_ts = _now_unix()
+    let mut completed: i64 = 0
+    let mut passed: i64 = 0
+    let mut failed: i64 = 0
+    let mut tier1_sum: i64 = 0
+    let mut completed_set: [bool] = []
+    let mut q: i64 = 0
+    while q < n { completed_set = completed_set + [false]; q = q + 1 }
+
+    while completed < n {
+        let now = _now_unix()
+        if now - start_ts >= timeout_sec {
+            eprintln("# kick_parallel: timeout reached (" + to_string(timeout_sec) + "s) — aborting remaining")
+            break
+        }
+        let _ = exec("sleep 5")
+        let mut p: i64 = 0
+        while p < n {
+            if !completed_set[p] && spawned[p].len() > 0 {
+                if !_pid_alive(spawned[p]) {
+                    completed_set[p] = true
+                    completed = completed + 1
+                    let result = _extract_kick_result(log_paths[p])
+                    if result.len() > 0 && _parse_pass(result) {
+                        passed = passed + 1
+                        tier1_sum = tier1_sum + _parse_tier1(result)
+                        eprintln("# kick_parallel: complete topic=[" + topics[p] + "] PID=" + spawned[p] + " PASS tier1=" + to_string(_parse_tier1(result)))
+                    } else {
+                        failed = failed + 1
+                        eprintln("# kick_parallel: complete topic=[" + topics[p] + "] PID=" + spawned[p] + " FAIL result=[" + result + "]")
+                    }
+                    // Spawn next pending if any.
+                    if next_to_launch < n {
+                        let pid_next = _spawn_kick(topics[next_to_launch], sid)
+                        spawned[next_to_launch] = pid_next
+                        eprintln("# kick_parallel: spawn topic=[" + topics[next_to_launch] + "] pid=" + pid_next + " log=" + log_paths[next_to_launch])
+                        next_to_launch = next_to_launch + 1
+                    }
+                }
+            }
+            p = p + 1
+        }
+    }
+
+    let elapsed = _now_unix() - start_ts
+    let verdict = if failed == 0 && completed == n { "PASS" } else { "FAIL" }
+    let mut witnesses = ""
+    let mut wi: i64 = 0
+    while wi < n {
+        if wi > 0 { witnesses = witnesses + "," }
+        witnesses = witnesses + log_paths[wi]
+        wi = wi + 1
+    }
+    eprintln("__KICK_PARALLEL__ " + verdict + " n=" + to_string(n) +
+             " passed=" + to_string(passed) + " failed=" + to_string(failed) +
+             " tier1_total=" + to_string(tier1_sum) +
+             " elapsed=" + to_string(elapsed) + "s")
+    eprintln("# kick_parallel: log_dir=" + log_dir + " (per-topic logs preserved)")
+    if verdict != "PASS" {
+        _emit_trailer("kick-parallel-incomplete: completed=" + to_string(completed) + "/" + to_string(n) + " failed=" + to_string(failed))
+        exit(1)
+    }
+    exit(0)
+}
