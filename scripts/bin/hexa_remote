@@ -490,6 +490,76 @@ if [ "$_IS_HEAVY_COMPUTE" = "1" ] && [ "${HEXA_REMOTE_NO_CONCURRENCY:-0}" != "1"
         done
         return 1
     }
+    # ──────────────────────────────────────────────────────────────────
+    # Sub-AK (2026-04-27): GPU concurrent slot tracking. Sub-AG L8 admission
+    # checked gpu_avail >= min single-shot — over-commit risk if 4 kicks
+    # all admit when only 12GB VRAM exists (each at 8GB threshold). Slot
+    # tracking caps concurrent GPU jobs per host at floor((gpu_avail -
+    # gpu_safety) / per_job_vram), clamped [1, 4]. Lock prefix
+    # /tmp/nexus_gpu_dispatch.<host>.gpu_slot<N>.lock parallel to RAM L1
+    # /tmp/nexus_heavy_dispatch.<host>.slot<N>.lock — orthogonal acquire.
+    #
+    # Math:
+    #   per_job_vram default 4096 (typical CUDA inference; train job set
+    #     HEXA_REMOTE_GPU_PER_JOB_VRAM_MB=10240 for 10GB workload)
+    #   gpu_safety default 1024 (CUDA context + driver overhead)
+    #   RTX 5070 12GB free idle → floor((11500-1024)/4096) = 2 slots/host
+    # Override: HEXA_REMOTE_GPU_CONCURRENCY_<HOST_UPPER> / GLOBAL.
+    _per_host_gpu_max() {
+        local _h="$1"
+        local _h_uc="$(printf '%s' "$_h" | tr '[:lower:]' '[:upper:]')"
+        local _explicit_var="HEXA_REMOTE_GPU_CONCURRENCY_${_h_uc}"
+        local _explicit="${!_explicit_var:-}"
+        if [ -n "$_explicit" ]; then printf '%s' "$_explicit"; return; fi
+        if [ -n "${HEXA_REMOTE_GPU_CONCURRENCY:-}" ]; then printf '%s' "$HEXA_REMOTE_GPU_CONCURRENCY"; return; fi
+        local _gpu_avail="${_picked_gpu_avail:-${_best_gpu_avail:-0}}"
+        local _gpu_safety="${HEXA_REMOTE_GPU_SAFETY_MB:-1024}"
+        local _per_job="${HEXA_REMOTE_GPU_PER_JOB_VRAM_MB:-4096}"
+        if [ "$_gpu_avail" -gt "$_gpu_safety" ] 2>/dev/null && [ "$_per_job" -gt 0 ] 2>/dev/null; then
+            local _gdyn=$(( (_gpu_avail - _gpu_safety) / _per_job ))
+            [ "$_gdyn" -lt 1 ] && _gdyn=1
+            [ "$_gdyn" -gt 4 ] && _gdyn=4
+            printf '%s' "$_gdyn"
+            return
+        fi
+        printf '1'
+    }
+    _acquire_gpu_slot() {
+        # Args: $1 = host. Sets _GPU_ACQUIRED on success. Mirrors _acquire_slot
+        # mechanics: mkdir lockdir + write pid + trap-on-exit cleanup. The trap
+        # is APPENDED to the existing _ACQUIRED trap so RAM + GPU slots both
+        # release on EXIT.
+        _h="$1"
+        _N_MAX_GH="$(_per_host_gpu_max "$_h")"
+        _GPU_LOCK_PREFIX="/tmp/nexus_gpu_dispatch.${_h}.gpu_slot"
+        _gi=1
+        while [ "$_gi" -le "$_N_MAX_GH" ]; do
+            _gld="${_GPU_LOCK_PREFIX}${_gi}.lock"
+            if mkdir "$_gld" 2>/dev/null; then
+                echo "$$" > "$_gld/pid" 2>/dev/null || true
+                _GPU_ACQUIRED="$_gld"
+                # Compose trap with existing _ACQUIRED cleanup. raw 36 fixpoint:
+                # both lockdirs released atomically on shell exit.
+                trap 'rm -rf "${_ACQUIRED:-}" "${_GPU_ACQUIRED:-}" 2>/dev/null || true' EXIT INT TERM
+                return 0
+            else
+                # Stale-detection mirror of RAM slot pattern.
+                _gpid="$(cat "$_gld/pid" 2>/dev/null || echo "")"
+                if [ -n "$_gpid" ] && ! kill -0 "$_gpid" 2>/dev/null; then
+                    rm -rf "$_gld" 2>/dev/null || true
+                    continue
+                fi
+                _gslot_age="$(( $(date +%s) - $(stat -f %m "$_gld" 2>/dev/null || stat -c %Y "$_gld" 2>/dev/null || date +%s) ))"
+                if [ "$_gslot_age" -ge "$_SLOT_MAX_HOLD" ] 2>/dev/null; then
+                    echo "hexa_remote: stale GPU slot reclaimed (held ${_gslot_age}s, pid ${_gpid:-?})" >&2
+                    rm -rf "$_gld" 2>/dev/null || true
+                    continue
+                fi
+            fi
+            _gi=$((_gi + 1))
+        done
+        return 1
+    }
     # 실제 acquire 호출은 host 결정 후 (line ~327 이후) `_gate_acquire_for_host` 에서.
     # 여기선 함수만 정의 — host pick 전에는 어느 슬롯에 속할지 알 수 없음.
     _gate_acquire_for_host() {
@@ -946,6 +1016,29 @@ if [ "$_IS_HEAVY_COMPUTE" = "1" ] \
             exit 64
         fi
         echo "hexa_remote: L8 GPU admission pass — host=$HOST class=$_job_class gpu_avail=${_picked_gpu_safe}MB >= min=${_gpu_admit_min_mb}MB" >&2
+        # Sub-AK (2026-04-27): GPU concurrent slot acquire. Caps physical
+        # over-commit beyond what L8 admission alone permits (admission is
+        # single-shot avail check; slot tracks active concurrent jobs).
+        if command -v _acquire_gpu_slot >/dev/null 2>&1 && [ "${HEXA_REMOTE_NO_GPU_CONCURRENCY:-0}" != "1" ]; then
+            _gpu_max_h="$(_per_host_gpu_max "$HOST")"
+            if _acquire_gpu_slot "$HOST"; then
+                echo "hexa_remote: L8 GPU slot acquired — host=$HOST slot=${_GPU_ACQUIRED} max_concurrent=${_gpu_max_h}" >&2
+            else
+                echo "hexa_remote: L8 GPU slot exhausted — host=$HOST max_concurrent=${_gpu_max_h} all in use" >&2
+                if [ -n "${_ACQUIRED:-}" ]; then
+                    rm -rf "$_ACQUIRED" 2>/dev/null || true
+                    _ACQUIRED=""
+                fi
+                echo "reason: l8-gpu-slot-exhausted: host=$HOST all ${_gpu_max_h} GPU slots busy" >&2
+                echo "fix: 1) wait + retry (other GPU jobs holding slots)" >&2
+                echo "     2) HEXA_REMOTE_GPU_CONCURRENCY=<n> raise cap (RTX 5070 12GB physical limit)" >&2
+                echo "     3) HEXA_REMOTE_NO_GPU_CONCURRENCY=1 bypass slot tracking (admission-only)" >&2
+                echo "     4) hexa run tool/cluster_load_audit.hexa  # check GPU util" >&2
+                printf 'NEXUS_REMOTE_ERROR {"host":"%s","gpu_max":%s,"job_class":"%s","reason":"l8_gpu_slot_exhausted","exit_code":64}\n' \
+                    "$HOST" "$_gpu_max_h" "$_job_class" >&2
+                exit 64
+            fi
+        fi
     fi
     # ──────────────────────────────────────────────────────────────────────
     # Wave 25 / L4 (2026-04-25): cgroup PSI feedback admission throttle.
