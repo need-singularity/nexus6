@@ -1,0 +1,364 @@
+// tool/cluster_load_audit.hexa — cross-host PSI + RAM + GPU + hexa-proc count audit.
+//
+// @tool(slug="cluster_load_audit", desc="cross-host live load snapshot — PSI mem/cpu, avail RAM,
+//   GPU memory + util, active hexa interpreter process count. Sub-AF (2026-04-27) — observability
+//   primitive for raw 86 cost-attribution + raw 40 external-host-dispatch utilization metric.
+//   Pairs with hexa_real_parity_check.hexa (binary parity) — this tool measures live load.")
+// @usage(hexa run /Users/ghost/core/nexus/tool/cluster_load_audit.hexa
+//   [--json] [--psi-threshold <pct>] [--selftest])
+// @omega-saturation-exempt("audit observer — convergence applies to the cluster it audits")
+// @exit_codes(0=PASS all hosts under threshold, 1=≥1 host saturated, 2=usage/io error)
+//
+// raw 1 + raw 47 + raw 66 + raw 80 + raw 84 + raw 86.
+//
+// CHECK MATRIX (per host)
+//   1. PSI mem  avg10 (%)          — memory pressure last 10s
+//   2. PSI cpu  avg10 (%)          — cpu pressure last 10s
+//   3. avail RAM (MB)              — `free -m` MemAvailable
+//   4. total RAM (MB)              — `free -m` total
+//   5. hexa proc count             — `pgrep -c hexa_interp.real` (active interpreters)
+//   6. GPU mem used (MB) / total   — `nvidia-smi` (linux only, omit on darwin)
+//   7. GPU util (%)                — `nvidia-smi` utilization.gpu
+//
+// SATURATION VERDICT (per host)
+//   psi_mem ≥ threshold (default 80%) OR psi_cpu ≥ threshold ⇒ saturated
+//   exit 1 if any host saturated; sentinel still PASS-individual on healthy hosts.
+//
+// SENTINEL
+//   stderr: __CLUSTER_LOAD_AUDIT__ <PASS|FAIL> healthy=<N> saturated=<M> total=<T>
+//   selftest: __CLUSTER_LOAD_AUDIT_SELFTEST__ <PASS|FAIL>
+//
+// AI-NATIVE ERROR (raw 66)
+//   reason=cluster-saturated: <hosts>
+//   fix: 1) inspect <host> external workload (top / nvidia-smi)  2) wait + re-audit  3) HEXA_LOCAL=1 bypass
+
+// ─── helpers ─────────────────────────────────────────────────────────
+
+fn _now_iso_utc() -> str {
+    return exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+fn _is_safe_host(h: str) -> bool {
+    if h.len() == 0 || h.len() > 64 { return false }
+    let mut i: i64 = 0
+    while i < h.len() {
+        let c = h.substring(i, i + 1)
+        let ok = (c >= "a" && c <= "z") || (c >= "A" && c <= "Z")
+            || (c >= "0" && c <= "9") || c == "-" || c == "_" || c == "."
+        if !ok { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// _safe_to_int_line — reused defensive parser pattern (raw 66 graceful-degrade).
+fn _safe_to_int_line(raw: str, default: i64, label: str) -> i64 {
+    let trimmed = raw.trim()
+    if trimmed.len() == 0 { return default }
+    let nl = trimmed.index_of("\n")
+    let first = if nl >= 0 { trimmed.substring(0, nl).trim() } else { trimmed }
+    if first.len() == 0 { return default }
+    let mut v: i64 = default
+    try { v = to_int(first) } catch e {
+        eprintln("# cluster_load_audit: reason=to_int-parse-fail-" + label + " fix=audit probe stdout default=" + to_string(default))
+        v = default
+    }
+    return v
+}
+
+// Probe one host. host == "local" uses local exec; else ssh.
+// Returns 7-element array: [psi_mem_pct, psi_cpu_pct, avail_mb, total_mb, hexa_n, gpu_mem, gpu_util]
+// gpu_mem / gpu_util = "-" on hosts without NVIDIA (darwin / hetzner CPU-only).
+fn _probe_host(host: str) -> [str] {
+    if !_is_safe_host(host) { return ["ERR_INPUT", "", "", "", "", "", ""] }
+    // Composite probe via POSIX parameter expansion — NO embedded single quotes
+    // so the ssh outer single-quote wrapper survives. Each metric line is
+    // KEY=VALUE for clean grep/parse on the receiving side.
+    let inner = "psi_mem_l=$(head -1 /proc/pressure/memory 2>/dev/null); " +
+                "case \"$psi_mem_l\" in *avg10=*) psi_mem_a=${psi_mem_l#*avg10=}; psi_mem=${psi_mem_a%% *};; *) psi_mem=NA;; esac; " +
+                "echo PSI_MEM=$psi_mem; " +
+                "psi_cpu_l=$(head -1 /proc/pressure/cpu 2>/dev/null); " +
+                "case \"$psi_cpu_l\" in *avg10=*) psi_cpu_a=${psi_cpu_l#*avg10=}; psi_cpu=${psi_cpu_a%% *};; *) psi_cpu=NA;; esac; " +
+                "echo PSI_CPU=$psi_cpu; " +
+                "tot_l=$(grep MemTotal: /proc/meminfo 2>/dev/null); " +
+                "set -- $tot_l; tot_kb=${2:-0}; " +
+                "av_l=$(grep MemAvailable: /proc/meminfo 2>/dev/null); " +
+                "set -- $av_l; av_kb=${2:-0}; " +
+                "echo MEM_LINE=$((av_kb / 1024)) $((tot_kb / 1024)); " +
+                "hexa_n=$(pgrep -fc hexa_interp.real 2>/dev/null); echo HEXA_N=${hexa_n:-0}; " +
+                "if [ -x /usr/bin/nvidia-smi ]; then " +
+                "  gpu_l=$(/usr/bin/nvidia-smi --query-gpu=memory.used,memory.total,utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1); " +
+                "  if [ -n \"$gpu_l\" ]; then gpu_clean=$(echo $gpu_l | tr -d \" \"); echo GPU=$gpu_clean; else echo GPU=NA,NA,NA; fi; " +
+                "else echo GPU=NA,NA,NA; fi"
+    let raw = if host == "local" {
+        // local darwin — /proc/pressure absent, free -m absent. POSIX-only sysctl + vm_stat.
+        // sysctl returns bytes; awk-free conversion via $((...)) arithmetic.
+        let mac_inner = "echo PSI_MEM=NA-darwin; " +
+                        "echo PSI_CPU=NA-darwin; " +
+                        "tot_b=$(sysctl -n hw.memsize 2>/dev/null); " +
+                        "tot_mb=$((tot_b / 1024 / 1024)); " +
+                        "vm_out=$(vm_stat 2>/dev/null); " +
+                        "free_p=$(echo \"$vm_out\" | grep 'Pages free' | tr -dc '0-9'); " +
+                        "ina_p=$(echo \"$vm_out\" | grep 'Pages inactive' | tr -dc '0-9'); " +
+                        "spec_p=$(echo \"$vm_out\" | grep 'Pages speculative' | tr -dc '0-9'); " +
+                        "avail_p=$(( ${free_p:-0} + ${ina_p:-0} + ${spec_p:-0} )); " +
+                        "avail_mb=$(( avail_p * 4096 / 1024 / 1024 )); " +
+                        "echo MEM_LINE=$avail_mb $tot_mb; " +
+                        "hexa_n=$(pgrep -fc hexa_interp.real 2>/dev/null); echo HEXA_N=${hexa_n:-0}; " +
+                        "echo GPU=NA,NA,NA"
+        exec(mac_inner)
+    } else {
+        let cmd = "ssh -o ConnectTimeout=8 -o BatchMode=yes -o StrictHostKeyChecking=no " + host + " '" + inner + "' 2>/dev/null"
+        exec(cmd)
+    }
+    let lines = raw.split("\n")
+    let mut psi_mem = "NA"
+    let mut psi_cpu = "NA"
+    let mut avail_mb = "0"
+    let mut total_mb = "0"
+    let mut hexa_n = "0"
+    let mut gpu_mem = "-"
+    let mut gpu_util = "-"
+    let mut i: i64 = 0
+    while i < len(lines) {
+        let line = lines[i].trim()
+        if line.starts_with("PSI_MEM=") {
+            psi_mem = line.substring(8, line.len()).trim()
+        } else if line.starts_with("PSI_CPU=") {
+            psi_cpu = line.substring(8, line.len()).trim()
+        } else if line.starts_with("MEM_LINE=") {
+            let rest = line.substring(9, line.len()).trim()
+            let parts = rest.split(" ")
+            if len(parts) >= 2 {
+                avail_mb = parts[0].trim()
+                total_mb = parts[1].trim()
+            }
+        } else if line.starts_with("HEXA_N=") {
+            hexa_n = line.substring(7, line.len()).trim()
+        } else if line.starts_with("GPU=") {
+            let rest = line.substring(4, line.len()).trim()
+            if rest.len() > 0 && rest != "NA,NA,NA" {
+                let parts = rest.split(",")
+                if len(parts) >= 3 {
+                    gpu_mem = parts[0].trim() + "/" + parts[1].trim()
+                    gpu_util = parts[2].trim()
+                }
+            }
+        }
+        i = i + 1
+    }
+    return [psi_mem, psi_cpu, avail_mb, total_mb, hexa_n, gpu_mem, gpu_util]
+}
+
+fn _build_targets() -> [[str]] {
+    let mut t: [[str]] = []
+    t = t + [["mac",     "local"]]
+    t = t + [["ubu1",    "ubu"]]
+    t = t + [["ubu2",    "ubu2"]]
+    t = t + [["hetzner", "hetzner"]]
+    return t
+}
+
+// Convert PSI string to integer percent (truncated). "NA" / "NA-darwin" → -1.
+fn _psi_to_int(psi: str) -> i64 {
+    let p = psi.trim()
+    if p.len() == 0 || p.starts_with("NA") { return -1 }
+    let dot = p.index_of(".")
+    let s = if dot >= 0 { p.substring(0, dot) } else { p }
+    return _safe_to_int_line(s, -1, "psi-parse")
+}
+
+fn _verdict_host(probe: [str], threshold: i64) -> str {
+    let psi_mem = _psi_to_int(probe[0])
+    let psi_cpu = _psi_to_int(probe[1])
+    if psi_mem >= threshold || psi_cpu >= threshold {
+        return "saturated"
+    }
+    if probe[0] == "ERR_INPUT" || probe[2] == "0" {
+        return "probe-error"
+    }
+    return "healthy"
+}
+
+fn _print_human(targets: [[str]], probes: [[str]], verdicts: [str], threshold: i64) -> void {
+    println("=== cluster load audit ===")
+    println("ts: " + _now_iso_utc())
+    println("threshold: psi >= " + to_string(threshold) + "% = saturated")
+    println("")
+    println("host      psi_mem  psi_cpu  avail_mb   total_mb   hexa_n   gpu(used/total MB,util%)   verdict")
+    println("--------  -------  -------  ---------  ---------  ------   --------------------------- ----------")
+    let mut i: i64 = 0
+    while i < len(targets) {
+        let lab = targets[i][0]
+        let p = probes[i]
+        let v = verdicts[i]
+        let pad_lab = lab + "        "
+        let lab_p = pad_lab.substring(0, 8)
+        let pad_pm = "        " + p[0]
+        let pm = pad_pm.substring(pad_pm.len() - 7, pad_pm.len())
+        let pad_pc = "        " + p[1]
+        let pc = pad_pc.substring(pad_pc.len() - 7, pad_pc.len())
+        let pad_av = "         " + p[2]
+        let av = pad_av.substring(pad_av.len() - 9, pad_av.len())
+        let pad_to = "         " + p[3]
+        let to = pad_to.substring(pad_to.len() - 9, pad_to.len())
+        let pad_hn = "      " + p[4]
+        let hn = pad_hn.substring(pad_hn.len() - 6, pad_hn.len())
+        let gpu = p[5] + "," + p[6]
+        let pad_gpu = gpu + "                          "
+        let gpu_p = pad_gpu.substring(0, 27)
+        println(lab_p + "  " + pm + "  " + pc + "  " + av + "  " + to + "  " + hn + "   " + gpu_p + " " + v)
+        i = i + 1
+    }
+}
+
+fn _print_json(targets: [[str]], probes: [[str]], verdicts: [str], threshold: i64) -> void {
+    let mut healthy: i64 = 0
+    let mut saturated: i64 = 0
+    let mut errors: i64 = 0
+    let mut k: i64 = 0
+    while k < len(verdicts) {
+        if verdicts[k] == "healthy" { healthy = healthy + 1 }
+        else if verdicts[k] == "saturated" { saturated = saturated + 1 }
+        else { errors = errors + 1 }
+        k = k + 1
+    }
+    let mut buf = "{\"ts\":\"" + _now_iso_utc() + "\",\"threshold_pct\":" + to_string(threshold) +
+                  ",\"healthy\":" + to_string(healthy) + ",\"saturated\":" + to_string(saturated) +
+                  ",\"errors\":" + to_string(errors) + ",\"hosts\":["
+    let mut i: i64 = 0
+    while i < len(targets) {
+        if i > 0 { buf = buf + "," }
+        let p = probes[i]
+        buf = buf + "{\"host\":\"" + targets[i][0] + "\",\"psi_mem\":\"" + p[0] + "\",\"psi_cpu\":\"" + p[1] +
+              "\",\"avail_mb\":" + p[2] + ",\"total_mb\":" + p[3] + ",\"hexa_n\":" + p[4] +
+              ",\"gpu_mem\":\"" + p[5] + "\",\"gpu_util\":\"" + p[6] + "\",\"verdict\":\"" + verdicts[i] + "\"}"
+        i = i + 1
+    }
+    buf = buf + "]}"
+    println(buf)
+}
+
+fn _emit_trailer(saturated_hosts: str) -> void {
+    eprintln("# cluster_load_audit: reason=cluster-saturated: hosts=" + saturated_hosts)
+    eprintln("# fix: 1) inspect external workload (ssh <host> top / nvidia-smi)")
+    eprintln("       2) wait 30-60s and re-audit (transient PSI spikes recover quickly)")
+    eprintln("       3) HEXA_LOCAL=1 bypass for time-critical kicks (raw 100 advisory edge)")
+    eprintln("       4) ref convergence/r4_blacklist_retire_simplification_2026_04_27 + raw 86 cost-attribution")
+}
+
+// ─── selftest ────────────────────────────────────────────────────────
+
+fn _selftest() -> i64 {
+    let mut fails: i64 = 0
+
+    // Fixture 1: _psi_to_int
+    if _psi_to_int("0.00") != 0 { eprintln("# selftest: psi-parse-zero-fail"); fails = fails + 1 }
+    if _psi_to_int("97.89") != 97 { eprintln("# selftest: psi-parse-decimal-fail"); fails = fails + 1 }
+    if _psi_to_int("NA") != -1 { eprintln("# selftest: psi-parse-NA-fail"); fails = fails + 1 }
+    if _psi_to_int("") != -1 { eprintln("# selftest: psi-parse-empty-fail"); fails = fails + 1 }
+
+    // Fixture 2: _verdict_host classifier
+    let p_healthy: [str] = ["10.0", "5.0", "20000", "32000", "1", "-", "-"]
+    if _verdict_host(p_healthy, 80) != "healthy" {
+        eprintln("# selftest: verdict-healthy-fail"); fails = fails + 1
+    }
+    let p_sat: [str] = ["95.5", "5.0", "1000", "32000", "1", "-", "-"]
+    if _verdict_host(p_sat, 80) != "saturated" {
+        eprintln("# selftest: verdict-saturated-fail"); fails = fails + 1
+    }
+    let p_err: [str] = ["ERR_INPUT", "", "", "", "", "", ""]
+    if _verdict_host(p_err, 80) != "probe-error" {
+        eprintln("# selftest: verdict-error-fail"); fails = fails + 1
+    }
+
+    // Fixture 3: input safety
+    if _is_safe_host("ubu; rm -rf /") {
+        eprintln("# selftest: host-injection-not-rejected"); fails = fails + 1
+    }
+    if !_is_safe_host("hetzner") {
+        eprintln("# selftest: legit-host-rejected"); fails = fails + 1
+    }
+
+    if fails == 0 {
+        eprintln("__CLUSTER_LOAD_AUDIT_SELFTEST__ PASS")
+        return 0
+    }
+    eprintln("__CLUSTER_LOAD_AUDIT_SELFTEST__ FAIL fails=" + to_string(fails))
+    return 1
+}
+
+// ─── main ────────────────────────────────────────────────────────────
+
+fn _has_flag_argv(args: [str], flag: str) -> bool {
+    let mut i: i64 = 0
+    while i < len(args) { if args[i] == flag { return true }; i = i + 1 }
+    return false
+}
+
+fn _arg_value(args: [str], flag: str, default_val: str) -> str {
+    let mut i: i64 = 0
+    while i < len(args) {
+        if args[i] == flag && i + 1 < len(args) { return args[i + 1] }
+        i = i + 1
+    }
+    return default_val
+}
+
+fn main() -> void {
+    let raw_args = args()
+    let mut user_start = 2
+    if raw_args.len() >= 3 && raw_args[1] == "run" { user_start = 3 }
+    let mut user_args: [str] = []
+    let mut i = user_start
+    while i < raw_args.len() {
+        user_args = user_args + [raw_args[i]]
+        i = i + 1
+    }
+
+    if _has_flag_argv(user_args, "--selftest") {
+        let rc = _selftest()
+        exit(rc)
+    }
+
+    let want_json = _has_flag_argv(user_args, "--json")
+    let threshold_s = _arg_value(user_args, "--psi-threshold", "80")
+    let threshold = _safe_to_int_line(threshold_s, 80, "cli-threshold")
+
+    let targets = _build_targets()
+    let mut probes: [[str]] = []
+    let mut verdicts: [str] = []
+    let mut saturated_list = ""
+    let mut healthy_n: i64 = 0
+    let mut saturated_n: i64 = 0
+    let mut k: i64 = 0
+    while k < len(targets) {
+        let p = _probe_host(targets[k][1])
+        let v = _verdict_host(p, threshold)
+        probes = probes + [p]
+        verdicts = verdicts + [v]
+        if v == "healthy" { healthy_n = healthy_n + 1 }
+        else if v == "saturated" {
+            saturated_n = saturated_n + 1
+            if saturated_list.len() > 0 { saturated_list = saturated_list + "," }
+            saturated_list = saturated_list + targets[k][0]
+        }
+        k = k + 1
+    }
+
+    if want_json {
+        _print_json(targets, probes, verdicts, threshold)
+    } else {
+        _print_human(targets, probes, verdicts, threshold)
+    }
+
+    let total = len(targets)
+    let verdict = if saturated_n == 0 { "PASS" } else { "FAIL" }
+    eprintln("__CLUSTER_LOAD_AUDIT__ " + verdict + " healthy=" + to_string(healthy_n) +
+             " saturated=" + to_string(saturated_n) + " total=" + to_string(total))
+    if saturated_n > 0 {
+        _emit_trailer(saturated_list)
+        exit(1)
+    }
+    exit(0)
+}
