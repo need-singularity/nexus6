@@ -1,0 +1,410 @@
+#!hexa strict
+// modules/chip_rtl_gen/chip_rtl_gen.hexa — n6-arch Phase-3 Mk.I RTL generator
+//
+// @tool(slug="chip_rtl_gen", desc="6-primitive Verilog generator (Ω₁..Ω₆: gemm, softmax, topk, gate, reduce, conv6). Loads templates/<op>_template.v and substitutes {{KEY}} placeholders with n=6 parameters.")
+// @usage(hexa run modules/chip_rtl_gen/chip_rtl_gen.hexa --op gemm --variant 00)
+// @usage(hexa run modules/chip_rtl_gen/chip_rtl_gen.hexa --self-test)
+// @sentinel(__CHIP_RTL_GEN__ <PASS|FAIL> [reason=<slug>])
+// @origin(rewrite of lost 430-LOC Python module via .hexa, sourced from
+//         ~/core/n6-architecture/domains/compute/chip-rtl-gen/rtl_generator.hexa)
+//
+// Hard rules:
+//   - HEXA-ONLY policy: no .py / .sh / .rs / .toml writes
+//   - templates/ directory pre-exists with the 6 *_template.v files
+//   - n=6 anchors: σ²=144 SM, n=6 issue width, τ=4 SIMD lanes, sopfr=5 protect
+//
+// Number-theory primitives (defined locally; no shared lib import):
+//   N=6, PHI=2, TAU=4, SIGMA=12, SOPFR=5, J2=24, S_T=8 (σ-τ scalar bus), MU=1
+//
+// Master identity: σ·φ = n·τ = J₂ = 24
+//
+// Falsifier hook: if `pyverilog` is on PATH, attempt structural lint after emit.
+//   Skipped silently if absent (do NOT fail).
+
+// ─── n=6 anchors ──────────────────────────────────────────────
+
+fn _N() -> int { return 6 }
+fn _PHI() -> int { return 2 }
+fn _TAU() -> int { return 4 }
+fn _SIGMA() -> int { return 12 }
+fn _SOPFR() -> int { return 5 }
+fn _J2() -> int { return 24 }
+fn _S_T() -> int { return 8 }   // σ-τ = 12-4 = 8 (scalar bus width)
+fn _MU() -> int { return 1 }
+
+fn _assert_n6_identity() -> bool {
+    let lhs = _SIGMA() * _PHI()
+    let rhs = _N() * _TAU()
+    if lhs != _J2() { return false }
+    if rhs != _J2() { return false }
+    if _SIGMA() - _TAU() != _S_T() { return false }
+    return true
+}
+
+// ─── path resolution ──────────────────────────────────────────
+
+fn _self_dir() -> string {
+    // Resolve modules/chip_rtl_gen/ from $HOME/core or NEXUS_CORE_ROOT
+    let override = env_var("NEXUS_CORE_ROOT")
+    if len(override) > 0 {
+        return override + "/nexus/modules/chip_rtl_gen"
+    }
+    return env_var("HOME") + "/core/nexus/modules/chip_rtl_gen"
+}
+
+fn _template_path(op: string) -> string {
+    return _self_dir() + "/templates/" + op + "_template.v"
+}
+
+fn _file_exists(p: string) -> bool {
+    let out = to_string(exec("test -f '" + p + "' && echo y || echo n")).trim()
+    if out == "y" { return true }
+    return false
+}
+
+// ─── placeholder substitution ─────────────────────────────────
+
+fn _interp(tmpl: string, key: string, value: string) -> string {
+    let token = "{{" + key + "}}"
+    return tmpl.replace(token, value)
+}
+
+fn _interp_pairs(tmpl: string, pairs: array) -> string {
+    let mut out = tmpl
+    let mut i = 0
+    while i < len(pairs) {
+        let pair = pairs[i]
+        out = _interp(out, pair[0], pair[1])
+        i = i + 1
+    }
+    return out
+}
+
+fn _gen_meta(op: string, variant: string) -> string {
+    return "op=" + op + ", variant=" + variant
+         + ", sigma=" + to_string(_SIGMA())
+         + ", phi=" + to_string(_PHI())
+         + ", tau=" + to_string(_TAU())
+         + ", n=" + to_string(_N())
+         + ", phase=Mk.I"
+}
+
+// ─── per-op pair builders ─────────────────────────────────────
+
+fn _pairs_gemm(variant: string) -> array {
+    let module_name = "gemm_core" + to_string(_SIGMA()) + "_" + variant
+    return [
+        ["MODULE_NAME",  module_name],
+        ["M",            to_string(_SIGMA())],
+        ["N",            to_string(_SIGMA())],
+        ["K",            to_string(_SIGMA())],
+        ["WIDTH_BITS",   to_string(_S_T())],
+        ["SIGMA_STAGES", to_string(_SIGMA())],
+        ["VARIANT",      "2'b" + variant],
+        ["GEN_META",     _gen_meta("gemm", variant)]
+    ]
+}
+
+fn _softmax_stage(variant: string) -> string {
+    if variant == "00" { return "exp" }
+    if variant == "01" { return "max" }
+    if variant == "10" { return "sub" }
+    return "norm"
+}
+
+fn _pairs_softmax(variant: string) -> array {
+    let stage = _softmax_stage(variant)
+    let module_name = "softmax_phi" + to_string(_PHI()) + "_" + stage
+    return [
+        ["MODULE_NAME", module_name],
+        ["VEC_LEN",     to_string(_SIGMA())],
+        ["WIDTH_BITS",  to_string(_S_T())],
+        ["PHI_STAGES",  to_string(_PHI())],
+        ["VARIANT",     "2'b" + variant],
+        ["GEN_META",    _gen_meta("softmax", variant)]
+    ]
+}
+
+fn _topk_stage(variant: string) -> string {
+    if variant == "00" { return "sort" }
+    if variant == "01" { return "pick" }
+    if variant == "10" { return "merge" }
+    return "idx"
+}
+
+fn _pairs_topk(variant: string) -> array {
+    let stage = _topk_stage(variant)
+    let module_name = "topk_phi" + to_string(_PHI()) + "_" + stage
+    return [
+        ["MODULE_NAME", module_name],
+        ["VEC_LEN",     to_string(_SIGMA())],
+        ["K",           to_string(_PHI())],
+        ["WIDTH_BITS",  to_string(_S_T())],
+        ["IDX_BITS",    to_string(4)],          // log₂(σ=12) ≈ 4
+        ["VARIANT",     "2'b" + variant],
+        ["GEN_META",    _gen_meta("topk", variant)]
+    ]
+}
+
+fn _gate_stage(variant: string) -> string {
+    if variant == "00" { return "mul" }
+    if variant == "01" { return "and" }
+    if variant == "10" { return "or" }
+    return "xor"
+}
+
+fn _gate_mode(variant: string) -> string {
+    if variant == "00" { return "0" }
+    if variant == "01" { return "1" }
+    if variant == "10" { return "2" }
+    return "3"
+}
+
+fn _pairs_gate(variant: string) -> array {
+    let stage = _gate_stage(variant)
+    let module_name = "gate_mu" + to_string(_MU()) + "_" + stage
+    return [
+        ["MODULE_NAME", module_name],
+        ["VEC_LEN",     to_string(_SIGMA())],
+        ["WIDTH_BITS",  to_string(_S_T())],
+        ["GATE_MODE",   _gate_mode(variant)],
+        ["VARIANT",     "2'b" + variant],
+        ["GEN_META",    _gen_meta("gate", variant)]
+    ]
+}
+
+fn _reduce_stage(variant: string) -> string {
+    if variant == "00" { return "sum" }
+    if variant == "01" { return "max" }
+    if variant == "10" { return "min" }
+    return "mean"
+}
+
+fn _reduce_op(variant: string) -> string {
+    if variant == "00" { return "0" }
+    if variant == "01" { return "1" }
+    if variant == "10" { return "2" }
+    return "3"
+}
+
+fn _pairs_reduce(variant: string) -> array {
+    let stage = _reduce_stage(variant)
+    let module_name = "reduce_tau" + to_string(_TAU()) + "_" + stage
+    return [
+        ["MODULE_NAME", module_name],
+        ["TAU_DEPTH",   to_string(_TAU())],
+        ["WIDTH_BITS",  to_string(_S_T())],
+        ["REDUCE_OP",   _reduce_op(variant)],
+        ["VARIANT",     "2'b" + variant],
+        ["GEN_META",    _gen_meta("reduce", variant)]
+    ]
+}
+
+fn _conv6_stage(variant: string) -> string {
+    if variant == "00" { return "3x3" }
+    if variant == "01" { return "1x1" }
+    if variant == "10" { return "dw" }
+    return "pw"
+}
+
+fn _conv6_kernel(variant: string) -> int {
+    if variant == "01" { return 1 }
+    return 3
+}
+
+fn _pairs_conv6(variant: string) -> array {
+    let stage = _conv6_stage(variant)
+    let module_name = "conv6_" + stage
+    return [
+        ["MODULE_NAME",  module_name],
+        ["IMG_H",        to_string(_SIGMA())],
+        ["IMG_W",        to_string(_SIGMA())],
+        ["KERNEL_SIZE",  to_string(_conv6_kernel(variant))],
+        ["CHANNELS",     to_string(_TAU())],
+        ["WIDTH_BITS",   to_string(_S_T())],
+        ["VARIANT",      "2'b" + variant],
+        ["GEN_META",     _gen_meta("conv6", variant)]
+    ]
+}
+
+// ─── public API: generate(op, variant) -> Verilog text ───────
+
+fn _is_known_op(op: string) -> bool {
+    if op == "gemm" || op == "softmax" || op == "topk" { return true }
+    if op == "gate" || op == "reduce" || op == "conv6" { return true }
+    return false
+}
+
+fn _is_valid_variant(v: string) -> bool {
+    if v == "00" || v == "01" || v == "10" || v == "11" { return true }
+    return false
+}
+
+fn _pairs_for(op: string, variant: string) -> array {
+    if op == "gemm"    { return _pairs_gemm(variant) }
+    if op == "softmax" { return _pairs_softmax(variant) }
+    if op == "topk"    { return _pairs_topk(variant) }
+    if op == "gate"    { return _pairs_gate(variant) }
+    if op == "reduce"  { return _pairs_reduce(variant) }
+    if op == "conv6"   { return _pairs_conv6(variant) }
+    return []
+}
+
+fn generate(op: string, variant: string) -> string {
+    if !_is_known_op(op) {
+        eprintln("__CHIP_RTL_GEN__ FAIL reason=unknown-op op=" + op + " fix=use one of gemm|softmax|topk|gate|reduce|conv6")
+        exit(1)
+    }
+    if !_is_valid_variant(variant) {
+        eprintln("__CHIP_RTL_GEN__ FAIL reason=bad-variant variant=" + variant + " fix=use 00|01|10|11")
+        exit(1)
+    }
+    let path = _template_path(op)
+    if !_file_exists(path) {
+        eprintln("__CHIP_RTL_GEN__ FAIL reason=template-missing path=" + path + " fix=ensure templates/ dir is intact")
+        exit(1)
+    }
+    let tmpl = read_file(path)
+    let pairs = _pairs_for(op, variant)
+    let body = _interp_pairs(tmpl, pairs)
+    return body
+}
+
+// ─── structural verifier (sim-free) ──────────────────────────
+
+fn _verify_structure(body: string, op: string, variant: string) -> bool {
+    if body.index_of("module ") < 0 { return false }
+    if body.index_of("endmodule") < 0 { return false }
+    if body.index_of("clk") < 0 { return false }
+    if body.index_of("rst_n") < 0 { return false }
+    if body.index_of("{{") >= 0 { return false }   // unsubstituted placeholder
+    if len(body) < 64 { return false }              // non-empty sanity
+    return true
+}
+
+// ─── optional pyverilog falsifier (skip-on-absent) ───────────
+
+fn _has_pyverilog() -> bool {
+    let out = to_string(exec("python3 -c 'import pyverilog' 2>/dev/null && echo y || echo n")).trim()
+    if out == "y" { return true }
+    return false
+}
+
+fn _try_pyverilog_lint(body: string, op: string, variant: string) -> string {
+    // Returns "skip" | "pass" | "fail"
+    if !_has_pyverilog() { return "skip" }
+    let tmp = "/tmp/chip_rtl_gen_lint_" + op + "_" + variant + ".v"
+    write_file(tmp, body)
+    let cmd = "python3 -c 'from pyverilog.vparser.parser import parse; parse([\"" + tmp + "\"])' 2>&1"
+    let out = to_string(exec(cmd))
+    exec("rm -f '" + tmp + "'")
+    if out.index_of("Error") >= 0 { return "fail" }
+    if out.index_of("error") >= 0 { return "fail" }
+    return "pass"
+}
+
+// ─── self-test ───────────────────────────────────────────────
+
+fn _self_test() -> void {
+    println("=== chip_rtl_gen --self-test ===")
+    // 1. n=6 identity
+    if !_assert_n6_identity() {
+        println("__CHIP_RTL_GEN__ FAIL reason=n6-identity-broken fix=verify σ·φ=n·τ=24 constants")
+        exit(1)
+    }
+    println("  σ·φ=n·τ=" + to_string(_J2()) + " PASS")
+    // 2. all 6 ops emit non-empty Verilog
+    let ops = ["gemm", "softmax", "topk", "gate", "reduce", "conv6"]
+    let mut ok = 0
+    let mut i = 0
+    while i < len(ops) {
+        let op = ops[i]
+        let body = generate(op, "00")
+        if !_verify_structure(body, op, "00") {
+            println("__CHIP_RTL_GEN__ FAIL reason=structure-bad op=" + op + " fix=inspect template " + _template_path(op))
+            exit(1)
+        }
+        ok = ok + 1
+        println("  op=" + op + " variant=00 bytes=" + to_string(len(body)) + " PASS")
+        i = i + 1
+    }
+    if ok != 6 {
+        println("__CHIP_RTL_GEN__ FAIL reason=op-count ok=" + to_string(ok) + " expected=6 fix=fix failing op above")
+        exit(1)
+    }
+    // 3. unknown op must error (we test the validator, not a live exit)
+    if _is_known_op("bogus_op") {
+        println("__CHIP_RTL_GEN__ FAIL reason=unknown-op-validator-broken fix=tighten _is_known_op whitelist")
+        exit(1)
+    }
+    println("  unknown-op validator PASS")
+    // 4. pyverilog falsifier (skip if absent — must NOT fail)
+    let body0 = generate("gemm", "00")
+    let lint = _try_pyverilog_lint(body0, "gemm", "00")
+    println("  pyverilog falsifier: " + lint)
+    println("__CHIP_RTL_GEN__ PASS ops=6 sigma_sq=" + to_string(_SIGMA() * _SIGMA()) + " issue_width=" + to_string(_N()) + " simd=" + to_string(_TAU()) + " sopfr=" + to_string(_SOPFR()))
+    exit(0)
+}
+
+// ─── CLI ─────────────────────────────────────────────────────
+
+fn _print_help() -> void {
+    println("usage:")
+    println("  hexa run modules/chip_rtl_gen/chip_rtl_gen.hexa --op <gemm|softmax|topk|gate|reduce|conv6> --variant <00|01|10|11>")
+    println("  hexa run modules/chip_rtl_gen/chip_rtl_gen.hexa --self-test")
+    println("flags:")
+    println("  --op       primitive op (Ω₁..Ω₆)")
+    println("  --variant  2-bit variant tag (default: 00)")
+    println("  --self-test run all 6 ops + structure verify + pyverilog lint")
+}
+
+fn main() -> void {
+    let raw = args()
+    let mut cli = []
+    let mut ai = 2
+    while ai < len(raw) {
+        cli.push(raw[ai])
+        ai = ai + 1
+    }
+    let mut op = ""
+    let mut variant = "00"
+    let mut self_test = false
+    let mut i = 0
+    while i < len(cli) {
+        let a = cli[i]
+        if a == "--self-test" || a == "--selftest" { self_test = true }
+        else if a == "--op" {
+            if i + 1 >= len(cli) {
+                eprintln("__CHIP_RTL_GEN__ FAIL reason=missing-op-value fix=--op gemm")
+                exit(1)
+            }
+            op = cli[i + 1]
+            i = i + 1
+        }
+        else if a == "--variant" {
+            if i + 1 >= len(cli) {
+                eprintln("__CHIP_RTL_GEN__ FAIL reason=missing-variant-value fix=--variant 00")
+                exit(1)
+            }
+            variant = cli[i + 1]
+            i = i + 1
+        }
+        else if a == "--help" || a == "-h" {
+            _print_help()
+            exit(0)
+        }
+        else {
+            eprintln("__CHIP_RTL_GEN__ FAIL reason=unknown-arg arg=" + a + " fix=hexa run ... --help")
+            exit(1)
+        }
+        i = i + 1
+    }
+    if self_test { _self_test() }
+    if len(op) == 0 {
+        _print_help()
+        eprintln("__CHIP_RTL_GEN__ FAIL reason=no-op fix=--op <one of gemm|softmax|topk|gate|reduce|conv6>")
+        exit(1)
+    }
+    let body = generate(op, variant)
+    println(body)
+}

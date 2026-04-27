@@ -1,0 +1,413 @@
+#!hexa strict
+// modules/multiverse_nav/multiverse_nav.hexa
+//
+// Bostrom branch-probability simulator over sigma^2 = 144 Everett branches.
+// Pure single-domain hexa rewrite of lost 484 LOC python module.
+//
+// Trilemma terms (Bostrom 2003): {P1: extinction, P2: post-human-no-sim,
+// P3: simulation}. We discretize over n/phi = 3 trilemma terms × 48 sub-modes
+// = 144 branches.
+//
+// n=6 anchors (locked):
+//   total branches = sigma^2 = 144
+//   trilemma terms = n/phi   = 3
+//
+// Falsifier: chi^2 goodness-of-fit fails uniform null at p<0.001 → flag bias.
+//
+// @sentinel(__MULTIVERSE_NAV__ PASS|FAIL)
+// @usage(hexa run modules/multiverse_nav/multiverse_nav.hexa --self-test)
+// @usage(hexa run modules/multiverse_nav/multiverse_nav.hexa --n_trials 2000 [--seed_source anu|urandom] [--branching_rule uniform|biased])
+
+// ─── number-theory primitives (local) ───
+
+fn sigma(n: int) -> int {
+    let mut s = 0
+    let mut k = 1
+    while k <= n {
+        if n % k == 0 { s = s + k }
+        k = k + 1
+    }
+    return s
+}
+
+fn euler_phi(n: int) -> int {
+    if n == 1 { return 1 }
+    let mut count = 0
+    let mut k = 1
+    while k < n {
+        if gcd(k, n) == 1 { count = count + 1 }
+        k = k + 1
+    }
+    return count
+}
+
+fn gcd(a: int, b: int) -> int {
+    let mut x = a
+    let mut y = b
+    if x < 0 { x = 0 - x }
+    if y < 0 { y = 0 - y }
+    while y != 0 {
+        let r = x % y
+        x = y
+        y = r
+    }
+    return x
+}
+
+// ─── path roots ───
+
+fn _core_root() -> string {
+    let override = env_var("NEXUS_CORE_ROOT")
+    if len(override) > 0 { return override }
+    let h = env_var("HOME")
+    return h + "/core"
+}
+
+fn _anu_source_path() -> string {
+    return _core_root() + "/nexus/sim_bridge/godel_q/anu_source.hexa"
+}
+
+// ─── ANU seed acquisition (with /dev/urandom fallback) ───
+//
+// Returns array [hex_string, source]:
+//   hex_string ∈ <128-char hex blob> | ""
+//   source     ∈ "anu" | "urandom" | "urandom-fallback" | ""
+
+fn _fetch_anu_seed() -> array {
+    let anu = _anu_source_path()
+    let test_anu = to_string(exec("test -f '" + anu + "' && echo y || echo n")).trim()
+    if test_anu == "y" {
+        let cmd = "env HEXA_RESOLVER_NO_REROUTE=1 hexa run '" + anu + "' 2>/dev/null"
+        let raw = to_string(exec(cmd)).trim()
+        // anu_source prints 128-char hex
+        if len(raw) >= 32 {
+            // sanity: take first 128 chars if available, else what's there
+            let mut hex = raw
+            if len(raw) > 128 { hex = raw.substring(0, 128) }
+            // verify hex
+            if _is_hex_string(hex) {
+                return [hex, "anu"]
+            }
+        }
+    }
+    // fallback: cat 16 bytes of /dev/urandom
+    let raw2 = to_string(exec("head -c 16 /dev/urandom 2>/dev/null | od -An -vtx1 | tr -d ' \\n'")).trim()
+    if len(raw2) >= 32 && _is_hex_string(raw2) {
+        return [raw2, "urandom-fallback"]
+    }
+    return ["", ""]
+}
+
+fn _is_hex_string(s: string) -> bool {
+    let n = len(s)
+    if n == 0 { return false }
+    let mut i = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        let ok = (c >= "0" && c <= "9") || (c >= "a" && c <= "f") || (c >= "A" && c <= "F")
+        if !ok { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// hex_to_int: parse single hex char to 0..15
+fn _hex_char_val(c: string) -> int {
+    if c >= "0" && c <= "9" { return to_int(c) }
+    if c == "a" || c == "A" { return 10 }
+    if c == "b" || c == "B" { return 11 }
+    if c == "c" || c == "C" { return 12 }
+    if c == "d" || c == "D" { return 13 }
+    if c == "e" || c == "E" { return 14 }
+    if c == "f" || c == "F" { return 15 }
+    return 0
+}
+
+// ─── deterministic PRNG seeded from hex blob ───
+// Uses an LCG (Numerical Recipes constants) seeded by folding hex bytes.
+// LCG: x_{n+1} = (a * x_n + c) mod m
+//   a = 1664525, c = 1013904223, m = 2^32
+
+fn _seed_from_hex(hex: string) -> int {
+    let mut s = 0
+    let mut i = 0
+    let n = len(hex)
+    while i < n {
+        let v = _hex_char_val(hex.substring(i, i + 1))
+        s = (s * 31 + v) % 2147483647
+        i = i + 1
+    }
+    if s < 0 { s = 0 - s }
+    if s == 0 { s = 1 }
+    return s
+}
+
+// LCG state passed as single-element array (mutable reference).
+fn _lcg_next(state: array) -> int {
+    let a = 1664525
+    let c = 1013904223
+    let m = 4294967296   // 2^32
+    let nx = (a * state[0] + c) % m
+    state[0] = nx
+    if nx < 0 { return 0 - nx }
+    return nx
+}
+
+// ─── chi^2 goodness-of-fit vs uniform-over-K ───
+//
+// chi2 = sum_i (O_i - E)^2 / E, with E = N/K.
+// Returns chi2 (float).
+
+fn _chi2_uniform(counts: array, total_trials: int, k_branches: int) -> float {
+    let expected = to_float(total_trials) / to_float(k_branches)
+    let mut s = 0.0
+    let mut i = 0
+    while i < len(counts) {
+        let diff = to_float(counts[i]) - expected
+        s = s + (diff * diff) / expected
+        i = i + 1
+    }
+    return s
+}
+
+// Critical chi^2 at p=0.001 for df=143 ≈ 196.7 (Wilson-Hilferty approx).
+// We hard-code 196.7 since df is fixed at K-1 = 143 for K=144.
+fn _chi2_crit_p001_df143() -> float {
+    return 196.7
+}
+
+// ─── simulate ───
+//
+// returns array:
+//   [branch_id_chosen, trilemma_term_code, chi2, status_code, anu_seed_hex, source]
+// trilemma_term_code: 0=P1, 1=P2, 2=P3
+// status_code: 0=PASS:uniform, 1=PASS:biased-input-detected, 2=FAIL:bad-args, 3=FAIL:no-rng
+
+fn simulate(n_trials: int, seed_source: string, branching_rule: string) -> array {
+    if n_trials < 1 { return [0, 0, 0.0, 2.0, "", ""] }
+    if seed_source != "anu" && seed_source != "urandom" {
+        return [0, 0, 0.0, 2.0, "", ""]
+    }
+    if branching_rule != "uniform" && branching_rule != "biased" {
+        return [0, 0, 0.0, 2.0, "", ""]
+    }
+
+    let n6_n = 6
+    let s = sigma(n6_n)        // 12
+    let p = euler_phi(n6_n)    // 2
+    let K = s * s              // 144 branches
+    let trilemma_K = n6_n / p  // 3 terms
+
+    // get seed — anu first if requested, fallback to urandom
+    let mut hex = ""
+    let mut source = ""
+    if seed_source == "anu" {
+        let anu_pair = _fetch_anu_seed()
+        hex = anu_pair[0]
+        source = anu_pair[1]
+    } else {
+        let raw = to_string(exec("head -c 16 /dev/urandom 2>/dev/null | od -An -vtx1 | tr -d ' \\n'")).trim()
+        if len(raw) >= 32 && _is_hex_string(raw) {
+            hex = raw
+            source = "urandom"
+        }
+    }
+
+    if len(hex) == 0 {
+        return [0, 0, 0.0, 3.0, "", ""]
+    }
+
+    let lcg_state = [_seed_from_hex(hex)]
+
+    // counts over K branches
+    let mut counts = []
+    let mut ci = 0
+    while ci < K {
+        counts.push(0)
+        ci = ci + 1
+    }
+
+    let mut last_branch = 0
+    let mut t = 0
+    while t < n_trials {
+        let r = _lcg_next(lcg_state)
+        let mut branch = 0
+        if branching_rule == "uniform" {
+            branch = r % K
+        } else {
+            // biased: skew toward branch 0 (heavy tail) — used to test falsifier
+            // 60% of trials forced into first 12 branches (sigma)
+            let m = r % 100
+            if m < 60 {
+                branch = r % s
+            } else {
+                branch = r % K
+            }
+        }
+        counts[branch] = counts[branch] + 1
+        last_branch = branch
+        t = t + 1
+    }
+
+    // chi^2 vs uniform
+    let chi2 = _chi2_uniform(counts, n_trials, K)
+    let crit = _chi2_crit_p001_df143()
+
+    let mut status = 0.0
+    if chi2 > crit { status = 1.0 }   // bias detected (this is the falsifier-flag, but result is "PASS:bias-flagged")
+
+    // trilemma term: branch_id mod trilemma_K
+    let trilemma_term = last_branch % trilemma_K
+
+    return [last_branch, trilemma_term, chi2, status, hex, source]
+}
+
+// ─── status / term decoders ───
+
+fn _term_label(code: int) -> string {
+    if code == 0 { return "P1" }
+    if code == 1 { return "P2" }
+    if code == 2 { return "P3" }
+    return "P?"
+}
+
+fn _status_label(code: float) -> string {
+    let c = to_int(code)
+    if c == 0 { return "PASS:uniform" }
+    if c == 1 { return "FAIL:bias-detected" }
+    if c == 2 { return "FAIL:bad-args" }
+    if c == 3 { return "FAIL:no-rng" }
+    return "UNKNOWN"
+}
+
+fn _emit_json(res: array, n_trials: int, seed_source: string, branching_rule: string) -> string {
+    let mut s = "{\n"
+    s = s + "  \"n_trials\": " + to_string(n_trials) + ",\n"
+    s = s + "  \"seed_source_requested\": \"" + seed_source + "\",\n"
+    s = s + "  \"seed_source_effective\": \"" + res[5] + "\",\n"
+    s = s + "  \"branching_rule\": \"" + branching_rule + "\",\n"
+    s = s + "  \"branch_id_chosen\": " + to_string(to_int(res[0])) + ",\n"
+    s = s + "  \"trilemma_term\": \"" + _term_label(to_int(res[1])) + "\",\n"
+    s = s + "  \"chi2_uniform\": " + to_string(res[2]) + ",\n"
+    s = s + "  \"anu_seed_hex\": \"" + res[4] + "\",\n"
+    s = s + "  \"falsifier_status\": \"" + _status_label(res[3]) + "\"\n"
+    s = s + "}\n"
+    return s
+}
+
+// ─── self-test ───
+//
+// validates: anu success path + fallback path + biased input detection.
+
+fn _run_self_test() -> void {
+    println("=== multiverse_nav --self-test ===")
+
+    // case 1: anu success path (or graceful urandom-fallback if anu offline)
+    let r1 = simulate(2000, "anu", "uniform")
+    println("  case1 (anu uniform N=2000)  : branch=" + to_string(to_int(r1[0])) + " term=" + _term_label(to_int(r1[1])) + " chi2=" + to_string(r1[2]) + " src=" + r1[5] + " status=" + _status_label(r1[3]))
+    let mut pass1 = true
+    if to_int(r1[3]) == 2 || to_int(r1[3]) == 3 { pass1 = false }
+    if r1[5] != "anu" && r1[5] != "urandom-fallback" { pass1 = false }
+    if to_int(r1[0]) < 0 || to_int(r1[0]) >= 144 { pass1 = false }
+
+    // case 2: explicit urandom path — must succeed
+    let r2 = simulate(2000, "urandom", "uniform")
+    println("  case2 (urandom uniform)     : branch=" + to_string(to_int(r2[0])) + " term=" + _term_label(to_int(r2[1])) + " chi2=" + to_string(r2[2]) + " src=" + r2[5] + " status=" + _status_label(r2[3]))
+    let mut pass2 = true
+    if r2[5] != "urandom" { pass2 = false }
+    if to_int(r2[3]) != 0 { pass2 = false }   // expect uniform PASS at N=2000
+
+    // case 3: biased input — should trip the falsifier (chi2 > 196.7)
+    let r3 = simulate(5000, "urandom", "biased")
+    println("  case3 (urandom biased N=5k) : chi2=" + to_string(r3[2]) + " status=" + _status_label(r3[3]))
+    let mut pass3 = true
+    if to_int(r3[3]) != 1 { pass3 = false }   // bias must be flagged
+
+    // case 4: bad args
+    let r4 = simulate(0, "urandom", "uniform")
+    let mut pass4 = true
+    if to_int(r4[3]) != 2 { pass4 = false }
+    println("  case4 (n_trials=0 → bad args): status=" + _status_label(r4[3]))
+
+    let mut overall = "PASS"
+    if !pass1 || !pass2 || !pass3 || !pass4 { overall = "FAIL" }
+
+    println("  case1=" + (if pass1 { "PASS" } else { "FAIL" }) + " case2=" + (if pass2 { "PASS" } else { "FAIL" }) + " case3=" + (if pass3 { "PASS" } else { "FAIL" }) + " case4=" + (if pass4 { "PASS" } else { "FAIL" }))
+    if overall == "PASS" {
+        println("__MULTIVERSE_NAV__ PASS")
+        exit(0)
+    }
+    println("__MULTIVERSE_NAV__ FAIL")
+    exit(1)
+}
+
+// ─── runner ───
+
+fn main() -> void {
+    let raw_args = args()
+    let mut cli = []
+    let mut ai = 2
+    while ai < len(raw_args) {
+        cli.push(raw_args[ai])
+        ai = ai + 1
+    }
+
+    let mut self_test = false
+    let mut json_mode = false
+    let mut n_trials = 2000
+    let mut seed_source = "urandom"
+    let mut branching_rule = "uniform"
+
+    let mut i = 0
+    while i < len(cli) {
+        let a = cli[i]
+        if a == "--self-test" || a == "--selftest" { self_test = true }
+        else if a == "--json" { json_mode = true }
+        else if a == "--n_trials" {
+            if i + 1 >= len(cli) { eprintln("--n_trials requires value"); exit(1) }
+            try { n_trials = to_int(cli[i + 1]) } catch e { n_trials = 2000 }
+            i = i + 1
+        }
+        else if a == "--seed_source" {
+            if i + 1 >= len(cli) { eprintln("--seed_source requires value"); exit(1) }
+            seed_source = cli[i + 1]
+            i = i + 1
+        }
+        else if a == "--branching_rule" {
+            if i + 1 >= len(cli) { eprintln("--branching_rule requires value"); exit(1) }
+            branching_rule = cli[i + 1]
+            i = i + 1
+        }
+        else if a == "--help" || a == "-h" {
+            println("usage: hexa run modules/multiverse_nav/multiverse_nav.hexa [opts]")
+            println("  --self-test                      run 4-case self-check")
+            println("  --json                           JSON output mode")
+            println("  --n_trials N         (def 2000)  trial count")
+            println("  --seed_source X      (def urandom) anu | urandom")
+            println("  --branching_rule R   (def uniform) uniform | biased")
+            exit(0)
+        }
+        else {
+            eprintln("multiverse_nav: unknown arg `" + a + "`")
+            exit(1)
+        }
+        i = i + 1
+    }
+
+    if self_test { _run_self_test() }
+
+    let res = simulate(n_trials, seed_source, branching_rule)
+    if json_mode {
+        println(_emit_json(res, n_trials, seed_source, branching_rule))
+    } else {
+        println("n_trials               = " + to_string(n_trials))
+        println("seed_source_requested  = " + seed_source)
+        println("seed_source_effective  = " + res[5])
+        println("branching_rule         = " + branching_rule)
+        println("branch_id_chosen       = " + to_string(to_int(res[0])))
+        println("trilemma_term          = " + _term_label(to_int(res[1])))
+        println("chi2_uniform           = " + to_string(res[2]))
+        println("falsifier_status       = " + _status_label(res[3]))
+    }
+    exit(0)
+}
