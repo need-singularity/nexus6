@@ -1,0 +1,647 @@
+// tool/noise_envelope_bench.hexa — α/β/γ noise envelope corpus statistics + chi-square + collision audit.
+//
+// @tool(slug="noise_envelope_bench", desc="scans state/kick/runs/<run>/noise_envelopes.jsonl corpus and emits verdict-bearing distribution + chi-square + collision metrics. Implementation of G5 SPEC frozen 2026-04-27 (witness 2026-04-27_g5-noise-envelope-bench-scaffold-entropy-distribution-real-m_omega_cycle.json fixpoint g5_bench_spec_v1_frozen_2026_04_27_T_13_25Z). raw 47 + raw 73 + raw 80 + raw 91 + raw 95.")
+// @usage(hexa run /Users/ghost/core/nexus/tool/noise_envelope_bench.hexa [--runs-root <DIR>] [--out <PATH>] [--threshold-alpha-pvalue 0.05] [--selftest])
+// @omega-saturation-exempt("monitoring tool — convergence applies to its callers")
+// @exit_codes(0=PASS|WARN-only, 1=FAIL, 2=usage/io error, 3=NO-DATA, 66=ai-native-trailer-error)
+//
+// raw 11 + raw 23 + raw 47 + raw 66 + raw 73 + raw 80 + raw 95.
+//
+// SOURCE OF TRUTH PARITY
+//   This tool is the bench-side consumer; it does NOT duplicate noise_envelope.hexa /
+//   kick_dispatch.hexa producer logic — it only reads their JSONL output. dual-SOT 0.
+//
+// CHI-SQUARE LOOKUP TABLE (frozen — no scipy dependency)
+//   df=15 (k=16 bridges), p=0.05  → critical = 25.00  (scipy.stats.chi2.ppf(0.95, 15) = 24.9958)
+//   df=7  (k=8),          p=0.05  → 14.07
+//   df=3  (k=4),          p=0.05  → 7.81
+//   df=31 (k=32),         p=0.05  → 44.99
+//
+// SENTINEL FORMAT (raw 80)
+//   stderr: __NOISE_ENVELOPE_BENCH__ <PASS|FAIL>
+//   selftest: __NOISE_ENVELOPE_BENCH_SELFTEST__ <PASS|FAIL>
+
+// ─── helpers ────────────────────────────────────────────────────────
+
+fn _now_iso_utc() -> str {
+    return exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+fn _shell_quote(s: str) -> str {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _file_exists(path: str) -> bool {
+    return exec("test -f '" + path + "' && echo y || echo n").trim() == "y"
+}
+
+fn _dir_exists(path: str) -> bool {
+    return exec("test -d '" + path + "' && echo y || echo n").trim() == "y"
+}
+
+fn _safe_to_int_line(raw: str, default: i64, label: str) -> i64 {
+    let trimmed = raw.trim()
+    if trimmed.len() == 0 { return default }
+    let nl = trimmed.index_of("\n")
+    let first = if nl >= 0 { trimmed.substring(0, nl).trim() } else { trimmed }
+    if first.len() == 0 { return default }
+    let mut v: i64 = default
+    try { v = to_int(first) } catch e {
+        let mut repr = raw.replace("\n", "\\n").replace("\r", "\\r")
+        if repr.len() > 80 { repr = repr.substring(0, 80) + "…" }
+        eprintln("# noise_envelope_bench: reason=to_int-probe-parse-fail-" + label + " fix=audit raw stdout repr=\"" + repr + "\" default=" + to_string(default))
+        v = default
+    }
+    return v
+}
+
+fn _json_escape(s: str) -> str {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", "\\n")
+    r = r.replace("\r", "\\r")
+    r = r.replace("\t", "\\t")
+    return r
+}
+
+// ─── chi-square critical lookup (df → critical at p=0.05) ──────────
+
+fn _chi_sq_critical_p05(df: i64) -> str {
+    // Pearson chi-square critical values at p=0.05 (table lookup; scipy.stats.chi2.ppf(0.95, df)).
+    if df == 1  { return "3.84" }
+    if df == 2  { return "5.99" }
+    if df == 3  { return "7.81" }
+    if df == 4  { return "9.49" }
+    if df == 5  { return "11.07" }
+    if df == 6  { return "12.59" }
+    if df == 7  { return "14.07" }
+    if df == 8  { return "15.51" }
+    if df == 9  { return "16.92" }
+    if df == 10 { return "18.31" }
+    if df == 11 { return "19.68" }
+    if df == 12 { return "21.03" }
+    if df == 13 { return "22.36" }
+    if df == 14 { return "23.68" }
+    if df == 15 { return "25.00" }
+    if df == 16 { return "26.30" }
+    if df == 17 { return "27.59" }
+    if df == 18 { return "28.87" }
+    if df == 19 { return "30.14" }
+    if df == 20 { return "31.41" }
+    if df == 31 { return "44.99" }
+    if df == 255 { return "293.25" }
+    return "UNAVAILABLE"
+}
+
+// ─── corpus scan (input/output via awk) ─────────────────────────────
+
+// _scan_total_lines — count all lines across all noise_envelopes.jsonl under runs_root.
+fn _scan_total_lines(runs_root: str) -> i64 {
+    let cmd = "find " + _shell_quote(runs_root) + " -name 'noise_envelopes.jsonl' -exec cat {} \\; 2>/dev/null | wc -l"
+    return _safe_to_int_line(exec(cmd), 0, "total-lines")
+}
+
+fn _scan_files_count(runs_root: str) -> i64 {
+    let cmd = "find " + _shell_quote(runs_root) + " -name 'noise_envelopes.jsonl' 2>/dev/null | wc -l"
+    return _safe_to_int_line(exec(cmd), 0, "files-count")
+}
+
+fn _scan_per_channel(runs_root: str, mech: str) -> i64 {
+    let cmd = "find " + _shell_quote(runs_root) + " -name 'noise_envelopes.jsonl' -exec cat {} \\; 2>/dev/null | grep -c '\"mechanism\":\"" + mech + "\"'"
+    return _safe_to_int_line(exec(cmd), 0, "per-channel-" + mech)
+}
+
+// _hist_source_id — emit "<count> <source_id>" lines for given mechanism, sorted desc.
+fn _hist_source_id(runs_root: str, mech: str) -> str {
+    let cmd = "find " + _shell_quote(runs_root) + " -name 'noise_envelopes.jsonl' -exec cat {} \\; 2>/dev/null | grep '\"mechanism\":\"" + mech + "\"' | grep -oE '\"source_id\":\"[^\"]+\"' | sort | uniq -c | sort -rn"
+    return exec(cmd).trim()
+}
+
+// _beta_unique_bytes — count unique qrng_byte values seen across corpus.
+fn _beta_unique_bytes(runs_root: str) -> i64 {
+    let cmd = "find " + _shell_quote(runs_root) + " -name 'noise_envelopes.jsonl' -exec cat {} \\; 2>/dev/null | grep '\"mechanism\":\"beta\"' | grep -oE 'qrng_byte=[0-9]+' | sort -u | wc -l"
+    return _safe_to_int_line(exec(cmd), 0, "beta-unique-bytes")
+}
+
+// _beta_source_count — count β envelopes whose source_id == given source.
+fn _beta_source_count(runs_root: str, source: str) -> i64 {
+    let cmd = "find " + _shell_quote(runs_root) + " -name 'noise_envelopes.jsonl' -exec cat {} \\; 2>/dev/null | grep '\"mechanism\":\"beta\"' | grep -c '\"source_id\":\"" + source + "\"'"
+    return _safe_to_int_line(exec(cmd), 0, "beta-source-" + source)
+}
+
+// _hash_total / _hash_unique — total emitted byte_hash count and distinct count.
+fn _hash_total(runs_root: str) -> i64 {
+    let cmd = "find " + _shell_quote(runs_root) + " -name 'noise_envelopes.jsonl' -exec cat {} \\; 2>/dev/null | grep -oE '\"byte_hash\":\"[a-f0-9]+\"' | wc -l"
+    return _safe_to_int_line(exec(cmd), 0, "hash-total")
+}
+
+fn _hash_unique(runs_root: str) -> i64 {
+    let cmd = "find " + _shell_quote(runs_root) + " -name 'noise_envelopes.jsonl' -exec cat {} \\; 2>/dev/null | grep -oE '\"byte_hash\":\"[a-f0-9]+\"' | sort -u | wc -l"
+    return _safe_to_int_line(exec(cmd), 0, "hash-unique")
+}
+
+// _collision_input_equiv_count — for each duplicated byte_hash, check whether the
+// corresponding (source_id + ts) pair is identical across the two carriers.
+// Returns the count of duplicates that are input_equivalent (i.e., not true hash collisions).
+fn _collision_input_equiv_count(runs_root: str) -> i64 {
+    // For each duplicate byte_hash, if the matching envelopes share both source_id and
+    // ts (second-level), we classify as input_equivalent. Implemented entirely in awk.
+    let cmd = "" +
+        "find " + _shell_quote(runs_root) + " -name 'noise_envelopes.jsonl' -exec cat {} \\; 2>/dev/null" +
+        " | awk -F'\"' '/byte_hash/{" +
+        "  bh=\"\"; sid=\"\"; ts=\"\";" +
+        "  for(i=1;i<=NF;i++){" +
+        "    if($i==\"byte_hash\")bh=$(i+2);" +
+        "    if($i==\"source_id\")sid=$(i+2);" +
+        "    if($i==\"ts\")ts=$(i+2);" +
+        "  }" +
+        "  if(bh!=\"\"){key=sid\"|\"ts; cnt[bh]++; pair[bh\"::\"key]=1; sigcount[bh]++}" +
+        "}" +
+        "END{" +
+        "  ie=0;" +
+        "  for(bh in cnt){" +
+        "    if(cnt[bh]>1){" +
+        "      sigs=0; for(k in pair){split(k,a,\"::\"); if(a[1]==bh)sigs++}" +
+        "      if(sigs==1){ie+=cnt[bh]-1}" +
+        "    }" +
+        "  }" +
+        "  print ie" +
+        "}'"
+    return _safe_to_int_line(exec(cmd), 0, "collision-input-equiv")
+}
+
+// ─── chi-square computation (gamma over 16 bridges) ────────────────
+
+// Returns observed chi-square statistic for the gamma source_id distribution
+// when binned to bridge:* only (ignoring 'bridge:none' / 'disabled' / etc).
+// Uses awk for arithmetic since hexa float math is sparse.
+fn _gamma_chi_sq(runs_root: str) -> str {
+    let cmd = "" +
+        "find " + _shell_quote(runs_root) + " -name 'noise_envelopes.jsonl' -exec cat {} \\; 2>/dev/null" +
+        " | grep '\"mechanism\":\"gamma\"'" +
+        " | grep -oE '\"source_id\":\"bridge:[a-z_0-9]+\"'" +
+        " | sort | uniq -c | sort -rn" +
+        " | awk 'BEGIN{n=0; total=0}" +
+        "        {cnt[NR]=$1; total+=$1; n++}" +
+        "        END{" +
+        "          if(n<=1){print \"0.000 0 0\"; exit}" +
+        "          mu=total/n;" +
+        "          chi=0;" +
+        "          for(i=1;i<=n;i++){chi += ((cnt[i]-mu)*(cnt[i]-mu))/mu}" +
+        "          printf \"%.3f %d %d\\n\", chi, n-1, total" +
+        "        }'"
+    return exec(cmd).trim()
+}
+
+// β coverage expected formula: 100 * (1 - (255/256)^n)
+// Implemented via awk (POSIX-portable; bc is also available but awk is simpler).
+fn _beta_expected_coverage_pct(n: i64) -> str {
+    let cmd = "awk 'BEGIN{n=" + to_string(n) + "; if(n<=0){print \"0.000\"; exit}; r=1; q=255/256; for(i=0;i<n;i++)r=r*q; printf \"%.3f\\n\", 100*(1-r)}'"
+    return exec(cmd).trim()
+}
+
+// ─── histogram parsing helpers ──────────────────────────────────────
+
+// Parse the 'sort | uniq -c | sort -rn' output into top-K {source_id, count} JSON array.
+fn _hist_top_k_json(hist_raw: str, k: i64) -> str {
+    if hist_raw.len() == 0 { return "[]" }
+    let lines = hist_raw.split("\n")
+    let mut out = "["
+    let mut emitted: i64 = 0
+    let mut total: i64 = 0
+    let mut i: i64 = 0
+    while i < len(lines) {
+        let line = lines[i].trim()
+        if line.len() > 0 {
+            // line shape: "  COUNT \"source_id\":\"VALUE\""
+            let sp = line.index_of(" ")
+            if sp > 0 {
+                let ck = _safe_to_int_line(line.substring(0, sp), 0, "hist-count")
+                total = total + ck
+            }
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < len(lines) && emitted < k {
+        let line = lines[i].trim()
+        if line.len() > 0 {
+            let sp = line.index_of(" ")
+            if sp > 0 {
+                let cnt_s = line.substring(0, sp).trim()
+                let cnt = _safe_to_int_line(cnt_s, 0, "hist-top-cnt")
+                let rest = line.substring(sp, line.len()).trim()
+                // rest = "\"source_id\":\"VALUE\""
+                let key = "\"source_id\":\""
+                let ki = rest.index_of(key)
+                let mut sid = ""
+                if ki >= 0 {
+                    let after = rest.substring(ki + key.len(), rest.len())
+                    let qe = after.index_of("\"")
+                    if qe >= 0 { sid = after.substring(0, qe) }
+                }
+                if sid.len() > 0 {
+                    if emitted > 0 { out = out + "," }
+                    let pct = if total > 0 { 100.0 * (cnt as f64) / (total as f64) } else { 0.0 }
+                    out = out + "{\"source_id\":\"" + _json_escape(sid) + "\",\"count\":" + to_string(cnt) + ",\"pct\":" + _format_pct(cnt, total) + "}"
+                    emitted = emitted + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    out = out + "]"
+    return out
+}
+
+// Avoid f64 reliance — format pct via awk subprocess (rare cost; total runs once).
+fn _format_pct(cnt: i64, total: i64) -> str {
+    if total <= 0 { return "0.00" }
+    return exec("awk 'BEGIN{printf \"%.2f\", 100*" + to_string(cnt) + "/" + to_string(total) + "}'").trim()
+}
+
+fn _hist_unique_count(hist_raw: str) -> i64 {
+    if hist_raw.len() == 0 { return 0 }
+    let lines = hist_raw.split("\n")
+    let mut n: i64 = 0
+    let mut i: i64 = 0
+    while i < len(lines) {
+        if lines[i].trim().len() > 0 { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+fn _hist_top3_pct(hist_raw: str) -> str {
+    if hist_raw.len() == 0 { return "0.00" }
+    let lines = hist_raw.split("\n")
+    let mut total: i64 = 0
+    let mut top3: i64 = 0
+    let mut i: i64 = 0
+    while i < len(lines) {
+        let line = lines[i].trim()
+        if line.len() > 0 {
+            let sp = line.index_of(" ")
+            if sp > 0 {
+                let ck = _safe_to_int_line(line.substring(0, sp), 0, "top3-cnt")
+                total = total + ck
+                if i < 3 { top3 = top3 + ck }
+            }
+        }
+        i = i + 1
+    }
+    return _format_pct(top3, total)
+}
+
+// ─── verdict assembly ───────────────────────────────────────────────
+
+// Builds full output JSON line (long but flat — preserves G5 SPEC output_shape v1).
+fn _build_output_json(
+    runs_root: str,
+    files_scanned: i64,
+    total: i64,
+    a_n: i64, b_n: i64, g_n: i64,
+    a_hist: str, g_hist: str,
+    b_unique: i64,
+    b_src_urandom: i64, b_src_anu: i64, b_src_fallback: i64,
+    h_total: i64, h_unique: i64, ie_count: i64,
+    g_chi_str: str,
+    verdict: str, verdict_reasons: str
+) -> str {
+    let ts = _now_iso_utc()
+    let collision_count = h_total - h_unique
+    let true_collision = collision_count - ie_count
+    let a_unique = _hist_unique_count(a_hist)
+    let g_unique = _hist_unique_count(g_hist)
+    let a_top3 = _hist_top3_pct(a_hist)
+    let a_dist = _hist_top_k_json(a_hist, 5)
+    let g_dist = _hist_top_k_json(g_hist, 16)
+
+    // β coverage
+    let b_unique_pct = _format_pct(b_unique, 256)
+    let b_expected_pct = _beta_expected_coverage_pct(b_n)
+    let b_in_band = _beta_in_band(b_unique_pct, b_expected_pct)
+
+    // gamma chi parts
+    let mut g_chi = "0.000"
+    let mut g_df: i64 = 0
+    let mut g_total: i64 = 0
+    let parts = g_chi_str.split(" ")
+    if len(parts) >= 3 {
+        g_chi = parts[0]
+        g_df = _safe_to_int_line(parts[1], 0, "g-df")
+        g_total = _safe_to_int_line(parts[2], 0, "g-total")
+    }
+    let g_critical = _chi_sq_critical_p05(g_df)
+    let g_uniform_rejected = _gt_str(g_chi, g_critical)
+
+    let mut buf = "{"
+    buf = buf + "\"schema\":\"noise_envelope_bench.v1\""
+    buf = buf + ",\"ts_utc\":\"" + ts + "\""
+    buf = buf + ",\"runs_root\":\"" + _json_escape(runs_root) + "\""
+    buf = buf + ",\"input_files_scanned\":" + to_string(files_scanned)
+    buf = buf + ",\"warn_skipped\":0"
+    buf = buf + ",\"total_envelopes\":" + to_string(total)
+    buf = buf + ",\"per_channel_count\":{\"alpha\":" + to_string(a_n) + ",\"beta\":" + to_string(b_n) + ",\"gamma\":" + to_string(g_n) + "}"
+    buf = buf + ",\"alpha_dist\":" + a_dist
+    buf = buf + ",\"alpha_unique_count\":" + to_string(a_unique)
+    buf = buf + ",\"alpha_top3_pct\":" + a_top3
+    buf = buf + ",\"alpha_chi_sq_value\":\"INFORMATIONAL_ONLY\""
+    buf = buf + ",\"alpha_chi_sq_caveat\":\"registry composition changed during sample window — chi^2 test assumption violated; per G5 SPEC V5_alpha_quant_only_no_verdict\""
+    buf = buf + ",\"beta_unique_byte_count\":" + to_string(b_unique)
+    buf = buf + ",\"beta_coverage_pct\":" + b_unique_pct
+    buf = buf + ",\"beta_coverage_expected_pct_for_n\":" + b_expected_pct
+    buf = buf + ",\"beta_coverage_in_tolerance\":" + b_in_band
+    buf = buf + ",\"beta_coverage_tolerance_band\":\"+/-5pp\""
+    buf = buf + ",\"beta_chi_sq_status\":\"" + _beta_chi_status(b_n) + "\""
+    buf = buf + ",\"beta_source_breakdown\":{\"urandom\":" + to_string(b_src_urandom) + ",\"anu\":" + to_string(b_src_anu) + ",\"urandom_fallback\":" + to_string(b_src_fallback) + "}"
+    buf = buf + ",\"gamma_dist\":" + g_dist
+    buf = buf + ",\"gamma_unique_count\":" + to_string(g_unique)
+    buf = buf + ",\"gamma_chi_sq_value\":" + g_chi
+    buf = buf + ",\"gamma_df\":" + to_string(g_df)
+    buf = buf + ",\"gamma_chi_sq_critical_p05\":" + g_critical
+    buf = buf + ",\"gamma_chi_sq_total\":" + to_string(g_total)
+    buf = buf + ",\"gamma_uniform_rejected\":" + g_uniform_rejected
+    buf = buf + ",\"byte_hash_total\":" + to_string(h_total)
+    buf = buf + ",\"byte_hash_unique\":" + to_string(h_unique)
+    buf = buf + ",\"collision_count\":" + to_string(collision_count)
+    buf = buf + ",\"collision_kind_breakdown\":{\"input_equivalent\":" + to_string(ie_count) + ",\"true_hash_collision\":" + to_string(true_collision) + "}"
+    buf = buf + ",\"verdict\":\"" + verdict + "\""
+    buf = buf + ",\"verdict_reasons\":[" + verdict_reasons + "]"
+    buf = buf + "}"
+    return buf
+}
+
+// _gt_str — returns "true"/"false" for float-string a > b via awk.
+fn _gt_str(a: str, b: str) -> str {
+    if b == "UNAVAILABLE" { return "false" }
+    return exec("awk 'BEGIN{print ((" + a + ")>=(" + b + "))?\"true\":\"false\"}'").trim()
+}
+
+fn _beta_in_band(observed_pct: str, expected_pct: str) -> str {
+    return exec("awk 'BEGIN{d=(" + observed_pct + ")-(" + expected_pct + "); if(d<0)d=-d; print (d<=5)?\"true\":\"false\"}'").trim()
+}
+
+fn _beta_chi_status(b_n: i64) -> str {
+    if b_n < 1280 { return "UNMEASURED — n=" + to_string(b_n) + " < 5*256=1280 required for valid chi-square per bin" }
+    return "MEASURABLE"
+}
+
+// ─── verdict computation ────────────────────────────────────────────
+
+// _compute_verdict — applies V1-V5 rules, returns "verdict|reasons_csv".
+//   V1 gamma_chi >= critical → FAIL
+//   V2 beta coverage out of band → WARN
+//   V3 true_hash_collision >= 1 → FAIL
+//   V4 total < 50 → NO-DATA exit=3
+//   V5 alpha → no verdict (informational only)
+fn _compute_verdict(total: i64, b_n: i64, g_chi_str: str, h_total: i64, h_unique: i64, ie_count: i64, b_unique: i64) -> str {
+    let mut reasons = ""
+    let mut fail = false
+    let mut warn = false
+    let mut no_data = false
+
+    if total < 50 {
+        no_data = true
+        reasons = reasons + "\"under_sampled\""
+    }
+
+    // V1 gamma chi
+    let parts = g_chi_str.split(" ")
+    if len(parts) >= 3 {
+        let g_chi = parts[0]
+        let g_df = _safe_to_int_line(parts[1], 0, "vd-g-df")
+        let g_critical = _chi_sq_critical_p05(g_df)
+        if g_critical != "UNAVAILABLE" {
+            let exceeded = _gt_str(g_chi, g_critical)
+            if exceeded == "true" {
+                fail = true
+                if reasons.len() > 0 { reasons = reasons + "," }
+                reasons = reasons + "\"gamma_non_uniform\""
+            }
+        }
+    }
+
+    // V2 beta coverage band
+    let b_obs_pct = _format_pct(b_unique, 256)
+    let b_exp_pct = _beta_expected_coverage_pct(b_n)
+    let in_band = _beta_in_band(b_obs_pct, b_exp_pct)
+    if in_band == "false" && b_n > 0 {
+        warn = true
+        if reasons.len() > 0 { reasons = reasons + "," }
+        reasons = reasons + "\"beta_coverage_out_of_band\""
+    }
+
+    // V3 true hash collision
+    let collisions = h_total - h_unique
+    let true_coll = collisions - ie_count
+    if true_coll >= 1 {
+        fail = true
+        if reasons.len() > 0 { reasons = reasons + "," }
+        reasons = reasons + "\"true_hash_collision\""
+    }
+
+    if no_data { return "NO-DATA|" + reasons }
+    if fail    { return "FAIL|" + reasons }
+    if warn    { return "WARN|" + reasons }
+    return "PASS|" + reasons
+}
+
+// ─── selftest fixtures ──────────────────────────────────────────────
+
+fn _selftest() -> i64 {
+    let mut fails: i64 = 0
+    let tmp = "/tmp/noise_envelope_bench_selftest_" + to_string(exec("date +%s%N").trim())
+    let _ = exec("rm -rf " + _shell_quote(tmp) + " && mkdir -p " + _shell_quote(tmp + "/run1") + " && mkdir -p " + _shell_quote(tmp + "/run2"))
+
+    // Fixture 1 — uniform γ across 16 bridges (160 entries, 10 each).
+    let mut buf1 = ""
+    let bridges = ["bridge_a","bridge_b","bridge_c","bridge_d","bridge_e","bridge_f","bridge_g","bridge_h","bridge_i","bridge_j","bridge_k","bridge_l","bridge_m","bridge_n","bridge_o","bridge_p"]
+    let mut bi: i64 = 0
+    while bi < len(bridges) {
+        let mut k: i64 = 0
+        while k < 10 {
+            let bh_seed = "test:" + bridges[bi] + ":" + to_string(k) + ":" + to_string(bi)
+            let bh = exec("printf %s " + _shell_quote(bh_seed) + " | (sha256sum 2>/dev/null || shasum -a 256) | awk '{print substr($1,1,16)}'").trim()
+            buf1 = buf1 + "{\"mechanism\":\"gamma\",\"source_id\":\"bridge:" + bridges[bi] + "\",\"byte_hash\":\"" + bh + "\",\"ts\":\"2026-04-27T00:00:" + _zero_pad(k) + "Z\",\"payload_summary\":\"selftest\"}\n"
+            k = k + 1
+        }
+        bi = bi + 1
+    }
+    let _ = exec("printf %s " + _shell_quote(buf1) + " > " + _shell_quote(tmp + "/run1/noise_envelopes.jsonl"))
+
+    let v1 = _scan_total_lines(tmp)
+    if v1 != 160 {
+        eprintln("# noise_envelope_bench selftest: reason=fixture1-total-mismatch fix=audit cat path expected=160 got=" + to_string(v1))
+        fails = fails + 1
+    }
+    let g_chi = _gamma_chi_sq(tmp)
+    let parts = g_chi.split(" ")
+    if len(parts) >= 1 {
+        // chi^2 should be very close to 0 for perfectly uniform fixture
+        let exceeded = _gt_str(parts[0], "5.0")
+        if exceeded == "true" {
+            eprintln("# noise_envelope_bench selftest: reason=fixture1-uniform-chi-too-high fix=audit gamma chi-square calc; chi=" + parts[0])
+            fails = fails + 1
+        }
+    } else {
+        eprintln("# noise_envelope_bench selftest: reason=fixture1-chi-output-malformed fix=audit awk pipeline raw=\"" + g_chi + "\"")
+        fails = fails + 1
+    }
+
+    // Fixture 2 — distorted γ (1 bridge dominates). Replace fixture file.
+    let mut buf2 = ""
+    let mut k2: i64 = 0
+    while k2 < 90 {
+        let bh = exec("printf 'distorted:dom:" + to_string(k2) + "' | (sha256sum 2>/dev/null || shasum -a 256) | awk '{print substr($1,1,16)}'").trim()
+        buf2 = buf2 + "{\"mechanism\":\"gamma\",\"source_id\":\"bridge:dom_bridge\",\"byte_hash\":\"" + bh + "\",\"ts\":\"2026-04-27T01:00:00Z\",\"payload_summary\":\"d\"}\n"
+        k2 = k2 + 1
+    }
+    // 10 other bridges with 1 each
+    let mut oi: i64 = 0
+    while oi < 10 {
+        let bh = exec("printf 'distorted:other:" + to_string(oi) + "' | (sha256sum 2>/dev/null || shasum -a 256) | awk '{print substr($1,1,16)}'").trim()
+        buf2 = buf2 + "{\"mechanism\":\"gamma\",\"source_id\":\"bridge:other_" + to_string(oi) + "\",\"byte_hash\":\"" + bh + "\",\"ts\":\"2026-04-27T01:00:01Z\",\"payload_summary\":\"o\"}\n"
+        oi = oi + 1
+    }
+    let _ = exec("printf %s " + _shell_quote(buf2) + " > " + _shell_quote(tmp + "/run1/noise_envelopes.jsonl"))
+    let g_chi2 = _gamma_chi_sq(tmp)
+    let parts2 = g_chi2.split(" ")
+    if len(parts2) >= 2 {
+        let df_str = parts2[1]
+        let g_critical = _chi_sq_critical_p05(_safe_to_int_line(df_str, 0, "selftest-df"))
+        if g_critical == "UNAVAILABLE" {
+            eprintln("# noise_envelope_bench selftest: reason=fixture2-df-not-in-lookup fix=add df row to _chi_sq_critical_p05; df=" + df_str)
+            fails = fails + 1
+        } else {
+            let exceeded = _gt_str(parts2[0], g_critical)
+            if exceeded != "true" {
+                eprintln("# noise_envelope_bench selftest: reason=fixture2-distorted-chi-not-flagged fix=audit gamma chi-square calc; chi=" + parts2[0] + " critical=" + g_critical)
+                fails = fails + 1
+            }
+        }
+    }
+
+    // Fixture 3 — zero data
+    let _ = exec("rm -rf " + _shell_quote(tmp))
+    let _ = exec("mkdir -p " + _shell_quote(tmp + "/empty_run"))
+    let v3 = _scan_total_lines(tmp)
+    if v3 != 0 {
+        eprintln("# noise_envelope_bench selftest: reason=fixture3-zero-data-mismatch fix=audit empty-dir handling; got=" + to_string(v3))
+        fails = fails + 1
+    }
+
+    let _ = exec("rm -rf " + _shell_quote(tmp))
+
+    if fails == 0 {
+        eprintln("__NOISE_ENVELOPE_BENCH_SELFTEST__ PASS")
+        return 0
+    }
+    eprintln("__NOISE_ENVELOPE_BENCH_SELFTEST__ FAIL fails=" + to_string(fails))
+    return 1
+}
+
+fn _zero_pad(n: i64) -> str {
+    if n < 10 { return "0" + to_string(n) }
+    return to_string(n)
+}
+
+// ─── CLI ────────────────────────────────────────────────────────────
+
+fn _arg_value(args: [str], flag: str, default_val: str) -> str {
+    let mut i: i64 = 0
+    while i < len(args) {
+        if args[i] == flag && i + 1 < len(args) { return args[i + 1] }
+        i = i + 1
+    }
+    return default_val
+}
+
+fn _has_flag(args: [str], flag: str) -> bool {
+    let mut i: i64 = 0
+    while i < len(args) {
+        if args[i] == flag { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn main() -> void {
+    let raw_args = args()
+    let mut user_start = 2
+    if raw_args.len() >= 3 && raw_args[1] == "run" { user_start = 3 }
+    let mut user_args: [str] = []
+    let mut ai = user_start
+    while ai < raw_args.len() {
+        user_args = user_args + [raw_args[ai]]
+        ai = ai + 1
+    }
+
+    if _has_flag(user_args, "--selftest") {
+        let rc = _selftest()
+        exit(rc)
+    }
+
+    let runs_root = _arg_value(user_args, "--runs-root", "/Users/ghost/core/nexus/state/kick/runs")
+    let out_path = _arg_value(user_args, "--out", "/Users/ghost/core/nexus/state/kick/bench/noise_envelope_bench.jsonl")
+
+    if !_dir_exists(runs_root) {
+        eprintln("# noise_envelope_bench: reason=runs-root-missing fix=pass --runs-root <dir> path=" + runs_root)
+        eprintln("__NOISE_ENVELOPE_BENCH__ FAIL")
+        exit(2)
+    }
+
+    let files_scanned = _scan_files_count(runs_root)
+    let total = _scan_total_lines(runs_root)
+    let a_n = _scan_per_channel(runs_root, "alpha")
+    let b_n = _scan_per_channel(runs_root, "beta")
+    let g_n = _scan_per_channel(runs_root, "gamma")
+    let a_hist = _hist_source_id(runs_root, "alpha")
+    let g_hist = _hist_source_id(runs_root, "gamma")
+    let b_unique = _beta_unique_bytes(runs_root)
+    let b_src_urandom = _beta_source_count(runs_root, "urandom")
+    let b_src_anu = _beta_source_count(runs_root, "anu")
+    let b_src_fallback = _beta_source_count(runs_root, "urandom_fallback")
+    let h_total = _hash_total(runs_root)
+    let h_unique = _hash_unique(runs_root)
+    let ie_count = _collision_input_equiv_count(runs_root)
+    let g_chi = _gamma_chi_sq(runs_root)
+
+    let v_full = _compute_verdict(total, b_n, g_chi, h_total, h_unique, ie_count, b_unique)
+    let bar_i = v_full.index_of("|")
+    let verdict = if bar_i >= 0 { v_full.substring(0, bar_i) } else { v_full }
+    let reasons = if bar_i >= 0 { v_full.substring(bar_i + 1, v_full.len()) } else { "" }
+
+    let json_line = _build_output_json(
+        runs_root, files_scanned, total,
+        a_n, b_n, g_n,
+        a_hist, g_hist,
+        b_unique, b_src_urandom, b_src_anu, b_src_fallback,
+        h_total, h_unique, ie_count,
+        g_chi, verdict, reasons
+    )
+
+    println(json_line)
+
+    // append to out file (best-effort — create parent dir if missing)
+    let _ = exec("mkdir -p \"$(dirname " + _shell_quote(out_path) + ")\" 2>/dev/null")
+    let _ = exec("printf '%s\\n' " + _shell_quote(json_line) + " >> " + _shell_quote(out_path))
+
+    // exit code mapping
+    if verdict == "PASS" {
+        eprintln("__NOISE_ENVELOPE_BENCH__ PASS")
+        exit(0)
+    }
+    if verdict == "WARN" {
+        // WARN-only is exit=0 per G5 SPEC (sentinel still PASS for downstream gates)
+        eprintln("__NOISE_ENVELOPE_BENCH__ PASS")
+        exit(0)
+    }
+    if verdict == "NO-DATA" {
+        eprintln("__NOISE_ENVELOPE_BENCH__ FAIL")
+        exit(3)
+    }
+    eprintln("__NOISE_ENVELOPE_BENCH__ FAIL")
+    exit(1)
+}

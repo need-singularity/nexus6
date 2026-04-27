@@ -146,10 +146,58 @@ fn noise_alpha(absorbed_dir: str) -> str {
 }
 
 // ─── β — QRNG-seeded byte (real ANU OR documented urandom-fallback) ──
-// Records source ∈ {anu, urandom, urandom_fallback} per obs_2 reframe + F16:
+// Records source ∈ {anu, anu_queued, urandom, urandom_fallback} per obs_2 reframe + F16 + T1 length=1024:
 //   - default (KICK_BETA_REAL_ANU unset)             → source = "urandom"
-//   - KICK_BETA_REAL_ANU=1 + ANU reachable           → source = "anu"
-//   - KICK_BETA_REAL_ANU=1 + ANU fail (429/network)  → source = "urandom_fallback"
+//   - KICK_BETA_REAL_ANU=1 + queue has byte          → source = "anu_queued" (T1 effective 1024× throughput)
+//   - KICK_BETA_REAL_ANU=1 + queue empty + ANU OK    → source = "anu" (1024 byte fetched, first used, 1023 queued)
+//   - KICK_BETA_REAL_ANU=1 + queue empty + ANU fail  → source = "urandom_fallback"
+//
+// T1 queue cache (own 2 first absorption, ext 9 ramp-phase Tier-1):
+//   Path: state/kick/cache/anu_byte_queue.txt — one byte (0-255 decimal) per line.
+//   Pop = head -1 + tail +2; Refill = ANU length=1024 batch, store all 1024 bytes.
+//   Effective β throughput: 8 → 8192 bit/sec (1024× per ext 9 throughput-bit-per-sec).
+
+fn _anu_queue_path() -> str {
+    return "/Users/ghost/core/nexus/state/kick/cache/anu_byte_queue.txt"
+}
+
+fn _anu_queue_pop() -> str {
+    let p = _anu_queue_path()
+    let exists = exec("test -f '" + p + "' && echo yes || echo no").trim()
+    if exists != "yes" { return "" }
+    let head = exec("head -1 '" + p + "' 2>/dev/null").trim()
+    if head.len() == 0 { return "" }
+    // pop: rewrite file with tail +2
+    exec("tail -n +2 '" + p + "' > '" + p + ".tmp' && mv '" + p + ".tmp' '" + p + "'")
+    return head
+}
+
+fn _anu_queue_refill_from_batch(parsed_bytes: str) -> i64 {
+    // parsed_bytes = whitespace-separated decimals. Append all to queue, return count.
+    let p = _anu_queue_path()
+    exec("mkdir -p '" + "/Users/ghost/core/nexus/state/kick/cache" + "'")
+    let n = exec("printf '%s\\n' " + parsed_bytes + " | wc -l").trim()
+    exec("printf '%s\\n' " + parsed_bytes + " >> '" + p + "'")
+    return _safe_to_int_line(n, 0, "anu-queue-refill-count")
+}
+
+fn _anu_fetch_batch_1024() -> str {
+    // T1: length=1024 batch. Returns space-separated decimals on success, empty on failure.
+    let curl_cmd = "curl -s --max-time 8 'https://qrng.anu.edu.au/API/jsonI.php?length=1024&type=uint8' 2>/dev/null"
+    let raw = exec(curl_cmd).trim()
+    if raw.len() == 0 || !raw.contains("\"success\":true") { return "" }
+    let key = "\"data\":["
+    let i = raw.index_of(key)
+    if i < 0 { return "" }
+    let rest = raw.substring(i + key.len(), raw.len())
+    let close_i = rest.index_of("]")
+    if close_i < 0 { return "" }
+    let csv = rest.substring(0, close_i)
+    // csv = "12,34,...,255". Convert commas to spaces (printf-friendly).
+    let space_sep = csv.replace(",", " ")
+    return space_sep
+}
+
 fn noise_beta() -> str {
     let ts = _now_iso_utc()
     let want_anu = env("KICK_BETA_REAL_ANU") == "1"
@@ -160,38 +208,43 @@ fn noise_beta() -> str {
     let mut source = "urandom"
 
     if want_anu {
-        // Direct curl to qrng.anu.edu.au (sim_bridge/anu_time/anu_clock.hexa is R37-stubbed).
-        // Endpoint: jsonI.php?length=1&type=uint8 (1 byte, uint8). 5s timeout.
-        let curl_cmd = "curl -s --max-time 5 'https://qrng.anu.edu.au/API/jsonI.php?length=1&type=uint8' 2>/dev/null"
-        let raw = exec(curl_cmd).trim()
-        let mut parsed_byte = ""
-        let mut parsed_ok = false
-        if raw.len() > 0 && raw.contains("\"success\":true") {
-            let key = "\"data\":["
-            let i = raw.index_of(key)
-            if i >= 0 {
-                let rest = raw.substring(i + key.len(), raw.len())
-                let mut e: i64 = 0
-                while e < rest.len() {
-                    let c = rest.substring(e, e + 1)
-                    if c == "]" || c == "," { break }
-                    e = e + 1
-                }
-                let num_s = rest.substring(0, e).trim()
-                let v = _safe_to_int_line(num_s, -1, "beta-anu-byte")
-                if v >= 0 && v <= 255 { parsed_byte = num_s; parsed_ok = true }
+        // T1: queue-first (own 2 absorption — ext 9 length=1024 batch path).
+        // Step 1: try queue pop. If hit, source = "anu_queued" (no API call).
+        let queued = _anu_queue_pop()
+        if queued.len() > 0 {
+            let qv = _safe_to_int_line(queued, -1, "anu-queue-pop")
+            if qv >= 0 && qv <= 255 {
+                byte = queued
+                source = "anu_queued"
             }
         }
-        if parsed_ok {
-            byte = parsed_byte
-            source = "anu"
-        } else {
-            source = "urandom_fallback"
+        // Step 2: queue empty (or invalid). Refill with length=1024 batch + use first byte.
+        if source != "anu_queued" {
+            let batch = _anu_fetch_batch_1024()
+            if batch.len() > 0 {
+                // first space-separated token = first byte
+                let space_i = batch.index_of(" ")
+                let first = if space_i > 0 { batch.substring(0, space_i) } else { batch }
+                let v = _safe_to_int_line(first.trim(), -1, "beta-anu-batch-first")
+                if v >= 0 && v <= 255 {
+                    byte = first.trim()
+                    source = "anu"
+                    // Append remaining 1023 bytes to queue (skip first).
+                    if space_i > 0 {
+                        let rest_bytes = batch.substring(space_i + 1, batch.len())
+                        _anu_queue_refill_from_batch(rest_bytes)
+                    }
+                } else {
+                    source = "urandom_fallback"
+                }
+            } else {
+                source = "urandom_fallback"
+            }
         }
     }
 
     let bh = _short_hash("beta:" + source + ":" + byte + ":" + ts)
-    let payload = "qrng_byte=" + byte + " source=" + source + " (obs_2 reframe — urandom-fallback witnessed)"
+    let payload = "qrng_byte=" + byte + " source=" + source + " (obs_2 reframe — T1 length=1024 queue active)"
     return "{\"mechanism\":\"beta\",\"source_id\":\"" + source + "\",\"byte_hash\":\"" + bh + "\",\"ts\":\"" + ts + "\",\"payload_summary\":\"" + payload + "\"}"
 }
 
@@ -419,7 +472,44 @@ fn main() -> void {
         exit(0)
     }
 
-    eprintln("# noise_envelope: reason=unknown-mechanism-" + mech + " fix=use one of alpha|beta|gamma|--selftest")
+    if mech == "batch" {
+        // T6 batch-emit (raw 108 absorption — A3 finding logic evolution):
+        // Single hexa startup amortized over N cycles. Each cycle emits 3 JSON
+        // envelope lines (alpha, beta, gamma) on stdout. amortized cost falls
+        // as N grows since hexa runtime startup (~400ms) is paid once.
+        // Args: --absorbed-dir <p> --bridges-dir <p> --count <N>
+        let absorbed_dir = _arg_value(user_args, "--absorbed-dir", "")
+        let bridges_dir = _arg_value(user_args, "--bridges-dir", "")
+        let count_s = _arg_value(user_args, "--count", "1")
+        let count = _safe_to_int_line(count_s, 1, "batch-count")
+        if absorbed_dir.len() == 0 || bridges_dir.len() == 0 {
+            eprintln("# noise_envelope: reason=batch-missing-dirs fix=pass --absorbed-dir <p> --bridges-dir <p> --count N")
+            eprintln("__NOISE_ENVELOPE__ FAIL mechanism=batch")
+            exit(1)
+        }
+        if count < 1 {
+            eprintln("# noise_envelope: reason=batch-count-invalid fix=pass --count N where N>=1")
+            eprintln("__NOISE_ENVELOPE__ FAIL mechanism=batch")
+            exit(1)
+        }
+        let mut k: i64 = 0
+        while k < count {
+            let a_json = noise_alpha(absorbed_dir)
+            println(a_json)
+            let b_json = noise_beta()
+            println(b_json)
+            // gamma needs a beta-byte seed. Sample a fresh urandom byte per cycle so
+            // gamma stays distinguishable across cycles (mirrors typical caller flow).
+            let gb_byte = _safe_to_int_line(exec("od -An -N1 -tu1 /dev/urandom 2>/dev/null").trim(), 0, "batch-gamma-beta")
+            let g_json = noise_gamma(bridges_dir, gb_byte)
+            println(g_json)
+            k = k + 1
+        }
+        eprintln("__NOISE_ENVELOPE__ PASS mechanism=batch count=" + to_string(count))
+        exit(0)
+    }
+
+    eprintln("# noise_envelope: reason=unknown-mechanism-" + mech + " fix=use one of alpha|beta|gamma|batch|--selftest")
     eprintln("__NOISE_ENVELOPE__ FAIL mechanism=?")
     exit(1)
 }

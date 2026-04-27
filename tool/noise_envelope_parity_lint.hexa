@@ -1,0 +1,348 @@
+// tool/noise_envelope_parity_lint.hexa — dual-SOT body-parity audit between
+// tool/noise_envelope.hexa (canonical) and tool/kick_dispatch.hexa (inline mirror).
+//
+// @tool(slug="noise_envelope_parity_lint", desc="sha256-prefix body-parity check across the 4 logical functions duplicated between noise_envelope.hexa and kick_dispatch.hexa. Implementation of B1 SPEC frozen 2026-04-27 (witness 2026-04-27_b1-parity-lint-scaffold-noise-envelope-hexa-vs-kick-dispatch_omega_cycle.json). Emits raw 80 sentinel + raw 66 trailer on divergence.")
+// @usage(hexa run /Users/ghost/core/nexus/tool/noise_envelope_parity_lint.hexa [--canonical <path>] [--mirror <path>] [--selftest] [--json])
+// @omega-saturation-exempt("audit tool — convergence applies to its callers")
+// @exit_codes(0=PASS, 1=FAIL-mismatch, 2=usage/io error, 66=ai-native-trailer-error)
+//
+// raw 11 + raw 23 + raw 47 + raw 66 + raw 80 + raw 85 + raw 95.
+//
+// FUNCTION PAIR INVENTORY (B1 SPEC frozen)
+//   normalized_name | canonical fn      | mirror fn
+//   ─────────────── │ ────────────────  │ ─────────────────
+//   short_hash      │ _short_hash       │ _short_hash       (identity)
+//   alpha           │ noise_alpha       │ _alpha_envelope   (rewrite noise_X ↔ _X_envelope)
+//   beta            │ noise_beta        │ _beta_envelope
+//   gamma           │ noise_gamma       │ _gamma_envelope
+//
+// NORMALIZATION
+//   step 1: extract body between first '{' (after fn signature) and matching '}' (depth=0)
+//   step 2: strip leading/trailing whitespace per line + drop empty lines
+//   step 3: strip line comments ('// ...' to EOL) — block comments not used in hexa
+//   step 4: sha256 → first 16 hex chars (envelope-consistent truncation)
+//
+// SENTINEL FORMAT (raw 80)
+//   stderr: __NOISE_PARITY_LINT__ <PASS|FAIL> short_hash=<a8>:<b8> alpha=<a8>:<b8> beta=<a8>:<b8> gamma=<a8>:<b8>
+//   selftest: __NOISE_PARITY_LINT_SELFTEST__ <PASS|FAIL>
+
+// ─── helpers ────────────────────────────────────────────────────────
+
+fn _shell_quote(s: str) -> str {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _file_exists(path: str) -> bool {
+    return exec("test -f '" + path + "' && echo y || echo n").trim() == "y"
+}
+
+fn _read_file_lines(path: str) -> [str] {
+    if !_file_exists(path) { return [] }
+    let raw = read_file(path)
+    return raw.split("\n")
+}
+
+fn _starts_with_fn(line: str, fn_name: str) -> bool {
+    let t = line.trim_start()
+    if !t.starts_with("fn ") { return false }
+    let rest = t.substring(3, t.len())
+    if !rest.starts_with(fn_name) { return false }
+    let after = rest.substring(fn_name.len(), rest.len())
+    if after.len() == 0 { return false }
+    let c = after.substring(0, 1)
+    // Next character must be one of '(', ' ', '<' for it to be a clean fn-name match.
+    return c == "(" || c == " " || c == "<"
+}
+
+// _strip_line_comments — remove text from '//' (outside string literals) to EOL.
+// Conservative: hexa uses '//' only as a comment marker; '/' inside string literals
+// would be preserved by a full string-aware tokenizer, but for the 4 audited
+// functions a simple scanner is sufficient (verified: no '//' substring inside any
+// string literal in the 4 fn bodies).
+fn _strip_line_comments(line: str) -> str {
+    let i = line.index_of("//")
+    if i < 0 { return line }
+    // Best-effort guard: if '//' is preceded by an unmatched quote, keep the line
+    // as-is. None of the 4 audited fn bodies hit this case (verified manually).
+    let before = line.substring(0, i)
+    let mut q: i64 = 0
+    let mut k: i64 = 0
+    while k < before.len() {
+        if before.substring(k, k + 1) == "\"" { q = q + 1 }
+        k = k + 1
+    }
+    if q % 2 == 1 { return line }
+    return before
+}
+
+// _extract_body — given file content lines and the line index where 'fn NAME ...' is found,
+// return the canonicalized body string (post-strip). Returns empty string if extraction fails.
+//
+// Algorithm:
+//   1. Starting at fn_line_idx, scan forward to find first '{'. That '{' opens the body.
+//      Body content begins AFTER that brace.
+//   2. Maintain brace depth. depth=1 after the opening '{'. Increment for each '{',
+//      decrement for each '}'. Stop when depth returns to 0 — that '}' closes the fn.
+//      Body content ends BEFORE that closing brace.
+//   3. Apply per-line normalization: strip line comments, strip trim leading/trailing
+//      whitespace per line, drop fully-empty post-strip lines, then concatenate with '\n'.
+fn _extract_body(lines: [str], fn_line_idx: i64) -> str {
+    let mut depth: i64 = 0
+    let mut started: bool = false
+    let mut body_lines: [str] = []
+
+    let mut i = fn_line_idx
+    while i < len(lines) {
+        let raw = lines[i]
+        // Find brace-relevant chars in this line, but split signature line if needed.
+        // We want to begin capturing AFTER the first '{' on the signature line.
+        let mut start_col: i64 = 0
+        if !started {
+            let bi = raw.index_of("{")
+            if bi < 0 {
+                // signature continues; record nothing; advance.
+                i = i + 1
+                continue
+            }
+            depth = 1
+            started = true
+            start_col = bi + 1
+        }
+        // Scan from start_col through end of line; track braces.
+        let mut col = start_col
+        let mut closed_at: i64 = -1
+        while col < raw.len() {
+            let c = raw.substring(col, col + 1)
+            if c == "{" { depth = depth + 1 }
+            else if c == "}" {
+                depth = depth - 1
+                if depth == 0 { closed_at = col; break }
+            }
+            col = col + 1
+        }
+        // Slice out the part of this line that belongs to the body.
+        let body_segment = if closed_at >= 0 {
+            raw.substring(start_col, closed_at)
+        } else {
+            raw.substring(start_col, raw.len())
+        }
+        // Apply per-line normalization to body_segment.
+        let stripped = _strip_line_comments(body_segment).trim()
+        if stripped.len() > 0 {
+            body_lines = body_lines + [stripped]
+        }
+        if closed_at >= 0 { break }
+        // re-arm start_col for subsequent iteration
+        i = i + 1
+    }
+
+    if !started { return "" }
+    // Concatenate body lines with newlines.
+    let mut out = ""
+    let mut k: i64 = 0
+    while k < len(body_lines) {
+        if k > 0 { out = out + "\n" }
+        out = out + body_lines[k]
+        k = k + 1
+    }
+    return out
+}
+
+// _find_fn_line — return line index of `fn FN_NAME(...)` or -1.
+fn _find_fn_line(lines: [str], fn_name: str) -> i64 {
+    let mut i: i64 = 0
+    while i < len(lines) {
+        if _starts_with_fn(lines[i], fn_name) { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// _hash16 — sha256 first 16 hex chars (envelope-consistent truncation).
+// Uses a temp file to avoid shell-escape headaches with multi-line content.
+fn _hash16(content: str) -> str {
+    let tmp = "/tmp/noise_parity_hash_input." + exec("date +%s%N | tr -d '\\n'").trim() + ".tmp"
+    let _ = exec("printf %s " + _shell_quote(content) + " > " + _shell_quote(tmp))
+    let h = exec("(sha256sum 2>/dev/null " + _shell_quote(tmp) + " || shasum -a 256 " + _shell_quote(tmp) + ") | awk '{print substr($1,1,16)}'").trim()
+    let _ = exec("rm -f " + _shell_quote(tmp))
+    return h
+}
+
+// ─── core diff routine ──────────────────────────────────────────────
+
+fn _compare_pair(canonical_lines: [str], canonical_fn: str, mirror_lines: [str], mirror_fn: str) -> str {
+    // Returns "<canonical_hash16>:<mirror_hash16>:<MATCH|MISMATCH|MISSING>"
+    let c_idx = _find_fn_line(canonical_lines, canonical_fn)
+    let m_idx = _find_fn_line(mirror_lines, mirror_fn)
+    if c_idx < 0 || m_idx < 0 {
+        let c_status = if c_idx < 0 { "missing" } else { "present" }
+        let m_status = if m_idx < 0 { "missing" } else { "present" }
+        return "----------------:----------------:MISSING(canonical=" + c_status + ",mirror=" + m_status + ")"
+    }
+    let c_body = _extract_body(canonical_lines, c_idx)
+    let m_body = _extract_body(mirror_lines, m_idx)
+    let c_h = _hash16(c_body)
+    let m_h = _hash16(m_body)
+    let verdict = if c_h == m_h { "MATCH" } else { "MISMATCH" }
+    return c_h + ":" + m_h + ":" + verdict
+}
+
+// ─── main lint routine ─────────────────────────────────────────────
+
+fn _run_lint(canonical_path: str, mirror_path: str, json_mode: bool) -> i64 {
+    if !_file_exists(canonical_path) {
+        eprintln("# noise_envelope_parity_lint: reason=canonical-missing fix=pass --canonical <path-to-noise_envelope.hexa> path=" + canonical_path)
+        eprintln("__NOISE_PARITY_LINT__ FAIL canonical=missing")
+        return 2
+    }
+    if !_file_exists(mirror_path) {
+        eprintln("# noise_envelope_parity_lint: reason=mirror-missing fix=pass --mirror <path-to-kick_dispatch.hexa> path=" + mirror_path)
+        eprintln("__NOISE_PARITY_LINT__ FAIL mirror=missing")
+        return 2
+    }
+
+    let c_lines = _read_file_lines(canonical_path)
+    let m_lines = _read_file_lines(mirror_path)
+
+    // Inventory (B1 SPEC frozen)
+    let pairs = [
+        ["short_hash", "_short_hash",  "_short_hash"],
+        ["alpha",      "noise_alpha",  "_alpha_envelope"],
+        ["beta",       "noise_beta",   "_beta_envelope"],
+        ["gamma",      "noise_gamma",  "_gamma_envelope"]
+    ]
+
+    let mut sentinel = "__NOISE_PARITY_LINT__"
+    let mut all_pass = true
+    let mut json = "{\"schema\":\"noise_envelope_parity_lint.v1\",\"canonical\":\"" + canonical_path + "\",\"mirror\":\"" + mirror_path + "\",\"pairs\":["
+    let mut first = true
+    let mut details = ""
+    let mut i: i64 = 0
+    while i < len(pairs) {
+        let p = pairs[i]
+        let res = _compare_pair(c_lines, p[1], m_lines, p[2])
+        // res = "c_h:m_h:verdict"
+        let parts = res.split(":")
+        let c_h = parts[0]
+        let m_h = parts[1]
+        let verdict = parts[2]
+        let pair_match = verdict == "MATCH"
+        if !pair_match { all_pass = false }
+        details = details + " " + p[0] + "=" + c_h + ":" + m_h
+        if !first { json = json + "," }
+        first = false
+        json = json + "{\"name\":\"" + p[0] + "\",\"canonical_fn\":\"" + p[1] + "\",\"mirror_fn\":\"" + p[2] + "\",\"canonical_hash16\":\"" + c_h + "\",\"mirror_hash16\":\"" + m_h + "\",\"match\":" + (if pair_match { "true" } else { "false" }) + ",\"verdict\":\"" + verdict + "\"}"
+        i = i + 1
+    }
+    let pass_str = if all_pass { "PASS" } else { "FAIL" }
+    json = json + "],\"pass\":" + (if all_pass { "true" } else { "false" }) + "}"
+
+    if json_mode {
+        println(json)
+    }
+
+    eprintln(sentinel + " " + pass_str + details)
+
+    if !all_pass {
+        // raw 66 trailer — explicit fix directives
+        eprintln("# noise_envelope_parity_lint: reason=body-divergence-detected fix=1) git diff tool/noise_envelope.hexa tool/kick_dispatch.hexa to locate drift  2) reconcile per Sub-U cc81ff60 pattern (canonical-leading)  3) re-run lint until PASS  4) raw 85 audit row appended to convergence record")
+        return 1
+    }
+    return 0
+}
+
+// ─── selftest ───────────────────────────────────────────────────────
+
+fn _selftest() -> i64 {
+    let mut fails: i64 = 0
+
+    // Branch 1 — baseline PASS (real files).
+    let canonical = "/Users/ghost/core/nexus/tool/noise_envelope.hexa"
+    let mirror = "/Users/ghost/core/nexus/tool/kick_dispatch.hexa"
+    let rc1 = _run_lint(canonical, mirror, false)
+    if rc1 != 0 {
+        eprintln("# noise_envelope_parity_lint selftest: reason=baseline-not-pass fix=audit current canonical/mirror parity; rc=" + to_string(rc1))
+        fails = fails + 1
+    }
+
+    // Branch 2 — intentional divergence in tmp fixture.
+    let tmp = "/tmp/noise_parity_lint_selftest_" + exec("date +%s%N | tr -d '\\n'").trim()
+    let _ = exec("mkdir -p " + _shell_quote(tmp))
+    let fix_a = tmp + "/canonical.hexa"
+    let fix_b = tmp + "/mirror.hexa"
+    let _ = exec("printf '%s\\n' " + _shell_quote("fn _short_hash(input: str) -> str { return input }") + " > " + _shell_quote(fix_a))
+    let _ = exec("printf '%s\\n' " + _shell_quote("fn _short_hash(input: str) -> str { return input + \"X\" }") + " > " + _shell_quote(fix_b))
+    // Tag both files with stub fn definitions for the other 3 pairs so detection mechanism focuses on the divergence.
+    let _ = exec("printf '\\n%s\\n' " + _shell_quote("fn noise_alpha(d: str) -> str { return \"\" }") + " >> " + _shell_quote(fix_a))
+    let _ = exec("printf '\\n%s\\n' " + _shell_quote("fn _alpha_envelope(d: str) -> str { return \"\" }") + " >> " + _shell_quote(fix_b))
+    let _ = exec("printf '\\n%s\\n' " + _shell_quote("fn noise_beta() -> str { return \"\" }") + " >> " + _shell_quote(fix_a))
+    let _ = exec("printf '\\n%s\\n' " + _shell_quote("fn _beta_envelope() -> str { return \"\" }") + " >> " + _shell_quote(fix_b))
+    let _ = exec("printf '\\n%s\\n' " + _shell_quote("fn noise_gamma(d: str, b: i64) -> str { return \"\" }") + " >> " + _shell_quote(fix_a))
+    let _ = exec("printf '\\n%s\\n' " + _shell_quote("fn _gamma_envelope(d: str, b: i64) -> str { return \"\" }") + " >> " + _shell_quote(fix_b))
+    let rc2 = _run_lint(fix_a, fix_b, false)
+    if rc2 != 1 {
+        eprintln("# noise_envelope_parity_lint selftest: reason=divergence-not-flagged-FAIL fix=audit body-extraction algorithm; rc=" + to_string(rc2) + " expected=1")
+        fails = fails + 1
+    }
+
+    // Branch 3 — usage error (missing canonical file).
+    let rc3 = _run_lint("/tmp/nonexistent_xyz_canonical.hexa", mirror, false)
+    if rc3 != 2 {
+        eprintln("# noise_envelope_parity_lint selftest: reason=usage-error-not-detected fix=check exit code mapping; rc=" + to_string(rc3) + " expected=2")
+        fails = fails + 1
+    }
+
+    // Cleanup
+    let _ = exec("rm -rf " + _shell_quote(tmp))
+
+    if fails == 0 {
+        eprintln("__NOISE_PARITY_LINT_SELFTEST__ PASS")
+        return 0
+    }
+    eprintln("__NOISE_PARITY_LINT_SELFTEST__ FAIL fails=" + to_string(fails))
+    return 1
+}
+
+// ─── CLI ────────────────────────────────────────────────────────────
+
+fn _arg_value(args: [str], flag: str, default_val: str) -> str {
+    let mut i: i64 = 0
+    while i < len(args) {
+        if args[i] == flag && i + 1 < len(args) { return args[i + 1] }
+        i = i + 1
+    }
+    return default_val
+}
+
+fn _has_flag(args: [str], flag: str) -> bool {
+    let mut i: i64 = 0
+    while i < len(args) {
+        if args[i] == flag { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn main() -> void {
+    let raw_args = args()
+    let mut user_start = 2
+    if raw_args.len() >= 3 && raw_args[1] == "run" { user_start = 3 }
+    let mut user_args: [str] = []
+    let mut ai = user_start
+    while ai < raw_args.len() {
+        user_args = user_args + [raw_args[ai]]
+        ai = ai + 1
+    }
+
+    if _has_flag(user_args, "--selftest") {
+        let rc = _selftest()
+        exit(rc)
+    }
+
+    let canonical = _arg_value(user_args, "--canonical", "/Users/ghost/core/nexus/tool/noise_envelope.hexa")
+    let mirror = _arg_value(user_args, "--mirror", "/Users/ghost/core/nexus/tool/kick_dispatch.hexa")
+    let json_mode = _has_flag(user_args, "--json")
+
+    let rc = _run_lint(canonical, mirror, json_mode)
+    exit(rc)
+}
