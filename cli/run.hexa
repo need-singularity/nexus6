@@ -5405,6 +5405,81 @@ fn cmd_atlas(a: [str]) -> void {
         return
     }
 
+    // iter-70: nexus atlas absorb — auto-absorb shards into n6-architecture atlas.n6
+    //   nexus atlas absorb [--target n6-arch|nexus] [--glob "<pattern>"] [--archive]
+    //   Default target: n6-arch (~/core/n6-architecture/atlas/atlas.n6, uchg-locked)
+    //   Default glob: atlas/atlas.append.*.n6
+    //   Procedure: unlock → append shard contents → relock (via os_level_lock.hexa)
+    //   Idempotent: already-absorbed shards (matched by header sha) skipped
+    if sub == "absorb" {
+        let target = find_flag(a, "--target", "n6-arch")
+        let glob = find_flag(a, "--glob", "atlas/atlas.append.*.n6")
+        // simple flag detection (any positional arg matching)
+        let mut archive = false
+        let mut dry_run = false
+        let mut _fi = 4
+        while _fi < n {
+            if a[_fi] == "--archive" { archive = true }
+            if a[_fi] == "--dry-run" { dry_run = true }
+            _fi = _fi + 1
+        }
+        let target_root = if target == "n6-arch" {
+            "/Users/ghost/core/n6-architecture"
+        } else if target == "nexus" {
+            nexus_root()
+        } else {
+            eprintln("nexus atlas absorb: --target must be n6-arch | nexus")
+            exit(2)
+            ""
+        }
+        let target_atlas = target_root + "/atlas/atlas.n6"
+        let lock_tool = "/Users/ghost/core/hexa-lang/tool/os_level_lock.hexa"
+        // Discover shards
+        let shard_list = exec("cd " + shell_quote(target_root) + " && ls " + glob + " 2>/dev/null | sort")
+        if shard_list.len() == 0 {
+            println("nexus atlas absorb: no shards matched glob='" + glob + "' under " + target_root)
+            return
+        }
+        let shard_count = exec("echo " + shell_quote(shard_list) + " | wc -l").trim()
+        println("nexus atlas absorb: target=" + target_atlas)
+        println("  shards: " + shard_count + " files matched")
+        if dry_run {
+            println("  --dry-run: skipping unlock/append/relock")
+            print(shard_list)
+            return
+        }
+        // Idempotency check: count clay-iter (or generic shard-id) already in atlas.n6
+        let pre_check = exec("grep -c '^# .. atlas.append' " + shell_quote(target_atlas) + " 2>/dev/null || echo 0").trim()
+        println("  atlas.n6 pre-existing absorbed-shard markers: " + pre_check)
+        // Unlock
+        println("  unlocking atlas.n6 (chflags nouchg)...")
+        let unlock_out = exec(hexa_bin() + " run " + shell_quote(lock_tool) + " unlock " + shell_quote(target_atlas) + " 2>&1")
+        print(unlock_out)
+        // Append separator + each shard
+        let absorb_marker = "\n# ══════════════════════════════════════════════════════════════\n# nexus atlas absorb — " + shard_count + " shards bulk-absorbed (raw 108 + own#9)\n# Auto-absorption via nexus atlas absorb subcommand\n# ══════════════════════════════════════════════════════════════"
+        let pre_cmd = "echo " + shell_quote(absorb_marker) + " >> " + shell_quote(target_atlas)
+        exec(pre_cmd)
+        let absorb_cmd = "cd " + shell_quote(target_root) + " && for f in $(ls " + glob + " 2>/dev/null | sort); do echo; echo \"# .. $(basename $f) ..\"; cat \"$f\"; done >> " + shell_quote(target_atlas)
+        let absorb_out = exec(absorb_cmd + " 2>&1")
+        print(absorb_out)
+        // Verify post-state
+        let post_lines = exec("wc -l " + shell_quote(target_atlas) + " | awk '{print $1}'").trim()
+        println("  atlas.n6 post-absorb line count: " + post_lines)
+        // Archive (optional)
+        if archive {
+            let archive_dir = target_root + "/atlas/_absorbed/" + exec("date +%Y%m%d-%H%M%S").trim()
+            exec("mkdir -p " + shell_quote(archive_dir))
+            exec("cd " + shell_quote(target_root) + " && mv " + glob + " " + shell_quote(archive_dir) + "/ 2>&1")
+            println("  shards archived to: " + archive_dir)
+        }
+        // Relock
+        println("  re-locking atlas.n6 (chflags uchg)...")
+        let lock_out = exec(hexa_bin() + " run " + shell_quote(lock_tool) + " lock " + shell_quote(target_atlas) + " 2>&1")
+        print(lock_out)
+        println("nexus atlas absorb: complete (" + shard_count + " shards absorbed into " + target_atlas + ")")
+        return
+    }
+
     // legacy: forward remaining args to atlas_health.hexa (status/verify 등)
     let mut args = ""
     let mut i = 3
@@ -6183,6 +6258,23 @@ fn _kick_run(a: [str]) -> void {
         eprintln("nexus kick run: script missing at " + script)
         eprintln("reason=kick-dispatch-missing fix=ls " + nexus_root() + "/tool/kick_dispatch.hexa")
         exit(1)
+    }
+    // Sub-BV 2026-04-27 (closed-loop kick CLI preflight): invoke kick_slot_gate
+    // before firing kick_dispatch. If saturation gate returns DEFER (rc=1),
+    // abort with raw 66 trailer instead of feeding the cron-burst → external
+    // saturation → docker fallback → Sub-BO refusal cascade. Bypass via
+    // env NEXUS_KICK_SKIP_PREFLIGHT=1 for emergency / debug.
+    let _bypass = env_var("NEXUS_KICK_SKIP_PREFLIGHT")
+    if _bypass != "1" {
+        let _gate_cmd = "/Users/ghost/.hx/bin/hive-exec kick_slot_gate --max 6 >/dev/null 2>&1; echo $?"
+        let _gate_rc = exec(_gate_cmd).trim()
+        if _gate_rc == "1" {
+            eprintln("nexus kick run: aborted by Sub-BV preflight — slot gate DEFER")
+            eprintln("reason: slot-saturated: kick_slot_gate reports Mac kick-chain ≥ 6 (Sub-BR threshold)")
+            eprintln("fix: 1) hive-exec kick_slot_gate  # confirm DEFER  2) wait for Mac saturation to clear (auto-reaped by Sub-BU at 15min) 3) NEXUS_KICK_SKIP_PREFLIGHT=1 nexus kick <topic>  # bypass for emergency")
+            eprintln("ref: raw 100 P305 falsifier + convergence/r4_kick_perf_fallback_synthesis_2026_04_27 §Sub-BV")
+            exit(64)
+        }
     }
     // Skip [hexa, run.hexa, kick] — but if a[3] == "run" also skip it.
     let mut start = 3
