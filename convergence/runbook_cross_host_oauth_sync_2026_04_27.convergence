@@ -1,0 +1,70 @@
+@track RUNBOOK_CROSS_HOST_OAUTH_SYNC
+@state completed
+@date 2026-04-27
+@chain ←r4_cli_only_migration_2026_04_27.convergence (Sub-S) ←r4_kick_auth_fail_detection_2026_04_27.convergence (Sub-W) ←r4_sub_n_airgenome_docker_hexa_routing_retirement (Sub-N)
+@kind runbook
+@scope cross-host OAuth credential sync — Mac canonical 12-slot pool 상태 vs ubu1/ubu2/hetzner 잔존 stale OAuth 처리 가이드.  Sub-W kick auth-fail trailer 가 가리키는 4-step fix 의 실제 운영 절차.  airgenome docker shim 폐기(Sub-N) 후 cross-host credential mgmt 책임 ownership 정리 포함.
+@audience operator running ω-cycle 가 cross-host dispatch 필요 OR 원격 호스트에서 hive subagent 가 stale OAuth 401 보고 시
+@authority raw 71 (CLI-only-migration) + raw 1 (SSOT lock for slot dirs) + raw 84 (escalation queue for credential refresh) + raw 85 (escalation-audit-trail for sync events)
+
+# 배경
+@context_mac Mac canonical: ~/.claude-claude{1..12} 12 slot, 모두 OAuth (.claude.json) 활성. `hexa run /Users/ghost/core/hive/tool/claude_slot_pick.hexa --list` 로 확인.
+@context_remote ubu1/ubu2/hetzner 의 ~/.claude-claudeN/ 일부만 존재 + Apr 20 stale OAuth 토큰 (Sub-W 진단). hive subagent 가 거기 dispatch 되면 401 invalid x-api-key.
+@context_airgenome_orphan Sub-N (airgenome docker hexa-routing 폐기, commit f3dec9dd) 이전에는 airgenome 의 gate daemon + capability watchdog 이 cross-host credential 일부 mediate. shim 폐기 후 그 책임이 orphan 상태 → 본 runbook 이 명시적 ownership 정리.
+
+# 진단 절차
+@diag_step_1 Mac local 에서: `hexa run /Users/ghost/core/hive/tool/claude_slot_pick.hexa --list` → 12 slot status. `available` 가 12 미만이면 일부 cooldown / weekly-limit. `kick_limit_until` 파일이 있는데 limit_until=null 이면 stale probe cache → `rm ~/.claude-claude*/.kick_limit_until` 후 재 list.
+@diag_step_2 원격 호스트별 (ssh ubu1 / ssh ubu2 / ssh hetzner): `ls -la ~/.claude-claude*/.claude.json` 으로 OAuth 파일 존재 + mtime 확인. mtime 이 7일+ 오래되면 stale. 1 slot 만 있으면 pool unsync.
+@diag_step_3 kick 시도 후 rc=5 (Sub-Y idle-timeout) 또는 rc=2 with `claude-auth-failure-401` (Sub-W) → 본 runbook 진입.
+
+# 시정 path (3 가지 — 상황별 선택)
+@path_1_local_refresh   `claude /login` per slot — 가장 안전, host-local 만 갱신.
+@path_1_when 1-2 slot 만 stale 이고 즉시 fix 필요할 때.
+@path_1_steps
+  1. `cd ~/.claude-claude<N>` (해당 slot dir)
+  2. `CLAUDE_CONFIG_DIR=$PWD claude /login` — interactive OAuth flow
+  3. 갱신 후 `cat .claude.json | jq .oauth.expiresAt` 확인 (만료 7d+ 미래)
+  4. `rm -f .kick_limit_until` (probe cache reset)
+@path_1_caveats 각 slot 마다 별도 login 필요 → 12 slot 갱신 시 12 회. 해당 slot 의 Anthropic plan 인증 정보가 별도면 plan quota 분리 가능.
+
+@path_2_rsync_from_mac   Mac → 원격 호스트 OAuth dir 동기화.
+@path_2_when 원격 호스트 (ubu1/ubu2/hetzner) 에 12-slot pool 전체 부재 OR 모든 slot stale.
+@path_2_steps
+  1. (Mac) `tar czf /tmp/claude-pool-$(date +%s).tgz -C ~ .claude-claude{1..12}/.claude.json`
+  2. `scp /tmp/claude-pool-*.tgz ubu1:/tmp/` (ubu2/hetzner 동일)
+  3. (원격) `cd ~ && tar xzf /tmp/claude-pool-*.tgz` → ~/.claude-claude{1..12}/.claude.json 적재
+  4. (원격) `chmod 600 ~/.claude-claude*/.claude.json` (보안 — 사용자 본인만 read)
+  5. (원격) `hexa run ~/core/hive/tool/claude_slot_pick.hexa --list` 로 12-slot 인식 확인
+  6. (Mac) `rm -f /tmp/claude-pool-*.tgz`
+@path_2_caveats
+  (a) **보안**: OAuth 토큰 file 이 한 호스트에 동시 존재. 만일 한 호스트가 침해되면 12-slot 전체 노출. ssh agent forwarding 또는 short-lived encrypted transit 권장.
+  (b) **race**: Mac에서 사용 중인 slot 을 동시에 원격이 사용하면 plan-quota race. 본 runbook 은 sequential dispatch 가정.
+  (c) **drift**: 동기화 후 어느 한 쪽에서 `claude /login` 갱신 시 다른 쪽 stale → 주기적 re-sync 필요. 자동화 cycle 은 별도 (Sub-Z OAuth sync daemon 후보, 미land).
+
+@path_3_force_local_bypass   Mac 만 사용 (HEXA_LOCAL=1).
+@path_3_when 원격 호스트 OAuth sync 못 하거나 안 하기로 결정. heavy-compute 라도 Mac 24GB cap 안에 들어맞을 때.
+@path_3_steps
+  1. `HEXA_LOCAL=1 nexus kick "<topic>"` — kick dispatch 가 Mac local 만 사용.
+  2. raw 100 advisory 위반 (omega-cycle 의 정형 path 는 외부 호스트 필수) — 가벼운 ω-cycle 만 사용 권장.
+@path_3_caveats raw 40 (external-host-dispatch-default) 위반. 단 raw 40 는 status=new + warn-target-30d 라 hard block 아님. 본 path 가 noise-envelope-module ω-cycle 에서 사용된 우회 (HEXA_LOCAL=1 + HEXA_RESOLVER_NO_REROUTE=1).
+
+# Path 권고 표
+@table_recommend
+  | 상황                                  | 권고 path |
+  |---------------------------------------|-----------|
+  | 1-2 slot stale, 즉시 fix              | Path 1    |
+  | 원격 12-slot pool 미동기              | Path 2    |
+  | 원격 sync 회피 / Mac만 충분           | Path 3    |
+  | heavy-compute + 원격 필요 + slot stale| Path 1 또는 Path 2 + Path 3 임시 우회 |
+
+# Sub-Y / Sub-W 와의 관계
+@relation_sub_w Sub-W (commit 71039262) 은 _detect_auth_failure 로 401 즉시 감지 + raw 66 4-step trailer 발행. trailer 의 4-step fix 가 본 runbook 의 Path 1/2/3 으로 매핑.
+@relation_sub_y Sub-Y (commit pending) 는 SSE drain idle-timeout — auth-fail 이 _detect_auth_failure 로 잡히지 않고 대신 hung 으로 surface 되는 edge case (hive-telegram extension stale-session) 차단. 두 fix 는 직교 (Sub-W=명시 401, Sub-Y=hang).
+
+# follow-up
+@followup_oauth_sync_daemon Path 2 의 race + drift 자동 해소를 위한 OAuth sync daemon 별도 cycle. launchd plist (raw 99 ban 회피하려면 hive init 통합) + bidirectional sync (Mac canonical → 원격, 갱신 시 원격 → Mac mirror). Sub-Z 후보.
+@followup_oauth_security_review Path 2 의 multi-host OAuth pool 노출 위협 모델 review. SSH key forwarding / short-lived per-host token / OAuth refresh-token-only sync 등 대안.
+@followup_metric_kick_auth_fail_count kick 의 raw 80 sentinel 통계에 auth_fail / idle_timeout count 추가 (Sub-W follow-up 과 결합).
+@followup_airgenome_credential_orphan_close airgenome 폐기 후 cross-host credential 책임이 본 runbook + nexus tool/claude_slot_pick.hexa 로 명시적 이관됨을 .own own#1 또는 .roadmap 에 기록.
+
+@verdict cross-host OAuth sync runbook 작성 — 3 path (local-refresh / rsync / HEXA_LOCAL=1) + 권고 표 + Sub-Y / Sub-W 관계 + airgenome 폐기 orphan ownership 명시. 차후 cross-host 401 또는 SSE hang 발생 시 진단→시정 self-contained.

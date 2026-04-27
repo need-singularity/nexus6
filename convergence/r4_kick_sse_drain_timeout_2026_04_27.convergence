@@ -1,0 +1,37 @@
+@track R4_KICK_SSE_DRAIN_TIMEOUT
+@state completed
+@date 2026-04-27
+@chain ←r4_kick_auth_fail_detection_2026_04_27.convergence (Sub-W) ←r4_kick_docker_slot_pick_fix_2026_04_27.convergence (Sub-X)
+@scope sub-Y — kick parent (subagent_dispatch.hexa) SSE relay 가 child PID 살아있고 SSE 무음 + agent.end 미발행 시 24h MAX_ITERS 까지 polling 하던 문제 fix.  noise-envelope-module ω-cycle 에서 22-min hang 으로 surface; raw 66 ai-native trailer + idle-timeout watchdog + 정확한 rc taxonomy (4=child-crash, 5=idle-timeout) 로 차단.
+@principle 근본해결 + UX-meaningful timeout + 정확한 진단 trailer
+
+# 문제 진단
+@symptom noise-envelope-module ω-cycle (HEXA_LOCAL=1 + HEXA_RESOLVER_NO_REROUTE=1, Mac local) 가 witness JSON (47KB) + atlas absorb (21 facts) + sentinel `__KICK_RESULT__ PASS tier1=3 falsifier_pass=5` 모두 emit 한 후, parent kick_dispatch + subagent_dispatch.hexa 가 22 분간 hung 상태 유지. 사용자 SIGTERM 으로 종료.
+@evidence_a hive subagent log (`/tmp/hive-subagent-auto-noise-envelope-...19877-...log`): 단 2 lines — `[hive] streaming on http://127.0.0.1:19877/event?sessionID=019dcee0-...` + `Extension error (...hive-telegram/index.ts): This extension instance is stale after session replacement or reload. Use the provided replacement-session context instead.`
+@evidence_b 22 분 elapsed 후: 자식 hive node PID (27794) 0.0% CPU, 0.2% mem, established TCP localhost:19877→63727, NO 외부 (api.anthropic.com) 연결. 즉 LLM call 끝났음에도 SSE relay 가 agent.end 신호를 받지 못해 polling.
+@root_cause _run_streaming_relay() 의 폴링 루프 종료 조건이 (a) `.done` sentinel arrival 또는 (b) 자식 PID death 둘 뿐. agent.end 가 hive-telegram extension stale-session 부산물로 swallowed → curl 안 끝남 → .done 안 써짐 → 자식 PID 는 살아있음 → 무한 polling. MAX_ITERS = 24h 한계는 UX-meaningless.
+
+# 결정 path 평가
+@path_a_hard_idle_timeout CHOSEN — 폴링 루프에 offset-advance 기반 idle watchdog 추가. `(now - last_offset_advance_ts) >= idle_timeout_sec` 시 break + rc=5. Default 600s = 10min, env override (`HIVE_SUBAGENT_DRAIN_TIMEOUT_SEC`). 기존 24h MAX_ITERS hard ceiling 보존.
+@path_b_disable_extension_per_kick SKIP — hive-telegram 등 extension 을 kick subagent 호출 시점에 disable 하려면 hive 런타임 변경 필요 (cross-cycle scope). 또한 다른 extension 도 동일 패턴 가능 → 근본 차단 아님.
+@path_c_parse_witness_for_completion_signal SKIP — witness JSON 의 `__KICK_RESULT__ PASS` sentinel 을 SSE 외부에서 감지해 강제 종료. Witness path 모니터링 추가 코드 + edge case (witness 없을 때) 복잡도 증가.
+@path_d_no_fix DEFERRED — 그냥 두면 매 hung 마다 사용자 수동 SIGTERM 필요. UX 비용 누적.
+
+# 구현
+@file /Users/ghost/core/hive/tool/subagent_dispatch.hexa (uchg unlock-edit-relock)
+@diff_a poll-loop 변수: `last_offset_advance_ts` (last offset 변동 시각) + `last_offset` + `idle_timed_out` flag + env-driven `idle_timeout_sec` (default 600).
+@diff_b 매 iteration 의 offset advance check: 변동 시 `last_offset_advance_ts = now_ts`. idle 검사: `(now_ts - last_offset_advance_ts) >= idle_timeout_sec` 시 `idle_timed_out = true; break`.
+@diff_c 루프 후 rc 분기: sentinel_seen (정상 종료, pipeline rc) / idle_timed_out (rc=5 + raw 66 4-step trailer + force-kill orphan PID) / child PID death (rc=4, 기존 동작).
+@chflags_lock 본 파일 uchg 로 relock. nexus/.raw-audit 에 raw 85 audit row 추가.
+
+# 검증
+@verification_static grep 으로 idle_timeout_sec init (line 514) / advance-tracking (line 538-541) / break (line 568-570) / rc=5 + trailer + force-kill (line 587-601) 모두 위치 확인.
+@verification_runtime 다음 hung kick 사례 발생 시 600s 후 자동 종료 + raw 66 trailer emit. 실제 검증은 다음 ω-cycle 에서 자연스럽게 (선제 검증 위해 의도적 hang reproduce 는 hive-telegram extension misuse 필요 — 비결정적).
+@verification_env HIVE_SUBAGENT_DRAIN_TIMEOUT_SEC=120 hexa run ... 로 짧은 timeout 시연 가능.
+
+# follow-up
+@followup_telegram_extension_root_fix hive-telegram extension 의 stale-session 처리 자체를 fix — 별도 hive-side cycle. 본 cycle 은 dispatch 측 timeout 만 처리.
+@followup_runbook_link convergence/runbook_cross_host_oauth_sync_2026_04_27.convergence 와 함께 commit — 두 follow-up 동시 land.
+@followup_idle_threshold_metric 실제 운영 hang 빈도 측정 후 default 600s 가 적절한지 재평가. 너무 짧으면 legitimate long-running agent 끊김.
+
+@verdict Sub-Y landed — subagent_dispatch.hexa idle-timeout watchdog + raw 66 trailer + force-kill orphan PID + raw 85 audit + chflags lock. kick parent SSE hang 의 22-min UX 비용을 600s 로 cap, 정확한 진단 surface (rc=5 + trailer) 로 차단.
