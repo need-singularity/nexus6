@@ -1,0 +1,95 @@
+@track R4_HIVE_INSTALL_EXTENSIONS_ROOT_FIX
+@state completed
+@date 2026-04-27
+@scope sub-P — root fix for hive ext symlink module-resolution failure ([FixUp-install-ext]); replace `~/.hive/agent/node_modules → ~/core/hive/node_modules` band-aid
+@chain ←r4_host_aware_dispatch_2026_04_27.convergence (sibling)
+@principle nexus kick canonical entry + non-destructive default + @convergence 기록필수 + raw 77 audit row + workspace-relative loader + portable install (no upstream-divergent install side-effects)
+
+# Problem statement
+
+@symptom hive coding-agent fails extension load:
+  `Failed to load extension "/home/aiden/.hive/agent/extensions/custom-provider-anthropic/index.ts": Cannot find module '@anthropic-ai/sdk'`
+@hosts ubu1, ubu2, hetzner — Linux. Mac partially affected (silent fallback through symlink-follow).
+@bandaid `~/.hive/agent/node_modules → ~/core/hive/node_modules` symlink applied 2026-04-25; works only when deps happen to be hoisted to repo root.
+
+# Root cause analysis
+
+@layer1 install-extensions.mjs creates `<agentDir>/extensions/<name>` as a symlink → `<repo>/packages/<pkg>/examples/extensions/<name>`. Correct, intentional.
+@layer2 npm workspace install hoists ext deps into `<source>/node_modules/<dep>` (sometimes via .bun store symlink). Verified: `ls .../custom-provider-anthropic/node_modules/@anthropic-ai/sdk` → exists; `ls ~/core/hive/node_modules/@anthropic-ai` → ENOENT (NOT in repo root flatten).
+@layer3 jiti/Node loads ext entry via the SYMLINK path. node_modules walk starts at the symlink dir. With `--preserve-symlinks` (or jiti default behavior on some hosts) the walk does NOT follow the symlink first → `<agentDir>/extensions/<name>/node_modules` does not exist → `MODULE_NOT_FOUND`.
+@witness_mac
+  ```
+  $ node --preserve-symlinks -e "createRequire('/Users/ghost/.hive/agent/extensions/custom-provider-anthropic/index.ts').resolve('@anthropic-ai/sdk')"
+  → /Users/ghost/.hive/agent/extensions/custom-provider-anthropic/node_modules/@anthropic-ai/sdk/index.js  (path through symlink dir name)
+  ```
+  Without `--preserve-symlinks` Node follows the entry symlink to realpath → walks `<source>/node_modules`, succeeds. So Mac silently passes when no flag, fails when flag set; Linux fails because jiti's node_modules walk on Linux retains the symlink-dir name in the walk anchor.
+
+# Three candidate axes considered
+
+@axis_a install-extensions ensures ext-local node_modules at install time (install or symlink each declared dep into ext-local nm). Pros: ext self-contained. Cons: dep duplication; install logic complex; doesn't help compiled-bun `virtualModules` path.
+@axis_b install-extensions creates `<symlink>/node_modules → <repo-root>/node_modules` at install time. Pros: minimal change. Cons: only correct if ALL ext deps are hoisted to repo root — verified false on Mac (`@anthropic-ai/sdk` lives in ext-local nm, not root). Would re-introduce the original "deps must hoist" assumption that failed on Linux.
+@axis_c loader-side realpath: canonicalize entry path via `fs.realpathSync` BEFORE handing to jiti. Walk anchor becomes `<source>/<name>/index.ts`, node_modules walk starts at `<source>/<name>/node_modules` (where deps actually are). Pros: clean separation, install stays simple/portable, survives `--preserve-symlinks`, no upstream divergence in install-extensions.mjs. Cons: requires loader code change + rebuild.
+
+@chosen_axis (c) — only axis that matches the observed dep layout (ext-local nm, NOT repo-root flatten). (b) would have shipped the same band-aid as the existing workaround.
+
+# Patch
+
+@file packages/coding-agent/src/core/extensions/loader.ts
+  - new helper `canonicalizeExtensionPath(p)` — `fs.realpathSync` with try/catch fallback.
+  - `loadExtension`: insert `const loadPath = canonicalizeExtensionPath(resolvedPath)` and pass `loadPath` to `loadExtensionModule`. `resolvedPath` is preserved for the `Extension` record so user-facing paths don't change.
+@file packages/coding-agent/test/extensions-discovery.test.ts
+  - new regression test "loads symlinked extension whose deps live in <source>/node_modules" — seeds `<source>/node_modules/tiny-dep`, symlinks via `<extensionsDir>/<name>`, asserts `result.errors == []` and command registered. Test passes on Mac.
+
+@build_verification `npm run build` → dist/core/extensions/loader.js contains `canonicalizeExtensionPath` + `realpathSync`. ✓
+@test_verification `vitest run extensions-discovery.test.ts extensions-runner.test.ts` → 55/55 pass. ✓
+@install_verification `node scripts/install-extensions.mjs --dry-run` → 10 ext OK (no churn). ✓
+
+# Workspace registration policy decision
+
+@5_of_11_registered package.json workspaces array currently registers: with-deps, custom-provider-anthropic, custom-provider-gitlab-duo, custom-provider-qwen-cli, custom-provider-claude-cli.
+@6_missing sandbox, hive-recap (have package.json + deps but not in workspaces) — note: dynamic-resources, plan-mode, subagent, doom-overlay have NO package.json and are NOT auto-installed by discoverExtensions, so registration is irrelevant for them.
+@decision DO NOT register additional ext at this time. Rationale: axis (c) makes registration unnecessary for the failure mode this fix targets — `fs.realpathSync` resolves the walk anchor regardless of whether deps are hoisted to root, ext-local nm, or .bun store. Registration is now an orthogonal concern (forces install-time dep-fetch into ext-local nm; useful for offline install consistency but not for runtime resolution). Defer registration audit to a separate pass if and only if a new failure mode appears.
+
+# Adjacent defects flagged (NOT fixed in this cycle — for sub-Q / future cycles)
+
+## (5a) hetzner SSOT chflags `uchg` blocks rsync rename
+
+@symptom `rsync: rename ".raw.te0lw6" -> ".raw": Operation not permitted` → hexa_remote rc=23 → fall-through.
+@root_cause_hypothesis raw#1 SSOT lock applies `chflags uchg` (or Linux `chattr +i`) on `.raw` to enforce immutability, but hexa_remote sync uses `rsync --temp-file rename` semantics which require WRITE+RENAME permission on the destination. Lock and sync coordinator have no handshake.
+@candidate_fixes
+  - (5a.i) hexa_remote acquires `unlock` lease before rsync, releases on success/abort; reuse the existing `npm run lock:soften` / `lock:harden` cycle but scoped to single-file `.raw` instead of full SSOT set.
+  - (5a.ii) rsync write to a sibling temp path (e.g. `.raw.staging.<ts>`) and atomic `mv` ONLY after `chflags nouchg` is held; coordinator must hold lock-mutex for the rename window.
+  - (5a.iii) restructure SSOT lock to apply `uchg` on the parent directory's read-only-bit instead of per-file `uchg`, so rsync's per-file rename works while the dir-level read-only blocks unauthorized writes. Less granular but eliminates the rename collision.
+
+## (5b) Mac docker hard-landing fork limit
+
+@symptom Docker daemon on Mac saturates fork limit during heavy concurrent container spawn (observed during airgenome tests).
+@root_cause_hypothesis cgroup pids cap (LinuxKit VM inside Docker Desktop) OR macOS host `kern.maxproc` saturation (default 1064 user-procs). Each Docker container exec consumes a Mac host slot via the helper proc.
+@candidate_fixes
+  - (5b.i) raise `kern.maxproc` + `kern.maxprocperuid` via launchd plist before docker daemon start; documented sysctl path.
+  - (5b.ii) cap concurrent Docker exec via airgenome-side semaphore (N=8) with backpressure — orthogonal to host limits, prevents fork storm regardless of host cap.
+  - (5b.iii) migrate hot tests off Docker to lima/colima where pids cap is exposed and tunable from the user side.
+
+## (5c) ubu1 Anthropic API key invalid (401)
+
+@symptom backend dispatch to ubu1 fails with HTTP 401 from anthropic.com — token rotation drift.
+@root_cause_hypothesis ubu1 still holds an old key after a rotation event; backend routing policy treats ubu1 as alive (TCP/SSH OK) but the key it carries is stale.
+@candidate_fixes
+  - (5c.i) backend routing policy: pre-flight 1-token probe before dispatch, mark host as `auth_stale` and skip; retry with fresh credential push.
+  - (5c.ii) centralize credential distribution via age-encrypted secrets-store with periodic pull on each host (cron or systemd-timer); eliminate per-host manual rotation drift.
+  - (5c.iii) fall back to claude_code backend when 401 detected; log + alert + leave anthropic backend disabled until manual re-key.
+
+# Final state
+
+@axis (c) loader-side realpath
+@files_modified
+  - /Users/ghost/core/hive/packages/coding-agent/src/core/extensions/loader.ts
+  - /Users/ghost/core/hive/packages/coding-agent/test/extensions-discovery.test.ts
+  - /Users/ghost/core/hive/.roadmap (entry → done; index row → done)
+@dist_rebuilt /Users/ghost/core/hive/packages/coding-agent/dist/core/extensions/loader.js
+@bandaid_status keep `~/.hive/agent/node_modules → ~/core/hive/node_modules` symlinks on ubu1/ubu2/hetzner for one cycle (defense-in-depth) — schedule removal in next cycle once cross-host verification confirms axis(c) sufficient.
+@verify_local PASS (vitest 55/55, install-extensions dry-run OK, dist build OK)
+@verify_cross_host pending — `nexus kick "verify-install-ext-fix" --dry-run --backend claude_code` (see report sentinel)
+@adjacent_defects 3 flagged (5a/5b/5c) for sub-Q / future cycles
+@upstream_divergence 0 (install-extensions.mjs unchanged; loader.ts is hive-fork code)
+@convergence_only_commit pending
