@@ -1,0 +1,394 @@
+// date_n_guard_lint.hexa — detector for unguarded `date +%s%[0-9]*N` shellouts
+// (carry-forward from ω-cycle `date-percent-3n-macos-bypass-audit`, 2026-04-27)
+// @allow-bare-exec
+// @no-lock-needed
+//
+// BUG CLASS:
+//   BSD `date(1)` on macOS does NOT support `%N` / `%3N`; it emits a literal
+//   trailing `N` AND exits 0. Shell `||` fallback never fires. `to_int(...)`
+//   then rejects → catch sets v=0 → silent semantic-zero in every comparison.
+//
+// CANONICAL SAFE CASCADE (audited 2026-04-27):
+//
+//   let s = exec("date +%s%3N 2>/dev/null").trim()
+//   if s.len() > 0 && s.contains("N") == false { try { v = to_int(s) } catch _ {} }
+//   if v <= 0 { /* python3 time.time_ns()  OR (under R37/AN13) skipped */ }
+//   if v <= 0 { /* date +%s padded with 000 / 000000000 */ }
+//
+// WHAT WE FLAG:
+//   Any source line containing `date +%s%<digits>N` OR `date +%N`
+//   that is NOT followed within `_LOOKAHEAD` lines by an N-guard token.
+//
+// WHAT WE COUNT AS A GUARD (any one is enough):
+//   - `.contains("N")`   — explicit literal-N filter (gold-standard)
+//   - `ends_with("N")`   — equivalent (used in some hive sites)
+//   - `case ` ... `*N)` — shell-side guard (`hexa-lang/tool/ai_native_bench.hexa` form)
+//   - `python3 -c 'import time'` within lookahead — the python3 cascade leg present
+//   - `gdate `           — explicit GNU coreutils binary, never BSD
+//   - `Time::HiRes`      — perl high-res alternative
+//   - a digit-only manual parser annotated with `// digit-only` on the same/next line
+//   - tempfile annotation `// tempfile-suffix-only` (no semantic comparison)
+//
+// HEURISTIC BOUND (honesty: this is NOT a full shell parser):
+//   - Works on raw text lines only (.hexa source).
+//   - May FALSE-POSITIVE on multi-line constructs where the guard is >5 lines away.
+//   - May FALSE-NEGATIVE on novel guard forms not in the token list above.
+//   - For ambiguous cases, prefer flagging — a doc-comment annotation
+//     `// @date-n-guard: <reason>` on the same line silences the rule.
+//
+// USAGE:
+//   hexa run tool/date_n_guard_lint.hexa --root <dir>      # scan all .hexa under dir
+//   hexa run tool/date_n_guard_lint.hexa --files a,b,c     # scan a comma list
+//   hexa run tool/date_n_guard_lint.hexa --selftest        # synthetic-fixture roundtrip
+//   hexa run tool/date_n_guard_lint.hexa --staged          # git diff --cached .hexa only
+//
+// SENTINEL (always emitted to stdout last line):
+//   __DATE_N_GUARD_LINT__ PASS|FAIL violations=<N> files_scanned=<M> root=<path-or-mode>
+//
+// EXIT:
+//   0  no violations (or selftest TP+TN both correct)
+//   1  violations found OR selftest mismatch
+//   2  usage error
+
+let _LOOKAHEAD: i64 = 5
+
+// ─── argv normalize (Mac=[hexa, script, user...] / Linux-stage1=[hexa, "run", script, user...]) ───
+fn _normalize_argv() -> [str] {
+    let _raw_argv = args()
+    let mut _script_idx: i64 = -1
+    let mut _scan_i: i64 = 0
+    while _scan_i < _raw_argv.len() {
+        if _raw_argv[_scan_i].ends_with(".hexa") { _script_idx = _scan_i; break }
+        _scan_i = _scan_i + 1
+    }
+    let mut _user_start: i64 = 2
+    let mut _script_token: str = ""
+    if _script_idx >= 0 {
+        _user_start = _script_idx + 1
+        _script_token = _raw_argv[_script_idx]
+    } else {
+        if _raw_argv.len() >= 3 {
+            if _raw_argv[1] == "run" { _user_start = 3 }
+            if _raw_argv[1] == "eval" { _user_start = 3 }
+        }
+    }
+    let mut argv: [str] = [_raw_argv[0], _script_token]
+    let mut _ua_i: i64 = _user_start
+    while _ua_i < _raw_argv.len() {
+        argv = argv + [_raw_argv[_ua_i]]
+        _ua_i = _ua_i + 1
+    }
+    return argv
+}
+
+// ─── pattern detection ───────────────────────────────────────────────
+// Returns true if the text contains the unguarded-prone substring `date +%s%<digit(s)>N`
+// or `date +%N`. Substring scan is sufficient for .hexa source — we don't try to
+// distinguish comments at this layer (comments containing the pattern are flagged,
+// which is the correct behavior since those comments document violations and should
+// be removed once the rule is enforced).
+fn _line_has_date_n_pattern(s: str) -> bool {
+    // Fast reject
+    if s.contains("date +%") == false { return false }
+    // %N variants: %N, %3N, %6N, %9N, ...
+    if s.contains("date +%N") { return true }
+    if s.contains("%s%N") { return true }
+    if s.contains("%s%3N") { return true }
+    if s.contains("%s%6N") { return true }
+    if s.contains("%s%9N") { return true }
+    // Generic: scan for "%s%" + digit + "N"
+    let chars = ["0","1","2","3","4","5","6","7","8","9"]
+    for d in chars {
+        if s.contains("%s%" + d + "N") { return true }
+        // two-digit forms (rare but exist)
+        for d2 in chars {
+            if s.contains("%s%" + d + d2 + "N") { return true }
+        }
+    }
+    return false
+}
+
+// Inline-silence annotation lets us suppress on intentional documentation.
+fn _line_has_silence_annotation(s: str) -> bool {
+    if s.contains("@date-n-guard:") { return true }
+    return false
+}
+
+// Returns true if `line` (or the next `_LOOKAHEAD` lines) carries a recognized N-guard.
+fn _window_has_guard(lines: [str], idx: i64) -> bool {
+    let n = lines.len()
+    let mut j = idx
+    let limit_raw = idx + _LOOKAHEAD + 1
+    let mut limit = limit_raw
+    if limit > n { limit = n }
+    while j < limit {
+        let ln = lines[j]
+        // Inline silence annotation (highest priority)
+        if _line_has_silence_annotation(ln) { return true }
+        // .contains("N") guard — the gold-standard pattern
+        if ln.contains(".contains(\"N\")") { return true }
+        if ln.contains(".contains('N')") { return true }
+        // ends_with("N")
+        if ln.contains("ends_with(\"N\")") { return true }
+        if ln.contains("ends_with('N')") { return true }
+        // shell-side case ... *N)
+        if ln.contains("*N)") { return true }
+        // python3 cascade leg
+        if ln.contains("python3 -c") && (ln.contains("time.time_ns") || ln.contains("time.time()")) { return true }
+        // gdate (GNU coreutils — never BSD)
+        if ln.contains("gdate ") { return true }
+        // perl Time::HiRes alternative
+        if ln.contains("Time::HiRes") { return true }
+        // digit-only manual parser annotation
+        if ln.contains("// digit-only") || ln.contains("# digit-only") { return true }
+        // tempfile-suffix-only annotation
+        if ln.contains("// tempfile-suffix-only") || ln.contains("# tempfile-suffix-only") { return true }
+        // explicit-threshold magnitude guard ( v > 1e15 / v >= 1e12 / numeric literal )
+        if ln.contains("> 1e15") || ln.contains(">= 1e12") || ln.contains("> 1e12") { return true }
+        if ln.contains("> 1000000000000000") || ln.contains("> 1000000000000.0") || ln.contains("< 1000000000000.0") { return true }
+        // awk-style trailing-N regex check — `if (L ~ /N$/)` or `~ /N$/`
+        if ln.contains("/N$/") { return true }
+        j = j + 1
+    }
+    return false
+}
+
+// ─── file scan ───────────────────────────────────────────────────────
+// Returns (violations_count, violation_lines_tsv).
+// _scan_file uses a TWO-PASS shell-side strategy to bound memory:
+//   Pass 1: `grep -n -E 'date \+%[sN0-9]*N'` produces only candidate-line numbers.
+//   Pass 2: per candidate, `awk` extracts a (line, line+_LOOKAHEAD) window of text.
+// This avoids loading multi-100KB source files into hexa-runtime memory.
+fn _scan_file(path: str) -> [str] {
+    let exists = to_string(exec("test -f '" + path + "' && echo y || echo n")).trim()  // @allow-bare-exec
+    if exists != "y" { return ["0", ""] }
+
+    // Pass 1: grep candidate lines. Output `<line>:<text>`.
+    // Pattern (ERE): `date \+%[sN0-9%]*N` — covers `date +%N`, `date +%s%N`, `date +%s%3N`, ...
+    let cmd1 = "grep -nE 'date \\+%[sN0-9%]*N' '" + path + "' 2>/dev/null"
+    let raw = to_string(exec(cmd1))  // @allow-bare-exec
+    if raw.len() == 0 { return ["0", ""] }
+
+    let mut violations: i64 = 0
+    let mut tsv: str = ""
+    let lookahead_str = to_string(_LOOKAHEAD)
+
+    for grep_ln in raw.split("\n") {
+        let g = to_string(grep_ln)
+        if g.len() == 0 { continue }
+        // split first ":" only — the text after may contain ":" itself
+        let colon = g.index_of(":")
+        if colon <= 0 { continue }
+        let line_no_str = g.substring(0, colon)
+        let text = g.substring(colon + 1, g.len())
+        let mut line_no: i64 = 0
+        try { line_no = to_int(line_no_str) } catch e { line_no = 0 }
+        if line_no <= 0 { continue }
+
+        // Skip if the matching line itself carries the silence annotation.
+        if _line_has_silence_annotation(text) { continue }
+
+        // Pass 2: extract window via awk (line_no .. line_no+_LOOKAHEAD).
+        let win_end = line_no + _LOOKAHEAD
+        let cmd2 = "awk 'NR>=" + to_string(line_no) + " && NR<=" + to_string(win_end) + "' '" + path + "' 2>/dev/null"
+        let win = to_string(exec(cmd2))  // @allow-bare-exec
+        let win_lines = win.split("\n")
+
+        // _window_has_guard expects a [str] of lines starting at idx 0 = the date-pattern line.
+        if _window_has_guard(win_lines, 0) == false {
+            violations = violations + 1
+            let preview = text.trim()
+            let mut prev_safe = preview
+            if prev_safe.len() > 120 { prev_safe = prev_safe.substring(0, 120) + "…" }
+            tsv = tsv + path + "\t" + to_string(line_no) + "\t" + prev_safe + "\n"
+        }
+    }
+    return [to_string(violations), tsv]
+}
+
+// ─── file enumerator ────────────────────────────────────────────────
+fn _list_hexa_under(root: str) -> [str] {
+    // Enumerate via find. Skip .git, .claude/worktrees, node_modules, __pycache__, dist, build.
+    // -size -512k caps memory by skipping multi-MB atlas-data .hexa shards
+    // (which are NOT source code; lint targets hand-written source only).
+    // Pre-filter with grep to keep only files that contain `date +%` — drastically
+    // reduces hexa-runtime memory pressure for large trees (cli/, n6/ etc.).
+    let cmd = "find '" + root + "' -type f -name '*.hexa' "
+        + "-not -path '*/.git/*' "
+        + "-not -path '*/.claude/worktrees/*' "
+        + "-not -path '*/node_modules/*' "
+        + "-not -path '*/__pycache__/*' "
+        + "-not -path '*/dist/*' "
+        + "-not -path '*/build/*' "
+        + "-size -512k "
+        + "-print0 2>/dev/null | xargs -0 grep -l 'date +%' 2>/dev/null"
+    let out = to_string(exec(cmd)).trim()  // @allow-bare-exec
+    if out.len() == 0 { return [] }
+    let mut result: [str] = []
+    for ln in out.split("\n") {
+        let s = to_string(ln).trim()
+        if s.len() > 0 { result = result + [s] }
+    }
+    return result
+}
+
+fn _list_staged_hexa() -> [str] {
+    let raw = to_string(exec("git diff --cached --name-only --diff-filter=ACM 2>/dev/null")).trim()  // @allow-bare-exec
+    if raw.len() == 0 { return [] }
+    let mut result: [str] = []
+    for ln in raw.split("\n") {
+        let s = to_string(ln).trim()
+        if s.len() > 0 && s.ends_with(".hexa") {
+            result = result + [s]
+        }
+    }
+    return result
+}
+
+// ─── orchestration ──────────────────────────────────────────────────
+fn _run_scan(files: [str], mode_label: str) -> i64 {
+    let mut total_violations: i64 = 0
+    let mut total_tsv: str = ""
+    for f in files {
+        let r = _scan_file(f)
+        let v = to_int(r[0])
+        if v > 0 {
+            total_violations = total_violations + v
+            total_tsv = total_tsv + r[1]
+        }
+    }
+    if total_violations > 0 {
+        eprintln("[date_n_guard_lint] VIOLATIONS:")
+        for ln in total_tsv.split("\n") {
+            let s = to_string(ln).trim()
+            if s.len() == 0 { continue }
+            let parts = s.split("\t")
+            if parts.len() >= 3 {
+                eprintln("  " + parts[0] + ":" + parts[1] + " — " + parts[2])
+            }
+        }
+        eprintln("")
+        eprintln("  fix: replace bare `date +%s%[0-9]*N` with cascade")
+        eprintln("       (BSD N-guard → python3 → date+%s padded zeros)")
+        eprintln("       silence: `// @date-n-guard: <reason>` on same line")
+    }
+    let mut verdict = "PASS"
+    if total_violations > 0 { verdict = "FAIL" }
+    println("__DATE_N_GUARD_LINT__ "
+        + verdict
+        + " violations=" + to_string(total_violations)
+        + " files_scanned=" + to_string(files.len())
+        + " root=" + mode_label)
+    return total_violations
+}
+
+// ─── selftest ───────────────────────────────────────────────────────
+// Synthesize 3 unsafe + 4 safe forms inline (no fixture file deps), run detector,
+// expect violations=3 and FP=0.
+fn _selftest() -> i64 {
+    // Three UNSAFE forms (each must be flagged):
+    // U1: classic bare exec to_int chain
+    // U2: `||` shell fallback (broken on BSD because date exits 0)
+    // U3: %N (no digits) bare
+    let unsafe_src = ""
+        + "fn t1() { let r = exec(\"date +%s%3N 2>/dev/null\").trim(); let v = to_int(r); }\n"
+        + "fn t2() { let r = exec(\"date +%s%3N || date +%s\").trim(); let v = to_int(r); }\n"
+        + "fn t3() { let r = exec(\"date +%N\").trim(); }\n"
+
+    // Four SAFE forms (none should be flagged):
+    // S1: gold-standard contains-N guard
+    // S2: shell case *N) guard
+    // S3: gdate explicit
+    // S4: python3 cascade present in window
+    let safe_src = ""
+        + "fn s1() { let r = exec(\"date +%s%3N\").trim(); if r.contains(\"N\") == false { let v = to_int(r); } }\n"
+        + "fn s2() { let r = exec(\"x=$(date +%s%3N); case \\\"$x\\\" in *N) x=0;; esac\").trim(); }\n"
+        + "fn s3() { let r = exec(\"gdate +%s%3N\").trim(); let v = to_int(r); }\n"
+        + "fn s4() { let r = exec(\"date +%s%3N 2>/dev/null\").trim(); if r.len() == 0 { r = exec(\"python3 -c 'import time;print(int(time.time_ns()))'\").trim(); } }\n"
+
+    let tmpdir = "/tmp/_date_n_guard_lint_selftest"
+    let _ = exec("mkdir -p '" + tmpdir + "' && rm -f '" + tmpdir + "/'*.hexa")  // @allow-bare-exec
+    let unsafe_path = tmpdir + "/UNSAFE.hexa"
+    let safe_path = tmpdir + "/SAFE.hexa"
+    let _ = exec("cat > '" + unsafe_path + "' <<'__SELFTEST_EOF_U__'\n" + unsafe_src + "__SELFTEST_EOF_U__\n")  // @allow-bare-exec
+    let _ = exec("cat > '" + safe_path + "' <<'__SELFTEST_EOF_S__'\n" + safe_src + "__SELFTEST_EOF_S__\n")  // @allow-bare-exec
+
+    let r_un = _scan_file(unsafe_path)
+    let r_sf = _scan_file(safe_path)
+    let v_un = to_int(r_un[0])
+    let v_sf = to_int(r_sf[0])
+
+    let tp_ok = (v_un == 3)  // expect 3 true positives
+    let fp_ok = (v_sf == 0)  // expect 0 false positives
+
+    let pass = tp_ok && fp_ok
+
+    let mut tp_label = "MISS"
+    if tp_ok { tp_label = "OK" }
+    let mut fp_label = "FP"
+    if fp_ok { fp_label = "OK" }
+    eprintln("[selftest] unsafe synthetic: expected=3 got=" + to_string(v_un) + " " + tp_label)
+    eprintln("[selftest] safe synthetic:   expected=0 got=" + to_string(v_sf) + " " + fp_label)
+    if !tp_ok { eprintln("[selftest] unsafe details:\n" + r_un[1]) }
+    if !fp_ok { eprintln("[selftest] safe FP details:\n" + r_sf[1]) }
+
+    let mut verdict = "FAIL"
+    if pass { verdict = "PASS" }
+    println("__DATE_N_GUARD_LINT__ "
+        + verdict
+        + " violations=" + to_string(v_un)
+        + " false_positives_in_selftest=" + to_string(v_sf)
+        + " files_scanned=2 root=selftest")
+
+    let _cleanup = exec("rm -rf '" + tmpdir + "'")  // @allow-bare-exec
+    if pass { return 0 }
+    return 1
+}
+
+// ─── main ───────────────────────────────────────────────────────────
+fn main() {
+    let argv = _normalize_argv()
+    if argv.len() < 3 {
+        eprintln("usage:")
+        eprintln("  hexa run tool/date_n_guard_lint.hexa --root <dir>")
+        eprintln("  hexa run tool/date_n_guard_lint.hexa --files a.hexa,b.hexa")
+        eprintln("  hexa run tool/date_n_guard_lint.hexa --selftest")
+        eprintln("  hexa run tool/date_n_guard_lint.hexa --staged")
+        exit(2)
+    }
+    let mode = argv[2]
+    if mode == "--selftest" {
+        let rc = _selftest()
+        exit(rc)
+    }
+    if mode == "--staged" {
+        let files = _list_staged_hexa()
+        let rc = _run_scan(files, "staged")
+        if rc > 0 { exit(1) }
+        exit(0)
+    }
+    if mode == "--root" {
+        if argv.len() < 4 { eprintln("--root needs <dir>"); exit(2) }
+        let root = argv[3]
+        let files = _list_hexa_under(root)
+        let rc = _run_scan(files, root)
+        if rc > 0 { exit(1) }
+        exit(0)
+    }
+    if mode == "--files" {
+        if argv.len() < 4 { eprintln("--files needs <a,b,c>"); exit(2) }
+        let csv = argv[3]
+        let mut files: [str] = []
+        for p in csv.split(",") {
+            let s = to_string(p).trim()
+            if s.len() > 0 { files = files + [s] }
+        }
+        let rc = _run_scan(files, "files-list")
+        if rc > 0 { exit(1) }
+        exit(0)
+    }
+    eprintln("unknown mode: " + mode)
+    exit(2)
+}
+
+main()

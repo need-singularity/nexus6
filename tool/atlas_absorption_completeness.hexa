@@ -1,0 +1,438 @@
+#!hexa strict
+// tool/atlas_absorption_completeness.hexa — RCA §4.2 implementation
+//
+// @tool(slug="atlas_absorption_completeness", desc="Diff cited |> paths in atlas.n6 + atlas.append.*.n6 vs the n6-architecture corpus (papers/, reports/sessions/, design/, domains/, docs/, experiments/). Reports uncited corpus files (B \\ A) so absorption gaps are visible.")
+// @usage(hexa run tool/atlas_absorption_completeness.hexa [--top N | --all] [--jsonl] [--self-test])
+// @exit_codes(0=PASS, 1=usage/io, 2=self-test failure)
+// @sentinel(__ATLAS_ABSORPTION_COMPLETENESS__ PASS uncited=N corpus=M cited=K)
+// @origin(state/absorption_miss_rca_2026-04-27.md §4.2)
+// @paradigm(structural — set diff of file paths cited in atlas vs file paths reachable in n6-arch corpus)
+// @allow-bare-exec
+
+// ─── helpers ───────────────────────────────────────────────────
+
+fn dir_exists(p: string) -> bool {
+    let out = to_string(exec("test -d '" + p + "' && echo y || echo n")).trim()
+    if out == "y" { return true }
+    return false
+}
+
+fn file_exists_safe(p: string) -> bool {
+    let out = to_string(exec("test -f '" + p + "' && echo y || echo n")).trim()
+    if out == "y" { return true }
+    return false
+}
+
+fn _core_root() -> string {
+    let override = env_var("NEXUS_CORE_ROOT")
+    if len(override) > 0 && dir_exists(override) { return override }
+    return env_var("HOME") + "/core"
+}
+
+fn _n6arch_root() -> string {
+    let r = _core_root()
+    if dir_exists(r + "/n6-architecture") { return r + "/n6-architecture" }
+    if dir_exists(r + "/n6-arch") { return r + "/n6-arch" }
+    return r + "/n6-architecture"
+}
+
+fn _atlas_main_path() -> string {
+    return _core_root() + "/nexus/n6/atlas.n6"
+}
+
+fn _shard_dir() -> string {
+    return _core_root() + "/nexus/n6"
+}
+
+// EXEMPT list: files which the absorption-completeness tool is NOT supposed to flag.
+// Per RCA §4.2 these live as 3리포 SSOT and are not expected to appear under |>.
+fn _exempt_list() -> array {
+    return [
+        "atlas/atlas.signals.n6",
+        "atlas/atlas.millennium.n6"
+    ]
+}
+
+fn _is_exempt(rel: string) -> bool {
+    let exempt = _exempt_list()
+    let mut i = 0
+    while i < len(exempt) {
+        if rel == exempt[i] { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── Build SET A (cited) ───────────────────────────────────────
+// Pull every "|> ..." line from atlas.n6 + every atlas.append.*.n6, then for each
+// such line split tokens on whitespace and keep tokens that look like a path
+// (i.e. contain "/" — bare slugs like "agent-session-ts-port-roi" are not files
+// in the corpus B and would just count as "uncited" noise; ignore them).
+// We further strip trailing punctuation (commas, colons, parens) and any ":<n>"
+// line-suffix so that "airgenome/core/core.hexa:16" matches "airgenome/core/core.hexa".
+
+fn _strip_path_suffix(tok: string) -> string {
+    let mut t = tok
+    // strip trailing punctuation (one pass — paths don't end in punct)
+    let mut changed = true
+    while changed {
+        changed = false
+        let n = len(t)
+        if n == 0 { return t }
+        let tail = t.substring(n - 1, n)
+        if tail == "," || tail == "." || tail == ";" || tail == ":" || tail == ")" || tail == "(" {
+            t = t.substring(0, n - 1)
+            changed = true
+        }
+    }
+    // strip ":<digits>" suffix (file:line refs like core.hexa:16)
+    let colon = t.last_index_of(":")
+    if colon > 0 {
+        let after = t.substring(colon + 1, len(t))
+        let mut all_digits = len(after) > 0
+        let mut k = 0
+        while k < len(after) {
+            let c = after.substring(k, k + 1)
+            if c < "0" || c > "9" { all_digits = false; break }
+            k = k + 1
+        }
+        if all_digits { t = t.substring(0, colon) }
+    }
+    return t
+}
+
+fn _build_cited_set() -> array {
+    let main = _atlas_main_path()
+    let dir = _shard_dir()
+    let cmd = "grep -hE '\\|>' '" + main + "' '" + dir + "'/atlas.append.*.n6 2>/dev/null"
+    let out = to_string(exec(cmd))
+    let mut set_lines = ""
+    if len(out.trim()) == 0 { return [set_lines, "0"] }
+    let lines = out.split("\n")
+    let mut seen = ""
+    let mut count = 0
+    let mut i = 0
+    while i < len(lines) {
+        let raw = lines[i]
+        let arrow = raw.index_of("|>")
+        if arrow < 0 { i = i + 1; continue }
+        let after = raw.substring(arrow + 2, len(raw)).trim()
+        if len(after) == 0 { i = i + 1; continue }
+        let toks = after.split(" ")
+        let mut j = 0
+        while j < len(toks) {
+            let raw_tok = toks[j].trim()
+            if len(raw_tok) == 0 { j = j + 1; continue }
+            let tok = _strip_path_suffix(raw_tok)
+            if len(tok) == 0 { j = j + 1; continue }
+            // require it look like a path: contain "/" OR end with a known ext
+            if tok.index_of("/") < 0 { j = j + 1; continue }
+            // dedup
+            let needle = "\n" + tok + "\n"
+            if seen.index_of(needle) < 0 && !(len(seen) >= len(tok) + 1 && seen.substring(0, len(tok) + 1) == tok + "\n") {
+                seen = seen + tok + "\n"
+                count = count + 1
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return [seen, to_string(count)]
+}
+
+// ─── Build SET B (corpus) ─────────────────────────────────────
+
+fn _corpus_subdirs() -> array {
+    return [
+        "experiments",
+        "papers",
+        "reports/sessions",
+        "design",
+        "domains",
+        "docs"
+    ]
+}
+
+fn _build_corpus(repo: string) -> array {
+    let subs = _corpus_subdirs()
+    let mut paths = []
+    let mut existing = []
+    let mut i = 0
+    while i < len(subs) {
+        let sub = subs[i]
+        let abs = repo + "/" + sub
+        if dir_exists(abs) { existing.push(abs) }
+        i = i + 1
+    }
+    if len(existing) == 0 { return paths }
+    // build space-quoted list
+    let mut roots_arg = ""
+    let mut k = 0
+    while k < len(existing) {
+        roots_arg = roots_arg + "'" + existing[k] + "' "
+        k = k + 1
+    }
+    let prune = "-not -path '*/venv/*' -not -path '*/__pycache__/*' -not -path '*/node_modules/*' -not -path '*/.cache/*' -not -path '*/.git/*'"
+    let exts = "\\( -name '*.md' -o -name '*.hexa' -o -name '*.json' -o -name '*.py' \\)"
+    let cmd = "find " + roots_arg + " -type f " + prune + " " + exts + " 2>/dev/null | sort"
+    let out = to_string(exec(cmd)).trim()
+    if len(out) == 0 { return paths }
+    let lines = out.split("\n")
+    let mut j = 0
+    while j < len(lines) {
+        let l = lines[j].trim()
+        if len(l) > 0 { paths.push(l) }
+        j = j + 1
+    }
+    return paths
+}
+
+fn _relpath_from(repo_root: string, abs_path: string) -> string {
+    let prefix = repo_root + "/"
+    if abs_path.index_of(prefix) == 0 {
+        return abs_path.substring(len(prefix), len(abs_path))
+    }
+    return abs_path
+}
+
+// ─── covered? — does any cited token reference this corpus rel-path? ───
+// A corpus rel-path is "covered" if cited_set contains any token T such that
+// T == rel  OR  T endswith rel  (e.g. cite "n6-architecture/papers/foo.md"
+// covers corpus rel "papers/foo.md")  OR  T is a prefix-dir of rel
+// (e.g. cite "experiments/anu_mc_verification" covers any file beneath that).
+//
+// We implement this as: for each line in cited_blob, test those three relations.
+
+fn _is_covered(cited_blob: string, rel: string) -> bool {
+    if len(cited_blob) == 0 { return false }
+    if len(rel) == 0 { return false }
+    let cited_lines = cited_blob.split("\n")
+    let mut i = 0
+    while i < len(cited_lines) {
+        let t = cited_lines[i].trim()
+        if len(t) == 0 { i = i + 1; continue }
+        if t == rel { return true }
+        // suffix match: cited token ends with rel (with "/" separator)
+        let want_suffix = "/" + rel
+        let ln = len(t)
+        let lr = len(want_suffix)
+        if ln >= lr {
+            let tail = t.substring(ln - lr, ln)
+            if tail == want_suffix { return true }
+        }
+        // dir-prefix: rel starts with t + "/"
+        let prefix = t + "/"
+        let lp = len(prefix)
+        if len(rel) >= lp {
+            let head = rel.substring(0, lp)
+            if head == prefix { return true }
+        }
+        // also: if cited token has a leading dir we don't know about, try its suffix
+        // e.g. cited="n6-architecture/experiments/foo.hexa", rel="experiments/foo.hexa"
+        // — handled by suffix-match above
+        i = i + 1
+    }
+    return false
+}
+
+// ─── self-test ────────────────────────────────────────────────
+
+fn _run_self_test() {
+    let tdir = "/tmp/atlas_absorption_test"
+    exec("rm -rf '" + tdir + "'")
+    exec("mkdir -p '" + tdir + "/papers' '" + tdir + "/experiments/anu_mc_verification' '" + tdir + "/atlas'")
+    // create three corpus files
+    write_file(tdir + "/papers/cited_paper.md", "# cited\n")
+    write_file(tdir + "/papers/uncited_paper.md", "# uncited\n")
+    write_file(tdir + "/experiments/anu_mc_verification/exp_a.hexa", "// exp\n")
+    // EXEMPT: signals + millennium
+    write_file(tdir + "/atlas/atlas.signals.n6", "@S TEST = x :: signal [NX] [TEST] [M7]\n")
+    write_file(tdir + "/atlas/atlas.millennium.n6", "// mill\n")
+
+    // synthetic cited blob (only papers/cited_paper.md + experiments/anu_mc_verification dir)
+    let cited_blob = "papers/cited_paper.md\nexperiments/anu_mc_verification\n"
+
+    let mut corpus = []
+    // mimic _build_corpus on tdir
+    let cmd = "find '" + tdir + "/papers' '" + tdir + "/experiments' '" + tdir + "/atlas' -type f \\( -name '*.md' -o -name '*.hexa' -o -name '*.n6' \\) 2>/dev/null | sort"
+    let out = to_string(exec(cmd)).trim()
+    let lines = out.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let l = lines[i].trim()
+        if len(l) > 0 { corpus.push(l) }
+        i = i + 1
+    }
+
+    let mut uncited = []
+    let mut signals_was_exempted = false
+    i = 0
+    while i < len(corpus) {
+        let abs = corpus[i]
+        let rel = _relpath_from(tdir, abs)
+        if _is_exempt(rel) {
+            if rel == "atlas/atlas.signals.n6" { signals_was_exempted = true }
+            i = i + 1
+            continue
+        }
+        if !_is_covered(cited_blob, rel) { uncited.push(rel) }
+        i = i + 1
+    }
+
+    // check 1: exemption — atlas/atlas.signals.n6 must have been EXEMPTED (not appear in uncited)
+    let mut signals_in_uncited = false
+    let mut k = 0
+    while k < len(uncited) {
+        if uncited[k] == "atlas/atlas.signals.n6" { signals_in_uncited = true }
+        k = k + 1
+    }
+
+    // check 2: uncited must contain papers/uncited_paper.md
+    let mut uncited_caught = false
+    k = 0
+    while k < len(uncited) {
+        if uncited[k] == "papers/uncited_paper.md" { uncited_caught = true }
+        k = k + 1
+    }
+
+    // check 3: covered file must NOT be in uncited
+    let mut covered_leaked = false
+    k = 0
+    while k < len(uncited) {
+        if uncited[k] == "papers/cited_paper.md" { covered_leaked = true }
+        k = k + 1
+    }
+
+    println("=== atlas_absorption_completeness --self-test ===")
+    println("  fixture          : " + tdir)
+    println("  corpus files     : " + to_string(len(corpus)))
+    println("  uncited count    : " + to_string(len(uncited)))
+    println("  exempt fired     : " + to_string(signals_was_exempted))
+    println("  signals in uncit : " + to_string(signals_in_uncited))
+    println("  uncited caught   : " + to_string(uncited_caught))
+    println("  covered leaked   : " + to_string(covered_leaked))
+
+    let mut ok = true
+    if !signals_was_exempted { ok = false }
+    if signals_in_uncited { ok = false }
+    if !uncited_caught { ok = false }
+    if covered_leaked { ok = false }
+
+    exec("rm -rf '" + tdir + "'")
+
+    if ok {
+        println("__ATLAS_ABSORPTION_COMPLETENESS_SELFTEST__ PASS")
+        exit(0)
+    }
+    println("__ATLAS_ABSORPTION_COMPLETENESS_SELFTEST__ FAIL")
+    exit(2)
+}
+
+// ─── main ─────────────────────────────────────────────────────
+
+fn _print_help() {
+    println("usage: hexa run tool/atlas_absorption_completeness.hexa [--top N | --all] [--jsonl] [--self-test]")
+    println("modes:")
+    println("  (default)        report top-50 uncited corpus files")
+    println("  --top N          report top-N uncited (default 50)")
+    println("  --all            report every uncited path")
+    println("  --jsonl          append a one-line JSON summary to state/atlas_health_timeline.jsonl")
+    println("  --self-test      synthetic-fixture pipeline, verify exemption + diff semantics")
+    println("origin: state/absorption_miss_rca_2026-04-27.md §4.2")
+    println("sentinel: __ATLAS_ABSORPTION_COMPLETENESS__ PASS uncited=N corpus=M cited=K")
+}
+
+fn main() -> void {
+    let raw_args = args()
+    let mut cli = []
+    let mut ai = 2
+    while ai < len(raw_args) {
+        cli.push(raw_args[ai])
+        ai = ai + 1
+    }
+    let mut top_n = 50
+    let mut show_all = false
+    let mut emit_jsonl = false
+    let mut self_test = false
+    let mut i = 0
+    while i < len(cli) {
+        let a = cli[i]
+        if a == "--self-test" || a == "--selftest" { self_test = true }
+        else if a == "--all" { show_all = true }
+        else if a == "--jsonl" { emit_jsonl = true }
+        else if a == "--top" {
+            if i + 1 >= len(cli) { eprintln("--top requires N"); exit(1) }
+            top_n = to_int(cli[i + 1])
+            i = i + 1
+        }
+        else if a == "--help" || a == "-h" { _print_help(); exit(0) }
+        else {
+            eprintln("atlas_absorption_completeness: unknown arg `" + a + "`")
+            exit(1)
+        }
+        i = i + 1
+    }
+
+    if self_test { _run_self_test() }
+
+    let repo = _n6arch_root()
+    if !dir_exists(repo) {
+        eprintln("__ATLAS_ABSORPTION_COMPLETENESS__ FAIL repo missing: " + repo)
+        exit(1)
+    }
+
+    let cited_pair = _build_cited_set()
+    let cited_blob = cited_pair[0]
+    let cited_count = to_int(cited_pair[1])
+
+    let corpus = _build_corpus(repo)
+    let mut uncited = []
+    let mut exempt_count = 0
+    i = 0
+    while i < len(corpus) {
+        let abs = corpus[i]
+        let rel = _relpath_from(repo, abs)
+        if _is_exempt(rel) { exempt_count = exempt_count + 1; i = i + 1; continue }
+        if !_is_covered(cited_blob, rel) { uncited.push(rel) }
+        i = i + 1
+    }
+
+    let limit = if show_all { len(uncited) } else { top_n }
+    let mut shown = limit
+    if shown > len(uncited) { shown = len(uncited) }
+
+    println("=== atlas_absorption_completeness ===")
+    println("  n6-arch repo     : " + repo)
+    println("  cited tokens     : " + to_string(cited_count))
+    println("  corpus files     : " + to_string(len(corpus)))
+    println("  exempted         : " + to_string(exempt_count))
+    println("  uncited count    : " + to_string(len(uncited)))
+    println("  showing          : " + to_string(shown) + (if show_all { "" } else { " (top)" }))
+    println("")
+    let mut p = 0
+    while p < shown {
+        println("  " + uncited[p])
+        p = p + 1
+    }
+    if !show_all && len(uncited) > shown {
+        println("  ... (" + to_string(len(uncited) - shown) + " more — use --all)")
+    }
+
+    if emit_jsonl {
+        let ts = to_string(exec("date -u +'%Y-%m-%dT%H:%M:%SZ'")).trim()
+        let line = "{\"ts\":\"" + ts + "\",\"scope\":\"atlas_absorption_completeness\",\"repo\":\"" + repo + "\",\"corpus\":" + to_string(len(corpus)) + ",\"cited\":" + to_string(cited_count) + ",\"uncited\":" + to_string(len(uncited)) + ",\"exempted\":" + to_string(exempt_count) + ",\"checker\":\"atlas_absorption_completeness.hexa\"}\n"
+        let timeline = _core_root() + "/nexus/state/atlas_health_timeline.jsonl"
+        exec("printf '%s' " + _shell_quote(line) + " >> '" + timeline + "'")
+        println("")
+        println("  jsonl appended to: " + timeline)
+    }
+
+    println("")
+    println("__ATLAS_ABSORPTION_COMPLETENESS__ PASS uncited=" + to_string(len(uncited)) + " corpus=" + to_string(len(corpus)) + " cited=" + to_string(cited_count))
+    exit(0)
+}
+
+fn _shell_quote(s: string) -> string {
+    let r = s.replace("'", "'\\''")
+    return "'" + r + "'"
+}

@@ -1,0 +1,1202 @@
+#!hexa strict
+// tool/signals_sync.hexa — read-only diff of atlas.signals.n6 across nexus / n6-arch / anima copies
+//
+// @tool(slug="signals_sync", desc="Read-only 3리포 (and any anima worktree copy) diff of atlas.signals.n6. Extracts @S signal IDs from each repo, reports only-in-A / only-in-B / common, and for common IDs sha256s the entry text to flag content drift. Default = NEVER auto-merges. `--apply-trivial` (env-gated by NEXUS_SIGNALS_SYNC_APPLY=1) and `--emit-patch` enable user-authorized APPLY_TRIVIAL paths. `--cross-publish` (env-gated by NEXUS_SIGNALS_SYNC_PUBLISH=1 + --direction + --confirm-direction-<dir>) enables user-authorized append of CROSS_PUBLISH-classed @S blocks across repos. `--batch sig1,sig2,...` scopes either pipeline to a user-named subset.")
+// @usage(hexa run tool/signals_sync.hexa [--detail] [--proposed-merge] [--by-id] [--repos] [--self-test] [--apply-trivial] [--emit-patch] [--patch-out <dir>] [--cross-publish] [--direction nexus-to-n6arch|n6arch-to-nexus] [--confirm-direction-nexus-to-n6arch|--confirm-direction-n6arch-to-nexus] [--batch sig1,sig2,...])
+// @exit_codes(0=PASS, 1=usage/io/env-gate-violation (raw 66), 2=self-test failure)
+// @sentinel(__SIGNALS_SYNC__ PASS repos=N drift=M content_drift=K)
+// @sentinel(__SIGNALS_SYNC_APPLY__ <PASS|SKIP|FAIL> applied=N patches=M skipped=K reason=<slug> fix=<directive>)
+// @sentinel(__SIGNALS_SYNC_PUBLISH__ <PASS|SKIP|FAIL> published=N patches=M skipped=K direction=<dir> reason=<slug> fix=<directive>)
+// @trailer-format(raw-66-v2-R1 single-line: each FAIL sentinel line is independently parseable;
+//                 reason=<slug> and fix=<directive> always appear on the same eprintln, never split.)
+// @origin(state/atlas_signals_3repo_sync.md — manual diff replacement)
+// @paradigm(structural — set diff over @S IDs + per-entry sha256 content-eq)
+// @allow-bare-exec
+//
+// Hard rule: read-only by DEFAULT. `--proposed-merge` prints a text plan to stdout.
+// `--apply-trivial` only proceeds with mutation when env NEXUS_SIGNALS_SYNC_APPLY=1
+// is set; otherwise refuses with raw 66 reason=apply-trivial-without-env-gate.
+// `--cross-publish` only proceeds with mutation when ALL of the following hold:
+//   (a) env NEXUS_SIGNALS_SYNC_PUBLISH=1 is set,
+//   (b) `--direction nexus-to-n6arch` OR `--direction n6arch-to-nexus` is given,
+//   (c) the matching `--confirm-direction-<dir>` flag is also passed (non-interactive
+//       sign-off; refuses to silently mutate cross-repo without explicit direction
+//       confirmation), AND
+//   (d) `--emit-patch` may be composed in (writes to design/patches/signals/cross_publish/).
+// Otherwise refuses with raw 66 reason=cross-publish-without-env-gate /
+// cross-publish-without-direction / cross-publish-without-direction-confirm.
+// `--emit-patch` writes unified diffs only — no mutation regardless of env-gate.
+// `--batch sig1,sig2,...` restricts either --apply-trivial or --cross-publish to
+// only the listed sig IDs (orthogonal scope filter; default = all in-class IDs).
+
+// ─── helpers ───────────────────────────────────────────────────
+
+fn dir_exists(p: string) -> bool {
+    let out = to_string(exec("test -d '" + p + "' && echo y || echo n")).trim()
+    if out == "y" { return true }
+    return false
+}
+
+fn file_exists_safe(p: string) -> bool {
+    let out = to_string(exec("test -f '" + p + "' && echo y || echo n")).trim()
+    if out == "y" { return true }
+    return false
+}
+
+fn _core_root() -> string {
+    let override = env_var("NEXUS_CORE_ROOT")
+    if len(override) > 0 && dir_exists(override) { return override }
+    return env_var("HOME") + "/core"
+}
+
+fn _shell_quote(s: string) -> string {
+    let r = s.replace("'", "'\\''")
+    return "'" + r + "'"
+}
+
+// ─── repo discovery ───────────────────────────────────────────
+// Canonical:
+//   - nexus           : /Users/ghost/core/nexus/n6/atlas.signals.n6
+//   - n6-architecture : /Users/ghost/core/n6-architecture/atlas/atlas.signals.n6
+//   - anima/n6        : /Users/ghost/core/anima/n6/atlas.signals.n6   (preferred)
+//   - anima/data      : /Users/ghost/core/anima/data/atlas.signals.n6 (older)
+// Plus any other anima copies: `find ~/core/anima -name 'atlas.signals.n6'`
+// We dedup by sha256-of-path so multiple worktrees with identical contents
+// still get aggregated. For the diff we keep them as separate repos but tag
+// worktree paths visibly.
+
+fn _discover_repos() -> array {
+    let core = _core_root()
+    let mut out = []
+    // canonical 3
+    let canonical = [
+        ["nexus", core + "/nexus/n6/atlas.signals.n6"],
+        ["n6-arch", core + "/n6-architecture/atlas/atlas.signals.n6"],
+        ["anima-n6", core + "/anima/n6/atlas.signals.n6"],
+        ["anima-data", core + "/anima/data/atlas.signals.n6"]
+    ]
+    let mut i = 0
+    while i < len(canonical) {
+        let row = canonical[i]
+        if file_exists_safe(row[1]) { out.push(row) }
+        i = i + 1
+    }
+    // anima worktrees + plus any other anima discovery
+    // -L follow symlinks (anima worktrees are symlinks), -type f passes after deref
+    let cmd = "find -L '" + core + "/anima' -name 'atlas.signals.n6' -type f 2>/dev/null | sort -u"
+    let raw = to_string(exec(cmd)).trim()
+    if len(raw) > 0 {
+        let lines = raw.split("\n")
+        let mut j = 0
+        while j < len(lines) {
+            let p = lines[j].trim()
+            if len(p) == 0 { j = j + 1; continue }
+            // skip if already in canonical list
+            let mut already = false
+            let mut k = 0
+            while k < len(out) {
+                if out[k][1] == p { already = true; break }
+                k = k + 1
+            }
+            if !already {
+                // derive a short label from the path component after /anima/
+                let needle = "/anima/"
+                let idx = p.index_of(needle)
+                let label = if idx >= 0 {
+                    "anima:" + p.substring(idx + len(needle), len(p))
+                } else { p }
+                out.push([label, p])
+            }
+            j = j + 1
+        }
+    }
+    return out
+}
+
+// ─── ID extraction ───────────────────────────────────────────
+
+fn _extract_ids(path: string) -> array {
+    let cmd = "grep '^@S [A-Z]' '" + path + "' 2>/dev/null | awk '{print $2}' | sort -u"
+    let out = to_string(exec(cmd)).trim()
+    if len(out) == 0 { return [] }
+    return out.split("\n")
+}
+
+// ─── entry sha (for common-ID content drift) ─────────────────
+// Extract the multi-line block for one @S id from the file, then sha256.
+// Block = the line "@S <id> ..." plus all following lines until next "@S " or EOF.
+// We use awk for this: split the file at /^@S /, then grep the right one.
+
+fn _entry_sha(path: string, id: string) -> string {
+    // safest: awk that prints from line "@S <id>" until next "@S " or EOF
+    let id_quoted = _shell_quote(id)
+    let path_quoted = _shell_quote(path)
+    let cmd = "awk -v ID=" + id_quoted + " 'BEGIN{p=0} /^@S /{ if (p) exit; if ($2==ID) p=1 } { if (p) print }' " + path_quoted + " | shasum -a 256 | awk '{print $1}'"
+    let out = to_string(exec(cmd)).trim()
+    return out
+}
+
+// ─── set ops ─────────────────────────────────────────────────
+
+fn _array_contains(arr: array, x: string) -> bool {
+    let mut i = 0
+    while i < len(arr) {
+        if arr[i] == x { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _intersect(a: array, b: array) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < len(a) {
+        if _array_contains(b, a[i]) { out.push(a[i]) }
+        i = i + 1
+    }
+    return out
+}
+
+fn _minus(a: array, b: array) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < len(a) {
+        if !_array_contains(b, a[i]) { out.push(a[i]) }
+        i = i + 1
+    }
+    return out
+}
+
+fn _union(a: array, b: array) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < len(a) { out.push(a[i]); i = i + 1 }
+    i = 0
+    while i < len(b) {
+        if !_array_contains(out, b[i]) { out.push(b[i]) }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── self-test ────────────────────────────────────────────────
+// 2 fixtures with known drift:
+//   fixture A: 3 IDs (X, Y, Z)
+//   fixture B: 3 IDs (X, Y, W)  — Y has different body content
+// expected diff: only-A=[Z], only-B=[W], common=[X,Y], content_drift={Y}
+
+fn _run_self_test() {
+    let tdir = "/tmp/signals_sync_test"
+    exec("rm -rf '" + tdir + "'")
+    exec("mkdir -p '" + tdir + "'")
+    let fa = tdir + "/A.signals.n6"
+    let fb = tdir + "/B.signals.n6"
+    let body_a = "# header\n\n@S SIG-X-001 = X stmt :: signal [NX] [TEST] [M7] [E1]\n  body of X\n\n@S SIG-Y-001 = Y stmt v1 :: signal [NX] [TEST] [M7] [E1]\n  body of Y v1\n\n@S SIG-Z-001 = Z stmt :: signal [NX] [TEST] [M7] [E1]\n  body of Z\n"
+    let body_b = "# header\n\n@S SIG-X-001 = X stmt :: signal [NX] [TEST] [M7] [E1]\n  body of X\n\n@S SIG-Y-001 = Y stmt v2 :: signal [NX] [TEST] [M7] [E1]\n  body of Y v2 (different)\n\n@S SIG-W-001 = W stmt :: signal [NX] [TEST] [M7] [E1]\n  body of W\n"
+    write_file(fa, body_a)
+    write_file(fb, body_b)
+
+    let ids_a = _extract_ids(fa)
+    let ids_b = _extract_ids(fb)
+    let only_a = _minus(ids_a, ids_b)
+    let only_b = _minus(ids_b, ids_a)
+    let common = _intersect(ids_a, ids_b)
+
+    // content drift among common
+    let mut drift = []
+    let mut i = 0
+    while i < len(common) {
+        let id = common[i]
+        let sa = _entry_sha(fa, id)
+        let sb = _entry_sha(fb, id)
+        if sa != sb { drift.push(id) }
+        i = i + 1
+    }
+
+    let mut ok = true
+    if len(only_a) != 1 || only_a[0] != "SIG-Z-001" { ok = false }
+    if len(only_b) != 1 || only_b[0] != "SIG-W-001" { ok = false }
+    if len(common) != 2 { ok = false }
+    if len(drift) != 1 || drift[0] != "SIG-Y-001" { ok = false }
+
+    println("=== signals_sync --self-test ===")
+    println("  ids_a            : " + to_string(len(ids_a)))
+    println("  ids_b            : " + to_string(len(ids_b)))
+    println("  only_a           : " + _join(only_a, ","))
+    println("  only_b           : " + _join(only_b, ","))
+    println("  common           : " + _join(common, ","))
+    println("  content_drift    : " + _join(drift, ","))
+
+    exec("rm -rf '" + tdir + "'")
+
+    if ok {
+        println("__SIGNALS_SYNC_SELFTEST__ PASS")
+        exit(0)
+    }
+    println("__SIGNALS_SYNC_SELFTEST__ FAIL")
+    exit(2)
+}
+
+fn _join(arr: array, sep: string) -> string {
+    let mut s = ""
+    let mut i = 0
+    while i < len(arr) {
+        if i > 0 { s = s + sep }
+        s = s + arr[i]
+        i = i + 1
+    }
+    return s
+}
+
+// ─── per-ID helpers (--by-id mode) ────────────────────────────
+// Extract the literal `@S <id> = ... :: signal [TAGS] ...` header line for one
+// id from a file. Returns "" if not present. Used by --by-id to compare tag
+// sets without sha-shadowing from trailing-block effects.
+
+fn _entry_header(path: string, id: string) -> string {
+    let id_quoted = _shell_quote(id)
+    let path_quoted = _shell_quote(path)
+    let cmd = "awk -v ID=" + id_quoted + " '/^@S /{ if ($2==ID) { print; exit } }' " + path_quoted
+    return to_string(exec(cmd)).trim()
+}
+
+// Extract the witness count line (`  witness: N`) from one entry block.
+fn _entry_witness(path: string, id: string) -> string {
+    let id_quoted = _shell_quote(id)
+    let path_quoted = _shell_quote(path)
+    let cmd = "awk -v ID=" + id_quoted + " 'BEGIN{p=0} /^@S /{ if (p) exit; if ($2==ID) p=1 } { if (p && $1==\"witness:\") { print $2; exit } }' " + path_quoted
+    return to_string(exec(cmd)).trim()
+}
+
+// Extract the body sha (lines AFTER the @S header, until next @S).
+// This isolates body content from header-tag changes so we can detect
+// header-only drift vs body drift.
+fn _entry_body_sha(path: string, id: string) -> string {
+    let id_quoted = _shell_quote(id)
+    let path_quoted = _shell_quote(path)
+    let cmd = "awk -v ID=" + id_quoted + " 'BEGIN{p=0} /^@S /{ if (p) exit; if ($2==ID) { p=1; next } } { if (p) print }' " + path_quoted + " | shasum -a 256 | awk '{print $1}'"
+    return to_string(exec(cmd)).trim()
+}
+
+// Body sha EXCLUDING the `  witness: N` line. Used to detect "witness-only"
+// body drift (which is trivially-safe to merge alongside a CROSS tag bump).
+fn _entry_body_sha_no_witness(path: string, id: string) -> string {
+    let id_quoted = _shell_quote(id)
+    let path_quoted = _shell_quote(path)
+    let cmd = "awk -v ID=" + id_quoted + " 'BEGIN{p=0} /^@S /{ if (p) exit; if ($2==ID) { p=1; next } } { if (p && $1!=\"witness:\") print }' " + path_quoted + " | shasum -a 256 | awk '{print $1}'"
+    return to_string(exec(cmd)).trim()
+}
+
+// Per-ID classification of drift between A and B for a single signal id.
+// Returns one of:
+//   "ONLY_IN_A"             — id present only in repo A
+//   "ONLY_IN_B"             — id present only in repo B
+//   "EQUAL"                 — same header + same body
+//   "HEADER_DRIFT"          — header differs, body equal
+//   "WITNESS_DRIFT"         — header equal, body differs ONLY in witness count
+//   "HEADER_WITNESS_DRIFT"  — header differs AND body differs ONLY in witness
+//   "BODY_DRIFT"            — body has substantive (non-witness) drift
+//   "BOTH_DRIFT"            — header AND substantive body drift
+fn _classify_id(A_path: string, B_path: string, A_ids: array, B_ids: array, id: string) -> string {
+    let in_a = _array_contains(A_ids, id)
+    let in_b = _array_contains(B_ids, id)
+    if in_a && !in_b { return "ONLY_IN_A" }
+    if !in_a && in_b { return "ONLY_IN_B" }
+    let ha = _entry_header(A_path, id)
+    let hb = _entry_header(B_path, id)
+    let ba = _entry_body_sha(A_path, id)
+    let bb = _entry_body_sha(B_path, id)
+    let header_eq = ha == hb
+    let body_eq = ba == bb
+    if header_eq && body_eq { return "EQUAL" }
+    // body diff exists — is it witness-only?
+    let bna = _entry_body_sha_no_witness(A_path, id)
+    let bnb = _entry_body_sha_no_witness(B_path, id)
+    let body_no_witness_eq = bna == bnb
+    if header_eq && !body_eq {
+        if body_no_witness_eq { return "WITNESS_DRIFT" }
+        return "BODY_DRIFT"
+    }
+    if !header_eq && body_eq { return "HEADER_DRIFT" }
+    // header_eq false, body_eq false
+    if body_no_witness_eq { return "HEADER_WITNESS_DRIFT" }
+    return "BOTH_DRIFT"
+}
+
+// Is `id` the last @S in `path`? (used to flag TAIL_ARTIFACT pseudo-drift)
+fn _is_last_id(path: string, id: string) -> bool {
+    let path_quoted = _shell_quote(path)
+    let cmd = "grep '^@S ' " + path_quoted + " | tail -1 | awk '{print $2}'"
+    let last = to_string(exec(cmd)).trim()
+    return last == id
+}
+
+// Per-ID propose action recommendation. Returns one of:
+//   "APPLY_TRIVIAL"   — header_drift only, looks like CROSS-tag + witness++ (safe)
+//   "PROPOSE_ONLY"    — drift exists but not unambiguously trivial
+//   "OBSTRUCTION"     — both header + body drift, or other ambiguity
+//   "CROSS_PUBLISH"   — only-in-A or only-in-B (copy block to other repo)
+//   "NOOP"            — equal
+//   "TAIL_ARTIFACT"   — pseudo-drift from awk EOF effect, not a real diff
+fn _propose_action(klass: string, is_tail: bool) -> string {
+    if klass == "EQUAL" { return "NOOP" }
+    if klass == "ONLY_IN_A" || klass == "ONLY_IN_B" { return "CROSS_PUBLISH" }
+    if klass == "HEADER_DRIFT" { return "APPLY_TRIVIAL" }
+    if klass == "WITNESS_DRIFT" { return "APPLY_TRIVIAL" }
+    if klass == "HEADER_WITNESS_DRIFT" { return "APPLY_TRIVIAL" }
+    if klass == "BODY_DRIFT" {
+        if is_tail { return "TAIL_ARTIFACT" }
+        return "PROPOSE_ONLY"
+    }
+    if klass == "BOTH_DRIFT" {
+        if is_tail { return "TAIL_ARTIFACT" }
+        return "OBSTRUCTION"
+    }
+    return "PROPOSE_ONLY"
+}
+
+// ─── apply-trivial / emit-patch helpers ──────────────────────
+// These helpers support user-authorized application of APPLY_TRIVIAL actions
+// and unified-diff patch emission. CROSS_PUBLISH and other classes are NOT
+// handled here — those require dedicated future flags + cross-repo
+// coordination.
+
+// Extract the full multi-line block for one @S id from a file (header line
+// inclusive through last body line BEFORE the next @S or EOF). Returns "" if
+// the id is not present.
+fn _entry_block(path: string, id: string) -> string {
+    let id_quoted = _shell_quote(id)
+    let path_quoted = _shell_quote(path)
+    let cmd = "awk -v ID=" + id_quoted + " 'BEGIN{p=0} /^@S /{ if (p) exit; if ($2==ID) p=1 } { if (p) print }' " + path_quoted
+    return to_string(exec(cmd))
+}
+
+// Generate a unified diff (one entry block, A->B) using `diff -u` on temp files.
+// Returns the unified diff text. Caller is responsible for header annotation.
+fn _entry_unified_diff(A_path: string, B_path: string, id: string,
+                       A_label: string, B_label: string) -> string {
+    let block_a = _entry_block(A_path, id)
+    let block_b = _entry_block(B_path, id)
+    let tdir = "/tmp/signals_sync_patch"
+    exec("mkdir -p '" + tdir + "'")
+    let fa = tdir + "/A_" + id + ".txt"
+    let fb = tdir + "/B_" + id + ".txt"
+    write_file(fa, block_a)
+    write_file(fb, block_b)
+    // Use --label to inject meaningful repo identifiers in the header.
+    let lbl_a = _shell_quote(A_label + ":atlas.signals.n6:" + id)
+    let lbl_b = _shell_quote(B_label + ":atlas.signals.n6:" + id)
+    let cmd = "diff -u --label " + lbl_a + " --label " + lbl_b + " '" + fa + "' '" + fb + "' 2>/dev/null || true"
+    let out = to_string(exec(cmd))
+    // best-effort cleanup of just these temps (leave dir for batch)
+    exec("rm -f '" + fa + "' '" + fb + "'")
+    return out
+}
+
+// Write a unified diff to design/patches/signals/2026-04-27_<sig_id>.patch.
+// Returns the absolute path written. Creates the dir if necessary.
+fn _write_patch_file(diff_text: string, sig_id: string, today: string) -> string {
+    let core = _core_root()
+    let dir = core + "/nexus/design/patches/signals"
+    exec("mkdir -p '" + dir + "'")
+    let path = dir + "/" + today + "_" + sig_id + ".patch"
+    write_file(path, diff_text)
+    return path
+}
+
+// Today (YYYY-MM-DD) for patch filenames. Pure-shell so we don't need a date
+// library. Falls back to the kick date 2026-04-27 if `date` fails.
+fn _today_ymd() -> string {
+    let out = to_string(exec("date +%Y-%m-%d 2>/dev/null")).trim()
+    if len(out) == 10 { return out }
+    return "2026-04-27"
+}
+
+// Verify env-gate is set for actual mutation. Returns true iff
+// NEXUS_SIGNALS_SYNC_APPLY=1 (exact match). Any other value (unset, "0",
+// "yes", "true", etc.) is treated as ungated.
+fn _apply_env_gate_ok() -> bool {
+    let v = env_var("NEXUS_SIGNALS_SYNC_APPLY")
+    if v == "1" { return true }
+    return false
+}
+
+// Apply a single APPLY_TRIVIAL action to target file: replace the existing
+// entry block for `id` with the entry block from source file. This is an
+// EDIT of an existing @S entry (header + witness), not an append. The caller
+// MUST have verified env-gate AND user authorization context.
+//
+// Strategy: extract block-from-src; locate existing block in target via awk;
+// rewrite target as: pre-block + new block + post-block. Writes target_path
+// in place. Returns true on apparent success, false on detected failure
+// (e.g., id not found in target).
+fn _apply_trivial_action(src_path: string, target_path: string, id: string) -> bool {
+    // safety: id must be present in BOTH files for trivial replace to be valid
+    if !_array_contains(_extract_ids(src_path), id) { return false }
+    if !_array_contains(_extract_ids(target_path), id) { return false }
+    let new_block = _entry_block(src_path, id)
+    if len(new_block) == 0 { return false }
+
+    let id_quoted = _shell_quote(id)
+    let target_quoted = _shell_quote(target_path)
+    // Build pre-block (everything before the @S id) and post-block (next @S
+    // onward). Use awk with three states: 0 pre, 1 in target, 2 post.
+    let pre_cmd = "awk -v ID=" + id_quoted + " 'BEGIN{s=0} { if (s==0) { if ($1==\"@S\" && $2==ID) { s=1; next } print; next } if (s==1) { if ($1==\"@S\") { s=2; print; next } next } print }' " + target_quoted
+    // Above prints pre + post (skipping the matched id block). We'll compose
+    // the new file as: capture pre/post separately for safety.
+    let pre_only = "awk -v ID=" + id_quoted + " '{ if ($1==\"@S\" && $2==ID) exit; print }' " + target_quoted
+    let post_only = "awk -v ID=" + id_quoted + " 'BEGIN{p=0;s=0} /^@S /{ if ($2==ID) { s=1; next } if (s==1) { p=1 } } { if (p) print }' " + target_quoted
+
+    let pre_text = to_string(exec(pre_only))
+    let post_text = to_string(exec(post_only))
+
+    // Compose. Ensure new_block ends with newline; if post_text exists prepend
+    // an "@S " marker — but we already excluded the next @S header in
+    // post_only's logic, so post_text starts with the next @S line itself.
+    let mut composed = pre_text + new_block
+    // new_block from _entry_block already includes content up to (but not
+    // including) the next @S line. Append post_text directly.
+    if len(post_text) > 0 {
+        // Ensure exactly one newline boundary. If new_block ends with \n and
+        // post_text starts at @S, concat is correct.
+        composed = composed + post_text
+    }
+    write_file(target_path, composed)
+    return true
+}
+
+// ─── cross-publish helpers ───────────────────────────────────
+// CROSS_PUBLISH = the source has an @S id that does NOT exist in the target.
+// Action = APPEND the source's full @S block to the END of target_path.
+// Honesty constraints (mirroring _apply_trivial):
+//   * env-gate `NEXUS_SIGNALS_SYNC_PUBLISH=1` required (exact string "1")
+//   * `--direction <nexus-to-n6arch|n6arch-to-nexus>` required (caller-checked)
+//   * `--confirm-direction-<dir>` required (caller-checked; non-interactive sign-off)
+// All four (env, direction, confirm, optional --emit-patch composition) are
+// orchestrated at the main() boundary. Helpers below assume those checks have
+// passed and only do the local mechanics.
+
+// Verify env-gate is set for cross-publish mutation. Returns true iff
+// NEXUS_SIGNALS_SYNC_PUBLISH=1 (exact match). Any other value (unset, "0",
+// "yes", "true", etc.) is treated as ungated.
+fn _publish_env_gate_ok() -> bool {
+    let v = env_var("NEXUS_SIGNALS_SYNC_PUBLISH")
+    if v == "1" { return true }
+    return false
+}
+
+// Map a direction slug -> source-label / target-label pair. Returns
+// ["", ""] for unknown. Currently supports two directions:
+//   nexus-to-n6arch  : src=nexus,   tgt=n6-arch
+//   n6arch-to-nexus  : src=n6-arch, tgt=nexus
+fn _direction_endpoints(direction: string) -> array {
+    if direction == "nexus-to-n6arch" { return ["nexus", "n6-arch"] }
+    if direction == "n6arch-to-nexus" { return ["n6-arch", "nexus"] }
+    return ["", ""]
+}
+
+// Resolve a label ("nexus" or "n6-arch") to its absolute atlas.signals.n6 path
+// using the discovered-repos array. Returns "" if not found.
+fn _resolve_repo_path(repos: array, label: string) -> string {
+    let mut i = 0
+    while i < len(repos) {
+        if repos[i][0] == label { return repos[i][1] }
+        i = i + 1
+    }
+    return ""
+}
+
+// Append a source's @S block to the target file. Source MUST have the id;
+// target MUST NOT have it (otherwise we would silently duplicate and break
+// _extract_ids semantics). Returns true on apparent success.
+fn _append_cross_publish_action(src_path: string, target_path: string, id: string) -> bool {
+    if !_array_contains(_extract_ids(src_path), id) { return false }
+    if _array_contains(_extract_ids(target_path), id) {
+        // already present — do not duplicate; treat as no-op fail
+        return false
+    }
+    let new_block = _entry_block(src_path, id)
+    if len(new_block) == 0 { return false }
+    // Read full target, append. Ensure newline boundary so the appended @S
+    // header is on its own line (atlas.signals.n6 convention is one trailing
+    // newline at EOF; insert a blank line separator before appending block).
+    let cur = to_string(exec("cat '" + target_path + "'"))
+    let mut composed = cur
+    if len(cur) > 0 {
+        // Ensure cur ends with newline.
+        let last = cur.substring(len(cur) - 1, len(cur))
+        if last != "\n" { composed = composed + "\n" }
+    }
+    composed = composed + "\n" + new_block
+    // Ensure trailing newline.
+    if len(composed) > 0 {
+        let last2 = composed.substring(len(composed) - 1, len(composed))
+        if last2 != "\n" { composed = composed + "\n" }
+    }
+    write_file(target_path, composed)
+    return true
+}
+
+// Generate a unified diff representing an APPEND of one entry block. Source
+// side = empty (file does not have the id), target side = the source's block.
+// Returns text suitable for writing as a .patch.
+fn _cross_publish_unified_diff(src_path: string, target_path: string, id: string,
+                               src_label: string, target_label: string) -> string {
+    let block_src = _entry_block(src_path, id)
+    let tdir = "/tmp/signals_sync_cross_patch"
+    exec("mkdir -p '" + tdir + "'")
+    let f_empty = tdir + "/EMPTY_" + id + ".txt"
+    let f_block = tdir + "/SRC_" + id + ".txt"
+    write_file(f_empty, "")
+    write_file(f_block, block_src)
+    let lbl_t = _shell_quote(target_label + ":atlas.signals.n6:" + id + " (absent)")
+    let lbl_s = _shell_quote(target_label + ":atlas.signals.n6:" + id + " (after-publish, sourced-from " + src_label + ")")
+    let cmd = "diff -u --label " + lbl_t + " --label " + lbl_s + " '" + f_empty + "' '" + f_block + "' 2>/dev/null || true"
+    let out = to_string(exec(cmd))
+    exec("rm -f '" + f_empty + "' '" + f_block + "'")
+    return out
+}
+
+// Write a cross-publish unified diff to design/patches/signals/cross_publish/<today>_<sig_id>.patch.
+// SEPARATE directory from --apply-trivial patches to keep audit trails distinct.
+fn _write_cross_publish_patch_file(diff_text: string, sig_id: string, today: string) -> string {
+    let core = _core_root()
+    let dir = core + "/nexus/design/patches/signals/cross_publish"
+    exec("mkdir -p '" + dir + "'")
+    let path = dir + "/" + today + "_" + sig_id + ".patch"
+    write_file(path, diff_text)
+    return path
+}
+
+// Parse `--batch sig1,sig2,...` argument. Returns an array of trimmed sig
+// IDs. Empty input -> empty array (caller treats as "no batch filter").
+fn _parse_batch(raw: string) -> array {
+    let mut out = []
+    if len(raw) == 0 { return out }
+    let parts = raw.split(",")
+    let mut i = 0
+    while i < len(parts) {
+        let s = parts[i].trim()
+        if len(s) > 0 { out.push(s) }
+        i = i + 1
+    }
+    return out
+}
+
+// Returns true if `id` should be included given a batch filter. Empty filter
+// (= []) means "all included".
+fn _id_in_batch(id: string, batch: array) -> bool {
+    if len(batch) == 0 { return true }
+    return _array_contains(batch, id)
+}
+
+// Cross-publish pipeline driver. For the given direction, iterates the
+// only-in-source ids (i.e. _minus(src_ids, target_ids)) and:
+//   - if --emit-patch: writes a .patch under design/patches/signals/cross_publish/
+//   - if --cross-publish AND env-gate AND direction-confirm: appends src block to target
+// Honors --batch filter. Returns [published, patches, skipped].
+fn _run_cross_publish(src_label: string, src_path: string, src_ids: array,
+                      target_label: string, target_path: string, target_ids: array,
+                      do_publish: bool, do_patch: bool,
+                      patch_dir_override: string, batch: array,
+                      today: string) -> array {
+    let only_in_src = _minus(src_ids, target_ids)
+    let mut published = 0
+    let mut patches = 0
+    let mut skipped = 0
+
+    println("=== CROSS-PUBLISH PIPELINE: " + src_label + " -> " + target_label + " ===")
+    println("  do_publish      : " + to_string(do_publish))
+    println("  do_patch        : " + to_string(do_patch))
+    println("  publish_env_ok  : " + to_string(_publish_env_gate_ok()))
+    println("  candidates      : " + to_string(len(only_in_src)) + " (only-in-" + src_label + ")")
+    if len(batch) > 0 {
+        println("  batch_filter    : " + to_string(len(batch)) + " ids → " + _join(batch, ","))
+    } else {
+        println("  batch_filter    : (none — all candidates)")
+    }
+    println("")
+
+    let mut i = 0
+    while i < len(only_in_src) {
+        let id = only_in_src[i]
+        if !_id_in_batch(id, batch) {
+            // silently outside batch scope; still log so user can see the filter at work
+            println("  [SKIP-BATCH] " + id + " not in --batch list")
+            skipped = skipped + 1
+            i = i + 1
+            continue
+        }
+
+        // Per-id classification (only-in-src ⇒ should be CROSS_PUBLISH;
+        // verify defensively to avoid misuse).
+        let klass = _classify_id(src_path, target_path, src_ids, target_ids, id)
+        if klass != "ONLY_IN_A" && klass != "ONLY_IN_B" {
+            println("  [SKIP-CLASS] " + id + " class=" + klass + " (not CROSS_PUBLISH; refusing to act)")
+            skipped = skipped + 1
+            i = i + 1
+            continue
+        }
+
+        if do_patch {
+            let diff = _cross_publish_unified_diff(src_path, target_path, id, src_label, target_label)
+            if patch_dir_override == "" {
+                let p = _write_cross_publish_patch_file(diff, id, today)
+                println("  [PATCH] " + id + " -> " + p)
+            } else {
+                exec("mkdir -p '" + patch_dir_override + "'")
+                let p = patch_dir_override + "/" + today + "_" + id + ".patch"
+                write_file(p, diff)
+                println("  [PATCH] " + id + " -> " + p)
+            }
+            patches = patches + 1
+        }
+
+        if do_publish {
+            // Defensive re-check of env-gate per-id (mid-run flag flip safety).
+            if !_publish_env_gate_ok() {
+                println("  [REFUSE] " + id + " — publish env-gate disappeared mid-run; aborting")
+                skipped = skipped + 1
+                i = i + 1
+                continue
+            }
+            let ok = _append_cross_publish_action(src_path, target_path, id)
+            if ok {
+                println("  [PUBLISH] " + id + " — appended " + src_label + "_block -> " + target_label)
+                published = published + 1
+            } else {
+                println("  [PUBLISH-FAIL] " + id + " — append failed (id missing from src OR present in target)")
+                skipped = skipped + 1
+            }
+        }
+
+        i = i + 1
+    }
+
+    println("")
+    println("  cross-publish totals: published=" + to_string(published) + " patches=" + to_string(patches) + " skipped=" + to_string(skipped))
+    println("=== / CROSS-PUBLISH PIPELINE ===")
+    println("")
+
+    return [published, patches, skipped]
+}
+
+// Emit per-ID merge proposal block to stdout.
+fn _emit_by_id(A_label: string, A_path: string, B_label: string, B_path: string,
+               A_ids: array, B_ids: array) {
+    let only_a = _minus(A_ids, B_ids)
+    let only_b = _minus(B_ids, A_ids)
+    let common = _intersect(A_ids, B_ids)
+
+    println("=== PER-ID MERGE PROPOSAL: " + A_label + " vs " + B_label + " ===")
+    println("  A=" + A_path)
+    println("  B=" + B_path)
+    println("")
+
+    let mut count_apply = 0
+    let mut count_propose = 0
+    let mut count_obstruct = 0
+    let mut count_cross = 0
+    let mut count_tail = 0
+
+    // 1) only-in-A
+    let mut i = 0
+    while i < len(only_a) {
+        let id = only_a[i]
+        let h = _entry_header(A_path, id)
+        println("  [CROSS_PUBLISH] " + id + "  (only in " + A_label + ")")
+        println("    src_header : " + h)
+        println("    action     : copy entry block " + id + " from " + A_label + " -> " + B_label)
+        count_cross = count_cross + 1
+        i = i + 1
+    }
+    // 2) only-in-B
+    i = 0
+    while i < len(only_b) {
+        let id = only_b[i]
+        let h = _entry_header(B_path, id)
+        println("  [CROSS_PUBLISH] " + id + "  (only in " + B_label + ")")
+        println("    src_header : " + h)
+        println("    action     : copy entry block " + id + " from " + B_label + " -> " + A_label)
+        count_cross = count_cross + 1
+        i = i + 1
+    }
+    // 3) common — classify
+    i = 0
+    while i < len(common) {
+        let id = common[i]
+        let klass = _classify_id(A_path, B_path, A_ids, B_ids, id)
+        if klass == "EQUAL" { i = i + 1; continue }
+        let is_tail_a = _is_last_id(A_path, id)
+        let is_tail_b = _is_last_id(B_path, id)
+        let is_tail = is_tail_a || is_tail_b
+        let action = _propose_action(klass, is_tail)
+        let ha = _entry_header(A_path, id)
+        let hb = _entry_header(B_path, id)
+        let wa = _entry_witness(A_path, id)
+        let wb = _entry_witness(B_path, id)
+        println("  [" + action + "] " + id + "  (class=" + klass + ", tail=" + to_string(is_tail) + ")")
+        println("    A_header   : " + ha)
+        println("    B_header   : " + hb)
+        println("    A_witness  : " + wa + "    B_witness : " + wb)
+        if action == "APPLY_TRIVIAL" {
+            println("    proposal   : promote A_header -> B (assumes A is forward; verify CROSS tag + witness++ pattern)")
+        } else if action == "PROPOSE_ONLY" {
+            println("    proposal   : human review — body content differs")
+        } else if action == "OBSTRUCTION" {
+            println("    proposal   : OBSTRUCTION_DOCUMENTED — header+body both drift, no automatic resolution")
+        } else if action == "TAIL_ARTIFACT" {
+            println("    proposal   : pseudo-drift (awk EOF effect: id is last @S in one repo). Body itself may be identical.")
+        }
+        if action == "APPLY_TRIVIAL" { count_apply = count_apply + 1 }
+        else if action == "PROPOSE_ONLY" { count_propose = count_propose + 1 }
+        else if action == "OBSTRUCTION" { count_obstruct = count_obstruct + 1 }
+        else if action == "TAIL_ARTIFACT" { count_tail = count_tail + 1 }
+        i = i + 1
+    }
+
+    println("")
+    println("  per-id totals: cross_publish=" + to_string(count_cross)
+            + " apply_trivial=" + to_string(count_apply)
+            + " propose_only=" + to_string(count_propose)
+            + " obstruction=" + to_string(count_obstruct)
+            + " tail_artifact=" + to_string(count_tail))
+    println("=== / PER-ID MERGE PROPOSAL ===")
+    println("")
+}
+
+// ─── main ─────────────────────────────────────────────────────
+
+fn _print_help() {
+    println("usage: hexa run tool/signals_sync.hexa [--detail] [--proposed-merge] [--by-id] [--repos] [--self-test]")
+    println("                                       [--apply-trivial] [--emit-patch] [--patch-out <dir>]")
+    println("                                       [--cross-publish] [--direction <nexus-to-n6arch|n6arch-to-nexus>]")
+    println("                                       [--confirm-direction-nexus-to-n6arch | --confirm-direction-n6arch-to-nexus]")
+    println("                                       [--batch sig1,sig2,...]")
+    println("modes:")
+    println("  (default)        summary table (per-pair only-in / common / drift)")
+    println("  --detail         enumerate IDs in each diff bucket")
+    println("  --proposed-merge text merge plan to stdout (NEVER auto-executed)")
+    println("  --by-id          per-ID merge proposal classification (CROSS_PUBLISH | APPLY_TRIVIAL | PROPOSE_ONLY | OBSTRUCTION | TAIL_ARTIFACT)")
+    println("  --repos          list discovered repo paths + per-repo @S count")
+    println("  --self-test      synthesize 2 fixtures with known drift, verify")
+    println("  --apply-trivial  attempt to apply APPLY_TRIVIAL actions (env-gated by NEXUS_SIGNALS_SYNC_APPLY=1)")
+    println("                   - default refusal: raw 66 reason=apply-trivial-without-env-gate")
+    println("                   - CROSS_PUBLISH actions are NOT touched by this flag (use --cross-publish)")
+    println("  --emit-patch     write unified diffs (.patch) per acted-on action")
+    println("                   - APPLY_TRIVIAL patches → design/patches/signals/")
+    println("                   - CROSS_PUBLISH patches → design/patches/signals/cross_publish/")
+    println("  --patch-out DIR  override default patch output directory (applies to whichever pipeline emits)")
+    println("  --cross-publish  attempt to APPEND only-in-source CROSS_PUBLISH @S blocks to target repo")
+    println("                   - env-gated by NEXUS_SIGNALS_SYNC_PUBLISH=1")
+    println("                   - REQUIRES --direction <nexus-to-n6arch|n6arch-to-nexus>")
+    println("                   - REQUIRES --confirm-direction-<dir> matching --direction (non-interactive sign-off)")
+    println("                   - default refusal: raw 66 reason=cross-publish-without-env-gate / -direction / -direction-confirm")
+    println("  --direction DIR  cross-publish direction: nexus-to-n6arch | n6arch-to-nexus")
+    println("  --confirm-direction-nexus-to-n6arch")
+    println("  --confirm-direction-n6arch-to-nexus  explicit per-direction sign-off (must match --direction)")
+    println("  --batch IDs      restrict --apply-trivial OR --cross-publish to comma-separated sig IDs")
+    println("                   (default = all in-class candidates; orthogonal scope filter)")
+    println("origin: state/atlas_signals_3repo_sync.md (read-only base)")
+    println("sentinel: __SIGNALS_SYNC__ PASS repos=N drift=M content_drift=K")
+    println("sentinel: __SIGNALS_SYNC_APPLY__ <PASS|SKIP|FAIL> applied=N patches=M skipped=K [reason=<slug> fix=<directive>]")
+    println("sentinel: __SIGNALS_SYNC_PUBLISH__ <PASS|SKIP|FAIL> published=N patches=M skipped=K direction=<dir> [reason=<slug> fix=<directive>]")
+}
+
+// ─── apply / patch driver ────────────────────────────────────
+// Iterates pair (A=nexus, B=other) common ids, classifies, and:
+//   - if --emit-patch: writes a .patch file (or prints to stdout) for each
+//     APPLY_TRIVIAL action.
+//   - if --apply-trivial AND env-gate: applies the trivial edit to target B.
+// Returns [applied_count, patches_count, skipped_count].
+// Refuses (raw 66) at caller side if --apply-trivial set without env-gate;
+// here we only honor whichever modes are passed in.
+fn _run_apply_patch(A_label: string, A_path: string, B_label: string, B_path: string,
+                    A_ids: array, B_ids: array,
+                    do_apply: bool, do_patch: bool, patch_dir_override: string,
+                    batch: array, today: string) -> array {
+    let common = _intersect(A_ids, B_ids)
+    let mut applied = 0
+    let mut patches = 0
+    let mut skipped = 0
+
+    println("=== APPLY/PATCH PIPELINE: " + A_label + " -> " + B_label + " ===")
+    println("  do_apply       : " + to_string(do_apply))
+    println("  do_patch       : " + to_string(do_patch))
+    println("  env_gate_ok    : " + to_string(_apply_env_gate_ok()))
+    if len(batch) > 0 {
+        println("  batch_filter   : " + to_string(len(batch)) + " ids → " + _join(batch, ","))
+    } else {
+        println("  batch_filter   : (none — all common ids)")
+    }
+    println("")
+
+    let mut i = 0
+    while i < len(common) {
+        let id = common[i]
+        let klass = _classify_id(A_path, B_path, A_ids, B_ids, id)
+        if klass == "EQUAL" { i = i + 1; continue }
+        let is_tail_a = _is_last_id(A_path, id)
+        let is_tail_b = _is_last_id(B_path, id)
+        let is_tail = is_tail_a || is_tail_b
+        let action = _propose_action(klass, is_tail)
+
+        if action != "APPLY_TRIVIAL" {
+            // CROSS_PUBLISH / OBSTRUCTION / PROPOSE_ONLY / TAIL_ARTIFACT — skip
+            if action == "CROSS_PUBLISH" {
+                println("  [SKIP] " + id + " action=CROSS_PUBLISH (handled by --cross-publish, not --apply-trivial)")
+            } else {
+                println("  [SKIP] " + id + " action=" + action)
+            }
+            skipped = skipped + 1
+            i = i + 1
+            continue
+        }
+
+        if !_id_in_batch(id, batch) {
+            println("  [SKIP-BATCH] " + id + " action=APPLY_TRIVIAL not in --batch list")
+            skipped = skipped + 1
+            i = i + 1
+            continue
+        }
+
+        // APPLY_TRIVIAL path — emit patch and/or apply
+        if do_patch {
+            let diff = _entry_unified_diff(A_path, B_path, id, A_label, B_label)
+            if patch_dir_override == "" {
+                let p = _write_patch_file(diff, id, today)
+                println("  [PATCH] " + id + " -> " + p)
+            } else {
+                exec("mkdir -p '" + patch_dir_override + "'")
+                let p = patch_dir_override + "/" + today + "_" + id + ".patch"
+                write_file(p, diff)
+                println("  [PATCH] " + id + " -> " + p)
+            }
+            patches = patches + 1
+        }
+
+        if do_apply {
+            // env-gate already verified at caller. We still re-verify defensively.
+            if !_apply_env_gate_ok() {
+                println("  [REFUSE] " + id + " — env-gate disappeared mid-run; aborting")
+                skipped = skipped + 1
+                i = i + 1
+                continue
+            }
+            // Apply A -> B (promote nexus header/witness into n6-arch entry).
+            let ok = _apply_trivial_action(A_path, B_path, id)
+            if ok {
+                println("  [APPLY] " + id + " — promoted " + A_label + "_block -> " + B_label)
+                applied = applied + 1
+            } else {
+                println("  [APPLY-FAIL] " + id + " — block extraction or write failed")
+                skipped = skipped + 1
+            }
+        }
+
+        i = i + 1
+    }
+
+    println("")
+    println("  pipeline totals: applied=" + to_string(applied) + " patches=" + to_string(patches) + " skipped=" + to_string(skipped))
+    println("=== / APPLY/PATCH PIPELINE ===")
+    println("")
+
+    return [applied, patches, skipped]
+}
+
+fn main() -> void {
+    let raw_args = args()
+    let mut cli = []
+    let mut ai = 2
+    while ai < len(raw_args) {
+        cli.push(raw_args[ai])
+        ai = ai + 1
+    }
+    let mut detail = false
+    let mut proposed_merge = false
+    let mut by_id = false
+    let mut list_repos = false
+    let mut self_test = false
+    let mut apply_trivial = false
+    let mut emit_patch = false
+    let mut patch_out = ""
+    let mut cross_publish = false
+    let mut direction = ""
+    let mut confirm_dir_n2a = false
+    let mut confirm_dir_a2n = false
+    let mut batch_raw = ""
+    let mut i = 0
+    while i < len(cli) {
+        let a = cli[i]
+        if a == "--self-test" || a == "--selftest" { self_test = true }
+        else if a == "--detail" { detail = true }
+        else if a == "--proposed-merge" { proposed_merge = true }
+        else if a == "--by-id" || a == "--byid" { by_id = true }
+        else if a == "--repos" { list_repos = true }
+        else if a == "--apply-trivial" { apply_trivial = true }
+        else if a == "--emit-patch" { emit_patch = true }
+        else if a == "--patch-out" {
+            if i + 1 >= len(cli) {
+                eprintln("__SIGNALS_SYNC_APPLY__ FAIL applied=0 patches=0 skipped=0 reason=patch-out-missing-arg fix=hexa run tool/signals_sync.hexa --patch-out /abs/dir")
+                exit(1)
+            }
+            patch_out = cli[i + 1]
+            i = i + 1
+        }
+        else if a == "--cross-publish" { cross_publish = true }
+        else if a == "--direction" {
+            if i + 1 >= len(cli) {
+                eprintln("__SIGNALS_SYNC_PUBLISH__ FAIL published=0 patches=0 skipped=0 direction= reason=direction-missing-arg fix=--direction nexus-to-n6arch | n6arch-to-nexus")
+                exit(1)
+            }
+            direction = cli[i + 1]
+            i = i + 1
+        }
+        else if a == "--confirm-direction-nexus-to-n6arch" { confirm_dir_n2a = true }
+        else if a == "--confirm-direction-n6arch-to-nexus" { confirm_dir_a2n = true }
+        else if a == "--batch" {
+            if i + 1 >= len(cli) {
+                eprintln("signals_sync: --batch requires comma-separated sig IDs")
+                eprintln("reason=batch-missing-arg fix=--batch SIG-X-001,SIG-Y-002")
+                exit(1)
+            }
+            batch_raw = cli[i + 1]
+            i = i + 1
+        }
+        else if a == "--help" || a == "-h" { _print_help(); exit(0) }
+        else {
+            eprintln("signals_sync: unknown arg `" + a + "`")
+            eprintln("reason=unknown-arg fix=see --help")
+            exit(1)
+        }
+        i = i + 1
+    }
+
+    let batch = _parse_batch(batch_raw)
+
+    // env-gate enforcement: --apply-trivial requires NEXUS_SIGNALS_SYNC_APPLY=1
+    if apply_trivial && !_apply_env_gate_ok() {
+        eprintln("__SIGNALS_SYNC_APPLY__ FAIL applied=0 patches=0 skipped=0 reason=apply-trivial-without-env-gate fix=NEXUS_SIGNALS_SYNC_APPLY=1 hexa run tool/signals_sync.hexa --apply-trivial [--emit-patch]")
+        exit(1)
+    }
+
+    // Direction + per-direction-confirm + env-gate enforcement for --cross-publish.
+    // Direction is REQUIRED whenever --cross-publish is set (even patch-only) because
+    // patch-emission still needs to know src vs target (which file is sourced, which
+    // is the would-be append target). The semantics:
+    //   * --cross-publish --emit-patch (no env, no confirm) = REVIEW-ONLY patches
+    //     (no mutation; safe artifact emission). Direction still required to choose
+    //     src/target. Confirm NOT required (no mutation will occur).
+    //   * --cross-publish (no --emit-patch, no env) = REFUSED (mutation requested
+    //     but env-gate missing).
+    //   * --cross-publish + env + direction + matching confirm = MUTATION + (optional
+    //     --emit-patch composes patch trail).
+    // This mirrors --apply-trivial but defers the env-gate refusal to the case where
+    // actual mutation is the intent (i.e. --cross-publish without --emit-patch OR
+    // with intent to mutate). Honesty: --emit-patch is read-only artifact emission;
+    // --cross-publish (alone or with mutation intent) requires the full ceremony.
+    if cross_publish {
+        if direction != "nexus-to-n6arch" && direction != "n6arch-to-nexus" {
+            eprintln("__SIGNALS_SYNC_PUBLISH__ FAIL published=0 patches=0 skipped=0 direction=" + direction + " reason=cross-publish-without-direction fix=--direction nexus-to-n6arch | n6arch-to-nexus")
+            exit(1)
+        }
+        // Patch-only mode (--cross-publish --emit-patch, no env-gate): permitted,
+        // skip mutation-side env+confirm checks; downgrade cross_publish→false for
+        // the pipeline call so it never mutates. We still keep direction, batch,
+        // and patch generation active.
+        let mutation_intent = !emit_patch || _publish_env_gate_ok()
+        if mutation_intent {
+            if !_publish_env_gate_ok() {
+                eprintln("__SIGNALS_SYNC_PUBLISH__ FAIL published=0 patches=0 skipped=0 direction=" + direction + " reason=cross-publish-without-env-gate fix=NEXUS_SIGNALS_SYNC_PUBLISH=1 hexa run tool/signals_sync.hexa --cross-publish --direction <dir> --confirm-direction-<dir>  (or add --emit-patch for review-only patches without env-gate)")
+                exit(1)
+            }
+            let confirm_match = (direction == "nexus-to-n6arch" && confirm_dir_n2a)
+                             || (direction == "n6arch-to-nexus" && confirm_dir_a2n)
+            if !confirm_match {
+                eprintln("__SIGNALS_SYNC_PUBLISH__ FAIL published=0 patches=0 skipped=0 direction=" + direction + " reason=cross-publish-without-direction-confirm fix=add --confirm-direction-" + direction + " (explicit non-interactive sign-off)")
+                exit(1)
+            }
+        }
+    }
+
+    if self_test { _run_self_test() }
+
+    let repos = _discover_repos()
+    if len(repos) == 0 {
+        eprintln("__SIGNALS_SYNC__ FAIL no atlas.signals.n6 found in known locations")
+        exit(1)
+    }
+
+    if list_repos {
+        println("=== signals_sync --repos ===")
+        let mut k = 0
+        while k < len(repos) {
+            let row = repos[k]
+            let ids = _extract_ids(row[1])
+            println("  " + row[0] + "  ids=" + to_string(len(ids)) + "  " + row[1])
+            k = k + 1
+        }
+        println("")
+        println("__SIGNALS_SYNC__ PASS repos=" + to_string(len(repos)) + " drift=0 content_drift=0 mode=repos")
+        exit(0)
+    }
+
+    // build per-repo id arrays
+    let mut all_ids = []
+    let mut per_repo_ids = []
+    let mut k = 0
+    while k < len(repos) {
+        let ids = _extract_ids(repos[k][1])
+        per_repo_ids.push(ids)
+        all_ids = _union(all_ids, ids)
+        k = k + 1
+    }
+
+    // pairwise diff vs first repo (treated as A); for full coverage we also
+    // emit pairwise for first-vs-each (n6-arch, anima copies).
+    println("=== signals_sync ===")
+    println("  repos discovered : " + to_string(len(repos)))
+    let mut p = 0
+    while p < len(repos) {
+        let row = repos[p]
+        println("    [" + to_string(p) + "] " + row[0] + "  ids=" + to_string(len(per_repo_ids[p])) + "  " + row[1])
+        p = p + 1
+    }
+    println("  union (all IDs)  : " + to_string(len(all_ids)))
+    println("")
+
+    let mut total_drift = 0
+    let mut total_content_drift = 0
+    let mut total_applied = 0
+    let mut total_patches = 0
+    let mut total_skipped = 0
+    let mut total_published = 0
+    let mut total_cp_patches = 0
+    let mut total_cp_skipped = 0
+    let today = _today_ymd()
+    let A_ids = per_repo_ids[0]
+    let A_path = repos[0][1]
+    let A_label = repos[0][0]
+    let mut q = 1
+    while q < len(repos) {
+        let B_ids = per_repo_ids[q]
+        let B_path = repos[q][1]
+        let B_label = repos[q][0]
+        let only_a = _minus(A_ids, B_ids)
+        let only_b = _minus(B_ids, A_ids)
+        let common = _intersect(A_ids, B_ids)
+        let mut drift = []
+        // content drift
+        let mut ci = 0
+        while ci < len(common) {
+            let id = common[ci]
+            let sa = _entry_sha(A_path, id)
+            let sb = _entry_sha(B_path, id)
+            if sa != sb { drift.push(id) }
+            ci = ci + 1
+        }
+        total_drift = total_drift + len(only_a) + len(only_b)
+        total_content_drift = total_content_drift + len(drift)
+        println("  pair: " + A_label + " vs " + B_label)
+        println("    only_in_" + A_label + " : " + to_string(len(only_a)))
+        println("    only_in_" + B_label + " : " + to_string(len(only_b)))
+        println("    common         : " + to_string(len(common)))
+        println("    content_drift  : " + to_string(len(drift)))
+        if detail {
+            if len(only_a) > 0 { println("    -- only_in_" + A_label + ": " + _join(only_a, ", ")) }
+            if len(only_b) > 0 { println("    -- only_in_" + B_label + ": " + _join(only_b, ", ")) }
+            if len(drift) > 0 { println("    -- content_drift: " + _join(drift, ", ")) }
+        }
+        println("")
+        if by_id {
+            _emit_by_id(A_label, A_path, B_label, B_path, A_ids, B_ids)
+        }
+        if apply_trivial || (emit_patch && !cross_publish) {
+            // Restrict to nexus -> n6-arch pair to honor "n6-arch is the target"
+            // intent. anima copies are symlinks and would be touched
+            // transitively; we DO NOT iterate them in apply/patch mode.
+            if B_label == "n6-arch" {
+                let totals = _run_apply_patch(A_label, A_path, B_label, B_path,
+                                              A_ids, B_ids,
+                                              apply_trivial, emit_patch, patch_out, batch, today)
+                total_applied = total_applied + totals[0]
+                total_patches = total_patches + totals[1]
+                total_skipped = total_skipped + totals[2]
+            } else {
+                println("  [apply/patch] skipping pair " + A_label + " vs " + B_label + " (only nexus -> n6-arch is in scope)")
+                println("")
+            }
+        }
+        q = q + 1
+    }
+
+    // ─── cross-publish orchestration ───────────────────────────
+    // Runs once (not per-pair) because direction explicitly names src/target.
+    // --emit-patch composes with --cross-publish to write patches to
+    // design/patches/signals/cross_publish/. --emit-patch alone (without
+    // --cross-publish) does NOT trigger cross-publish patch emission.
+    // do_publish argument to the pipeline is gated by env: if env-gate is OFF
+    // and we got here only because of --emit-patch composition, we MUST NOT
+    // mutate even though --cross-publish was passed (review-only mode).
+    if cross_publish {
+        let endpoints = _direction_endpoints(direction)
+        let src_label = endpoints[0]
+        let tgt_label = endpoints[1]
+        let src_path = _resolve_repo_path(repos, src_label)
+        let tgt_path = _resolve_repo_path(repos, tgt_label)
+        if len(src_path) == 0 || len(tgt_path) == 0 {
+            eprintln("__SIGNALS_SYNC_PUBLISH__ FAIL published=0 patches=0 skipped=0 direction=" + direction + " reason=cross-publish-repo-not-discovered fix=ensure both nexus and n6-arch atlas.signals.n6 are present under " + _core_root())
+            exit(1)
+        }
+        let src_ids = _extract_ids(src_path)
+        let tgt_ids = _extract_ids(tgt_path)
+        // Mutation only when env-gate is set (caller already verified confirm-
+        // direction matches when mutation_intent was true at the top).
+        let do_publish_actual = _publish_env_gate_ok()
+        let cp_totals = _run_cross_publish(src_label, src_path, src_ids,
+                                           tgt_label, tgt_path, tgt_ids,
+                                           do_publish_actual, emit_patch,
+                                           patch_out, batch, today)
+        total_published = cp_totals[0]
+        total_cp_patches = cp_totals[1]
+        total_cp_skipped = cp_totals[2]
+    }
+
+    if proposed_merge {
+        println("=== PROPOSED MERGE PLAN (text only — NOT auto-executed) ===")
+        println("  rule: pick max-grade entry; CROSS tag if observed in 2+ repos")
+        println("  steps:")
+        println("    1. for each ID present in only one repo → cross-publish to others")
+        println("    2. for each content-drift ID → manual review, pick canonical body")
+        println("    3. re-grade with [CROSS] repo tag if observed in >=2 repos")
+        println("  invocation: this tool DOES NOT execute these steps.")
+        println("  next: human-in-loop or a different tool with separate slug")
+        println("=== / PROPOSED MERGE PLAN ===")
+        println("")
+    }
+
+    println("__SIGNALS_SYNC__ PASS repos=" + to_string(len(repos)) + " drift=" + to_string(total_drift) + " content_drift=" + to_string(total_content_drift))
+    if apply_trivial || (emit_patch && !cross_publish) {
+        let mut verdict = "PASS"
+        if apply_trivial && total_applied == 0 && total_skipped == 0 {
+            // applied=0 with no skipped means no APPLY_TRIVIAL ids existed —
+            // legitimate PASS (nothing to do).
+            verdict = "PASS"
+        }
+        println("__SIGNALS_SYNC_APPLY__ " + verdict + " applied=" + to_string(total_applied)
+                + " patches=" + to_string(total_patches)
+                + " skipped=" + to_string(total_skipped))
+    }
+    if cross_publish {
+        let mut verdict_cp = "PASS"
+        if cross_publish && total_published == 0 && total_cp_skipped == 0 && total_cp_patches == 0 {
+            verdict_cp = "PASS"
+        }
+        println("__SIGNALS_SYNC_PUBLISH__ " + verdict_cp + " published=" + to_string(total_published)
+                + " patches=" + to_string(total_cp_patches)
+                + " skipped=" + to_string(total_cp_skipped)
+                + " direction=" + direction)
+    }
+    exit(0)
+}

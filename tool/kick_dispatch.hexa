@@ -88,6 +88,31 @@ fn _safe_to_int_line(raw: str, default: i64, label: str) -> i64 {
     return v
 }
 
+// _extract_inner_hexa_rc — parse hexa.real's auto-appended __HEXA_RC=N suffix.
+// hexa.real's exec() runtime appends `__HEXA_RC=N` at the tail of captured
+// stdout for the inner process. When dispatch shells through docker (or any
+// inner runtime) and that inner runtime fails (e.g. rc=3), the outer
+// `; echo __RC=$?` wrapper may still echo 0 because the shell pipeline
+// succeeded. Without parsing the inner sentinel, gating decisions made on
+// outer rc alone misclassify failures as success. Carry-forward from
+// kick_bench.hexa post-fix (commit 2d40c170, ω-cycle live-spawn-smoke).
+// Returns 0 if sentinel absent (graceful — older runtimes / non-hexa exec).
+fn _extract_inner_hexa_rc(out: str) -> i64 {
+    let key = "__HEXA_RC="
+    let hi = out.last_index_of(key)
+    if hi < 0 { return 0 }
+    let tail = out.substring(hi + key.len(), out.len())
+    let mut e: i64 = 0
+    while e < tail.len() {
+        let c = tail.substring(e, e + 1)
+        if c == " " || c == "\n" || c == "\t" || c == "_" { break }
+        e = e + 1
+    }
+    let piece = tail.substring(0, e).trim()
+    if piece.len() == 0 { return 0 }
+    return _safe_to_int_line(piece, 0, "inner-hexa-rc")
+}
+
 fn _nexus_root() -> str {
     let n = env("NEXUS")
     if n.len() > 0 { return n }
@@ -567,16 +592,25 @@ fn _auto_absorb_witness(witness_path: str) {
 
     let cmd = _hexa_bin() + " run " + _shell_quote(ingest_tool) + " --witness " + _shell_quote(witness_path) + " 2>&1; echo __RC=$?"
     let out = exec(cmd).trim()
+    // OUTER rc — explicitly echoed by `; echo __RC=$?` shell wrapper.
     let rc_idx = out.last_index_of("__RC=")
     let mut rc: i64 = -1
     if rc_idx >= 0 {
         let tail = out.substring(rc_idx + 5, out.len()).trim()
         rc = _safe_to_int_line(tail, -1, "atlas-ingest-rc")
     }
+    // INNER rc — auto-appended by hexa.real exec() runtime. Gate on EITHER
+    // failing (3-way ladder collapsed to fail-on-any-nonzero for this site
+    // since it's an absorb-or-skip decision, not a status field).
+    let inner_rc = _extract_inner_hexa_rc(out)
 
     if rc != 0 {
         // raw 66 trailer
         eprintln("__KICK_AUTO_ABSORB__ FAIL witness=" + witness_path + " reason=ingest-rc-" + to_string(rc) + " fix=hexa run " + ingest_tool + " --witness " + witness_path + " 2>&1   # inspect")
+        return
+    }
+    if inner_rc != 0 {
+        eprintln("__KICK_AUTO_ABSORB__ FAIL witness=" + witness_path + " reason=ingest-inner-rc-" + to_string(inner_rc) + " fix=hexa run " + ingest_tool + " --witness " + witness_path + " 2>&1   # outer rc=0 but hexa.real reported inner failure (e.g. dispatched-runtime exit code)")
         return
     }
 
@@ -594,13 +628,23 @@ fn _auto_absorb_witness(witness_path: str) {
 }
 
 // ─── claude_code multi-slot helper bridge (raw 80 + raw 66) ──────────
-// Decision: route claude_code spawns through tool/claude_slot_pick.hexa so
-// that limit-hit (rate_limit_event in stream-json OR "Claude Pro/Max plan
-// quota exhausted" terminal-error from hive child) auto-rotates to the
-// next slot. codex_cli + gemini_cli backends remain on the single-shot
+// Decision: route claude_code spawns through hive/tool/claude_slot_pick.hexa
+// so that limit-hit (rate_limit_event in stream-json OR "Claude Pro/Max
+// plan quota exhausted" terminal-error from hive child) auto-rotates to
+// the next slot. codex_cli + gemini_cli backends remain on the single-shot
 // path (their CLI auth model is different — no multi-account env switch).
+//
+// Helper home: hive/tool/ (cross-execution OS-primitive per
+// project_resource_management_pivot 2026-04-25). Resolution order:
+//   1) HIVE_ROOT env override (test fixtures)
+//   2) ~/core/hive/tool/claude_slot_pick.hexa (canonical)
+// Consumers should reach the helper through hive CLI surface
+// `hive-exec claude_slot_pick <args>` when invoked from outside hive
+// — see _spawn_via_hive_exec below. We keep the direct hive_root path
+// here for backward-compat smoke; the registry DSL (state/kick/registry/
+// backends/claude_code.hexa#slot-helper) advertises the hive-CLI form.
 fn _slot_pick_tool() -> str {
-    return _nexus_root() + "/tool/claude_slot_pick.hexa"
+    return _hive_root() + "/tool/claude_slot_pick.hexa"
 }
 
 fn _slot_id_from_dir(dir: str) -> str {
@@ -609,10 +653,23 @@ fn _slot_id_from_dir(dir: str) -> str {
     return dir.substring(prefix.len(), dir.len())
 }
 
+// Build the helper invocation prefix. Prefer hive CLI surface
+// `hive-exec claude_slot_pick <args>` when ~/.hx/bin/hive-exec is on
+// disk; fall back to direct hexa-run on the hive_root path otherwise
+// (test envs without ~/.hx/bin/hive-exec installed).
+fn _slot_pick_invocation_prefix() -> str {
+    let hive_exec = env("HOME") + "/.hx/bin/hive-exec"
+    if _file_exists(hive_exec) {
+        return _shell_quote(hive_exec) + " claude_slot_pick"
+    }
+    let tool = _slot_pick_tool()
+    return _hexa_bin() + " run " + _shell_quote(tool)
+}
+
 fn _claude_pick_slot(exclude_csv: str) -> str {
     let tool = _slot_pick_tool()
     if !_file_exists(tool) { return "" }
-    let mut cmd = _hexa_bin() + " run " + _shell_quote(tool) + " --pick"
+    let mut cmd = _slot_pick_invocation_prefix() + " --pick"
     if exclude_csv.len() > 0 { cmd = cmd + " --exclude " + _shell_quote(exclude_csv) }
     return exec(cmd + " 2>/dev/null").trim()
 }
@@ -620,7 +677,7 @@ fn _claude_pick_slot(exclude_csv: str) -> str {
 fn _claude_mark_cooldown(slot_id: str, kind: str, until_epoch: i64) -> void {
     let tool = _slot_pick_tool()
     if !_file_exists(tool) { return }
-    let cmd = _hexa_bin() + " run " + _shell_quote(tool) +
+    let cmd = _slot_pick_invocation_prefix() +
         " --mark-cooldown " + _shell_quote(slot_id) +
         " --kind " + _shell_quote(kind) +
         " --until-epoch " + to_string(until_epoch) +
@@ -631,7 +688,7 @@ fn _claude_mark_cooldown(slot_id: str, kind: str, until_epoch: i64) -> void {
 fn _claude_touch_slot(slot_id: str) -> void {
     let tool = _slot_pick_tool()
     if !_file_exists(tool) { return }
-    let cmd = _hexa_bin() + " run " + _shell_quote(tool) + " --touch " + _shell_quote(slot_id)
+    let cmd = _slot_pick_invocation_prefix() + " --touch " + _shell_quote(slot_id)
     let _ = exec(cmd + " >/dev/null 2>&1")
 }
 
@@ -904,11 +961,21 @@ fn main() -> void {
                 _hexa_bin() + " run " + _shell_quote(dispatch_tool) + " " +
                 _shell_quote(parent_sid) + " --task-file " + _shell_quote(prompt_path)
             let out = exec(cmd + " 2>&1; echo __RC=$?")
+            // OUTER rc — explicit shell echo.
             let rc_idx = out.last_index_of("__RC=")
             let mut local_rc: i64 = 0
             if rc_idx >= 0 {
                 let tail = out.substring(rc_idx + 5, out.len()).trim()
                 local_rc = _safe_to_int_line(tail, 0, "claude-spawn-rc")
+            }
+            // INNER rc — hexa.real-appended __HEXA_RC=N. Promote inner failure
+            // to outer rc when outer reports success but inner runtime failed
+            // (carry-forward from kick_bench.hexa post-fix). This prevents
+            // shell-wrapped subagent failures from being misclassified as PASS.
+            let inner_rc = _extract_inner_hexa_rc(out)
+            if local_rc == 0 && inner_rc != 0 {
+                eprintln("# kick_dispatch: slot=" + slot_id + " outer rc=0 but __HEXA_RC=" + to_string(inner_rc) + " — promoting to spawn failure")
+                local_rc = inner_rc
             }
             print(out)
             rc = local_rc
@@ -932,10 +999,19 @@ fn main() -> void {
         // codex_cli / gemini_cli — unchanged single-shot path.
         let cmd = _hexa_bin() + " run " + _shell_quote(dispatch_tool) + " " + _shell_quote(parent_sid) + " --task-file " + _shell_quote(prompt_path)
         let rc_str = exec(cmd + " 2>&1; echo __RC=$?").trim()
+        // OUTER rc — explicit shell echo.
         let rc_idx = rc_str.last_index_of("__RC=")
         if rc_idx >= 0 {
             let tail = rc_str.substring(rc_idx + 5, rc_str.len()).trim()
             rc = _safe_to_int_line(tail, 0, "single-shot-spawn-rc")
+        }
+        // INNER rc — hexa.real-appended __HEXA_RC=N. Promote inner failure
+        // to rc when outer succeeded but inner runtime failed (carry-forward
+        // from kick_bench.hexa post-fix). Prevents misclassified PASS at L965.
+        let inner_rc_ss = _extract_inner_hexa_rc(rc_str)
+        if rc == 0 && inner_rc_ss != 0 {
+            eprintln("# kick_dispatch: single-shot outer rc=0 but __HEXA_RC=" + to_string(inner_rc_ss) + " — promoting to spawn failure")
+            rc = inner_rc_ss
         }
         print(rc_str)
     }

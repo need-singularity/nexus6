@@ -1,0 +1,649 @@
+#!hexa strict
+// tool/n6arch_experiments_ingest.hexa — experiments/** atlas-emit auto-discovery (Phase-2 dynamic glob)
+//
+// @tool(slug="n6arch_experiments_ingest", desc="experiments/** glob → atlas DSL inline + promote_candidate.md table → delta-only [7] floor facts emit. Sibling of hexa_sim_atlas_ingest (which holds 16 hardcoded bridges). Implements RCA 2026-04-27 §4.1 prevention proposal.")
+// @usage(hexa run tool/n6arch_experiments_ingest.hexa [--apply] [--self-test] [--json-summary] [--repo PATH])
+// @exit_codes(0=PASS, 1=usage/io, 2=schema-guard violation, 3=apply conflict)
+// @sentinel(__N6ARCH_EXP_INGEST__ PASS|FAIL matched_files=N candidates=M dedup_skip=K emitted=E)
+// @origin(state/absorption_miss_rca_2026-04-27.md §4.1 — Phase-2 dynamic-glob mode)
+// @abstraction(raw 23 schema-guard + raw 68 byte-eq idempotence; reused from hexa_sim_atlas_ingest)
+// @paradigm(structural — dynamic discovery over experiments tree, deterministic emit, byte-eq idempotence on identical input set)
+// @allow-bare-exec
+//
+// atlas DSL grammar (atlas.n6 v1):
+//   @<TYPE> <id> = <expr> :: <domain> [<grade>]
+//   types: P primitive, C constant, L law, F formula, R relation, S symmetry, X crossing, ? candidate
+//   grade: 0-11 + d.r alien index; * verified, ! breakthrough, ? hypothesis
+//
+// HARD RULES (per RCA):
+//   - default = dry-run (no shard write); --apply required for actual emission
+//   - dedup against atlas.n6 + every existing atlas.append.*.n6
+//   - skip venv/, __pycache__/, node_modules/, .cache/
+//   - floor grade [7] when source line lacks explicit grade
+
+// ─── polyfill: dir_exists ─────────────────────────────────────
+
+fn dir_exists(p: string) -> bool {
+    let out = to_string(exec("test -d '" + p + "' && echo y || echo n")).trim()
+    if out == "y" { return true }
+    return false
+}
+
+fn file_exists_safe(p: string) -> bool {
+    let out = to_string(exec("test -f '" + p + "' && echo y || echo n")).trim()
+    if out == "y" { return true }
+    return false
+}
+
+// ─── path roots ───────────────────────────────────────────────
+
+fn _core_root() -> string {
+    let override = env_var("NEXUS_CORE_ROOT")
+    if len(override) > 0 && dir_exists(override) { return override }
+    let top = to_string(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()
+    if len(top) > 0 {
+        let parent = to_string(exec("dirname '" + top + "' 2>/dev/null")).trim()
+        if len(parent) > 0 && dir_exists(parent + "/nexus/n6") { return parent }
+    }
+    return env_var("HOME") + "/core"
+}
+
+fn _n6arch_root() -> string {
+    let r = _core_root()
+    if dir_exists(r + "/n6-architecture") { return r + "/n6-architecture" }
+    if dir_exists(r + "/n6-arch") { return r + "/n6-arch" }
+    return r + "/n6-architecture"
+}
+
+fn _atlas_main_path() -> string {
+    let r = _core_root()
+    return r + "/nexus/n6/atlas.n6"
+}
+
+fn _shard_dir() -> string {
+    let r = _core_root()
+    return r + "/nexus/n6"
+}
+
+fn _shard_path() -> string {
+    return _shard_dir() + "/atlas.append.n6arch-experiments-auto-2026-04-27.n6"
+}
+
+// ─── glob discovery ───────────────────────────────────────────
+// RCA spec: ["experiments/**/*.hexa", "experiments/**/*.json",
+//            "experiments/**/promote_candidate.md", "experiments/**/README.md"]
+// Skip: venv/, __pycache__/, node_modules/, .cache/
+
+fn _glob_experiments(repo_root: string) -> array {
+    let exp_dir = repo_root + "/experiments"
+    if !dir_exists(exp_dir) { return [] }
+    let prune = "-not -path '*/venv/*' -not -path '*/__pycache__/*' -not -path '*/node_modules/*' -not -path '*/.cache/*'"
+    let cmd = "find '" + exp_dir + "' -type f " + prune + " \\( -name '*.hexa' -o -name '*.json' -o -name 'promote_candidate.md' -o -name 'README.md' \\) 2>/dev/null | sort"
+    let out = to_string(exec(cmd)).trim()
+    if len(out) == 0 { return [] }
+    return out.split("\n")
+}
+
+fn _relpath_from(repo_root: string, abs_path: string) -> string {
+    let prefix = repo_root + "/"
+    if abs_path.index_of(prefix) == 0 {
+        return abs_path.substring(len(prefix), len(abs_path))
+    }
+    return abs_path
+}
+
+// ─── schema-guard (raw 23, mirror of hexa_sim_atlas_ingest) ───
+
+fn _valid_type(t: string) -> bool {
+    if t == "P" || t == "C" || t == "L" || t == "F" || t == "R" || t == "S" || t == "X" || t == "?" { return true }
+    return false
+}
+
+fn _valid_grade(g: string) -> bool {
+    if len(g) == 0 { return false }
+    let mut i = 0
+    let n = len(g)
+    let mut digit_seen = false
+    while i < n {
+        let c = g.substring(i, i + 1)
+        if c >= "0" && c <= "9" { digit_seen = true; i = i + 1; continue }
+        if c == "*" || c == "!" || c == "?" || c == "." { i = i + 1; continue }
+        // also allow uppercase/underscore for extended grade tokens (PASS_LITERATURE etc.)
+        if (c >= "A" && c <= "Z") || c == "_" { i = i + 1; continue }
+        return false
+    }
+    return digit_seen
+}
+
+fn _valid_id(id: string) -> bool {
+    if len(id) == 0 { return false }
+    let mut i = 0
+    let n = len(id)
+    while i < n {
+        let c = id.substring(i, i + 1)
+        let ok_alpha = (c >= "a" && c <= "z") || (c >= "A" && c <= "Z")
+        let ok_digit = c >= "0" && c <= "9"
+        let ok_punct = c == "_" || c == "-"
+        if !(ok_alpha || ok_digit || ok_punct) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn _validate_emit(t: string, id: string, expr: string, domain: string, grade: string) -> array {
+    if !_valid_type(t) { return ["FAIL", "invalid type `" + t + "`"] }
+    if !_valid_id(id) { return ["FAIL", "invalid id `" + id + "`"] }
+    if len(expr) == 0 { return ["FAIL", "empty expr"] }
+    if len(domain) == 0 { return ["FAIL", "empty domain"] }
+    if !_valid_grade(grade) { return ["FAIL", "invalid grade `" + grade + "`"] }
+    return ["OK", ""]
+}
+
+// ─── atlas DSL inline pattern parser ──────────────────────────
+// Looks for patterns of the form:
+//   @<TYPE> <id> = <expr> :: <domain> [<grade>]
+// type ∈ {P, C, F, L, R, S, X, ?}
+// Returns array of [type, id, expr, domain, grade, source_relpath, raw_line].
+
+fn _scan_inline_dsl(abs_path: string, relpath: string) -> array {
+    let mut hits = []
+    if !file_exists_safe(abs_path) { return hits }
+    // grep is much faster than reading whole file in hexa stdlib;
+    // pattern: @<TYPE> <id> = ... :: ... [...]
+    let cmd = "grep -nE '@[PCFLRSX?] [A-Za-z_][A-Za-z0-9_-]* = .* :: [^ ]+.* \\[[^]]+\\]' '" + abs_path + "' 2>/dev/null"
+    let out = to_string(exec(cmd))
+    if len(out.trim()) == 0 { return hits }
+    let lines = out.split("\n")
+    let mut i = 0
+    let n = len(lines)
+    while i < n {
+        let raw = lines[i]
+        if len(raw.trim()) == 0 { i = i + 1; continue }
+        // strip "lineno:" prefix
+        let colon = raw.index_of(":")
+        if colon < 0 { i = i + 1; continue }
+        let line = raw.substring(colon + 1, len(raw))
+        // find "@<T> "
+        let at = line.index_of("@")
+        if at < 0 { i = i + 1; continue }
+        if at + 3 > len(line) { i = i + 1; continue }
+        let t = line.substring(at + 1, at + 2)
+        if !_valid_type(t) { i = i + 1; continue }
+        if line.substring(at + 2, at + 3) != " " { i = i + 1; continue }
+        let after_at = line.substring(at + 3, len(line))
+        let eq = after_at.index_of(" = ")
+        if eq < 0 { i = i + 1; continue }
+        let id = after_at.substring(0, eq).trim()
+        if !_valid_id(id) { i = i + 1; continue }
+        let after_eq = after_at.substring(eq + 3, len(after_at))
+        let dom_idx = after_eq.index_of(" :: ")
+        if dom_idx < 0 { i = i + 1; continue }
+        let expr = after_eq.substring(0, dom_idx).trim()
+        let after_dom = after_eq.substring(dom_idx + 4, len(after_eq))
+        let lb = after_dom.index_of(" [")
+        if lb < 0 { i = i + 1; continue }
+        let domain = after_dom.substring(0, lb).trim()
+        let after_lb = after_dom.substring(lb + 2, len(after_dom))
+        let rb = after_lb.index_of("]")
+        if rb < 0 { i = i + 1; continue }
+        let grade = after_lb.substring(0, rb).trim()
+        if len(grade) == 0 { i = i + 1; continue }
+        hits.push([t, id, expr, domain, grade, relpath, line.trim()])
+        i = i + 1
+    }
+    return hits
+}
+
+// ─── promote_candidate.md table parser ────────────────────────
+// Looks for lines of the form:
+//   | <num> | <ID-like-string> ... | [<old>] | **[<new>]** | <gate> |
+// or, more loosely:
+//   | BT-<n> ...   | MILL-<...> ...
+// Extract ID + proposed grade; default-grade = [7]; emit as @? candidate facts.
+
+fn _trim_md_cell(s: string) -> string {
+    let t = s.trim()
+    // strip surrounding ** **
+    if len(t) >= 4 && t.substring(0, 2) == "**" {
+        let tail2 = t.substring(len(t) - 2, len(t))
+        if tail2 == "**" { return t.substring(2, len(t) - 2).trim() }
+    }
+    // strip backticks
+    if len(t) >= 2 && t.substring(0, 1) == "`" {
+        let tail1 = t.substring(len(t) - 1, len(t))
+        if tail1 == "`" { return t.substring(1, len(t) - 1).trim() }
+    }
+    return t
+}
+
+fn _extract_id_token(cell: string) -> string {
+    // pull first BT-<num> or MILL-<...> or n6-bt-<num> token
+    // simplest: find "BT-" / "MILL-" / "n6-bt-" / "DSE-" / "BMK-" prefix and continue while alnum/dash/underscore
+    let prefixes = ["n6-bt-", "MILL-", "BT-", "DSE-", "BMK-", "BC-"]
+    let mut p = 0
+    while p < len(prefixes) {
+        let needle = prefixes[p]
+        let idx = cell.index_of(needle)
+        if idx >= 0 {
+            // walk forward while alnum / - / _
+            let mut j = idx + len(needle)
+            let nl = len(cell)
+            while j < nl {
+                let c = cell.substring(j, j + 1)
+                let ok_alpha = (c >= "a" && c <= "z") || (c >= "A" && c <= "Z")
+                let ok_digit = c >= "0" && c <= "9"
+                let ok_punct = c == "_" || c == "-"
+                if !(ok_alpha || ok_digit || ok_punct) { break }
+                j = j + 1
+            }
+            return cell.substring(idx, j)
+        }
+        p = p + 1
+    }
+    return ""
+}
+
+fn _extract_bracket_grade(cell: string) -> string {
+    let lb = cell.index_of("[")
+    if lb < 0 { return "" }
+    let after = cell.substring(lb + 1, len(cell))
+    let rb = after.index_of("]")
+    if rb < 0 { return "" }
+    return after.substring(0, rb).trim()
+}
+
+fn _scan_promote_candidate_md(abs_path: string, relpath: string) -> array {
+    let mut hits = []
+    if !file_exists_safe(abs_path) { return hits }
+    // Only scan files literally named promote_candidate.md
+    let cmd_basename = "basename '" + abs_path + "'"
+    let bn = to_string(exec(cmd_basename)).trim()
+    if bn != "promote_candidate.md" { return hits }
+    // Pull rows starting with "| " that mention BT-/MILL-/n6-bt-/DSE-/BMK-/BC-
+    let cmd = "grep -nE '^\\| .*([Bb][Tt]-|MILL-|n6-bt-|DSE-|BMK-|BC-)' '" + abs_path + "' 2>/dev/null"
+    let out = to_string(exec(cmd))
+    if len(out.trim()) == 0 { return hits }
+    let lines = out.split("\n")
+    let mut i = 0
+    let n = len(lines)
+    while i < n {
+        let raw = lines[i]
+        if len(raw.trim()) == 0 { i = i + 1; continue }
+        let colon = raw.index_of(":")
+        if colon < 0 { i = i + 1; continue }
+        let line = raw.substring(colon + 1, len(raw))
+        // skip header / divider
+        if line.index_of("|---") >= 0 { i = i + 1; continue }
+        if line.index_of("| #") == 0 { i = i + 1; continue }
+        // split on "|"
+        let cells = line.split("|")
+        if len(cells) < 3 { i = i + 1; continue }
+        // search for the first cell containing an ID token
+        let mut id_token = ""
+        let mut ci = 0
+        while ci < len(cells) {
+            let cell = _trim_md_cell(cells[ci])
+            let cand = _extract_id_token(cell)
+            if len(cand) > 0 { id_token = cand; break }
+            ci = ci + 1
+        }
+        if len(id_token) == 0 { i = i + 1; continue }
+        if !_valid_id(id_token) { i = i + 1; continue }
+        // proposed grade — search for last "[...]" cell with a digit (e.g. "**[10*]**" "[10*]" "[7]")
+        let mut grade = ""
+        let mut ck = len(cells) - 1
+        while ck >= 0 {
+            let g = _extract_bracket_grade(_trim_md_cell(cells[ck]))
+            if _valid_grade(g) { grade = g; break }
+            ck = ck - 1
+        }
+        if len(grade) == 0 { grade = "7" }  // floor grade
+        // expr = trimmed full row (compressed)
+        let expr_raw = line.replace("|", " ").trim()
+        let expr = expr_raw
+        // domain: derive from path — anu_mc_verification etc.
+        let dom_dir = to_string(exec("dirname '" + abs_path + "' | xargs basename")).trim()
+        let domain = "experiments_" + dom_dir
+        hits.push(["?", id_token, expr, domain, grade, relpath, line.trim()])
+        i = i + 1
+    }
+    return hits
+}
+
+// ─── existing-id index (atlas.n6 + every atlas.append.*.n6) ───
+
+fn _build_existing_id_set() -> string {
+    // Concatenate "id" tokens from atlas.n6 + atlas.append.*.n6 into a newline-joined blob;
+    // callers do simple substring lookup with newline guards.
+    let main = _atlas_main_path()
+    let dir = _shard_dir()
+    let cmd = "(grep -hE '^@[PCFLRSX?] [A-Za-z_][A-Za-z0-9_-]+' '" + main + "' '" + dir + "'/atlas.append.*.n6 2>/dev/null | awk '{print $2}' | sort -u)"
+    let out = to_string(exec(cmd))
+    return out
+}
+
+fn _id_already_exists(blob: string, id: string) -> bool {
+    if len(blob) == 0 { return false }
+    // exact-line match: "\n" + id + "\n", with leading-line and trailing-line guards
+    let needle1 = "\n" + id + "\n"
+    if blob.index_of(needle1) >= 0 { return true }
+    // first line edge case
+    if blob.index_of(id + "\n") == 0 { return true }
+    // last line edge case (no trailing newline)
+    let nl = len(blob)
+    let nid = len(id)
+    if nl >= nid {
+        let tail = blob.substring(nl - nid, nl)
+        if tail == id {
+            // ensure prefix is start or newline
+            if nl == nid { return true }
+            let prev = blob.substring(nl - nid - 1, nl - nid)
+            if prev == "\n" { return true }
+        }
+    }
+    return false
+}
+
+// ─── shard emit (delta-only) ──────────────────────────────────
+
+fn _emit_line(t: string, id: string, expr: string, domain: string, grade: string, relpath: string) -> string {
+    let mut s = "@" + t + " " + id + " = " + expr + " :: " + domain + " [" + grade + "]\n"
+    s = s + "  |> " + relpath + "\n"
+    return s
+}
+
+fn _emit_shard_text(emits: array) -> string {
+    let mut s = "// ═══════════════════════════════════════════════════════════════\n"
+    s = s + "// atlas.append.n6arch-experiments-auto-2026-04-27.n6 — n6-arch experiments/** auto-discovered facts\n"
+    s = s + "// 작성: 2026-04-27, tool/n6arch_experiments_ingest.hexa (deterministic emit, RCA §4.1 prevention)\n"
+    s = s + "// 본체 충돌 방지: atlas.n6 직접 편집 대신 본 append 파일에만 기록\n"
+    s = s + "// 병합 주체: main context (다음 atlas 통합 phase 에서)\n"
+    s = s + "// 전체 건수: " + to_string(len(emits)) + " 신규 emit\n"
+    s = s + "// 등급 정책: floor=[7] (no explicit grade) / explicit=preserved\n"
+    s = s + "// idempotence: same input set → byte-eq output (raw 68)\n"
+    s = s + "// schema-guard: raw 23 (atlas DSL grammar mini-lint, exit 2 on violation)\n"
+    s = s + "// dedup: against atlas.n6 + every atlas.append.*.n6 (id-only check)\n"
+    s = s + "// ═══════════════════════════════════════════════════════════════\n\n"
+    s = s + "// ── facts (delta-only) ──\n\n"
+    let mut i = 0
+    let n = len(emits)
+    while i < n {
+        let row = emits[i]
+        s = s + _emit_line(row[0], row[1], row[2], row[3], row[4], row[5])
+        s = s + "\n"
+        i = i + 1
+    }
+    s = s + "// EOF — total " + to_string(len(emits)) + " emits\n"
+    return s
+}
+
+// ─── self-test ────────────────────────────────────────────────
+// Builds tiny fixture under /tmp/n6arch_test/ and runs the pipeline.
+// Verifies:
+//   1. Idempotent (run twice, byte-equal output)
+//   2. Schema-guard fires on a deliberately malformed line
+//   3. Dedup correctly skips a line that matches an existing atlas.n6 ID
+
+fn _run_self_test() {
+    let tdir = "/tmp/n6arch_test"
+    let exp = tdir + "/experiments"
+    let exp_sub = exp + "/anu_mc_verification"
+    exec("rm -rf '" + tdir + "'")
+    exec("mkdir -p '" + exp_sub + "'")
+    // fixture A: a .hexa with one inline DSL line
+    let f1 = exp + "/dse_pilot.hexa"
+    let f1_body = "// dse pilot\n// @F dse_pilot_synth_id_2026 = sigma * phi - 1 = 23 :: experiments_test [7]\n// some other content\n"
+    write_file(f1, f1_body)
+    // fixture B: promote_candidate.md with a 2-row table (one ID matches existing atlas BT-209, one is novel)
+    let f2 = exp_sub + "/promote_candidate.md"
+    let f2_body = "# Promote table\n\n| # | Atlas ID | Current | Proposed | Gate |\n|---|---|---|---|---|\n| 1 | BT-209 (`m_p/m_e ≈ 6·π⁵`) | [7] | **[10*]** | analytic |\n| 2 | n6-bt-synth-2026 (novel) | [7] | **[10*]** | mc-test |\n"
+    write_file(f2, f2_body)
+    // fixture C: malformed (broken bracket — schema-guard target)
+    let f3 = exp + "/malformed.hexa"
+    let f3_body = "// @F bad_id = something :: dom [bad-grade-no-digit]\n"
+    write_file(f3, f3_body)
+
+    // Build a synthetic existing-id blob containing BT-209 (mimic existing atlas.n6 dedup)
+    let synth_existing = "BT-209\nn6-bt-209\nsome_other_id\n"
+
+    // ── check 1: idempotence ──
+    let files = [
+        [f1, _relpath_from(tdir, f1)],
+        [f2, _relpath_from(tdir, f2)],
+        [f3, _relpath_from(tdir, f3)]
+    ]
+    // Pass 1
+    let mut hits1 = []
+    let mut malformed_count1 = 0
+    let mut dedup_skip1 = 0
+    let mut mi = 0
+    while mi < len(files) {
+        let pair = files[mi]
+        let inline = _scan_inline_dsl(pair[0], pair[1])
+        let pmd = _scan_promote_candidate_md(pair[0], pair[1])
+        let mut all = []
+        let mut k = 0
+        while k < len(inline) { all.push(inline[k]); k = k + 1 }
+        k = 0
+        while k < len(pmd) { all.push(pmd[k]); k = k + 1 }
+        let mut j = 0
+        while j < len(all) {
+            let row = all[j]
+            let v = _validate_emit(row[0], row[1], row[2], row[3], row[4])
+            if v[0] != "OK" { malformed_count1 = malformed_count1 + 1; j = j + 1; continue }
+            if _id_already_exists(synth_existing, row[1]) { dedup_skip1 = dedup_skip1 + 1; j = j + 1; continue }
+            hits1.push(row)
+            j = j + 1
+        }
+        mi = mi + 1
+    }
+    let text1 = _emit_shard_text(hits1)
+
+    // Pass 2 — identical fixture, run again
+    let mut hits2 = []
+    let mut mi2 = 0
+    while mi2 < len(files) {
+        let pair = files[mi2]
+        let inline = _scan_inline_dsl(pair[0], pair[1])
+        let pmd = _scan_promote_candidate_md(pair[0], pair[1])
+        let mut all = []
+        let mut k = 0
+        while k < len(inline) { all.push(inline[k]); k = k + 1 }
+        k = 0
+        while k < len(pmd) { all.push(pmd[k]); k = k + 1 }
+        let mut j = 0
+        while j < len(all) {
+            let row = all[j]
+            let v = _validate_emit(row[0], row[1], row[2], row[3], row[4])
+            if v[0] != "OK" { j = j + 1; continue }
+            if _id_already_exists(synth_existing, row[1]) { j = j + 1; continue }
+            hits2.push(row)
+            j = j + 1
+        }
+        mi2 = mi2 + 1
+    }
+    let text2 = _emit_shard_text(hits2)
+
+    let mut idem = "PASS"
+    if text1 != text2 { idem = "FAIL" }
+
+    let mut guard = "FAIL"
+    if malformed_count1 >= 1 { guard = "PASS" }
+
+    let mut dedup = "FAIL"
+    if dedup_skip1 >= 1 { dedup = "PASS" }
+
+    println("=== n6arch_experiments_ingest --self-test ===")
+    println("  fixture dir       : " + tdir)
+    println("  matched files     : " + to_string(len(files)))
+    println("  emit count pass1  : " + to_string(len(hits1)))
+    println("  malformed caught  : " + to_string(malformed_count1))
+    println("  dedup skips       : " + to_string(dedup_skip1))
+    println("  check 1 idempotent: " + idem)
+    println("  check 2 schemaguard: " + guard)
+    println("  check 3 dedup     : " + dedup)
+    if idem == "PASS" && guard == "PASS" && dedup == "PASS" {
+        println("__N6ARCH_EXP_INGEST_SELFTEST__ PASS")
+        // cleanup
+        exec("rm -rf '" + tdir + "'")
+        exit(0)
+    }
+    println("__N6ARCH_EXP_INGEST_SELFTEST__ FAIL idem=" + idem + " guard=" + guard + " dedup=" + dedup)
+    exec("rm -rf '" + tdir + "'")
+    exit(2)
+}
+
+// ─── runner ───────────────────────────────────────────────────
+
+fn main() -> void {
+    let raw_args = args()
+    let mut cli = []
+    let mut ai = 2
+    while ai < len(raw_args) {
+        cli.push(raw_args[ai])
+        ai = ai + 1
+    }
+    let mut apply = false
+    let mut json_summary = false
+    let mut self_test = false
+    let mut repo_override = ""
+    let mut i = 0
+    while i < len(cli) {
+        let a = cli[i]
+        if a == "--self-test" || a == "--selftest" { self_test = true }
+        else if a == "--apply" { apply = true }
+        else if a == "--json-summary" { json_summary = true }
+        else if a == "--repo" {
+            if i + 1 >= len(cli) { eprintln("--repo requires path"); exit(1) }
+            repo_override = cli[i + 1]
+            i = i + 1
+        }
+        else if a == "--help" || a == "-h" {
+            println("usage: hexa run tool/n6arch_experiments_ingest.hexa [--apply] [--self-test] [--json-summary] [--repo PATH]")
+            println("modes:")
+            println("  (default)        DRY-RUN — print would-be output, no shard write")
+            println("  --apply          actually write the shard (RCA §4.1 hard rule: not invoked by tooling)")
+            println("  --self-test      run /tmp/n6arch_test/ fixture pipeline and check 3 invariants")
+            println("  --json-summary   JSON output mode")
+            println("  --repo PATH      override n6-architecture root (else auto-detect)")
+            println("origin: state/absorption_miss_rca_2026-04-27.md §4.1")
+            exit(0)
+        }
+        else {
+            eprintln("n6arch_experiments_ingest: unknown arg `" + a + "`")
+            exit(1)
+        }
+        i = i + 1
+    }
+
+    if self_test { _run_self_test() }
+
+    let repo = if len(repo_override) > 0 { repo_override } else { _n6arch_root() }
+    if !dir_exists(repo) {
+        eprintln("__N6ARCH_EXP_INGEST__ FAIL repo missing: " + repo)
+        exit(1)
+    }
+
+    let files = _glob_experiments(repo)
+    let existing_blob = _build_existing_id_set()
+
+    let mut all_emits = []
+    let mut malformed = []
+    let mut dedup_skip = 0
+    let mut intra_emit_ids = ""
+    let mut fi = 0
+    while fi < len(files) {
+        let abs = files[fi]
+        let rel = _relpath_from(repo, abs)
+        let inline = _scan_inline_dsl(abs, rel)
+        let pmd = _scan_promote_candidate_md(abs, rel)
+        let mut combined = []
+        let mut k = 0
+        while k < len(inline) { combined.push(inline[k]); k = k + 1 }
+        k = 0
+        while k < len(pmd) { combined.push(pmd[k]); k = k + 1 }
+        let mut j = 0
+        while j < len(combined) {
+            let row = combined[j]
+            let v = _validate_emit(row[0], row[1], row[2], row[3], row[4])
+            if v[0] != "OK" {
+                malformed.push(rel + ":" + row[1] + " :: " + v[1])
+                j = j + 1
+                continue
+            }
+            // dedup against atlas + existing shards
+            if _id_already_exists(existing_blob, row[1]) {
+                dedup_skip = dedup_skip + 1
+                j = j + 1
+                continue
+            }
+            // dedup within this run
+            if _id_already_exists(intra_emit_ids, row[1]) {
+                dedup_skip = dedup_skip + 1
+                j = j + 1
+                continue
+            }
+            intra_emit_ids = intra_emit_ids + row[1] + "\n"
+            all_emits.push(row)
+            j = j + 1
+        }
+        fi = fi + 1
+    }
+
+    if len(malformed) > 0 {
+        eprintln("__N6ARCH_EXP_INGEST__ FAIL schema-guard violations: " + to_string(len(malformed)))
+        let mut m = 0
+        while m < len(malformed) && m < 10 {
+            eprintln("  " + malformed[m])
+            m = m + 1
+        }
+        exit(2)
+    }
+
+    let shard_text = _emit_shard_text(all_emits)
+
+    if !apply {
+        // DRY-RUN: print summary + first 10 lines
+        if json_summary {
+            println("{")
+            println("  \"tool\": \"n6arch_experiments_ingest\",")
+            println("  \"mode\": \"dry-run\",")
+            println("  \"repo\": \"" + repo + "\",")
+            println("  \"matched_files\": " + to_string(len(files)) + ",")
+            println("  \"candidate_emits\": " + to_string(len(all_emits)) + ",")
+            println("  \"dedup_skipped\": " + to_string(dedup_skip) + ",")
+            println("  \"shard_target\": \"" + _shard_path() + "\"")
+            println("}")
+        } else {
+            println("=== n6arch_experiments_ingest DRY-RUN ===")
+            println("  repo            : " + repo)
+            println("  matched files   : " + to_string(len(files)))
+            println("  candidate emits : " + to_string(len(all_emits)))
+            println("  dedup skipped   : " + to_string(dedup_skip))
+            println("  shard target    : " + _shard_path() + " (NOT written)")
+            println("")
+            println("  first 10 candidate emit lines:")
+            let mut p = 0
+            while p < len(all_emits) && p < 10 {
+                let row = all_emits[p]
+                println("    @" + row[0] + " " + row[1] + " :: " + row[3] + " [" + row[4] + "]  |> " + row[5])
+                p = p + 1
+            }
+            if len(all_emits) > 10 { println("    ... (" + to_string(len(all_emits) - 10) + " more)") }
+            println("=== / DRY-RUN ===")
+        }
+        println("__N6ARCH_EXP_INGEST__ PASS matched_files=" + to_string(len(files)) + " candidates=" + to_string(len(all_emits)) + " dedup_skip=" + to_string(dedup_skip) + " emitted=0 mode=dry-run")
+        exit(0)
+    }
+
+    // --apply mode — actually write the shard
+    let shard = _shard_path()
+    if file_exists_safe(shard) {
+        eprintln("__N6ARCH_EXP_INGEST__ FAIL apply conflict: shard already exists at " + shard)
+        eprintln("  reason: refusing to overwrite — delete or rename existing shard first")
+        exit(3)
+    }
+    write_file(shard, shard_text)
+    println("__N6ARCH_EXP_INGEST__ PASS matched_files=" + to_string(len(files)) + " candidates=" + to_string(len(all_emits)) + " dedup_skip=" + to_string(dedup_skip) + " emitted=" + to_string(len(all_emits)) + " mode=apply shard=" + shard)
+    exit(0)
+}
