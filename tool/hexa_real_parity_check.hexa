@@ -1,0 +1,463 @@
+// tool/hexa_real_parity_check.hexa — cross-host hexa_real SHA + HEXA_EXEC_WARN gate
+// drift detector.  Runs over Mac + ubu1 + ubu2 + hetzner (primary + bootstrap),
+// groups by OS, asserts within-group SHA parity + universal gate presence.
+//
+// @tool(slug="hexa_real_parity_check", desc="cross-host hexa_real SHA + HEXA_EXEC_WARN
+//   gate drift detector — Sub-V root-cause-permanent-fix for r4_hexa_runtime_security_warning
+//   recurrence (2026-04-27).  Two binary copies (/root/.hx/bin/hexa_real +
+//   /home/ghost-nexus/_bootstrap/hexa_linux_x86_64 on hetzner) had drifted silently
+//   until the user reported stderr noise; this detector catches the same condition
+//   automatically.")
+// @usage(hexa run /Users/ghost/core/nexus/tool/hexa_real_parity_check.hexa
+//   [--json] [--strict] [--selftest])
+// @omega-saturation-exempt("audit detector — convergence applies to the cluster
+//   it audits, not to the auditor itself")
+// @exit_codes(0=PASS, 1=drift detected, 2=usage/io error, 66=ai-native-trailer)
+//
+// raw 1 + raw 66 + raw 75 + raw 80 + raw 84 + raw 85 + raw 95.
+//
+// CHECK MATRIX
+//   For each (host, path) probe target:
+//     1. probe sha256 of binary at path
+//     2. probe `strings <bin> | grep -c HEXA_EXEC_WARN` gate count
+//     3. record (host, path, os_group, sha, gate, ok|missing|error)
+//
+//   Assertions:
+//     A.  All darwin-group SHAs equal
+//     B.  All linux-group SHAs equal
+//     C.  All probe targets gate count >= 1
+//     D.  No probe-error / missing-binary status
+//
+//   Mac ↔ Linux SHA are LEGITIMATELY different (darwin binary vs linux x86_64
+//   binary).  Within-OS-group equality is the real invariant.
+//
+// SENTINEL
+//   stderr: __HEXA_REAL_PARITY__ <PASS|FAIL> darwin_sha=<10> linux_sha=<10>
+//   selftest: __HEXA_REAL_PARITY_SELFTEST__ <PASS|FAIL>
+//
+// AI-NATIVE ERROR (raw 66)
+//   reason=<sub-class>: <details>
+//   fix: 1) <action>  2) <action>  3) <action>
+
+// ─── helpers ─────────────────────────────────────────────────────────
+
+fn _now_iso_utc() -> str {
+    return exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+// Single-token guard for SSH-style host strings.  Defends against typos
+// or env-substituted strings carrying ; | $( etc.
+fn _is_safe_host(h: str) -> bool {
+    if h.len() == 0 || h.len() > 64 { return false }
+    let mut i: i64 = 0
+    while i < h.len() {
+        let c = h.substring(i, i + 1)
+        let ok = (c >= "a" && c <= "z") || (c >= "A" && c <= "Z")
+            || (c >= "0" && c <= "9") || c == "-" || c == "_" || c == "."
+        if !ok { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn _is_safe_path(p: str) -> bool {
+    if p.len() == 0 || p.len() > 256 { return false }
+    let mut i: i64 = 0
+    while i < p.len() {
+        let c = p.substring(i, i + 1)
+        let bad = c == ";" || c == "|" || c == "&" || c == "$" || c == "`"
+            || c == "\"" || c == "'" || c == "\\" || c == "\n"
+        if bad { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// Probe sha256 of a path on a remote host (or local host when host == "local").
+// Container-portable cascade per commit 59bfc967.
+fn _probe_sha(host: str, path: str) -> str {
+    if !_is_safe_host(host) || !_is_safe_path(path) { return "ERR_INPUT" }
+    // Use `cut -d' ' -f1` instead of `awk '{print $1}'` to avoid nested
+    // single-quote conflict when this command is wrapped in `ssh host '...'`.
+    let inner = "(sha256sum " + path + " 2>/dev/null || shasum -a 256 " + path + " 2>/dev/null) | cut -d\" \" -f1"
+    if host == "local" {
+        return exec(inner).trim()
+    }
+    let cmd = "ssh -o ConnectTimeout=8 -o BatchMode=yes -o StrictHostKeyChecking=no " + host + " '" + inner + "' 2>/dev/null"
+    return exec(cmd).trim()
+}
+
+// Probe HEXA_EXEC_WARN gate-string count.  >=1 means the binary was built
+// from a source that contains the env-gate (post hxa-20260422-005, 2026-04-23).
+fn _probe_gate(host: str, path: str) -> i64 {
+    if !_is_safe_host(host) || !_is_safe_path(path) { return -1 }
+    let inner = "strings " + path + " 2>/dev/null | grep -c HEXA_EXEC_WARN || echo 0"
+    let raw = if host == "local" {
+        exec(inner).trim()
+    } else {
+        let cmd = "ssh -o ConnectTimeout=8 -o BatchMode=yes -o StrictHostKeyChecking=no " + host + " '" + inner + "' 2>/dev/null"
+        exec(cmd).trim()
+    }
+    if raw.len() == 0 { return -1 }
+    let mut v: i64 = 0
+    try { v = to_int(raw) } catch e { v = -1 }
+    return v
+}
+
+fn _short(s: str) -> str {
+    if s.len() <= 10 { return s }
+    return s.substring(0, 10)
+}
+
+// ─── probe target schema ─────────────────────────────────────────────
+// Encoded as parallel arrays so the helper stays compatible with the
+// hexa runtime that lacks struct support in some build pipelines.
+//   targets[i] = (host_label, ssh_target, abs_path, os_group)
+
+fn _build_targets() -> [[str]] {
+    let mut t: [[str]] = []
+    t = t + [["mac",                 "local",   "/Users/ghost/.hx/bin/hexa_real",                  "darwin"]]
+    t = t + [["ubu1",                "ubu",     "/home/aiden/.hx/bin/hexa_real",                   "linux"]]
+    t = t + [["ubu2",                "ubu2",    "/home/summer/.hx/bin/hexa_real",                  "linux"]]
+    t = t + [["hetzner-primary",     "hetzner", "/root/.hx/bin/hexa_real",                         "linux"]]
+    t = t + [["hetzner-bootstrap",   "hetzner", "/home/ghost-nexus/_bootstrap/hexa_linux_x86_64",  "linux"]]
+    return t
+}
+
+// ─── main probe loop ─────────────────────────────────────────────────
+// Returns parallel arrays [labels, shas, gates, statuses, os_groups].
+// status ∈ {ok, missing-binary, probe-error}.
+
+fn _probe_all() -> [[str]] {
+    let targets = _build_targets()
+    let mut labels: [str] = []
+    let mut shas: [str] = []
+    let mut gates: [str] = []
+    let mut statuses: [str] = []
+    let mut groups: [str] = []
+    let mut i: i64 = 0
+    while i < len(targets) {
+        let row = targets[i]
+        let label = row[0]
+        let ssh_t = row[1]
+        let path = row[2]
+        let grp = row[3]
+        let sha = _probe_sha(ssh_t, path)
+        let gate = _probe_gate(ssh_t, path)
+        let mut status = "ok"
+        if sha == "ERR_INPUT" || sha.len() == 0 { status = "probe-error" }
+        else if sha.len() < 64 { status = "missing-binary" }
+        if gate < 0 && status == "ok" { status = "probe-error" }
+        labels = labels + [label]
+        shas = shas + [sha]
+        gates = gates + [to_string(gate)]
+        statuses = statuses + [status]
+        groups = groups + [grp]
+        i = i + 1
+    }
+    return [labels, shas, gates, statuses, groups]
+}
+
+// ─── verdict + report ────────────────────────────────────────────────
+
+fn _verdict(probes: [[str]]) -> [str] {
+    // Returns [verdict, darwin_sha, linux_sha, drift_reasons_csv]
+    let labels = probes[0]
+    let shas = probes[1]
+    let gates = probes[2]
+    let statuses = probes[3]
+    let groups = probes[4]
+
+    let mut darwin_sha = ""
+    let mut linux_sha = ""
+    let mut darwin_drift = false
+    let mut linux_drift = false
+    let mut gate_fail: [str] = []
+    let mut probe_err: [str] = []
+
+    let mut i: i64 = 0
+    while i < len(labels) {
+        let g = groups[i]
+        let sha = shas[i]
+        let gate = gates[i]
+        let st = statuses[i]
+        if st != "ok" { probe_err = probe_err + [labels[i] + ":" + st] }
+        else {
+            // gate check
+            let mut gv: i64 = 0
+            try { gv = to_int(gate) } catch e { gv = -1 }
+            if gv < 1 { gate_fail = gate_fail + [labels[i] + ":gate=" + gate] }
+            // sha within-group
+            if g == "darwin" {
+                if darwin_sha.len() == 0 { darwin_sha = sha }
+                else if darwin_sha != sha { darwin_drift = true }
+            }
+            if g == "linux" {
+                if linux_sha.len() == 0 { linux_sha = sha }
+                else if linux_sha != sha { linux_drift = true }
+            }
+        }
+        i = i + 1
+    }
+
+    let mut reasons: [str] = []
+    if darwin_drift { reasons = reasons + ["darwin-sha-drift"] }
+    if linux_drift  { reasons = reasons + ["linux-sha-drift"] }
+    if len(gate_fail) > 0 {
+        let mut s = "missing-gate("
+        let mut k: i64 = 0
+        while k < len(gate_fail) {
+            if k > 0 { s = s + "," }
+            s = s + gate_fail[k]
+            k = k + 1
+        }
+        s = s + ")"
+        reasons = reasons + [s]
+    }
+    if len(probe_err) > 0 {
+        let mut s = "probe-error("
+        let mut k: i64 = 0
+        while k < len(probe_err) {
+            if k > 0 { s = s + "," }
+            s = s + probe_err[k]
+            k = k + 1
+        }
+        s = s + ")"
+        reasons = reasons + [s]
+    }
+
+    let verdict = if len(reasons) == 0 { "PASS" } else { "FAIL" }
+    let mut reasons_csv = ""
+    let mut k: i64 = 0
+    while k < len(reasons) {
+        if k > 0 { reasons_csv = reasons_csv + "," }
+        reasons_csv = reasons_csv + reasons[k]
+        k = k + 1
+    }
+    return [verdict, darwin_sha, linux_sha, reasons_csv]
+}
+
+fn _print_human(probes: [[str]], verdict_arr: [str]) -> void {
+    let labels = probes[0]
+    let shas = probes[1]
+    let gates = probes[2]
+    let statuses = probes[3]
+    let groups = probes[4]
+    let verdict = verdict_arr[0]
+    let darwin_sha = verdict_arr[1]
+    let linux_sha = verdict_arr[2]
+    let reasons = verdict_arr[3]
+
+    println("=== hexa_real cross-host parity audit ===")
+    println("ts: " + _now_iso_utc())
+    println("")
+    println("host                  os_group  status          gate  sha10")
+    println("--------------------  --------  --------------  ----  ----------")
+    let mut i: i64 = 0
+    while i < len(labels) {
+        let lab = labels[i]
+        let pad_lab = lab + "                    "
+        let lab_p = pad_lab.substring(0, 20)
+        let g = groups[i]
+        let pad_g = g + "        "
+        let g_p = pad_g.substring(0, 8)
+        let st = statuses[i]
+        let pad_st = st + "              "
+        let st_p = pad_st.substring(0, 14)
+        let gate = gates[i]
+        let pad_gate = "    " + gate
+        let gate_p = pad_gate.substring(pad_gate.len() - 4, pad_gate.len())
+        let sha10 = _short(shas[i])
+        println(lab_p + "  " + g_p + "  " + st_p + "  " + gate_p + "  " + sha10)
+        i = i + 1
+    }
+    println("")
+    println("darwin canonical sha: " + _short(darwin_sha))
+    println("linux  canonical sha: " + _short(linux_sha))
+    println("verdict: " + verdict)
+    if reasons.len() > 0 {
+        println("reasons: " + reasons)
+    }
+}
+
+fn _print_json(probes: [[str]], verdict_arr: [str]) -> void {
+    let labels = probes[0]
+    let shas = probes[1]
+    let gates = probes[2]
+    let statuses = probes[3]
+    let groups = probes[4]
+    let verdict = verdict_arr[0]
+    let darwin_sha = verdict_arr[1]
+    let linux_sha = verdict_arr[2]
+    let reasons = verdict_arr[3]
+
+    let mut buf = "{\"ts\":\"" + _now_iso_utc() + "\",\"verdict\":\"" + verdict + "\",\"darwin_sha\":\"" + darwin_sha + "\",\"linux_sha\":\"" + linux_sha + "\",\"reasons\":\"" + reasons + "\",\"probes\":["
+    let mut i: i64 = 0
+    while i < len(labels) {
+        if i > 0 { buf = buf + "," }
+        buf = buf + "{\"host\":\"" + labels[i] + "\",\"os_group\":\"" + groups[i] + "\",\"status\":\"" + statuses[i] + "\",\"gate\":" + gates[i] + ",\"sha\":\"" + shas[i] + "\"}"
+        i = i + 1
+    }
+    buf = buf + "]}"
+    println(buf)
+}
+
+// ─── ai-native error trailer (raw 66) ────────────────────────────────
+
+fn _emit_ai_native_trailer(reasons: str) -> void {
+    eprintln("# hexa_real_parity_check: reason=drift-or-missing-gate: " + reasons)
+    eprintln("# fix: 1) inspect divergent host listed in reasons (sha drift = stale binary; missing gate = pre hxa-20260422-005 build)")
+    eprintln("       2) cross-build canonical linux x86_64 binary on Mac via tool/hexa_remote.hexa cross-build (Sub-D pattern)")
+    eprintln("       3) scp + chmod +x + mv to target host(s); also mirror /home/ghost-nexus/_bootstrap/hexa_linux_x86_64 if hetzner")
+    eprintln("       4) re-run this detector — must emit __HEXA_REAL_PARITY__ PASS")
+    eprintln("       5) ref convergence/r4_hexa_runtime_security_warning_2026_04_27.convergence + r4_hexa_real_parity_drift_lock_2026_04_27.convergence")
+}
+
+// ─── selftest ────────────────────────────────────────────────────────
+
+fn _selftest() -> i64 {
+    // Hermetic selftest with synthetic probes — no SSH calls.  Validates
+    // _verdict() classifier against known-good and known-drift fixtures.
+    let mut fails: i64 = 0
+
+    // Fixture A: all-green (matches current cluster state)
+    let p_ok: [[str]] = [
+        ["mac","ubu1","ubu2","hetz-p","hetz-b"],
+        ["AAAAAAAAAA64-darwin-fixture-sha-padded-to-sufficient-len-for-validation",
+         "BBBBBBBBBB64-linux-fixture-sha-padded-to-sufficient-len-for-validation",
+         "BBBBBBBBBB64-linux-fixture-sha-padded-to-sufficient-len-for-validation",
+         "BBBBBBBBBB64-linux-fixture-sha-padded-to-sufficient-len-for-validation",
+         "BBBBBBBBBB64-linux-fixture-sha-padded-to-sufficient-len-for-validation"],
+        ["1","1","1","1","1"],
+        ["ok","ok","ok","ok","ok"],
+        ["darwin","linux","linux","linux","linux"]
+    ]
+    let v_ok = _verdict(p_ok)
+    if v_ok[0] != "PASS" {
+        eprintln("# selftest: reason=fixture-A-expected-PASS-got-" + v_ok[0] + " reasons=" + v_ok[3])
+        fails = fails + 1
+    }
+
+    // Fixture B: linux-sha-drift
+    let p_drift: [[str]] = [
+        ["mac","ubu1","ubu2"],
+        ["AAAAAAAAAA64-darwin-fixture-sha-padded-to-sufficient-len-for-validation",
+         "BBBBBBBBBB64-linux-fixture-sha-padded-to-sufficient-len-for-validation",
+         "CCCCCCCCCC64-stale-fixture-sha-padded-to-sufficient-len-for-validation"],
+        ["1","1","1"],
+        ["ok","ok","ok"],
+        ["darwin","linux","linux"]
+    ]
+    let v_drift = _verdict(p_drift)
+    if v_drift[0] != "FAIL" {
+        eprintln("# selftest: reason=fixture-B-expected-FAIL-got-" + v_drift[0])
+        fails = fails + 1
+    }
+    if !v_drift[3].contains("linux-sha-drift") {
+        eprintln("# selftest: reason=fixture-B-missing-linux-sha-drift-tag reasons=" + v_drift[3])
+        fails = fails + 1
+    }
+
+    // Fixture C: gate-missing on one host
+    let p_gate: [[str]] = [
+        ["mac","ubu1"],
+        ["AAAAAAAAAA64-darwin-fixture-sha-padded-to-sufficient-len-for-validation",
+         "BBBBBBBBBB64-linux-fixture-sha-padded-to-sufficient-len-for-validation"],
+        ["1","0"],
+        ["ok","ok"],
+        ["darwin","linux"]
+    ]
+    let v_gate = _verdict(p_gate)
+    if v_gate[0] != "FAIL" {
+        eprintln("# selftest: reason=fixture-C-expected-FAIL-got-" + v_gate[0])
+        fails = fails + 1
+    }
+    if !v_gate[3].contains("missing-gate") {
+        eprintln("# selftest: reason=fixture-C-missing-gate-tag reasons=" + v_gate[3])
+        fails = fails + 1
+    }
+
+    // Fixture D: probe-error
+    let p_err: [[str]] = [
+        ["mac","ubu1"],
+        ["AAAAAAAAAA64-darwin-fixture-sha-padded-to-sufficient-len-for-validation",
+         ""],
+        ["1","-1"],
+        ["ok","probe-error"],
+        ["darwin","linux"]
+    ]
+    let v_err = _verdict(p_err)
+    if v_err[0] != "FAIL" {
+        eprintln("# selftest: reason=fixture-D-expected-FAIL-got-" + v_err[0])
+        fails = fails + 1
+    }
+    if !v_err[3].contains("probe-error") {
+        eprintln("# selftest: reason=fixture-D-missing-probe-error-tag reasons=" + v_err[3])
+        fails = fails + 1
+    }
+
+    // Fixture E: input safety (single-token host guard)
+    if _is_safe_host("ubu; rm -rf /") {
+        eprintln("# selftest: reason=fixture-E-host-injection-not-rejected")
+        fails = fails + 1
+    }
+    if !_is_safe_host("ubu1") {
+        eprintln("# selftest: reason=fixture-E-legit-host-rejected")
+        fails = fails + 1
+    }
+    if _is_safe_path("/tmp/foo;rm -rf /") {
+        eprintln("# selftest: reason=fixture-E-path-injection-not-rejected")
+        fails = fails + 1
+    }
+
+    if fails == 0 {
+        eprintln("__HEXA_REAL_PARITY_SELFTEST__ PASS")
+        return 0
+    }
+    eprintln("__HEXA_REAL_PARITY_SELFTEST__ FAIL fails=" + to_string(fails))
+    return 1
+}
+
+// ─── main ────────────────────────────────────────────────────────────
+
+fn _has_flag_argv(args: [str], flag: str) -> bool {
+    let mut i: i64 = 0
+    while i < len(args) { if args[i] == flag { return true }; i = i + 1 }
+    return false
+}
+
+fn main() -> void {
+    let raw_args = args()
+    let mut user_start = 2
+    if raw_args.len() >= 3 && raw_args[1] == "run" { user_start = 3 }
+    let mut user_args: [str] = []
+    let mut i = user_start
+    while i < raw_args.len() {
+        user_args = user_args + [raw_args[i]]
+        i = i + 1
+    }
+
+    if _has_flag_argv(user_args, "--selftest") {
+        let rc = _selftest()
+        exit(rc)
+    }
+
+    let want_json = _has_flag_argv(user_args, "--json")
+    let strict = _has_flag_argv(user_args, "--strict")
+
+    let probes = _probe_all()
+    let v = _verdict(probes)
+    let verdict = v[0]
+    let darwin_sha = v[1]
+    let linux_sha = v[2]
+    let reasons = v[3]
+
+    if want_json { _print_json(probes, v) } else { _print_human(probes, v) }
+
+    eprintln("__HEXA_REAL_PARITY__ " + verdict + " darwin_sha=" + _short(darwin_sha) + " linux_sha=" + _short(linux_sha))
+    if verdict != "PASS" {
+        _emit_ai_native_trailer(reasons)
+        if strict { exit(1) } else { exit(1) }
+    }
+    exit(0)
+}
