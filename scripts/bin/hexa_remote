@@ -110,7 +110,7 @@ _probe_host() {
         err="$(LC_ALL=C ssh -o ConnectTimeout=$ctimeout -o BatchMode=yes -o ServerAliveInterval=5 \
             -o ServerAliveCountMax=1 \
             -o ControlMaster=no -o ControlPath=none "$cand" \
-            'echo OK $(LC_ALL=C free -m 2>/dev/null | awk "/^Mem:/ {print \$7}" | tr -d "[:space:]" || awk "/MemAvailable:/ {print int(\$2/1024); exit}" /proc/meminfo 2>/dev/null || echo 0); awk "/^some/ {gsub(/avg10=/,\"\"); print \$2; exit}" /proc/pressure/memory 2>/dev/null || echo "0.00"; if command -v nvidia-smi >/dev/null 2>&1; then nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d "[:space:]" || echo 0; else echo 0; fi' 2>&1)"
+            'echo OK $(LC_ALL=C free -m 2>/dev/null | awk "/^Mem:/ {print \$7}" | tr -d "[:space:]" || awk "/MemAvailable:/ {print int(\$2/1024); exit}" /proc/meminfo 2>/dev/null || echo 0); awk "/^some/ {gsub(/avg10=/,\"\"); print \$2; exit}" /proc/pressure/memory 2>/dev/null || echo "0.00"; if command -v nvidia-smi >/dev/null 2>&1; then nvidia-smi --query-gpu=memory.free,utilization.gpu --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d " " || echo "0,0"; else echo "0,0"; fi' 2>&1)"
         rc=$?
         if [ $rc -eq 0 ]; then
             # Parse "OK <avail>" — avail field 2 onwards (robust to extra whitespace).
@@ -118,9 +118,14 @@ _probe_host() {
             avail="$(printf '%s' "$err" | awk '/^OK/ {print $2}' | head -n1)"
             # PSI: 첫 OK 줄을 제외한 다음 줄. 빈 값이면 미지원 (macOS 등) → "" 로 둠.
             psi="$(printf '%s' "$err" | awk 'NR>1 && $0!="" {print; exit}')"
-            # Sub-AG (2026-04-27): GPU avail MB — 3번째 line. 미지원 / 미설치 시 0.
-            # nvidia-smi memory.free (MB unit, --nounits). RTX 5070 12GB → ~11500 MB free idle.
-            gpu_avail="$(printf '%s' "$err" | awk 'NR==3 {print; exit}')"
+            # Sub-AG (2026-04-27) + Sub-AY (2026-04-28): GPU probe — 3번째 line.
+            # Format: "<gpu_avail_mb>,<gpu_util_pct>" (memory.free,utilization.gpu).
+            # 미지원 / 미설치 시 "0,0". RTX 5070 12GB → ~11500MB,0% idle.
+            gpu_line="$(printf '%s' "$err" | awk 'NR==3 {print; exit}')"
+            gpu_avail="$(printf '%s' "$gpu_line" | awk -F, '{print $1}')"
+            gpu_util="$(printf '%s' "$gpu_line" | awk -F, '{print $2}')"
+            [ -z "$gpu_avail" ] && gpu_avail="0"
+            [ -z "$gpu_util" ] && gpu_util="0"
             # ω-hexa-5 (R5.4): PSI avg10 > 80 hard-reject. 호스트가 심하게
             # saturated 됐는데 RAM avail 만으로 통과시키면 stalls 발생.
             # threshold 80 → integer*100 = 8000 비교. Disable via
@@ -236,6 +241,8 @@ _probe_host() {
                 HEXA_REMOTE_LAST_PSI="${psi:-}"
                 # Sub-AG: export GPU avail MB. 미지원 호스트 = 0.
                 HEXA_REMOTE_LAST_GPU_AVAIL="${gpu_avail:-0}"
+                # Sub-AY: export GPU utilization % (compute pressure).
+                HEXA_REMOTE_LAST_GPU_UTIL="${gpu_util:-0}"
                 return 0
             fi
             echo "hexa_remote: host=$cand SSH OK but RAM avail=${avail:-?}MB < ${min_ram}MB threshold (raw#36 bracket) — skipping" >&2
@@ -802,20 +809,28 @@ else
     _best_avail=-1
     _best_psi=""
     _best_gpu_avail=0
+    _best_gpu_util=0
     _healthy_hosts=""
     # Sub-AX GPU-class threshold for LB-pick filter — match L8 admission
     # default (8192MB) so picker rejects in advance instead of L8 reject
     # without fallback. Override: HEXA_REMOTE_GPU_PICK_MIN_MB.
     _gpu_pick_min="${HEXA_REMOTE_GPU_PICK_MIN_MB:-8192}"
+    # Sub-AY (2026-04-28): GPU utilization throttle threshold. Skip hosts
+    # with gpu_util > threshold (default 70%). compute pressure analog to
+    # Sub-AI RAM PSI clamp. Closes convergence lint D6 GPU-PSI-throttle.
+    # Override: HEXA_REMOTE_GPU_UTIL_THRESHOLD (default 70).
+    _gpu_util_threshold="${HEXA_REMOTE_GPU_UTIL_THRESHOLD:-70}"
     for cand in $FALLBACK_CHAIN; do
         HEXA_REMOTE_LAST_AVAIL=""
         HEXA_REMOTE_LAST_PSI=""
         HEXA_REMOTE_LAST_GPU_AVAIL=""
+        HEXA_REMOTE_LAST_GPU_UTIL=""
         if _probe_host "$cand"; then
             _cand_avail="${HEXA_REMOTE_LAST_AVAIL:-0}"
             _cand_psi="${HEXA_REMOTE_LAST_PSI:-}"
             _cand_gpu="${HEXA_REMOTE_LAST_GPU_AVAIL:-0}"
-            _healthy_hosts="$_healthy_hosts $cand(avail=${_cand_avail}MB,psi=${_cand_psi:-NA},gpu=${_cand_gpu}MB)"
+            _cand_gpu_util="${HEXA_REMOTE_LAST_GPU_UTIL:-0}"
+            _healthy_hosts="$_healthy_hosts $cand(avail=${_cand_avail}MB,psi=${_cand_psi:-NA},gpu=${_cand_gpu}MB,gpu_util=${_cand_gpu_util}%)"
             # Sub-AX (2026-04-28): GPU class filter at LB-pick stage.
             # When class=gpu, skip CPU-only / under-threshold hosts so
             # max-avail comparison only runs over GPU-capable candidates.
@@ -825,12 +840,23 @@ else
                     echo "hexa_remote: Sub-AX GPU-class LB-pick skip — host=$cand class=gpu gpu_avail=${_cand_gpu}MB < $_gpu_pick_min" >&2
                     continue
                 fi
+                # Sub-AY (2026-04-28): GPU-PSI throttle — skip GPU host with
+                # high compute pressure (gpu_util > threshold). Even if VRAM
+                # available, busy GPU degrades dispatch + new workload.
+                # Bypass: HEXA_REMOTE_NO_GPU_UTIL_THROTTLE=1.
+                if [ "${HEXA_REMOTE_NO_GPU_UTIL_THROTTLE:-0}" != "1" ]; then
+                    if [ "$_cand_gpu_util" -gt "$_gpu_util_threshold" ] 2>/dev/null; then
+                        echo "hexa_remote: Sub-AY GPU-PSI throttle skip — host=$cand class=gpu gpu_util=${_cand_gpu_util}% > $_gpu_util_threshold%" >&2
+                        continue
+                    fi
+                fi
             fi
             # Strict `>` — tie 는 chain 순서 먼저 온 쪽 유지 (PREFERRED stability).
             if [ "$_cand_avail" -gt "$_best_avail" ] 2>/dev/null; then
                 _best_avail="$_cand_avail"
                 _best_psi="$_cand_psi"
                 _best_gpu_avail="$_cand_gpu"
+                _best_gpu_util="$_cand_gpu_util"
                 _best_host="$cand"
             fi
         fi
