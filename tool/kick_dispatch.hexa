@@ -789,6 +789,29 @@ fn _detect_rate_limit_kind(out: str) -> str {
     return "five_hour"
 }
 
+// Sub-W (2026-04-27): detect Anthropic API 401 / invalid x-api-key in
+// subagent output.  Distinct from rate-limit (which has a recoverable
+// reset window) — auth failure means OAuth credentials in the slot's
+// CLAUDE_CONFIG_DIR are stale OR direct API path is being used with
+// missing/invalid key.  ALL slots on the same host share the same
+// OAuth directory family (~/.claude-claudeN), so rotating to next
+// slot on the same host is unlikely to recover.  Caller treats this
+// as a fail-fast (raw 66 trailer + exit) rather than rotation.
+fn _detect_auth_failure(out: str) -> bool {
+    // Two captured signal sources:
+    //   (a) Anthropic API direct response — '"type":"authentication_error"' OR
+    //       '"message":"invalid x-api-key"' (R4 CLI-only migration retired
+    //       direct-API path; presence of these indicates a stale code path
+    //       or a non-CLI extension still in use).
+    //   (b) HTTP 401 line at the head of stderr — "401 {\"type\":\"error\",..."
+    if out.index_of("\"type\":\"authentication_error\"") >= 0 { return true }
+    if out.index_of("invalid x-api-key") >= 0 { return true }
+    // Conservative: bare 401 without authentication_error context could be
+    // OAuth-side. Match only when paired with an Anthropic-shaped payload.
+    if out.index_of("401 {\"type\":\"error\"") >= 0 { return true }
+    return false
+}
+
 fn _detect_resets_epoch(out: str) -> i64 {
     // Try numeric resetsAt first (claude CLI emits seconds — index.ts:1933).
     let key1 = "\"resetsAt\":"
@@ -1083,6 +1106,16 @@ fn main() -> void {
                 tried = tried + [slot_id]
                 eprintln("# kick_dispatch: slot=" + slot_id + " rate-limited (" + rl_kind + "); cooldown until epoch=" + to_string(cooldown_until) + "; rotating to next slot")
                 continue
+            }
+            // Sub-W: auth-failure (401 / invalid x-api-key) → fail-fast.
+            // All slots on the same host share the same ~/.claude-claudeN
+            // OAuth directory family; rotating here would just retry stale
+            // creds N times. Surface a raw 66 trailer pointing the operator
+            // at the cross-host sync / CLI-only migration follow-up.
+            if _detect_auth_failure(out) {
+                eprintln("__KICK_RESULT__ FAIL witness=" + witness_path + " tier1=0 falsifier_pass=0")
+                eprintln("reason=claude-auth-failure-401 fix=1) check OAuth tokens in $CLAUDE_CONFIG_DIR (slot=" + slot_id + ") — refresh via `claude /login` if local; 2) cross-host: ubu1/ubu2 hetzner have stale ~/.claude-claudeN/ from earlier sync → rsync from Mac OR force HEXA_LOCAL=1; 3) verify R4 CLI-only migration absorbed all extensions (.ext entry 7 retired); 4) ref convergence/r4_cli_only_migration_2026_04_27 + r4_kick_auth_fail_detection_2026_04_27")
+                exit(2)
             }
             if local_rc == 0 { _claude_touch_slot(slot_id) }
             break
