@@ -471,12 +471,38 @@ if [ "$_IS_HEAVY_COMPUTE" = "1" ] && [ "${HEXA_REMOTE_NO_CONCURRENCY:-0}" != "1"
             # _best_psi is set by the LB-pick chain after probe (string e.g. "12.34");
             # if absent / unparsable / negative → fall back to 8 (legacy behavior).
             # Bypass: HEXA_REMOTE_NO_PSI_CLAMP=1 (force legacy [1, 8] uniform).
-            local _clamp_max=8
+            # Sub-BS 2026-04-27 (push toward physical limits): make clamp ceiling
+            # env-driven. Default base=8 preserves legacy. HEXA_REMOTE_PSI_CLAMP_BASE
+            # raises ceiling for hosts with massive RAM headroom (e.g. hetzner 124GB
+            # at PSI=0 leaves capacity for 12-16 concurrent dispatches without
+            # crossing class_min_mb × dyn_count budget). Per-host override:
+            # HEXA_REMOTE_PSI_CLAMP_BASE_<HOST_UC>. Lossless: dyn formula still
+            # caps at floor((avail-safety)/cmin), so RAM is the hard limit; PSI
+            # clamp is just the safety bracket.
+            # Sub-DL 2026-04-27 (per-host sensible defaults): hetzner has 124GB
+            # RAM at PSI=0 routinely → 16 concurrent slots is safe (medium-class
+            # 8GB×16 = 128GB ≤ 124GB; dyn formula still binds at floor((avail-
+            # safety)/cmin) so this only RAISES the ceiling when RAM permits).
+            # ubu/ubu2 keep 8 (their 32GB / 8GB-medium = 4 dyn slots anyway).
+            # User can still env-override per-host or globally.
+            local _default_base=8
+            case "$_h" in
+                hetzner) _default_base=16 ;;
+            esac
+            local _clamp_base="${HEXA_REMOTE_PSI_CLAMP_BASE:-$_default_base}"
+            local _per_host_clamp_var="HEXA_REMOTE_PSI_CLAMP_BASE_${_h_uc}"
+            local _per_host_clamp="${!_per_host_clamp_var:-}"
+            [ -n "$_per_host_clamp" ] && _clamp_base="$_per_host_clamp"
+            local _clamp_max="$_clamp_base"
             if [ "${HEXA_REMOTE_NO_PSI_CLAMP:-0}" != "1" ] && [ -n "${_best_psi:-}" ]; then
                 local _psi_int_clamp
                 _psi_int_clamp="$(awk -v p="${_best_psi:-0}" 'BEGIN{printf "%d", p}' 2>/dev/null)"
                 if [ -n "$_psi_int_clamp" ] && [ "$_psi_int_clamp" -ge 0 ] 2>/dev/null; then
-                    _clamp_max=$(( 8 - _psi_int_clamp / 12 ))
+                    # Linear scale: at PSI=0 → clamp=base; at PSI=96 → clamp=1.
+                    # Step = base/12 so PSI=12 reduces by 1 ceiling slot.
+                    local _step=$(( _clamp_base / 12 ))
+                    [ "$_step" -lt 1 ] && _step=1
+                    _clamp_max=$(( _clamp_base - _psi_int_clamp / 12 * _step ))
                     [ "$_clamp_max" -lt 1 ] && _clamp_max=1
                 fi
             fi
@@ -1761,9 +1787,13 @@ elif [ "${HEXA_REMOTE_NO_CAP:-0}" = "1" ]; then
     # R4 BUG#3 fix (2026-04-27): inject HEXA_LANG so `use "self/stdlib/..."` resolves on remote.
     # Mac sets HEXA_LANG globally; remote ssh shells inherit minimal env without it. Fallback chain.
     # BUG#5 RETIRED (2026-04-27): ANTHROPIC_API_KEY env passthrough removed per user directive. OAuth slot pool (~/.claude-claude<N>/) is canonical credential path.
-    REMOTE_CMD="$REMOTE_TRAP; cd \"$REMOTE_ROOT${REL:+/$REL}\" && export HEXA=\"$REMOTE_HEXA\" HEXA_LOCAL=1 HEXA_NO_LAUNCHD=1 HEXA_LANG=\"\$(for d in \$HOME/Dev/hexa-lang \$HOME/core/hexa-lang; do [ -d \$d ] && echo \$d && break; done)\" && ${_REMOTE_LOCK_PREFIX}$REMOTE_HEXA$_ARG_QUOTED"
+    # 2026-04-28 fix: search order flipped — $HOME/core/hexa-lang FIRST, $HOME/Dev/hexa-lang SECOND.
+    # On hetzner, $HOME/Dev/hexa-lang is a stale symlink to /home/hexa-lang (Apr 19) missing
+    # ai_err.hexa stdlib; $HOME/core/hexa-lang has the canonical Apr 27 stdlib including ai_err_exit.
+    # Old order surfaced "Runtime error: undefined function: ai_err_exit" on remote kicks (×3).
+    REMOTE_CMD="$REMOTE_TRAP; cd \"$REMOTE_ROOT${REL:+/$REL}\" && export HEXA=\"$REMOTE_HEXA\" HEXA_LOCAL=1 HEXA_NO_LAUNCHD=1 HEXA_LANG=\"\$(for d in \$HOME/core/hexa-lang \$HOME/Dev/hexa-lang; do [ -d \$d/self/stdlib ] && [ -f \$d/self/stdlib/ai_err.hexa ] && echo \$d && break; done)\" && ${_REMOTE_LOCK_PREFIX}$REMOTE_HEXA$_ARG_QUOTED"
 else
-    REMOTE_CMD="$REMOTE_TRAP; cd \"$REMOTE_ROOT${REL:+/$REL}\" && export HEXA=\"$REMOTE_HEXA\" HEXA_LOCAL=1 HEXA_NO_LAUNCHD=1 HEXA_LANG=\"\$(for d in \$HOME/Dev/hexa-lang \$HOME/core/hexa-lang; do [ -d \$d ] && echo \$d && break; done)\" && if $_SD_CHECK; then $_SD_WRAP $REMOTE_HEXA$_ARG_QUOTED; else ${_REMOTE_LOCK_PREFIX}$REMOTE_HEXA$_ARG_QUOTED; fi"
+    REMOTE_CMD="$REMOTE_TRAP; cd \"$REMOTE_ROOT${REL:+/$REL}\" && export HEXA=\"$REMOTE_HEXA\" HEXA_LOCAL=1 HEXA_NO_LAUNCHD=1 HEXA_LANG=\"\$(for d in \$HOME/core/hexa-lang \$HOME/Dev/hexa-lang; do [ -d \$d/self/stdlib ] && [ -f \$d/self/stdlib/ai_err.hexa ] && echo \$d && break; done)\" && if $_SD_CHECK; then $_SD_WRAP $REMOTE_HEXA$_ARG_QUOTED; else ${_REMOTE_LOCK_PREFIX}$REMOTE_HEXA$_ARG_QUOTED; fi"
 fi
 
 # BUG#5 RETIRED (2026-04-27): pre-flight ANTHROPIC_API_KEY warning block removed per user directive.
