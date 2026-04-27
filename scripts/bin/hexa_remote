@@ -314,6 +314,30 @@ if [ "$_IS_HEAVY_COMPUTE" = "1" ] && [ -z "${HEXA_REMOTE_HOST:-}" ]; then
     PREFERRED="hetzner"
 fi
 
+# Sub-AX (2026-04-28): GPU class detection for LB-pick filtering.
+# When job is class=gpu (--gpu / --cuda flag OR --engine mk10), LB-pick must
+# prefer hosts with actual GPU (gpu_avail > threshold). Otherwise picker
+# selects max-avail host (often hetzner = CPU-only) → L8 GPU admission
+# rejects → no fallback chain (Sub-AW gap).
+# Sub-AX preempts: filter LB candidates by gpu_avail >= GPU threshold when
+# class=gpu, before max-avail comparison runs.
+_IS_GPU_CLASS=0
+if [ "$_IS_HEAVY_COMPUTE" = "1" ]; then
+    for _gc_a in "${@:3}"; do
+        case "$_gc_a" in
+            --gpu|--cuda) _IS_GPU_CLASS=1; break ;;
+        esac
+    done
+    # mk10 engine triggers gpu (Sub-AG _classify_job alignment)
+    _gc_prev=""
+    for _gc_a in "${@:3}"; do
+        if [ "$_gc_prev" = "--engine" ] && [ "$_gc_a" = "mk10" ]; then
+            _IS_GPU_CLASS=1; break
+        fi
+        _gc_prev="$_gc_a"
+    done
+fi
+
 # Wave 24 / L3 (2026-04-25): per-job memory class — argv 분석으로 small/medium/large
 # 분류. L2 의 균일 MIN_AVAIL_MB=4096 가 모든 작업에 동일 cap 을 부과해 cluster
 # headroom 사장 (small drill 도 large 와 동일 admission)을 야기. L3 는 cmd /
@@ -779,6 +803,10 @@ else
     _best_psi=""
     _best_gpu_avail=0
     _healthy_hosts=""
+    # Sub-AX GPU-class threshold for LB-pick filter — match L8 admission
+    # default (8192MB) so picker rejects in advance instead of L8 reject
+    # without fallback. Override: HEXA_REMOTE_GPU_PICK_MIN_MB.
+    _gpu_pick_min="${HEXA_REMOTE_GPU_PICK_MIN_MB:-8192}"
     for cand in $FALLBACK_CHAIN; do
         HEXA_REMOTE_LAST_AVAIL=""
         HEXA_REMOTE_LAST_PSI=""
@@ -788,6 +816,16 @@ else
             _cand_psi="${HEXA_REMOTE_LAST_PSI:-}"
             _cand_gpu="${HEXA_REMOTE_LAST_GPU_AVAIL:-0}"
             _healthy_hosts="$_healthy_hosts $cand(avail=${_cand_avail}MB,psi=${_cand_psi:-NA},gpu=${_cand_gpu}MB)"
+            # Sub-AX (2026-04-28): GPU class filter at LB-pick stage.
+            # When class=gpu, skip CPU-only / under-threshold hosts so
+            # max-avail comparison only runs over GPU-capable candidates.
+            # Bypass: HEXA_REMOTE_NO_GPU_PICK_FILTER=1 (legacy avail-only).
+            if [ "$_IS_GPU_CLASS" = "1" ] && [ "${HEXA_REMOTE_NO_GPU_PICK_FILTER:-0}" != "1" ]; then
+                if [ "$_cand_gpu" -lt "$_gpu_pick_min" ] 2>/dev/null; then
+                    echo "hexa_remote: Sub-AX GPU-class LB-pick skip — host=$cand class=gpu gpu_avail=${_cand_gpu}MB < $_gpu_pick_min" >&2
+                    continue
+                fi
+            fi
             # Strict `>` — tie 는 chain 순서 먼저 온 쪽 유지 (PREFERRED stability).
             if [ "$_cand_avail" -gt "$_best_avail" ] 2>/dev/null; then
                 _best_avail="$_cand_avail"
@@ -797,6 +835,26 @@ else
             fi
         fi
     done
+    # Sub-AX fallback: if class=gpu AND no GPU host passed filter, fall
+    # through to legacy avail-only pick + warn. Operator can then use
+    # HEXA_REMOTE_GPU_MIN_AVAIL_MB=2048 (smaller workload) or NO_GPU_ADMISSION.
+    if [ "$_IS_GPU_CLASS" = "1" ] && [ -z "$_best_host" ]; then
+        echo "hexa_remote: Sub-AX no GPU-capable host in chain — falling back to avail-only pick (will hit L8 admission later)" >&2
+        for cand in $FALLBACK_CHAIN; do
+            HEXA_REMOTE_LAST_AVAIL=""
+            HEXA_REMOTE_LAST_PSI=""
+            HEXA_REMOTE_LAST_GPU_AVAIL=""
+            if _probe_host "$cand"; then
+                _cand_avail="${HEXA_REMOTE_LAST_AVAIL:-0}"
+                if [ "$_cand_avail" -gt "$_best_avail" ] 2>/dev/null; then
+                    _best_avail="$_cand_avail"
+                    _best_psi="${HEXA_REMOTE_LAST_PSI:-}"
+                    _best_gpu_avail="${HEXA_REMOTE_LAST_GPU_AVAIL:-0}"
+                    _best_host="$cand"
+                fi
+            fi
+        done
+    fi
     if [ -n "$_best_host" ]; then
         HOST="$_best_host"
         _picked_psi="$_best_psi"
