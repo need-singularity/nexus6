@@ -1,0 +1,150 @@
+// ══════════════════════════════════════════════════════════════
+// nexus/n6/file_lock.hexa — per-file chflags governance module
+// raw 1 (os-lock per-file) + raw 85 (escalation-audit-trail-witness)
+// + raw 99 (hive-cli-canonical-entry-point)
+//
+// @resolver-bypass(reason="darwin-native-chflags-+-local-fs-audit")
+// (raw 82 — chflags(2) syscalls + local audit ledger writes are darwin-native;
+//  bypass docker landing; HIVE_CLI_PARENT detection is local env check.)
+//
+// Subcommands (called by `nexus lock|unlock|lock-status` via cli/run.hexa):
+//   lock <path> --reason "<text>"       chflags uchg + audit append
+//   unlock <path> --reason "<text>"     chflags nouchg + audit append
+//   lock-status <path>                   show chflags state + last 5 audit entries
+//
+// Audit ledger: state/lock_audit/audit.jsonl (raw 77 schema)
+//   ts (ISO-8601), agent_id, op, target, prior_state, new_state, reason
+//
+// HIVE_CLI_PARENT detection (raw 99):
+//   This module REQUIRES HIVE_CLI_PARENT=1 in env (set by cli/run.hexa).
+//   Direct invocation (without env) emits raw 66 ai-native warning + still proceeds
+//   so legitimate scripts (atlas_absorb.hexa) can call it after setting the env.
+//   For chflags(1) shell calls bypassing this module, install the
+//   ~/.hx/bin/chflags-warn wrapper (warns when HIVE_CLI_PARENT not set).
+//
+// File chflags uchg-locked after authoring.
+// ══════════════════════════════════════════════════════════════
+
+let _args = args()
+
+fn _shell_quote(s: str) -> str { return "'" + s + "'" }
+
+fn _flag_value(name: str, default_val: str) -> str {
+    let mut i = 0
+    while i < _args.len() - 1 {
+        if _args[i] == name { return _args[i + 1] }
+        i = i + 1
+    }
+    return default_val
+}
+
+fn _detect_hive_cli_parent() -> bool {
+    let v = exec("echo \"${HIVE_CLI_PARENT:-}\"").trim()
+    return v == "1"
+}
+
+fn _emit_warn_no_cli() {
+    println("[file_lock] WARN: HIVE_CLI_PARENT env not set — direct invocation detected")
+    println("  reason: governance-context-missing — call should originate from `nexus lock|unlock`")
+    println("  fix: 1) `nexus lock <path> --reason \"...\"`  2) `HIVE_CLI_PARENT=1 hexa run nexus/n6/file_lock.hexa <op> <path> --reason \"...\"`")
+    println("  raw 66 ai-native trailer + raw 99 canonical-CLI mandate")
+}
+
+fn _ts_iso() -> str {
+    return exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+fn _audit_append(op: str, target: str, prior_state: str, new_state: str, reason: str, cli_parent: bool) {
+    // Locate audit ledger relative to nexus root (calling repo)
+    let nexus_root_path = exec("dirname $(dirname $(realpath \"" + _args[1] + "\"))").trim()
+    let audit_dir = nexus_root_path + "/state/lock_audit"
+    let audit_path = audit_dir + "/audit.jsonl"
+    exec("mkdir -p " + _shell_quote(audit_dir))
+    let parent_flag = if cli_parent { "true" } else { "false" }
+    let row = "{\"ts\":\"" + _ts_iso() + "\",\"op\":\"" + op
+            + "\",\"target\":\"" + target
+            + "\",\"prior_state\":\"" + prior_state
+            + "\",\"new_state\":\"" + new_state
+            + "\",\"reason\":\"" + reason
+            + "\",\"hive_cli_parent\":" + parent_flag + "}"
+    exec("echo " + _shell_quote(row) + " >> " + _shell_quote(audit_path))
+}
+
+fn _chflags_state(path: str) -> str {
+    // returns "uchg" if locked, "-" if unlocked, "missing" if not found
+    let exists = exec("test -e " + _shell_quote(path) + " && echo 1 || echo 0").trim()
+    if exists != "1" { return "missing" }
+    let flags = exec("ls -lO " + _shell_quote(path) + " | awk '{print $5}'").trim()
+    if flags == "uchg" { return "uchg" }
+    return "-"
+}
+
+fn cmd_lock(target: str, reason: str, cli_parent: bool) -> i64 {
+    let prior = _chflags_state(target)
+    if prior == "missing" {
+        println("[file_lock] ERROR: target not found: " + target)
+        println("  reason: invalid-path"); println("  fix: verify path exists before lock")
+        return 3
+    }
+    let lock_out = exec("chflags uchg " + _shell_quote(target) + " 2>&1")
+    let new_state = _chflags_state(target)
+    println("[file_lock] lock " + target)
+    println("  prior: " + prior + " → new: " + new_state + "  reason: " + reason)
+    if lock_out.len() > 0 { print(lock_out) }
+    _audit_append("lock", target, prior, new_state, reason, cli_parent)
+    if new_state != "uchg" {
+        println("  WARN: chflags uchg did NOT take effect (file may need elevated perms)")
+        return 4
+    }
+    return 0
+}
+
+fn cmd_unlock(target: str, reason: str, cli_parent: bool) -> i64 {
+    let prior = _chflags_state(target)
+    if prior == "missing" {
+        println("[file_lock] ERROR: target not found: " + target)
+        return 3
+    }
+    let unlock_out = exec("chflags nouchg " + _shell_quote(target) + " 2>&1")
+    let new_state = _chflags_state(target)
+    println("[file_lock] unlock " + target)
+    println("  prior: " + prior + " → new: " + new_state + "  reason: " + reason)
+    if unlock_out.len() > 0 { print(unlock_out) }
+    _audit_append("unlock", target, prior, new_state, reason, cli_parent)
+    return 0
+}
+
+fn cmd_lock_status(target: str) -> i64 {
+    let state = _chflags_state(target)
+    println("[file_lock] status: " + target)
+    println("  chflags: " + state)
+    let nexus_root_path = exec("dirname $(dirname $(realpath \"" + _args[1] + "\"))").trim()
+    let audit_path = nexus_root_path + "/state/lock_audit/audit.jsonl"
+    let last5 = exec("test -f " + _shell_quote(audit_path) + " && grep " + _shell_quote(target) + " " + _shell_quote(audit_path) + " 2>/dev/null | tail -5 || echo '(no audit entries)'")
+    println("  last 5 audit entries:")
+    print(last5)
+    return 0
+}
+
+fn run() -> i64 {
+    if _args.len() < 4 {
+        println("[file_lock] usage: hexa run file_lock.hexa <op> <path> [--reason \"...\"]")
+        println("  op: lock | unlock | lock-status")
+        return 2
+    }
+    let op = _args[2]
+    let target = _args[3]
+    let reason = _flag_value("--reason", "(no reason)")
+    let cli_parent = _detect_hive_cli_parent()
+    if !cli_parent && (op == "lock" || op == "unlock") {
+        _emit_warn_no_cli()
+    }
+    if op == "lock" { return cmd_lock(target, reason, cli_parent) }
+    if op == "unlock" { return cmd_unlock(target, reason, cli_parent) }
+    if op == "lock-status" { return cmd_lock_status(target) }
+    println("[file_lock] ERROR: unknown op: " + op)
+    return 2
+}
+
+let rc = run()
+exit(rc)
