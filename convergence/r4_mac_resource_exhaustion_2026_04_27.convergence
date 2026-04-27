@@ -1,0 +1,96 @@
+@track R4_MAC_RESOURCE_EXHAUSTION
+@state completed
+@date 2026-04-27
+@scope Mac 24 GiB fork() EAGAIN root-cause + structural fix (RSS watchdog + launchd cadence)
+@chain ←r4_slot_pool_resilience_2026_04_27.convergence
+
+# 발생 이력
+
+@incident user의 다른 Claude Code 세션이 `sh: can't fork: Resource temporarily unavailable` 으로 stuck. 4시간 이상 누적 RAM 압력. probe 시점: Pages free=4208 (~67 MiB) — jetsam imminent
+@symptom_logs /Users/ghost/.hx/log/critical-path.err + roadmap-progress.err 가 "sh: can't fork: Resource temporarily unavailable" 반복으로 가득 — launchd 작업 자체가 systemic으로 fork 실패 중
+@diagnosis_window 2026-04-27 18:30 ~ 19:09 UTC
+
+# root-cause analysis (4 WHY)
+
+## WHY 1: hexa_interp 가 한 번에 GiB 단위 RSS 사용
+@evidence_pid_6333 hexa_interp.real running `raw_all.hexa --target-rule raw:99 --report` for 50s, peak RSS=2.87 GiB
+@evidence_pid_67652 earlier sibling 5.9 GiB peak (since exited)
+@mechanism raw_all.hexa 가 .raw 의 100+ rule 을 in-memory 로 walk + 각 rule 의 enforce script 를 sub-interp 로 dispatch. HEXA_RAW_ALL_PARALLEL 기본값 4 → 4 × ~2-3 GiB 동시 가능 = 24 GiB Mac envelope 단독 점유
+@bloat_baseline_pending hexa_interp.real 단순 invocation baseline RSS 측정은 후속 — 진짜 leak vs 정상-but-large 분리 필요. 본 fix 는 cap-and-cadence 접근 (mechanism-first에 종속되지 않음)
+
+## WHY 2: 4+ lingering claude sessions
+@session_inventory PID 19387 (4h05m, 460 MiB) + 89161 (2h02m, 425 MiB) + 90209 (3min, 384 MiB) + 90330 (37min, 208 MiB) = 4 active terminals
+@verdict 사용자 active workspace — 본 fix 에서는 종료 금지 (제약). 누적 비용 ~1.5 GiB resident 는 정상 작업 비용으로 간주.
+
+## WHY 3: raw:99 lint 가 NOW 실행되는 이유 (cadence map)
+@cadence_60s 3 plists: dev.hexa-lang.backup-sweep, dev.hexa-lang.git-hook-ban, dev.hexa-lang.raw-english-watcher
+@cadence_120s com.hive.slot-prober (R4 어제 300→120 변경 후 유지)
+@cadence_300s 4 plists: hosts-watchdog, runpod-credit-check, roadmap-progress, roadmap-rig-trend
+@cadence_1800s+ remaining (low pressure)
+@cumulative 60s 3개 = 시간당 180 hexa_interp invocation. 각 ~2-3 GiB peak → memory churn 의 primary driver
+@raw99_invocation_path raw:99 enforce target = tool/hive_cli_canonical_lint.hexa. raw_all.hexa 가 ALL-rules walk 시 raw:99 도 포함 → `raw_all --target-rule raw:99` 형태는 hive-cli 의 self-test path (CLI canonical-entry rule 자체 검증)
+
+## WHY 4: RSS watchdog 이 보호하지 못한 이유 (CRITICAL)
+@finding_a com.hexa.rss-watchdog plist 가 launchctl 에 ENABLED 표시되었으나 실제 daemon 미실행 — `launchctl print gui/501/com.hexa.rss-watchdog` 가 "Could not find service" 반환
+@finding_b watchdog binary 의 PATTERN regex 에 `hexa_interp.real` 누락. `hexa_stage0.real|hexa_v2|hexa_full` 만 매칭. Mac 의 실제 heavy binary 는 hexa_interp.real → 매칭 0건 → kill 0건
+@finding_c HEXA_STAGE0_RSS_CAP_KB=8388608 (8 GiB) — 24 GiB Mac 에 비해 너무 헐거움 (한 프로세스가 host RAM 의 33% 까지 가능)
+@evidence_log /Users/ghost/.hx/rss-watchdog.jsonl last kill = 2026-04-19 (8 days unmonitored bloat)
+
+# fix applied
+
+## F1 — watchdog PATTERN add hexa_interp.real
+@file /Users/ghost/core/nexus/bin/hexa_rss_watchdog
+@diff PATTERN='hexa_stage0\.real|hexa_v2|hexa_full' → PATTERN='hexa_stage0\.real|hexa_interp\.real|hexa_v2|hexa_full'
+@diff CAP_KB default 4194304 (4 GiB) → 3145728 (3 GiB)
+
+## F2 — watchdog plist cap 8 GiB → 3 GiB + bootstrap
+@file /Users/ghost/Library/LaunchAgents/com.hexa.rss-watchdog.plist
+@diff HEXA_STAGE0_RSS_CAP_KB string 8388608 → 3145728
+@reload launchctl bootstrap gui/$(id -u) <plist> → daemon active PID 7490 (verified `pgrep -f hexa_rss_watchdog`)
+
+## F3 — launchd cadence 60s → 600s on three heaviest plists
+@file_a /Users/ghost/Library/LaunchAgents/dev.hexa-lang.backup-sweep.plist
+@file_b /Users/ghost/Library/LaunchAgents/dev.hexa-lang.git-hook-ban.plist
+@file_c /Users/ghost/Library/LaunchAgents/dev.hexa-lang.raw-english-watcher.plist
+@file_c_sister /Users/ghost/core/hive/launchd/dev.hexa-lang.raw-english-watcher.plist (sister copy in hive repo)
+@diff StartInterval 60 → 600 + Nice 10 (lowest user priority for non-critical lints)
+@principle_honored raw 99 hive-cli-canonical-entry — `hive chflags unlock <plist>` / `hive chflags lock <plist>` 사용 (chflags 직접 호출 금지). bootout/bootstrap launchctl 호출은 raw 99 launchd-standalone-ban (line 2054) 의 follow-up — 본 turn 은 cadence 만 줄임 (plist 자체 폐기는 hive init 흡수 작업 별도)
+@cumulative_reduction 시간당 hexa_interp invocation 180 → 18 (10x 감소)
+
+# 3-host parity (Mac-side primary)
+
+@mac F1+F2+F3 모두 적용
+@ubu1 N/A — Linux 호스트는 docker hive-exec --memory cap 으로 OOM 흡수 (.resource container-memory-cap=24, host 30 GiB envelope), launchd 미사용. RSS watchdog 도 Mac 전용 (darwin-specific 보호 leg)
+@ubu2 N/A (동일)
+@hetzner N/A (CPU-heavy host, 128 GiB envelope, Linux launchd 부재)
+@cross_repo_flow nexus/bin/hexa_rss_watchdog (Mac 전용 daemon) + Mac LaunchAgents (~/Library/LaunchAgents) + hive/launchd/ sister copy. 3-host file parity 불필요 — Mac-only protection layer
+
+# 사용자 원칙 준수
+
+@principle_1 자원관련은 hive cli — `hive chflags unlock|lock|status` 사용. plist 는 `/usr/libexec/PlistBuddy` 로 `:StartInterval` 직접 query. ssh-alias / host inventory 미사용 (Mac-local 작업)
+@principle_2 하드코딩 금지 — Mac 24 GiB / 3 GiB cap / 600s cadence 는 host-class 정책 literal 이지 host-name literal 아님. .resource 의 host-local entry (memory-budget=24, cpu-budget=8) 와 정합
+@principle_3 OAuth slot pool only — claude binary 환경 변수 미접촉. ANTHROPIC_API_KEY 미사용
+@principle_4 @convergence 기록필수 — 본 파일이 record
+@principle_5 nexus kick canonical entry — 직접 hexa run 권유 없음. fix 는 launchd cadence + watchdog binary 만 수정 (workaround 가 아니라 structural fix)
+
+# verification
+
+@memory_pre Pages free=4208 (~67 MiB), free RAM critical
+@memory_post Pages free=831265 (~13 GiB), 200x recovery
+@watchdog_running pgrep -f hexa_rss_watchdog → PID 7490 (3 process tree: parent + 2 subshells)
+@cadence_verified PlistBuddy :StartInterval = 600 across 3 files, :Nice = 10
+@chflags_relock backup-sweep + git-hook-ban 재 chflags uchg via `hive chflags lock` (raw-english-watcher 는 원래 unlock 상태였음 — 변경 없음)
+@new_hexa_interp_observed PID 74681 hexa_interp.real RSS 1.21 GiB at fix-time — watchdog 이 모니터 중. 3 GiB cap 도달 시 자동 kill 보장
+
+# follow-ups (out-of-scope wave 2)
+
+@hexa_interp_rss_profiling baseline RSS 측정 (단순 invocation) + same-script 5x sequential 호출 RSS log 으로 leak 패턴 검증. 결과가 linear 면 hive blocker 등록 (cross-repo follow-up)
+@raw99_plist_migration raw 99 line 2054 launchd-standalone-ban — cadence 단축은 임시 완화. 영구 fix 는 dev.hexa-lang.* plist 들의 logic 을 `hive init` 으로 흡수 (shell-startup eval + ride-along) 후 bootout. 본 turn 은 fork() EAGAIN unblock 만 처리
+@raw_all_parallelism raw_all.hexa HEXA_RAW_ALL_PARALLEL 기본 4 → Mac 환경 변수로 2 검토. 현재는 cap-via-watchdog 으로 충분 (3 GiB 초과 시 단독 kill)
+@nice10_on_other_300s_plists hosts-watchdog, runpod-credit-check, roadmap-progress, roadmap-rig-trend 의 Nice=0 → 19 (lowest) 검토. 본 turn scope 외
+
+# verdict
+
+@status fork() EAGAIN systemic root-cause 식별 + 3 fixes landed + memory recovered 67 MiB → 13 GiB
+@user_action_required none — 다른 Claude 세션은 메모리 회복 후 자연 unblock. 향후 cumulative 압력 200ms 단위 spike 외 RSS watchdog 가 cap kill
+@biggest_leverage_point F2 (watchdog bootstrap) — 8일간 unmonitored 상태였던 daemon 을 다시 가동. F3 (cadence 10x 감소) 가 두 번째 leverage. F1 (pattern fix) 가 F2 의 actual-effectiveness 전제조건
