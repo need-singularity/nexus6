@@ -285,6 +285,87 @@ fn noise_gamma(bridges_dir: str, beta_byte: i64) -> str {
     return "{\"mechanism\":\"gamma\",\"source_id\":\"bridge:" + pick_slug + "\",\"byte_hash\":\"" + bh + "\",\"ts\":\"" + ts + "\",\"payload_summary\":\"" + payload + "\"}"
 }
 
+// ─── B7 PoC: γ with separate syscall (entropy-dilution redesign) ─────
+// raw 108 absorption — B7 entropy_dilution_observation redesign.
+// noise_gamma's bridge selection uses β-byte mod n (4-bit collapse when n≤16).
+// This PoC resolves dilution by pulling γ's own /dev/urandom byte —
+// γ is no longer entropy-dependent on β.
+// Output is byte-distinguishable from noise_gamma even at same ts (different syscall).
+fn noise_gamma_v2(bridges_dir: str) -> str {
+    let ts = _now_iso_utc()
+    let files = _list_files(bridges_dir)
+    let n = len(files)
+    if n == 0 {
+        let bh = _short_hash("gamma_v2:" + ts + ":empty")
+        return "{\"mechanism\":\"gamma_v2\",\"source_id\":\"bridge:none\",\"byte_hash\":\"" + bh + "\",\"ts\":\"" + ts + "\",\"payload_summary\":\"bridges_registry_empty=true source=independent_urandom\"}"
+    }
+    // independent /dev/urandom byte — no β-input dependency
+    let raw_byte = exec("od -An -N1 -tu1 /dev/urandom 2>/dev/null").trim()
+    let g_byte = _safe_to_int_line(raw_byte, 0, "gamma_v2-independent-byte")
+    let mut idx: i64 = g_byte % n
+    if idx < 0 { idx = -idx }
+    let pick = bridges_dir + "/" + files[idx]
+    let pick_slug = _registry_field(pick, "slug")
+    let pick_invocation = _registry_field(pick, "invocation")
+    let bh = _short_hash("gamma_v2:" + pick_slug + ":" + ts + ":" + raw_byte)
+    let payload = "bridge_pick=" + pick_slug + " invocation=" + pick_invocation + " gamma_byte=" + raw_byte + " (B7 PoC — independent /dev/urandom syscall)"
+    return "{\"mechanism\":\"gamma_v2\",\"source_id\":\"bridge:" + pick_slug + "\",\"byte_hash\":\"" + bh + "\",\"ts\":\"" + ts + "\",\"payload_summary\":\"" + payload + "\"}"
+}
+
+// ─── B8 PoC: 3-domain entropy multiplexer (graceful degradation) ─────
+// raw 108 absorption — B8 3-domain entropy multiplexer design.
+// Tier order: quantum_hw (ANU queue) → sim_output (sentinel-marked) → system_csprng (urandom).
+// Failure transitions: queue empty + ANU fail → sim_output stub → urandom_fallback.
+// Each tier is observable via source_id field for downstream audit.
+fn noise_multiplex() -> str {
+    let ts = _now_iso_utc()
+    let mut byte = "0"
+    let mut source = "system_csprng"
+    let mut tier_used = "tier_3"
+
+    // Tier 1: quantum_hw via T1 ANU queue (no API call if queue has byte)
+    let queued = _anu_queue_pop()
+    if queued.len() > 0 {
+        let qv = _safe_to_int_line(queued, -1, "multiplex-queue-pop")
+        if qv >= 0 && qv <= 255 {
+            byte = queued
+            source = "quantum_hw_anu_queued"
+            tier_used = "tier_1"
+        }
+    }
+
+    // Tier 2: sim_output (PoC stub — emits synthetic byte from sim-output fingerprint)
+    // Real impl would invoke sim_bridge/<sim>_clock.hexa; here we emit a deterministic
+    // sentinel byte hashed from ts to remain distinguishable from urandom.
+    if tier_used == "tier_3" {
+        // Try sim_output if a sentinel hint dir exists (PoC: state/kick/cache/sim_output_hint/)
+        let hint_present = exec("test -d /Users/ghost/core/nexus/state/kick/cache/sim_output_hint && echo yes || echo no").trim()
+        if hint_present == "yes" {
+            // PoC: take low byte of sha256(ts) as sim_output proxy.
+            let sim_byte = exec("printf '%s' '" + ts + "' | shasum -a 256 | head -c 2 2>/dev/null").trim()
+            // hex 2 chars → int 0-255
+            let sim_v = _safe_to_int_line(exec("printf '%d' '0x" + sim_byte + "' 2>/dev/null").trim(), -1, "multiplex-sim-byte")
+            if sim_v >= 0 && sim_v <= 255 {
+                byte = to_string(sim_v)
+                source = "sim_output_proxy"
+                tier_used = "tier_2"
+            }
+        }
+    }
+
+    // Tier 3: system_csprng (always available)
+    if tier_used == "tier_3" {
+        let sys_byte = exec("od -An -N1 -tu1 /dev/urandom 2>/dev/null").trim()
+        let sys_v = _safe_to_int_line(sys_byte, 0, "multiplex-csprng")
+        byte = to_string(sys_v)
+        source = "system_csprng"
+    }
+
+    let bh = _short_hash("multiplex:" + source + ":" + byte + ":" + ts)
+    let payload = "multiplex_byte=" + byte + " tier=" + tier_used + " source=" + source + " (B8 PoC — 3-domain graceful degradation)"
+    return "{\"mechanism\":\"multiplex\",\"source_id\":\"" + source + "\",\"byte_hash\":\"" + bh + "\",\"ts\":\"" + ts + "\",\"payload_summary\":\"" + payload + "\"}"
+}
+
 // ─── envelope JSON shape validator (raw 23) ──────────────────────────
 fn _validate_envelope(env_json: str, mech: str) -> bool {
     if !env_json.starts_with("{") { return false }
@@ -402,7 +483,7 @@ fn _has_flag(args: [str], flag: str) -> bool {
 }
 
 fn _emit_usage_and_fail() -> i64 {
-    eprintln("usage: hexa run noise_envelope.hexa <alpha|beta|gamma|--selftest> [--absorbed-dir <path>] [--bridges-dir <path>] [--beta-byte <int>]")
+    eprintln("usage: hexa run noise_envelope.hexa <alpha|beta|gamma|gamma_v2|multiplex|batch|--selftest> [--absorbed-dir <path>] [--bridges-dir <path>] [--beta-byte <int>] [--count <N>]")
     eprintln("# noise_envelope: reason=usage-missing-mechanism fix=pass alpha|beta|gamma|--selftest as first positional arg")
     eprintln("__NOISE_ENVELOPE__ FAIL mechanism=?")
     return 1
@@ -469,6 +550,28 @@ fn main() -> void {
         let env_json = noise_gamma(bridges_dir, beta_byte)
         println(env_json)
         eprintln("__NOISE_ENVELOPE__ PASS mechanism=g")
+        exit(0)
+    }
+
+    if mech == "gamma_v2" {
+        // B7 PoC: γ with separate /dev/urandom syscall (entropy-dilution redesign).
+        let bridges_dir = _arg_value(user_args, "--bridges-dir", "")
+        if bridges_dir.len() == 0 {
+            eprintln("# noise_envelope: reason=gamma_v2-missing-bridges-dir fix=pass --bridges-dir <p>")
+            eprintln("__NOISE_ENVELOPE__ FAIL mechanism=g2")
+            exit(1)
+        }
+        let env_json = noise_gamma_v2(bridges_dir)
+        println(env_json)
+        eprintln("__NOISE_ENVELOPE__ PASS mechanism=g2")
+        exit(0)
+    }
+
+    if mech == "multiplex" {
+        // B8 PoC: 3-domain entropy multiplexer (quantum_hw → sim_output → system_csprng).
+        let env_json = noise_multiplex()
+        println(env_json)
+        eprintln("__NOISE_ENVELOPE__ PASS mechanism=mx")
         exit(0)
     }
 
