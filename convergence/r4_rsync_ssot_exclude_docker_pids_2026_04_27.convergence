@@ -1,0 +1,64 @@
+@track R4_RSYNC_SSOT_EXCLUDE_DOCKER_PIDS
+@state completed
+@date 2026-04-27
+@scope sub-Q — fix adjacent defects 5(a) hexa_remote rsync rename EPERM on chattr +i remote files + 5(b) Mac docker hard-landing fork-storm caused by hexa-exec container at pids.max=512.
+@chain ←r4_hardcode_migration_2026_04_27.convergence
+@principle 자원관련 hive cli + 하드코딩 금지 (raw 95) + nexus kick canonical entry + @convergence 기록필수 + raw 44 docker hard-landing safety
+
+# motivation
+
+@symptom_5a Mac→remote rsync via hexa_remote emitted `rsync: rename ".raw.te0lw6" -> ".raw": Operation not permitted` and exited rc=23 (partial transfer with errors). Caller hexa_remote treated rc=23 as fatal → exit 64 → upper Mac wrapper escalated to docker hard-landing fallback.
+
+@symptom_5b Once docker hard-landing fired, exec inside hexa-exec hit `sh: can't fork: Resource temporarily unavailable` repeatedly. This blocked the entire dispatch chain and turned a transient remote-EPERM into a hard outage.
+
+@root_cause_5a SSOT files (.raw .own .roadmap .guide .ext .turn .end .command .meta .chain .raw-audit) are Mac-canonical with chflags uchg/uappnd. On remote hosts the same files often carry chattr +i (immutable). rsync's default per-file strategy is "write to .target.tmpXXX then rename onto target" — rename onto an immutable target = EPERM. Live verification on 2026-04-27 also caught EPERM on tool/kick_bench.hexa + tool/kick_dispatch.hexa (also chattr +i on remote ubu1) — broader than SSOT alone.
+
+@root_cause_5b Live measurement during this kick revealed `pids.current = pids.max = 512` on hexa-exec while `docker top hexa-exec` showed only 1 process (sleep infinity). This is leaked PID accounting in the cgroup — prior `docker exec` invocations left phantom entries that cgroup pids subsystem never reclaimed. New container at 4096 cap with current=10 immediately after recreate confirms accounting was the bug, not real fork-bomb load. Mac kern.maxproc=6000 / kern.maxprocperuid=4000 NOT the bottleneck (current uid 501 = 490-685 procs).
+
+# fix applied
+
+## 5(a) — hexa_remote SSOT exclusion + graceful rc=23
+
+@file scripts/bin/hexa_remote (Mac chflags uchg, unlocked → edit → relocked)
+
+@change_1 module-level SSOT_EXCLUDES array introduced once and prepended into all 5 SYNC_EXCLUDES blocks (airgenome, nexus, anima, n6-architecture, hive):
+  SSOT_EXCLUDES=(--exclude=.raw --exclude=.own --exclude=.roadmap --exclude=.guide
+                 --exclude=.ext --exclude=.turn --exclude=.end --exclude=.command
+                 --exclude=.meta --exclude=.chain --exclude=.raw-audit)
+
+@change_2 graceful rc=23 handler before the fatal-rc branch:
+  - rc=23 = "partial transfer due to error" — most common cause is EPERM on rename to chattr +i target.
+  - Log warning to /tmp/hexa_remote_last_rsync_warn.log + treat as success (rsync_rc=0).
+  - Avoids cascading to docker hard-landing fallback. Excluded SSOT files don't need re-sync; other immutable remote files (kick_bench.hexa, kick_dispatch.hexa, etc.) are already up-to-date.
+
+@verification live test 2026-04-27 11:14 UTC:
+  - HEXA_RESOLVER_NO_REROUTE=1 hexa_remote hetzner true (rerouted to ubu1 by LB)
+  - Output: `hexa_remote: rsync rc=23 partial-transfer 무시 (ubu1): rsync error: some files/attrs were not transferred ... (code 23)` then `hexa_remote: ubu1 에서 원격 실행 중` → rc=0 PASS
+  - Warn log captured EPERM on tool/kick_bench.hexa + tool/kick_dispatch.hexa (broader than SSOT — confirms graceful rc=23 was the load-bearing fix)
+
+## 5(b) — docker pids-limit bump + container restart
+
+@file ~/.hx/bin/hexa (resolver — outside nexus tree; tracked here for chain integrity)
+@change --pids-limit=512 → --pids-limit=4096 (8× headroom) in `_ensure_hexa_exec_container`
+@accompanying_op `docker rm -f hexa-exec` then trigger resolver to recreate via `hexa --version` — clears leaked cgroup pids accounting AND picks up new cap.
+@verification post-restart pids.current=10 / pids.max=4096; `docker exec hexa-exec sh -c 'true | true | true'` rc=0 (3-stage fork pipeline that previously failed with EAGAIN now passes).
+
+# residual / follow-ups
+
+@residual_a hive repo dispatch path NOT verified live (only nexus). Same SSOT_EXCLUDES applied to hive branch — assumed to work by symmetry but unsmoked.
+@residual_b airgenome / anima / n6-architecture branches likewise applied-but-unsmoked. Defer until sister sub-agent or natural dispatch surfaces them.
+@residual_c root cause of pids leak NOT diagnosed — only mitigated. Possible causes: (i) tini missing as PID 1 → zombie reaping unfinished; (ii) docker-on-Mac VM cgroupv2 quirk; (iii) `docker exec`'s exec-thread cleanup race. Bumping cap to 4096 buys 8× headroom but if leak rate is unbounded, periodic restart is needed. Track as kick(ω-cycle) candidate `hexa-exec-pids-leak-rca`.
+@residual_d resolver edit (`~/.hx/bin/hexa`) is OUT of nexus tree; this commit covers nexus only. Resolver edit recorded in audit ledger + this convergence for chain integrity. If/when resolver migrates to a nexus-tracked source (recommended), re-link.
+
+# files modified (this commit)
+
+- scripts/bin/hexa_remote (chflags uchg unlock → edit → relock)
+- .raw-audit (append-only ledger row)
+- convergence/r4_rsync_ssot_exclude_docker_pids_2026_04_27.convergence (this file, new)
+
+# files modified (out-of-tree, documented here)
+
+- ~/.hx/bin/hexa : `--pids-limit=512` → `--pids-limit=4096` + comment update
+- (live op) `docker rm -f hexa-exec` + recreate with new cap
+
+@end

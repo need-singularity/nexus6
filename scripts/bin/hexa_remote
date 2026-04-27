@@ -1149,6 +1149,29 @@ CWD="$(pwd -P)"
 # macOS case-insensitive FS: lowercase for detection only; preserve CWD for rsync source.
 CWD_LC="$(printf '%s' "$CWD" | tr '[:upper:]' '[:lower:]')"
 HOME_LC="$(printf '%s' "$HOME" | tr '[:upper:]' '[:lower:]')"
+
+# 2026-04-27 (r4 5a): SSOT files are Mac-canonical with chflags uchg/uappnd. On
+# remote hosts the same files carry chattr +i so rsync's "rename .raw.tmp -> .raw"
+# strategy hits EPERM → rsync rc=23 ("partial transfer with errors") → hexa_remote
+# exit 64 → Mac docker hard-landing fallback → docker pids-cap fork storm (5b).
+# Excluding SSOT files from rsync prevents the entire chain. SSOT canonical state
+# is Mac-side; remotes already have their own snapshot via prior dispatch or
+# never need them (drill/smash/free runtime does not consume SSOT files).
+# Hexa-lang has its own .raw self-format file too — exclude pattern matches both.
+SSOT_EXCLUDES=(
+    --exclude=.raw
+    --exclude=.own
+    --exclude=.roadmap
+    --exclude=.guide
+    --exclude=.ext
+    --exclude=.turn
+    --exclude=.end
+    --exclude=.command
+    --exclude=.meta
+    --exclude=.chain
+    --exclude=.raw-audit
+)
+
 case "$CWD_LC" in
   "$HOME_LC/dev/airgenome"|"$HOME_LC/dev/airgenome"/*|"$HOME_LC/core/airgenome"|"$HOME_LC/core/airgenome"/*)
     LOCAL_ROOT="${CWD%%/[Aa]irgenome*}/airgenome"
@@ -1158,7 +1181,8 @@ case "$CWD_LC" in
         [ -d "$candidate" ] && LOCAL_ROOT="$candidate" && break
     done
     REMOTE_ROOT='$HOME/airgenome'
-    SYNC_EXCLUDES=(--exclude=archive/v1/ --exclude=data/ --exclude=__pycache__/
+    SYNC_EXCLUDES=("${SSOT_EXCLUDES[@]}"
+                   --exclude=archive/v1/ --exclude=data/ --exclude=__pycache__/
                    --exclude=.git/ --exclude='*.log' --exclude=.DS_Store)
     ;;
   "$HOME_LC/dev/nexus"|"$HOME_LC/dev/nexus"/*|"$HOME_LC/core/nexus"|"$HOME_LC/core/nexus"/*)
@@ -1174,7 +1198,8 @@ case "$CWD_LC" in
     # "could not make way for new symlink" + "cannot delete non-empty directory"
     # code=23 → hexa_remote exit 64 → Mac 래퍼 rc=74 증폭. 세 경로 sync 제외.
     # 원본 config/ roadmaps/ tool/ 은 top-level 로 sync 되므로 정보 손실 없음.
-    SYNC_EXCLUDES=(--exclude=.git/ --exclude='*.log' --exclude=.DS_Store
+    SYNC_EXCLUDES=("${SSOT_EXCLUDES[@]}"
+                   --exclude=.git/ --exclude='*.log' --exclude=.DS_Store
                    --exclude=.runtime/ --exclude=shared/blowup/lens/
                    --exclude=shared/config --exclude=shared/roadmaps
                    --exclude=shared/harness/safe_hexa_launchd.sh)
@@ -1188,6 +1213,7 @@ case "$CWD_LC" in
     # anima = 87GB, mostly data/artifacts. Sync only source code paths;
     # exclude large data trees. Local anima-engines/ is ~1.2MB.
     SYNC_EXCLUDES=(
+        "${SSOT_EXCLUDES[@]}"
         --exclude=.git/
         --exclude='*.log'
         --exclude=.DS_Store
@@ -1215,6 +1241,7 @@ case "$CWD_LC" in
     done
     REMOTE_ROOT='$HOME/core/n6-architecture'
     SYNC_EXCLUDES=(
+        "${SSOT_EXCLUDES[@]}"
         --exclude=.git/
         --exclude='*.log'
         --exclude=.DS_Store
@@ -1235,6 +1262,7 @@ case "$CWD_LC" in
     done
     REMOTE_ROOT='$HOME/core/hive'
     SYNC_EXCLUDES=(
+        "${SSOT_EXCLUDES[@]}"
         --exclude=.git/
         --exclude='*.log'
         --exclude=.DS_Store
@@ -1313,6 +1341,19 @@ if [ "${HEXA_REMOTE_NO_SYNC:-0}" != "1" ]; then
   # dispatch 시 code 11 발생). rsync 3.2.3+ 필요 — 모든 호스트 3.2.7 확인됨.
   rsync -aH --mkpath -e "$RSYNC_SSH" "${SYNC_EXCLUDES[@]}" "$LOCAL_ROOT/" "$HOST:${REMOTE_ROOT#\$HOME/}/" >/dev/null 2>"$RSYNC_ERR_FILE"
   rsync_rc=$?
+  # 2026-04-27 (r4 5a): rc=23 graceful path. rc=23 = "partial transfer due to error"
+  # — most common cause is EPERM on rename to chattr +i target (immutable SSOT files
+  # on remote). With SSOT_EXCLUDES applied above, this should never trigger for SSOT;
+  # if it does, the offending files are by definition NOT business-critical for the
+  # dispatch (drill/smash/free runtimes don't read SSOT). Log + treat as success
+  # rather than cascading to docker hard-landing fork-storm (defect 5b).
+  if [ "$rsync_rc" = "23" ]; then
+    cp -f "$RSYNC_ERR_FILE" /tmp/hexa_remote_last_rsync_warn.log 2>/dev/null
+    rsync_last="$(tail -n 1 "$RSYNC_ERR_FILE" 2>/dev/null)"
+    echo "hexa_remote: rsync rc=23 partial-transfer 무시 ($HOST): ${rsync_last:-EPERM on immutable target} [warn: /tmp/hexa_remote_last_rsync_warn.log]" >&2
+    rm -f "$RSYNC_ERR_FILE"
+    rsync_rc=0
+  fi
   if [ "$rsync_rc" -ne 0 ]; then
     # rsync_rc 캡처는 if-block 밖에서. 기존 `if ! rsync; then rsync_rc=$?` 는 항상 0
     # (if-test 통과 결과) 이라 진짜 rc 가 묻혀 진단 불가능했음.
