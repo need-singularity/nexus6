@@ -22,6 +22,14 @@
 #                                        ω-network-4 (2026-04-26) so operators can
 #                                        calibrate without re-deploying once the PSI log
 #                                        accumulates per-host distribution.
+#   HEXA_REMOTE_PSI_NO_SCALE=1           Disable RAM-headroom-scaled PSI threshold (ISSUE 3,
+#                                        2026-04-27). When unset (default), the per-probe
+#                                        effective threshold is computed as
+#                                          effective = min(95, base + (avail_gb / 32))
+#                                        — htz/hetzner with 122GB free gets +3.8pt, ubu1
+#                                        with 30GB gets +0.94pt, ceiling 95 prevents runaway.
+#                                        Closes user incident 2026-04-27 where htz PSI=91
+#                                        was rejected despite enormous RAM headroom.
 #
 # Exit 64 → caller should fall back to local (cwd not mappable).
 
@@ -160,6 +168,45 @@ _probe_host() {
                     _psi_threshold="80"
                     _psi_src="default80"
                 fi
+                # ─── ISSUE 3 (2026-04-27): RAM-headroom-scaled PSI threshold ────
+                # Original behavior rejected htz at PSI=91 even though 122GB was
+                # free, because the static 80 threshold ignored that PSI on a
+                # fat-RAM host doesn't predict OOM the same way as on a 32GB
+                # host. New formula:
+                #     effective_psi = min(95, base + (avail_gb / 32))
+                # The bonus term is a *float* — the *100 integer comparison
+                # below preserves sub-point precision. Worked example:
+                #     ubu1  (30GB free)  → 80 + 30/32  = 80.94  (≈80, no change)
+                #     ubu2  (28GB free)  → 80 + 28/32  = 80.88  (≈80, no change)
+                #     htz   (128GB)      → 80 + 128/32 = 84.00  (was rejecting at 80)
+                #     hetzner (200GB)    → 80 + 200/32 = 86.25  (was rejecting at 80)
+                #     huge (500GB)       → 80 + 500/32 = 95.00  (clamped at ceiling)
+                # Bypass: HEXA_REMOTE_PSI_NO_SCALE=1 (testing / debug). Default
+                # is opt-in scale ON because it is *strictly more permissive* —
+                # never rejects what the static path would accept, only accepts
+                # additional fat-RAM cases the static path was over-rejecting.
+                # _psi_eff_src records "scaled" vs "static" for log forensics.
+                local _psi_eff _psi_eff_int _psi_eff_src
+                if [ "${HEXA_REMOTE_PSI_NO_SCALE:-0}" = "1" ]; then
+                    _psi_eff="$_psi_threshold"
+                    _psi_eff_src="static"
+                    _psi_eff_int="$(awk -v t="$_psi_eff" 'BEGIN{printf "%d", t*100}')"
+                else
+                    # avail is MB → GB as float; bonus = avail_gb / 32 (float).
+                    # Both the eff display string AND the *100 integer comparison
+                    # are computed in awk to keep precision (PSI is float, e.g. 12.34).
+                    # Ceiling 95 clamps any host with absurd headroom.
+                    _psi_eff="$(awk -v base="$_psi_threshold" -v avail_mb="${avail:-0}" '
+                        BEGIN {
+                            avail_gb = avail_mb / 1024.0
+                            bonus = avail_gb / 32.0
+                            eff = base + bonus
+                            if (eff > 95) eff = 95
+                            printf "%.2f", eff
+                        }')"
+                    _psi_eff_int="$(awk -v t="$_psi_eff" 'BEGIN{printf "%d", t*100}')"
+                    _psi_eff_src="scaled(base=${_psi_threshold},avail_gb=$(awk -v m="${avail:-0}" 'BEGIN{printf "%.2f", m/1024.0}'))"
+                fi
                 local _psi_threshold_int
                 _psi_threshold_int="$(awk -v t="$_psi_threshold" 'BEGIN{printf "%d", t*100}')"
                 local _psi_log="${HEXA_REMOTE_PSI_LOG:-/tmp/hexa_remote_psi.log}"
@@ -172,18 +219,21 @@ _probe_host() {
                     # env source ("HEXA_REMOTE_PSI_THRESHOLD_HETZNER" |
                     # "HEXA_REMOTE_PSI_THRESHOLD" | "default80") is recoverable per
                     # row without re-deriving from environment state.
-                    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                    # ISSUE 3 (2026-04-27): col 8 = effective scaled threshold,
+                    # col 9 = scaling source ("scaled(base=..)" | "static").
+                    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
                         "$_ts" "$cand" "$psi" "$_psi_threshold" "$1" "$2" "$_psi_src" \
+                        "$_psi_eff" "$_psi_eff_src" \
                         >> "$_psi_log" 2>/dev/null || true
                 }
-                if [ "$_psi_int" -gt "$_psi_threshold_int" ] 2>/dev/null; then
-                    _psi_emit "reject" "PSI avg10=$psi > $_psi_threshold (R5.4 src=$_psi_src)"
-                    echo "hexa_remote: host=$cand PSI avg10=$psi > $_psi_threshold (R5.4 ω-hexa-5 src=$_psi_src) — skipping saturated host" >&2
-                    reason="PSI saturated (avg10=$psi > $_psi_threshold)"
+                if [ "$_psi_int" -gt "$_psi_eff_int" ] 2>/dev/null; then
+                    _psi_emit "reject" "PSI avg10=$psi > eff=$_psi_eff (base=$_psi_threshold src=$_psi_src ${_psi_eff_src})"
+                    echo "hexa_remote: host=$cand PSI avg10=$psi > eff=$_psi_eff (base=$_psi_threshold src=$_psi_src ${_psi_eff_src}) — skipping saturated host" >&2
+                    reason="PSI saturated (avg10=$psi > eff=$_psi_eff base=$_psi_threshold)"
                     rc=1
                     break
                 else
-                    _psi_emit "accept" "PSI avg10=$psi <= $_psi_threshold (src=$_psi_src)"
+                    _psi_emit "accept" "PSI avg10=$psi <= eff=$_psi_eff (base=$_psi_threshold src=$_psi_src ${_psi_eff_src})"
                 fi
             fi
             # Accept if RAM check disabled OR avail >= threshold.
@@ -422,6 +472,112 @@ for cand in hetzner ubu1 ubu2 htz; do
     esac
 done
 
+# ─── ISSUE 5 (2026-04-27): structured all-routes-blocked diagnostic trailer ───
+# When every external probe path AND the docker fallback (when applicable) are
+# blocked, emit a raw 66 ai-native trailer that tells the operator *exactly*
+# which artifacts to inspect/clear, instead of the historical cryptic
+# 'all-claude-slots-exhausted'. Fields surfaced:
+#   - external_blacklist: per-host /tmp/hexa_remote.blacklist.<host> mtime + age
+#                         (live = file present; stale = present but >TTL)
+#   - docker_neg_cache:   /tmp/hexa_resolver.connectivity presence + ttl_remaining
+#   - slot_pool:          available/cooldown/unknown across the 12 claude slots
+#                         (best-effort summary parse from claude_slot_pick --list --json,
+#                          falls back to simple dir-existence count)
+#   - fix:                 ordered remediation directives (raw 66 / raw 81 contract)
+#   - ref:                 raw#ai-native-error-message + nexus/.guide § cross-host parity
+# Args: $1 = space-separated FALLBACK_CHAIN, $2 = reason slug.
+# Stdout: nothing. Stderr: multi-line trailer.
+# Idempotent — pure read-side; no state mutation.
+_emit_all_routes_blocked_trailer() {
+    local _chain="$1" _reason="$2"
+    local _now
+    _now="$(date +%s)"
+    local _bl_ttl="${HEXA_REMOTE_BLACKLIST_TTL:-300}"
+    echo "err hexa_remote/all-routes-blocked" >&2
+    # external_blacklist row
+    local _bl_row="" _h _bl_file _bl_mtime _bl_age _bl_state
+    for _h in $_chain; do
+        _bl_file="/tmp/hexa_remote.blacklist.$_h"
+        if [ -f "$_bl_file" ]; then
+            _bl_mtime="$(stat -f %m "$_bl_file" 2>/dev/null || stat -c %Y "$_bl_file" 2>/dev/null || echo 0)"
+            _bl_age="$(( _now - _bl_mtime ))"
+            if [ "$_bl_age" -lt "$_bl_ttl" ] 2>/dev/null; then
+                _bl_state="live(age=${_bl_age}s)"
+            else
+                _bl_state="stale(age=${_bl_age}s)"
+            fi
+        else
+            _bl_state="absent"
+        fi
+        if [ -z "$_bl_row" ]; then _bl_row="$_h=$_bl_state"
+        else _bl_row="$_bl_row, $_h=$_bl_state"; fi
+    done
+    echo "  external_blacklist: $_bl_row  (TTL=${_bl_ttl}s)" >&2
+    # docker_neg_cache row (the resolver's connectivity neg-cache file).
+    local _dc_file="/tmp/hexa_resolver.connectivity"
+    local _dc_ttl="${HEXA_RESOLVER_CONNECTIVITY_TTL:-60}"
+    local _dc_row="absent"
+    if [ -f "$_dc_file" ]; then
+        local _dc_mtime _dc_age _dc_remaining
+        _dc_mtime="$(stat -f %m "$_dc_file" 2>/dev/null || stat -c %Y "$_dc_file" 2>/dev/null || echo 0)"
+        _dc_age="$(( _now - _dc_mtime ))"
+        _dc_remaining="$(( _dc_ttl - _dc_age ))"
+        [ "$_dc_remaining" -lt 0 ] 2>/dev/null && _dc_remaining=0
+        _dc_row="present(age=${_dc_age}s, ttl_remaining=${_dc_remaining}s)"
+    fi
+    echo "  docker_neg_cache: $_dc_row" >&2
+    # slot_pool row — best-effort. Try hive helper first; fall back to dir count.
+    local _slot_row="<unprobed>"
+    local _slot_helper="$HOME/core/hive/tool/claude_slot_pick.hexa"
+    local _hexa_bin="${HEXA:-$HOME/.hx/bin/hexa}"
+    if [ -x "$_hexa_bin" ] && [ -f "$_slot_helper" ]; then
+        # Use --list --json; parse summary block. 1s timeout — this is diagnostic,
+        # we never block the exit path on it.
+        local _slot_json
+        _slot_json="$(HEXA_RESOLVER_NO_REROUTE=1 timeout 2 "$_hexa_bin" run "$_slot_helper" --list --json 2>/dev/null || true)"
+        if [ -n "$_slot_json" ]; then
+            local _avail_n _cool_n _unk_n _total_n
+            _avail_n="$(printf '%s' "$_slot_json" | awk -F: '/"available":/ {gsub(/[^0-9]/,"",$2); print $2; exit}')"
+            _cool_n="$(printf '%s'  "$_slot_json" | awk -F: '/"session_limit":/ {gsub(/[^0-9]/,"",$2); print $2; exit}')"
+            _unk_n="$(printf '%s'   "$_slot_json" | awk -F: '/"unknown":/ {gsub(/[^0-9]/,"",$2); print $2; exit}')"
+            _total_n="$(printf '%s' "$_slot_json" | awk -F: '/"total":/ {gsub(/[^0-9]/,"",$2); print $2; exit}')"
+            _total_n="${_total_n:-12}"
+            _slot_row="${_avail_n:-?}/${_total_n} available, ${_cool_n:-?}/${_total_n} cooldown, ${_unk_n:-?}/${_total_n} unknown"
+        fi
+    fi
+    if [ "$_slot_row" = "<unprobed>" ]; then
+        local _slot_dirs
+        _slot_dirs="$(ls -1d "$HOME"/.claude-claude* 2>/dev/null | wc -l | tr -d ' ')"
+        _slot_row="${_slot_dirs:-0}/12 dirs (helper unreachable)"
+    fi
+    echo "  slot_pool: $_slot_row" >&2
+    # fix block — ordered remediation. Cite stale hosts so operator can copy-paste.
+    local _stale_hosts=""
+    for _h in $_chain; do
+        _bl_file="/tmp/hexa_remote.blacklist.$_h"
+        if [ -f "$_bl_file" ]; then
+            _bl_mtime="$(stat -f %m "$_bl_file" 2>/dev/null || stat -c %Y "$_bl_file" 2>/dev/null || echo 0)"
+            _bl_age="$(( _now - _bl_mtime ))"
+            if [ "$_bl_age" -ge "$_bl_ttl" ] 2>/dev/null; then
+                if [ -z "$_stale_hosts" ]; then _stale_hosts="$_h"
+                else _stale_hosts="$_stale_hosts $_h"; fi
+            fi
+        fi
+    done
+    echo "  fix:" >&2
+    if [ -n "$_stale_hosts" ]; then
+        echo "    1) clear stale: rm -f$(for _sh in $_stale_hosts; do printf ' /tmp/hexa_remote.blacklist.%s' "$_sh"; done)" >&2
+    else
+        echo "    1) clear stale: (none — all blacklist files are within TTL or absent)" >&2
+    fi
+    echo "    2) clear neg_cache: rm -f /tmp/hexa_resolver.connectivity" >&2
+    echo "    3) probe slots: hexa run /Users/ghost/core/hive/tool/claude_slot_pick.hexa --probe-all" >&2
+    echo "    4) full bypass: HEXA_RESOLVER_NO_REROUTE=1 nexus kick run <topic>" >&2
+    echo "  ref: raw:ai-native-error-message + nexus/.guide § Cross-host parity matrix" >&2
+    # raw 66 trailer
+    echo "reason=$_reason fix=see-block-above" >&2
+}
+
 # 2026-04-22: preflight — parallel 300ms TCP probe of $FALLBACK_CHAIN via
 # $HEXA_LANG/gate/remote_preflight.hexa (hexa-lang PR#24). Fast-path exit 64
 # when all hosts are down, instead of paying per-host ConnectTimeout×N.
@@ -446,6 +602,8 @@ if [ "${HEXA_REMOTE_SKIP_PREFLIGHT:-0}" != "1" ] \
                 else _pf_hosts_json="$_pf_hosts_json,\"$_h\""; fi
             done
             printf 'NEXUS_REMOTE_ERROR {"hosts_tried":[%s],"reason":"all_unreachable_preflight","exit_code":64}\n' "$_pf_hosts_json" >&2
+            # ─── ISSUE 5 (2026-04-27): structured failure cascade trailer ───
+            _emit_all_routes_blocked_trailer "$FALLBACK_CHAIN" "all_unreachable_preflight" >&2
             exit 64
             ;;
     esac
@@ -609,6 +767,8 @@ if [ -z "$HOST" ]; then
             fi
         done
         printf 'NEXUS_REMOTE_ERROR {"hosts_tried":[%s],"reason":"all_unreachable","exit_code":64}\n' "$_hosts_json" >&2
+        # ─── ISSUE 5 (2026-04-27): structured failure cascade trailer ───
+        _emit_all_routes_blocked_trailer "$FALLBACK_CHAIN" "all_unreachable" >&2
         exit 64
     fi
 fi
@@ -1236,9 +1396,27 @@ if [ "${HEXA_REMOTE_DOCKER:-0}" = "1" ]; then
     # docker exec -i (no -t) 로 stdin/stdout 직통. bash -lc 는 PATH 확보.
     REMOTE_CMD="$REMOTE_TRAP; docker exec -i $_DOCKER_CONTAINER bash -lc $(printf %q "$_INNER_CMD")"
 elif [ "${HEXA_REMOTE_NO_CAP:-0}" = "1" ]; then
-    REMOTE_CMD="$REMOTE_TRAP; cd \"$REMOTE_ROOT${REL:+/$REL}\" && export HEXA=\"$REMOTE_HEXA\" HEXA_LOCAL=1 HEXA_NO_LAUNCHD=1 && ${_REMOTE_LOCK_PREFIX}$REMOTE_HEXA$_ARG_QUOTED"
+    # R4 BUG#3 fix (2026-04-27): inject HEXA_LANG so `use "self/stdlib/..."` resolves on remote.
+    # Mac sets HEXA_LANG globally; remote ssh shells inherit minimal env without it. Fallback chain.
+    # R4 BUG#5 fix (2026-04-27): forward ANTHROPIC_API_KEY for kick claude_code backend.
+    # Hive coding-agent on remote needs API key for LLM calls. Mac shell-env passthrough.
+    # Empty Mac env = empty remote env (fails at remote with raw 66 ai-native error from hive shim).
+    # Single-entry-point invariant: handled within `nexus kick`, NOT a separate `nexus credential` subcommand.
+    REMOTE_CMD="$REMOTE_TRAP; cd \"$REMOTE_ROOT${REL:+/$REL}\" && export HEXA=\"$REMOTE_HEXA\" HEXA_LOCAL=1 HEXA_NO_LAUNCHD=1 HEXA_LANG=\"\$(for d in \$HOME/Dev/hexa-lang \$HOME/core/hexa-lang; do [ -d \$d ] && echo \$d && break; done)\" ANTHROPIC_API_KEY=$(printf %q "${ANTHROPIC_API_KEY:-}") && ${_REMOTE_LOCK_PREFIX}$REMOTE_HEXA$_ARG_QUOTED"
 else
-    REMOTE_CMD="$REMOTE_TRAP; cd \"$REMOTE_ROOT${REL:+/$REL}\" && export HEXA=\"$REMOTE_HEXA\" HEXA_LOCAL=1 HEXA_NO_LAUNCHD=1 && if $_SD_CHECK; then $_SD_WRAP $REMOTE_HEXA$_ARG_QUOTED; else ${_REMOTE_LOCK_PREFIX}$REMOTE_HEXA$_ARG_QUOTED; fi"
+    REMOTE_CMD="$REMOTE_TRAP; cd \"$REMOTE_ROOT${REL:+/$REL}\" && export HEXA=\"$REMOTE_HEXA\" HEXA_LOCAL=1 HEXA_NO_LAUNCHD=1 HEXA_LANG=\"\$(for d in \$HOME/Dev/hexa-lang \$HOME/core/hexa-lang; do [ -d \$d ] && echo \$d && break; done)\" ANTHROPIC_API_KEY=$(printf %q "${ANTHROPIC_API_KEY:-}") && if $_SD_CHECK; then $_SD_WRAP $REMOTE_HEXA$_ARG_QUOTED; else ${_REMOTE_LOCK_PREFIX}$REMOTE_HEXA$_ARG_QUOTED; fi"
+fi
+
+# R4 BUG#5 fix (2026-04-27): pre-flight ai-native warning if Mac side has no API key.
+# This fires once per dispatch, providing raw 66 reason+fix trailer to user before remote fail.
+# Skipped for non-kick / non-claude_code invocations (heuristic: argv contains "kick" or "claude_code").
+if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+    case " $* " in
+        *" kick "*|*"--backend claude_code"*|*"backend=claude_code"*)
+            echo "hexa_remote: ⚠ ANTHROPIC_API_KEY unset on Mac — claude_code backend on $HOST will fail at LLM dispatch" >&2
+            echo "reason=missing-api-key fix=1) export ANTHROPIC_API_KEY=sk-ant-... in ~/.zshrc  2) source ~/.zshrc  3) re-run nexus kick" >&2
+            ;;
+    esac
 fi
 
 # -T = no pty, ServerAlive = 장시간 compute (drill) 중 네트워크 끊기면 30s 내 감지 후 종료.

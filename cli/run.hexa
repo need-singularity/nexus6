@@ -5817,19 +5817,20 @@ fn _qrng_help() -> void {
 // implementation:        tool/kick_{tree,dispatch,bench}.hexa + state/kick/registry/
 
 fn _kick_help() -> void {
-    println("nexus kick — kick(ω-cycle) executor (kick ≡ ω-cycle, full equivalence)")
+    println("nexus kick — kick(ω-cycle) executor (kick ≡ ω-cycle)")
+    println("")
+    println("usage:")
+    println("  nexus kick <topic> [--stratum <s>] [--axes a,b,c] [--noise alpha,beta,gamma] [--backend <slug>] [--parent-sid <sid>] [--dry-run]")
+    println("    fire ω-cycle. parent-sid auto-synthesized if env unset (R4 ISSUE#4).")
     println("")
     println("subcommands:")
-    println("  tree                                live registry tree (state/kick/registry/{strata,axes,backends,noise_sources}/)")
-    println("  bench <topic> [--backends a,b,c] [--dry-run]   cross-backend perf bench (5 axes: wall_time_ms/cost_usd/tier_1_count/falsifier_coverage_pct/dedup_ratio_vs_prior)")
-    println("  run <topic> [--backend <slug>] [--stratum <slug>] [--axes a,b,c] [--noise alpha,beta,gamma] [--witness-dir <path>] [--parent-sid <sid>] [--dry-run]   single-shot kick(ω-cycle)")
+    println("  tree                                live registry (strata/axes/backends/noise_sources)")
+    println("  status                              hosts/slot-pool/cache dashboard")
+    println("  bench <topic> [--backends a,b,c]    cross-backend perf bench")
+    println("  run <topic> [...]                   alias for default-run (legacy)")
     println("  help                                this message")
     println("")
-    println("note: claude_code slot pool listing 은 hive CLI 단독 surface — `hive-exec claude_slot_pick --list [--json]`.")
-    println("      kick_dispatch internal 은 자동으로 hive-exec 경유. 멱등성: 동일 동작이 nexus + hive 둘 다 노출되지 않음.")
-    println("")
-    println("default subcommand when topic supplied: run")
-    println("noise injections (architecture witness axis_abstraction_noise):")
+    println("noise injections (outside-the-well; canonical diagram: ~/core/diagrams/llm_vs_nexus_noise.md):")
     println("  alpha — absorbed-primitive sampling from state/kick/registry/noise_sources/absorbed/")
     println("  beta  — QRNG byte (real ANU when KICK_BETA_REAL_ANU=1, urandom fallback per obs_2)")
     println("  gamma — empirical bridge selected by beta-byte from registered 16 bridges")
@@ -5899,6 +5900,64 @@ fn _kick_run(a: [str]) -> void {
 // kick_dispatch internal 은 _slot_pick_invocation_prefix() 가 hive-exec 경유.
 // 사용자가 `nexus kick slots` 입력 시 hive-exec redirection 안내만 출력 (raw 66 fix).
 
+// R4 ISSUE#6 (2026-04-27): `nexus kick status` — holistic resource-management dashboard.
+// Single-entry-point invariant preserved: status reporting lives within `nexus kick`,
+// NOT a separate top-level command. Surfaces 3 layers in one view:
+//   1) external host load (RAM avail + PSI memory + load avg) for ubu/ubu2/htz
+//   2) claude slot pool state (12 slots, available/cooldown/unknown counts)
+//   3) resolver caches (blacklist files + neg_cache mtime + ttl)
+// Plus actionable raw 66 fix directives when any layer is degraded.
+fn _kick_status() -> void {
+    println("nexus kick status — hive resource-management dashboard")
+    println("=====================================================")
+    println("")
+    println("[1/3] external hosts (cross-host kick targets)")
+    let hosts = ["ubu", "ubu2", "htz"]
+    let mut hi = 0
+    while hi < len(hosts) {
+        let h = hosts[hi]
+        let probe = "ssh -o ConnectTimeout=5 -o BatchMode=yes " + h + " \"awk '/MemAvailable:/ {printf \\\"avail=%dMB \\\", \\$2/1024}' /proc/meminfo; awk -F'[= ]' '/^some/ {printf \\\"PSI_mem=%s \\\", \\$5}' /proc/pressure/memory; uptime | awk -F'load average: ' '{print \\\"load=\\\" \\$2}'\" 2>&1"
+        let line = exec(probe).trim()
+        let status_label = if line.len() > 0 && line.index_of("avail=") >= 0 { "  ✓" } else { "  ✗" }
+        println(status_label + " " + h + ": " + line)
+        hi = hi + 1
+    }
+    println("")
+    println("[2/3] claude_code slot pool (12 slots, mac-side)")
+    let slot_cmd = hexa_bin() + " run " + shell_quote(nexus_root() + "/../hive/tool/claude_slot_pick.hexa") + " --list 2>&1"
+    let slot_out = exec(slot_cmd)
+    // Count avail/cooldown/unknown
+    let avail_n = slot_out.split("available").len() - 1
+    let cooldown_n = slot_out.split("cooldown").len() - 1
+    let unknown_n = slot_out.split("unknown").len() - 1
+    println("  available=" + to_string(avail_n) + " cooldown=" + to_string(cooldown_n) + " unknown=" + to_string(unknown_n) + " (target: ≥3 available for healthy fan-out)")
+    if avail_n < 3 {
+        println("  ⚠ slot pool depleted — fix: hexa run hive/tool/claude_slot_pick.hexa --probe-all  (refreshes 'unknown' status)")
+    }
+    println("")
+    println("[3/3] resolver caches (stale = silent host-skip)")
+    let bl_cmd = "ls /tmp/hexa_remote.blacklist.* 2>/dev/null | wc -l"
+    let bl_count = exec(bl_cmd).trim()
+    let nc_cmd = "ls /tmp/hexa_resolver.connectivity 2>/dev/null"
+    let nc_path = exec(nc_cmd).trim()
+    println("  blacklist files: " + bl_count + " present (300s TTL — fresh probe blocked)")
+    if bl_count != "0" {
+        let bl_list = exec("ls -la /tmp/hexa_remote.blacklist.* 2>/dev/null | awk '{print $9, \"(mtime=\" $6, $7, $8 \")\"}'")
+        print(bl_list)
+        println("  ⚠ blacklist may be stale — fix: rm -f /tmp/hexa_remote.blacklist.*  (forces fresh probe)")
+    }
+    if nc_path.len() > 0 {
+        println("  neg_cache: " + nc_path + " (60s TTL — bare-Mac fallback blocked)")
+        println("  ⚠ may need: rm -f /tmp/hexa_resolver.connectivity  (clears resolver memo)")
+    }
+    println("")
+    println("=====================================================")
+    println("note: stale caches block fresh probes silently. when in doubt:")
+    println("  rm -f /tmp/hexa_remote.blacklist.* /tmp/hexa_resolver.connectivity")
+    println("  hexa run /Users/ghost/core/hive/tool/claude_slot_pick.hexa --probe-all")
+    println("then re-run: nexus kick run <topic>")
+}
+
 fn cmd_kick(a: [str]) -> void {
     let n = len(a)
     let sub = if n >= 4 { a[3] } else { "" }
@@ -5908,10 +5967,12 @@ fn cmd_kick(a: [str]) -> void {
     if sub == "tree" { _kick_tree(); return }
     if sub == "bench" { _kick_bench(a); return }
     if sub == "run" { _kick_run(a); return }
+    if sub == "status" { _kick_status(); return }   // R4 ISSUE#6 — holistic resource-management dashboard
     if sub == "slots" {
         // 멱등성 가드 (2026-04-26 helper relocation) — slot pool surface 는 hive 단독.
-        eprintln("nexus kick slots: REMOVED — hive CLI 단독 surface")
-        eprintln("reason=nexus-kick-slots-deprecated fix=hive-exec claude_slot_pick --list [--json] [--include-phantom] [--refresh]")
+        // status 안에 통합됐으니 안내만.
+        eprintln("nexus kick slots: REMOVED — use `nexus kick status` (holistic dashboard) or `hive-exec claude_slot_pick --list`")
+        eprintln("reason=nexus-kick-slots-deprecated fix=nexus kick status   # full dashboard with slot pool inline")
         exit(2)
     }
     // default: treat as topic (run mode)
