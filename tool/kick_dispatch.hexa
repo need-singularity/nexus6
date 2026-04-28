@@ -123,6 +123,71 @@ fn _extract_inner_hexa_rc(out: str) -> i64 {
     return _safe_to_int_line(piece, 0, "inner-hexa-rc")
 }
 
+// _kick_dispatch_timeout_sec — B.4 silent-timeout RCA fix (2026-04-28).
+//
+// Cycle 3 silent-timeout RCA: hetzner subagent_dispatch fired but no
+// __KICK_RESULT__ sentinel + no witness emitted within the operator's
+// 30s outer-wrapper budget. Root-cause = hypothesis #5 (raw 80 sentinel
+// not emitted on timeout/SIGKILL paths) + hypothesis #1 (30s too short
+// for cross-host SSH + LLM cold-start). Internal `exec()` runs without
+// any deadline → when wrapped by `timeout 30 nexus kick ...` externally,
+// SIGTERM kills hexa before it can print the FAIL sentinel.
+//
+// Fix: wrap the inner subagent_dispatch.hexa exec in `timeout
+// --kill-after=10 N` so the dispatcher itself enforces a deadline,
+// producing a clean rc=124 (or rc=137 on SIGKILL escalation). The
+// surrounding code (rc != 0 branch at L1377-1387) already emits
+// __KICK_RESULT__ FAIL with raw 66 trailer when rc != 0 AND witness
+// schema-invalid — so a clean rc=124 from the wrapper produces a
+// deterministic sentinel even when the subagent dies silently.
+//
+// Default 1800s (30min) — generous for live LLM kicks; closes the
+// hypothesis #1 friction (30s far too short for cross-host + LLM
+// cold-start). Operator override: KICK_DISPATCH_TIMEOUT_SEC=N.
+//
+// Disable: KICK_DISPATCH_NO_TIMEOUT=1 reverts to pre-patch behavior
+// (no inner timeout). Required for the rare interactive-debug path.
+fn _kick_dispatch_timeout_sec() -> i64 {
+    if env("KICK_DISPATCH_NO_TIMEOUT") == "1" { return 0 }
+    let ov = env("KICK_DISPATCH_TIMEOUT_SEC")
+    if ov.len() > 0 {
+        let n = _safe_to_int_line(ov.trim(), 1800, "kick-dispatch-timeout-env")
+        if n > 0 { return n }
+    }
+    return 1800
+}
+
+// _timeout_bin — pick gtimeout (macOS coreutils) → timeout (Linux) → ""
+// (no wrapper available, fall back to bare cmd). Cached implicitly via
+// shell `command -v` per call (cheap; no global cache primitive in hexa).
+fn _timeout_bin() -> str {
+    let try_gtimeout = exec("command -v gtimeout 2>/dev/null").trim()
+    if try_gtimeout.len() > 0 { return "gtimeout" }
+    let try_timeout = exec("command -v timeout 2>/dev/null").trim()
+    if try_timeout.len() > 0 { return "timeout" }
+    return ""
+}
+
+// _wrap_with_timeout — prepend `<timeout-bin> --kill-after=10 N sh -c
+// '<cmd>'` when sec > 0 + bin available. Falls back to bare cmd on
+// minimal Linux images without coreutils (best-effort, not load-bearing
+// — operator's outer wrapper still bounds runaway).
+fn _wrap_with_timeout(cmd: str) -> str {
+    let sec = _kick_dispatch_timeout_sec()
+    if sec <= 0 { return cmd }
+    let bin = _timeout_bin()
+    if bin.len() == 0 { return cmd }
+    return bin + " --kill-after=10 " + to_string(sec) + " sh -c " + _shell_quote(cmd)
+}
+
+// _is_timeout_rc — coreutils `timeout` exits 124 on TERM, 137 on KILL
+// escalation (128 + 9). When wrap prepended, these rc values mean
+// "self-imposed deadline expired" — surface as deterministic raw 66
+// trailer so sentinel + reason chain is always present (B.4 mandate).
+fn _is_timeout_rc(rc: i64) -> bool {
+    return rc == 124 || rc == 137
+}
+
 fn _nexus_root() -> str {
     let n = env("NEXUS")
     if n.len() > 0 { return n }
@@ -1300,7 +1365,11 @@ fn main() -> void {
             let cmd = "CLAUDE_CONFIG_DIR=" + _shell_quote(cfg_dir) + " " +
                 _hexa_bin() + " run " + _shell_quote(dispatch_tool) + " " +
                 _shell_quote(parent_sid) + " --task-file " + _shell_quote(prompt_path)
-            let out = exec(cmd + " 2>&1; echo __RC=$?")
+            // B.4 silent-timeout fix (2026-04-28): wrap with self-imposed
+            // deadline → rc=124/137 lands cleanly into the rc != 0 branch
+            // below + _is_timeout_rc() trailer surfaces raw 66 reason.
+            let wrapped_cmd = _wrap_with_timeout(cmd)
+            let out = exec(wrapped_cmd + " 2>&1; echo __RC=$?")
             last_subprocess_out = out
             // OUTER rc — explicit shell echo.
             let rc_idx = out.last_index_of("__RC=")
@@ -1349,7 +1418,9 @@ fn main() -> void {
     } else {
         // codex_cli / gemini_cli — unchanged single-shot path.
         let cmd = _hexa_bin() + " run " + _shell_quote(dispatch_tool) + " " + _shell_quote(parent_sid) + " --task-file " + _shell_quote(prompt_path)
-        let rc_str = exec(cmd + " 2>&1; echo __RC=$?").trim()
+        // B.4 silent-timeout fix (2026-04-28): same wrap as claude_code branch.
+        let wrapped_cmd = _wrap_with_timeout(cmd)
+        let rc_str = exec(wrapped_cmd + " 2>&1; echo __RC=$?").trim()
         last_subprocess_out = rc_str
         // OUTER rc — explicit shell echo.
         let rc_idx = rc_str.last_index_of("__RC=")
@@ -1379,6 +1450,16 @@ fn main() -> void {
             eprintln("# kick_dispatch: subagent rc=" + to_string(rc) + " but witness schema-valid → R4 recover")
             eprintln("reason=subagent-relay-hang-recovered fix=inspect ~/.hive/subagent-state for hang root cause; hive shim may reference Linux paths on Mac (D-2 incident 2026-04-27)")
             rc = 0
+        } else if _is_timeout_rc(rc) {
+            // B.4 silent-timeout fix (2026-04-28): rc=124 (TERM)/137 (KILL)
+            // from `timeout --kill-after=10 N` wrapper. Distinct trailer so
+            // operator can tune KICK_DISPATCH_TIMEOUT_SEC instead of debugging
+            // generic spawn failure. Closes hypothesis #5 (sentinel mandate
+            // gap on timeout/SIGKILL paths) — sentinel ALWAYS emits now.
+            eprintln("__KICK_RESULT__ FAIL witness=" + witness_path_emit + " tier1=0 falsifier_pass=0")
+            let dl = to_string(_kick_dispatch_timeout_sec())
+            eprintln("reason=spawn-timeout-rc-" + to_string(rc) + "-deadline-" + dl + "s fix=1) raise deadline: KICK_DISPATCH_TIMEOUT_SEC=<n> nexus kick run <topic>; 2) verify network reachability + hetzner SSH responsiveness; 3) check hive subagent state at ~/.hive/subagent-state for hang root cause; 4) tail " + runs_root + "/prompt.txt; 5) ref design/kick/2026-04-28_b4-silent-timeout-rca_omega_cycle.json (B.4 RCA witness)")
+            exit(2)
         } else {
             eprintln("__KICK_RESULT__ FAIL witness=" + witness_path_emit + " tier1=0 falsifier_pass=0")
             eprintln("reason=spawn-failed-rc-" + to_string(rc) + " fix=tail " + runs_root + "/prompt.txt; check hive subagent state at ~/.hive/subagent-state")
