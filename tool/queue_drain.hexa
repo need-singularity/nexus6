@@ -1,0 +1,197 @@
+// tool/queue_drain.hexa — drain state/dispatch_queue/ to external host.
+//
+// @tool(slug="queue_drain", desc="drainer for nexus state/dispatch_queue/. Reads each kick_<ts>_<pid>.jsonl, parses argv[], forwards to NEXUS_KICK_FORWARD_HOST (default hetzner) via ssh, archives processed entries to state/dispatch_queue/.processed/. Idempotent — drained files are mv'd not deleted. raw 65 idempotent + raw 142 D2 try-and-revert wrapped.")
+// @usage(hexa run tool/queue_drain.hexa [--watch] [--max N] [--host <alias>])
+// @resolver-bypass(reason="thin shell-driver around ssh; runs on Mac orchestrator only")
+// @exit_codes(0=PASS-or-empty, 1=usage/io error, 2=ssh-unreachable, 3=partial-fail-some-entries-stuck)
+//
+// Background: kick_run() (cli/run.hexa) auto-forward path is primary dispatch
+// (raw 40+42 / 2026-04-29). When auto-forward probe FAILs (external host down)
+// OR caller sets NEXUS_KICK_NO_AUTO_FORWARD=1, kicks land in dispatch_queue/
+// as JSONL files. Without this drainer they accumulate forever — the user-
+// reported "kick 고장났어" 5× cumulative root cause (P1+P3+P5 forensics
+// 2026-04-29: 13/30 witness-not-captured class).
+//
+// Behaviour:
+//   - Walk state/dispatch_queue/kick_*.jsonl in mtime order (oldest first)
+//   - For each: parse JSON, extract argv array, ssh-forward to host
+//   - On success (rc=0): mv to state/dispatch_queue/.processed/<basename>.processed
+//   - On fail (rc!=0): leave in place, emit raw 66 trailer, continue to next
+//   - --max N caps entries processed per invocation (default: 16)
+//   - --watch keeps polling every 30s until queue empty (cron-friendly)
+
+fn _nexus_root() -> string {
+    let env_root = env("NEXUS_ROOT")
+    if env_root != "" { return env_root }
+    let home = env("HOME")
+    return home + "/core/nexus"
+}
+
+fn _shell_quote(s: string) -> string {
+    let mut out = "'"
+    let mut i = 0
+    while i < s.len() {
+        let c = s.substring(i, i + 1)
+        if c == "'" { out = out + "'\\''" } else { out = out + c }
+        i = i + 1
+    }
+    return out + "'"
+}
+
+// Parse a JSON-array-of-strings field from a single-line JSONL row.
+// Naive parser sufficient for argv (no nested arrays / objects, only strings).
+// Returns space-joined shell-quoted argv ready for remote ssh consumption.
+fn _parse_argv_field(jsonl: string) -> string {
+    let key = "\"argv\":["
+    let i = jsonl.index_of(key)
+    if i < 0 { return "" }
+    let mut j = i + key.len()
+    let mut out = ""
+    let mut count = 0
+    while j < jsonl.len() {
+        let c = jsonl.substring(j, j + 1)
+        if c == "]" { break }
+        if c == "\"" {
+            // start of string element — read until next unescaped "
+            let mut k = j + 1
+            let mut elem = ""
+            while k < jsonl.len() {
+                let cc = jsonl.substring(k, k + 1)
+                if cc == "\\" && k + 1 < jsonl.len() {
+                    let nxt = jsonl.substring(k + 1, k + 2)
+                    if nxt == "\"" { elem = elem + "\""; k = k + 2; continue }
+                    if nxt == "\\" { elem = elem + "\\"; k = k + 2; continue }
+                    elem = elem + cc; k = k + 1; continue
+                }
+                if cc == "\"" { break }
+                elem = elem + cc
+                k = k + 1
+            }
+            if count > 0 { out = out + " " }
+            out = out + _shell_quote(elem)
+            count = count + 1
+            j = k + 1
+            continue
+        }
+        j = j + 1
+    }
+    return out
+}
+
+fn _drain_one(qfile: string, host: string) -> int {
+    let line = exec("cat " + _shell_quote(qfile)).trim()
+    if line.len() == 0 {
+        eprintln("queue_drain: skipping empty queue file " + qfile)
+        return 0  // empty = noop, archive
+    }
+    let argv = _parse_argv_field(line)
+    if argv.len() == 0 {
+        eprintln("queue_drain: failed to parse argv from " + qfile)
+        eprintln("reason=argv-parse-fail fix=cat " + qfile + "  # inspect JSON; expected {\"argv\":[\"kick\",\"run\",\"<topic>\"...]}")
+        return 1
+    }
+    let inner = "cd ~/core/nexus && NEXUS_KICK_SKIP_OAUTH_GATE=1 NEXUS_KICK_SKIP_PREFLIGHT=1 ~/.hx/bin/hexa run cli/run.hexa " + argv
+    let cmd = "ssh -o BatchMode=yes -o ServerAliveInterval=30 -o ConnectTimeout=10 " + _shell_quote(host) + " " + _shell_quote(inner) + " 2>&1; echo __DRAIN_RC=$?"
+    eprintln("queue_drain: forwarding " + qfile + " → " + host)
+    let out = exec(cmd)
+    print(out)
+    let mut rc_str = "0"
+    let lines = out.split("\n")
+    let mut li = 0
+    while li < len(lines) {
+        let ln = lines[li]
+        if ln.find("__DRAIN_RC=") >= 0 {
+            rc_str = ln.replace("__DRAIN_RC=", "").trim()
+        }
+        li = li + 1
+    }
+    if rc_str == "0" { return 0 }
+    return 2
+}
+
+fn _process_queue(host: string, max: int) -> int {
+    let qdir = _nexus_root() + "/state/dispatch_queue"
+    let pdir = qdir + "/.processed"
+    let _ = exec("mkdir -p " + _shell_quote(pdir))
+    // List by mtime ascending (oldest first). ls -tr.
+    let listing = exec("ls -tr " + _shell_quote(qdir) + "/kick_*.jsonl 2>/dev/null").trim()
+    if listing.len() == 0 {
+        println("queue_drain: queue empty at " + qdir)
+        return 0
+    }
+    let entries = listing.split("\n")
+    let mut processed = 0
+    let mut stuck = 0
+    let mut idx = 0
+    while idx < len(entries) {
+        if processed >= max { break }
+        let qfile = entries[idx].trim()
+        if qfile.len() == 0 { idx = idx + 1; continue }
+        let rc = _drain_one(qfile, host)
+        if rc == 0 {
+            // archive
+            let base = exec("basename " + _shell_quote(qfile)).trim()
+            let dest = pdir + "/" + base + ".processed"
+            let _ = exec("mv " + _shell_quote(qfile) + " " + _shell_quote(dest))
+            eprintln("queue_drain: archived " + qfile + " → " + dest)
+        } else {
+            stuck = stuck + 1
+            eprintln("queue_drain: stuck " + qfile + " (rc=" + to_string(rc) + " — leaving in place)")
+        }
+        processed = processed + 1
+        idx = idx + 1
+    }
+    println("queue_drain: processed=" + to_string(processed) + " stuck=" + to_string(stuck))
+    if stuck > 0 { return 3 }
+    return 0
+}
+
+fn main() -> void {
+    let argv = ARGV
+    let argc = len(argv)
+    let mut watch = false
+    let mut max = 16
+    let mut host = env("NEXUS_KICK_FORWARD_HOST")
+    if host.len() == 0 { host = "ubu2" }  // nexus repo is on ubu2 only (P2 forensics 2026-04-29)
+    let mut i = 1
+    while i < argc {
+        let a = argv[i]
+        if a == "--watch" { watch = true; i = i + 1; continue }
+        if a == "--max" && i + 1 < argc {
+            max = to_int(argv[i + 1])
+            if max <= 0 { max = 16 }
+            i = i + 2; continue
+        }
+        if a == "--host" && i + 1 < argc {
+            host = argv[i + 1]
+            i = i + 2; continue
+        }
+        if a == "--help" || a == "-h" {
+            println("usage: hexa run tool/queue_drain.hexa [--watch] [--max N] [--host <alias>]")
+            println("  default host: $NEXUS_KICK_FORWARD_HOST or 'hetzner'")
+            println("  default max:  16 entries per invocation")
+            println("  --watch:      poll every 30s until queue empty (cron-friendly)")
+            return
+        }
+        eprintln("queue_drain: unknown arg " + a)
+        eprintln("reason=unknown-arg fix=hexa run tool/queue_drain.hexa --help")
+        exit(1)
+    }
+    if watch {
+        let mut iter = 0
+        while iter < 1000 {  // hard cap so a runaway watch self-terminates
+            let rc = _process_queue(host, max)
+            if rc == 0 {
+                let qdir = _nexus_root() + "/state/dispatch_queue"
+                let still = exec("ls " + _shell_quote(qdir) + "/kick_*.jsonl 2>/dev/null | wc -l").trim()
+                if still == "0" { println("queue_drain: queue drained after " + to_string(iter + 1) + " iterations"); return }
+            }
+            let _ = exec("sleep 30")
+            iter = iter + 1
+        }
+        eprintln("queue_drain: watch loop hit 1000-iter cap — aborting")
+        exit(3)
+    }
+    let rc = _process_queue(host, max)
+    exit(rc)
+}
