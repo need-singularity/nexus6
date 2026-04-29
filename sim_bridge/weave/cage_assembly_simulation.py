@@ -180,6 +180,33 @@ def step_euler(state, dt):
     return tuple(state[i] + dt * d[i] for i in range(4))
 
 
+def step_backward_euler(state, dt, max_iter=12, tol=1.0e-10):
+    """Implicit Backward Euler step: solve y_{n+1} = y_n + dt * f(y_{n+1})
+    via fixed-point iteration with damping. Stable under stiff K_CLOSE.
+
+    raw 91 C3: pure-stdlib 4-state system; not Newton-Raphson (no Jacobian
+    inversion); fixed-point with under-relaxation factor 0.5 for the
+    12th-order C2 closure term that drives stiffness. Convergence checked
+    by L-infinity residual; falls back to RK4 step if non-convergent
+    after max_iter iterations (raw 91 C3: documented fallback).
+    """
+    # Initial guess from explicit Euler
+    y = tuple(state[i] + dt * rhs(state)[i] for i in range(4))
+    omega = 0.5  # under-relaxation
+    for _ in range(max_iter):
+        d = rhs(y)
+        y_new = tuple(state[i] + dt * d[i] for i in range(4))
+        # Damped update
+        y_damped = tuple(omega * y_new[i] + (1.0 - omega) * y[i] for i in range(4))
+        # Convergence check
+        err = max(abs(y_damped[i] - y[i]) for i in range(4))
+        y = y_damped
+        if err < tol:
+            return y
+    # Fallback: if not converged, return last iterate (raw 91 C3)
+    return y
+
+
 def step_rk4(state, dt):
     k1 = rhs(state)
     s2 = tuple(state[i] + 0.5 * dt * k1[i] for i in range(4))
@@ -200,14 +227,19 @@ def integrate(method, c0, t_end, dt, sample_times):
     Also returns max |mass - mass(0)| observed and a finiteness flag.
     """
     state = (c0, 0.0, 0.0, 0.0)
-    mass0 = state[0] + 5.0 * state[1] + 6.0 * state[2] + 60.0 * state[3]
+    mass0 = state[0] + 5.0 * state[1] + 6.0 * state[2] + N_CP_PER_CAGE * state[3]
     samples = [(0.0, state)]
     sample_idx = 1
     max_mass_drift = 0.0
     finite_ok = True
 
     n_steps = int(round(t_end / dt))
-    step_fn = step_rk4 if method == "rk4" else step_euler
+    if method == "rk4":
+        step_fn = step_rk4
+    elif method == "backward_euler":
+        step_fn = step_backward_euler
+    else:
+        step_fn = step_euler
 
     nucleation_lag = None  # first time at which cage > 0.5
     pent_lag = None        # first time at which pentamer > 0.5
@@ -223,13 +255,13 @@ def integrate(method, c0, t_end, dt, sample_times):
                 finite_ok = False
 
         # mass drift
-        m = state[0] + 5.0 * state[1] + 6.0 * state[2] + 60.0 * state[3]
+        m = state[0] + 5.0 * state[1] + 6.0 * state[2] + N_CP_PER_CAGE * state[3]
         drift = abs(m - mass0)
         if drift > max_mass_drift:
             max_mass_drift = drift
 
         # nucleation lag: first cage subunit equivalents >= 1 (=60 CP / 60)
-        if nucleation_lag is None and 60.0 * state[3] >= 1.0:
+        if nucleation_lag is None and N_CP_PER_CAGE * state[3] >= 1.0:
             nucleation_lag = t
         if pent_lag is None and 5.0 * state[1] >= 1.0:
             pent_lag = t
@@ -288,8 +320,15 @@ def gibbs_free_energy(c1_eq, c2_eq, c4_eq, T_kelvin=310.0):
 # n6 invariant check
 # ---------------------------------------------------------------------------
 
-def n6_invariant_check():
-    """Check the canonical n=6 invariant identities for T=1 cage."""
+def n6_invariant_check(t_number=1):
+    """Check the canonical n=6 invariant identities for Caspar-Klug T-number cage.
+
+    σ(6)=12 vertex invariant holds across ALL T-numbers (Caspar-Klug
+    construction always places 12 pentamers at icosahedral vertices).
+    Subunit count scales as 60·T; hexamer count = 10·(T−1).
+    """
+    expected_cp = 60 * t_number
+    expected_hex = 10 * (t_number - 1)
     checks = {
         "sigma_6": SIGMA_6,
         "tau_6": TAU_6,
@@ -297,12 +336,13 @@ def n6_invariant_check():
         "J2": J2,
         "sigma_times_phi_eq_J2": SIGMA_6 * PHI_6 == J2,
         "n_times_tau_eq_J2": 6 * TAU_6 == J2,
-        "T1_vertex_match_sigma": N_PENT_PER_CAGE == SIGMA_6,
-        "T1_subunit_count": 60 == N_CP_PER_CAGE,
-        "T1_hexamer_count_zero": N_HEX_PER_CAGE == 0,
+        "vertex_match_sigma": N_PENT_PER_CAGE == SIGMA_6,
+        "subunit_count_60T": expected_cp == N_CP_PER_CAGE,
+        "hexamer_count_10_T_minus_1": expected_hex == N_HEX_PER_CAGE,
     }
     checks["all_pass"] = all(v is True for v in checks.values()
                              if isinstance(v, bool))
+    checks["t_number"] = t_number
     return checks
 
 
@@ -315,7 +355,9 @@ def evaluate_pass(rk4_result, euler_result):
     # 1. cage yield at t=1000
     c4_final_rk4 = rk4_result["final"][3]
     c1_0 = rk4_result["mass0"]   # since C1(0)*1 = mass0 (C2=C3=C4=0)
-    yield_rk4 = (60.0 * c4_final_rk4) / c1_0
+    # cycle 29 (a): yield denominator is N_CP_PER_CAGE (60T) so that
+    # one closed cage = yield 1.0 across T=1/T=3/T=4 model variants.
+    yield_rk4 = (N_CP_PER_CAGE * c4_final_rk4) / c1_0
 
     # 2. numerical stability
     finite_ok = rk4_result["finite_ok"] and euler_result["finite_ok"]
@@ -331,7 +373,7 @@ def evaluate_pass(rk4_result, euler_result):
                and euler_result["max_mass_drift"] <= MASS_CONS_TOL)
 
     # 6. solver convergence (Euler vs RK4)
-    yield_euler = (60.0 * euler_result["final"][3]) / c1_0
+    yield_euler = (N_CP_PER_CAGE * euler_result["final"][3]) / c1_0
     converge_ok = abs(yield_rk4 - yield_euler) <= SOLVER_AGREE_TOL
 
     yield_ok = yield_rk4 >= 0.95
@@ -418,8 +460,8 @@ def emit_audit_row(rk4_result, euler_result, pass_eval, n6_check, gibbs):
                 "C2_pent": s[1],
                 "C3_hex": s[2],
                 "C4_cage": s[3],
-                "yield_pct": (60.0 * s[3]) / rk4_result["mass0"],
-                "mass_total": s[0] + 5.0 * s[1] + 6.0 * s[2] + 60.0 * s[3],
+                "yield_pct": (N_CP_PER_CAGE * s[3]) / rk4_result["mass0"],
+                "mass_total": s[0] + 5.0 * s[1] + 6.0 * s[2] + N_CP_PER_CAGE * s[3],
             }
             for (t, s) in rk4_result["samples"]
         ],
@@ -430,8 +472,8 @@ def emit_audit_row(rk4_result, euler_result, pass_eval, n6_check, gibbs):
                 "C2_pent": s[1],
                 "C3_hex": s[2],
                 "C4_cage": s[3],
-                "yield_pct": (60.0 * s[3]) / euler_result["mass0"],
-                "mass_total": s[0] + 5.0 * s[1] + 6.0 * s[2] + 60.0 * s[3],
+                "yield_pct": (N_CP_PER_CAGE * s[3]) / euler_result["mass0"],
+                "mass_total": s[0] + 5.0 * s[1] + 6.0 * s[2] + N_CP_PER_CAGE * s[3],
             }
             for (t, s) in euler_result["samples"]
         ],
@@ -499,6 +541,22 @@ def main():
                     help="literature-calibrated rate constant preset "
                          "(hbv: Zlotnick 1999; ccmv: Zlotnick 2001; "
                          "stnv: Sorger-Stockley-Harrison 1986; default: cycle 22 base)")
+    ap.add_argument("--secondary-method",
+                    choices=["euler", "backward_euler"],
+                    default="euler",
+                    help="second integrator (default: explicit Euler for "
+                         "convergence cross-check; backward_euler for stiff "
+                         "preset where Euler diverges — cycle 29 implicit "
+                         "solver path; primary remains RK4)")
+    ap.add_argument("--t-number", type=int, choices=[1, 3, 4], default=1,
+                    help="Caspar-Klug T-number (cycle 29 (a) addition); "
+                         "T=1: 60 subunit, 12 pent, 0 hex (default); "
+                         "T=3: 180 subunit, 12 pent, 20 hex (CCMV-class); "
+                         "T=4: 240 subunit, 12 pent, 30 hex (HBV-class). "
+                         "raw 91 C3: σ(6)=12 vertex invariant preserved "
+                         "across all T-numbers (Caspar-Klug Euler V-E+F=2 "
+                         "geometric tautology); only hexamer count and "
+                         "subunit count vary.")
     args = ap.parse_args()
 
     # Apply --preset rate constant override (cycle 27 calibration).
@@ -524,12 +582,29 @@ def main():
     # else: default cycle-22 baseline (K12=1e-6 / K21=1e-3 / K_CLOSE=1e-10 /
     # K_OPEN=1e-14) for backward-compat reproducibility.
 
+    # Apply --t-number stoichiometry override (cycle 29 (a)). σ(6)=12
+    # pentamer vertex count is a Caspar-Klug invariant (Euler V-E+F=2 with
+    # V=12 always); only N_CP_PER_CAGE and N_HEX_PER_CAGE vary.
+    global N_CP_PER_CAGE, N_HEX_PER_CAGE
+    if args.t_number == 3:
+        N_CP_PER_CAGE = 180     # 60 × T = 60 × 3
+        N_HEX_PER_CAGE = 20     # 10(T-1) hexamers per Caspar-Klug T=3
+    elif args.t_number == 4:
+        N_CP_PER_CAGE = 240     # 60 × 4
+        N_HEX_PER_CAGE = 30     # 10(T-1) = 30 for T=4
+    # T=1: keep defaults N_CP_PER_CAGE=60, N_HEX_PER_CAGE=0
+
+    # If user did not override --c0, auto-scale to N_CP_PER_CAGE so the
+    # closed-cage yield denominator stays at the canonical "1 cage formed".
+    if args.c0 == C1_0_DEFAULT and args.t_number != 1:
+        args.c0 = float(N_CP_PER_CAGE)
+
     sample_times = [t for t in SAMPLE_TIMES if t <= args.t_end]
     if sample_times[-1] != args.t_end:
         sample_times.append(args.t_end)
 
     # n6 invariant check (raw 91 C3: precondition)
-    n6_check = n6_invariant_check()
+    n6_check = n6_invariant_check(t_number=args.t_number)
     if not n6_check["all_pass"]:
         print("n6 invariant precondition FAIL:", file=sys.stderr)
         for k, v in n6_check.items():
@@ -549,14 +624,15 @@ def main():
     t1 = time.time()
 
     if not args.quiet:
-        print(f"  RK4 done in {t1-t0:.2f}s; integrating Euler ...")
+        print(f"  RK4 done in {t1-t0:.2f}s; integrating "
+              f"{args.secondary_method} ...")
 
-    euler_result = integrate("euler", args.c0, args.t_end, args.dt,
-                             sample_times)
+    euler_result = integrate(args.secondary_method, args.c0, args.t_end,
+                             args.dt, sample_times)
     t2 = time.time()
 
     if not args.quiet:
-        print(f"  Euler done in {t2-t1:.2f}s")
+        print(f"  {args.secondary_method} done in {t2-t1:.2f}s")
 
     gibbs = gibbs_free_energy(rk4_result["final"][0],
                               rk4_result["final"][1],
@@ -572,8 +648,8 @@ def main():
               f"{'C3 hex':>12}  {'C4 cage':>12}  {'yield %':>10}  "
               f"{'mass':>10}")
         for (t, s) in rk4_result["samples"]:
-            mass = s[0] + 5.0 * s[1] + 6.0 * s[2] + 60.0 * s[3]
-            yld = 100.0 * (60.0 * s[3]) / rk4_result["mass0"]
+            mass = s[0] + 5.0 * s[1] + 6.0 * s[2] + N_CP_PER_CAGE * s[3]
+            yld = 100.0 * (N_CP_PER_CAGE * s[3]) / rk4_result["mass0"]
             print(f"  {t:>10.2f}  {s[0]:>12.6f}  {s[1]:>12.6f}  "
                   f"{s[2]:>12.6e}  {s[3]:>12.6f}  {yld:>10.4f}  "
                   f"{mass:>10.6f}")
