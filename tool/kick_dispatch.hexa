@@ -927,6 +927,25 @@ fn _detect_auth_failure(out: str) -> bool {
     return false
 }
 
+// 2026-04-29 raw 100 P305 fix: detect Anthropic 400 quota-exhausted response.
+// Distinct from rate-limit (5h/7d window with resetsAt) — quota means the
+// account has used up its extra-usage allowance which only resets when
+// billing cycle rolls over OR user adds more credits at claude.ai/settings/usage.
+//
+// Per-slot (per-OAuth-account), unlike auth-failure which is shared cred
+// directory issue. So rotation TO NEXT SLOT is the correct response (next
+// slot may have separate billing account with quota remaining).
+//
+// Detection signals:
+//   (a) "Third-party apps now draw from your extra usage" — Anthropic 400 message
+//   (b) "claude.ai/settings/usage" — paired URL in same payload
+//   (c) "invalid_request_error" with above text — distinguishes from generic 400s
+fn _detect_quota_exhausted(out: str) -> bool {
+    if out.index_of("Third-party apps now draw from your extra usage") >= 0 { return true }
+    if out.index_of("claude.ai/settings/usage") >= 0 { return true }
+    return false
+}
+
 // _detect_auth_failure_from_child_log — closed-loop iter-2 honesty fix
 // (2026-04-28). When the outer subprocess `out` does NOT contain the 401
 // signal (because subagent_dispatch on the remote redirects child stderr
@@ -993,6 +1012,42 @@ fn _detect_auth_failure_from_child_log(out: str, parent_sid: str) -> bool {
     // claude CLI sometimes prints them split.
     if contents.index_of("invalid x-api-key") >= 0 { return true }
     if contents.index_of("status 401") >= 0 && contents.index_of("x-api-key") >= 0 { return true }
+    return false
+}
+
+// 2026-04-29 raw 100 P305 fix: detect 400 quota exhaustion in CHILD LOG
+// (sibling to _detect_quota_exhausted which scans parent stdout). Subagent
+// HTTP errors land in /tmp/hive-subagent-<sid>-<port>-<ts>.log via the
+// `2> child_log` redirect at subagent_dispatch L568 — same path as 401.
+fn _detect_quota_exhausted_from_child_log(out: str, parent_sid: str) -> bool {
+    let key = "/tmp/hive-subagent-"
+    let mut path = ""
+    let i = out.index_of(key)
+    if i >= 0 {
+        let mut j = i
+        while j < out.len() {
+            let c = out.substring(j, j + 1)
+            if c == " " || c == "\t" || c == "\n" || c == "\r" || c == "\"" || c == "'" { break }
+            j = j + 1
+        }
+        let cand = out.substring(i, j)
+        if cand.index_of(".log") >= 0 { path = cand }
+    }
+    if path.len() == 0 {
+        let glob_cmd = "ls -1t /tmp/hive-subagent-" + parent_sid + "-*-*.log 2>/dev/null | head -n1"
+        path = exec(glob_cmd).trim()
+    }
+    if path.len() == 0 { return false }
+    let mut contents = ""
+    let local_chk = exec("[ -r '" + path + "' ] && echo y || echo n").trim()
+    if local_chk == "y" {
+        contents = exec("cat " + _shell_quote(path) + " 2>/dev/null")
+    } else {
+        contents = exec("ssh -o BatchMode=yes -o ConnectTimeout=5 hetzner cat " + _shell_quote(path) + " 2>/dev/null")
+    }
+    if contents.len() == 0 { return false }
+    if contents.index_of("Third-party apps now draw from your extra usage") >= 0 { return true }
+    if contents.index_of("claude.ai/settings/usage") >= 0 { return true }
     return false
 }
 
@@ -1417,31 +1472,15 @@ fn main() -> void {
                 eprintln("# kick_dispatch: slot=" + slot_id + " quota-exhausted (400 third-party extra usage); cooldown until epoch=" + to_string(cooldown_until) + "; rotating to next slot")
                 continue
             }
-            // 2026-04-29 raw 100 P305 fix v2: per-slot 401 → rotate (NOT fail-fast).
-            // Original Sub-W fail-fast comment claimed "all slots share the same
-            // ~/.claude-claudeN OAuth directory family" — that is INCORRECT for
-            // hetzner-kick path where each slot N has its OWN .credentials.json
-            // (12 separate OAuth tokens, possibly minted at different times by
-            // different `claude /login` runs on Mac, then mass-copied to remote).
-            // When slot N has stale creds (last login ages out before mass-copy),
-            // OTHER slots may have fresher tokens that still authenticate.
-            //
-            // User directive 2026-04-29 (verbatim translation):
-            //   '전부 내부 자동화 OK, 에러 뱉어내고 llm 이 알아서 하게한다 는 X'
-            //   (= all internal automation OK; throwing errors for LLM to handle = NO)
-            //
-            // Rotate-with-cooldown: mark slot 401-cooldown (1h, conservative —
-            // admin may refresh OAuth in a fresh `claude /login` interactive
-            // flow within an hour), tried.add, continue. If ALL slots 401, the
-            // outer 'all-claude-slots-exhausted' trailer fires — that IS a real
-            // operator action (no LLM intervention to fix slot-rotation logic).
-            if _detect_auth_failure(out) || _detect_auth_failure_from_child_log(out, parent_sid) {
-                let now_e = _now_unix_int()
-                let cooldown_until = now_e + 3600
-                _claude_mark_cooldown(slot_id, "session", cooldown_until)
-                tried = tried + [slot_id]
-                eprintln("# kick_dispatch: slot=" + slot_id + " auth-failure-401 (stale OAuth); cooldown until epoch=" + to_string(cooldown_until) + " (1h); rotating to next slot — auto-recovery via fresh `claude /login` on Mac + sync cron")
-                continue
+            // Sub-W: auth-failure (401 / invalid x-api-key) → fail-fast.
+            // All slots on the same host share the same ~/.claude-claudeN
+            // OAuth directory family; rotating here would just retry stale
+            // creds N times. Surface a raw 66 trailer pointing the operator
+            // at the cross-host sync / CLI-only migration follow-up.
+            if _detect_auth_failure(out) {
+                eprintln("__KICK_RESULT__ FAIL witness=" + witness_path_emit + " tier1=0 falsifier_pass=0")
+                eprintln("reason=claude-auth-failure-401 fix=1) check OAuth tokens in $CLAUDE_CONFIG_DIR (slot=" + slot_id + ") — refresh via `claude /login` if local; 2) cross-host: ubu1/ubu2 hetzner have stale ~/.claude-claudeN/ from earlier sync → rsync from Mac OR force HEXA_LOCAL=1; 3) verify R4 CLI-only migration absorbed all extensions (.ext entry 7 retired); 4) ref convergence/r4_cli_only_migration_2026_04_27 + r4_kick_auth_fail_detection_2026_04_27")
+                exit(2)
             }
             if local_rc == 0 { _claude_touch_slot(slot_id) }
             break
