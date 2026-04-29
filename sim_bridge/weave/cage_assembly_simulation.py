@@ -494,7 +494,35 @@ def main():
     ap.add_argument("--no-emit", action="store_true",
                     help="skip writing audit jsonl row")
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--preset", choices=["hbv", "ccmv", "stnv", "default"],
+                    default="default",
+                    help="literature-calibrated rate constant preset "
+                         "(hbv: Zlotnick 1999; ccmv: Zlotnick 2001; "
+                         "stnv: Sorger-Stockley-Harrison 1986; default: cycle 22 base)")
     args = ap.parse_args()
+
+    # Apply --preset rate constant override (cycle 27 calibration).
+    # raw 91 C3 honest: literature values approximated; T-number adapted
+    # to T=1 60-subunit base model; not exact reproduction of any
+    # single-paper assay condition.
+    global K12, K21, K_CLOSE, K_OPEN
+    if args.preset == "hbv":
+        K12 = 2.0e-5
+        K21 = 2.0e-3
+        K_CLOSE = 1.0e-7
+        K_OPEN = 1.0e-12
+    elif args.preset == "ccmv":
+        K12 = 5.0e-5
+        K21 = 5.0e-3
+        K_CLOSE = 2.0e-7
+        K_OPEN = 1.0e-12
+    elif args.preset == "stnv":
+        K12 = 1.0e-5
+        K21 = 1.0e-3
+        K_CLOSE = 5.0e-8
+        K_OPEN = 1.0e-12
+    # else: default cycle-22 baseline (K12=1e-6 / K21=1e-3 / K_CLOSE=1e-10 /
+    # K_OPEN=1e-14) for backward-compat reproducibility.
 
     sample_times = [t for t in SAMPLE_TIMES if t <= args.t_end]
     if sample_times[-1] != args.t_end:
