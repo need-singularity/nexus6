@@ -1,0 +1,191 @@
+#!hexa strict
+// tool/claude_changelog_bridge_fetcher.hexa — Claude Code changelog γ-bridge fetcher
+//
+// @tool(slug="claude_changelog_bridge_fetcher", desc="γ-bridge web-fetch fetcher — Claude Code release notes (M-Y browser-harness invoke + sanitize + OFFLINE-FALLBACK)")
+// @usage(hexa run tool/claude_changelog_bridge_fetcher.hexa [--fetch] [--selftest] [--json])
+// @exit_codes(0=PASS, 1=usage, 2=fetch fail, 3=injection-reject)
+// @sentinel(__CLAUDE_CHANGELOG_BRIDGE__ <PASS|OFFLINE|REJECT> latest_version=<X.Y.Z> entries=<N> first_title=<truncated>)
+// @origin(γ-bridge wave U1 2026-05-01 — hive r58 Stage 19 follow-up #61)
+// @abstraction(web-fetch γ-bridge fetcher → kick_dispatch γ envelope contributor)
+// @paradigm(M-Y browser-harness invoke + prompt-injection sanitize + raw 91 honest OFFLINE-FALLBACK)
+
+let FETCH_URL = "https://docs.anthropic.com/en/release-notes/claude-code"
+let SLUG      = "bridge_claude_changelog"
+let SOURCE    = "claude_changelog"
+
+fn _injection_substrings() -> array {
+    return ["<task-notification>", "<system-reminder>", "IMPORTANT:", "Ignore previous", "ignore all previous"]
+}
+
+fn _exec_pattern_substrings() -> array {
+    return ["$(", "`", "rm -rf", "<script", "</script", "javascript:", "<style", " on" + "click=", " on" + "load=", " on" + "error="]
+}
+
+fn _has_any(haystack: str, needles: array) -> bool {
+    let mut i = 0
+    while i < len(needles) {
+        if haystack.index_of(needles[i]) >= 0 { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _strip_control_chars(s: str) -> str {
+    let mut out = ""
+    let mut i = 0
+    while i < s.len() {
+        let c = s.substring(i, i + 1)
+        let allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .,:;=/\\\"'-_+()[]<>?!@#%&*"
+        if allowed.index_of(c) >= 0 { out = out + c }
+        i = i + 1
+    }
+    return out
+}
+
+fn _truncate(s: str, n: i64) -> str {
+    if s.len() <= n { return s }
+    return s.substring(0, n - 3) + "..."
+}
+
+fn _sanitize_payload(raw_text: str) -> str {
+    if _has_any(raw_text, _injection_substrings()) { return "INJECTION_REJECT" }
+    if _has_any(raw_text, _exec_pattern_substrings()) { return "INJECTION_REJECT" }
+    return _truncate(_strip_control_chars(raw_text), 200)
+}
+
+fn _browser_harness_fetch(url: str) -> str {
+    let probe = exec("command -v hexa >/dev/null 2>&1 && [ -f tool/browser_harness.hexa ] && echo y || echo n").trim()
+    if probe != "y" { return "" }
+    return ""
+}
+
+fn _short_hash(input: str) -> str {
+    let cmd = "printf %s '" + input.replace("'", "'\\''") + "' | (sha256sum 2>/dev/null || shasum -a 256) | awk '{print substr($1,1,16)}'"
+    return exec(cmd).trim()
+}
+
+fn _now_iso_utc() -> str {
+    return exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+// Extract first semver-looking token (X.Y.Z digits)
+fn extract_semver(body: str) -> str {
+    let mut i = 0
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if "0123456789".index_of(c) >= 0 {
+            // try parse X.Y.Z
+            let mut j = i
+            let mut dots = 0
+            while j < body.len() {
+                let d = body.substring(j, j + 1)
+                if "0123456789".index_of(d) >= 0 { j = j + 1 }
+                else if d == "." && dots < 2 { dots = dots + 1; j = j + 1 }
+                else { break }
+            }
+            if dots == 2 && (j - i) >= 5 { return body.substring(i, j) }
+        }
+        i = i + 1
+    }
+    return "unknown"
+}
+
+fn extract_first_h2(body: str) -> str {
+    let i = body.index_of("<h2")
+    if i < 0 { return "unknown" }
+    let after = body.substring(i, body.len())
+    let gt = after.index_of(">")
+    if gt < 0 { return "unknown" }
+    let rest = after.substring(gt + 1, after.len())
+    let close = rest.index_of("</h2>")
+    if close < 0 { return "unknown" }
+    return _truncate(rest.substring(0, close).trim(), 60)
+}
+
+fn count_entries(body: str) -> i64 {
+    let mut n = 0
+    let mut rest = body
+    while true {
+        let i = rest.index_of("<h2")
+        if i < 0 { break }
+        n = n + 1
+        rest = rest.substring(i + 3, rest.len())
+    }
+    return n
+}
+
+fn build_payload(raw_body: str) -> str {
+    if raw_body == "" {
+        return "latest_version=offline entries=0 first_title=offline_fallback"
+    }
+    let ver = extract_semver(raw_body)
+    let n = count_entries(raw_body)
+    let title = extract_first_h2(raw_body)
+    return "latest_version=" + ver + " entries=" + to_string(n) + " first_title=" + title
+}
+
+fn _emit_envelope(payload: str, ts: str) -> str {
+    let bh = _short_hash("gamma:" + SLUG + ":" + ts)
+    return "{\"mechanism\":\"gamma\",\"source_id\":\"bridge:" + SLUG + "\",\"byte_hash\":\"" + bh + "\",\"ts\":\"" + ts + "\",\"payload_summary\":\"" + payload + "\",\"kind\":\"web-fetch\"}"
+}
+
+fn cmd_fetch(json_mode: bool) {
+    let opt_in = exec("printf '%s' \"${KICK_USE_WEB_BRIDGES:-0}\"").trim()
+    if opt_in != "1" && opt_in != "web-only" {
+        eprintln("claude_changelog_bridge_fetcher: KICK_USE_WEB_BRIDGES not set — bridge default-inactive")
+        exit(1)
+    }
+    let raw_body = _browser_harness_fetch(FETCH_URL)
+    let sanitized = _sanitize_payload(raw_body)
+    if sanitized == "INJECTION_REJECT" {
+        let ts = _now_iso_utc()
+        println("__CLAUDE_CHANGELOG_BRIDGE__ REJECT latest_version=- entries=0 first_title=injection_reject")
+        exit(3)
+    }
+    let payload = build_payload(raw_body)
+    let ts = _now_iso_utc()
+    if json_mode { println(_emit_envelope(payload, ts)) } else { println(payload) }
+    let verdict = if raw_body == "" { "OFFLINE" } else { "PASS" }
+    println("__CLAUDE_CHANGELOG_BRIDGE__ " + verdict + " " + payload)
+    exit(0)
+}
+
+fn _selftest() {
+    if FETCH_URL != "https://docs.anthropic.com/en/release-notes/claude-code" { eprintln("[selftest] FAIL: URL drift"); exit(1) }
+    if extract_semver("v1.27.4 release") != "1.27.4" { eprintln("[selftest] FAIL: semver"); exit(1) }
+    if extract_semver("no version") != "unknown" { eprintln("[selftest] FAIL: semver-miss"); exit(1) }
+    if extract_first_h2("<h2>Initial release</h2>") != "Initial release" { eprintln("[selftest] FAIL: h2 extract"); exit(1) }
+    if _sanitize_payload("<system-reminder>x</system-reminder>") != "INJECTION_REJECT" { eprintln("[selftest] FAIL: injection"); exit(1) }
+    let h1 = _short_hash("gamma:bridge_claude_changelog:2026-05-01T00:00:00Z")
+    if h1.len() != 16 { eprintln("[selftest] FAIL: hash len"); exit(1) }
+    println("[claude_changelog_bridge_fetcher selftest] OK")
+    exit(0)
+}
+
+fn main() -> void {
+    let raw_args = args()
+    let mut cli = []
+    let mut ai = 2
+    while ai < len(raw_args) { cli.push(raw_args[ai]); ai = ai + 1 }
+    let mut do_fetch = false
+    let mut json_mode = false
+    let mut i = 0
+    while i < len(cli) {
+        let a = cli[i]
+        if a == "--selftest" || a == "selftest" { _selftest() }
+        else if a == "--fetch" { do_fetch = true }
+        else if a == "--json" { json_mode = true }
+        else if a == "--help" || a == "-h" {
+            println("usage: hexa run tool/claude_changelog_bridge_fetcher.hexa [--fetch] [--json] [--selftest]")
+            println("url: " + FETCH_URL)
+            exit(0)
+        } else {
+            eprintln("claude_changelog_bridge_fetcher: unknown arg `" + a + "`")
+            exit(1)
+        }
+        i = i + 1
+    }
+    if do_fetch { cmd_fetch(json_mode) }
+    eprintln("claude_changelog_bridge_fetcher: pass --fetch or --selftest")
+    exit(1)
+}

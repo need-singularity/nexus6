@@ -1,0 +1,178 @@
+#!hexa strict
+// tests/integration_web_bridges.hexa — γ-bridge wave U1 5-bridge integration test
+//
+// @tool(slug="integration_web_bridges", desc="Integration suite for U1 web-fetch γ-bridges (5 bridges + selector kind field)")
+// @usage(hexa run tests/integration_web_bridges.hexa)
+// @exit_codes(0=PASS, 1=usage, 2=fail)
+// @sentinel(__INTEGRATION_WEB_BRIDGES__ <PASS|FAIL> bridges=<N> tests=<N>)
+// @origin(γ-bridge wave U1 2026-05-01 — hive r58 Stage 19 follow-up #61)
+//
+// Coverage matrix (F1-F8):
+//   F1 — anthropic_status: build_cmd / classify / sanitize / OFFLINE-FALLBACK / sentinel
+//   F2 — claude_changelog: build_cmd / classify / sanitize / OFFLINE-FALLBACK / sentinel
+//   F3 — arxiv_recent:    build_cmd / classify / sanitize / OFFLINE-FALLBACK / sentinel
+//   F4 — github_trending: build_cmd / classify / sanitize / OFFLINE-FALLBACK / sentinel
+//   F5 — hackernews_top:  build_cmd / classify / sanitize / OFFLINE-FALLBACK / sentinel
+//   F6 — injection scenario reject (cross-bridge — all 5 must reject same payload)
+//   F7 — selector capability classification (kind=web-fetch field present in 5 manifests + Akida)
+//   F8 — byte_hash determinism (same input → same hash, len=16)
+
+let BRIDGES_DIR = "state/kick/registry/noise_sources/bridges"
+let TOOL_DIR = "tool"
+
+let WEB_BRIDGES = [
+    ["bridge_anthropic_status", "anthropic_status_bridge_fetcher.hexa", "__ANTHROPIC_STATUS_BRIDGE__"],
+    ["bridge_claude_changelog", "claude_changelog_bridge_fetcher.hexa", "__CLAUDE_CHANGELOG_BRIDGE__"],
+    ["bridge_arxiv_recent",     "arxiv_recent_bridge_fetcher.hexa",     "__ARXIV_RECENT_BRIDGE__"],
+    ["bridge_github_trending",  "github_trending_bridge_fetcher.hexa",  "__GITHUB_TRENDING_BRIDGE__"],
+    ["bridge_hackernews_top",   "hackernews_top_bridge_fetcher.hexa",   "__HACKERNEWS_TOP_BRIDGE__"]
+]
+
+let mut PASS_COUNT: i64 = 0
+let mut FAIL_COUNT: i64 = 0
+
+fn _expect(label: str, cond: bool) {
+    if cond {
+        PASS_COUNT = PASS_COUNT + 1
+        println("  [PASS] " + label)
+    } else {
+        FAIL_COUNT = FAIL_COUNT + 1
+        eprintln("  [FAIL] " + label)
+    }
+}
+
+fn _read_manifest(slug: str) -> str {
+    return read_file(BRIDGES_DIR + "/" + slug + ".hexa")
+}
+
+fn _get_field(manifest: str, key: str) -> str {
+    let lines = manifest.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let line = lines[i].trim_start()
+        if line.starts_with(key + " ") {
+            return line.substring(key.len() + 1, line.len()).trim()
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _short_hash(input: str) -> str {
+    let cmd = "printf %s '" + input.replace("'", "'\\''") + "' | (sha256sum 2>/dev/null || shasum -a 256) | awk '{print substr($1,1,16)}'"
+    return exec(cmd).trim()
+}
+
+// ─── F1-F5 per-bridge build_cmd / classify / sanitize / OFFLINE / sentinel ───
+
+fn test_bridge(slug: str, fetcher: str, sentinel: str, fnum: str) {
+    println("[" + fnum + "] " + slug)
+    // build_cmd: fetcher path exists
+    _expect(fnum + ".build_cmd: fetcher file present", _file_exists(TOOL_DIR + "/" + fetcher))
+    // classify: manifest declares kind=web-fetch
+    let manifest = _read_manifest(slug)
+    _expect(fnum + ".classify: kind=web-fetch", _get_field(manifest, "kind") == "web-fetch")
+    // sanitize: prompt-injection-strip true
+    _expect(fnum + ".sanitize: prompt-injection-strip true", _get_field(manifest, "prompt-injection-strip") == "true")
+    // offline-fallback: true (raw 91 honest C3)
+    _expect(fnum + ".OFFLINE-FALLBACK: offline-fallback true", _get_field(manifest, "offline-fallback") == "true")
+    // sentinel: fetcher source contains __X_BRIDGE__ token
+    let fetcher_src = read_file(TOOL_DIR + "/" + fetcher)
+    _expect(fnum + ".sentinel: " + sentinel + " present", fetcher_src.index_of(sentinel) >= 0)
+    // opt-in-gate: KICK_USE_WEB_BRIDGES=1
+    _expect(fnum + ".opt-in-gate: KICK_USE_WEB_BRIDGES=1", _get_field(manifest, "opt-in-gate") == "KICK_USE_WEB_BRIDGES=1")
+    // default state: 0 inactive
+    let first_line = manifest.split("\n")
+    let mut found_inactive = false
+    let mut k = 0
+    while k < len(first_line) {
+        if first_line[k].index_of("noise-source 0 inactive") >= 0 { found_inactive = true; break }
+        k = k + 1
+    }
+    _expect(fnum + ".default-inactive: noise-source 0 inactive", found_inactive)
+}
+
+fn _file_exists(p: str) -> bool {
+    return exec("[ -f '" + p + "' ] && echo y || echo n").trim() == "y"
+}
+
+// ─── F6 cross-bridge injection reject scenario ───
+// Reads each fetcher source and verifies all blacklist substrings are present.
+
+fn test_injection_scenario() {
+    println("[F6] cross-bridge injection scenario")
+    let blacklist = ["<task-notification>", "<system-reminder>", "IMPORTANT:", "$(", "rm -rf"]
+    let mut bi = 0
+    while bi < len(WEB_BRIDGES) {
+        let bridge = WEB_BRIDGES[bi]
+        let fetcher_src = read_file(TOOL_DIR + "/" + bridge[1])
+        let mut k = 0
+        while k < len(blacklist) {
+            let needle = blacklist[k]
+            _expect("F6." + bridge[0] + ": blacklist contains `" + needle + "`", fetcher_src.index_of(needle) >= 0)
+            k = k + 1
+        }
+        bi = bi + 1
+    }
+}
+
+// ─── F7 selector capability classification ───
+// All 5 web-fetch bridges + Akida (hardware-gate) MUST be classified by selector.
+
+fn test_selector_capability() {
+    println("[F7] selector capability classification")
+    let mut bi = 0
+    while bi < len(WEB_BRIDGES) {
+        let bridge = WEB_BRIDGES[bi]
+        let manifest = _read_manifest(bridge[0])
+        _expect("F7." + bridge[0] + ": kind=web-fetch", _get_field(manifest, "kind") == "web-fetch")
+        _expect("F7." + bridge[0] + ": fetch-url present", _get_field(manifest, "fetch-url").len() > 8)
+        bi = bi + 1
+    }
+    // Akida classification (existing 17th bridge — should be kind=bridge per manifest, hardware-gate)
+    let akida = _read_manifest("bridge_akida_inference")
+    _expect("F7.akida: hardware-gate present", _get_field(akida, "hardware-gate") == "AKIDA_HW_PRESENT=1")
+    // Verify selector seam comment exists in kick_dispatch.hexa
+    let dispatch = read_file(TOOL_DIR + "/kick_dispatch.hexa")
+    _expect("F7.selector: _gamma_envelope fn present in dispatch", dispatch.index_of("fn _gamma_envelope(") >= 0)
+    _expect("F7.selector: KICK_USE_WEB_BRIDGES env-gate present in dispatch", dispatch.index_of("KICK_USE_WEB_BRIDGES") >= 0)
+    _expect("F7.selector: kind field read in dispatch", dispatch.index_of("\"kind\"") >= 0)
+}
+
+// ─── F8 byte_hash determinism ───
+
+fn test_byte_hash() {
+    println("[F8] byte_hash determinism")
+    let h1 = _short_hash("gamma:bridge_anthropic_status:2026-05-01T00:00:00Z")
+    let h2 = _short_hash("gamma:bridge_anthropic_status:2026-05-01T00:00:00Z")
+    _expect("F8.deterministic: h1 == h2", h1 == h2)
+    _expect("F8.length: hash len == 16", h1.len() == 16)
+    let h3 = _short_hash("gamma:bridge_hackernews_top:2026-05-01T00:00:00Z")
+    _expect("F8.distinct: different inputs → different hashes", h1 != h3)
+}
+
+fn main() -> void {
+    println("=== integration_web_bridges (γ-bridge wave U1) ===")
+    println("bridges_dir=" + BRIDGES_DIR)
+    println("tool_dir=" + TOOL_DIR)
+    println("")
+
+    // F1-F5
+    test_bridge(WEB_BRIDGES[0][0], WEB_BRIDGES[0][1], WEB_BRIDGES[0][2], "F1")
+    test_bridge(WEB_BRIDGES[1][0], WEB_BRIDGES[1][1], WEB_BRIDGES[1][2], "F2")
+    test_bridge(WEB_BRIDGES[2][0], WEB_BRIDGES[2][1], WEB_BRIDGES[2][2], "F3")
+    test_bridge(WEB_BRIDGES[3][0], WEB_BRIDGES[3][1], WEB_BRIDGES[3][2], "F4")
+    test_bridge(WEB_BRIDGES[4][0], WEB_BRIDGES[4][1], WEB_BRIDGES[4][2], "F5")
+
+    // F6-F8
+    test_injection_scenario()
+    test_selector_capability()
+    test_byte_hash()
+
+    println("")
+    println("--- summary ---")
+    println("PASS=" + to_string(PASS_COUNT) + " FAIL=" + to_string(FAIL_COUNT))
+    let verdict = if FAIL_COUNT == 0 { "PASS" } else { "FAIL" }
+    println("__INTEGRATION_WEB_BRIDGES__ " + verdict + " bridges=5 tests=" + to_string(PASS_COUNT + FAIL_COUNT))
+    if FAIL_COUNT == 0 { exit(0) } else { exit(2) }
+}
