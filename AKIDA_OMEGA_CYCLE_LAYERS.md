@@ -61,15 +61,17 @@ ablation study 가 ω-cycle 자체에 통합 — α / β / γ 각 envelope 의 e
 | 2 | γ bridge (Akida inference) | classify model output | A-design (commit `f8aeca4e`) |
 | 3 | host pool (raspberry-akida) | RM4 step 11 zero-touch | A-design |
 | 4 | edge inference dispatch | LLM quota 0 분기 | A-design |
-| 5 | α absorbed re-encoding | spike-based primitive 시간 entropy | 사전 제시 |
-| 6 | tier_1 promotion gate | falsifier_pass HW 검증 | 사전 제시 |
-| 7 | honesty_triad 검증 | fabrication anomaly detect | 사전 제시 |
-| 8 | correlation strict | embedding cosine HW 측정 | 사전 제시 |
-| 9 | γ bridge fact verify | cross-reference HW | 사전 제시 |
-| 10 | prompt-injection sentinel | injection pattern HW detect | 사전 제시 |
-| 11 | δ-spatial (4번째 noise) | spatial spike pattern envelope | 사전 제시 |
-| **δ** | **δ-feedback (cross-stratum)** | **witness → kernel retune** | **LLM 발견** |
-| **θ** | **θ-counterfactual** | **envelope ablation study** | **LLM 발견** |
+| 5 | α absorbed re-encoding | spike-based primitive 시간 entropy | **구현 land** (commit hive `c2a900014` r58 Stage 21 amend, `tool/akida_alpha_reencoding.hexa`) |
+| 6 | tier_1 promotion gate | falsifier_pass HW 검증 | **구현 land** (`tool/akida_tier1_gate.hexa`) |
+| 7 | honesty_triad 검증 | fabrication anomaly detect | **구현 land** (`tool/akida_honesty_detector.hexa`) |
+| 8 | correlation strict | embedding cosine HW 측정 | **구현 land** (`tool/akida_correlation_strict.hexa`) |
+| 9 | γ bridge fact verify | cross-reference HW | **구현 land** (`tool/akida_bridge_fact_verify.hexa`) |
+| 10 | prompt-injection sentinel | injection pattern HW detect | **구현 land** (`tool/akida_injection_sentinel.hexa`) |
+| 11 | δ-spatial (4번째 noise) | spatial spike pattern envelope | **구현 land** (`tool/akida_delta_spatial.hexa`) |
+| **δ** | **δ-feedback (cross-stratum)** | **witness → kernel retune** | **구현 land** (`tool/akida_delta_feedback.hexa`) |
+| **θ** | **θ-counterfactual** | **envelope ablation study** | **구현 land** (`tool/akida_theta_counterfactual.hexa`) |
+
+**Layer 5-11 + δ + θ 사전 land (도착 전 9 module, commit hive `c2a900014` 2026-05-01 r58 Stage 21 amend)** — `AKIDA_HW_PRESENT=1` env 활성 시 즉시 real path 진입, default mock-tier. 각 module raw 247 r45 pure-fn / io-seam separation, F1-F6 또는 F1-F8 selftest mock, claude binary call 0, real Akida invoke 0. integration test `tests/integration_akida_layers_5_to_theta.hexa` (F1-F18). raw 257 closure ETA ≈ 0.047d ≈ 67 min/agent (~2360 LoC).
 
 ---
 
