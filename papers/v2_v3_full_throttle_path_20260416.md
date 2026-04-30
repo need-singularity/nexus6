@@ -4,6 +4,8 @@
 >
 > v2_v3 풀가동 5-track 플랜은 `_v1` 로 보관. 이 문서는 현재 **극한 루트** 링크 인덱스.
 
+> **AI-native ETA SSOT (2026-05-01)**: For any closure / roadmap ETA in this repo, the authoritative computation is `$HIVE/tool/closure_eta.hexa` (LoC × parallel + bg × ∞ frame, rate 50,000 LoC/day/agent default, par+ser schema, DAG critical path). Static "+N 달" / "+N month" markdown estimates anchored to human single-developer baseline are DEPRECATED for closure-scope decisions per hive raw 257 (`ai-native-eta-closure-mandate`). Reference fixture: `--module critical-path --example gamebox --target CM-30` = 0.22d ≈ 5.3h vs static 630d (×2863 compression).
+
 ---
 
 ## 🎯 목표

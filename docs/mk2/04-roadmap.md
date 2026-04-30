@@ -2,6 +2,8 @@
 
 > 2026-04-06 갱신 | 전체 흡수 1차 완료
 
+> **AI-native ETA SSOT (2026-05-01)**: For any closure / roadmap ETA in this repo, the authoritative computation is `$HIVE/tool/closure_eta.hexa` (LoC × parallel + bg × ∞ frame, rate 50,000 LoC/day/agent default, par+ser schema, DAG critical path). Static "+N 달" / "+N month" markdown estimates anchored to human single-developer baseline are DEPRECATED for closure-scope decisions per hive raw 257 (`ai-native-eta-closure-mandate`). Reference fixture: `--module critical-path --example gamebox --target CM-30` = 0.22d ≈ 5.3h vs static 630d (×2863 compression).
+
 ## 현재 상태 (최신)
 
 | 지표 | 값 |
