@@ -202,6 +202,18 @@ fn _nexus_root() -> str {
     return home + "/core/nexus"
 }
 
+// Resolve symlinks so spawn CWD lands at a path the child sandbox accepts.
+// _nexus_root() may pick /root/Dev/nexus → /home/nexus (Hetzner) — child agent's
+// sandbox allowlist is built from the realpath, so spawning cwd at the symlink
+// causes write-side blocks even though the declared landing path resolves to
+// the same dir. readlink -f normalizes once; falls back to the input on error.
+fn _canonical_nexus_root() -> str {
+    let r = _nexus_root()
+    let resolved = to_string(exec("readlink -f " + _shell_quote(r) + " 2>/dev/null")).trim()
+    if resolved.len() > 0 { return resolved }
+    return r
+}
+
 fn _hive_root() -> str {
     let h = env("HIVE_ROOT")
     if h.len() > 0 { return h }
@@ -1295,9 +1307,12 @@ fn main() -> void {
     _ensure_dir(runs_root)
     let envelope_log = runs_root + "/noise_envelopes.jsonl"
 
-    // Resolve witness landing path.
+    // Resolve witness landing path. Use canonical (realpath) nexus root so the
+    // path string handed to the child Write tool matches the spawn cwd literally
+    // — Claude's tool-permission check is path-string-based and treats a symlink
+    // path as distinct from its realpath even when both resolve to the same dir.
     let mut wd = witness_dir
-    if !wd.starts_with("/") { wd = _nexus_root() + "/" + wd }
+    if !wd.starts_with("/") { wd = _canonical_nexus_root() + "/" + wd }
     // BUG #2 (2026-04-28): strip trailing slash before concat — `wd + "/" + run_id`
     // produced `design/kick//<date>_topic.json` when caller passed a "/"-suffixed
     // witness_dir. Normalize once here so all downstream emits stay clean.
@@ -1417,7 +1432,11 @@ fn main() -> void {
                 exit(2)
             }
             let slot_id = _slot_id_from_dir(cfg_dir)
-            let cmd = "CLAUDE_CONFIG_DIR=" + _shell_quote(cfg_dir) + " " +
+            // Spawn CWD = realpath(nexus_root) so the child sandbox's allowlist
+            // (built from realpath) covers the witness landing dir. Otherwise
+            // /root/Dev/nexus → /home/nexus symlink derefs outside cwd → blocked.
+            let spawn_cwd = _canonical_nexus_root()
+            let cmd = "cd " + _shell_quote(spawn_cwd) + " && CLAUDE_CONFIG_DIR=" + _shell_quote(cfg_dir) + " " +
                 _hexa_bin() + " run " + _shell_quote(dispatch_tool) + " " +
                 _shell_quote(parent_sid) + " --task-file " + _shell_quote(prompt_path)
             // B.4 silent-timeout fix (2026-04-28): wrap with self-imposed
@@ -1502,8 +1521,10 @@ fn main() -> void {
             break
         }
     } else {
-        // codex_cli / gemini_cli — unchanged single-shot path.
-        let cmd = _hexa_bin() + " run " + _shell_quote(dispatch_tool) + " " + _shell_quote(parent_sid) + " --task-file " + _shell_quote(prompt_path)
+        // codex_cli / gemini_cli — single-shot path; same canonical-cwd prefix
+        // as claude_code branch so child sandbox allowlist matches witness path.
+        let spawn_cwd = _canonical_nexus_root()
+        let cmd = "cd " + _shell_quote(spawn_cwd) + " && " + _hexa_bin() + " run " + _shell_quote(dispatch_tool) + " " + _shell_quote(parent_sid) + " --task-file " + _shell_quote(prompt_path)
         // B.4 silent-timeout fix (2026-04-28): same wrap as claude_code branch.
         let wrapped_cmd = _wrap_with_timeout(cmd)
         let rc_str = exec(wrapped_cmd + " 2>&1; echo __RC=$?").trim()
