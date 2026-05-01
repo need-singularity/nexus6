@@ -717,10 +717,104 @@ fn _witness_schema_valid(path: str) -> bool {
     return out.index_of("__WITNESS_VALIDATE__ PASS") >= 0
 }
 
-// R4 sentinel-derive helper (2026-04-27).
+// Count PASS verdicts inside the gate_tier1_promotion.verdicts object.
+// Used as a fallback when the witness omits the `falsifier_pass_count` top-level
+// scalar but emits the canonical {"F1":"PASS",...} verdicts map (LLM-emitted
+// shape per omega_cycle.witness_v1; observed 2026-05-01 closure verify).
+fn _count_pass_verdicts_in_gate(text: str) -> i64 {
+    // Locate "gate_tier1_promotion": { ... } object span.
+    let key = "\"gate_tier1_promotion\":"
+    let i = text.index_of(key)
+    if i < 0 { return 0 }
+    let mut j = i + key.len()
+    while j < text.len() {
+        let c = text.substring(j, j + 1)
+        if c == "{" { break }
+        j = j + 1
+    }
+    if j >= text.len() { return 0 }
+    let mut depth: i64 = 0
+    let mut k: i64 = j
+    let mut in_str = false
+    let mut esc = false
+    let mut end: i64 = -1
+    while k < text.len() {
+        let c = text.substring(k, k + 1)
+        if esc { esc = false; k = k + 1; continue }
+        if c == "\\" { esc = true; k = k + 1; continue }
+        if c == "\"" { in_str = !in_str; k = k + 1; continue }
+        if !in_str {
+            if c == "{" { depth = depth + 1 }
+            if c == "}" {
+                depth = depth - 1
+                if depth == 0 { end = k + 1; break }
+            }
+        }
+        k = k + 1
+    }
+    if end < 0 { return 0 }
+    let gate = text.substring(j, end)
+    // Locate the inner "verdicts": { ... } object inside the gate.
+    let vk = "\"verdicts\":"
+    let vi = gate.index_of(vk)
+    if vi < 0 { return 0 }
+    let mut vj = vi + vk.len()
+    while vj < gate.len() {
+        let c = gate.substring(vj, vj + 1)
+        if c == "{" { break }
+        vj = vj + 1
+    }
+    if vj >= gate.len() { return 0 }
+    let mut vdepth: i64 = 0
+    let mut vk2: i64 = vj
+    let mut v_in_str = false
+    let mut v_esc = false
+    let mut vend: i64 = -1
+    while vk2 < gate.len() {
+        let c = gate.substring(vk2, vk2 + 1)
+        if v_esc { v_esc = false; vk2 = vk2 + 1; continue }
+        if c == "\\" { v_esc = true; vk2 = vk2 + 1; continue }
+        if c == "\"" { v_in_str = !v_in_str; vk2 = vk2 + 1; continue }
+        if !v_in_str {
+            if c == "{" { vdepth = vdepth + 1 }
+            if c == "}" {
+                vdepth = vdepth - 1
+                if vdepth == 0 { vend = vk2 + 1; break }
+            }
+        }
+        vk2 = vk2 + 1
+    }
+    if vend < 0 { return 0 }
+    let verdicts = gate.substring(vj, vend)
+    // Count non-overlapping `"PASS"` literals inside the verdicts map.
+    let needle = "\"PASS\""
+    let mut count: i64 = 0
+    let mut p: i64 = 0
+    while p < verdicts.len() {
+        let hit = verdicts.substring(p, verdicts.len()).index_of(needle)
+        if hit < 0 { break }
+        count = count + 1
+        p = p + hit + needle.len()
+    }
+    return count
+}
+
+// R4 sentinel-derive helper (2026-04-27, F23 fallback 2026-05-01).
 // Parses the witness JSON top-level fields `falsifier_pass_count` and `tier_1_count` to
 // reconstruct the raw 80 sentinel even when the spawned subagent failed to print one
 // (D-2 incident: hive-subagent relay heartbeat-loop hang post-witness).
+//
+// F23 final-aggregation contradiction fix (2026-05-01): when the LLM emits a
+// schema-valid witness without the convenience top-level scalars (the canonical
+// omega_cycle.witness_v1 shape uses gate_tier1_promotion.verdicts +
+// tier_1_promotions[]), fall back to deriving counts from those structures.
+// Without this fallback the aggregation reported tier1=0 falsifier_pass=0 even
+// though the first PASS sentinel (LLM-side) showed tier1=1 falsifier_pass=5 —
+// a self-contradicting final emission. Witness schema PASS does NOT require
+// the top-level scalars (witness_emit.hexa --validate gates 7 fields, none of
+// which are these counts), so counting absence of the scalars as schema-invalid
+// is wrong on two axes: misleading reason trailer + losing real PASS verdicts.
+//
 // Returns 3-tuple as array: [verdict, tier1_count, falsifier_pass_count].
 // Verdict = PASS iff schema-valid AND falsifier_pass_count > 0; FAIL otherwise.
 fn _derive_sentinel_from_witness(path: str) -> [str] {
@@ -730,8 +824,22 @@ fn _derive_sentinel_from_witness(path: str) -> [str] {
     let text = read_file(path)
     let fpass_str = _json_field(text, "falsifier_pass_count")
     let tier1_str = _json_field(text, "tier_1_count")
-    let fpass = _safe_to_int_line(fpass_str, 0, "derive-fpass")
-    let tier1 = _safe_to_int_line(tier1_str, 0, "derive-tier1")
+    let mut fpass = _safe_to_int_line(fpass_str, 0, "derive-fpass")
+    let mut tier1 = _safe_to_int_line(tier1_str, 0, "derive-tier1")
+    // F23 fallback: derive tier1 from tier_1_promotions / tier_1_implemented array length
+    // when the top-level scalar is absent.
+    if tier1 == 0 {
+        let mut arr = _slice_top_array(text, "tier_1_promotions")
+        if arr.len() == 0 { arr = _slice_top_array(text, "tier_1_implemented") }
+        if arr.len() > 0 {
+            tier1 = len(_split_array_elements(arr))
+        }
+    }
+    // F23 fallback: derive falsifier_pass count from gate_tier1_promotion.verdicts
+    // PASS values when the top-level scalar is absent.
+    if fpass == 0 {
+        fpass = _count_pass_verdicts_in_gate(text)
+    }
     let valid = _witness_schema_valid(path)
     let verdict = if valid && fpass > 0 { "PASS" } else { "FAIL" }
     return [verdict, to_string(tier1), to_string(fpass)]
@@ -789,7 +897,14 @@ fn _write_absorbed_entry(witness_path: str, trawl_id: str, tier1_id: str, axis: 
 fn _writeback_absorbed_from_witness(witness_path: str) -> i64 {
     if !_file_exists(witness_path) { return 0 }
     let text = read_file(witness_path)
-    let trawl_id = _json_field(text, "trawl_id")
+    // F23 (2026-05-01) — accept cycle_id as fallback when trawl_id absent.
+    // Canonical omega_cycle.witness_v1 uses cycle_id at the top level; trawl_id
+    // is a convenience alias kept for backwards compatibility with earlier
+    // witness shapes. Returning 0 unconditionally on missing trawl_id meant
+    // schema-valid LLM witnesses (which use cycle_id) silently produced
+    // absorbed_written=0 even when tier_1_promotions[] was non-empty.
+    let mut trawl_id = _json_field(text, "trawl_id")
+    if trawl_id.len() == 0 { trawl_id = _json_field(text, "cycle_id") }
     if trawl_id.len() == 0 { return 0 }
     // Try tier_1_promotions first (architecture witness key); fall back to
     // tier_1_implemented (code-emission witness key).
@@ -1829,7 +1944,17 @@ fn main() -> void {
     let fpass_str = derived[2]
     println("__KICK_RESULT__ " + verdict + " witness=" + witness_path_emit + " tier1=" + tier1_str + " falsifier_pass=" + fpass_str + "  absorbed_written=" + to_string(absorbed_n))
     if verdict == "FAIL" {
-        eprintln("reason=witness-schema-invalid fix=hexa run " + _nexus_root() + "/tool/witness_emit.hexa --validate " + witness_path + "  # see field-level FAIL")
+        // F23 (2026-05-01): split the FAIL reason between true schema invalidity
+        // (witness_emit.hexa --validate FAIL) and "schema-valid but no derivable
+        // PASS verdicts" (gate_tier1_promotion.verdicts is missing/empty AND
+        // top-level falsifier_pass_count absent). The previous blanket
+        // "witness-schema-invalid" trailer misled the operator when schema PASS
+        // but counts were unavailable — observed in 2026-05-01 closure verify.
+        if !_witness_schema_valid(witness_path) {
+            eprintln("reason=witness-schema-invalid fix=hexa run " + _nexus_root() + "/tool/witness_emit.hexa --validate " + witness_path + "  # see field-level FAIL")
+        } else {
+            eprintln("reason=witness-counts-derive-empty fix=1) inspect witness for top-level falsifier_pass_count or gate_tier1_promotion.verdicts containing PASS values; 2) ref kick_dispatch._derive_sentinel_from_witness fallback chain; 3) the witness passed schema validation but no PASS verdicts could be derived from any known shape")
+        }
         exit(3)
     }
     exit(0)
