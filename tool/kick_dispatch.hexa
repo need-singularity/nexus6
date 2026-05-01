@@ -1,5 +1,6 @@
 // tool/kick_dispatch.hexa — kick(ω-cycle) sub-agent dispatcher with α/β/γ outside-noise injection.
 //
+// @resolver-bypass(reason="Block 12 (2026-05-01): kick_dispatch invokes claude_slot_pick which depends on macOS Mach-O claude binary; container route reaches in-container branch line 1273-1276 that bypasses host-pin marker. Pin entire dispatch to host. Without this, `nexus/cli/run.hexa kick run` enters docker route at entry → kick_dispatch.hexa runs in Alpine container → in-container branch invokes slot-pick with no HEXA_RESOLVER_NO_REROUTE prefix → resolver REAL exec → claude binary fails (Mach-O on Linux) → all 12/12 slots probe unhealthy → all-slots-unhealthy-live-probe.")
 // @tool(slug="kick_dispatch", desc="single-shot kick(ω-cycle) executor — resolves backend from registry, builds prompt with α (absorbed-primitive) + β (QRNG seed) + γ (bridge reframe) noise envelopes, spawns sub-agent via tool/subagent_dispatch.hexa (raw 44 parent SID propagation), captures witness JSON path")
 // @usage(hexa /Users/ghost/core/nexus/tool/kick_dispatch.hexa <topic> [--backend <slug>] [--stratum <slug>] [--axes a,b,c] [--noise alpha,beta,gamma] [--witness-dir <path>] [--parent-sid <sid>] [--dry-run])
 // @omega-saturation-exempt("dispatch shim — convergence applies to spawned cycles, not to this dispatcher (mirrors tool/subagent_dispatch.hexa exemption)")
@@ -1206,10 +1207,42 @@ fn _slot_id_from_dir(dir: str) -> str {
     return dir.substring(prefix.len(), dir.len())
 }
 
+// Block 3 docker-gate (2026-05-01, raw 248 cycle r58 follow-up):
+// _is_docker_ctx — multi-signal docker container detection. Used to gate
+// hive-exec wrapper preference (which depends on node + bash being in PATH).
+//
+// Signals OR'd:
+//   (a) /.dockerenv  — kernel-injected marker file in every docker container
+//   (b) HEXA_RESOLVER_IN_CONTAINER=1 — hexa-resolver convention
+//   (c) /proc/1/cgroup contains "docker" — fallback for non-OCI runtimes
+//       (some podman / kata configs lack /.dockerenv)
+fn _is_docker_ctx() -> bool {
+    if _file_exists("/.dockerenv") { return true }
+    if env("HEXA_RESOLVER_IN_CONTAINER") == "1" { return true }
+    let cg = exec("cat /proc/1/cgroup 2>/dev/null | grep -c docker || echo 0").trim()
+    if cg.len() > 0 && cg != "0" { return true }
+    return false
+}
+
+// _validates_node_bash — deep validation that node + bash are ACTUALLY
+// executable in the current shell context. _file_exists alone returns true
+// for bind-mounted host paths even when the binary's interpreter is missing
+// (raw 248 Block 3 root-cause: hexa-runner container has hive-exec script
+// visible via $HOME bind-mount but no node/bash interpreter → "command not
+// found" → empty pick result → all-claude-slots-exhausted false-positive).
+fn _validates_node_bash() -> bool {
+    let nv = exec("command -v node >/dev/null 2>&1 && echo y || echo n").trim()
+    if nv != "y" { return false }
+    let bv = exec("command -v bash >/dev/null 2>&1 && echo y || echo n").trim()
+    if bv != "y" { return false }
+    return true
+}
+
 // Build the helper invocation prefix. Prefer hive CLI surface
 // `hive-exec claude_slot_pick <args>` when ~/.hx/bin/hive-exec is on
-// disk AND we're not inside a minimal hexa-runner container; otherwise
-// fall back to direct hexa-run on the hive_root path.
+// disk AND we're not inside a minimal hexa-runner container AND node+bash
+// are actually executable; otherwise fall back to direct hexa-run on
+// the hive_root path.
 //
 // Sub-X (2026-04-27): inside hexa-runner docker, ~/.hx/bin/hive-exec
 // is visible via $HOME bind-mount BUT it's a node/bash script whose
@@ -1218,24 +1251,136 @@ fn _slot_id_from_dir(dir: str) -> str {
 // failures that surfaced as `all-claude-slots-exhausted` (false-positive,
 // since direct hexa-run on the same .hexa works inside the container).
 //
-// Container detection: /.dockerenv presence OR HEXA_RESOLVER_IN_CONTAINER=1
-// (matches ~/.hx/bin/hexa resolver convention).
+// Block 3 follow-up (2026-05-01, raw 248): docker-context gate alone is
+// insufficient when host re-routes via hexa-resolver into a container
+// that the gate can't see from Mac. Adds _validates_node_bash() — a real
+// `command -v node` + `command -v bash` probe — so even on Mac if the
+// effective PATH for the wrapper is broken (rare but possible in CI),
+// we route via direct hexa-run instead of hive-exec.
 fn _slot_pick_invocation_prefix() -> str {
-    let in_container = _file_exists("/.dockerenv") || env("HEXA_RESOLVER_IN_CONTAINER") == "1"
+    let in_container = _is_docker_ctx()
     let hive_exec = env("HOME") + "/.hx/bin/hive-exec"
-    if !in_container && _file_exists(hive_exec) {
+    if !in_container && _file_exists(hive_exec) && _validates_node_bash() {
         return _shell_quote(hive_exec) + " claude_slot_pick"
     }
     let tool = _slot_pick_tool()
+    // Block 3 follow-up #2 (2026-05-01): prefix HEXA_RESOLVER_NO_REROUTE=1
+    // when on Mac (NOT in container). Without this, hexa-resolver
+    // transparently re-routes the slot-pick into hexa-runner docker container,
+    // where the slot live-probe shell-out (uses `perl` for cred parse + curl
+    // for /v1/messages probe) fails because the minimal image lacks perl →
+    // every slot reports unhealthy → false-positive all-slots-exhausted.
+    // In-container we skip the prefix (already on the runtime side).
+    if !in_container {
+        return "HEXA_RESOLVER_NO_REROUTE=1 " + _hexa_bin() + " run " + _shell_quote(tool)
+    }
+    // Mechanism D ssh-bridge (2026-05-01, raw 261): in-container, the
+    // hexa-runner image is distroless + bind-mounts host hive_root so the
+    // .hexa file resolves, BUT the container's claude binary path does not
+    // exist (Mach-O host binary not in image), causing every claude_slot_pick
+    // live-probe to return unhealthy → 12/12 unhealthy → all-slots-exhausted.
+    // When HEXA_HOST_BRIDGE_SSH=1 AND ssh is present in the image AND the
+    // host key bind-mount is wired AND the host bridge addr is reachable,
+    // escape into the host shell via ssh so the host's binary stack handles
+    // the live-probe.  Falls through to direct hexa-run on any precondition
+    // miss — operator sees "[mech-D fallthrough <reason>]" in stderr.
+    if env("HEXA_HOST_BRIDGE_SSH") == "1" {
+        let host_addr_raw = env("HEXA_HOST_BRIDGE")
+        let host_addr = if host_addr_raw.len() > 0 { host_addr_raw } else { "host.docker.internal" }
+        let key_raw = env("HEXA_HOST_KEY")
+        let key_path = if key_raw.len() > 0 { key_raw } else { env("HOME") + "/.ssh/id_ed25519" }
+        let user_raw = env("HEXA_HOST_USER")
+        let host_user = if user_raw.len() > 0 { user_raw } else { "ghost" }
+        let ssh_avail = exec("command -v ssh >/dev/null 2>&1 && echo y || echo n").trim()
+        let key_avail = exec("[ -r " + _shell_quote(key_path) + " ] && echo y || echo n").trim()
+        if ssh_avail == "y" && key_avail == "y" {
+            // Host hive_root is identical to the bind-mounted path inside the
+            // container ($HOME = /Users/ghost on Mac docker desktop), so we
+            // reuse the same _slot_pick_tool() path on the host side.  Host
+            // binary is /Users/ghost/.hx/bin/hexa (mac arm64).  Important:
+            // we do NOT shell_quote the remote command — caller appends
+            // ` --pick` / ` --exclude ...` AFTER this string, and ssh joins
+            // its remote-argv with spaces before delivery to the remote
+            // shell.  So the bare suffix "hexa run <tool>" works correctly
+            // when caller appends additional flags.
+            let ssh_prefix = "ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5 -i " + _shell_quote(key_path) + " " + host_user + "@" + host_addr + " /Users/ghost/.hx/bin/hexa run " + _shell_quote(tool)
+            eprintln("# kick_dispatch: mech-D ssh-bridge active host=" + host_addr + " user=" + host_user)
+            return ssh_prefix
+        }
+        eprintln("# kick_dispatch: mech-D ssh-bridge fallthrough ssh=" + ssh_avail + " key=" + key_avail)
+    }
     return _hexa_bin() + " run " + _shell_quote(tool)
+}
+
+// Block 10 reason-passthrough (2026-05-01): spool stderr to a known path so
+// that callers can recover the canonical __SLOT_PICK_RESULT__ reason= slug
+// after an empty pick.  Previously stderr was 2>/dev/null and the empty-pick
+// branch hardcoded reason=all-claude-slots-exhausted, masking the real cause
+// (e.g. all-slots-unhealthy-live-probe, empty-pool, cooldown-active).
+fn _claude_pick_stderr_spool() -> str {
+    return "/tmp/kick_dispatch_last_pick_stderr.log"
 }
 
 fn _claude_pick_slot(exclude_csv: str) -> str {
     let tool = _slot_pick_tool()
     if !_file_exists(tool) { return "" }
+    let spool = _claude_pick_stderr_spool()
+    // Reset spool so stale data from a prior pick doesn't bleed forward.
+    let _ = exec(": > " + _shell_quote(spool) + " 2>/dev/null")
     let mut cmd = _slot_pick_invocation_prefix() + " --pick"
     if exclude_csv.len() > 0 { cmd = cmd + " --exclude " + _shell_quote(exclude_csv) }
-    return exec(cmd + " 2>/dev/null").trim()
+    let result = exec(cmd + " 2>" + _shell_quote(spool)).trim()
+    // Block 3 retry-on-empty (2026-05-01, raw 248): if invocation produced
+    // empty result AND we're using the hive-exec wrapper path, retry once
+    // via direct hexa-run before giving up. Catches the Mac→docker-route
+    // false-positive: hexa-resolver may transparently re-route hive-exec
+    // into a container missing node/bash even though _is_docker_ctx() is
+    // false on Mac. Empty result is the canonical "command not found"
+    // signal (stderr captured to spool — preserves reason for caller).
+    if result.len() == 0 && cmd.index_of("hive-exec") >= 0 {
+        eprintln("# kick_dispatch: slot-pick empty via hive-exec wrapper — retrying direct hexa-run (Block 3 Mac→docker-route gate)")
+        let mut fallback = "HEXA_RESOLVER_NO_REROUTE=1 " + _hexa_bin() + " run " + _shell_quote(tool) + " --pick"
+        if exclude_csv.len() > 0 { fallback = fallback + " --exclude " + _shell_quote(exclude_csv) }
+        return exec(fallback + " 2>" + _shell_quote(spool)).trim()
+    }
+    return result
+}
+
+// Block 10 helper (2026-05-01): parse the canonical __SLOT_PICK_RESULT__
+// sentinel line out of the spooled stderr.  Format produced by
+// hive/tool/claude_slot_pick.hexa:
+//   __SLOT_PICK_RESULT__ <PASS|FAIL> slot=<N|none> reason=<slug>
+// Returns the reason slug verbatim (e.g. all-slots-unhealthy-live-probe,
+// empty-pool, cache-invalidate-failed, missing-mode) or "" when no sentinel
+// line is present.  Caller falls back to a default when "" is returned.
+fn _extract_last_pick_reason() -> str {
+    let spool = _claude_pick_stderr_spool()
+    if !_file_exists(spool) { return "" }
+    let raw = read_file(spool)
+    if raw.len() == 0 { return "" }
+    let lines = raw.split("\n")
+    let key = "__SLOT_PICK_RESULT__"
+    let rkey = "reason="
+    // Walk lines bottom-up so the most recent sentinel wins (covers the
+    // self-heal probe-all flow which emits __SLOT_PICK_SELF_HEAL__ and then
+    // either PASS or FAIL).
+    let mut i: i64 = len(lines) - 1
+    while i >= 0 {
+        let line = lines[i]
+        if line.index_of(key) >= 0 {
+            let ri = line.last_index_of(rkey)
+            if ri >= 0 {
+                let after = line.substring(ri + rkey.len(), line.len()).trim()
+                // reason slug runs to first whitespace (sentinel is a single
+                // line, but be defensive).
+                let sp = after.index_of(" ")
+                let reason = if sp >= 0 { after.substring(0, sp) } else { after }
+                return reason
+            }
+        }
+        i = i - 1
+    }
+    return ""
 }
 
 fn _claude_mark_cooldown(slot_id: str, kind: str, until_epoch: i64) -> void {
@@ -1781,8 +1926,19 @@ fn main() -> void {
             }
             let cfg_dir = _claude_pick_slot(excl)
             if cfg_dir.len() == 0 {
+                // Block 10 reason-passthrough (2026-05-01): forward the actual
+                // reason slug emitted by claude_slot_pick.hexa via its
+                // __SLOT_PICK_RESULT__ stderr sentinel.  Hardcoded
+                // all-claude-slots-exhausted previously masked real causes
+                // (all-slots-unhealthy-live-probe, empty-pool, cooldown-active,
+                // cache-invalidate-failed, …) — true root-cause now visible
+                // in __KICK_RESULT__ trailer for both humans and downstream
+                // dispatchers.  Default kept for the (rare) case where the
+                // sentinel is absent (e.g. tool aborted before emitting it).
+                let actual_reason = _extract_last_pick_reason()
+                let final_reason = if actual_reason.len() > 0 { actual_reason } else { "all-claude-slots-exhausted" }
                 eprintln("__KICK_RESULT__ FAIL witness=" + witness_path_emit + " tier1=0 falsifier_pass=0")
-                eprintln("reason=all-claude-slots-exhausted fix=hexa run " + _slot_pick_tool() + " --list   # all slots in cooldown or pool empty; rm ~/.claude-claude*/.kick_limit_until if you believe limits have reset")
+                eprintln("reason=" + final_reason + " fix=hexa run " + _slot_pick_tool() + " --list   # see " + _claude_pick_stderr_spool() + " for full sentinel; all slots in cooldown / pool empty / live-probe unhealthy; rm ~/.claude-claude*/.kick_limit_until if you believe limits have reset")
                 exit(2)
             }
             let slot_id = _slot_id_from_dir(cfg_dir)
@@ -1869,12 +2025,18 @@ fn main() -> void {
                     _shell_quote(parent_sid) + " --task-file " + _shell_quote(prompt_path)
                 eprintln("# kick_dispatch: KICK_LEGACY_LOCAL=1 → Mac-local subagent_dispatch (legacy escape hatch)")
             } else {
-                let inner = "cd " + _shell_quote(spawn_cwd) + " && HEXA_RESOLVER_NO_REROUTE=1 HIVE_HEXA_ADD_DIR=" + _shell_quote(spawn_cwd) +
+                // r58 follow-up #2 (2026-05-01): hive dispatch --purpose=kick wrapper
+                // REMOVED from default branch as well. Original removal in r58 patched
+                // only via_mac_reverse branch (line ~1852) — default branch retained the
+                // wrapper, causing "Error: Unknown option: --purpose" rc=1 to mask the
+                // real β chain output for every kick that did not opt into a specialized
+                // branch (mac_reverse / cli_direct / legacy_local). Mirror the simpler
+                // shape used by via_cli_direct / kick_legacy_local: bare inner exec.
+                cmd = "cd " + _shell_quote(spawn_cwd) + " && HEXA_RESOLVER_NO_REROUTE=1 HIVE_HEXA_ADD_DIR=" + _shell_quote(spawn_cwd) +
                     " CLAUDE_CONFIG_DIR=" + _shell_quote(cfg_dir) + " " +
                     _hexa_bin() + " run " + _shell_quote(dispatch_tool) + " " +
                     _shell_quote(parent_sid) + " --task-file " + _shell_quote(prompt_path)
-                cmd = _hive_root() + "/bin/hive dispatch --purpose=kick " + _shell_quote(inner)
-                eprintln("# kick_dispatch: default → hive dispatch --purpose=kick (raw 240 r28 LB engine default-ON; claude-cloud 0)")
+                eprintln("# kick_dispatch: default → bare subagent_dispatch (raw 240 r28 LB engine default-ON; hive-dispatch-wrap retired r58 follow-up #2; claude-cloud 0)")
             }
             // B.4 silent-timeout fix (2026-04-28): wrap with self-imposed
             // deadline → rc=124/137 lands cleanly into the rc != 0 branch
@@ -2047,7 +2209,7 @@ fn main() -> void {
             // gap on timeout/SIGKILL paths) — sentinel ALWAYS emits now.
             eprintln("__KICK_RESULT__ FAIL witness=" + witness_path_emit + " tier1=0 falsifier_pass=0")
             let dl = to_string(_kick_dispatch_timeout_sec())
-            eprintln("reason=spawn-timeout-rc-" + to_string(rc) + "-deadline-" + dl + "s fix=1) raise deadline: KICK_DISPATCH_TIMEOUT_SEC=<n> nexus kick run <topic>; 2) verify network reachability + hetzner SSH responsiveness; 3) check hive subagent state at ~/.hive/subagent-state for hang root cause; 4) tail " + runs_root + "/prompt.txt; 5) ref design/kick/2026-04-28_b4-silent-timeout-rca_omega_cycle.json (B.4 RCA witness)")
+            eprintln("reason=spawn-timeout-rc-" + to_string(rc) + "-deadline-" + dl + "s fix=1) raise deadline: KICK_DISPATCH_TIMEOUT_SEC=<n> nexus kick <topic>; 2) verify network reachability + hetzner SSH responsiveness; 3) check hive subagent state at ~/.hive/subagent-state for hang root cause; 4) tail " + runs_root + "/prompt.txt; 5) ref design/kick/2026-04-28_b4-silent-timeout-rca_omega_cycle.json (B.4 RCA witness)")
             exit(2)
         } else {
             eprintln("__KICK_RESULT__ FAIL witness=" + witness_path_emit + " tier1=0 falsifier_pass=0")
