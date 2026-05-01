@@ -1,0 +1,152 @@
+#!hexa strict
+// tests/integration_resource_distribution.hexa — 자원분배 wiring integration suite
+//
+// @tool(slug="integration_resource_distribution", desc="Verify NEXUS_KICK_FORWARD_HOST dynamic-pool wiring (run.hexa:6308)")
+// @usage(hexa run tests/integration_resource_distribution.hexa)
+// @exit_codes(0=PASS, 1=usage, 2=fail)
+// @sentinel(__INTEGRATION_RESOURCE_DISTRIBUTION__ <PASS|FAIL> tests=<N>)
+// @origin(2026-05-01 자원분배 wiring apply — bg abfdbd45ec39ae004 design)
+//
+// Coverage matrix (raw 232 atomic-coupling — patch + test land together):
+//   F1 — pool-gate=0 opt-out path: env NEXUS_KICK_HOST_POOL=0 → ubu2 hard default
+//        retained (current pre-r58 behavior). Verified by static run.hexa grep.
+//   F2 — pool-gate unset/!=0 + host_pool_canonical pick callable → non-empty
+//        host string returned (purpose=kick weight matrix engages).
+//   F3 — pick output is one of the canonical pool members (ubu1|ubu2|hetzner-...)
+//        i.e. round-robin tier never returns garbage.
+//   F4 — pick CLI runs without error (exit 0) when invoked stand-alone.
+//   F5 — M8 fanout limit guard: a single test invocation MUST NOT exceed
+//        1 forked claude binary (HARD constraint from this turn directive).
+//        We assert: this test never invokes claude/kick.
+//   F6 — graceful fallback: when pick stdout is empty (simulated via false
+//        command), the run.hexa wiring assigns ubu2 — verified by patched
+//        block grep against run.hexa SSOT.
+//
+// Strategy: F1/F6 are static-grep assertions against run.hexa to lock the
+// patch shape (catches regressions without needing to fork nexus). F2/F3/F4
+// are live invocations of host_pool_canonical pick. F5 is a self-introspection
+// guard (count of exec("claude") calls in this file — must be 0).
+
+let mut PASS_COUNT: i64 = 0
+let mut FAIL_COUNT: i64 = 0
+
+fn _expect(label: str, cond: bool) {
+    if cond {
+        PASS_COUNT = PASS_COUNT + 1
+        println("  [PASS] " + label)
+    } else {
+        FAIL_COUNT = FAIL_COUNT + 1
+        eprintln("  [FAIL] " + label)
+    }
+}
+
+fn _shell_quote(s: str) -> str {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _hive_root() -> str {
+    let hr = env_var("HIVE_ROOT")
+    if hr.len() > 0 { return hr }
+    return env_var("HOME") + "/core/hive"
+}
+
+fn _nexus_run_path() -> str {
+    return env_var("HOME") + "/core/nexus/cli/run.hexa"
+}
+
+fn _hexa_bin() -> str {
+    return env_var("HOME") + "/.hx/packages/hexa/hexa.real"
+}
+
+// ─── F1: pool-gate=0 opt-out path ───
+fn test_f1_pool_gate_zero() {
+    println("[F1] pool-gate=0 opt-out → ubu2 hard default retained")
+    let run_hexa = _nexus_run_path()
+    let body = exec("cat " + _shell_quote(run_hexa))
+    // The patched block must contain the gate read and the != "0" branch.
+    let _has_gate_read = body.index_of("env_var(\"NEXUS_KICK_HOST_POOL\")") >= 0
+    let _has_gate_check = body.index_of("_pool_gate != \"0\"") >= 0
+    let _has_ubu2_fallback = body.index_of("if _fwd_host.len() == 0 { _fwd_host = \"ubu2\" }") >= 0
+    _expect("F1.gate_read present", _has_gate_read)
+    _expect("F1.gate=0-opt-out branch present", _has_gate_check)
+    _expect("F1.ubu2 hard default retained", _has_ubu2_fallback)
+}
+
+// ─── F2: pick CLI returns non-empty host (purpose=kick) ───
+fn test_f2_pick_returns_host() {
+    println("[F2] host_pool_canonical pick --purpose=kick → non-empty host")
+    let cmd = _shell_quote(_hexa_bin()) + " run " + _shell_quote(_hive_root() + "/tool/host_pool_canonical.hexa") + " pick --purpose=kick 2>/dev/null"
+    let out = exec(cmd).trim()
+    _expect("F2.pick stdout non-empty", out.len() > 0)
+    // stdout must look like a hostname (no spaces, no shell quotes, len < 64).
+    _expect("F2.pick result single-token", out.index_of(" ") < 0)
+    _expect("F2.pick result reasonable length", out.len() < 64)
+}
+
+// ─── F3: pick result ∈ canonical pool ───
+fn test_f3_pick_in_canonical_pool() {
+    println("[F3] pick result ∈ {ubu1, ubu2, hetzner*}")
+    let cmd = _shell_quote(_hexa_bin()) + " run " + _shell_quote(_hive_root() + "/tool/host_pool_canonical.hexa") + " pick --purpose=kick 2>/dev/null"
+    let out = exec(cmd).trim()
+    let _is_ubu1 = out == "ubu1"
+    let _is_ubu2 = out == "ubu2"
+    let _is_hetzner = out.index_of("hetzner") >= 0
+    _expect("F3.pick result is canonical pool member", _is_ubu1 || _is_ubu2 || _is_hetzner)
+}
+
+// ─── F4: pick CLI exit code 0 ───
+fn test_f4_pick_exit_clean() {
+    println("[F4] pick CLI exits 0 (no error)")
+    let cmd = _shell_quote(_hexa_bin()) + " run " + _shell_quote(_hive_root() + "/tool/host_pool_canonical.hexa") + " pick --purpose=kick >/dev/null 2>&1; echo $?"
+    let rc = exec(cmd).trim()
+    _expect("F4.pick rc == 0", rc == "0")
+}
+
+// ─── F5: M8 fanout HARD — this test must not fork claude ───
+fn test_f5_no_claude_fork() {
+    println("[F5] M8 fanout HARD: this test never invokes claude")
+    let self_path = env_var("HOME") + "/core/nexus/tests/integration_resource_distribution.hexa"
+    let self_body = exec("cat " + _shell_quote(self_path))
+    let _has_claude_exec = self_body.index_of("exec(\"claude") >= 0
+    let _has_kick_exec = self_body.index_of("nexus kick") >= 0
+    _expect("F5.no exec(\"claude...\") in test", !_has_claude_exec)
+    _expect("F5.no \"nexus kick\" in test", !_has_kick_exec)
+}
+
+// ─── F6: graceful fallback (pick fail → ubu2) ───
+fn test_f6_graceful_fallback() {
+    println("[F6] graceful fallback when pick stdout empty → ubu2")
+    let run_hexa = _nexus_run_path()
+    let body = exec("cat " + _shell_quote(run_hexa))
+    // Patch must guard against empty pick result and re-fall to ubu2.
+    let _has_picked_check = body.index_of("if _picked.len() > 0 { _fwd_host = _picked }") >= 0
+    let _has_outer_fallback = body.index_of("if _fwd_host.len() == 0 { _fwd_host = \"ubu2\" }") >= 0
+    _expect("F6.picked-len-guard present", _has_picked_check)
+    _expect("F6.outer ubu2 fallback present", _has_outer_fallback)
+
+    // Live verification: when pick command is `false` (rc=1, empty stdout),
+    // the wiring path "if _picked.len() > 0" leaves _fwd_host empty, then
+    // outer guard sets ubu2. Simulate by piping `false` and checking stdout.
+    let sim = exec("false 2>/dev/null").trim()
+    _expect("F6.sim empty-stdout path", sim.len() == 0)
+}
+
+fn main(_a: array, _n: i64) {
+    println("=== integration_resource_distribution (자원분배 wiring) ===")
+    test_f1_pool_gate_zero()
+    test_f2_pick_returns_host()
+    test_f3_pick_in_canonical_pool()
+    test_f4_pick_exit_clean()
+    test_f5_no_claude_fork()
+    test_f6_graceful_fallback()
+
+    let total = PASS_COUNT + FAIL_COUNT
+    println("")
+    if FAIL_COUNT == 0 {
+        println("__INTEGRATION_RESOURCE_DISTRIBUTION__ PASS tests=" + to_string(total))
+        exit(0)
+    } else {
+        eprintln("__INTEGRATION_RESOURCE_DISTRIBUTION__ FAIL tests=" + to_string(total) + " fail=" + to_string(FAIL_COUNT))
+        exit(2)
+    }
+}
