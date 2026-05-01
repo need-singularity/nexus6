@@ -563,6 +563,15 @@ fn _build_prompt(topic: str, stratum: str, axes_csv: str, alpha: str, beta: str,
     buf = buf + "Then on a SEPARATE line print sentinel: __KICK_RESULT__ <PASS|FAIL> witness=<path> tier1=<N> falsifier_pass=<N>\n"
     buf = buf + "On error print: reason=<slug> fix=<directive>\n"
     buf = buf + "Do NOT write to any file — caller persists the JSON from stdout to <path>.\n"
+    buf = buf + "\n"
+    buf = buf + "CRITICAL DELIMITER RULE (r7 absorb-fail 2026-05-01 root cause):\n"
+    buf = buf + "  The exact strings <<WITNESS_JSON_START>> and <<WITNESS_JSON_END>> MUST appear\n"
+    buf = buf + "  EXACTLY TWICE in your entire stdout — once each as the wrapping delimiters\n"
+    buf = buf + "  on their own line. NEVER include those literal strings as field values inside\n"
+    buf = buf + "  the witness JSON body (e.g. emit.delimiter_end). If you need to reference them,\n"
+    buf = buf + "  use a synonym ('end-marker', 'kick-witness-close-tag', etc) — NEVER the literal.\n"
+    buf = buf + "  Caller uses last_index_of(<<WITNESS_JSON_END>>) for robustness, but premature\n"
+    buf = buf + "  occurrences of <<WITNESS_JSON_START>> still risk truncating prompt-echo regions.\n"
     return buf
 }
 
@@ -1598,18 +1607,43 @@ fn main() -> void {
             // persist to declared witness_path. Reason: ω-cycle prompt asks LLM to
             // print witness JSON to stdout (no file write — caller persists).
             // Bypasses Mac sshd file-write permission + ubu2/Mac path mismatch.
+            //
+            // r7 absorb-fail fix (2026-05-01): use last_index_of for close-marker
+            // and first-after-open for open-marker. Witness JSON often contains
+            // literal "<<WITNESS_JSON_END>>" inside emit{} fields (LLM cited the
+            // delimiter as schema metadata) — index_of(close) matched that inner
+            // string and truncated the witness mid-body. Symptom: 6626-byte file
+            // landed but JSON parse failed at "Unterminated string ... char 6619",
+            // atlas ingest rejected with reason=witness-schema-invalid.
+            //
+            // Strategy:
+            //   1. Find first <<WITNESS_JSON_START>> after the prompt echo region
+            //      (use rfind on START as well — prompt instructions echo it back
+            //      in stderr-merged stdout when subagent quotes the task).
+            //   2. After that, find the LAST <<WITNESS_JSON_END>> in the trailing
+            //      window — outermost close wins, internal field-value mentions
+            //      become safe substrings.
+            //   3. Persist via stdin pipe (cat << HEREDOC) to avoid ARG_MAX
+            //      truncation on large witnesses (printf '%s' '<huge string>'
+            //      may hit ~256KB limit on macOS).
             let _ws_marker_open = "<<WITNESS_JSON_START>>"
             let _ws_marker_close = "<<WITNESS_JSON_END>>"
-            let _ws_open = out.index_of(_ws_marker_open)
-            let _ws_close = out.index_of(_ws_marker_close)
+            // Use last_index_of for both — outermost wraps; LLM-quoted prompt
+            // echoes earlier copies, the actual emit is the LAST pair.
+            let _ws_open = out.last_index_of(_ws_marker_open)
+            let _ws_close = out.last_index_of(_ws_marker_close)
             if _ws_open >= 0 && _ws_close > _ws_open {
                 let _json_start = _ws_open + _ws_marker_open.len()
                 let _json_body = out.substring(_json_start, _ws_close).trim()
                 if _json_body.len() > 0 {
                     let _wp_dir = exec("dirname " + _shell_quote(witness_path)).trim()
                     let _ = exec("mkdir -p " + _shell_quote(_wp_dir))
-                    let _ = exec("printf '%s' " + _shell_quote(_json_body) + " > " + _shell_quote(witness_path))
-                    eprintln("# kick_dispatch: stdout-capture extracted witness JSON (" + to_string(_json_body.len()) + " bytes) → " + witness_path)
+                    // Heredoc pipe avoids ARG_MAX. Sentinel chosen unlikely to
+                    // collide with witness body (random-ish + length>=24).
+                    let _heredoc_tag = "EOF_KICK_WITNESS_R7FIX_2026_05_01"
+                    let _cmd = "cat > " + _shell_quote(witness_path) + " <<'" + _heredoc_tag + "'\n" + _json_body + "\n" + _heredoc_tag + "\n"
+                    let _ = exec(_cmd)
+                    eprintln("# kick_dispatch: stdout-capture extracted witness JSON (" + to_string(_json_body.len()) + " bytes, last-pair delimiter) → " + witness_path)
                 }
             }
             // OUTER rc — explicit shell echo.

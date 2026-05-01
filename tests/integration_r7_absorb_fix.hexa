@@ -1,0 +1,212 @@
+#!hexa strict
+// tests/integration_r7_absorb_fix.hexa — r7 absorb-fail stdout-capture extraction unit suite
+//
+// @tool(slug="integration_r7_absorb_fix", desc="Verify last_index_of close-marker fix for r7 witness extraction")
+// @usage(hexa run tests/integration_r7_absorb_fix.hexa)
+// @exit_codes(0=PASS, 1=usage, 2=fail)
+// @sentinel(__INTEGRATION_R7_ABSORB_FIX__ <PASS|FAIL> tests=<N>)
+// @origin(r7 absorb-fail diagnose 2026-05-01 — kick_dispatch.hexa:1601+ patch)
+//
+// Coverage matrix:
+//   F1 — clean delimiters (single open/close pair) → full body extracted
+//   F2 — JSON contains literal "<<WITNESS_JSON_END>>" inside emit{} field
+//        (r7 actual failure mode) → last_index_of wins, full body extracted
+//   F3 — prompt-echo region quotes delimiters before actual emit
+//        → last-pair wins (last_index_of on open + close)
+//   F4 — both delimiters absent → no extraction, no-op
+//   F5 — open-only (close missing) → no extraction (guard _ws_close > _ws_open)
+//   F6 — large body (~50KB) via heredoc — verifies persistence path beyond
+//        printf %s ARG_MAX risk
+//
+// Strategy: replicate extraction algorithm locally (kick_dispatch internal fns
+// are not importable). The extraction we validate is the EXACT logic that
+// landed at kick_dispatch.hexa:1603+ (last_index_of for both markers, heredoc
+// persist via cat).
+
+let MARKER_OPEN = "<<WITNESS_JSON_START>>"
+let MARKER_CLOSE = "<<WITNESS_JSON_END>>"
+
+let mut PASS_COUNT: i64 = 0
+let mut FAIL_COUNT: i64 = 0
+
+fn _expect(label: str, cond: bool) {
+    if cond {
+        PASS_COUNT = PASS_COUNT + 1
+        println("  [PASS] " + label)
+    } else {
+        FAIL_COUNT = FAIL_COUNT + 1
+        eprintln("  [FAIL] " + label)
+    }
+}
+
+fn _shell_quote(s: str) -> str {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+// Mirror of kick_dispatch.hexa:1603-1623 extraction logic.
+// Returns extracted JSON body, or empty string on no-extract.
+fn extract_witness(out: str) -> str {
+    let _ws_open = out.last_index_of(MARKER_OPEN)
+    let _ws_close = out.last_index_of(MARKER_CLOSE)
+    if _ws_open >= 0 && _ws_close > _ws_open {
+        let _json_start = _ws_open + MARKER_OPEN.len()
+        return out.substring(_json_start, _ws_close).trim()
+    }
+    return ""
+}
+
+// Persist via heredoc (mirror of kick_dispatch.hexa heredoc tag path).
+// Returns size of file written (stat -f %z on macOS, stat -c %s on Linux).
+fn persist_witness(witness_path: str, body: str) -> i64 {
+    let tag = "EOF_KICK_WITNESS_R7FIX_2026_05_01_TEST"
+    let cmd = "cat > " + _shell_quote(witness_path) + " <<'" + tag + "'\n" + body + "\n" + tag + "\n"
+    let _ = exec(cmd)
+    let sz = exec("wc -c < " + _shell_quote(witness_path)).trim()
+    if sz.len() == 0 { return 0 }
+    return _safe_int(sz)
+}
+
+fn _safe_int(s: str) -> i64 {
+    let mut i: i64 = 0
+    let mut sign: i64 = 1
+    let t = s.trim()
+    let mut k: i64 = 0
+    if t.len() > 0 && t.substring(0, 1) == "-" { sign = -1; k = 1 }
+    while k < t.len() {
+        let c = t.substring(k, k + 1)
+        if c >= "0" && c <= "9" {
+            i = i * 10 + (_char_to_int(c))
+        } else { return -1 }
+        k = k + 1
+    }
+    return i * sign
+}
+
+fn _char_to_int(c: str) -> i64 {
+    if c == "0" { return 0 }
+    if c == "1" { return 1 }
+    if c == "2" { return 2 }
+    if c == "3" { return 3 }
+    if c == "4" { return 4 }
+    if c == "5" { return 5 }
+    if c == "6" { return 6 }
+    if c == "7" { return 7 }
+    if c == "8" { return 8 }
+    if c == "9" { return 9 }
+    return 0
+}
+
+// ─── F1 clean delimiters ───
+fn test_f1_clean() {
+    println("[F1] clean delimiters (single pair)")
+    let body = "{\"topic\":\"test\",\"value\":42}"
+    let stdout = "preamble noise\n" + MARKER_OPEN + "\n" + body + "\n" + MARKER_CLOSE + "\n__KICK_RESULT__ PASS witness=/tmp/x tier1=1 falsifier_pass=5\n"
+    let extracted = extract_witness(stdout)
+    _expect("F1.extracted == body", extracted == body)
+    _expect("F1.body length matches", extracted.len() == body.len())
+}
+
+// ─── F2 r7 actual failure mode — close-marker literal inside JSON body ───
+fn test_f2_close_in_body() {
+    println("[F2] close-marker literal inside JSON body (r7 actual failure mode)")
+    // This emulates the r7 witness which had emit.delimiter_end pointing at
+    // the literal close marker string. Pre-fix index_of would truncate here.
+    let body = "{\"topic\":\"r7\",\"emit\":{\"mode\":\"stdout-delimited\",\"delimiter_start\":\"" + MARKER_OPEN + "\",\"delimiter_end\":\"" + MARKER_CLOSE + "\"},\"tier1\":[\"a\",\"b\"]}"
+    let stdout = MARKER_OPEN + "\n" + body + "\n" + MARKER_CLOSE + "\n__KICK_RESULT__ PASS\n"
+    let extracted = extract_witness(stdout)
+    // The extracted body MUST end with closing brace, NOT inside the delimiter_end string
+    _expect("F2.extracted ends with closing brace", extracted.substring(extracted.len() - 1, extracted.len()) == "}")
+    _expect("F2.extracted preserves emit.delimiter_end field", extracted.index_of("\"delimiter_end\":\"" + MARKER_CLOSE + "\"") >= 0)
+    _expect("F2.extracted preserves tier1 array", extracted.index_of("tier1") >= 0)
+    // Pre-fix bug: extracted would be truncated near "delimiter_end\":\""
+    // Post-fix: full body
+    _expect("F2.extracted == full body", extracted == body)
+}
+
+// ─── F3 prompt-echo region (LLM quotes task) ───
+fn test_f3_prompt_echo() {
+    println("[F3] prompt-echo region quotes delimiters before actual emit")
+    // Subagent stdout contains the task instructions echoed back (it often
+    // narrates "I will print witness wrapped in <<WITNESS_JSON_START>> ...
+    // <<WITNESS_JSON_END>>") before actually emitting the witness.
+    let body = "{\"topic\":\"r7-echo\",\"value\":1}"
+    let echo_region = "I will now emit the witness wrapped in " + MARKER_OPEN + " and " + MARKER_CLOSE + " on separate lines.\n"
+    let stdout = echo_region + MARKER_OPEN + "\n" + body + "\n" + MARKER_CLOSE + "\n__KICK_RESULT__ PASS\n"
+    let extracted = extract_witness(stdout)
+    _expect("F3.extracted == real body (last-pair wins)", extracted == body)
+    _expect("F3.echo region not in extracted", extracted.index_of("I will now emit") < 0)
+}
+
+// ─── F4 both delimiters absent ───
+fn test_f4_no_delimiters() {
+    println("[F4] both delimiters absent → no-op")
+    let stdout = "subagent failed before emitting witness\n__KICK_RESULT__ FAIL reason=spawn-failure\n"
+    let extracted = extract_witness(stdout)
+    _expect("F4.extracted is empty", extracted.len() == 0)
+}
+
+// ─── F5 open-only (close missing) ───
+fn test_f5_open_only() {
+    println("[F5] open present, close missing → no-op (guard)")
+    let stdout = MARKER_OPEN + "\n{\"topic\":\"truncated\",\n__KICK_RESULT__ FAIL\n"
+    let extracted = extract_witness(stdout)
+    _expect("F5.extracted is empty (close missing)", extracted.len() == 0)
+}
+
+// ─── F6 large body via heredoc ───
+fn test_f6_large_body_heredoc() {
+    println("[F6] large body persistence via heredoc (ARG_MAX bypass)")
+    // Build a ~50KB JSON-like body. Real witnesses can hit 200KB+ when
+    // axes_surfaced[] options_considered have rich rationale.
+    let mut chunk = "{\"a\":\"" + "x".repeat(8192) + "\","
+    chunk = chunk + "\"b\":\"" + "y".repeat(8192) + "\","
+    chunk = chunk + "\"c\":\"" + "z".repeat(8192) + "\","
+    chunk = chunk + "\"d\":\"" + "w".repeat(8192) + "\","
+    chunk = chunk + "\"e\":\"" + "v".repeat(8192) + "\","
+    chunk = chunk + "\"f\":\"" + "u".repeat(8192) + "\""
+    let body = chunk + "}"
+    let stdout = MARKER_OPEN + "\n" + body + "\n" + MARKER_CLOSE + "\n"
+    let extracted = extract_witness(stdout)
+    _expect("F6.extracted matches body", extracted == body)
+    _expect("F6.extracted size > 48KB", extracted.len() > 49000)
+    let tmp = "/tmp/r7_absorb_fix_test_witness_" + to_string(_now_unix_int_local()) + ".json"
+    let sz = persist_witness(tmp, extracted)
+    _expect("F6.persist size matches body+1 (newline)", sz == extracted.len() + 1 || sz == extracted.len())
+    let _ = exec("rm -f " + _shell_quote(tmp))
+}
+
+fn _now_unix_int_local() -> i64 {
+    let s = exec("date +%s").trim()
+    return _safe_int(s)
+}
+
+// ─── kick_dispatch source assertion (anchor — fix landed) ───
+fn test_kick_dispatch_anchor() {
+    println("[F7] kick_dispatch.hexa anchor — fix landed at line 1603-1623")
+    let src = read_file("tool/kick_dispatch.hexa")
+    _expect("F7.last_index_of(_ws_marker_open) present", src.index_of("last_index_of(_ws_marker_open)") >= 0)
+    _expect("F7.last_index_of(_ws_marker_close) present", src.index_of("last_index_of(_ws_marker_close)") >= 0)
+    _expect("F7.heredoc tag present", src.index_of("EOF_KICK_WITNESS_R7FIX_2026_05_01") >= 0)
+    _expect("F7.r7 absorb-fail comment present", src.index_of("r7 absorb-fail fix (2026-05-01)") >= 0)
+    _expect("F7.CRITICAL DELIMITER RULE prompt strengthened", src.index_of("CRITICAL DELIMITER RULE") >= 0)
+}
+
+fn main() -> void {
+    println("=== integration_r7_absorb_fix (kick_dispatch stdout-capture) ===")
+    println("")
+
+    test_f1_clean()
+    test_f2_close_in_body()
+    test_f3_prompt_echo()
+    test_f4_no_delimiters()
+    test_f5_open_only()
+    test_f6_large_body_heredoc()
+    test_kick_dispatch_anchor()
+
+    println("")
+    println("--- summary ---")
+    println("PASS=" + to_string(PASS_COUNT) + " FAIL=" + to_string(FAIL_COUNT))
+    let verdict = if FAIL_COUNT == 0 { "PASS" } else { "FAIL" }
+    println("__INTEGRATION_R7_ABSORB_FIX__ " + verdict + " tests=" + to_string(PASS_COUNT + FAIL_COUNT))
+    if FAIL_COUNT == 0 { exit(0) } else { exit(2) }
+}
