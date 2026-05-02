@@ -1,0 +1,202 @@
+#!hexa strict
+// nexus/core/bind/inproc_dispatch.hexa — in-process axis dispatch table (T1)
+//
+// @tool(slug="nexus_bind_inproc_dispatch", desc="In-process bind axis dispatch table — switch-style registry that imports each subscriber's pub on_<axis>_axis_fire fn and forwards BindPayload directly without subprocess hop. Mirrors hive/core/raw_format/registry.hexa dispatch-by-string pattern (raw 273 stage0 fn-pointer absence). Eliminates ~800ms hexa-interpreter init per fire by sharing the caller's process/heap. Falls back to caller (router) for axes not registered here.")
+// @sentinel(__NEXUS_BIND_INPROC_DISPATCH_SELFTEST__ <PASS|FAIL>)
+// @usage(hexa run nexus/core/bind/inproc_dispatch.hexa [--selftest])
+// @resolver-bypass(reason="lib-only-no-subprocess; pure in-process axis switch")
+// @exit_codes(0=ok, 1=selftest_fail)
+// @claude-dependency(NONE)
+//
+// raw#9 hexa-only strict. raw 270/272/273 conformant.
+//
+// REGISTERED IN-PROCESS AXES (1, additive):
+//   outside_noise   — handler.on_outside_noise_axis_fire(cycle_id) → verdict str
+//                     (wrapped here into BindResult; no subprocess exec)
+//
+// ARCHITECTURE:
+//   router.fire(axis, payload)
+//     ├─ if active_bindings.hxc entry has inprocess=true AND axis in this table:
+//     │     return inproc_dispatch(axis, payload)        ← O(symbol-call)
+//     └─ else: subprocess fallback (existing path)        ← O(~800ms hexa-init)
+//
+// Adding a new in-process axis = 1 import + 1 case branch + 1 subscription flag.
+//
+// raw#10:
+//   (1) Import direction: T1 (this file) imports tool/handlers/<>.hexa directly
+//       — same direction hive/core/raw_format/registry.hexa imports
+//       hive/modules/raw_format/<mk>.hexa (raw 273 sanctioned T1→T2 EXCEPT
+//       through registry/router). The handler exposes
+//       `pub fn on_outside_noise_axis_fire(cycle_id: str) -> str`.
+//   (2) Verdict-only return contract: handler.on_*_axis_fire returns just the
+//       verdict string. We wrap it into BindResult here with success=true if
+//       verdict in {PASS, DRY-RUN}, else success=false. data/tail_snippet are
+//       set to short marker strings (no stdout to capture in-process).
+//   (3) duration_ms measured by date+%s wallclock around the in-process call —
+//       expected sub-millisecond (compiled-fn invoke), but we keep the same
+//       second-resolution ts0/ts1 instrumentation as router for parity.
+//   (4) FALLBACK ON ANY in-process axis NOT registered here: nexus_bind_inproc_dispatch
+//       returns BindResult with verdict="UNREGISTERED-INPROC". Caller (router) MUST
+//       inspect verdict and fall back to subprocess path if seen — never emit as
+//       dispatch outcome.
+//   (5) State sharing across calls: in-process invocation shares heap with
+//       caller, including any module-level state inside handler. The handler is
+//       audited stateless (only writes reality_map JSONL + roadmap; reads dedup
+//       through last_summary), so multiple sequential fires produce same effects
+//       as separate subprocess invocations. CLM mock branch is deterministic.
+//   (6) Subscriber wrapper module (modules/bind/outside_noise.hexa) is left
+//       intact — wrapper-via-subprocess remains for back-compat / debug.
+
+use "source"
+use "../../tool/handlers/outside_noise_clm_handler"
+
+fn _now_unix_inproc() -> int {
+    return to_int(to_string(exec("date +%s")).trim())
+}
+
+fn _truncate_300_inproc(s: str) -> str {
+    if len(s) <= 300 { return s }
+    return s.substring(0, 300)
+}
+
+// ─── Registered in-process axis names ───────────────────────────────────────
+
+pub fn nexus_bind_inproc_dispatch_axes() -> [str] {
+    let mut a = []
+    a.push("outside_noise")
+    return a
+}
+
+pub fn nexus_bind_inproc_dispatch_has(axis: str) -> bool {
+    let xs = nexus_bind_inproc_dispatch_axes()
+    let mut i = 0
+    while i < len(xs) {
+        if xs[i] == axis { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── Switch-style dispatch table (raw 273 stage0 pattern) ───────────────────
+
+pub fn nexus_bind_inproc_dispatch(axis: str, payload: BindPayload) -> BindResult {
+    let ts0 = _now_unix_inproc()
+
+    if axis == "outside_noise" {
+        // Direct fn call — no subprocess. Handler fn returns verdict str only.
+        let verdict_raw = on_outside_noise_axis_fire(payload.cycle_id)
+        let ts1 = _now_unix_inproc()
+        let dur_ms = (ts1 - ts0) * 1000
+
+        let mut success = false
+        if verdict_raw == "PASS" { success = true }
+        if verdict_raw == "DRY-RUN" { success = true }
+
+        let mut rc = 0
+        if !success { rc = 1 }
+        if verdict_raw == "REJECT" { rc = 1 }
+
+        let snippet = _truncate_300_inproc(
+            "__OUTSIDE_NOISE_CLM__ " + verdict_raw + " cycle=" + payload.cycle_id + " (inproc)"
+        )
+
+        return bind_result_make(
+            success,
+            "{\"inproc\":true,\"axis\":\"outside_noise\",\"cycle_id\":\"" + payload.cycle_id + "\",\"verdict\":\"" + verdict_raw + "\"}",
+            "inproc dispatched axis=outside_noise verdict=" + verdict_raw,
+            rc,
+            verdict_raw,
+            dur_ms,
+            snippet
+        )
+    }
+
+    // Sentinel — caller (router) MUST inspect this verdict and fall back
+    // to subprocess dispatch. NEVER emit UNREGISTERED-INPROC as outcome.
+    let ts1u = _now_unix_inproc()
+    let dur_msu = (ts1u - ts0) * 1000
+    return bind_result_make(
+        false,
+        "",
+        "axis not registered for in-process dispatch: " + axis,
+        7,
+        "UNREGISTERED-INPROC",
+        dur_msu,
+        ""
+    )
+}
+
+// ─── Selftest ───────────────────────────────────────────────────────────────
+
+fn _selftest_inproc() -> int {
+    // 1. axes table contains outside_noise
+    let xs = nexus_bind_inproc_dispatch_axes()
+    if len(xs) < 1 { return 0 }
+    let mut found = false
+    let mut i = 0
+    while i < len(xs) {
+        if xs[i] == "outside_noise" { found = true; break }
+        i = i + 1
+    }
+    if !found { return 0 }
+
+    // 2. has() positive + negative
+    if !nexus_bind_inproc_dispatch_has("outside_noise") { return 0 }
+    if nexus_bind_inproc_dispatch_has("nonexistent_xyz") { return 0 }
+
+    // 3. dispatch unregistered axis returns UNREGISTERED-INPROC sentinel
+    let opts0 = [["timeout_sec", "30"]]
+    let p_un = bind_payload_make("nonexistent_xyz", 0, "{}", "c0", -1.0, opts0)
+    let r_un = nexus_bind_inproc_dispatch("nonexistent_xyz", p_un)
+    if r_un.verdict != "UNREGISTERED-INPROC" { return 0 }
+    if r_un.success { return 0 }
+
+    // 4. dispatch outside_noise mock cycle 0 — expects PASS|REJECT|DRY-RUN
+    //    (handler self-probe pipeline, no subprocess)
+    let p_on = bind_payload_make("outside_noise", 0, "{\"cycle\":0}", "c0", -1.0, opts0)
+    let r_on = nexus_bind_inproc_dispatch("outside_noise", p_on)
+    if r_on.verdict == "UNREGISTERED-INPROC" { return 0 }
+    if r_on.verdict == "ERROR" { return 0 }
+    // accept PASS / REJECT / DRY-RUN — all are valid handler outcomes
+    let v = r_on.verdict
+    if v != "PASS" && v != "REJECT" && v != "DRY-RUN" && v != "FAIL" { return 0 }
+
+    return 1
+}
+
+fn main() {
+    let raw_args = args()
+    let mut cli = []
+    let mut ai = 2
+    let mut _scan = 0
+    let _nra = len(raw_args)
+    while _scan < _nra {
+        let _a = raw_args[_scan]
+        let _la = len(_a)
+        if _la >= 5 && _a.substring(_la - 5, _la) == ".hexa" {
+            ai = _scan + 1
+            break
+        }
+        _scan = _scan + 1
+    }
+    while ai < len(raw_args) {
+        cli.push(raw_args[ai])
+        ai = ai + 1
+    }
+
+    if len(cli) >= 1 && (cli[0] == "--selftest" || cli[0] == "selftest") {
+        let ok = _selftest_inproc()
+        if ok == 1 {
+            let xs = nexus_bind_inproc_dispatch_axes()
+            println("__NEXUS_BIND_INPROC_DISPATCH_SELFTEST__ PASS axes=" + to_string(len(xs)) + " sub=4/4")
+            exit(0)
+        } else {
+            println("__NEXUS_BIND_INPROC_DISPATCH_SELFTEST__ FAIL")
+            exit(1)
+        }
+    }
+
+    println("usage: hexa run nexus/core/bind/inproc_dispatch.hexa --selftest")
+    println("(library module — invoked via nexus/core/bind/router.hexa fire pathway)")
+    exit(0)
+}
