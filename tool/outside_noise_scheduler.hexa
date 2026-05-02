@@ -1,0 +1,346 @@
+#!hexa strict
+// tool/outside_noise_scheduler.hexa — launchd-side wrapper around outside_noise_clm_handler
+//
+// @tool(slug="outside_noise_scheduler", desc="launchd-fired wrapper that increments cycle counter, invokes outside_noise_clm_handler with watchdog, appends scheduler audit row")
+// @sentinel(__OUTSIDE_NOISE_SCHED__ <FIRED|SKIPPED|ERROR> cycle=<N> rc=<rc> elapsed_ms=<ms>)
+// @usage(hexa run nexus/tool/outside_noise_scheduler.hexa [--once] [--check] [--dry-run] [--cycle <N>] [--mode <mock|local|hf>] [--watchdog-sec <S>])
+// @resolver-bypass(reason="launchd-fired entry point — must not auto-route into linux container")
+// @exit_codes(0=fired+handler-rc-passthrough-merged, 1=lock-contention-skipped, 2=counter-corrupt, 3=handler-watchdog-killed, 4=usage)
+//
+// This wrapper does NOT touch the handler itself — it just orchestrates:
+//   1. Acquire flock on counter file (atomic reservation; concurrent fire = exit 1)
+//   2. Read counter.current_cycle, increment
+//   3. Persist counter.tmp -> rename atomic
+//   4. Invoke handler under `timeout` (default 30s watchdog)
+//   5. Append scheduler audit row to state/outside_noise_scheduler.jsonl
+//   6. Emit __OUTSIDE_NOISE_SCHED__ sentinel + scheduler marker
+//   7. Release flock
+//
+// raw#10 honest:
+//   - launchd interval drift: macOS may delay fire under load (ProcessType Background + low priority IO)
+//   - flock reliance: NFS / sandbox environments may not honor flock — mac local default OK
+//   - watchdog SIGTERM (not SIGKILL); handler that ignores SIGTERM may leak (rare)
+//   - counter rotation: at i64 overflow handler still works, no rollover (~9e18 cycles)
+//   - dry-run prints plan without touching counter or invoking handler
+//   - mode=mock (selftest cycle), mode=local|hf for real CLM (handler-side dependent)
+
+fn _home() -> string {
+    let h = env_var("HOME")
+    if len(h) > 0 { return h }
+    return to_string(exec("echo $HOME")).trim()
+}
+
+fn _nexus_root() -> string {
+    let override = env_var("NEXUS_CORE_ROOT")
+    if len(override) > 0 { return override + "/nexus" }
+    return _home() + "/core/nexus"
+}
+
+fn _shell_quote(s: string) -> string {
+    let mut r = s.replace("'", "'\\''")
+    return "'" + r + "'"
+}
+
+fn _file_exists(p: string) -> bool {
+    return to_string(exec("test -f '" + p + "' && echo y || echo n")).trim() == "y"
+}
+
+fn now_utc() -> string {
+    return to_string(exec("date -u +%FT%TZ")).trim()
+}
+
+fn _ms_epoch() -> string {
+    // millisecond epoch — gnu date `+%s%3N` not portable on bsd; use python fallback chain
+    // Pure shell: use `date +%s` then concat 000 (sec resolution acceptable as fallback);
+    // mac coreutils `gdate` may exist — try that first.
+    let g = to_string(exec("command -v gdate >/dev/null 2>&1 && gdate +%s%3N || date +%s000")).trim()
+    return g
+}
+
+// ─── counter persistence ──────────────────────────────────────────────────
+
+fn _counter_path() -> string {
+    return _nexus_root() + "/state/outside_noise_cycle_counter.json"
+}
+
+fn _counter_lock_path() -> string {
+    return _nexus_root() + "/state/outside_noise_cycle_counter.lock"
+}
+
+fn _counter_init_if_missing() -> bool {
+    let p = _counter_path()
+    if _file_exists(p) { return true }
+    // Initialize to current_cycle=4 (last known absorbed cycle per design doc Phase 4 progress)
+    // so the next fire will start at cycle=5. raw#10: this assumes no manual cycle 5+ run yet.
+    let body = "{\"current_cycle\":4,\"last_run_ts\":\"\",\"last_rc\":-1,\"created_at\":\"" + now_utc() + "\",\"schema\":\"nexus/state/outside_noise_cycle_counter/v1\"}\n"
+    let tmp = p + ".tmp"
+    let _ = exec("printf '%s' " + _shell_quote(body) + " > '" + tmp + "'")
+    let _ = exec("mv '" + tmp + "' '" + p + "'")
+    return _file_exists(p)
+}
+
+fn _counter_read_current() -> i64 {
+    let p = _counter_path()
+    if !_file_exists(p) { return -1 }
+    let raw = to_string(exec("cat '" + p + "' 2>/dev/null"))
+    let key = "\"current_cycle\":"
+    let kp = raw.index_of(key)
+    if kp < 0 { return -1 }
+    let after = raw.substring(kp + len(key), len(raw))
+    let trimmed = after.trim()
+    let mut digits = ""
+    let mut i = 0
+    let n = len(trimmed)
+    while i < n {
+        let c = trimmed.substring(i, i + 1)
+        if c >= "0" && c <= "9" {
+            digits = digits + c
+        } else if c == "-" && len(digits) == 0 {
+            digits = digits + c
+        } else {
+            break
+        }
+        i = i + 1
+    }
+    if len(digits) == 0 { return -1 }
+    return to_int(digits)
+}
+
+fn _counter_persist(new_cycle: i64, rc: i64) -> bool {
+    let p = _counter_path()
+    let body = "{\"current_cycle\":" + to_string(new_cycle) + ",\"last_run_ts\":\"" + now_utc() + "\",\"last_rc\":" + to_string(rc) + ",\"schema\":\"nexus/state/outside_noise_cycle_counter/v1\"}\n"
+    let tmp = p + ".tmp"
+    let _ = exec("printf '%s' " + _shell_quote(body) + " > '" + tmp + "'")
+    let _ = exec("mv '" + tmp + "' '" + p + "'")
+    return _file_exists(p)
+}
+
+// ─── lock (flock-style via mkdir atomic; mac/linux portable) ──────────────
+// Uses mkdir which is filesystem-atomic on POSIX (no flock dependency).
+
+fn _lock_acquire() -> bool {
+    let lk = _counter_lock_path()
+    let rc = to_string(exec("mkdir '" + lk + "' 2>/dev/null && echo OK || echo BUSY")).trim()
+    return rc == "OK"
+}
+
+fn _lock_release() -> void {
+    let lk = _counter_lock_path()
+    let _ = exec("rmdir '" + lk + "' 2>/dev/null")
+}
+
+fn _lock_force_clear() -> void {
+    // For --check / install cleanup; do NOT call inside normal scheduler fire path
+    let lk = _counter_lock_path()
+    let _ = exec("rmdir '" + lk + "' 2>/dev/null")
+}
+
+// ─── audit JSONL ──────────────────────────────────────────────────────────
+
+fn _audit_append(cycle_n: i64, status: string, rc: i64, elapsed_ms: i64, mode: string) -> void {
+    let p = _nexus_root() + "/state/outside_noise_scheduler.jsonl"
+    let row = "{\"ts\":\"" + now_utc() + "\",\"cycle\":" + to_string(cycle_n) + ",\"status\":\"" + status + "\",\"rc\":" + to_string(rc) + ",\"elapsed_ms\":" + to_string(elapsed_ms) + ",\"mode\":\"" + mode + "\",\"schema\":\"nexus/state/outside_noise_scheduler/v1\"}\n"
+    let _ = exec("printf '%s' " + _shell_quote(row) + " >> '" + p + "'")
+}
+
+// ─── marker emit ──────────────────────────────────────────────────────────
+
+fn _emit_scheduler_marker(status: string, cycle_n: i64) -> string {
+    let dir = _nexus_root() + "/state/markers"
+    let _ = exec("mkdir -p '" + dir + "'")
+    let ts = to_string(exec("date +%s")).trim()
+    let path = dir + "/outside_noise_scheduler_" + status + "_" + to_string(cycle_n) + "_" + ts + ".marker"
+    let body = "{\"slug\":\"outside_noise_scheduler\",\"status\":\"" + status + "\",\"cycle\":" + to_string(cycle_n) + ",\"ts\":\"" + now_utc() + "\"}\n"
+    let _ = exec("printf '%s' " + _shell_quote(body) + " > '" + path + "'")
+    return path
+}
+
+// ─── handler invocation under watchdog ────────────────────────────────────
+
+fn _invoke_handler_with_watchdog(cycle_n: i64, mode: string, watchdog_sec: i64) -> i64 {
+    let handler = _nexus_root() + "/tool/handlers/outside_noise_clm_handler.hexa"
+    if !_file_exists(handler) { return 99 }
+    let mut mode_flag = ""
+    if mode == "mock" { mode_flag = "--mock" }
+    else if mode == "hf" { mode_flag = "--hf-fallback" }
+    // mode == "local" -> no extra flag (handler default)
+    // Wrap the hexa invocation in `timeout` — coreutils on linux, gtimeout on mac.
+    let timeout_bin = to_string(exec("command -v gtimeout >/dev/null 2>&1 && echo gtimeout || (command -v timeout >/dev/null 2>&1 && echo timeout || echo none)")).trim()
+    let mut cmd = ""
+    if timeout_bin == "none" {
+        // Fallback: invoke without watchdog (and warn via stderr — not fatal)
+        cmd = "env HEXA_RESOLVER_NO_REROUTE=1 hexa run " + _shell_quote(handler) + " --cycle " + to_string(cycle_n) + " " + mode_flag + " 2>&1; echo __SCHED_RC=$?"
+    } else {
+        cmd = timeout_bin + " --signal=SIGTERM " + to_string(watchdog_sec) + "s env HEXA_RESOLVER_NO_REROUTE=1 hexa run " + _shell_quote(handler) + " --cycle " + to_string(cycle_n) + " " + mode_flag + " 2>&1; echo __SCHED_RC=$?"
+    }
+    let out = to_string(exec(cmd))
+    let rc_idx = out.last_index_of("__SCHED_RC=")
+    if rc_idx < 0 { return -1 }
+    let tail = out.substring(rc_idx + 11, len(out)).trim()
+    let nl = tail.index_of("\n")
+    let rc_str = if nl >= 0 { tail.substring(0, nl).trim() } else { tail }
+    return to_int(rc_str)
+}
+
+// ─── modes ────────────────────────────────────────────────────────────────
+
+fn _check_mode() -> i64 {
+    println("[outside_noise_scheduler --check]")
+    let plist_src = _nexus_root() + "/launchd/com.nexus.outside_noise_clm.plist"
+    let plist_dst = _home() + "/Library/LaunchAgents/com.nexus.outside_noise_clm.plist"
+    let counter_p = _counter_path()
+    let lock_p = _counter_lock_path()
+    let handler = _nexus_root() + "/tool/handlers/outside_noise_clm_handler.hexa"
+
+    println("  plist source     : " + plist_src + " " + (if _file_exists(plist_src) { "[present]" } else { "[MISSING]" }))
+    println("  plist installed  : " + plist_dst + " " + (if _file_exists(plist_dst) { "[present]" } else { "[not installed]" }))
+    println("  counter          : " + counter_p + " " + (if _file_exists(counter_p) { "[present, current_cycle=" + to_string(_counter_read_current()) + "]" } else { "[uninitialized]" }))
+    let lock_present = to_string(exec("test -d '" + lock_p + "' && echo y || echo n")).trim() == "y"
+    println("  lock dir         : " + lock_p + " " + (if lock_present { "[HELD — concurrent fire blocked]" } else { "[free]" }))
+    println("  handler          : " + handler + " " + (if _file_exists(handler) { "[present]" } else { "[MISSING]" }))
+
+    // launchctl status (if launchctl exists)
+    let lctl = to_string(exec("command -v launchctl >/dev/null 2>&1 && launchctl list 2>/dev/null | grep -E '^[0-9-]+\\s+[0-9-]+\\s+com\\.nexus\\.outside_noise_clm$' || echo NOT_LOADED")).trim()
+    if lctl == "NOT_LOADED" || len(lctl) == 0 {
+        println("  launchctl        : agent NOT loaded")
+    } else {
+        println("  launchctl        : agent LOADED (" + lctl + ")")
+    }
+    return 0
+}
+
+fn _dry_run_mode(cycle_n: i64, mode: string, watchdog_sec: i64) -> i64 {
+    println("[outside_noise_scheduler --dry-run]")
+    let next = if cycle_n >= 0 { cycle_n } else { _counter_read_current() + 1 }
+    println("  plan: invoke handler --cycle " + to_string(next) + " mode=" + mode + " watchdog=" + to_string(watchdog_sec) + "s")
+    println("  counter      : " + _counter_path() + " (would update current_cycle -> " + to_string(next) + ")")
+    println("  audit row    : " + _nexus_root() + "/state/outside_noise_scheduler.jsonl (would append)")
+    println("  marker       : state/markers/outside_noise_scheduler_<status>_" + to_string(next) + "_<ts>.marker (would emit)")
+    println("  no handler invocation, no counter mutation")
+    return 0
+}
+
+fn _fire_once(forced_cycle: i64, mode: string, watchdog_sec: i64) -> i64 {
+    let _ = _counter_init_if_missing()
+    let t0_ms = to_int(_ms_epoch())
+    if !_lock_acquire() {
+        let elapsed = to_int(_ms_epoch()) - t0_ms
+        eprintln("__OUTSIDE_NOISE_SCHED__ SKIPPED cycle=? rc=1 elapsed_ms=" + to_string(elapsed))
+        _audit_append(-1, "skipped_lock", 1, elapsed, mode)
+        let _ = _emit_scheduler_marker("skipped_lock", -1)
+        return 1
+    }
+    let cur = _counter_read_current()
+    if cur < 0 {
+        _lock_release()
+        let elapsed = to_int(_ms_epoch()) - t0_ms
+        eprintln("__OUTSIDE_NOISE_SCHED__ ERROR cycle=? rc=2 elapsed_ms=" + to_string(elapsed))
+        _audit_append(-1, "counter_corrupt", 2, elapsed, mode)
+        let _ = _emit_scheduler_marker("counter_corrupt", -1)
+        return 2
+    }
+    let next_cycle = if forced_cycle >= 0 { forced_cycle } else { cur + 1 }
+    let rc = _invoke_handler_with_watchdog(next_cycle, mode, watchdog_sec)
+    let _ = _counter_persist(next_cycle, rc)
+    _lock_release()
+    let elapsed = to_int(_ms_epoch()) - t0_ms
+    let mut status = "fired"
+    if rc == 124 { status = "watchdog_killed" }  // gtimeout/timeout convention rc=124
+    else if rc == -1 { status = "no_rc" }
+    println("__OUTSIDE_NOISE_SCHED__ FIRED cycle=" + to_string(next_cycle) + " rc=" + to_string(rc) + " elapsed_ms=" + to_string(elapsed))
+    _audit_append(next_cycle, status, rc, elapsed, mode)
+    let _ = _emit_scheduler_marker(status, next_cycle)
+    if rc == 124 { return 3 }
+    return 0
+}
+
+// ─── main ─────────────────────────────────────────────────────────────────
+
+fn main() -> void {
+    let raw_args = args()
+    let mut cli = []
+    let mut ai = 2
+    let mut _scan = 0
+    let _nra = len(raw_args)
+    while _scan < _nra {
+        let _a = raw_args[_scan]
+        let _la = len(_a)
+        if _la >= 5 && _a.substring(_la - 5, _la) == ".hexa" {
+            ai = _scan + 1
+            break
+        }
+        _scan = _scan + 1
+    }
+    while ai < len(raw_args) {
+        cli.push(raw_args[ai])
+        ai = ai + 1
+    }
+
+    let mut want_check = false
+    let mut want_dry = false
+    let mut forced_cycle: i64 = -1
+    let mut mode = "mock"
+    let mut watchdog_sec: i64 = 30
+    // honor env override for dry-run (used by install integration tests)
+    let env_dry = env_var("NEXUS_SCHEDULER_DRY_RUN")
+    if env_dry == "1" || env_dry == "true" { want_dry = true }
+
+    let mut i = 0
+    while i < len(cli) {
+        let a = cli[i]
+        if a == "--check" {
+            want_check = true
+        } else if a == "--dry-run" {
+            want_dry = true
+        } else if a == "--once" {
+            // explicit single-fire (default behavior anyway)
+        } else if a == "--cycle" {
+            i = i + 1
+            if i >= len(cli) {
+                eprintln("__OUTSIDE_NOISE_SCHED__ ERROR cycle=? rc=4 elapsed_ms=0 reason=missing-cycle-arg")
+                exit(4)
+            }
+            forced_cycle = to_int(cli[i])
+        } else if a == "--mode" {
+            i = i + 1
+            if i >= len(cli) {
+                eprintln("__OUTSIDE_NOISE_SCHED__ ERROR cycle=? rc=4 elapsed_ms=0 reason=missing-mode-arg")
+                exit(4)
+            }
+            mode = cli[i]
+        } else if a == "--watchdog-sec" {
+            i = i + 1
+            if i >= len(cli) {
+                eprintln("__OUTSIDE_NOISE_SCHED__ ERROR cycle=? rc=4 elapsed_ms=0 reason=missing-watchdog-arg")
+                exit(4)
+            }
+            watchdog_sec = to_int(cli[i])
+        } else if a == "--help" || a == "-h" {
+            println("usage: hexa run nexus/tool/outside_noise_scheduler.hexa [--once] [--check] [--dry-run] [--cycle <N>] [--mode <mock|local|hf>] [--watchdog-sec <S>]")
+            println("  --check        : report install state (plist, counter, lock, agent)")
+            println("  --dry-run      : print plan; do not mutate counter or invoke handler")
+            println("  --once         : explicit single-fire (default)")
+            println("  --cycle <N>    : force a specific cycle number (skips counter increment)")
+            println("  --mode         : mock | local | hf (default mock)")
+            println("  --watchdog-sec : SIGTERM timeout for handler (default 30)")
+            println("  exit 0=fired+passthrough, 1=lock-skipped, 2=counter-corrupt, 3=watchdog-killed, 4=usage")
+            exit(0)
+        } else {
+            eprintln("__OUTSIDE_NOISE_SCHED__ ERROR cycle=? rc=4 elapsed_ms=0 reason=unknown-arg-" + a)
+            exit(4)
+        }
+        i = i + 1
+    }
+
+    if want_check {
+        let rc = _check_mode()
+        exit(rc)
+    }
+    if want_dry {
+        let rc = _dry_run_mode(forced_cycle, mode, watchdog_sec)
+        exit(rc)
+    }
+
+    let rc = _fire_once(forced_cycle, mode, watchdog_sec)
+    exit(rc)
+}

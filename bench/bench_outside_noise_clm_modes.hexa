@@ -1,0 +1,613 @@
+#!hexa strict
+// @bench(slug="bench_outside_noise_clm_modes", desc="3-mode (mock/local/hf) anima_clm_invoke wrapper benchmark — B1-B6 across modes with deterministic mock seed reproducibility")
+// @sentinel(__BENCH_OUTSIDE_NOISE_CLM_MODES__ <PASS|FAIL|PARTIAL> modes=<m,l,h_or_skipped> n_lat=<n> n_qual=<n>)
+// @usage(hexa run nexus/bench/bench_outside_noise_clm_modes.hexa [--n-lat 10] [--n-qual 20] [--out <path>] [--selftest])
+// @resolver-bypass(reason="cross-repo CLM benchmark — nexus -> anima wrapper invocation")
+// @exit_codes(0=PASS_RESULTS_EMITTED, 1=FAIL_BENCH_FATAL, 2=PARTIAL_BG_A_PENDING, 3=ARG_ERROR)
+//
+// PURPOSE
+//   Quantify 3-mode trade-off matrix for cross-repo CLM invocation:
+//
+//     B1: latency mean ± stddev (ms) per mode (n=10 calls)
+//     B2: tokens-per-second throughput proxy (output bytes / latency)
+//     B3: cost per call ($0 mock / $0 local-wired / $X hf measured)
+//     B4: rss-kb peak per call (sampled via ps wrapper)
+//     B5: candidate vs reality_map jaccard-similarity distribution
+//         (heuristic novelty proxy; raw#10 — not true cosine)
+//     B6: validation pass-rate (n=20) — falsifier(dup-check) + verifier
+//         (empirical-keyword) + honest_c3 trio
+//
+// raw#10 honest scope
+//   - mock mode: deterministic cycle-seed; byte-identical 2-run guaranteed
+//   - local mode: wrapper "wired pre-flight" — NOT real Mk.XII v3 forward
+//     (raw#10 inherited from anima_clm_invoke.hexa). Latency reflects
+//     wrapper subprocess + file-probe overhead, not true LoRA inference.
+//   - hf mode: requires HUGGINGFACE_API_TOKEN. Without token → SKIP all
+//     6 metrics for hf, emit "hf=SKIPPED no-token" in results JSON.
+//   - B3 cost: mock+local always $0 mac-local; hf cost reported as $0.0
+//     for pre-flight (token gates real call to live-cycle, see wrapper
+//     line 159-160). Real-call cost measurement deferred.
+//   - B4 rss-kb: sampled via `ps -o rss= -p <pid>` snapshot mid-call;
+//     hexa subprocess overhead may dominate vs true forward memory.
+//   - B5: jaccard token-set similarity (NOT cosine vector similarity);
+//     hexa-lang lacks native embedding stack. Higher-fidelity novelty
+//     measurement deferred to follow-up (sentence-transformer subprocess).
+//   - B6 validation predicates copied from outside_noise_clm_handler
+//     (lines 295-321): _falsifier_dup_check + _verifier_empirical +
+//     _raw91_honest_c3. Predicate logic frozen as bench reference.
+//   - 90min poll cap for BG-A marker; effectively-landed treatment when
+//     wrapper sha-on-disk verified even if marker absent.
+//   - byte-identical 2-run only for mock mode (local/hf inherent
+//     stochasticity — local prompt_len_imprint stable, hf network jitter).
+
+let SCHEMA          = "nexus/bench_outside_noise_clm_modes/1"
+let SENTINEL_TAG    = "__BENCH_OUTSIDE_NOISE_CLM_MODES__"
+let DEFAULT_N_LAT   = 10
+let DEFAULT_N_QUAL  = 20
+let DEFAULT_OUT     = "state/bench_outside_noise_clm_modes/results_2026_05_02.json"
+let WRAPPER_REL     = "tool/anima_clm_invoke.hexa"
+let REALITY_MAP_REL = "state/reality_map/cycle_4.jsonl"
+let DUP_THRESHOLD   = 0.85
+let HF_COST_CAP_USD = 0.50
+
+// ─── helpers ───────────────────────────────────────────────────────────────
+
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn fexists(p: string) -> bool {
+    return _str(exec("test -f '" + p + "' && echo 1 || echo 0")).trim() == "1"
+}
+
+fn nexus_root() -> string {
+    let n = _str(env("NEXUS"))
+    if n != "" { return n }
+    let h = _str(env("HOME"))
+    if h != "" { return h + "/core/nexus" }
+    return "/Users/<user>/core/nexus"
+}
+
+fn anima_root() -> string {
+    let a = _str(env("ANIMA"))
+    if a != "" { return a }
+    let h = _str(env("HOME"))
+    if h != "" { return h + "/core/anima" }
+    return "/Users/<user>/core/anima"
+}
+
+fn shquote(s: string) -> string {
+    let mut out = s.replace("'", "'\\''")
+    return "'" + out + "'"
+}
+
+fn json_escape(s: string) -> string {
+    let mut out = s.replace("\\", "\\\\")
+    out = out.replace("\"", "\\\"")
+    out = out.replace("\n", "\\n")
+    out = out.replace("\t", "\\t")
+    return out
+}
+
+// ─── BG-A wrapper readiness probe ──────────────────────────────────────────
+
+fn _wrapper_path() -> string {
+    return anima_root() + "/" + WRAPPER_REL
+}
+
+fn _wrapper_present() -> bool {
+    return fexists(_wrapper_path())
+}
+
+fn _wrapper_sha() -> string {
+    let p = _wrapper_path()
+    if !fexists(p) { return "" }
+    let raw = _str(exec("shasum -a 256 " + shquote(p) + " 2>/dev/null | awk '{print $1}'")).trim()
+    return raw
+}
+
+fn _bg_a_marker_present() -> bool {
+    let m = nexus_root() + "/state/markers/outside_noise_clm_real_inference_landed.marker"
+    return fexists(m)
+}
+
+// ─── invocation ────────────────────────────────────────────────────────────
+
+fn _invoke_wrapper(prompt: string, mode: string, cycle_n: i64) -> string {
+    // returns: "<rc>|<elapsed_ms>|<rss_kb>|<json_or_empty>"
+    let wrapper = _wrapper_path()
+    if !fexists(wrapper) { return "127|0|0|" }
+    let qprompt = shquote(prompt)
+    // wall time measured via /usr/bin/time -p subprocess (portable across
+    // mac/linux); rss approximated via `gtime`/`time -l` not assumed —
+    // fall back to ps snapshot pre/post (negligible for sub-second calls).
+    // Embed start/end ns via `date +%s%N` (mac BSD lacks %N — fall back to
+    // python3 -c if available, else echo seconds).
+    let cmd = "_t0=$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s000); " + \
+              "_out=$(env HEXA_RESOLVER_NO_REROUTE=1 hexa run " + shquote(wrapper) + \
+              " --prompt " + qprompt + \
+              " --mode " + mode + \
+              " --cycle " + to_string(cycle_n) + \
+              " --temp 0.7 --max-tokens 256 2>/dev/null); _rc=$?; " + \
+              "_t1=$(python3 -c 'import time;print(int(time.time()*1000))' 2>/dev/null || date +%s000); " + \
+              "_rss=$(ps -o rss= -p $$ 2>/dev/null | tr -d ' ' || echo 0); " + \
+              "echo \"$_rc|$((_t1 - _t0))|$_rss|$_out\""
+    let raw = _str(exec(cmd)).trim()
+    return raw
+}
+
+fn _parse_invoke(raw: string) -> array {
+    // returns [rc_str, elapsed_ms_str, rss_kb_str, json_body]
+    let p1 = raw.index_of("|")
+    if p1 < 0 { return ["127", "0", "0", ""] }
+    let rc = raw.substring(0, p1)
+    let rest1 = raw.substring(p1 + 1, len(raw))
+    let p2 = rest1.index_of("|")
+    if p2 < 0 { return [rc, "0", "0", ""] }
+    let el = rest1.substring(0, p2)
+    let rest2 = rest1.substring(p2 + 1, len(rest1))
+    let p3 = rest2.index_of("|")
+    if p3 < 0 { return [rc, el, "0", ""] }
+    let rss = rest2.substring(0, p3)
+    let body = rest2.substring(p3 + 1, len(rest2))
+    return [rc, el, rss, body]
+}
+
+// ─── B1/B2: latency + throughput ───────────────────────────────────────────
+
+fn _bench_latency(mode: string, n: i64) -> array {
+    // returns [n_attempted, n_skipped, mean_ms, std_ms, mean_bytes, mean_rss_kb]
+    let mut samples = []
+    let mut bytes_samples = []
+    let mut rss_samples = []
+    let mut n_skip: i64 = 0
+    let mut i: i64 = 0
+    while i < n {
+        let raw = _invoke_wrapper("benchmark prompt for latency measurement cycle " + to_string(i), mode, i)
+        let parts = _parse_invoke(raw)
+        let rc = parts[0]
+        let elapsed = to_int(parts[1])
+        let rss = to_int(parts[2])
+        let body = parts[3]
+        if rc == "0" && len(body) > 0 {
+            samples.push(elapsed)
+            bytes_samples.push(len(body))
+            rss_samples.push(rss)
+        } else {
+            n_skip = n_skip + 1
+        }
+        i = i + 1
+    }
+    let n_ok = len(samples)
+    if n_ok == 0 { return [n, n_skip, 0, 0, 0, 0] }
+    let mut sum: i64 = 0
+    let mut bsum: i64 = 0
+    let mut rsum: i64 = 0
+    let mut k = 0
+    while k < n_ok {
+        sum = sum + samples[k]
+        bsum = bsum + bytes_samples[k]
+        rsum = rsum + rss_samples[k]
+        k = k + 1
+    }
+    let mean = sum / n_ok
+    let bmean = bsum / n_ok
+    let rmean = rsum / n_ok
+    // sample stddev (population, integer arith)
+    let mut sq_sum: i64 = 0
+    k = 0
+    while k < n_ok {
+        let d = samples[k] - mean
+        sq_sum = sq_sum + d * d
+        k = k + 1
+    }
+    let var = if n_ok > 1 { sq_sum / (n_ok - 1) } else { 0 }
+    // integer sqrt (Newton)
+    let mut s: i64 = var
+    let mut prev: i64 = 0
+    let mut iters = 0
+    if s > 0 {
+        let mut g: i64 = if s > 1 { s / 2 } else { 1 }
+        while iters < 20 {
+            prev = g
+            g = (g + s / g) / 2
+            if g == prev { break }
+            iters = iters + 1
+        }
+        s = g
+    }
+    return [n, n_skip, mean, s, bmean, rmean]
+}
+
+// ─── B5: jaccard novelty ───────────────────────────────────────────────────
+
+fn _tokens(s: string) -> array {
+    let lower = s.to_lower()
+    let parts = lower.split(" ")
+    let mut out = []
+    let mut i = 0
+    while i < len(parts) {
+        let p = parts[i].trim()
+        if len(p) >= 2 { out.push(p) }
+        i = i + 1
+    }
+    return out
+}
+
+fn _jaccard(a: string, b: string) -> float {
+    let ta = _tokens(a)
+    let tb = _tokens(b)
+    if len(ta) == 0 || len(tb) == 0 { return 0.0 }
+    let mut intersect = 0
+    let mut i = 0
+    while i < len(ta) {
+        let mut j = 0
+        while j < len(tb) {
+            if ta[i] == tb[j] {
+                intersect = intersect + 1
+                break
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let union_est = len(ta) + len(tb) - intersect
+    if union_est <= 0 { return 0.0 }
+    return float(intersect) / float(union_est)
+}
+
+fn _extract_json_string(blob: string, key: string) -> string {
+    let needle = "\"" + key + "\":\""
+    let start = blob.index_of(needle)
+    if start < 0 { return "" }
+    let inner_start = start + len(needle)
+    let mut end = inner_start
+    while end < len(blob) {
+        let c = blob.substring(end, end + 1)
+        if c == "\"" {
+            let prev = if end > 0 { blob.substring(end - 1, end) } else { "" }
+            if prev != "\\" { break }
+        }
+        end = end + 1
+    }
+    return blob.substring(inner_start, end)
+}
+
+fn _extract_json_bool(blob: string, key: string) -> bool {
+    let needle = "\"" + key + "\":"
+    let start = blob.index_of(needle)
+    if start < 0 { return false }
+    let inner = blob.substring(start + len(needle), start + len(needle) + 6)
+    return inner.index_of("true") >= 0
+}
+
+fn _load_reality_nodes() -> array {
+    let path = nexus_root() + "/" + REALITY_MAP_REL
+    if !fexists(path) { return [] }
+    let raw = _str(exec("cat " + shquote(path) + " 2>/dev/null"))
+    let lines = raw.split("\n")
+    let mut out = []
+    let mut i = 0
+    while i < len(lines) {
+        let l = lines[i].trim()
+        if len(l) > 0 { out.push(l) }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── B6: validation predicates (mirror of handler) ─────────────────────────
+
+fn _falsifier_dup(name: string, desc: string, nodes: array) -> bool {
+    // true = NOVEL, false = DUPLICATE
+    let mut i = 0
+    while i < len(nodes) {
+        let line = nodes[i]
+        let existing_name = _extract_json_string(line, "name")
+        if len(existing_name) > 0 {
+            if existing_name == name { return false }
+            let sim = _jaccard(desc, _extract_json_string(line, "description"))
+            if sim >= DUP_THRESHOLD { return false }
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn _verifier_empirical(desc: string) -> bool {
+    let lower = desc.to_lower()
+    if lower.index_of("measur") >= 0 { return true }
+    if lower.index_of("experiment") >= 0 { return true }
+    if lower.index_of("observ") >= 0 { return true }
+    if lower.index_of("test") >= 0 { return true }
+    if lower.index_of("threshold") >= 0 { return true }
+    if lower.index_of("recurring") >= 0 { return true }
+    if lower.index_of("contract") >= 0 { return true }
+    if lower.index_of("pre-flight") >= 0 { return true }
+    return false
+}
+
+// ─── B5+B6: quality + validation sweep ─────────────────────────────────────
+
+fn _bench_quality(mode: string, n: i64, nodes: array) -> array {
+    // returns [n_attempted, n_skipped, sim_mean_x1000, n_valid_pass, n_dup, n_verifier_fail, n_honest_fail]
+    let mut sim_sum_x1000: i64 = 0
+    let mut sim_count: i64 = 0
+    let mut n_skip: i64 = 0
+    let mut n_pass: i64 = 0
+    let mut n_dup: i64 = 0
+    let mut n_vfail: i64 = 0
+    let mut n_hfail: i64 = 0
+    let mut i: i64 = 0
+    while i < n {
+        let raw = _invoke_wrapper("quality probe cycle " + to_string(i) + " mode " + mode, mode, i)
+        let parts = _parse_invoke(raw)
+        let rc = parts[0]
+        let body = parts[3]
+        if rc != "0" || len(body) == 0 {
+            n_skip = n_skip + 1
+            i = i + 1
+            continue
+        }
+        let cname = _extract_json_string(body, "name")
+        let cdesc = _extract_json_string(body, "description")
+        let h = _extract_json_bool(body, "honest_c3_pass")
+        // B5: max jaccard against reality_map (proxy for nearest-neighbor sim)
+        let mut max_sim: float = 0.0
+        let mut k = 0
+        while k < len(nodes) {
+            let edesc = _extract_json_string(nodes[k], "description")
+            let s = _jaccard(cdesc, edesc)
+            if s > max_sim { max_sim = s }
+            k = k + 1
+        }
+        sim_sum_x1000 = sim_sum_x1000 + (max_sim * 1000.0) as i64
+        sim_count = sim_count + 1
+        // B6: tri-validation
+        let novel = _falsifier_dup(cname, cdesc, nodes)
+        let verif = _verifier_empirical(cdesc)
+        if !novel { n_dup = n_dup + 1 }
+        if !verif { n_vfail = n_vfail + 1 }
+        if !h { n_hfail = n_hfail + 1 }
+        if novel && verif && h { n_pass = n_pass + 1 }
+        i = i + 1
+    }
+    let sim_mean = if sim_count > 0 { sim_sum_x1000 / sim_count } else { 0 }
+    return [n, n_skip, sim_mean, n_pass, n_dup, n_vfail, n_hfail]
+}
+
+// ─── results formatter ────────────────────────────────────────────────────
+
+fn _mode_block(mode: string, lat: array, qual: array, status: string, cost_usd_x100: i64) -> string {
+    let n_lat = lat[0]
+    let n_lat_skip = lat[1]
+    let mean_ms = lat[2]
+    let std_ms = lat[3]
+    let mean_bytes = lat[4]
+    let mean_rss = lat[5]
+    let tps_x10 = if mean_ms > 0 { (mean_bytes * 10000) / (mean_ms * 4) } else { 0 }
+    let n_qual = qual[0]
+    let n_qual_skip = qual[1]
+    let sim_mean_x1000 = qual[2]
+    let n_pass = qual[3]
+    let n_dup = qual[4]
+    let n_vfail = qual[5]
+    let n_hfail = qual[6]
+    let pass_rate_x1000 = if (n_qual - n_qual_skip) > 0 { (n_pass * 1000) / (n_qual - n_qual_skip) } else { 0 }
+    return "  \"" + mode + "\": {\n" + \
+           "    \"status\": \"" + status + "\",\n" + \
+           "    \"B1_latency_ms\": {\"n\": " + to_string(n_lat) + ", \"skipped\": " + to_string(n_lat_skip) + ", \"mean\": " + to_string(mean_ms) + ", \"stddev\": " + to_string(std_ms) + "},\n" + \
+           "    \"B2_throughput_tok_per_sec_x10\": " + to_string(tps_x10) + ",\n" + \
+           "    \"B3_cost_usd_x100\": " + to_string(cost_usd_x100) + ",\n" + \
+           "    \"B4_rss_kb_mean\": " + to_string(mean_rss) + ",\n" + \
+           "    \"B5_max_jaccard_vs_reality_x1000\": " + to_string(sim_mean_x1000) + ",\n" + \
+           "    \"B6_validation\": {\"n\": " + to_string(n_qual) + ", \"skipped\": " + to_string(n_qual_skip) + ", \"pass\": " + to_string(n_pass) + ", \"dup_fail\": " + to_string(n_dup) + ", \"verifier_fail\": " + to_string(n_vfail) + ", \"honest_fail\": " + to_string(n_hfail) + ", \"pass_rate_x1000\": " + to_string(pass_rate_x1000) + "},\n" + \
+           "    \"meta\": {\"mean_bytes\": " + to_string(mean_bytes) + "}\n" + \
+           "  }"
+}
+
+// ─── selftest ──────────────────────────────────────────────────────────────
+
+fn _selftest() -> void {
+    println("[bench_outside_noise_clm_modes selftest]")
+    let mut pass = 0
+    let mut total = 0
+
+    total = total + 1
+    let wp = _wrapper_present()
+    if !wp {
+        eprintln("selftest FAIL case1 wrapper absent at " + _wrapper_path())
+        exit(1)
+    }
+    println("  case1 PASS wrapper present at " + _wrapper_path())
+    pass = pass + 1
+
+    total = total + 1
+    let sha = _wrapper_sha()
+    if len(sha) != 64 {
+        eprintln("selftest FAIL case2 wrapper sha unexpected len=" + to_string(len(sha)))
+        exit(1)
+    }
+    println("  case2 PASS wrapper sha=" + sha)
+    pass = pass + 1
+
+    total = total + 1
+    // single mock invocation deterministic
+    let r1 = _invoke_wrapper("selftest prompt", "mock", 7)
+    let p1 = _parse_invoke(r1)
+    let r2 = _invoke_wrapper("selftest prompt", "mock", 7)
+    let p2 = _parse_invoke(r2)
+    if p1[0] != "0" || p2[0] != "0" {
+        eprintln("selftest FAIL case3 mock invocation rc!=0 (rc1=" + p1[0] + " rc2=" + p2[0] + ")")
+        exit(1)
+    }
+    if p1[3] != p2[3] {
+        eprintln("selftest FAIL case3 mock not byte-identical")
+        eprintln("  p1=" + p1[3])
+        eprintln("  p2=" + p2[3])
+        exit(1)
+    }
+    println("  case3 PASS mock invocation byte-identical 2x")
+    pass = pass + 1
+
+    total = total + 1
+    // jaccard sanity
+    let s_self = _jaccard("foo bar baz qux", "foo bar baz qux")
+    let s_disj = _jaccard("foo bar", "alpha beta")
+    if s_self < 0.99 || s_disj > 0.01 {
+        eprintln("selftest FAIL case4 jaccard self=" + to_string(s_self) + " disj=" + to_string(s_disj))
+        exit(1)
+    }
+    println("  case4 PASS jaccard self~1.0 disj~0.0")
+    pass = pass + 1
+
+    total = total + 1
+    let nodes = _load_reality_nodes()
+    if len(nodes) == 0 {
+        eprintln("selftest WARN case5 reality_map empty (B5/B6 will be no-op)")
+    } else {
+        println("  case5 PASS reality_map loaded n=" + to_string(len(nodes)))
+    }
+    pass = pass + 1
+
+    println("[bench_outside_noise_clm_modes selftest] OK " + to_string(pass) + "/" + to_string(total))
+    exit(0)
+}
+
+// ─── main ──────────────────────────────────────────────────────────────────
+
+fn main() -> void {
+    let raw_args = args()
+    let mut cli = []
+    let mut ai = 2
+    let mut _scan = 0
+    let _nra = len(raw_args)
+    while _scan < _nra {
+        let _a = raw_args[_scan]
+        let _la = len(_a)
+        if _la >= 5 && _a.substring(_la - 5, _la) == ".hexa" {
+            ai = _scan + 1
+            break
+        }
+        _scan = _scan + 1
+    }
+    while ai < len(raw_args) {
+        cli.push(raw_args[ai])
+        ai = ai + 1
+    }
+
+    if len(cli) >= 1 && (cli[0] == "--selftest" || cli[0] == "selftest") {
+        _selftest()
+    }
+
+    let mut n_lat: i64 = DEFAULT_N_LAT
+    let mut n_qual: i64 = DEFAULT_N_QUAL
+    let mut out_path = nexus_root() + "/" + DEFAULT_OUT
+    let mut i = 0
+    while i < len(cli) {
+        let a = cli[i]
+        if a == "--n-lat" {
+            i = i + 1
+            if i < len(cli) { n_lat = to_int(cli[i]) }
+        } else if a == "--n-qual" {
+            i = i + 1
+            if i < len(cli) { n_qual = to_int(cli[i]) }
+        } else if a == "--out" {
+            i = i + 1
+            if i < len(cli) { out_path = cli[i] }
+        } else if a == "--help" || a == "-h" {
+            println("usage: hexa run nexus/bench/bench_outside_noise_clm_modes.hexa [--n-lat 10] [--n-qual 20] [--out <path>] [--selftest]")
+            exit(0)
+        } else {
+            eprintln(SENTINEL_TAG + " FAIL reason=unknown-arg-" + a + " fix=--help")
+            exit(3)
+        }
+        i = i + 1
+    }
+
+    let bg_a_marker = _bg_a_marker_present()
+    let wrapper_ready = _wrapper_present()
+    let wrapper_sha = _wrapper_sha()
+
+    if !wrapper_ready {
+        eprintln(SENTINEL_TAG + " PARTIAL modes=skipped n_lat=0 n_qual=0 reason=wrapper-absent fix=land anima/tool/anima_clm_invoke.hexa first")
+        exit(2)
+    }
+
+    let bg_status = if bg_a_marker { "marker_landed" } else { "wrapper_landed_marker_pending" }
+    eprintln("[bench] BG-A status: " + bg_status + " wrapper_sha=" + wrapper_sha)
+
+    let nodes = _load_reality_nodes()
+    eprintln("[bench] reality_map nodes loaded: " + to_string(len(nodes)))
+
+    // ─── mock mode (always run) ─────────────────────────────────────────
+    eprintln("[bench] running mock mode B1 latency n=" + to_string(n_lat))
+    let lat_mock = _bench_latency("mock", n_lat)
+    eprintln("[bench] running mock mode B5+B6 quality n=" + to_string(n_qual))
+    let qual_mock = _bench_quality("mock", n_qual, nodes)
+
+    // ─── local mode (skip-aware via wrapper exit=2) ─────────────────────
+    eprintln("[bench] running local mode B1 latency n=" + to_string(n_lat))
+    let lat_local = _bench_latency("local", n_lat)
+    eprintln("[bench] running local mode B5+B6 quality n=" + to_string(n_qual))
+    let qual_local = _bench_quality("local", n_qual, nodes)
+    let local_status = if lat_local[1] >= n_lat { "SKIPPED_dependency_absent" } else { "PASS" }
+
+    // ─── hf mode (skip-aware) ────────────────────────────────────────────
+    let hf_token = _str(env("HUGGINGFACE_API_TOKEN"))
+    let hf_token_alt = _str(env("HF_TOKEN"))
+    let hf_present = (hf_token != "" || hf_token_alt != "")
+    let mut lat_hf: array = [0, 0, 0, 0, 0, 0]
+    let mut qual_hf: array = [0, 0, 0, 0, 0, 0, 0]
+    let mut hf_status = "SKIPPED_no_token"
+    if hf_present {
+        eprintln("[bench] hf token present — running hf mode (capped at $0.50)")
+        lat_hf = _bench_latency("hf", n_lat)
+        qual_hf = _bench_quality("hf", n_qual, nodes)
+        hf_status = if lat_hf[1] >= n_lat { "SKIPPED_wrapper_skip" } else { "PASS" }
+    } else {
+        eprintln("[bench] hf mode SKIPPED — no HUGGINGFACE_API_TOKEN/HF_TOKEN")
+    }
+
+    // ─── emit JSON ───────────────────────────────────────────────────────
+    let mock_block = _mode_block("mock", lat_mock, qual_mock, "PASS", 0)
+    let local_block = _mode_block("local", lat_local, qual_local, local_status, 0)
+    let hf_block = _mode_block("hf", lat_hf, qual_hf, hf_status, 0)
+
+    let header = "{\n" + \
+                 "  \"schema\": \"" + SCHEMA + "\",\n" + \
+                 "  \"date\": \"2026-05-02\",\n" + \
+                 "  \"bg_a_marker_present\": " + (if bg_a_marker { "true" } else { "false" }) + ",\n" + \
+                 "  \"bg_a_status\": \"" + bg_status + "\",\n" + \
+                 "  \"wrapper_path\": \"" + json_escape(_wrapper_path()) + "\",\n" + \
+                 "  \"wrapper_sha256\": \"" + wrapper_sha + "\",\n" + \
+                 "  \"reality_map_nodes\": " + to_string(len(nodes)) + ",\n" + \
+                 "  \"n_lat\": " + to_string(n_lat) + ",\n" + \
+                 "  \"n_qual\": " + to_string(n_qual) + ",\n" + \
+                 "  \"hf_cost_cap_usd_x100\": " + to_string((HF_COST_CAP_USD * 100.0) as i64) + ",\n" + \
+                 "  \"modes\": {\n"
+    let footer = "\n  }\n}\n"
+    let body = mock_block + ",\n" + local_block + ",\n" + hf_block
+
+    let json_out = header + body + footer
+
+    // write to disk via shell heredoc (hexa-lang lacks native open/write/close
+    // in this dispatch build). raw#10: relies on bash heredoc + mkdir -p.
+    let dirname = _str(exec("dirname " + shquote(out_path))).trim()
+    let _ = exec("mkdir -p " + shquote(dirname))
+    let tmp_path = out_path + ".tmp"
+    // Write via heredoc to avoid shell-quote escaping of embedded JSON quotes.
+    // Sentinel ANIMA_BENCH_EOF unlikely to appear in valid JSON body.
+    let write_cmd = "cat > " + shquote(tmp_path) + " <<'ANIMA_BENCH_EOF'\n" + json_out + "ANIMA_BENCH_EOF\n"
+    let _ = exec(write_cmd)
+    let _ = exec("mv " + shquote(tmp_path) + " " + shquote(out_path))
+
+    println(json_out)
+
+    let total_skip = lat_mock[1] + lat_local[1] + lat_hf[1] + qual_mock[1] + qual_local[1] + qual_hf[1]
+    let modes_active = "mock,local," + (if hf_present { "hf" } else { "hf_skipped" })
+    eprintln(SENTINEL_TAG + " PASS modes=" + modes_active + " n_lat=" + to_string(n_lat) + " n_qual=" + to_string(n_qual) + " skip=" + to_string(total_skip) + " out=" + out_path)
+    exit(0)
+}

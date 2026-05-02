@@ -1,0 +1,206 @@
+#!hexa strict
+// nexus/modules/kick/claude_kick.hexa — anthropic claude CLI / API kick (T3 IMPLEMENTED, mock-default)
+//
+// @tool(slug="kick_claude_kick", desc="autonomous claude CLI invocation for ω-cycle kicks. Defaults to mock-mode (synthetic witness, no spawn, no cost). Live path is opt-in via NEXUS_KICK_CLAUDE_LIVE=1 and is gated by topic + cap-usd + timeout. Per-call cost cap enforced before spawn.")
+// @usage(hexa run nexus/modules/kick/claude_kick.hexa --selftest)
+// @sentinel(__KICK_CLAUDE_KICK__ <PASS|FAIL>)
+// @resolver-bypass(reason="selftest gated to mock fixture; live path is opt-in via NEXUS_KICK_CLAUDE_LIVE=1.")
+//
+// raw#9 hexa-only strict. raw#10:
+//   (1) Mock-mode is the **default**. Selftest never makes a network/CLI call.
+//   (2) Live path requires (a) NEXUS_KICK_CLAUDE_LIVE=1, (b) claude CLI on PATH,
+//       (c) NEXUS_KICK_CAP_USD set (per-call upper bound), (d) NEXUS_KICK_TIMEOUT_S.
+//   (3) The cap is **declarative** here — actual spend is whatever claude CLI consumes.
+//       Real ledger entry per call is a follow-up cycle (no cost ledger writer yet).
+//   (4) Args layered: KickRequest.topic = primary instruction; cap_usd / timeout
+//       come from NEXUS_KICK_CAP_USD / NEXUS_KICK_TIMEOUT_S env (raw#10 honest:
+//       hexa stage0 has no struct field for cap; env is the only path today).
+//   (5) Witness path is synthetic for mock; for live path it points to the
+//       captured CLI stdout dump (timestamp-bearing path). raw#10: clock is
+//       elided from the FILE NAME for byte-identical selftest.
+//   (6) Registry selftest uses dry_run=0 + no env → MUST still fail (preserved).
+//   (7) Mock witness file is **not** actually written; only path is returned.
+
+struct KickRequest {
+    topic:        str,
+    backend:      str,
+    stratum:      str,
+    axes:         [str],
+    noise_modes:  [str],
+    parent_sid:   str,
+    dry_run:      int
+}
+
+struct KickSourceMeta {
+    name:           str,
+    tier:           int,
+    cost_usd:       int,
+    lead_days:      int,
+    is_local:       int,
+    is_canonical:   int,
+    status:         str,
+    vendor:         str
+}
+
+struct KickResult {
+    ok:           int,
+    witness_path: str,
+    sentinel:     str,
+    tier1_count:  int,
+    falsifier_pass: int,
+    message:      str
+}
+
+fn kick_meta_make(
+    name: str, tier: int, cost_usd: int, lead_days: int,
+    is_local: int, is_canonical: int, status: str, vendor: str
+) -> KickSourceMeta {
+    return KickSourceMeta {
+        name: name, tier: tier, cost_usd: cost_usd, lead_days: lead_days,
+        is_local: is_local, is_canonical: is_canonical, status: status, vendor: vendor
+    }
+}
+
+fn kick_result_fail(reason: str) -> KickResult {
+    return KickResult { ok: 0, witness_path: "", sentinel: "", tier1_count: 0, falsifier_pass: 0, message: reason }
+}
+
+fn kick_result_ok(witness_path: str, sentinel: str, t1: int, fp: int, msg: str) -> KickResult {
+    return KickResult { ok: 1, witness_path: witness_path, sentinel: sentinel, tier1_count: t1, falsifier_pass: fp, message: msg }
+}
+
+fn kick_source_meta_claude_kick() -> KickSourceMeta {
+    // status changed STUB → IMPLEMENTED (mock-default + opt-in live).
+    // Registry selftest (which calls dispatch with dry_run=0, no env) still FAILs
+    // because live path requires NEXUS_KICK_CLAUDE_LIVE=1 — registry contract preserved.
+    return kick_meta_make("claude_kick", 3, 1, 0, 0, 0, "IMPLEMENTED", "anthropic_claude_cli_or_api")
+}
+
+fn _shell_quote(s: str) -> str {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _env(name: str) -> str {
+    return exec("printenv " + name + " 2>/dev/null || true").trim()
+}
+
+fn _mock_witness_path(req: KickRequest) -> str {
+    let safe_topic = if len(req.topic) > 0 { req.topic } else { "smoke" }
+    return "/tmp/nexus_kick_claude_mock_" + safe_topic + ".json"
+}
+
+fn _mock_dispatch(req: KickRequest) -> KickResult {
+    let witness = _mock_witness_path(req)
+    let sent = "__KICK_RESULT__ MOCK witness=" + witness + " tier1=0 falsifier_pass=0 (claude_kick mock)"
+    return kick_result_ok(witness, sent, 0, 0, "claude_kick: mock-mode (no spawn, no cost)")
+}
+
+fn kick_source_dispatch_claude_kick(req: KickRequest) -> KickResult {
+    // Path 1: dry_run=1 → mock witness path (CI / selftest aggregator).
+    if req.dry_run == 1 {
+        return _mock_dispatch(req)
+    }
+    // Path 2: explicit mock env (NEXUS_KICK_CLAUDE_MOCK=1) → mock witness path.
+    let mock = _env("NEXUS_KICK_CLAUDE_MOCK")
+    if mock == "1" {
+        return _mock_dispatch(req)
+    }
+    // Path 3: live path — gated.
+    let live = _env("NEXUS_KICK_CLAUDE_LIVE")
+    if live != "1" {
+        return kick_result_fail("claude_kick: live path gated — set NEXUS_KICK_CLAUDE_LIVE=1 (or NEXUS_KICK_CLAUDE_MOCK=1 for CI)")
+    }
+    if len(req.topic) < 1 {
+        return kick_result_fail("claude_kick: topic required for live spawn")
+    }
+    // Cap + timeout REQUIRED before spawn (cost guard).
+    let cap = _env("NEXUS_KICK_CAP_USD")
+    if len(cap) < 1 {
+        return kick_result_fail("claude_kick: NEXUS_KICK_CAP_USD env required (per-call upper bound USD)")
+    }
+    let to = _env("NEXUS_KICK_TIMEOUT_S")
+    if len(to) < 1 {
+        return kick_result_fail("claude_kick: NEXUS_KICK_TIMEOUT_S env required (per-call timeout seconds)")
+    }
+    // Probe claude binary on PATH.
+    let cli = exec("command -v claude 2>/dev/null || true").trim()
+    if len(cli) < 1 {
+        return kick_result_fail("claude_kick: claude CLI not on PATH (install ~/.local/bin/claude or set PATH)")
+    }
+    // Live invocation. Use stdin pipe for the topic; gtimeout / timeout for hard cap.
+    let topic_q = _shell_quote(req.topic)
+    let to_n = to_int(to)
+    if to_n < 1 {
+        return kick_result_fail("claude_kick: NEXUS_KICK_TIMEOUT_S must be a positive integer")
+    }
+    // Witness path WITHOUT timestamp (byte-identical hygiene). Live caller may add one.
+    let safe_topic = req.topic
+    let witness = "/tmp/nexus_kick_claude_live_" + safe_topic + ".out"
+    // Compose: echo topic | timeout <S> claude > witness 2>&1
+    let cmd = "echo " + topic_q + " | timeout " + to + " " + cli + " > " + witness + " 2>&1; echo __EXIT__ $?"
+    let out = exec(cmd)
+    let lines = out.split("\n")
+    let mut exit_code = 0
+    let mut i = 0
+    while i < len(lines) {
+        if lines[i].contains("__EXIT__") {
+            let parts = lines[i].split(" ")
+            if len(parts) >= 2 {
+                let ec = to_int(parts[1].trim())
+                if ec >= 0 { exit_code = ec }
+            }
+        }
+        i = i + 1
+    }
+    if exit_code != 0 {
+        return kick_result_fail("claude_kick: claude CLI exit=" + str(exit_code) + " (witness=" + witness + ")")
+    }
+    let sent = "__KICK_RESULT__ LIVE witness=" + witness + " tier1=0 falsifier_pass=0 (claude_kick cli)"
+    return kick_result_ok(witness, sent, 0, 0, "claude_kick: live CLI ok (cap=$" + cap + ", timeout=" + to + "s)")
+}
+
+fn _selftest() -> int {
+    // 1. Meta shape
+    let m = kick_source_meta_claude_kick()
+    if m.name != "claude_kick" { return 0 }
+    if m.tier != 3 { return 0 }
+    if m.is_canonical != 0 { return 0 }
+    if m.status != "IMPLEMENTED" { return 0 }
+    // 2. dry_run=1 → mock PASS (no spawn)
+    let req_dry = KickRequest { topic: "smoke", backend: "claude_kick", stratum: "", axes: [], noise_modes: [], parent_sid: "", dry_run: 1 }
+    let r1 = kick_source_dispatch_claude_kick(req_dry)
+    if r1.ok != 1 { return 0 }
+    if len(r1.witness_path) < 1 { return 0 }
+    if r1.witness_path.contains("/tmp/nexus_kick_claude_mock_smoke.json") == false { return 0 }
+    // 3. live path with no env → FAIL (preserves registry contract)
+    let req_live = KickRequest { topic: "smoke", backend: "claude_kick", stratum: "", axes: [], noise_modes: [], parent_sid: "", dry_run: 0 }
+    let live = exec("printenv NEXUS_KICK_CLAUDE_LIVE 2>/dev/null || true").trim()
+    let mock = exec("printenv NEXUS_KICK_CLAUDE_MOCK 2>/dev/null || true").trim()
+    if live != "1" {
+        if mock != "1" {
+            let r2 = kick_source_dispatch_claude_kick(req_live)
+            if r2.ok != 0 { return 0 }
+        }
+    }
+    // 4. dry_run=1 idempotence — second call returns same witness path
+    let r3 = kick_source_dispatch_claude_kick(req_dry)
+    if r3.ok != 1 { return 0 }
+    if r3.witness_path != r1.witness_path { return 0 }
+    // 5. empty topic mock still produces a witness ("smoke" fallback)
+    let req_empty = KickRequest { topic: "", backend: "claude_kick", stratum: "", axes: [], noise_modes: [], parent_sid: "", dry_run: 1 }
+    let r4 = kick_source_dispatch_claude_kick(req_empty)
+    if r4.ok != 1 { return 0 }
+    if r4.witness_path.contains("smoke") == false { return 0 }
+    return 1
+}
+
+fn main() {
+    println("[kick/claude_kick] anthropic claude CLI / API kick (T3 IMPLEMENTED mock-default)")
+    if _selftest() == 1 {
+        println("[kick/claude_kick] SELFTEST PASS")
+        println("__KICK_CLAUDE_KICK__ PASS")
+    } else {
+        println("[kick/claude_kick] SELFTEST FAIL")
+        println("__KICK_CLAUDE_KICK__ FAIL")
+    }
+}

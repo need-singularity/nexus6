@@ -1,0 +1,194 @@
+#!hexa strict
+// nexus/core/kick/router.hexa — config-driven kick backend selection + fallback
+//
+// @tool(slug="kick_router", desc="config + env priority router for kick backends. Reads nexus/config/kick_sources.json (priority list) OR env override NEXUS_KICK_SOURCE / NEXUS_KICK_FALLBACK_CHAIN.")
+// @usage(hexa run nexus/core/kick/router.hexa --selftest)
+// @sentinel(__KICK_ROUTER__ <PASS|FAIL>)
+// @resolver-bypass(reason="self-contained dry-run path; live spawn deferred to wrapper module.")
+//
+// Default priority chain: nexus_kick → mac_kick → dispatch_router
+//   (T1 canonical first, T2 mac fallback, T0 no-spawn safety net)
+//
+// raw#9 hexa-only strict. raw#10:
+//   (1) Selftest uses dry_run=1 / dispatch_router only — no real subagent spawn.
+//   (2) Env precedence: NEXUS_KICK_SOURCE > NEXUS_KICK_FALLBACK_CHAIN > default.
+//   (3) Fallback chain silently degrades canonical-ness; consumers should
+//       inspect meta.is_canonical when ok=1.
+
+// ── struct mirror ──────────────────────────────────────────
+
+struct KickRequest {
+    topic:        str,
+    backend:      str,
+    stratum:      str,
+    axes:         [str],
+    noise_modes:  [str],
+    parent_sid:   str,
+    dry_run:      int
+}
+
+struct KickSourceMeta {
+    name:           str,
+    tier:           int,
+    cost_usd:       int,
+    lead_days:      int,
+    is_local:       int,
+    is_canonical:   int,
+    status:         str,
+    vendor:         str
+}
+
+struct KickResult {
+    ok:           int,
+    witness_path: str,
+    sentinel:     str,
+    tier1_count:  int,
+    falsifier_pass: int,
+    message:      str
+}
+
+fn kick_result_fail(reason: str) -> KickResult {
+    return KickResult { ok: 0, witness_path: "", sentinel: "", tier1_count: 0, falsifier_pass: 0, message: reason }
+}
+
+fn kick_result_ok(witness_path: str, sentinel: str, t1: int, fp: int, msg: str) -> KickResult {
+    return KickResult { ok: 1, witness_path: witness_path, sentinel: sentinel, tier1_count: t1, falsifier_pass: fp, message: msg }
+}
+
+// ── per-backend dispatch (mirror registry; dry-run safe) ────
+
+fn _route_dispatch(name: str, req: KickRequest) -> KickResult {
+    if name == "dispatch_router" {
+        let witness = "/tmp/nexus_kick_router_dryrun.json"
+        return kick_result_ok(witness, "__KICK_RESULT__ DRY witness=" + witness, 0, 0, "dispatch_router: ok")
+    }
+    if name == "nexus_kick" {
+        if req.dry_run == 1 {
+            let witness = "/tmp/nexus_kick_router_nk_dryrun.json"
+            return kick_result_ok(witness, "__KICK_RESULT__ DRY witness=" + witness, 0, 0, "nexus_kick: dry-run (router)")
+        }
+        return kick_result_fail("nexus_kick: live spawn deferred to wrapper module")
+    }
+    if name == "mac_kick" {
+        return kick_result_fail("mac_kick: WRAPPED — host claude integration audit pending")
+    }
+    if name == "claude_kick" {
+        return kick_result_fail("claude_kick: STUB — anthropic API SDK pending")
+    }
+    return kick_result_fail("unknown backend: " + name)
+}
+
+// ── Default chain ──────────────────────────────────────────
+
+fn kick_default_chain() -> [str] {
+    let mut a = []
+    a = a.push("nexus_kick")
+    a = a.push("mac_kick")
+    a = a.push("dispatch_router")
+    return a
+}
+
+// ── Resolve chain from env or default ───────────────────────
+
+fn kick_resolve_chain() -> [str] {
+    let single = exec("printenv NEXUS_KICK_SOURCE 2>/dev/null || true").trim()
+    if len(single) > 0 {
+        let mut a = []
+        a = a.push(single)
+        return a
+    }
+    let chain = exec("printenv NEXUS_KICK_FALLBACK_CHAIN 2>/dev/null || true").trim()
+    if len(chain) > 0 {
+        let parts = chain.split(",")
+        let mut a = []
+        let mut i = 0
+        while i < len(parts) {
+            let p = parts[i].trim()
+            if len(p) > 0 { a = a.push(p) }
+            i = i + 1
+        }
+        if len(a) > 0 { return a }
+    }
+    return kick_default_chain()
+}
+
+// ── Public route_dispatch ──────────────────────────────────
+
+struct KickRouteResult {
+    final_backend: str,
+    attempts:      [str],
+    reasons:       [str],
+    result:        KickResult
+}
+
+fn kick_route_dispatch(req: KickRequest) -> KickRouteResult {
+    let chain = kick_resolve_chain()
+    let mut attempts = []
+    let mut reasons = []
+    let mut i = 0
+    while i < len(chain) {
+        let name = chain[i]
+        attempts = attempts.push(name)
+        let r = _route_dispatch(name, req)
+        if r.ok == 1 {
+            reasons = reasons.push("ok")
+            return KickRouteResult {
+                final_backend: name,
+                attempts: attempts,
+                reasons: reasons,
+                result: r
+            }
+        }
+        reasons = reasons.push(r.message)
+        i = i + 1
+    }
+    return KickRouteResult {
+        final_backend: "",
+        attempts: attempts,
+        reasons: reasons,
+        result: kick_result_fail("router: all backends in chain failed")
+    }
+}
+
+// ── Selftest ───────────────────────────────────────────────
+
+fn _selftest_router() -> int {
+    let dc = kick_default_chain()
+    if len(dc) != 3 { return 0 }
+    if dc[0] != "nexus_kick" { return 0 }
+    if dc[2] != "dispatch_router" { return 0 }
+    let rc = kick_resolve_chain()
+    if len(rc) < 1 { return 0 }
+    // direct dispatch_router
+    let req = KickRequest { topic: "smoke", backend: "dispatch_router", stratum: "", axes: [], noise_modes: [], parent_sid: "", dry_run: 1 }
+    let r1 = _route_dispatch("dispatch_router", req)
+    if r1.ok != 1 { return 0 }
+    // unknown FAIL
+    let r2 = _route_dispatch("not_a_backend", req)
+    if r2.ok != 0 { return 0 }
+    // route_dispatch with default chain — nexus_kick dry-run wins
+    let route = kick_route_dispatch(req)
+    if route.result.ok != 1 { return 0 }
+    if len(route.attempts) < 1 { return 0 }
+    return 1
+}
+
+fn main() {
+    println("[kick/router] config-driven backend selection + fallback chain")
+    if _selftest_router() == 1 {
+        println("[kick/router] SELFTEST PASS")
+        println("__KICK_ROUTER__ PASS")
+    } else {
+        println("[kick/router] SELFTEST FAIL")
+        println("__KICK_ROUTER__ FAIL")
+    }
+    let req = KickRequest { topic: "demo", backend: "", stratum: "", axes: [], noise_modes: [], parent_sid: "", dry_run: 1 }
+    let route = kick_route_dispatch(req)
+    println("[kick/router] route_dispatch demo")
+    println("[kick/router]   attempts=" + str(len(route.attempts)) + " final_backend=" + route.final_backend)
+    let mut i = 0
+    while i < len(route.attempts) {
+        println("[kick/router]   try[" + str(i) + "] " + route.attempts[i] + " -> " + route.reasons[i])
+        i = i + 1
+    }
+}

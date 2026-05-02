@@ -1,0 +1,450 @@
+#!hexa strict
+// bench/bench_outside_noise_scheduler.hexa — scheduler-side benchmarks (B1..B6)
+//
+// @tool(slug="bench_outside_noise_scheduler", desc="measure scheduler latency / drift / overhead / 24h projection / crash recovery / lock contention")
+// @sentinel(__BENCH_OUTSIDE_NOISE_SCHED__ <PASS|FAIL> b1=<ms> b2=<jitter_pct> b3=<ms> b4=<count> b5=<ms> b6=<n>)
+// @usage(hexa run nexus/bench/bench_outside_noise_scheduler.hexa [--out <path>] [--quick] [--n <samples>])
+// @resolver-bypass(reason="bench fires real scheduler in mock mode")
+// @exit_codes(0=bench-complete, 1=write-fail, 2=usage)
+//
+// Measurements (mock mode only; no real CLM):
+//   B1 — scheduler trigger latency: time from `hexa run scheduler` start to handler
+//        invocation start, mean/stddev over n samples
+//   B2 — cycle interval drift: requested 1s vs measured interval over n iterations,
+//        coefficient of variation in pct
+//   B3 — scheduler overhead: per-fire elapsed_ms minus handler-only time
+//   B4 — 24h projected cycle count: sustained rate * 86400 (extrapolation honest)
+//   B5 — crash recovery: kill scheduler mid-fire, verify next fire succeeds + measure
+//        recovery latency
+//   B6 — lock contention: n parallel attempts, count how many succeed (target = 1)
+//
+// Output: deterministic JSON to results.json (byte-identical 2-run via timestamp elision
+// + sample-set replacement with summary stats only).
+
+fn _home() -> string {
+    let h = env_var("HOME")
+    if len(h) > 0 { return h }
+    return to_string(exec("echo $HOME")).trim()
+}
+
+fn _nexus_root() -> string {
+    let override = env_var("NEXUS_CORE_ROOT")
+    if len(override) > 0 { return override + "/nexus" }
+    return _home() + "/core/nexus"
+}
+
+fn _shell_quote(s: string) -> string {
+    let mut r = s.replace("'", "'\\''")
+    return "'" + r + "'"
+}
+
+fn _ms_epoch() -> i64 {
+    let g = to_string(exec("command -v gdate >/dev/null 2>&1 && gdate +%s%3N || date +%s000")).trim()
+    return to_int(g)
+}
+
+fn _file_exists(p: string) -> bool {
+    return to_string(exec("test -f '" + p + "' && echo y || echo n")).trim() == "y"
+}
+
+// ─── stats helpers ─────────────────────────────────────────────────────────
+
+fn _i64_mean(xs: array) -> i64 {
+    if len(xs) == 0 { return 0 }
+    let mut s: i64 = 0
+    let mut i = 0
+    while i < len(xs) {
+        s = s + to_int(to_string(xs[i]))
+        i = i + 1
+    }
+    return s / to_int(to_string(len(xs)))
+}
+
+fn _i64_stddev(xs: array, mean: i64) -> i64 {
+    if len(xs) <= 1 { return 0 }
+    let mut sq: i64 = 0
+    let mut i = 0
+    while i < len(xs) {
+        let v = to_int(to_string(xs[i]))
+        let d = v - mean
+        sq = sq + (d * d)
+        i = i + 1
+    }
+    // integer sqrt via bisection
+    let mean_sq = sq / to_int(to_string(len(xs) - 1))
+    let mut lo: i64 = 0
+    let mut hi: i64 = mean_sq + 1
+    while lo + 1 < hi {
+        let mid = (lo + hi) / 2
+        if mid * mid <= mean_sq { lo = mid } else { hi = mid }
+    }
+    return lo
+}
+
+fn _i64_min(xs: array) -> i64 {
+    if len(xs) == 0 { return 0 }
+    let mut m: i64 = to_int(to_string(xs[0]))
+    let mut i = 1
+    while i < len(xs) {
+        let v = to_int(to_string(xs[i]))
+        if v < m { m = v }
+        i = i + 1
+    }
+    return m
+}
+
+fn _i64_max(xs: array) -> i64 {
+    if len(xs) == 0 { return 0 }
+    let mut m: i64 = to_int(to_string(xs[0]))
+    let mut i = 1
+    while i < len(xs) {
+        let v = to_int(to_string(xs[i]))
+        if v > m { m = v }
+        i = i + 1
+    }
+    return m
+}
+
+// ─── B1: scheduler trigger latency ─────────────────────────────────────────
+// We measure end-to-end scheduler --cycle <forced> elapsed_ms (already part of
+// sentinel output). This is the fire latency from invocation to completion;
+// stripping handler time gives B3.
+
+fn _bench_b1(n: i64, base_cycle: i64) -> array {
+    // returns [array of elapsed_ms samples, array of handler_rc]
+    let mut elapsed_samples = []
+    let mut rc_samples = []
+    let scheduler = _nexus_root() + "/tool/outside_noise_scheduler.hexa"
+    let mut i: i64 = 0
+    while i < n {
+        let cycle_n = base_cycle + i
+        let cmd = "env HEXA_RESOLVER_NO_REROUTE=1 hexa run '" + scheduler + "' --cycle " + to_string(cycle_n) + " --mode mock --watchdog-sec 15 2>&1"
+        let out = to_string(exec(cmd))
+        // parse elapsed_ms from sentinel
+        let key = "elapsed_ms="
+        let kp = out.last_index_of(key)
+        if kp >= 0 {
+            let after = out.substring(kp + len(key), len(out))
+            let mut digits = ""
+            let mut j = 0
+            let na = len(after)
+            while j < na {
+                let c = after.substring(j, j + 1)
+                if c >= "0" && c <= "9" { digits = digits + c }
+                else { break }
+                j = j + 1
+            }
+            if len(digits) > 0 { elapsed_samples.push(digits) }
+        }
+        let key2 = "rc="
+        let kp2 = out.last_index_of(key2)
+        if kp2 >= 0 {
+            let after2 = out.substring(kp2 + len(key2), len(out))
+            let mut digits2 = ""
+            let mut j2 = 0
+            let na2 = len(after2)
+            // allow optional minus
+            let first2 = after2.substring(0, 1)
+            if first2 == "-" { digits2 = digits2 + "-"; j2 = 1 }
+            while j2 < na2 {
+                let c2 = after2.substring(j2, j2 + 1)
+                if c2 >= "0" && c2 <= "9" { digits2 = digits2 + c2 }
+                else { break }
+                j2 = j2 + 1
+            }
+            if len(digits2) > 0 { rc_samples.push(digits2) }
+        }
+        i = i + 1
+    }
+    return [elapsed_samples, rc_samples]
+}
+
+// ─── B2: cycle interval drift ─────────────────────────────────────────────
+// Fires n scheduler invocations with target 1s spacing (sleep between),
+// records actual interval ms; CV = stddev/mean*100
+
+fn _bench_b2(n: i64, base_cycle: i64, target_ms: i64) -> array {
+    let scheduler = _nexus_root() + "/tool/outside_noise_scheduler.hexa"
+    let mut intervals = []
+    let mut prev_t: i64 = -1
+    let mut i: i64 = 0
+    while i < n {
+        // raw#10: keep cycle range close to base so handler prev_cycle walk stays bounded
+        let cycle_n = base_cycle + 20 + i  // distinct cycle range to avoid B1 conflict
+        let cmd = "env HEXA_RESOLVER_NO_REROUTE=1 hexa run '" + scheduler + "' --cycle " + to_string(cycle_n) + " --mode mock --watchdog-sec 10 >/dev/null 2>&1"
+        let _ = exec(cmd)
+        let now_ms = _ms_epoch()
+        if prev_t >= 0 {
+            intervals.push(to_string(now_ms - prev_t))
+        }
+        prev_t = now_ms
+        // sleep for target_ms - typical fire takes ~1s already so subtract
+        if target_ms > 0 {
+            let _ = exec("sleep " + to_string(float(target_ms) / 1000.0))
+        }
+        i = i + 1
+    }
+    return intervals
+}
+
+// ─── B3: scheduler overhead = total - handler-only ────────────────────────
+// We invoke handler directly and measure its time, subtract from B1 mean.
+
+fn _bench_b3_handler_baseline(n: i64, base_cycle: i64) -> array {
+    // raw#10: must use cycle range CLOSE to current_cycle so handler's
+    // prev_cycle backward-walk (file_exists loop) does not dominate measurement;
+    // re-using same cycle base as B1 means handler cycles already exist as
+    // markers but reality_map gap is tiny.
+    let handler = _nexus_root() + "/tool/handlers/outside_noise_clm_handler.hexa"
+    let mut samples = []
+    let mut i: i64 = 0
+    while i < n {
+        // offset just past the B1+B2 ranges (B1 uses base_cycle..+n,
+        // B2 uses base_cycle+1000..+1000+n) — pick base_cycle+10 area
+        let cycle_n = base_cycle + 10 + i
+        let t0 = _ms_epoch()
+        let cmd = "env HEXA_RESOLVER_NO_REROUTE=1 hexa run '" + handler + "' --cycle " + to_string(cycle_n) + " --mock >/dev/null 2>&1"
+        let _ = exec(cmd)
+        let t1 = _ms_epoch()
+        samples.push(to_string(t1 - t0))
+        i = i + 1
+    }
+    return samples
+}
+
+// ─── B5: crash recovery ───────────────────────────────────────────────────
+// Force a stale lock (mkdir the lock dir manually), then fire scheduler
+// (should SKIP). Then clear lock and fire again (should FIRE). Measure
+// recovery latency from clear -> next FIRED.
+
+fn _bench_b5_crash_recovery(base_cycle: i64) -> array {
+    let lock = _nexus_root() + "/state/outside_noise_cycle_counter.lock"
+    let scheduler = _nexus_root() + "/tool/outside_noise_scheduler.hexa"
+    // 1) acquire lock (simulating crashed scheduler that left stale lock)
+    let _ = exec("mkdir '" + lock + "' 2>/dev/null")
+    // 2) attempt fire — expected SKIP
+    let cmd1 = "env HEXA_RESOLVER_NO_REROUTE=1 hexa run '" + scheduler + "' --cycle " + to_string(base_cycle + 30) + " --mode mock --watchdog-sec 10 2>&1"
+    let out1 = to_string(exec(cmd1))
+    let skip_ok = out1.index_of("SKIPPED") >= 0
+    // 3) clear lock (simulate manual cleanup)
+    let t_clear = _ms_epoch()
+    let _ = exec("rmdir '" + lock + "' 2>/dev/null")
+    // 4) fire again — expected FIRE
+    let cmd2 = "env HEXA_RESOLVER_NO_REROUTE=1 hexa run '" + scheduler + "' --cycle " + to_string(base_cycle + 31) + " --mode mock --watchdog-sec 10 2>&1"
+    let out2 = to_string(exec(cmd2))
+    let t_fired = _ms_epoch()
+    let fired_ok = out2.index_of("FIRED") >= 0
+    let recovery_ms = t_fired - t_clear
+    let res = []
+    res.push(if skip_ok { "1" } else { "0" })
+    res.push(if fired_ok { "1" } else { "0" })
+    res.push(to_string(recovery_ms))
+    return res
+}
+
+// ─── B6: lock contention ──────────────────────────────────────────────────
+// Spawn n parallel scheduler invocations via single sh with `&` chain + wait;
+// only 1 should successfully FIRE, rest must SKIP. Uses sh-level parallelism
+// because hexa exec() blocks and `&` inside a single exec call serializes.
+
+fn _bench_b6_contention(n: i64, base_cycle: i64) -> array {
+    let scheduler = _nexus_root() + "/tool/outside_noise_scheduler.hexa"
+    let cycle_n = base_cycle + 50
+    let outdir = _nexus_root() + "/state/bench/outside_noise_scheduler"
+    let _ = exec("mkdir -p '" + outdir + "'")
+    // Build single multi-fork command line; rely on sh's & + wait
+    let mut cmd = "set +e; "
+    let mut i: i64 = 0
+    while i < n {
+        let tmp = outdir + "/_b6_" + to_string(i) + ".out"
+        cmd = cmd + "(env HEXA_RESOLVER_NO_REROUTE=1 hexa run '" + scheduler + "' --cycle " + to_string(cycle_n) + " --mode mock --watchdog-sec 10 > '" + tmp + "' 2>&1) & "
+        i = i + 1
+    }
+    cmd = cmd + "wait"
+    let _ = exec(cmd)
+    // count fired vs skipped
+    let mut fired: i64 = 0
+    let mut skipped: i64 = 0
+    let mut k: i64 = 0
+    while k < n {
+        let p = outdir + "/_b6_" + to_string(k) + ".out"
+        let raw = to_string(exec("cat '" + p + "' 2>/dev/null"))
+        if raw.index_of("FIRED") >= 0 { fired = fired + 1 }
+        else if raw.index_of("SKIPPED") >= 0 { skipped = skipped + 1 }
+        let _ = exec("rm -f '" + p + "'")
+        k = k + 1
+    }
+    let res = []
+    res.push(to_string(n))
+    res.push(to_string(fired))
+    res.push(to_string(skipped))
+    return res
+}
+
+// ─── results emission ─────────────────────────────────────────────────────
+
+fn _emit_results(out_path: string,
+                 b1_mean: i64, b1_stddev: i64, b1_min: i64, b1_max: i64, b1_n: i64,
+                 b2_mean: i64, b2_stddev: i64, b2_target_ms: i64, b2_n: i64,
+                 b3_handler_mean: i64, b3_overhead_mean: i64,
+                 b4_rate_per_sec_milli: i64, b4_24h_count: i64,
+                 b5_skip_ok: i64, b5_fired_ok: i64, b5_recovery_ms: i64,
+                 b6_n: i64, b6_fired: i64, b6_skipped: i64) -> bool {
+    let mut body = "{\n"
+    body = body + "  \"schema\": \"nexus/bench/outside_noise_scheduler/v1\",\n"
+    body = body + "  \"date\": \"2026-05-02\",\n"
+    body = body + "  \"environment\": \"mac-local-mock\",\n"
+    body = body + "  \"b1_trigger_latency_ms\": {\"mean\": " + to_string(b1_mean) + ", \"stddev\": " + to_string(b1_stddev) + ", \"min\": " + to_string(b1_min) + ", \"max\": " + to_string(b1_max) + ", \"n\": " + to_string(b1_n) + "},\n"
+    body = body + "  \"b2_interval_drift\": {\"mean_ms\": " + to_string(b2_mean) + ", \"stddev_ms\": " + to_string(b2_stddev) + ", \"target_ms\": " + to_string(b2_target_ms) + ", \"n\": " + to_string(b2_n) + "},\n"
+    body = body + "  \"b3_overhead_ms\": {\"handler_only_mean\": " + to_string(b3_handler_mean) + ", \"scheduler_overhead\": " + to_string(b3_overhead_mean) + "},\n"
+    body = body + "  \"b4_24h_projection\": {\"rate_per_sec_milli\": " + to_string(b4_rate_per_sec_milli) + ", \"projected_24h_count\": " + to_string(b4_24h_count) + ", \"design_doc_estimate\": 4000, \"caveat\": \"extrapolation-from-short-window\"},\n"
+    body = body + "  \"b5_crash_recovery\": {\"stale_lock_skip_ok\": " + to_string(b5_skip_ok) + ", \"post_clear_fired_ok\": " + to_string(b5_fired_ok) + ", \"recovery_ms\": " + to_string(b5_recovery_ms) + "},\n"
+    body = body + "  \"b6_lock_contention\": {\"parallel_attempts\": " + to_string(b6_n) + ", \"fired\": " + to_string(b6_fired) + ", \"skipped\": " + to_string(b6_skipped) + ", \"expected_fired\": 1}\n"
+    body = body + "}\n"
+    let tmp = out_path + ".tmp"
+    let _ = exec("printf '%s' " + _shell_quote(body) + " > '" + tmp + "'")
+    let _ = exec("mv '" + tmp + "' '" + out_path + "'")
+    return _file_exists(out_path)
+}
+
+// ─── main ────────────────────────────────────────────────────────────────
+
+fn main() -> void {
+    let raw_args = args()
+    let mut cli = []
+    let mut ai = 2
+    let mut _scan = 0
+    let _nra = len(raw_args)
+    while _scan < _nra {
+        let _a = raw_args[_scan]
+        let _la = len(_a)
+        if _la >= 5 && _a.substring(_la - 5, _la) == ".hexa" {
+            ai = _scan + 1
+            break
+        }
+        _scan = _scan + 1
+    }
+    while ai < len(raw_args) {
+        cli.push(raw_args[ai])
+        ai = ai + 1
+    }
+
+    let mut out_path = _nexus_root() + "/state/bench/outside_noise_scheduler/results_2026_05_02.json"
+    let mut n_samples: i64 = 5
+    let mut quick = false
+    let mut i = 0
+    while i < len(cli) {
+        let a = cli[i]
+        if a == "--out" {
+            i = i + 1
+            if i >= len(cli) {
+                eprintln("usage: --out requires path")
+                exit(2)
+            }
+            out_path = cli[i]
+        } else if a == "--n" {
+            i = i + 1
+            n_samples = to_int(cli[i])
+        } else if a == "--quick" {
+            quick = true
+            n_samples = 3
+        } else if a == "--help" || a == "-h" {
+            println("usage: hexa run nexus/bench/bench_outside_noise_scheduler.hexa [--out <path>] [--n <samples>] [--quick]")
+            exit(0)
+        } else {
+            eprintln("usage: unknown-arg-" + a)
+            exit(2)
+        }
+        i = i + 1
+    }
+
+    println("[bench_outside_noise_scheduler]")
+    println("  out: " + out_path)
+    println("  n: " + to_string(n_samples) + (if quick { " (quick)" } else { "" }))
+    let _ = exec("mkdir -p '" + _nexus_root() + "/state/bench/outside_noise_scheduler'")
+
+    // Use a "bench cycle base" close to current absorbed cycle so handler's
+    // prev_cycle backward-walk (file_exists in a loop) stays bounded — large
+    // gaps trigger O(N) shell exec which hides scheduler cost.
+    let counter_p = _nexus_root() + "/state/outside_noise_cycle_counter.json"
+    let mut bench_base: i64 = 7
+    if _file_exists(counter_p) {
+        let raw = to_string(exec("cat '" + counter_p + "' 2>/dev/null"))
+        let key = "\"current_cycle\":"
+        let kp = raw.index_of(key)
+        if kp >= 0 {
+            let after = raw.substring(kp + len(key), len(raw))
+            let trimmed = after.trim()
+            let mut digits = ""
+            let mut k = 0
+            let n2 = len(trimmed)
+            while k < n2 {
+                let c = trimmed.substring(k, k + 1)
+                if c >= "0" && c <= "9" { digits = digits + c }
+                else { break }
+                k = k + 1
+            }
+            if len(digits) > 0 { bench_base = to_int(digits) + 2 }
+        }
+    }
+
+    println("  B1 scheduler trigger latency...")
+    let b1_pair = _bench_b1(n_samples, bench_base)
+    let b1_samples = b1_pair[0]
+    let _b1_rc = b1_pair[1]
+    let b1_mean = _i64_mean(b1_samples)
+    let b1_stddev = _i64_stddev(b1_samples, b1_mean)
+    let b1_min = _i64_min(b1_samples)
+    let b1_max = _i64_max(b1_samples)
+    println("    mean=" + to_string(b1_mean) + "ms stddev=" + to_string(b1_stddev) + "ms min=" + to_string(b1_min) + " max=" + to_string(b1_max) + " n=" + to_string(len(b1_samples)))
+
+    println("  B2 interval drift...")
+    let b2_target_ms: i64 = 100
+    let b2_intervals = _bench_b2(n_samples, bench_base, b2_target_ms)
+    let b2_mean = _i64_mean(b2_intervals)
+    let b2_stddev = _i64_stddev(b2_intervals, b2_mean)
+    println("    mean_interval=" + to_string(b2_mean) + "ms stddev=" + to_string(b2_stddev) + "ms target=" + to_string(b2_target_ms) + "+fire-time")
+
+    println("  B3 scheduler overhead (handler baseline)...")
+    let b3_handler = _bench_b3_handler_baseline(n_samples, bench_base)
+    let b3_handler_mean = _i64_mean(b3_handler)
+    let b3_overhead = b1_mean - b3_handler_mean
+    println("    handler_only_mean=" + to_string(b3_handler_mean) + "ms scheduler_overhead=" + to_string(b3_overhead) + "ms")
+
+    println("  B4 24h projection...")
+    // sustained rate = 1 fire per (b1_mean + ~1s sleep gap real interval). Use measured b2_mean.
+    let avg_interval_ms = if b2_mean > 0 { b2_mean } else { b1_mean + 100 }
+    // rate_per_sec * 1000 = milli rate → integer math
+    let rate_per_sec_milli = if avg_interval_ms > 0 { 1000000 / avg_interval_ms } else { 0 }
+    let projected_24h = if avg_interval_ms > 0 { (86400 * 1000) / avg_interval_ms } else { 0 }
+    println("    rate=" + to_string(rate_per_sec_milli) + "milli/sec projected_24h=" + to_string(projected_24h) + " (design_estimate=4000)")
+
+    println("  B5 crash recovery...")
+    let b5 = _bench_b5_crash_recovery(bench_base)
+    let b5_skip_ok = to_int(to_string(b5[0]))
+    let b5_fired_ok = to_int(to_string(b5[1]))
+    let b5_recovery = to_int(to_string(b5[2]))
+    println("    stale_lock_skip=" + to_string(b5_skip_ok) + " post_clear_fired=" + to_string(b5_fired_ok) + " recovery_ms=" + to_string(b5_recovery))
+
+    println("  B6 lock contention...")
+    let b6_n: i64 = 5
+    let b6 = _bench_b6_contention(b6_n, bench_base)
+    let b6_total = to_int(to_string(b6[0]))
+    let b6_fired = to_int(to_string(b6[1]))
+    let b6_skipped = to_int(to_string(b6[2]))
+    println("    parallel=" + to_string(b6_total) + " fired=" + to_string(b6_fired) + " skipped=" + to_string(b6_skipped) + " (expected fired=1)")
+
+    let ok = _emit_results(out_path,
+                           b1_mean, b1_stddev, b1_min, b1_max, len(b1_samples),
+                           b2_mean, b2_stddev, b2_target_ms, len(b2_intervals),
+                           b3_handler_mean, b3_overhead,
+                           rate_per_sec_milli, projected_24h,
+                           b5_skip_ok, b5_fired_ok, b5_recovery,
+                           b6_total, b6_fired, b6_skipped)
+    if !ok {
+        eprintln("__BENCH_OUTSIDE_NOISE_SCHED__ FAIL b1=" + to_string(b1_mean) + " b2=" + to_string(b2_stddev) + " b3=" + to_string(b3_overhead) + " b4=" + to_string(projected_24h) + " b5=" + to_string(b5_recovery) + " b6=" + to_string(b6_fired))
+        exit(1)
+    }
+    println("__BENCH_OUTSIDE_NOISE_SCHED__ PASS b1=" + to_string(b1_mean) + " b2=" + to_string(b2_stddev) + " b3=" + to_string(b3_overhead) + " b4=" + to_string(projected_24h) + " b5=" + to_string(b5_recovery) + " b6=" + to_string(b6_fired))
+    exit(0)
+}
