@@ -765,7 +765,7 @@ _emit_all_routes_blocked_trailer() {
     # → slot probe → full bypass.
     echo "  fix:" >&2
     echo "    1) clear neg_cache: rm -f /tmp/hexa_resolver.connectivity" >&2
-    echo "    2) probe slots: hexa run /Users/ghost/core/hive/tool/claude_slot_pick.hexa --probe-all" >&2
+    echo "    2) probe slots: hexa run $HIVE/tool/claude_slot_pick.hexa --probe-all" >&2
     echo "    3) connectivity check: for h in $_chain; do ssh -o ConnectTimeout=5 -o BatchMode=yes \$h 'echo OK' 2>/dev/null && echo \"\$h: OK\" || echo \"\$h: FAIL\"; done" >&2
     echo "    4) full bypass: HEXA_RESOLVER_NO_REROUTE=1 nexus kick run <topic>" >&2
     echo "  ref: raw:ai-native-error-message + nexus/.guide § Cross-host parity matrix" >&2
@@ -890,6 +890,21 @@ else
     _best_gpu_avail=0
     _best_gpu_util=0
     _healthy_hosts=""
+    # Round-robin tier (2026-05-03): when the highest-score host equals the
+    # last-picked host, prefer a tier-eligible alternative (score within
+    # ±HEXA_REMOTE_TIER_PCT of the best). Closes the monotonic-favor case
+    # where score margins of a few percent kept routing to the same host
+    # repeatedly. Defaults: tier=10%, last-pick file under /tmp.
+    _tier_pct="${HEXA_REMOTE_TIER_PCT:-10}"
+    _last_pick_file="${HEXA_REMOTE_LAST_PICK_FILE:-/tmp/hexa_remote_last_pick.txt}"
+    _last_pick=""
+    [ -f "$_last_pick_file" ] && _last_pick="$(cat "$_last_pick_file" 2>/dev/null | head -1 | tr -d '[:space:]')"
+    _best_host_excl_last=""
+    _best_score_excl_last=-1
+    _best_avail_excl_last=-1
+    _best_psi_excl_last=""
+    _best_gpu_avail_excl_last=0
+    _best_gpu_util_excl_last=0
     # Sub-AX GPU-class threshold for LB-pick filter — match L8 admission
     # default (8192MB) so picker rejects in advance instead of L8 reject
     # without fallback. Override: HEXA_REMOTE_GPU_PICK_MIN_MB.
@@ -906,13 +921,13 @@ else
     # instead of raw free RAM). Bypass: HEXA_REMOTE_LEGACY_LB_PICK=1.
     for cand in $FALLBACK_CHAIN; do
         # 2026-04-28 user directive '로그인 실패건은 작동에서 제외':
-        # Skip hosts listed in /Users/ghost/.hx/state/oauth_blacklisted_hosts.jsonl
+        # Skip hosts listed in $HOME/.hx/state/oauth_blacklisted_hosts.jsonl
         # (1 host per JSONL row, "host":"<name>" field). Cleared by
         # oauth_refresh_detector on REFRESH_HEALTHY events. Bypass:
         # HEXA_REMOTE_NO_OAUTH_BLACKLIST=1 (test only).
         if [ "${HEXA_REMOTE_NO_OAUTH_BLACKLIST:-0}" != "1" ] && \
-           [ -f /Users/ghost/.hx/state/oauth_blacklisted_hosts.jsonl ]; then
-            if grep -q "\"host\":\"$cand\"" /Users/ghost/.hx/state/oauth_blacklisted_hosts.jsonl 2>/dev/null; then
+           [ -f $HOME/.hx/state/oauth_blacklisted_hosts.jsonl ]; then
+            if grep -q "\"host\":\"$cand\"" $HOME/.hx/state/oauth_blacklisted_hosts.jsonl 2>/dev/null; then
                 echo "hexa_remote: oauth-blacklist skip — host=$cand (~/.hx/state/oauth_blacklisted_hosts.jsonl); clear via oauth_refresh_detector REFRESH_HEALTHY" >&2
                 continue
             fi
@@ -972,8 +987,38 @@ else
                 _best_gpu_util="$_cand_gpu_util"
                 _best_host="$cand"
             fi
+            # Round-robin track: best candidate that ISN'T the last_pick.
+            # Used after the loop to swap the winner if best_host == last_pick
+            # AND the alternative is within tier_pct of best_score.
+            if [ "$cand" != "$_last_pick" ] && [ "$_cand_score" -gt "$_best_score_excl_last" ] 2>/dev/null; then
+                _best_score_excl_last="$_cand_score"
+                _best_avail_excl_last="$_cand_avail"
+                _best_psi_excl_last="$_cand_psi"
+                _best_gpu_avail_excl_last="$_cand_gpu"
+                _best_gpu_util_excl_last="$_cand_gpu_util"
+                _best_host_excl_last="$cand"
+            fi
         fi
     done
+    # Round-robin tier swap: if best == last_pick AND alternative is within
+    # ±tier_pct of best_score, prefer the alternative to spread load. Disable:
+    # HEXA_REMOTE_NO_TIER_RR=1.
+    if [ "${HEXA_REMOTE_NO_TIER_RR:-0}" != "1" ] \
+       && [ -n "$_best_host" ] && [ -n "$_last_pick" ] && [ "$_best_host" = "$_last_pick" ] \
+       && [ -n "$_best_host_excl_last" ] && [ "$_best_score" -gt 0 ] 2>/dev/null; then
+        _tier_threshold=$(( _best_score * (100 - _tier_pct) / 100 ))
+        if [ "$_best_score_excl_last" -ge "$_tier_threshold" ] 2>/dev/null; then
+            echo "hexa_remote: tier-rr swap from $_best_host (score=$_best_score, was last_pick) to $_best_host_excl_last (score=$_best_score_excl_last, threshold=$_tier_threshold)" >&2
+            _best_host="$_best_host_excl_last"
+            _best_score="$_best_score_excl_last"
+            _best_avail="$_best_avail_excl_last"
+            _best_psi="$_best_psi_excl_last"
+            _best_gpu_avail="$_best_gpu_avail_excl_last"
+            _best_gpu_util="$_best_gpu_util_excl_last"
+        fi
+    fi
+    # Persist last_pick for the next invocation's round-robin decision.
+    [ -n "$_best_host" ] && echo "$_best_host" > "$_last_pick_file" 2>/dev/null
     # Sub-AX fallback: if class=gpu AND no GPU host passed filter, fall
     # through to legacy avail-only pick + warn. Operator can then use
     # HEXA_REMOTE_GPU_MIN_AVAIL_MB=2048 (smaller workload) or NO_GPU_ADMISSION.
@@ -1845,14 +1890,14 @@ else
     _SD_CHECK='command -v systemd-run >/dev/null 2>&1 && [ -d "/run/user/$(id -u)" ]'
     _SD_WRAP="export XDG_RUNTIME_DIR=\"/run/user/\$(id -u)\"; systemd-run --user --scope --quiet -p MemoryMax=$_MEM_MAX -p MemoryHigh=$_MEM_HIGH -p TasksMax=512 -- sh -c 'echo 500 > /proc/self/oom_score_adj 2>/dev/null; exec ${_REMOTE_LOCK_PREFIX}\"\$@\"' --"
 fi
-# 2026-04-25: no-sync mode path rewrite — Mac $HOME/.hx/* (e.g. /Users/ghost/.hx/
-# packages/nexus/cli/run.hexa) 는 원격의 $HOME (hetzner=/root, ubu=/home/summer)
+# 2026-04-25: no-sync mode path rewrite — Mac $HOME/.hx/* (e.g. <mac-home>/.hx/
+# packages/nexus/cli/run.hexa) 는 원격의 $HOME (hetzner=<remote-root>, ubu=<remote-summer>)
 # 에서 유효하지 않음. Mac-home-absolute 를 unquoted literal $HOME/.hx/ 로 재작성
 # → printf %q 가 \$HOME 로 escape → 원격 shell 에서 expand.
 # sshfs 마운트 우회로 Mac 경로가 remote 에 접근 가능한 호스트 (ubu2 mac_home) 도
 # 있지만, hetzner 같은 non-sshfs 호스트는 반드시 path rewrite 필요.
-# Path rewrite: Mac-absolute $HOME/.hx/* 는 remote $HOME 이 다르므로 (hetzner=/root,
-# ubu=/home/summer) remote shell 에서 expand 돼야 함. printf %q 가 $ 를 \$ 로 escape
+# Path rewrite: Mac-absolute $HOME/.hx/* 는 remote $HOME 이 다르므로 (hetzner=<remote-root>,
+# ubu=<remote-summer>) remote shell 에서 expand 돼야 함. printf %q 가 $ 를 \$ 로 escape
 # 하면 remote 에서 literal '$HOME' 이 되어 실패 → 해당 arg 는 quote_args 우회,
 # "$HOME/.hx/..." 형태 double-quoted remote literal 로 직접 주입.
 _ARG_QUOTED=''
