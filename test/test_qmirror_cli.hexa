@@ -1,0 +1,212 @@
+// test/test_qmirror_cli.hexa — CLI surface tests for cli/qmirror.hexa
+//
+// Targets: U1 (qrng --json includes bytes_hex/tier_used/mode) and U3 (--quiet)
+// from orpheus/docs/upstream_qmirror_improvements_2026_05_04.ai.md.
+//
+// Invocation:
+//   cd ~/core/nexus && hexa run test/test_qmirror_cli.hexa
+//
+// Exit:
+//   0 = PASS (all assertions hold)
+//   1 = FAIL (any assertion failed — see __TEST_QMIRROR_CLI__ FAIL line)
+//
+// What it asserts (exec-based; runs the actual CLI as subprocess):
+//
+//   T1.  qrng --bits=64 --json --quiet
+//        → stdout is single-line JSON
+//        → contains bytes_hex (non-empty hex string, length == 16)
+//        → contains tier_used non-empty
+//        → contains mode in {"mock","live"}
+//        → stderr is non-empty (preamble + module raw output went there)
+//
+//   T2.  qrng --bits=64 --json (no --quiet)
+//        → stdout has BOTH human preamble lines AND the JSON tail
+//          (preamble line "nexus qmirror qrng" present + JSON line present)
+//
+//   T3.  qrng --bits=8 --json --quiet
+//        → bytes_hex length == 2 (1 byte of hex)
+//
+//   T4.  qrng --quiet (no --json) → stderr advisory; human preamble still on stdout
+//        → human path NOT broken (raw#10 backward compat)
+//
+// raw#9 honored — no .py invoked. Pure hexa via $NX/bin/hexa.
+
+let HOME = env("HOME")
+let NEXUS_ENV = env("NEXUS")
+fn _nx() -> str {
+    if NEXUS_ENV.len() > 0 { return NEXUS_ENV }
+    return HOME + "/core/nexus"
+}
+let NX = _nx()
+let HEXA = NX + "/bin/hexa"
+let CLI  = NX + "/cli/qmirror.hexa"
+
+fn _shq(s: str) -> str {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+// Run the qmirror CLI with given args; return (stdout, stderr) via tmp files.
+struct RunResult { stdout: str, stderr: str }
+
+let mut _CALL_COUNTER: int = 0
+
+fn _run_cli(extra: [str]) -> RunResult {
+    _CALL_COUNTER = _CALL_COUNTER + 1
+    let tag = str(_CALL_COUNTER)
+    let out_path = "/tmp/test_qmirror_cli." + tag + ".out"
+    let err_path = "/tmp/test_qmirror_cli." + tag + ".err"
+    // HEXA_LOCAL=1 forces local execution so the inner subprocess does not
+    // bounce to docker / remote (where $NX/bin/hexa is absent).
+    let mut cmd = "HEXA_LOCAL=1 " + _shq(HEXA) + " run " + _shq(CLI)
+    for x in extra {
+        cmd = cmd + " " + _shq(x)
+    }
+    cmd = cmd + " >" + _shq(out_path) + " 2>" + _shq(err_path)
+    exec(cmd)
+    let so = exec("cat " + _shq(out_path) + " 2>/dev/null").trim()
+    let se = exec("cat " + _shq(err_path) + " 2>/dev/null").trim()
+    return RunResult { stdout: so, stderr: se }
+}
+
+let mut _PASS: int = 0
+let mut _FAIL: int = 0
+let mut _LOG: [str] = []
+
+fn _check(label: str, ok: bool, detail: str) {
+    if ok {
+        _PASS = _PASS + 1
+        _LOG = _LOG + ["PASS " + label]
+    } else {
+        _FAIL = _FAIL + 1
+        _LOG = _LOG + ["FAIL " + label + " :: " + detail]
+    }
+}
+
+// Extract a quoted string value following `"key":"` from a JSON line.
+// Returns "" if not found. Naive but sufficient for our flat objects.
+fn _json_str_field(line: str, key: str) -> str {
+    let needle = "\"" + key + "\":\""
+    let idx = line.find(needle)
+    if idx < 0 { return "" }
+    let start = idx + needle.len()
+    // Find next unescaped quote.
+    let rest = line.substr(start, line.len() - start)
+    let close = rest.find("\"")
+    if close < 0 { return "" }
+    return rest.substr(0, close)
+}
+
+// Lowercase-hex sanity check (orpheus contract: bytes_hex is /[0-9a-f]*/).
+fn _is_lower_hex(s: str) -> bool {
+    if s.len() == 0 { return false }
+    let chars = "0123456789abcdef"
+    let mut i = 0
+    while i < s.len() {
+        let c = s.substr(i, 1)
+        if chars.find(c) < 0 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn _t1_qrng_quiet_json() {
+    let r = _run_cli(["qrng", "--bits=64", "--json", "--quiet"])
+    // stdout = single JSON line.
+    let out_lines = r.stdout.split("\n")
+    let mut json_line = ""
+    for ln in out_lines {
+        let t = ln.trim()
+        if t.starts_with("{") { json_line = t }
+    }
+    _check("T1.json_present", json_line.len() > 0, "stdout had no JSON line; stdout=" + r.stdout)
+
+    let bh = _json_str_field(json_line, "bytes_hex")
+    _check("T1.bytes_hex_nonempty", bh.len() > 0, "bytes_hex empty in: " + json_line)
+    _check("T1.bytes_hex_length_16", bh.len() == 16, "expected 16 hex chars (64 bits / 8 = 8 bytes), got " + str(bh.len()) + " :: '" + bh + "'")
+    _check("T1.bytes_hex_lower_hex", _is_lower_hex(bh), "non-hex chars in bytes_hex='" + bh + "'")
+
+    let tu = _json_str_field(json_line, "tier_used")
+    _check("T1.tier_used_nonempty", tu.len() > 0, "tier_used empty in: " + json_line)
+
+    let md = _json_str_field(json_line, "mode")
+    let mode_ok = if md == "mock" { true } else { md == "live" }
+    _check("T1.mode_valid", mode_ok, "mode not in {mock,live}: '" + md + "'")
+
+    // stderr should contain the preamble (non-empty + has 'nexus qmirror qrng')
+    _check("T1.stderr_has_preamble", r.stderr.contains("nexus qmirror qrng"), "stderr lacks preamble; stderr=" + r.stderr)
+    // Critical: preamble MUST NOT have leaked to stdout.
+    _check("T1.stdout_no_preamble", r.stdout.contains("4-tier fallback") == false, "preamble leaked to stdout; stdout=" + r.stdout)
+}
+
+fn _t2_qrng_json_no_quiet() {
+    let r = _run_cli(["qrng", "--bits=64", "--json"])
+    // stdout has BOTH preamble line AND JSON line.
+    _check("T2.stdout_has_preamble", r.stdout.contains("nexus qmirror qrng"), "stdout lacks preamble; stdout=" + r.stdout)
+
+    let out_lines = r.stdout.split("\n")
+    let mut json_line = ""
+    for ln in out_lines {
+        let t = ln.trim()
+        if t.starts_with("{") { json_line = t }
+    }
+    _check("T2.stdout_has_json_tail", json_line.len() > 0, "stdout lacks JSON tail; stdout=" + r.stdout)
+
+    let bh = _json_str_field(json_line, "bytes_hex")
+    _check("T2.json_has_bytes_hex", bh.len() > 0, "bytes_hex missing in: " + json_line)
+}
+
+fn _t3_qrng_8bits() {
+    let r = _run_cli(["qrng", "--bits=8", "--json", "--quiet"])
+    let out_lines = r.stdout.split("\n")
+    let mut json_line = ""
+    for ln in out_lines {
+        let t = ln.trim()
+        if t.starts_with("{") { json_line = t }
+    }
+    let bh = _json_str_field(json_line, "bytes_hex")
+    _check("T3.bytes_hex_length_2", bh.len() == 2, "expected 2 hex chars (8 bits = 1 byte), got " + str(bh.len()) + " :: '" + bh + "'")
+}
+
+fn _t4_quiet_without_json() {
+    let r = _run_cli(["status", "--quiet"])
+    // Human path preserved → stdout has the cond table.
+    _check("T4.human_path_preserved", r.stdout.contains("closure 8/8 cond"), "human stdout lost; stdout=" + r.stdout)
+    // Stderr has the advisory.
+    _check("T4.advisory_on_stderr", r.stderr.contains("--quiet ignored"), "stderr lacks --quiet advisory; stderr=" + r.stderr)
+}
+
+fn main() {
+    println("[test_qmirror_cli] start — CLI=" + CLI)
+
+    // Skip-when-sandboxed: this test exec()s the CLI as a subprocess. If the
+    // hexa runtime routed us through docker / remote, $NX/bin/hexa may be
+    // mounted but unrunnable (Mac-shell-script + Linux container shell
+    // mismatch), so the inner `hexa run` returns "sh: ... not found". In
+    // that case every assertion would falsely FAIL. Probe by exec-ing a
+    // trivial hexa command and checking for the resolver header. If absent,
+    // bail with a SKIP marker (re-invoke under HEXA_LOCAL=1 for real test).
+    let probe = exec(_shq(HEXA) + " --help 2>&1 | head -1").trim()
+    let probe_ok = if probe.contains("HEXA") { true } else { probe.contains("hexa-resolver") }
+    if probe_ok == false {
+        println("[test_qmirror_cli] SKIP — hexa bin not invokable from sandbox; re-run with HEXA_LOCAL=1")
+        println("[test_qmirror_cli]   probe='" + probe + "'")
+        println("__TEST_QMIRROR_CLI__ SKIP_SANDBOXED")
+        return
+    }
+
+    _t1_qrng_quiet_json()
+    _t2_qrng_json_no_quiet()
+    _t3_qrng_8bits()
+    _t4_quiet_without_json()
+
+    println("")
+    for ln in _LOG { println("  " + ln) }
+    println("")
+    println("[test_qmirror_cli] PASS=" + str(_PASS) + " FAIL=" + str(_FAIL))
+    if _FAIL == 0 {
+        println("__TEST_QMIRROR_CLI__ PASS")
+    } else {
+        println("__TEST_QMIRROR_CLI__ FAIL")
+        exit(1)
+    }
+}
