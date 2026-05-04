@@ -80,7 +80,7 @@
 ```
 1. 새 host class 등록
    ~/.workspace 에 host.rpi5-akida 자원 추가
-   nexus kick run 시 "low-power-inference" 라벨 = 자동 라우팅
+   nexus kick 시 "low-power-inference" 라벨 = 자동 라우팅
 
 2. ouroboros_qrng + Akida 융합
    sim_bridge/ouroboros_qrng 가 ANU 양자수 받아 Akida 스파이크 시드
@@ -146,7 +146,7 @@ T1-N26 black-hole boundary encoding
 2. M.2 슬롯 Akida AKD1000 카드 확인
 3. Meta TF SDK 설치 + 예제 모델 검증
 4. ~/.workspace 에 host.rpi5-akida 자원 등재 (raw 40 5-class 활성화)
-5. nexus kick run "low-power" 라우팅 테스트
+5. nexus kick "low-power" 라우팅 테스트
 ```
 
 ### Week 1: sim_bridge 도구 통합

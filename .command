@@ -38,9 +38,9 @@ command drill engines "F6 DRILL_GAP divergent seed 발사 (N>=3 angles)"
   handler cli/run.hexa
   entry drill
   shim yes
-  why kick stratum 으로 통합 (kick run --stratum drill) 이지만 단독 호출 호환 보존.
+  why kick stratum 으로 통합 (kick <topic> --stratum drill) 이지만 단독 호출 호환 보존.
   proof cli/run.hexa (drill subcommand 분기)
-  note kick 의 L2 stratum 으로 absorbed — 새 작업은 `nexus kick run <topic> --stratum drill` 권장.
+  note kick 의 L2 stratum 으로 absorbed — 새 작업은 `nexus kick <topic> --stratum drill` 권장.
 
 command atlas audit "atlas.n6 검색/추가 — 외부접근 §3 독점 subcmd"
   keywords atlas 지도 atlas.n6
