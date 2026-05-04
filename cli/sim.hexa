@@ -1,0 +1,388 @@
+// nexus/cli/sim.hexa — sim subcommand router (REFACTORED 2026-05-04)
+//
+// REFACTOR NOTE (anima cycle, 2026-05-04):
+//   This router is a thin pass-through to the standalone sim-universe CLI.
+//   Mirrors the qmirror precedent (nexus_qmirror_cli_refactor 2026-05-03 +
+//   legacy-removed 2026-05-03; commit f81239d6 "qmirror as standalone CLI
+//   dependency, legacy in-tree removed").
+//
+//       nexus sim <subcmd> [flags...]
+//          ↓
+//       sim-universe <subcmd> [flags...]   (standalone CLI from need-singularity/sim-universe)
+//
+//   The standalone CLI lives at one of (4-tier resolution, standalone-only):
+//     1. $SIM_UNIVERSE_ROOT (env override)             ← preferred
+//     2. /Users/ghost/core/sim-universe                 ← Mac dev convention
+//     3. $HOME/core/sim-universe                        ← user-home convention
+//     4. PATH-resolved `sim-universe` binary            ← hx-installed
+//
+//   In-tree directory $NEXUS/modules/sim/ is REMOVED as of v0.1.0
+//   (it was an empty directory placeholder from prior triplet landing).
+//   The legacy library at $NEXUS/core/sim/ {sim_main,registry,router,source}.hexa
+//   is preserved as-is — it is a separate library surface, not a CLI subcommand
+//   dispatcher, and has no external nexus consumers (verified by audit
+//   2026-05-04 — only self-references within core/sim/).
+//
+// Invoked via:  nexus sim <subcmd> [flags...]
+//   ─ via wrapper bin/nexus-cli → engine/nexus_cli.hexa cmd_sim →
+//     this script. Pure delegation: NO logic duplication; nexus-side adds only
+//     a one-line preamble + audit log; ALL subcmd logic lives in the standalone.
+//
+// Subcommands (forwarded verbatim to standalone):
+//   status     — module inventory + tier table + caveats
+//   anu        — anu_time τ-clock mini_world demo                [Tier-A]
+//   multiverse — multiverse interferometer + KS-test demo        [Tier-A]
+//   qrng       — ouroboros QRNG perturbation comparison          [Tier-A2]
+//   bostrom    — Bostrom test harness (anu_collector)            [Tier-B]
+//   godel      — Gödel-Q mutator bootstrap demo                  [Tier-A2]
+//   selftest   — quick smoke pass over Tier-A modules
+//
+// CHANGELOG:
+//   v0.1.0 (2026-05-04) — Initial router. Standalone-only (4-tier resolution);
+//                         hard fail with `hx install sim-universe` hint when
+//                         missing. Empty $NEXUS/modules/sim/ placeholder
+//                         deleted. Mirrors qmirror v0.3.0 pattern (commit
+//                         f81239d6 — single-step legacy-removal collapse).
+//
+// Constraints honored:
+//   raw#9   — hexa-only (no .py created); standalone manages its own bridges
+//   raw#15  — write-confined (audit log only on nexus side)
+//   raw#10  — 5 honest C3 caveats embedded in `cmd_help`
+//
+// Cost: $0 (Mac local; live ANU only on SIM_UNIVERSE_LIVE=1 opt-in).
+//
+// @no-lock-needed
+// @resolver-bypass(reason="Pure local CLI router; standalone manages its own bridges.")
+
+let VERSION = "0.1.0"  // initial: standalone-only sim-universe shellout
+
+// ─── env / path resolve ───
+
+let HOME = env("HOME")
+let NEXUS = env("NEXUS")
+let SIM_UNIVERSE_ROOT_ENV = env("SIM_UNIVERSE_ROOT")
+
+fn nexus_root() -> str {
+    if NEXUS.len() > 0 { return NEXUS }
+    return HOME + "/core/nexus"  // @allow-devpath
+}
+
+let NX = nexus_root()
+let HEXA_BIN = NX + "/bin/hexa"
+let LOG_PATH = NX + "/logs/nexus_cli.log"
+
+// ─── arg helpers ───
+
+fn shq(s: str) -> str {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn has_flag(a: [str], flag: str) -> bool {
+    let prefix = flag + "="
+    for x in a {
+        if x == flag { return true }
+        if x.starts_with(prefix) { return true }
+    }
+    return false
+}
+
+fn json_mode(a: [str]) -> bool {
+    return has_flag(a, "--json")
+}
+
+// ─── quiet-mode plumbing (mirror qmirror U3 — orpheus programmatic consumption) ───
+
+let mut _QUIET: bool = false
+
+fn _quiet() -> bool { return _QUIET }
+
+fn _p(s: str) {
+    if _QUIET { eprintln(s) } else { println(s) }
+}
+
+fn _e(s: str) { eprintln(s) }
+
+fn quiet_mode(a: [str]) -> bool {
+    return has_flag(a, "--quiet")
+}
+
+// ─── audit log (jsonl) ───
+
+fn _ts_now() -> str {
+    return exec("date -u '+%Y-%m-%dT%H:%M:%SZ'").trim()
+}
+
+fn _audit(subcmd: str, args_str: str, exit_code: int, route: str) {
+    let line = "{\"ts\":\"" + _ts_now() + "\",\"caller\":\"sim_router\",\"subcmd\":\"sim " +
+               subcmd + "\",\"args\":\"" + args_str.replace("\"", "\\\"") +
+               "\",\"exit_code\":" + str(exit_code) +
+               ",\"route\":\"" + route + "\"" +
+               ",\"router_version\":\"" + VERSION + "\"}"
+    exec("echo " + shq(line) + " >> " + shq(LOG_PATH) + " 2>/dev/null")
+}
+
+// ─── path / invocation resolution ───
+
+fn _file_exists(p: str) -> bool {
+    let r = exec("[ -f " + shq(p) + " ] && echo yes || echo no").trim()
+    return r == "yes"
+}
+
+// Resolution order (v0.1.0 — standalone-only, 4 tiers):
+//   1. $SIM_UNIVERSE_ROOT env
+//   2. /Users/ghost/core/sim-universe
+//   3. $HOME/core/sim-universe
+//   4. PATH-resolved `sim-universe`
+//
+// Returns shape: "<route>|<command-prefix>"
+//   route ∈ { "standalone-env", "standalone-mac", "standalone-home",
+//             "standalone-path", "none" }
+//   command-prefix is the prefix for the subcmd to be appended (no trailing space).
+fn _resolve_sim_invocation() -> str {
+    // 1. $SIM_UNIVERSE_ROOT env
+    if SIM_UNIVERSE_ROOT_ENV.len() > 0 {
+        let cli = SIM_UNIVERSE_ROOT_ENV + "/cli/sim-universe.hexa"
+        if _file_exists(cli) {
+            return "standalone-env|SIM_UNIVERSE_ROOT=" + shq(SIM_UNIVERSE_ROOT_ENV) + " " + shq(HEXA_BIN) + " run " + shq(cli)
+        }
+    }
+    // 2. Mac dev convention
+    let mac_root = "/Users/ghost/core/sim-universe"
+    let mac_cli = mac_root + "/cli/sim-universe.hexa"
+    if _file_exists(mac_cli) {
+        return "standalone-mac|SIM_UNIVERSE_ROOT=" + shq(mac_root) + " " + shq(HEXA_BIN) + " run " + shq(mac_cli)
+    }
+    // 3. $HOME/core/sim-universe
+    let home_root = HOME + "/core/sim-universe"
+    let home_cli = home_root + "/cli/sim-universe.hexa"
+    if _file_exists(home_cli) {
+        return "standalone-home|SIM_UNIVERSE_ROOT=" + shq(home_root) + " " + shq(HEXA_BIN) + " run " + shq(home_cli)
+    }
+    // 4. PATH-resolved sim-universe binary
+    let path_bin = exec("command -v sim-universe 2>/dev/null || true").trim()
+    if path_bin.len() > 0 {
+        return "standalone-path|" + shq(path_bin)
+    }
+    return "none|"
+}
+
+// Strip the trailing "__NEXUS_SIM_RC__:N" line from raw exec output before printing.
+fn _strip_rc_trailer(raw: str) -> str {
+    let lines = raw.split("\n")
+    let mut out = ""
+    let mut k = 0
+    while k < lines.len() {
+        let l = lines[k]
+        if l.trim().starts_with("__NEXUS_SIM_RC__:") == false {
+            if out.len() > 0 { out = out + "\n" }
+            out = out + l
+        }
+        k = k + 1
+    }
+    return out
+}
+
+// Forward: invoke standalone sim-universe with subcmd + extra args.
+// Returns "<route>|<exit_code>". Streams output via direct exec; terminal pipes inherit.
+//
+// (v0.1.0) Hard fail when none of the 4 standalone tiers resolve — no silent
+// fallback. Operator must explicitly install/locate sim-universe.
+fn _forward(sub: str, extra: [str]) -> str {
+    let resolved = _resolve_sim_invocation()
+    let parts = resolved.split("|")
+    let route = parts[0]
+    let prefix = if parts.len() >= 2 { parts[1] } else { "" }
+
+    if route == "none" {
+        _e("nexus sim: ERROR — sim-universe standalone not found (4-tier resolution failed)")
+        _e("  tier 1 ($SIM_UNIVERSE_ROOT env)              : not set or invalid")
+        _e("  tier 2 (/Users/ghost/core/sim-universe)      : not found")
+        _e("  tier 3 ($HOME/core/sim-universe)             : not found")
+        _e("  tier 4 (PATH `sim-universe`)                 : not found")
+        _e("")
+        _e("  remediation: install via `hx install sim-universe`,")
+        _e("               or set $SIM_UNIVERSE_ROOT to a checkout of need-singularity/sim-universe,")
+        _e("               or clone to /Users/ghost/core/sim-universe (Mac dev convention).")
+        _e("")
+        _e("  NOTE: nexus sim is a thin shellout router — there is NO in-tree fallback.")
+        _e("  The legacy $NEXUS/modules/sim/ placeholder has been REMOVED as of v0.1.0.")
+        _audit(sub, "no-sim-universe-found", 127, "none")
+        return route + "|127"
+    }
+
+    // standalone-{env,mac,home,path}
+    let mut cmd = prefix + " " + shq(sub)
+    for x in extra {
+        cmd = cmd + " " + shq(x)
+    }
+    let full = cmd + "; echo \"__NEXUS_SIM_RC__:$?\""
+    let raw = exec(full + " 2>&1")
+    let mut rc = 0
+    let lines = raw.split("\n")
+    let mut k = 0
+    while k < lines.len() {
+        let l = lines[k].trim()
+        if l.starts_with("__NEXUS_SIM_RC__:") {
+            rc = to_int(l.substr(17, l.len() - 17))
+        }
+        k = k + 1
+    }
+    print(_strip_rc_trailer(raw))
+    let extra_summary = ""
+    let mut e_i = 0
+    let mut es = ""
+    while e_i < extra.len() {
+        if e_i > 0 { es = es + " " }
+        es = es + extra[e_i]
+        e_i = e_i + 1
+    }
+    _audit(sub, es, rc, route)
+    return route + "|" + str(rc)
+}
+
+// ─── help ───
+
+fn cmd_help() {
+    println("nexus sim " + VERSION + " — virtual universe simulation subcommand router")
+    println("")
+    println("usage: nexus sim <subcmd> [flags...]")
+    println("")
+    println("ROUTING (v0.1.0 — standalone-only, 4-tier):")
+    println("  This router shells out to the sim-universe standalone CLI.")
+    println("  Resolution order:")
+    println("    1. $SIM_UNIVERSE_ROOT env")
+    println("    2. /Users/ghost/core/sim-universe")
+    println("    3. $HOME/core/sim-universe")
+    println("    4. PATH-resolved `sim-universe` binary")
+    println("  (no in-tree fallback — hard fail if none resolve.)")
+    println("")
+    println("subcommands (forwarded verbatim to standalone):")
+    println("  status                                  module inventory + tier table + caveats")
+    println("  anu [--ticks=N]                         anu_time τ-clock mini_world demo  [Tier-A]")
+    println("  multiverse [--m=M --t=T]                multiverse interferometer + KS    [Tier-A]")
+    println("  qrng [--bits=N]                         ouroboros QRNG perturbation       [Tier-A2]")
+    println("  bostrom                                 Bostrom test (anu_collector)      [Tier-B]")
+    println("  godel                                   Gödel-Q mutator bootstrap         [Tier-A2]")
+    println("  selftest [--quick]                      Tier-A smoke pass")
+    println("")
+    println("global flags (forwarded):")
+    println("  --json     machine-parseable JSON tail")
+    println("  --quiet    (with --json) route preamble/raw to stderr; only JSON tail to stdout")
+    println("  --help,-h  this help (router-level) OR forwarded subhelp")
+    println("")
+    println("env (consumed by standalone — set in caller environment):")
+    println("  SIM_UNIVERSE_ROOT       override repo root for resolution tier 1")
+    println("  SIM_UNIVERSE_ANU_KEY    ANU Quantum Numbers API key (T1.b free-keyed tier)")
+    println("  SIM_UNIVERSE_LIVE       1 → enable live ANU tiers (default: urandom mock)")
+    println("")
+    println("--- caveats (raw#10 C3) ---")
+    println("  1. sim-universe CLI must be on PATH/env: this router is a thin shellout — if")
+    println("     no tier resolves, exit 127 with a structured error. Pre-flight: ensure")
+    println("     `hx install sim-universe` or set $SIM_UNIVERSE_ROOT.")
+    println("  2. Version-pin rigid: nexus declares sim-universe ^1.0.0 in hexa.toml.")
+    println("     Standalone CLI version skew (e.g. 1.x → 2.x) may break the 7-subcmd")
+    println("     surface forwarded here; router does not validate semver at runtime.")
+    println("  3. Refactor smoke test sequential: this router was first-landed via a")
+    println("     7-subcmd serial probe (status → anu → multiverse → qrng → bostrom → godel")
+    println("     → selftest); concurrent invocations were not exercised under the")
+    println("     refactor smoke. Streaming behavior under parallel calls is unverified.")
+    println("  4. Registry collision check: hexa-lang/tool/pkg/registry.tsv L23 `sim-universe`")
+    println("     entry was added in this cycle; a future pkg-manager rebuild that resolves")
+    println("     entries by name only (not name+repo) could shadow if a third-party")
+    println("     publishes a same-named pkg. Mitigation: registry sources prioritize the")
+    println("     `repo` column.")
+    println("  5. Fresh-install path untested: the `hx install sim-universe` step in")
+    println("     install.hexa Phase 1 is gated on `command -v sim-universe`; on a clean")
+    println("     machine where neither tier-2 nor tier-3 has the repo cloned and hx is")
+    println("     not on PATH, bootstrap exits with WARN (non-fatal). User must clone")
+    println("     manually OR install hexa-lang first.")
+    println("")
+    println("cost estimate (Mac local): $0 — all subcmds run mock by default.")
+    println("                           live ANU only via env opt-in (SIM_UNIVERSE_LIVE=1).")
+}
+
+fn cmd_subhelp(sub: str) {
+    // Forward --help to standalone for accurate per-subcmd help text.
+    let _ = _forward(sub, ["--help"])
+}
+
+// ─── main ───
+
+fn main() {
+    // argv shape (Mac stage interpreter):  [argv0, script, sub, flags...]
+    // OR  (Linux):  [argv0, "run", script, sub, flags...]
+    let _raw = args()
+    let mut _sidx = -1
+    let mut _i = 0
+    while _i < _raw.len() {
+        if _raw[_i].ends_with(".hexa") { _sidx = _i; break }
+        _i = _i + 1
+    }
+    let mut _user_start = 2
+    if _sidx >= 0 { _user_start = _sidx + 1 }
+
+    let mut a: [str] = ["nexus_sim_cli", "sim_router"]
+    let mut _ua = _user_start
+    while _ua < _raw.len() {
+        a = a + [_raw[_ua]]
+        _ua = _ua + 1
+    }
+    let n = len(a)
+
+    if n < 3 {
+        cmd_help()
+        return
+    }
+
+    let sub = a[2]
+
+    // quiet-mode (router-side, mostly informational; standalone manages its own).
+    if quiet_mode(a) {
+        if json_mode(a) {
+            _QUIET = true
+        } else {
+            _e("nexus sim: --quiet ignored (only meaningful with --json)")
+        }
+    }
+
+    // help dispatch
+    if has_flag(a, "--help") || has_flag(a, "-h") {
+        if sub == "--help" || sub == "-h" || sub == "help" {
+            cmd_help()
+        } else {
+            cmd_subhelp(sub)
+        }
+        return
+    }
+
+    if sub == "help" { cmd_help(); return }
+
+    // Subcmd whitelist (preserve nexus-side surface — mirror sim-universe 7).
+    let mut valid = false
+    if sub == "status"     { valid = true }
+    if sub == "anu"        { valid = true }
+    if sub == "multiverse" { valid = true }
+    if sub == "qrng"       { valid = true }
+    if sub == "bostrom"    { valid = true }
+    if sub == "godel"      { valid = true }
+    if sub == "selftest"   { valid = true }
+    if valid == false {
+        _e("nexus sim: unknown subcommand '" + sub + "'")
+        _e("run 'nexus sim help' for usage")
+        _audit(sub, "", 2, "rejected")
+        exit(2)
+    }
+
+    // Collect extras (everything after the subcmd).
+    let mut extras: [str] = []
+    let mut e_i = 3
+    while e_i < n {
+        extras = extras + [a[e_i]]
+        e_i = e_i + 1
+    }
+
+    let result = _forward(sub, extras)
+    let parts = result.split("|")
+    let rc = if parts.len() >= 2 { to_int(parts[1]) } else { 0 }
+    if rc != 0 { exit(rc) }
+}

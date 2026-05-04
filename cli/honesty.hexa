@@ -1,0 +1,306 @@
+// nexus/cli/honesty.hexa — honesty-monitor subcommand router (shellout to standalone)
+//
+// REFACTOR NOTE (anima cycle, 2026-05-04):
+//   This router shells out to the standalone honesty-monitor CLI:
+//
+//       nexus honesty <subcmd> [flags...]
+//          ↓
+//       honesty-monitor <subcmd> [flags...]   (standalone CLI from need-singularity/honesty-monitor)
+//
+//   The standalone CLI lives at one of (4-tier resolution, mirroring qmirror):
+//     1. $HONESTY_MONITOR_ROOT (env override)            ← preferred
+//     2. /Users/ghost/core/honesty-monitor                ← Mac dev convention
+//     3. $HOME/core/honesty-monitor                       ← user-home convention
+//     4. PATH-resolved `honesty-monitor` binary           ← hx-installed
+//
+//   In-tree modules at $NEXUS/modules/honesty_monitor/ are scheduled for
+//   removal after smoke PASS (deletion deferred per task constraint —
+//   "DO NOT auto-commit nexus delete").
+//
+// Invoked via:  nexus honesty <subcmd> [flags...]
+//   ─ via wrapper bin/nexus-cli → engine/nexus_cli.hexa cmd_honesty →
+//     this script. Pure delegation: NO logic duplication; nexus-side adds only
+//     a one-line preamble + audit log; ALL subcmd logic lives in the standalone.
+//
+// Subcommands (forwarded verbatim to standalone):
+//   status     — contract + API summary
+//   demo       — synthetic 5-step trace (mixed alerts)
+//   self-test  — boundary brackets + F-AI2-A/B verification
+//
+// Constraints honored:
+//   raw#9   — hexa-only (no .py created); standalone is pure-stdlib
+//   raw#15  — write-confined (audit log only on nexus side)
+//   raw#10  — 5 honest C3 caveats embedded in cmd_help
+//
+// Cost: $0 (Mac local; no network; deterministic).
+//
+// @no-lock-needed
+// @resolver-bypass(reason="Pure local CLI router; standalone is dep-free.")
+
+let VERSION = "0.1.0"  // initial shellout refactor
+
+// ─── env / path resolve ───
+
+let HOME = env("HOME")
+let NEXUS = env("NEXUS")
+let HM_ROOT_ENV = env("HONESTY_MONITOR_ROOT")
+
+fn nexus_root() -> str {
+    if NEXUS.len() > 0 { return NEXUS }
+    return HOME + "/core/nexus"  // @allow-devpath
+}
+
+let NX = nexus_root()
+let HEXA_BIN = NX + "/bin/hexa"
+let LOG_PATH = NX + "/logs/nexus_cli.log"
+
+// ─── arg helpers ───
+
+fn shq(s: str) -> str {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn has_flag(a: [str], flag: str) -> bool {
+    let prefix = flag + "="
+    for x in a {
+        if x == flag { return true }
+        if x.starts_with(prefix) { return true }
+    }
+    return false
+}
+
+fn json_mode(a: [str]) -> bool {
+    return has_flag(a, "--json")
+}
+
+// ─── audit log (jsonl) ───
+
+fn _ts_now() -> str {
+    return exec("date -u '+%Y-%m-%dT%H:%M:%SZ'").trim()
+}
+
+fn _audit(subcmd: str, args_str: str, exit_code: int, route: str) {
+    let line = "{\"ts\":\"" + _ts_now() + "\",\"caller\":\"honesty_router\",\"subcmd\":\"honesty " +
+               subcmd + "\",\"args\":\"" + args_str.replace("\"", "\\\"") +
+               "\",\"exit_code\":" + str(exit_code) +
+               ",\"route\":\"" + route + "\"" +
+               ",\"router_version\":\"" + VERSION + "\"}"
+    exec("echo " + shq(line) + " >> " + shq(LOG_PATH) + " 2>/dev/null")
+}
+
+// ─── path / invocation resolution ───
+
+fn _file_exists(p: str) -> bool {
+    let r = exec("[ -f " + shq(p) + " ] && echo yes || echo no").trim()
+    return r == "yes"
+}
+
+// Resolution order (4 tiers — mirrors qmirror v0.3.0 standalone-only):
+//   1. $HONESTY_MONITOR_ROOT env
+//   2. /Users/ghost/core/honesty-monitor
+//   3. $HOME/core/honesty-monitor
+//   4. PATH-resolved `honesty-monitor`
+//
+// Returns shape: "<route>|<command-prefix>"
+//   route ∈ { "standalone-env", "standalone-mac", "standalone-home",
+//             "standalone-path", "none" }
+fn _resolve_invocation() -> str {
+    // 1. $HONESTY_MONITOR_ROOT env
+    if HM_ROOT_ENV.len() > 0 {
+        let cli = HM_ROOT_ENV + "/cli/honesty-monitor.hexa"
+        if _file_exists(cli) {
+            return "standalone-env|HONESTY_MONITOR_ROOT=" + shq(HM_ROOT_ENV) + " " + shq(HEXA_BIN) + " run " + shq(cli)
+        }
+    }
+    // 2. Mac dev convention
+    let mac_root = "/Users/ghost/core/honesty-monitor"
+    let mac_cli = mac_root + "/cli/honesty-monitor.hexa"
+    if _file_exists(mac_cli) {
+        return "standalone-mac|HONESTY_MONITOR_ROOT=" + shq(mac_root) + " " + shq(HEXA_BIN) + " run " + shq(mac_cli)
+    }
+    // 3. $HOME/core/honesty-monitor
+    let home_root = HOME + "/core/honesty-monitor"
+    let home_cli = home_root + "/cli/honesty-monitor.hexa"
+    if _file_exists(home_cli) {
+        return "standalone-home|HONESTY_MONITOR_ROOT=" + shq(home_root) + " " + shq(HEXA_BIN) + " run " + shq(home_cli)
+    }
+    // 4. PATH-resolved binary
+    let path_bin = exec("command -v honesty-monitor 2>/dev/null || true").trim()
+    if path_bin.len() > 0 {
+        return "standalone-path|" + shq(path_bin)
+    }
+    return "none|"
+}
+
+fn _strip_rc_trailer(raw: str) -> str {
+    let lines = raw.split("\n")
+    let mut out = ""
+    let mut k = 0
+    while k < lines.len() {
+        let l = lines[k]
+        if l.trim().starts_with("__NEXUS_HONESTY_RC__:") == false {
+            if out.len() > 0 { out = out + "\n" }
+            out = out + l
+        }
+        k = k + 1
+    }
+    return out
+}
+
+// Forward: invoke standalone honesty-monitor with subcmd + extra args.
+// Hard fail when none of the 4 tiers resolve (no silent in-tree fallback).
+fn _forward(sub: str, extra: [str]) -> str {
+    let resolved = _resolve_invocation()
+    let parts = resolved.split("|")
+    let route = parts[0]
+    let prefix = if parts.len() >= 2 { parts[1] } else { "" }
+
+    if route == "none" {
+        eprintln("nexus honesty: ERROR — honesty-monitor standalone not found (4-tier resolution failed)")
+        eprintln("  tier 1 ($HONESTY_MONITOR_ROOT env)              : not set or invalid")
+        eprintln("  tier 2 (/Users/ghost/core/honesty-monitor)      : not found")
+        eprintln("  tier 3 ($HOME/core/honesty-monitor)             : not found")
+        eprintln("  tier 4 (PATH `honesty-monitor`)                 : not found")
+        eprintln("")
+        eprintln("  remediation: install via `hx install honesty-monitor`,")
+        eprintln("               or set $HONESTY_MONITOR_ROOT to a checkout of need-singularity/honesty-monitor,")
+        eprintln("               or clone to /Users/ghost/core/honesty-monitor (Mac dev convention).")
+        _audit(sub, "no-honesty-monitor-found", 127, "none")
+        return route + "|127"
+    }
+
+    let mut cmd = prefix + " " + shq(sub)
+    for x in extra {
+        cmd = cmd + " " + shq(x)
+    }
+    let full = cmd + "; echo \"__NEXUS_HONESTY_RC__:$?\""
+    let raw = exec(full + " 2>&1")
+    let mut rc = 0
+    let lines = raw.split("\n")
+    let mut k = 0
+    while k < lines.len() {
+        let l = lines[k].trim()
+        if l.starts_with("__NEXUS_HONESTY_RC__:") {
+            rc = to_int(l.substr(21, l.len() - 21))
+        }
+        k = k + 1
+    }
+    print(_strip_rc_trailer(raw))
+    let mut es = ""
+    let mut e_i = 0
+    while e_i < extra.len() {
+        if e_i > 0 { es = es + " " }
+        es = es + extra[e_i]
+        e_i = e_i + 1
+    }
+    _audit(sub, es, rc, route)
+    return route + "|" + str(rc)
+}
+
+// ─── help ───
+
+fn cmd_help() {
+    println("nexus honesty " + VERSION + " — AI honesty-bit falsifier subcommand router")
+    println("")
+    println("usage: nexus honesty <subcmd> [flags...]")
+    println("")
+    println("ROUTING (4-tier standalone-only):")
+    println("  This router shells out to the honesty-monitor standalone CLI.")
+    println("  Resolution order:")
+    println("    1. $HONESTY_MONITOR_ROOT env")
+    println("    2. /Users/ghost/core/honesty-monitor")
+    println("    3. $HOME/core/honesty-monitor")
+    println("    4. PATH-resolved `honesty-monitor` binary")
+    println("  (Hard-fails with exit 127 when none resolve.)")
+    println("")
+    println("subcommands (forwarded verbatim to standalone):")
+    println("  status                                  contract + API summary")
+    println("  demo                                    synthetic 5-step trace (mixed alerts)")
+    println("  self-test                               boundary brackets + F-AI2-A/B verification")
+    println("")
+    println("global flags (forwarded):")
+    println("  --json     machine-parseable JSON tail")
+    println("  --help,-h  this help (router-level) OR forwarded subhelp")
+    println("")
+    println("--- caveats (raw#10 C3) ---")
+    println("  1. Boundary semantics strict: 4.99% silent / 5.01% alerts. Float-epsilon at exactly")
+    println("     5.0% may bias toward alert depending on IEEE-754 rounding; use 4.99% / 5.01% in tests.")
+    println("  2. Standalone resolution required: hard-fail with exit 127 if all 4 tiers miss.")
+    println("     Pre-flight: ensure `hx install honesty-monitor` or set $HONESTY_MONITOR_ROOT.")
+    println("  3. Single-process state: standalone _OBSERVATIONS / _ALERTS are module-level globals.")
+    println("     Multi-process callers (distributed training) must aggregate snapshots externally.")
+    println("  4. Severity tiers (low/medium/high/critical) are HEURISTIC fanout hints — your")
+    println("     alerting policy (Slack/pager/kill-switch) is your responsibility.")
+    println("  5. Asymmetric domains (RL reward shaping, sparse-reward eval) may need a fork with")
+    println("     adjusted thresholds (default 5%/1% are the BT-AI2 contract values).")
+    println("")
+    println("cost estimate: $0 — pure-stdlib, no Python, no network, deterministic.")
+}
+
+fn cmd_subhelp(sub: str) {
+    let _ = _forward(sub, ["--help"])
+}
+
+// ─── main ───
+
+fn main() {
+    let _raw = args()
+    let mut _sidx = -1
+    let mut _i = 0
+    while _i < _raw.len() {
+        if _raw[_i].ends_with(".hexa") { _sidx = _i; break }
+        _i = _i + 1
+    }
+    let mut _user_start = 2
+    if _sidx >= 0 { _user_start = _sidx + 1 }
+
+    let mut a: [str] = ["nexus_honesty_cli", "honesty_router"]
+    let mut _ua = _user_start
+    while _ua < _raw.len() {
+        a = a + [_raw[_ua]]
+        _ua = _ua + 1
+    }
+    let n = len(a)
+
+    if n < 3 {
+        cmd_help()
+        return
+    }
+
+    let sub = a[2]
+
+    if has_flag(a, "--help") || has_flag(a, "-h") {
+        if sub == "--help" || sub == "-h" || sub == "help" {
+            cmd_help()
+        } else {
+            cmd_subhelp(sub)
+        }
+        return
+    }
+
+    if sub == "help" { cmd_help(); return }
+
+    let mut valid = false
+    if sub == "status"    { valid = true }
+    if sub == "demo"      { valid = true }
+    if sub == "self-test" { valid = true }
+    if sub == "selftest"  { valid = true }
+    if valid == false {
+        eprintln("nexus honesty: unknown subcommand '" + sub + "'")
+        eprintln("run 'nexus honesty help' for usage")
+        _audit(sub, "", 2, "rejected")
+        exit(2)
+    }
+
+    let mut extras: [str] = []
+    let mut e_i = 3
+    while e_i < n {
+        extras = extras + [a[e_i]]
+        e_i = e_i + 1
+    }
+
+    let result = _forward(sub, extras)
+    let parts = result.split("|")
+    let rc = if parts.len() >= 2 { to_int(parts[1]) } else { 0 }
+    if rc != 0 { exit(rc) }
+}
