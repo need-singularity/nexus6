@@ -1,0 +1,304 @@
+// nexus/cli/agent.hexa — anima-agent subcommand router (shellout to standalone)
+//
+// REFACTOR NOTE (anima-agent extraction cycle, 2026-05-04):
+//   This router shells out to the standalone anima-agent CLI:
+//
+//       nexus agent <subcmd> [flags...]
+//          ↓
+//       anima-agent <subcmd> [flags...]   (standalone CLI from need-singularity/anima-agent)
+//
+//   The standalone CLI lives at one of (4-tier resolution, mirroring qmirror/honesty):
+//     1. $ANIMA_AGENT_ROOT (env override)              ← preferred
+//     2. /Users/ghost/core/anima-agent                  ← Mac dev convention
+//     3. $HOME/core/anima-agent                         ← user-home convention
+//     4. PATH-resolved `anima-agent` binary             ← hx-installed
+//
+//   Origin in-tree at $ANIMA/anima-agent/ is NOT touched by this refactor
+//   (raw constraint "DO NOT delete origin until smoke-tested"). After
+//   a smoke PASS cycle, the in-tree origin will be deprecated with a
+//   cross-link comment + cleanup will be a separate cycle.
+//
+// Invoked via:  nexus agent <subcmd> [flags...]
+//   ─ via wrapper bin/nexus-cli → engine/nexus_cli.hexa cmd_agent →
+//     this script. Pure delegation: NO logic duplication; nexus-side adds only
+//     a one-line preamble + audit log; ALL subcmd logic lives in the standalone.
+//
+// Subcommands (forwarded verbatim to standalone):
+//   status     — agent status (Φ, tension, emotion, channels, provider)
+//   run        — start agent (default channel: cli)
+//   mcp        — start MCP server mode (9 tools)
+//   channel    — start on specific channel (cli|telegram|discord|slack|all)
+//   autonomy   — start the autonomy/discovery loop
+//   self-test  — boot smoke + boundary verify
+//
+// Constraints honored:
+//   raw#9   — hexa-only (no .py created); standalone is hexa-native
+//   raw#15  — write-confined (audit log only on nexus side; tokens never echoed)
+//   raw#10  — 5 honest C3 caveats embedded in cmd_help
+//
+// Cost: $0 (Mac local; no network for routing; deterministic).
+//
+// @no-lock-needed
+// @resolver-bypass(reason="Pure local CLI router; standalone is hexa-bundled.")
+
+let VERSION = "0.1.0"  // initial shellout refactor
+
+// ─── env / path resolve ───
+
+let HOME = env("HOME")
+let NEXUS = env("NEXUS")
+let AA_ROOT_ENV = env("ANIMA_AGENT_ROOT")
+
+fn nexus_root() -> str {
+    if NEXUS.len() > 0 { return NEXUS }
+    return HOME + "/core/nexus"  // @allow-devpath
+}
+
+let NX = nexus_root()
+let HEXA_BIN = NX + "/bin/hexa"
+let LOG_PATH = NX + "/logs/nexus_cli.log"
+
+// ─── arg helpers ───
+
+fn shq(s: str) -> str {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn has_flag(a: [str], flag: str) -> bool {
+    let prefix = flag + "="
+    for x in a {
+        if x == flag { return true }
+        if x.starts_with(prefix) { return true }
+    }
+    return false
+}
+
+// ─── audit log (jsonl) ───
+
+fn _ts_now() -> str {
+    return exec("date -u '+%Y-%m-%dT%H:%M:%SZ'").trim()
+}
+
+fn _audit(subcmd: str, args_str: str, exit_code: int, route: str) {
+    let line = "{\"ts\":\"" + _ts_now() + "\",\"caller\":\"agent_router\",\"subcmd\":\"agent " +
+               subcmd + "\",\"args\":\"" + args_str.replace("\"", "\\\"") +
+               "\",\"exit_code\":" + str(exit_code) +
+               ",\"route\":\"" + route + "\"" +
+               ",\"router_version\":\"" + VERSION + "\"}"
+    exec("echo " + shq(line) + " >> " + shq(LOG_PATH) + " 2>/dev/null")
+}
+
+// ─── path / invocation resolution ───
+
+fn _file_exists(p: str) -> bool {
+    let r = exec("[ -f " + shq(p) + " ] && echo yes || echo no").trim()
+    return r == "yes"
+}
+
+// Resolution order (4 tiers — mirrors qmirror v0.3.0 / honesty-monitor):
+//   1. $ANIMA_AGENT_ROOT env
+//   2. /Users/ghost/core/anima-agent
+//   3. $HOME/core/anima-agent
+//   4. PATH-resolved `anima-agent`
+//
+// Returns shape: "<route>|<command-prefix>"
+fn _resolve_invocation() -> str {
+    if AA_ROOT_ENV.len() > 0 {
+        let cli = AA_ROOT_ENV + "/cli/anima-agent.hexa"
+        if _file_exists(cli) {
+            return "standalone-env|ANIMA_AGENT_ROOT=" + shq(AA_ROOT_ENV) + " " + shq(HEXA_BIN) + " run " + shq(cli)
+        }
+    }
+    let mac_root = "/Users/ghost/core/anima-agent"
+    let mac_cli = mac_root + "/cli/anima-agent.hexa"
+    if _file_exists(mac_cli) {
+        return "standalone-mac|ANIMA_AGENT_ROOT=" + shq(mac_root) + " " + shq(HEXA_BIN) + " run " + shq(mac_cli)
+    }
+    let home_root = HOME + "/core/anima-agent"
+    let home_cli = home_root + "/cli/anima-agent.hexa"
+    if _file_exists(home_cli) {
+        return "standalone-home|ANIMA_AGENT_ROOT=" + shq(home_root) + " " + shq(HEXA_BIN) + " run " + shq(home_cli)
+    }
+    let path_bin = exec("command -v anima-agent 2>/dev/null || true").trim()
+    if path_bin.len() > 0 {
+        return "standalone-path|" + shq(path_bin)
+    }
+    return "none|"
+}
+
+fn _strip_rc_trailer(raw: str) -> str {
+    let lines = raw.split("\n")
+    let mut out = ""
+    let mut k = 0
+    while k < lines.len() {
+        let l = lines[k]
+        if l.trim().starts_with("__NEXUS_AGENT_RC__:") == false {
+            if out.len() > 0 { out = out + "\n" }
+            out = out + l
+        }
+        k = k + 1
+    }
+    return out
+}
+
+fn _forward(sub: str, extra: [str]) -> str {
+    let resolved = _resolve_invocation()
+    let parts = resolved.split("|")
+    let route = parts[0]
+    let prefix = if parts.len() >= 2 { parts[1] } else { "" }
+
+    if route == "none" {
+        eprintln("nexus agent: ERROR — anima-agent standalone not found (4-tier resolution failed)")
+        eprintln("  tier 1 ($ANIMA_AGENT_ROOT env)                    : not set or invalid")
+        eprintln("  tier 2 (/Users/ghost/core/anima-agent)            : not found")
+        eprintln("  tier 3 ($HOME/core/anima-agent)                   : not found")
+        eprintln("  tier 4 (PATH `anima-agent`)                       : not found")
+        eprintln("")
+        eprintln("  remediation: install via `hx install anima-agent`,")
+        eprintln("               or set $ANIMA_AGENT_ROOT to a checkout of need-singularity/anima-agent,")
+        eprintln("               or clone to /Users/ghost/core/anima-agent (Mac dev convention).")
+        _audit(sub, "no-anima-agent-found", 127, "none")
+        return route + "|127"
+    }
+
+    let mut cmd = prefix + " " + shq(sub)
+    for x in extra {
+        cmd = cmd + " " + shq(x)
+    }
+    let full = cmd + "; echo \"__NEXUS_AGENT_RC__:$?\""
+    let raw = exec(full + " 2>&1")
+    let mut rc = 0
+    let lines = raw.split("\n")
+    let mut k = 0
+    while k < lines.len() {
+        let l = lines[k].trim()
+        if l.starts_with("__NEXUS_AGENT_RC__:") {
+            rc = to_int(l.substr(19, l.len() - 19))
+        }
+        k = k + 1
+    }
+    print(_strip_rc_trailer(raw))
+    let mut es = ""
+    let mut e_i = 0
+    while e_i < extra.len() {
+        if e_i > 0 { es = es + " " }
+        es = es + extra[e_i]
+        e_i = e_i + 1
+    }
+    _audit(sub, es, rc, route)
+    return route + "|" + str(rc)
+}
+
+// ─── help ───
+
+fn cmd_help() {
+    println("nexus agent " + VERSION + " — anima-agent subcommand router (shellout to standalone)")
+    println("")
+    println("usage: nexus agent <subcmd> [flags...]")
+    println("")
+    println("ROUTING (4-tier standalone-only):")
+    println("  This router shells out to the anima-agent standalone CLI.")
+    println("  Resolution order:")
+    println("    1. $ANIMA_AGENT_ROOT env")
+    println("    2. /Users/ghost/core/anima-agent")
+    println("    3. $HOME/core/anima-agent")
+    println("    4. PATH-resolved `anima-agent` binary")
+    println("  (Hard-fails with exit 127 when none resolve.)")
+    println("")
+    println("subcommands (forwarded verbatim to standalone):")
+    println("  status                                  agent status (Φ, tension, emotion)")
+    println("  run [--channel cli]                     start agent (default channel: cli)")
+    println("  mcp [--direct]                          start MCP server (9 tools)")
+    println("  channel <name>                          cli|telegram|discord|slack|all")
+    println("  autonomy                                start the autonomy/discovery loop")
+    println("  self-test                               boot smoke + boundary verify")
+    println("")
+    println("global flags (forwarded):")
+    println("  --help,-h                               this help (router-level) OR forwarded subhelp")
+    println("")
+    println("--- caveats (raw#10 C3) ---")
+    println("  1. Standalone resolution required: hard-fail with exit 127 if all 4 tiers miss.")
+    println("     Pre-flight: ensure `hx install anima-agent` or set $ANIMA_AGENT_ROOT.")
+    println("  2. Standalone is the AGENT runtime; live consciousness needs $ANIMA_ROOT")
+    println("     (separate consciousness backend). Without it, status returns SCAFFOLD signal.")
+    println("  3. Channel adapters (Telegram/Discord/Slack) are sister repos at")
+    println("     anima-agent-channels — not bundled in standalone install.")
+    println("  4. Provider tokens (ANTHROPIC_API_KEY, ANIMA_TELEGRAM_TOKEN, …) are READ-ONLY")
+    println("     env vars; never echoed to stdout (raw#15).")
+    println("  5. trading/ subdomain is wired but Φ-gated — refuses live trades until")
+    println("     Φ≥5 + emotion>0.5 + 30d profit history (T4/T5 tiers).")
+    println("")
+    println("cost estimate: $0 — pure-stdlib router; per-subcmd cost depends on provider.")
+}
+
+fn cmd_subhelp(sub: str) {
+    let _ = _forward(sub, ["--help"])
+}
+
+// ─── main ───
+
+fn main() {
+    let _raw = args()
+    let mut _sidx = -1
+    let mut _i = 0
+    while _i < _raw.len() {
+        if _raw[_i].ends_with(".hexa") { _sidx = _i; break }
+        _i = _i + 1
+    }
+    let mut _user_start = 2
+    if _sidx >= 0 { _user_start = _sidx + 1 }
+
+    let mut a: [str] = ["nexus_agent_cli", "agent_router"]
+    let mut _ua = _user_start
+    while _ua < _raw.len() {
+        a = a + [_raw[_ua]]
+        _ua = _ua + 1
+    }
+    let n = len(a)
+
+    if n < 3 {
+        cmd_help()
+        return
+    }
+
+    let sub = a[2]
+
+    if has_flag(a, "--help") || has_flag(a, "-h") {
+        if sub == "--help" || sub == "-h" || sub == "help" {
+            cmd_help()
+        } else {
+            cmd_subhelp(sub)
+        }
+        return
+    }
+
+    if sub == "help" { cmd_help(); return }
+
+    let mut valid = false
+    if sub == "status"    { valid = true }
+    if sub == "run"       { valid = true }
+    if sub == "mcp"       { valid = true }
+    if sub == "channel"   { valid = true }
+    if sub == "autonomy"  { valid = true }
+    if sub == "self-test" { valid = true }
+    if sub == "selftest"  { valid = true }
+    if sub == "version"   { valid = true }
+    if valid == false {
+        eprintln("nexus agent: unknown subcommand '" + sub + "'")
+        eprintln("run 'nexus agent help' for usage")
+        _audit(sub, "", 2, "rejected")
+        exit(2)
+    }
+
+    let mut extras: [str] = []
+    let mut e_i = 3
+    while e_i < n {
+        extras = extras + [a[e_i]]
+        e_i = e_i + 1
+    }
+
+    let result = _forward(sub, extras)
+    let parts = result.split("|")
+    let rc = if parts.len() >= 2 { to_int(parts[1]) } else { 0 }
+    if rc != 0 { exit(rc) }
+}

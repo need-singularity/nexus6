@@ -209,6 +209,11 @@ auto-bootstrapped by [`install.hexa`](install.hexa)):
 | Package | Pin | Purpose | Repo |
 |---------|-----|---------|------|
 | [`qmirror`](https://github.com/need-singularity/qmirror) | `^1.0.0` | Quantum Mirror substrate (CHSH / IIT / NIST / QRNG) consumed by `nexus/modules/qmirror/*` | `hx install qmirror` |
+| [`sim-universe`](https://github.com/need-singularity/sim-universe) | `^1.0.0` | Virtual universe simulation runtime (anu_time τ-clock + multiverse interferometer + ouroboros QRNG + Bostrom test + Gödel-Q + qpu_bridge) consumed by `nexus/cli/sim.hexa` (4-tier resolution) | `hx install sim-universe` |
+| [`hexa-bio`](https://github.com/need-singularity/hexa-bio) | `^1.0.0` | Molecular Toolkit (HEXA family) — 4 verbs WEAVE/NANOBOT/RIBOZYME/VIROCAPSID consumed by `nexus/cli/bio.hexa` (4-tier resolution) | `hx install hexa-bio` |
+| [`honesty-monitor`](https://github.com/need-singularity/honesty-monitor) | `^1.0.0` | AI honesty-bit falsifier (BT-AI2 contract) consumed by `nexus/cli/honesty.hexa` (4-tier resolution) | `hx install honesty-monitor` |
+| [`qrng`](https://github.com/need-singularity/qrng) | `^1.0.0` | Quantum random number generator (5 backends, T0..T3 tiers, NIST SP 800-22 compliant) consumed by `nexus/cli/qrng.hexa` (4-tier resolution) | `hx install qrng` |
+| [`anima-agent`](https://github.com/need-singularity/anima-agent) | `^1.0.0` | Consciousness-driven agent runtime (HEXA family) consumed by `nexus/cli/agent.hexa` (4-tier resolution) | `hx install anima-agent` |
 
 ## Run
 
