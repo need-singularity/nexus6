@@ -1,0 +1,260 @@
+// tool/kick_mk2_main.hexa — top-level mk2 nexus kick entrypoint.
+//
+// 2026-05-05 — single canonical entry that wires:
+//   1. auth_slot_pool --pick --purpose kick      (slot selection)
+//   2. auth_slot_pool --ensure-fresh <slot>      (idempotent revive + cache)
+//   3. auth_slot_pool --acquire-lock <slot>      (per-slot exclusive)
+//   4. tool/kick_dispatch.hexa <topic>           (existing inner kick)
+//   5. auth_slot_pool --mark-success / --mark-failure based on rc
+//   6. auth_slot_pool --release-lock             (always, in cleanup)
+//
+// All slot-auth policy lives in hive/core/auth_slot_pool/ — this
+// wrapper is a coordination shell. raw auth-store.002 (sister to
+// auth-store.001) registers the pre-spawn ensure-fresh gate as
+// mandatory for all kick spawns.
+//
+// @tool(slug="kick_mk2_main", desc="canonical mk2 kick entrypoint — slot pick + auth-store ensure-fresh + lock + kick_dispatch + mark-success/failure + release. Single SSOT for nexus kick spawning.")
+// @sentinel(__NEXUS_KICK_MK2__ <PASS|FAIL> slot=<id> rc=<N> revived=<0|1> elapsed=<sec>)
+// @usage(hexa run tool/kick_mk2_main.hexa --topic <topic> [--backend <slug>] [--dry-run])
+// @usage(hexa run tool/kick_mk2_main.hexa --selftest)
+// @exit_codes(0=PASS, 1=usage, 2=no-pickable-slot, 3=lock-acquire-failed, 4=spawn-failed)
+// @resolver-bypass(reason="orchestrator wrapper; spawns kick_dispatch which itself orchestrates claude.real")
+
+fn _shq(s: str) -> str {
+    let r = s.replace("'", "'\\''")
+    return "'" + r + "'"
+}
+
+fn _hive_root() -> str {
+    let h = exec("printenv HIVE 2>/dev/null").trim()
+    if len(h) > 0 { return h }
+    return env("HOME") + "/core/hive"
+}
+
+fn _nexus_root() -> str {
+    let n = exec("printenv NEXUS 2>/dev/null").trim()
+    if len(n) > 0 { return n }
+    return env("HOME") + "/core/nexus"
+}
+
+fn _hexa_bin() -> str {
+    let h = exec("which hexa 2>/dev/null").trim()
+    if len(h) > 0 { return h }
+    return env("HOME") + "/.hx/bin/hexa"
+}
+
+fn _now_sec() -> int {
+    return to_int(exec("date +%s").trim())
+}
+
+fn _pool_path() -> str {
+    return _hive_root() + "/core/auth_slot_pool/auth_slot_pool_main.hexa"
+}
+
+fn _pool_exec(args: str) -> array {
+    // Returns [stdout_str, rc]
+    let cmd = "HEXA_RESOLVER_NO_REROUTE=1 " + _hexa_bin() + " run "
+        + _shq(_pool_path()) + " " + args + " 2>&1; echo __RC=$?"
+    let out = to_string(exec(cmd))
+    let rc_idx = out.last_index_of("__RC=")
+    let mut rc = 1
+    let mut payload = out
+    if rc_idx >= 0 {
+        let tail = out.substring(rc_idx + 5, len(out)).trim()
+        rc = to_int(tail)
+        payload = out.substring(0, rc_idx).trim()
+    }
+    return [payload, to_string(rc)]
+}
+
+fn _selftest() -> int {
+    println("[kick_mk2_main selftest]")
+    let mut fails = 0
+
+    // F1: auth_slot_pool main is reachable
+    let pool = _pool_path()
+    let exists = exec("test -f " + _shq(pool) + " && echo y || echo n").trim()
+    if exists == "y" { println("  PASS F1 auth_slot_pool path " + pool) }
+    else { println("  FAIL F1 auth_slot_pool not found at " + pool); fails = fails + 1 }
+
+    // F2: kick_dispatch reachable
+    let kd = _nexus_root() + "/tool/kick_dispatch.hexa"
+    let kd_exists = exec("test -f " + _shq(kd) + " && echo y || echo n").trim()
+    if kd_exists == "y" { println("  PASS F2 kick_dispatch path " + kd) }
+    else { println("  FAIL F2 kick_dispatch not found at " + kd); fails = fails + 1 }
+
+    // F3: auth_slot_pool --health surface live
+    let h_pair = _pool_exec("--health")
+    let h_payload = to_string(h_pair[0])
+    if h_payload.contains("__AUTH_SLOT_POOL_HEALTH__") {
+        println("  PASS F3 auth_slot_pool --health emits sentinel")
+    } else {
+        println("  FAIL F3 auth_slot_pool --health no sentinel")
+        fails = fails + 1
+    }
+
+    // F4: ensure-fresh idempotency on a known-fresh slot (claude9 was fresh)
+    // Skip if no slot is fresh — selftest is best-effort, not API-cost-bearing.
+    println("  SKIP F4 ensure-fresh idempotency (covered by auth-store.001 lint)")
+
+    if fails == 0 {
+        println("__NEXUS_KICK_MK2__ SELFTEST PASS fails=0")
+        return 0
+    }
+    println("__NEXUS_KICK_MK2__ SELFTEST FAIL fails=" + to_string(fails))
+    return 5
+}
+
+fn _emit_fail(slot_id: str, rc: int, reason: str, elapsed: int) -> int {
+    println("__NEXUS_KICK_MK2__ FAIL slot=" + slot_id
+        + " rc=" + to_string(rc)
+        + " elapsed=" + to_string(elapsed)
+        + " reason=" + reason)
+    return rc
+}
+
+fn _run_kick(topic: str, backend: str, dry_run: bool) -> int {
+    let started = _now_sec()
+
+    // 1. Pick slot via auth_slot_pool --pick --purpose kick.
+    // Parse slot id from the sentinel line:
+    //   __AUTH_SLOT_POOL_PICK__ slot=claudeN idx=N purpose=kick
+    let pick_pair = _pool_exec("--pick --purpose kick")
+    let pick_payload = to_string(pick_pair[0])
+    let pick_rc = to_int(to_string(pick_pair[1]))
+    let mut slot_id = ""
+    let sentinel_idx = pick_payload.last_index_of("__AUTH_SLOT_POOL_PICK__ slot=")
+    if sentinel_idx >= 0 {
+        let after = pick_payload.substring(sentinel_idx + len("__AUTH_SLOT_POOL_PICK__ slot="), len(pick_payload))
+        let space_idx = after.index_of(" ")
+        slot_id = if space_idx > 0 { after.substring(0, space_idx) } else { after.trim() }
+    }
+    if pick_rc != 0 || len(slot_id) == 0 || slot_id == "none" {
+        eprintln("__NEXUS_KICK_MK2__ FAIL slot=none rc=2 reason=no-pickable-slot")
+        eprintln("# detail: auth_slot_pool --pick rc=" + to_string(pick_rc))
+        return 2
+    }
+    eprintln("# kick_mk2: picked slot=" + slot_id)
+
+    // 2. Ensure fresh (idempotent — fast no-op when token has >60s left)
+    let ef_pair = _pool_exec("--ensure-fresh " + _shq(slot_id))
+    let ef_payload = to_string(ef_pair[0])
+    let revived = if ef_payload.contains("revived=1") { 1 } else { 0 }
+    eprintln("# kick_mk2: ensure-fresh revived=" + to_string(revived))
+
+    // 3. Acquire lock (60s TTL — kick_dispatch's claude-spawn budget)
+    let lock_pair = _pool_exec("--acquire-lock " + _shq(slot_id) + " --ttl-ms 60000")
+    let lock_rc = to_int(to_string(lock_pair[1]))
+    if lock_rc != 0 {
+        let elapsed = _now_sec() - started
+        return _emit_fail(slot_id, 3, "lock-acquire-failed", elapsed)
+    }
+
+    // 4. Delegate to kick_dispatch
+    if dry_run {
+        let _release = _pool_exec("--release-lock " + _shq(slot_id))
+        let elapsed = _now_sec() - started
+        println("__NEXUS_KICK_MK2__ DRY_RUN slot=" + slot_id
+            + " topic=" + topic
+            + " backend=" + backend
+            + " elapsed=" + to_string(elapsed))
+        return 0
+    }
+    let kd = _nexus_root() + "/tool/kick_dispatch.hexa"
+    let mut kd_args = _shq(topic)
+    if len(backend) > 0 { kd_args = kd_args + " --backend " + _shq(backend) }
+    let kd_cmd = "HIVE_CLAUDE_ACCOUNT=" + _shq(slot_id) + " "
+        + _hexa_bin() + " run " + _shq(kd) + " " + kd_args + " 2>&1; echo __RC=$?"
+    let kd_out = to_string(exec(kd_cmd))
+    print(kd_out)
+    let rc_idx = kd_out.last_index_of("__RC=")
+    let mut spawn_rc = 1
+    if rc_idx >= 0 {
+        let tail = kd_out.substring(rc_idx + 5, len(kd_out)).trim()
+        spawn_rc = to_int(tail)
+    }
+
+    // 5. Mark success / failure based on rc + detected signals
+    let mut mark_kind = ""
+    if spawn_rc == 0 {
+        let _m = _pool_exec("--mark-success " + _shq(slot_id))
+    } else {
+        // Pick failure kind from kd_out signals (best effort)
+        if kd_out.contains("authentication_error") || kd_out.contains("invalid x-api-key") { mark_kind = "auth-fail" }
+        else if kd_out.contains("rate_limit_event") || kd_out.contains("quota exhausted") { mark_kind = "rate-limit" }
+        else { mark_kind = "network" }
+        let _m = _pool_exec("--mark-failure " + _shq(slot_id) + " --kind " + _shq(mark_kind))
+    }
+
+    // 6. Release lock (always)
+    let _release = _pool_exec("--release-lock " + _shq(slot_id))
+
+    let elapsed = _now_sec() - started
+    let verdict = if spawn_rc == 0 { "PASS" } else { "FAIL" }
+    println("__NEXUS_KICK_MK2__ " + verdict
+        + " slot=" + slot_id
+        + " rc=" + to_string(spawn_rc)
+        + " revived=" + to_string(revived)
+        + " elapsed=" + to_string(elapsed))
+    return spawn_rc
+}
+
+fn _usage() {
+    eprintln("usage:")
+    eprintln("  hexa run tool/kick_mk2_main.hexa --topic <topic> [--backend <slug>] [--dry-run]")
+    eprintln("  hexa run tool/kick_mk2_main.hexa --selftest")
+    eprintln("")
+    eprintln("see: docs/nexus_kick_mk2.ai.md")
+}
+
+fn main() {
+    let _argv = args()
+    let mut user_args = []
+    // hexa argv: [exe_cache_path, exe_cache_path, ...user-args]
+    // Default skips first 2; if .hexa filename appears (some invocation
+    // patterns include it), advance past it.
+    let mut _ai = 2
+    let mut _scan = 0
+    while _scan < len(_argv) {
+        let _av = to_string(_argv[_scan])
+        let _la = len(_av)
+        if _la >= 5 && _av.substring(_la - 5, _la) == ".hexa" {
+            _ai = _scan + 1
+            break
+        }
+        _scan = _scan + 1
+    }
+    while _ai < len(_argv) {
+        user_args.push(to_string(_argv[_ai]))
+        _ai = _ai + 1
+    }
+
+    if len(user_args) < 1 { _usage(); exit(1) }
+
+    if user_args[0] == "--selftest" { exit(_selftest()) }
+
+    let mut topic = ""
+    let mut backend = ""
+    let mut dry_run = false
+    let mut i = 0
+    while i < len(user_args) {
+        let a = user_args[i]
+        if a == "--topic" {
+            i = i + 1
+            if i < len(user_args) { topic = user_args[i] }
+            i = i + 1
+            continue
+        }
+        if a == "--backend" {
+            i = i + 1
+            if i < len(user_args) { backend = user_args[i] }
+            i = i + 1
+            continue
+        }
+        if a == "--dry-run" { dry_run = true; i = i + 1; continue }
+        i = i + 1
+    }
+
+    if len(topic) == 0 { _usage(); exit(1) }
+    exit(_run_kick(topic, backend, dry_run))
+}
