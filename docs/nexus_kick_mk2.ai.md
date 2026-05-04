@@ -9,52 +9,70 @@ ssot:
 audience: AI + operator
 ---
 
-# nexus kick mk2 — top-level CLI + auth-store integration
+# nexus kick — auth-store integration
 
-## Why this exists
-
-Pre-2026-05-05 nexus kick had **no pre-spawn auth gate**. `kick_dispatch.hexa` picked a slot via the legacy `claude_slot_pick.hexa --pick` (mk1 surface), bound `CLAUDE_CONFIG_DIR`, and spawned `claude.real` immediately. If the slot's keychain token had expired since the last `auth-refresh` daemon cycle (30 min cadence), the spawn hit 401 mid-stream — wasted spawn cost and a slot rotation budget.
-
-mk2 closes that gap by routing every spawn through **`auth_slot_pool --ensure-fresh <slot>`** (idempotent, ~1ms fast path on fresh tokens, ~25s revive on expired tokens). Single SSOT lives in hive's `auth_slot_pool_main.hexa`; nexus is a caller.
-
-## Top-level CLI
+## Canonical CLI
 
 ```sh
-hexa run tool/kick_mk2_main.hexa --topic <topic> [--backend <slug>] [--dry-run]
-hexa run tool/kick_mk2_main.hexa --selftest
+nexus kick <topic>
 ```
 
-### Sequence (per invocation)
+Singleton invariant since 2026-05-01 (`hive kick` BANNED at hive cli
+dispatch). The shim at `~/.hx/bin/nexus` raw-200-bypasses the resolver
+and dispatches directly to `~/.hx/packages/nexus/cli/run.hexa cmd_kick`,
+which calls `tool/kick_dispatch.hexa <topic>`.
+
+## Why mk2 cycle (2026-05-05)
+
+Pre-2026-05-05 `kick_dispatch.hexa` picked a slot, bound
+`CLAUDE_CONFIG_DIR`, and spawned `claude.real` immediately. If the slot's
+keychain token had expired since the last `auth-refresh` daemon cycle
+(30 min cadence), the spawn hit 401 mid-stream — wasted spawn cost and a
+slot rotation budget.
+
+mk2 closes that gap by routing every spawn through
+**`auth_slot_pool --ensure-fresh <slot>`** (idempotent, ~1ms fast path
+on fresh tokens, ~25s revive on expired tokens). SSOT lives in hive's
+`auth_slot_pool_main.hexa`; nexus is a caller via the inline
+`_kick_mk2_ensure_fresh` helper in `tool/kick_dispatch.hexa`.
+
+## Dispatch chain
 
 ```
-1. auth_slot_pool --pick --purpose kick          → "claudeN" or "none"
-2. auth_slot_pool --ensure-fresh claudeN          (idempotent, may revive)
-3. auth_slot_pool --acquire-lock claudeN --ttl-ms 60000
-4. HIVE_CLAUDE_ACCOUNT=claudeN tool/kick_dispatch.hexa <topic>
-5. auth_slot_pool --mark-success claudeN          (rc=0)
-   or --mark-failure claudeN --kind <auth-fail|rate-limit|network>  (rc!=0)
-6. auth_slot_pool --release-lock claudeN          (always)
+nexus kick <topic>
+  → ~/.hx/bin/nexus  (shim — raw 200 canonical-form bypass)
+  → ~/.hx/packages/nexus/cli/run.hexa  cmd_kick
+  → tool/kick_dispatch.hexa
+      ↳ _claude_pick_slot()              → "claudeN"
+      ↳ _kick_mk2_ensure_fresh(slot)     → hive auth_slot_pool --ensure-fresh
+      ↳ claude.real spawn (CLAUDE_CONFIG_DIR=~/.claude-claudeN)
+      ↳ detect rate-limit / auth-fail   → rotate or trailer
 ```
 
-### Sentinels
+## Sentinel (existing kick_dispatch surface)
 
 ```
-__NEXUS_KICK_MK2__ PASS     slot=claudeN rc=0 revived=<0|1> elapsed=<sec>
-__NEXUS_KICK_MK2__ FAIL     slot=claudeN rc=<N> elapsed=<sec> reason=<...>
-__NEXUS_KICK_MK2__ DRY_RUN  slot=claudeN topic=<...> backend=<...> elapsed=<sec>
-__NEXUS_KICK_MK2__ SELFTEST <PASS|FAIL> fails=<N>
+__KICK_RESULT__ PASS  witness=<path> tier1=<0|1> falsifier_pass=<0|1>
+__KICK_RESULT__ FAIL  witness=<path> tier1=<0|1> falsifier_pass=<0|1>
+                      reason=<...> fix=<...>
 ```
 
-### Exit codes
+## Internal orchestrator (NOT user CLI)
 
-| code | meaning |
-|------|---------|
-| 0    | PASS — kick succeeded |
-| 1    | usage error (missing --topic) |
-| 2    | no-pickable-slot (all sentinel / cooldown / rate-limited) |
-| 3    | lock-acquire-failed (concurrent kick on same slot) |
-| 4    | spawn-failed (kick_dispatch returned non-zero) |
-| 5    | selftest-fail |
+`tool/kick_mk2_main.hexa` is a programmatic mk2 wrapper providing the
+full sequence (pick + ensure-fresh + lock + spawn + mark-success/failure
++ release). Sentinel: `__NEXUS_KICK_MK2__`. Intended for hooks, daemons,
+or future cli/run.hexa consolidation — NOT human invocation. End users
+should always invoke `nexus kick <topic>`.
+
+```sh
+hexa run tool/kick_mk2_main.hexa --selftest        # programmatic selftest
+hexa run tool/kick_mk2_main.hexa --topic <t> --dry-run
+hexa run tool/kick_mk2_main.hexa --topic <t>       # programmatic kick
+```
+
+Exit codes (mk2_main): 0 PASS / 1 usage / 2 no-pickable-slot /
+3 lock-fail / 4 spawn-fail / 5 selftest-fail.
 
 ## Idempotency
 
