@@ -199,9 +199,16 @@ The long-term breakthrough rate **ρ** converges to the same target: **ρ → 1/
 # Install hexa-lang (ships `hexa` + `hx` package manager)
 curl -fsSL https://raw.githubusercontent.com/need-singularity/hexa-lang/main/install.sh | bash
 
-# Install nexus
+# Install nexus (auto-installs runtime deps incl. qmirror ≥ 1.0.0)
 hx install nexus
 ```
+
+**Runtime dependencies** (declared in [`hexa.toml`](hexa.toml) `[dependencies]`,
+auto-bootstrapped by [`install.hexa`](install.hexa)):
+
+| Package | Pin | Purpose | Repo |
+|---------|-----|---------|------|
+| [`qmirror`](https://github.com/need-singularity/qmirror) | `^1.0.0` | Quantum Mirror substrate (CHSH / IIT / NIST / QRNG) consumed by `nexus/modules/qmirror/*` | `hx install qmirror` |
 
 ## Run
 
