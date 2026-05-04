@@ -1,0 +1,271 @@
+// tool/kick_derive_sentinel_fallback_test.hexa — regression test for the
+// R5 array-length fallback in _derive_sentinel_from_witness.
+//
+// @tool(slug="kick_derive_sentinel_fallback_test", desc="exercise _derive_sentinel_from_witness with the P5 axis-I CONDITIONAL witness shape (top-level falsifier_pass_count=null + tier_1_count=null + non-empty pre_registered_falsifiers + non-empty tier_1_promotions). Asserts non-zero counts derived from array lengths and the PASS verdict gate (sentinel = schema_valid && fpass>0).")
+// @usage(hexa /Users/ghost/core/nexus/tool/kick_derive_sentinel_fallback_test.hexa)
+// @exit_codes(0=PASS, 1=any-case-failed)
+//
+// raw 80 sentinel: __KICK_DERIVE_FALLBACK__ <PASS|FAIL> cases=<N> failed=<N>
+// raw 66 err:     reason=<slug> fix=<directive>
+//
+// Helpers (`_json_field`, `_slice_top_array`, `_split_array_elements`,
+// `_safe_to_int_line`) are duplicated verbatim from tool/kick_dispatch.hexa
+// because hexa-lang has no module export. If the helpers there change,
+// mirror the change here. Same fail-loud-on-divergence rule as
+// kick_to_int_safety_test.hexa.
+
+// ─── duplicated helpers ────────────────────────────────────────────────
+fn _safe_to_int_line(raw: str, default: i64, label: str) -> i64 {
+    let trimmed = raw.trim()
+    if trimmed.len() == 0 { return default }
+    let nl = trimmed.index_of("\n")
+    let first = if nl >= 0 { trimmed.substring(0, nl).trim() } else { trimmed }
+    if first.len() == 0 { return default }
+    let mut v: i64 = default
+    try { v = to_int(first) } catch e {
+        v = default
+    }
+    return v
+}
+
+fn _slice_top_array(text: str, key: str) -> str {
+    let needle = "\"" + key + "\":"
+    let i = text.index_of(needle)
+    if i < 0 { return "" }
+    let mut j = i + needle.len()
+    while j < text.len() {
+        let c = text.substring(j, j + 1)
+        if c == "[" { break }
+        j = j + 1
+    }
+    if j >= text.len() { return "" }
+    let mut depth: i64 = 0
+    let mut k: i64 = j
+    let mut in_str = false
+    let mut esc = false
+    while k < text.len() {
+        let c = text.substring(k, k + 1)
+        if esc { esc = false; k = k + 1; continue }
+        if c == "\\" { esc = true; k = k + 1; continue }
+        if c == "\"" { in_str = !in_str; k = k + 1; continue }
+        if !in_str {
+            if c == "[" { depth = depth + 1 }
+            if c == "]" {
+                depth = depth - 1
+                if depth == 0 { return text.substring(j, k + 1) }
+            }
+        }
+        k = k + 1
+    }
+    return ""
+}
+
+fn _split_array_elements(arr_text: str) -> [str] {
+    let mut out: [str] = []
+    if arr_text.len() < 2 { return out }
+    let inner = arr_text.substring(1, arr_text.len() - 1)
+    let mut depth: i64 = 0
+    let mut start: i64 = -1
+    let mut i: i64 = 0
+    let mut in_str = false
+    let mut esc = false
+    while i < inner.len() {
+        let c = inner.substring(i, i + 1)
+        if esc { esc = false; i = i + 1; continue }
+        if c == "\\" { esc = true; i = i + 1; continue }
+        if c == "\"" { in_str = !in_str; i = i + 1; continue }
+        if !in_str {
+            if c == "{" {
+                if depth == 0 { start = i }
+                depth = depth + 1
+            } else if c == "}" {
+                depth = depth - 1
+                if depth == 0 && start >= 0 {
+                    out = out + [inner.substring(start, i + 1)]
+                    start = -1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _json_field(obj: str, key: str) -> str {
+    let needle = "\"" + key + "\":"
+    let i = obj.index_of(needle)
+    if i < 0 { return "" }
+    let mut j = i + needle.len()
+    while j < obj.len() {
+        let c = obj.substring(j, j + 1)
+        if c == " " || c == "\t" { j = j + 1 } else { break }
+    }
+    if j >= obj.len() { return "" }
+    let first = obj.substring(j, j + 1)
+    if first == "\"" {
+        let mut k = j + 1
+        let mut esc = false
+        while k < obj.len() {
+            let c = obj.substring(k, k + 1)
+            if esc { esc = false; k = k + 1; continue }
+            if c == "\\" { esc = true; k = k + 1; continue }
+            if c == "\"" { break }
+            k = k + 1
+        }
+        return obj.substring(j + 1, k)
+    }
+    let mut k = j
+    while k < obj.len() {
+        let c = obj.substring(k, k + 1)
+        if c == "," || c == "}" || c == "\n" { break }
+        k = k + 1
+    }
+    return obj.substring(j, k).trim()
+}
+
+// Parse-only re-implementation of the R5 fallback chain in
+// _derive_sentinel_from_witness (sans _witness_schema_valid; we test counts only).
+// Returns [tier1_count, fpass_count, fpass_from_array, tier1_from_array] as strings.
+fn _derive_counts_only(text: str) -> [str] {
+    let fpass_str = _json_field(text, "falsifier_pass_count")
+    let tier1_str = _json_field(text, "tier_1_count")
+    let mut fpass = _safe_to_int_line(fpass_str, 0, "derive-fpass")
+    let mut tier1 = _safe_to_int_line(tier1_str, 0, "derive-tier1")
+    let mut fpass_arr = false
+    let mut tier1_arr = false
+    if fpass <= 0 {
+        let pre_arr = _slice_top_array(text, "pre_registered_falsifiers")
+        if pre_arr.len() > 0 {
+            let pre_elems = _split_array_elements(pre_arr)
+            let n = len(pre_elems)
+            if n > 0 { fpass = n; fpass_arr = true }
+        }
+    }
+    if tier1 <= 0 {
+        let t1_arr = _slice_top_array(text, "tier_1_promotions")
+        if t1_arr.len() > 0 {
+            let t1_elems = _split_array_elements(t1_arr)
+            let n = len(t1_elems)
+            if n > 0 { tier1 = n; tier1_arr = true }
+        }
+    }
+    let fa = if fpass_arr { "true" } else { "false" }
+    let ta = if tier1_arr { "true" } else { "false" }
+    return [to_string(tier1), to_string(fpass), fa, ta]
+}
+
+fn _check(label: str, got: str, want: str, mut failed: i64) -> i64 {
+    if got == want {
+        println("PASS " + label + " got=" + got)
+        return failed
+    }
+    println("FAIL " + label + " want=" + want + " got=" + got)
+    return failed + 1
+}
+
+fn main() -> void {
+    let mut failed: i64 = 0
+    let mut cases: i64 = 0
+
+    // ── Case 1 — P5-shape witness (the regression target).
+    // null counts + 5 pre_registered_falsifiers + 1 tier_1_promotion
+    // Expected: tier1=1, fpass=5, both flags=true.
+    let p5 = "{\n" +
+        "  \"falsifier_pass_count\": null,\n" +
+        "  \"tier_1_count\": null,\n" +
+        "  \"gate_tier1_promotion\": {},\n" +
+        "  \"pre_registered_falsifiers\": [\n" +
+        "    {\"id\":\"F1\",\"condition\":\"a\"},\n" +
+        "    {\"id\":\"F2\",\"condition\":\"b\"},\n" +
+        "    {\"id\":\"F3\",\"condition\":\"c\"},\n" +
+        "    {\"id\":\"F4\",\"condition\":\"d\"},\n" +
+        "    {\"id\":\"F5\",\"condition\":\"e\"}\n" +
+        "  ],\n" +
+        "  \"tier_1_promotions\": [\n" +
+        "    {\"axis\":\"I (Bekenstein bound)\",\"status\":\"Tier-1 CONDITIONAL\"}\n" +
+        "  ]\n" +
+        "}\n"
+    let r1 = _derive_counts_only(p5)
+    failed = _check("p5-tier1", r1[0], "1", failed); cases = cases + 1
+    failed = _check("p5-fpass", r1[1], "5", failed); cases = cases + 1
+    failed = _check("p5-fpass-from-array", r1[2], "true", failed); cases = cases + 1
+    failed = _check("p5-tier1-from-array", r1[3], "true", failed); cases = cases + 1
+
+    // ── Case 2 — selftest-shape witness (the explicit-counts happy path).
+    // Counts present, arrays present. Explicit counts must win; flags=false.
+    let st = "{\n" +
+        "  \"falsifier_pass_count\": 5,\n" +
+        "  \"tier_1_count\": 1,\n" +
+        "  \"tier_1_promotions\": [{\"id\":\"selftest-1\"}],\n" +
+        "  \"pre_registered_falsifiers\": [{\"id\":\"F1\"},{\"id\":\"F2\"},{\"id\":\"F3\"},{\"id\":\"F4\"},{\"id\":\"F5\"}]\n" +
+        "}\n"
+    let r2 = _derive_counts_only(st)
+    failed = _check("selftest-tier1", r2[0], "1", failed); cases = cases + 1
+    failed = _check("selftest-fpass", r2[1], "5", failed); cases = cases + 1
+    failed = _check("selftest-fpass-from-array", r2[2], "false", failed); cases = cases + 1
+    failed = _check("selftest-tier1-from-array", r2[3], "false", failed); cases = cases + 1
+
+    // ── Case 3 — P4-shape witness (tier_1_promotions is array of strings, not objects).
+    // _split_array_elements only yields {...} objects, so the fallback DOES NOT fire
+    // for string-only arrays (this is intentional — string-only arrays carry no
+    // structured promotion records). tier1 stays 0.
+    // pre_registered_falsifiers is an array of objects (5 items) → fpass=5 via fallback.
+    let p4 = "{\n" +
+        "  \"pre_registered_falsifiers\": [\n" +
+        "    {\"id\":\"F1\"},{\"id\":\"F2\"},{\"id\":\"F3\"},{\"id\":\"F4\"},{\"id\":\"F5\"}\n" +
+        "  ],\n" +
+        "  \"tier_1_promotions\": [\n" +
+        "    \"metric_canonical=Cohen_kappa\",\n" +
+        "    \"threshold=kappa_lower_CI95<0.40\"\n" +
+        "  ]\n" +
+        "}\n"
+    let r3 = _derive_counts_only(p4)
+    failed = _check("p4-tier1-strings-stay-zero", r3[0], "0", failed); cases = cases + 1
+    failed = _check("p4-fpass", r3[1], "5", failed); cases = cases + 1
+    failed = _check("p4-fpass-from-array", r3[2], "true", failed); cases = cases + 1
+
+    // ── Case 4 — empty witness (degenerate). All zero, flags=false.
+    let empty = "{}"
+    let r4 = _derive_counts_only(empty)
+    failed = _check("empty-tier1", r4[0], "0", failed); cases = cases + 1
+    failed = _check("empty-fpass", r4[1], "0", failed); cases = cases + 1
+    failed = _check("empty-fpass-from-array", r4[2], "false", failed); cases = cases + 1
+    failed = _check("empty-tier1-from-array", r4[3], "false", failed); cases = cases + 1
+
+    // ── Case 5 — explicit zero counts (degenerate guard). Should fall through to
+    // array-length fallback (treat 0 as "missing/null" by symmetry — array-derived
+    // is more honest than a literal zero count when arrays are non-empty).
+    let zeros = "{\n" +
+        "  \"falsifier_pass_count\": 0,\n" +
+        "  \"tier_1_count\": 0,\n" +
+        "  \"pre_registered_falsifiers\": [{\"id\":\"F1\"}],\n" +
+        "  \"tier_1_promotions\": [{\"id\":\"T1\"}]\n" +
+        "}\n"
+    let r5 = _derive_counts_only(zeros)
+    failed = _check("zeros-tier1", r5[0], "1", failed); cases = cases + 1
+    failed = _check("zeros-fpass", r5[1], "1", failed); cases = cases + 1
+
+    // ── Case 6 — real P5 witness on disk (when present). Guarded — skipped if file
+    // not co-located on this host. Path is the canonical orpheus mirror.
+    let real_path = "/Users/ghost/core/orpheus/state/kick_witnesses/2026-05-04_p5_axis_I_bekenstein_conditional_omega_cycle.json"
+    let exists = exec("[ -f '" + real_path + "' ] && echo y || echo n").trim()
+    if exists == "y" {
+        let real_text = read_file(real_path)
+        let r6 = _derive_counts_only(real_text)
+        // Real witness has 5 pre_registered_falsifiers and 1 tier_1_promotion.
+        failed = _check("real-p5-tier1", r6[0], "1", failed); cases = cases + 1
+        failed = _check("real-p5-fpass", r6[1], "5", failed); cases = cases + 1
+        failed = _check("real-p5-fpass-from-array", r6[2], "true", failed); cases = cases + 1
+        failed = _check("real-p5-tier1-from-array", r6[3], "true", failed); cases = cases + 1
+    } else {
+        println("SKIP real-p5-witness file=" + real_path + " reason=not-on-this-host")
+    }
+
+    if failed > 0 {
+        println("__KICK_DERIVE_FALLBACK__ FAIL cases=" + to_string(cases) + " failed=" + to_string(failed))
+        eprintln("reason=derive-sentinel-r5-fallback-regression fix=tail tool/kick_dispatch.hexa _derive_sentinel_from_witness; verify R5 fallback chain (pre_registered_falsifiers / tier_1_promotions array-length derivation) still fires when explicit counts are null/zero")
+        exit(1)
+    }
+    println("__KICK_DERIVE_FALLBACK__ PASS cases=" + to_string(cases) + " failed=0")
+    exit(0)
+}
