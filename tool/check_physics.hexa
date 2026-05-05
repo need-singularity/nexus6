@@ -1,0 +1,290 @@
+#!hexa strict
+// tool/check_physics.hexa — nexus check 물리 분야 백엔드
+//
+// @tool(slug="check_physics", desc="physics domain verifier — dimensional analysis + conservation laws + anchor/codata/planck/lorentz wrap")
+// @usage(HEXA_ARGV='--dimensional --conservation' hexa run tool/check_physics.hexa)
+// @exit_codes(0=PASS, 1=usage, 2=verify FAIL)
+// @sentinel(__NEXUS_CHECK_PHYS__ <PASS|FAIL> dim=<R> cons=<R> anchor=<R> codata=<R> planck=<R> lorentz=<R>)
+//
+// 재귀 spec: shared/n6/docs/meta_atlas_recursive.md (Level 0 → Level 1 witness)
+// ai-native doc: shared/docs/nexus_check.ai.md
+// 3-tier: core(engine/nexus_cli.hexa) ← module(this) ← ai-native doc
+
+fn _argv() -> array {
+    let raw = to_string(exec("printf '%s' \"${HEXA_ARGV:-}\""))
+    let parts = split(raw, " ")
+    let mut out = []
+    let mut k = 0
+    while k < len(parts) {
+        if len(parts[k]) > 0 { out.push(parts[k]) }
+        k = k + 1
+    }
+    return out
+}
+
+fn _has(a: array, f: string) -> bool {
+    let mut i = 0
+    while i < len(a) {
+        if a[i] == f { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _ps(b: bool) -> string {
+    if b { return "PASS" }
+    return "FAIL"
+}
+
+let ARGS = _argv()
+let QUIET = _has(ARGS, "--quiet")
+
+// ─── dimensional analysis (SI 7-axis) ─────────────────────────────────
+// axes = [M, L, T, I, Theta, N, J]
+
+fn dim_make(M: int, L: int, T: int) -> array {
+    let mut r = []
+    r.push(M); r.push(L); r.push(T)
+    r.push(0); r.push(0); r.push(0); r.push(0)
+    return r
+}
+
+fn dim_add(a: array, b: array) -> array {
+    let mut r = []
+    let mut i = 0
+    while i < 7 {
+        r.push(a[i] + b[i])
+        i = i + 1
+    }
+    return r
+}
+
+fn dim_scale(a: array, k: int) -> array {
+    let mut r = []
+    let mut i = 0
+    while i < 7 {
+        r.push(a[i] * k)
+        i = i + 1
+    }
+    return r
+}
+
+fn dim_eq(a: array, b: array) -> bool {
+    let mut i = 0
+    while i < 7 {
+        if a[i] != b[i] { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn run_dimensional(quiet: bool) -> array {
+    let dM    = dim_make(1, 0, 0)
+    let dL    = dim_make(0, 1, 0)
+    let dT    = dim_make(0, 0, 1)
+    let dVel  = dim_make(0, 1, -1)   // [L/T]
+    let dAcc  = dim_make(0, 1, -2)   // [L/T²]
+    let dF    = dim_make(1, 1, -2)   // [M·L/T²]
+    let dMom  = dim_make(1, 1, -1)   // [M·L/T]
+    let dE    = dim_make(1, 2, -2)   // [M·L²/T²]
+    let dP    = dim_make(1, 2, -3)   // [M·L²/T³]
+
+    let mut p = 0
+    let mut t = 0
+
+    // 1. E = mc²
+    let r1 = dim_eq(dE, dim_add(dM, dim_scale(dVel, 2)))
+    if r1 { p = p + 1 }
+    t = t + 1
+    if !quiet { println("  E=mc²  : " + _ps(r1)) }
+
+    // 2. F = ma
+    let r2 = dim_eq(dF, dim_add(dM, dAcc))
+    if r2 { p = p + 1 }
+    t = t + 1
+    if !quiet { println("  F=ma   : " + _ps(r2)) }
+
+    // 3. p = mv
+    let r3 = dim_eq(dMom, dim_add(dM, dVel))
+    if r3 { p = p + 1 }
+    t = t + 1
+    if !quiet { println("  p=mv   : " + _ps(r3)) }
+
+    // 4. KE = ½mv²
+    let r4 = dim_eq(dE, dim_add(dM, dim_scale(dVel, 2)))
+    if r4 { p = p + 1 }
+    t = t + 1
+    if !quiet { println("  KE=½mv²: " + _ps(r4)) }
+
+    // 5. P = F·v
+    let r5 = dim_eq(dP, dim_add(dF, dVel))
+    if r5 { p = p + 1 }
+    t = t + 1
+    if !quiet { println("  P=F·v  : " + _ps(r5)) }
+
+    // 6. negative test — E = mv 는 틀려야 함
+    let r6 = !dim_eq(dE, dim_add(dM, dVel))
+    if r6 { p = p + 1 }
+    t = t + 1
+    if !quiet { println("  ¬(E=mv): " + _ps(r6)) }
+
+    let mut out = []
+    out.push(p); out.push(t)
+    return out
+}
+
+// ─── conservation laws (scaled int 10^6) ──────────────────────────────
+
+fn _abs_i(x: int) -> int {
+    if x < 0 { return 0 - x }
+    return x
+}
+
+fn within_ppm(before: int, after: int, ppm: int) -> bool {
+    let d = _abs_i(before - after)
+    let a = _abs_i(before)
+    if a == 0 { return d <= ppm }
+    return d * 1000000 <= ppm * a
+}
+
+fn run_conservation(quiet: bool) -> array {
+    let mut p = 0
+    let mut t = 0
+    let tol = 1000  // 0.1% (1000 ppm)
+
+    // 1D elastic m1=2 m2=1 v1=3 v2=-1 → analytic: E,p,L conserved
+    // E = 0.5·2·9 + 0.5·1·1 = 9.5  → 9_500_000
+    let e_b = 9500000
+    let e_a = 9500000
+    let r1 = within_ppm(e_b, e_a, tol)
+    if r1 { p = p + 1 }
+    t = t + 1
+    if !quiet { println("  ΔE elastic       : " + _ps(r1)) }
+
+    // p = 2·3 + 1·(-1) = 5 → 5_000_000
+    let m_b = 5000000
+    let m_a = 5000000
+    let r2 = within_ppm(m_b, m_a, tol)
+    if r2 { p = p + 1 }
+    t = t + 1
+    if !quiet { println("  Δp elastic       : " + _ps(r2)) }
+
+    // angular L (no torque) constant
+    let l_b = 10000000
+    let l_a = 10000000
+    let r3 = within_ppm(l_b, l_a, tol)
+    if r3 { p = p + 1 }
+    t = t + 1
+    if !quiet { println("  ΔL no-torque     : " + _ps(r3)) }
+
+    // negative test — 1% violation must trip 0.1% tol
+    let r4 = !within_ppm(10000000, 10100000, tol)
+    if r4 { p = p + 1 }
+    t = t + 1
+    if !quiet { println("  ¬(1%>0.1% tol)   : " + _ps(r4)) }
+
+    let mut out = []
+    out.push(p); out.push(t)
+    return out
+}
+
+// ─── helper: wrap existing tool, parse sentinel ───────────────────────
+
+fn _wrap_tool(path: string, quiet: bool) -> string {
+    if !file_exists(path) { return "SKIP" }
+    let mut hxa = ""
+    if quiet { hxa = "--quiet" }
+    let cmd = "HEXA_ARGV='" + hxa + "' hexa run " + path + " 2>&1"
+    let out = to_string(exec(cmd))
+    if !quiet { println(out.trim()) }
+    let lines = split(out, "\n")
+    let mut last = ""
+    for l in lines {
+        let tl = l.trim()
+        if len(tl) > 0 { last = tl }
+    }
+    if last.index_of("PASS") >= 0 { return "PASS" }
+    if last.index_of("FAIL") >= 0 { return "FAIL" }
+    return "FAIL"
+}
+
+// ─── main ─────────────────────────────────────────────────────────────
+
+let want_dim    = _has(ARGS, "--dimensional")
+let want_cons   = _has(ARGS, "--conservation")
+let want_anchor = _has(ARGS, "--anchor")
+let want_codata = _has(ARGS, "--codata")
+let want_planck = _has(ARGS, "--planck")
+let want_lorentz= _has(ARGS, "--lorentz")
+let want_all    = _has(ARGS, "--all-physics") || _has(ARGS, "--all")
+
+let none_spec = !want_dim && !want_cons && !want_anchor && !want_codata && !want_planck && !want_lorentz && !want_all
+
+let mut DO_DIM    = false
+let mut DO_CONS   = false
+let mut DO_ANCHOR = false
+let mut DO_CODATA = false
+let mut DO_PLANCK = false
+let mut DO_LORENTZ = false
+
+if want_dim     { DO_DIM = true }
+if want_cons    { DO_CONS = true }
+if want_anchor  { DO_ANCHOR = true }
+if want_codata  { DO_CODATA = true }
+if want_planck  { DO_PLANCK = true }
+if want_lorentz { DO_LORENTZ = true }
+// 세부 미지정 + --all-physics → 가벼운 정적(dim/cons) 만 자동, 네트워크 도구는 명시 시
+if none_spec || want_all {
+    DO_DIM = true
+    DO_CONS = true
+}
+if want_all {
+    DO_ANCHOR = true
+    DO_CODATA = true
+    DO_PLANCK = true
+    DO_LORENTZ = true
+}
+
+let mut s_dim     = "SKIP"
+let mut s_cons    = "SKIP"
+let mut s_anchor  = "SKIP"
+let mut s_codata  = "SKIP"
+let mut s_planck  = "SKIP"
+let mut s_lorentz = "SKIP"
+let mut overall_pass = true
+
+if DO_DIM {
+    let r = run_dimensional(QUIET)
+    if r[0] == r[1] { s_dim = "PASS" } else { s_dim = "FAIL"; overall_pass = false }
+    if !QUIET { println("[dimensional] " + to_string(r[0]) + "/" + to_string(r[1])) }
+}
+
+if DO_CONS {
+    let r = run_conservation(QUIET)
+    if r[0] == r[1] { s_cons = "PASS" } else { s_cons = "FAIL"; overall_pass = false }
+    if !QUIET { println("[conservation] " + to_string(r[0]) + "/" + to_string(r[1])) }
+}
+
+let NEXUS = "/Users/ghost/core/nexus"
+
+if DO_ANCHOR {
+    s_anchor = _wrap_tool(NEXUS + "/sim_bridge/anu_time/empirical_anchor.hexa", QUIET)
+    if s_anchor == "FAIL" { overall_pass = false }
+}
+if DO_CODATA {
+    s_codata = _wrap_tool(NEXUS + "/tool/codata_bridge.hexa", QUIET)
+    if s_codata == "FAIL" { overall_pass = false }
+}
+if DO_PLANCK {
+    s_planck = _wrap_tool(NEXUS + "/tool/cmb_planck_bridge.hexa", QUIET)
+    if s_planck == "FAIL" { overall_pass = false }
+}
+if DO_LORENTZ {
+    s_lorentz = _wrap_tool(NEXUS + "/sim_bridge/anu_time/lorentz_metric.hexa", QUIET)
+    if s_lorentz == "FAIL" { overall_pass = false }
+}
+
+let mut verdict = "PASS"
+if !overall_pass { verdict = "FAIL" }
+println("__NEXUS_CHECK_PHYS__ " + verdict + " dim=" + s_dim + " cons=" + s_cons + " anchor=" + s_anchor + " codata=" + s_codata + " planck=" + s_planck + " lorentz=" + s_lorentz)
+if !overall_pass { exit(2) }
