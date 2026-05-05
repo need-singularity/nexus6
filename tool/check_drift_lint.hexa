@@ -1,0 +1,239 @@
+#!hexa strict
+// tool/check_drift_lint.hexa — nexus check 도메인 정의 drift lint (4 source 일치 검증)
+//
+// @tool(slug="check_drift_lint", desc="lint check-domain definitions across spec/router/doc/backend (4 sources must agree)")
+// @usage(hexa run tool/check_drift_lint.hexa [--quiet])
+// @exit_codes(0=PASS, 1=usage/io error, 2=drift detected)
+// @sentinel(__CHECK_DRIFT_LINT__ <PASS|FAIL> spec_domains=<N> router_domains=<N> doc_domains=<N> backends_present=<N> drift=<set|none>)
+//
+// 4 sources of truth (must agree on domain set, '--all' meta-flag 제외):
+//   1. engine/nexus_cli_spec.json   subcmds_check.check.domain_flags  (현재 14: 13 + --all)
+//   2. tool/check_router.hexa       let DOMAINS = [...] literal       (13)
+//   3. docs/nexus_check.ai.md       Domain matrix table `--<dom>`     (13)
+//   4. tool/check_<domain>.hexa     file_exists 백엔드                 (보고만, drift 아님)
+//
+// docs/nexus_check.ai.md Falsifier #1 / #6 직접 보호.
+// read-only — 어떤 source 도 수정하지 않음. precommit 훅 통합 가능 형태.
+//
+// raw 73 admissibility: 4 독립 source cross-check, 자명 아님
+// raw 80 sentinel: 한 줄 stdout 끝
+// raw 71 report-only: 자동 mutation 없음
+
+fn _argv() -> array {
+    let raw = to_string(exec("printf '%s' \"${HEXA_ARGV:-}\""))
+    let parts = split(raw, " ")
+    let mut out = []
+    let mut k = 0
+    while k < len(parts) {
+        if len(parts[k]) > 0 { out.push(parts[k]) }
+        k = k + 1
+    }
+    return out
+}
+
+fn _has(a: array, f: string) -> bool {
+    let mut i = 0
+    while i < len(a) {
+        if a[i] == f { return true }
+        i = i + 1
+    }
+    return false
+}
+
+let NEXUS = "/Users/ghost/core/nexus"
+let SPEC  = NEXUS + "/engine/nexus_cli_spec.json"
+let ROUTER= NEXUS + "/tool/check_router.hexa"
+let DOC   = NEXUS + "/docs/nexus_check.ai.md"
+
+let ARGS = _argv()
+let QUIET = _has(ARGS, "--quiet")
+
+if _has(ARGS, "--help") || _has(ARGS, "-h") {
+    println("usage: HEXA_ARGV='--quiet' hexa run tool/check_drift_lint.hexa")
+    println("  lint nexus check domain definitions across 4 sources:")
+    println("    1. engine/nexus_cli_spec.json   subcmds_check.check.domain_flags")
+    println("    2. tool/check_router.hexa       DOMAINS = [...]")
+    println("    3. docs/nexus_check.ai.md       Domain matrix table")
+    println("    4. tool/check_<domain>.hexa     backend file_exists (report-only)")
+    println("  exit 0=PASS, 1=usage/io, 2=drift")
+    return
+}
+
+fn _say(msg: string) {
+    if !QUIET { println(msg) }
+}
+
+fn _set_add(s: array, v: string) -> array {
+    let mut i = 0
+    while i < len(s) {
+        if s[i] == v { return s }
+        i = i + 1
+    }
+    let mut out = s
+    out.push(v)
+    return out
+}
+
+fn _set_contains(s: array, v: string) -> bool {
+    let mut i = 0
+    while i < len(s) {
+        if s[i] == v { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _set_diff_str(label_a: string, set_a: array, label_b: string, set_b: array) -> string {
+    // elements in a not in b
+    let mut missing = []
+    let mut i = 0
+    while i < len(set_a) {
+        if !_set_contains(set_b, set_a[i]) { missing.push(set_a[i]) }
+        i = i + 1
+    }
+    if len(missing) == 0 { return "" }
+    let mut s = label_a + "\\" + label_b + "={"
+    let mut j = 0
+    while j < len(missing) {
+        if j > 0 { s = s + "," }
+        s = s + missing[j]
+        j = j + 1
+    }
+    s = s + "}"
+    return s
+}
+
+// ── Source 1: spec.json domain_flags (regex extract via grep) ─────
+// 'domain_flags' 블록 내 "--<name>": "..." 키만 추출.
+// jq 의존 회피 — grep -oE + awk 로 충분.
+fn _extract_spec_domains() -> array {
+    if !file_exists(SPEC) { return [] }
+    // domain_flags 블록 lookahead: 해당 블록만 카토 추출
+    let cmd = "awk '/\"domain_flags\"[[:space:]]*:/,/^[[:space:]]*}/' " + SPEC +
+              " | grep -oE '\"--[a-z-]+\"' | sed 's/\"//g'"
+    let out = to_string(exec(cmd))
+    let lines = split(out, "\n")
+    let mut s = []
+    for l in lines {
+        let t = l.trim()
+        if len(t) == 0 { continue }
+        if t == "--all" { continue }  // meta-flag 제외
+        // strip leading '--'
+        let name = t.substring(2, len(t))
+        s = _set_add(s, name)
+    }
+    return s
+}
+
+// ── Source 2: router DOMAINS literal ──────────────────────────────
+// `let DOMAINS = [ ... ]` 의 string 토큰만 수집.
+fn _extract_router_domains() -> array {
+    if !file_exists(ROUTER) { return [] }
+    // multi-line literal — sed 로 'let DOMAINS' ~ 닫는 ']' 까지 추출
+    let cmd = "awk '/let[[:space:]]+DOMAINS[[:space:]]*=/,/\\]/' " + ROUTER +
+              " | grep -oE '\"[a-z]+\"' | sed 's/\"//g'"
+    let out = to_string(exec(cmd))
+    let lines = split(out, "\n")
+    let mut s = []
+    for l in lines {
+        let t = l.trim()
+        if len(t) == 0 { continue }
+        s = _set_add(s, t)
+    }
+    return s
+}
+
+// ── Source 3: doc Domain matrix table ─────────────────────────────
+// 표의 첫 컬럼 `--<dom>` 만 추출 — backtick 으로 감싸진 토큰.
+fn _extract_doc_domains() -> array {
+    if !file_exists(DOC) { return [] }
+    // Domain matrix 섹션 한정: '## Domain matrix' ~ 다음 '## ' 까지
+    let cmd = "awk '/^## Domain matrix/,/^## Sub-flag matrix/' " + DOC +
+              " | grep -oE '`--[a-z]+`' | sed 's/`//g'"
+    let out = to_string(exec(cmd))
+    let lines = split(out, "\n")
+    let mut s = []
+    for l in lines {
+        let t = l.trim()
+        if len(t) == 0 { continue }
+        if t == "--all" { continue }
+        let name = t.substring(2, len(t))
+        s = _set_add(s, name)
+    }
+    return s
+}
+
+// ── Source 4: backends present (file_exists) ──────────────────────
+fn _count_backends(domains: array) -> int {
+    let mut n = 0
+    let mut i = 0
+    while i < len(domains) {
+        let path = NEXUS + "/tool/check_" + domains[i] + ".hexa"
+        if file_exists(path) { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+// ── Run extractors ────────────────────────────────────────────────
+let spec_set   = _extract_spec_domains()
+let router_set = _extract_router_domains()
+let doc_set    = _extract_doc_domains()
+
+_say("source 1 (spec.json domain_flags): " + to_string(len(spec_set))   + " domains")
+_say("source 2 (router DOMAINS):         " + to_string(len(router_set)) + " domains")
+_say("source 3 (doc Domain matrix):      " + to_string(len(doc_set))    + " domains")
+
+// union of 3 authoritative sets for backend audit
+let mut union_set = []
+let mut us_i = 0
+while us_i < len(spec_set)   { union_set = _set_add(union_set, spec_set[us_i]);   us_i = us_i + 1 }
+us_i = 0
+while us_i < len(router_set) { union_set = _set_add(union_set, router_set[us_i]); us_i = us_i + 1 }
+us_i = 0
+while us_i < len(doc_set)    { union_set = _set_add(union_set, doc_set[us_i]);    us_i = us_i + 1 }
+
+let backends_present = _count_backends(union_set)
+_say("source 4 (check_<dom>.hexa):       " + to_string(backends_present) + "/" + to_string(len(union_set)) + " backends present (report-only)")
+
+// ── Drift detection (pairwise symmetric diffs) ────────────────────
+let mut drift_parts = []
+let mut d1 = _set_diff_str("spec",   spec_set,   "router", router_set)
+let mut d2 = _set_diff_str("router", router_set, "spec",   spec_set)
+let mut d3 = _set_diff_str("spec",   spec_set,   "doc",    doc_set)
+let mut d4 = _set_diff_str("doc",    doc_set,    "spec",   spec_set)
+let mut d5 = _set_diff_str("router", router_set, "doc",    doc_set)
+let mut d6 = _set_diff_str("doc",    doc_set,    "router", router_set)
+for d in [d1, d2, d3, d4, d5, d6] {
+    if len(d) > 0 { drift_parts.push(d) }
+}
+
+let mut drift_str = "none"
+let mut overall_pass = true
+if len(drift_parts) > 0 {
+    overall_pass = false
+    drift_str = ""
+    let mut k = 0
+    while k < len(drift_parts) {
+        if k > 0 { drift_str = drift_str + ";" }
+        drift_str = drift_str + drift_parts[k]
+        k = k + 1
+    }
+    _say("DRIFT: " + drift_str)
+    _say("  fix: align spec.json domain_flags ↔ router DOMAINS ↔ doc Domain matrix")
+} else {
+    _say("DRIFT: none — 3 authoritative sources agree (" + to_string(len(spec_set)) + " domains)")
+}
+
+// ── Sentinel ──────────────────────────────────────────────────────
+let mut verdict = "PASS"
+if !overall_pass { verdict = "FAIL" }
+let sentinel = "__CHECK_DRIFT_LINT__ " + verdict +
+               " spec_domains=" + to_string(len(spec_set)) +
+               " router_domains=" + to_string(len(router_set)) +
+               " doc_domains=" + to_string(len(doc_set)) +
+               " backends_present=" + to_string(backends_present) +
+               " drift=" + drift_str
+println(sentinel)
+
+if !overall_pass { exit(2) }
