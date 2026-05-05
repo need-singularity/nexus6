@@ -40,7 +40,7 @@ on fresh tokens, ~25s revive on expired tokens). SSOT lives in hive's
 
 ```
 nexus kick <topic>
-  → ~/.hx/bin/nexus  (shim — raw 200 canonical-form bypass)
+  → ~/.hx/bin/nexus  (shim — canonical-form bypass)
   → ~/.hx/packages/nexus/cli/run.hexa  cmd_kick
   → tool/kick_dispatch.hexa
       ↳ _claude_pick_slot()              → "claudeN"
