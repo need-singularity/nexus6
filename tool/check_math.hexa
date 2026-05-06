@@ -47,15 +47,20 @@ if _has(ARGS, "--help") || _has(ARGS, "-h") {
     return
 }
 
-// invariants — bash script exit code via inline __EXIT__ marker
+// invariants — bash script exit code via inline __EXIT__ marker.
+// --report 모드로 호출하여 drift_count + stale_hours 를 stdout 에서 파싱 →
+// engine/nexus_cli.hexa cmd_check 의 BT-AI2 auto-audit 가 소비할 __BT_AI2__ 라인 emit.
+// drift_count 미파싱 (예: upstream missing SKIP) 시 BT_AI2 emit skip — backward compat.
 fn run_invariants(quiet: bool) -> string {
     let path = NEXUS + "/tool/n6_invariants_drift_check.sh"
     if !file_exists(path) { return "SKIP" }
     // exec() 은 stdout 만 반환 — exit code 를 마지막 라인에 echo 로 emit 하여 파싱.
-    let cmd = "bash " + path + " 2>&1; echo __EXIT__=$?"
+    let cmd = "bash " + path + " --report 2>&1; echo __EXIT__=$?"
     let out = to_string(exec(cmd))
     let lines = split(out, "\n")
     let mut ec = -1
+    let mut drift_count = -1
+    let mut stale_hours = -1
     let mut display = []
     for l in lines {
         let t = l.trim()
@@ -63,6 +68,22 @@ fn run_invariants(quiet: bool) -> string {
         if t.index_of("__EXIT__=") == 0 {
             let v = t.substring(9, len(t))
             ec = to_int(v)
+        } else if t.index_of("drift_count=") == 0 {
+            let v = t.substring(12, len(t))
+            drift_count = to_int(v)
+            display.push(l)
+        } else if t.index_of("stale=") == 0 {
+            // line shape: "stale=N stale_hours=M"
+            let parts = split(t, " ")
+            let mut pi = 0
+            while pi < len(parts) {
+                let p = parts[pi]
+                if p.index_of("stale_hours=") == 0 {
+                    stale_hours = to_int(p.substring(12, len(p)))
+                }
+                pi = pi + 1
+            }
+            display.push(l)
         } else {
             display.push(l)
         }
@@ -73,8 +94,20 @@ fn run_invariants(quiet: bool) -> string {
     }
     // exit 0 ⇒ PASS (semantic match + fresh, OR upstream-missing fail-open SKIP)
     // exit 1/2/3 ⇒ FAIL (drift / stale / parse error)
-    if ec == 0 { return "PASS" }
-    return "FAIL"
+    let result = if ec == 0 { "PASS" } else { "FAIL" }
+
+    // BT-AI2 honesty-bit emit — loss = drift_count + max(stale_hours, 0); expected = 0.
+    // Pure-drift FAIL: loss = drift_count ≥ 1 → claim=FAIL, rel_err ≥ 1 → no F-AI2-B fire.
+    // Pure-stale FAIL: loss = stale_hours ≥ 1 → no F-AI2-B fire.
+    // Silent regression (claim=PASS but loss>0): F-AI2-A fires when rel_err ≥ 0.05.
+    // drift_count==-1 (parse missed, e.g. upstream-missing SKIP) → emit skip.
+    if drift_count >= 0 {
+        let stale_eff = if stale_hours > 0 { stale_hours } else { 0 }
+        let loss_int = drift_count + stale_eff
+        println("__BT_AI2__ label=math.invariants claim=" + result +
+                " loss=" + to_string(loss_int) + ".0 expected=0.0")
+    }
+    return result
 }
 
 // v1: absolute / hyperarith 는 별도 PR 에서 wire — 항상 SKIP
