@@ -39,13 +39,7 @@
 >
 > **[📄 Papers](https://github.com/need-singularity/papers)** — Complete paper collection (92 papers, Zenodo DOIs).
 
-## Sub-projects
-
-> **[🐝 Hive](https://github.com/need-singularity/hive)** — pi-mono fork. AI-agent swarm: multi-cell parallel agents, layered persistent memory, need-singularity bridges.
->
-> **[🕳️ Void](https://github.com/need-singularity/void)** — Ghostty fork. AI-native terminal: grid mode (N×M auto-layout), agent I/O alongside PTY, perf-first budget.
->
-> **[🧬 airgenome](https://github.com/need-singularity/airgenome)** — OS genome scanner: 6-axis hexagon projection of host vitals + pattern accumulation + anomaly detection.
+> **[Other projects →](https://github.com/orgs/need-singularity/repositories)**
 
 ## 💬 Community
 
@@ -54,7 +48,6 @@
 Live research discussion, paper drops, stage-gate reviews, cross-project dispatch.
 
 <!-- private repos는 projects.json의 private_repos 필드에 저장됨 (노출 금지) -->
-
 <!-- SHARED:PROJECTS:END -->
 
 
@@ -211,7 +204,6 @@ auto-bootstrapped by [`install.hexa`](install.hexa)):
 | [`qmirror`](https://github.com/need-singularity/qmirror) | `^1.0.0` | Quantum Mirror substrate (CHSH / IIT / NIST / QRNG) consumed by `nexus/modules/qmirror/*` | `hx install qmirror` |
 | [`sim-universe`](https://github.com/need-singularity/sim-universe) | `^1.0.0` | Virtual universe simulation runtime (anu_time τ-clock + multiverse interferometer + ouroboros QRNG + Bostrom test + Gödel-Q + qpu_bridge) consumed by `nexus/cli/sim.hexa` (4-tier resolution) | `hx install sim-universe` |
 | [`hexa-bio`](https://github.com/need-singularity/hexa-bio) | `^1.0.0` | Molecular Toolkit (HEXA family) — 4 verbs WEAVE/NANOBOT/RIBOZYME/VIROCAPSID consumed by `nexus/cli/bio.hexa` (4-tier resolution) | `hx install hexa-bio` |
-| [`honesty-monitor`](https://github.com/need-singularity/honesty-monitor) | `^1.0.0` | AI honesty-bit falsifier (BT-AI2 contract) consumed by `nexus/cli/honesty.hexa` (4-tier resolution) | `hx install honesty-monitor` |
 | [`qrng`](https://github.com/need-singularity/qrng) | `^1.0.0` | Quantum random number generator (5 backends, T0..T3 tiers, NIST SP 800-22 compliant) consumed by `nexus/cli/qrng.hexa` (4-tier resolution) | `hx install qrng` |
 | [`mc-integrate`](https://github.com/need-singularity/mc-integrate) | `^1.0.0` | Monte Carlo integrator (catalan / zeta3 / euler_gamma / pi5_times_n6 + Welch-t indistinguishability) consumed by `nexus/cli/mc.hexa` (4-tier resolution) | `hx install mc-integrate` |
 
