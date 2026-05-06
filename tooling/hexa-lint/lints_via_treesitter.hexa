@@ -1,0 +1,375 @@
+#!hexa strict
+// tooling/hexa-lint/lints_via_treesitter.hexa
+// — tree-sitter-hexa lints.scm structural query → nexus check hexalint domain wiring.
+//
+// @tool(slug="hexa_lint_via_treesitter", desc="batch lint .hexa files via tree-sitter-hexa lints.scm — AST-aware structural rule check")
+// @usage(HEXA_ARGV='[--quiet] [--ndjson] [--selftest] [<path1> <path2> ...]' hexa run tooling/hexa-lint/lints_via_treesitter.hexa)
+// @exit_codes(0=PASS (0 errors), 1=usage / tree-sitter unavailable, 2=violations detected)
+// @sentinel(__NEXUS_CHECK_HEXA_LINT__ <PASS|FAIL> files=<N> violations=<N> errors=<N> warnings=<N> rules=<list>)
+//
+// Differentiation (concurrent agents):
+//   - tree-sitter wiring (this file) = batch lint (CI / manual / nexus check)
+//   - hexa-introspect Phase 2 --check  = single-file fast scanner-based lint
+//   - hook bind                        = pre-write real-time enforcement
+//
+// Design:
+//   1. Resolve target paths (positional args or default = mk2_hexa/mk2/src/atlas/)
+//   2. Walk dirs → collect *.hexa files (find -type f -name *.hexa)
+//   3. Invoke tree-sitter CLI: `tree-sitter query <lints.scm> <file>` (cwd = tooling/tree-sitter-hexa/)
+//   4. Parse capture lines (`capture: N - error.<rule-id>, start: (R, C), end: (R, C), text: \`...\``)
+//   5. Filter primary @error.<rule> captures (skip @_fn / @_inner aux captures starting with `_`)
+//   6. Per-file output + per-rule severity tally — parallel arrays (no struct literal)
+//   7. Final sentinel + exit propagation (errors > 0 → exit 2)
+//
+// 규칙: hexa >=/<= 금지 — </> 만 사용. stdlib only. (docs/hexa-lang/RULES.md)
+// raw 71 falsifier: report-only — never mutates source files.
+// raw 80 sentinel: last stdout line = __NEXUS_CHECK_HEXA_LINT__ ... PASS|FAIL.
+// raw 73 admissibility: AST-precise (vs grep) — no false positives on string/comment occurrences.
+//
+// SSOT (read-only): tooling/tree-sitter-hexa/queries/lints.scm (D-track output, 수정 금지 here).
+
+fn _argv() -> array {
+    let raw = to_string(exec("printf '%s' \"${HEXA_ARGV:-}\""))   // @allow-bare-exec env probe
+    let parts = split(raw, " ")
+    let mut out = []
+    let mut k = 0
+    while k < len(parts) {
+        if len(parts[k]) > 0 { out.push(parts[k]) }
+        k = k + 1
+    }
+    return out
+}
+
+fn _has(a: array, f: string) -> bool {
+    let mut i = 0
+    while i < len(a) {
+        if a[i] == f { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn shq(s: string) -> string {
+    // shell-quote: wrap in single quotes; escape internal '
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+let NEXUS    = "/Users/ghost/core/nexus"
+let TS_DIR   = NEXUS + "/tooling/tree-sitter-hexa"
+let LINT_SCM = TS_DIR + "/queries/lints.scm"
+let TS_BIN   = "/opt/homebrew/bin/tree-sitter"
+
+let ARGS    = _argv()
+let QUIET   = _has(ARGS, "--quiet")
+let NDJSON  = _has(ARGS, "--ndjson")
+let SELFTST = _has(ARGS, "--selftest")
+
+// rule severity classification — all 5 lints.scm rules are project-policy errors
+// except nested-call-exec (warning): a `bare-exec` capture for the same expression
+// already fires error severity; nested adds context only.
+fn _severity(rule: string) -> string {
+    if rule == "relop-banned"        { return "error" }
+    if rule == "bare-exec"           { return "error" }
+    if rule == "silent-catch"        { return "error" }
+    if rule == "silent-catch.struct" { return "error" }
+    if rule == "silent-exit"         { return "error" }
+    if rule == "nested-call-exec"    { return "warning" }
+    return "warning"
+}
+
+if _has(ARGS, "--help") || _has(ARGS, "-h") {
+    println("usage: HEXA_ARGV='[--quiet] [--ndjson] [--selftest] [<path>...]' hexa run tooling/hexa-lint/lints_via_treesitter.hexa")
+    println("  --quiet     suppress per-file/per-violation output (sentinel only)")
+    println("  --ndjson    emit one NDJSON record per violation on stdout")
+    println("  --selftest  run on tooling/tree-sitter-hexa/test fixtures (smoke)")
+    println("  <path>      file or directory; default = mk2_hexa/mk2/src/atlas/")
+    println("  exit 0=PASS, 1=usage/tree-sitter unavailable, 2=violations")
+    return
+}
+
+// ── precondition: tree-sitter CLI + lints.scm both available ───────
+fn _precondition_check() -> string {
+    if !file_exists(LINT_SCM) {
+        return "lints.scm missing: " + LINT_SCM
+    }
+    let probe = to_string(exec(TS_BIN + " --version 2>&1")).trim()   // @allow-bare-exec ts probe
+    if probe.index_of("tree-sitter") < 0 {
+        return "tree-sitter CLI unavailable (probed: " + TS_BIN + ")"
+    }
+    return ""
+}
+
+let pc_err = _precondition_check()
+if pc_err.len() > 0 {
+    println("[hexa-lint] precondition FAIL: " + pc_err)
+    println("__NEXUS_CHECK_HEXA_LINT__ FAIL files=0 violations=0 errors=0 warnings=0 rules=precondition")
+    exit(1)   // @allow-silent-exit precondition gate
+}
+
+// ── target path resolution ─────────────────────────────────────────
+// Drop meta-flags from positional args; remainder = paths.
+let mut targets = []
+let mut a_i = 0
+while a_i < len(ARGS) {
+    let arg = ARGS[a_i]
+    let mut is_flag = false
+    if arg == "--quiet"    { is_flag = true }
+    if arg == "--ndjson"   { is_flag = true }
+    if arg == "--selftest" { is_flag = true }
+    if arg == "--help"     { is_flag = true }
+    if arg == "-h"         { is_flag = true }
+    if arg.starts_with("--path=") {
+        is_flag = true
+        targets.push(arg.substring(7, len(arg)))
+    }
+    if !is_flag { targets.push(arg) }
+    a_i = a_i + 1
+}
+
+if SELFTST {
+    targets = [NEXUS + "/tooling/tree-sitter-hexa/test"]
+}
+
+if len(targets) == 0 {
+    targets = [NEXUS + "/mk2_hexa/mk2/src/atlas"]
+}
+
+// ── walk targets → collect *.hexa files ────────────────────────────
+// NOTE: hexa runtime `file_exists` returns false for directories — must probe
+// with `test -e` (any) and `test -d` (dir) explicitly via shell.
+fn _collect_hexa_files(roots: array) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < len(roots) {
+        let p = roots[i]
+        // 3-state probe: dir / file / missing
+        let probe = to_string(exec(
+            "if [ -d " + shq(p) + " ]; then echo dir; " +
+            "elif [ -e " + shq(p) + " ]; then echo file; " +
+            "else echo missing; fi"
+        )).trim()   // @allow-bare-exec path-classify
+        if probe == "dir" {
+            let cmd = "find " + shq(p) + " -type f -name '*.hexa' 2>/dev/null"
+            let raw = to_string(exec(cmd))   // @allow-bare-exec dir-walk
+            let lines = split(raw, "\n")
+            let mut li = 0
+            while li < len(lines) {
+                let t = lines[li].trim()
+                if len(t) > 0 { out.push(t) }
+                li = li + 1
+            }
+        } else {
+            if probe == "file" {
+                if p.ends_with(".hexa") { out.push(p) }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+let files = _collect_hexa_files(targets)
+
+if !QUIET && !NDJSON {
+    println("[hexa-lint] tree-sitter " + to_string(len(files)) + " file(s) against " + LINT_SCM)
+}
+
+// ── per-file scan — parallel arrays for violations (no struct literal) ─
+// V_FILE / V_RULE / V_ROW / V_COL / V_TEXT / V_SEV — all same length.
+let mut V_FILE: [str] = []
+let mut V_RULE: [str] = []
+let mut V_ROW : [int] = []
+let mut V_COL : [int] = []
+let mut V_TEXT: [str] = []
+let mut V_SEV : [str] = []
+
+// Suppression check: if the source line at `row` (0-indexed) contains
+// `// @allow-<rule>` (or its 'silent-catch.struct' base form 'silent-catch'),
+// the violation is suppressed.
+fn _is_suppressed(file: string, row: int, rule: string) -> bool {
+    if row < 0 { return false }
+    // Read the specific source line via sed (1-indexed for sed addressing).
+    let lineno = to_string(row + 1)
+    let cmd = "sed -n " + lineno + "p " + shq(file) + " 2>/dev/null"
+    let line = to_string(exec(cmd))   // @allow-bare-exec line-fetch
+    let comment_idx = line.index_of("//")
+    if comment_idx < 0 { return false }
+    let after_cmt = line.substring(comment_idx, len(line))
+    let token = "@allow-" + rule
+    if after_cmt.index_of(token) > 0 { return true }
+    // Direct match (legacy `// @allow-<rule>` form)
+    if line.index_of("// @allow-" + rule) > 0 { return true }
+    // Compound rule: silent-catch.struct → also accept @allow-silent-catch
+    if rule == "silent-catch.struct" {
+        if after_cmt.index_of("@allow-silent-catch") > 0 { return true }
+    }
+    // nested-call-exec piggy-backs on bare-exec annotation (same exec(...) span).
+    if rule == "nested-call-exec" {
+        if after_cmt.index_of("@allow-bare-exec") > 0 { return true }
+        if after_cmt.index_of("@allow-nested-call-exec") > 0 { return true }
+    }
+    return false
+}
+
+fn _scan_one(file: string) -> int {
+    // returns count of violations appended to V_*.
+    // tree-sitter query output (one match per pattern):
+    //   pattern: <N>
+    //     capture: <N> - <name>, start: (R, C), end: (R, C), text: `<text>`
+    // Only @error.<rule> captures count; aux @_fn / @_inner are skipped.
+    // Suppression: lines with matching `// @allow-<rule>` are dropped.
+    let cmd = "cd " + shq(TS_DIR) + " && " + shq(TS_BIN) + " query " + shq(LINT_SCM) +
+              " " + shq(file) + " 2>&1"
+    let raw = to_string(exec(cmd))   // @allow-bare-exec ts query
+    let lines = split(raw, "\n")
+    let mut count = 0
+    let mut li = 0
+    while li < len(lines) {
+        let trimmed = lines[li].trim()
+        if trimmed.starts_with("capture:") {
+            let dash_idx = trimmed.index_of(" - ")
+            if dash_idx > 0 {
+                let after = trimmed.substring(dash_idx + 3, len(trimmed))
+                let comma = after.index_of(",")
+                if comma > 0 {
+                    let name = after.substring(0, comma).trim()
+                    if name.starts_with("error.") {
+                        let rule = name.substring(6, len(name))
+                        // start: (R, C)
+                        let mut row = 0 - 1
+                        let mut col = 0 - 1
+                        let s_idx = trimmed.index_of("start: (")
+                        if s_idx > 0 {
+                            let after_s = trimmed.substring(s_idx + 8, len(trimmed))
+                            let close = after_s.index_of(")")
+                            if close > 0 {
+                                let pair = after_s.substring(0, close)
+                                let parts = split(pair, ", ")
+                                if len(parts) > 1 {
+                                    row = to_int(parts[0])
+                                    col = to_int(parts[1])
+                                }
+                            }
+                        }
+                        // text: `...` — text is on a single output line per ts CLI convention.
+                        let mut text = ""
+                        let t_idx = trimmed.index_of("text: `")
+                        if t_idx > 0 {
+                            let after_t = trimmed.substring(t_idx + 7, len(trimmed))
+                            let lc = after_t.last_index_of("`")
+                            if lc > 0 {
+                                text = after_t.substring(0, lc)
+                            } else {
+                                text = after_t
+                            }
+                        }
+                        // suppression filter — `// @allow-<rule>` on same source line.
+                        if !_is_suppressed(file, row, rule) {
+                            V_FILE.push(file)
+                            V_RULE.push(rule)
+                            V_ROW.push(row)
+                            V_COL.push(col)
+                            V_TEXT.push(text)
+                            V_SEV.push(_severity(rule))
+                            count = count + 1
+                        }
+                    }
+                }
+            }
+        }
+        li = li + 1
+    }
+    return count
+}
+
+fn _ndjson_escape(s: string) -> string {
+    // minimal JSON string escape: backslash, dquote, newline, tab.
+    let s1 = s.replace("\\", "\\\\")
+    let s2 = s1.replace("\"", "\\\"")
+    let s3 = s2.replace("\n", "\\n")
+    let s4 = s3.replace("\t", "\\t")
+    return s4
+}
+
+fn _set_add(s: array, v: string) -> array {
+    let mut i = 0
+    while i < len(s) { if s[i] == v { return s }; i = i + 1 }
+    let mut out = s
+    out.push(v)
+    return out
+}
+
+let mut total_err  = 0
+let mut total_warn = 0
+let mut rule_set: [str] = []
+
+let mut fi = 0
+while fi < len(files) {
+    let f = files[fi]
+    let n_before = len(V_FILE)
+    let _added = _scan_one(f)
+    let n_added = len(V_FILE) - n_before
+
+    if !QUIET && !NDJSON {
+        if n_added < 1 {
+            println("  [PASS] " + f)
+        } else {
+            println("  [VIOL] " + f + " (" + to_string(n_added) + ")")
+        }
+    }
+
+    // per-violation emit + tally
+    let mut vi = n_before
+    while vi < len(V_FILE) {
+        if V_SEV[vi] == "error"   { total_err  = total_err  + 1 }
+        if V_SEV[vi] == "warning" { total_warn = total_warn + 1 }
+        rule_set = _set_add(rule_set, V_RULE[vi])
+
+        if NDJSON {
+            let line = "{\"file\":\""     + _ndjson_escape(V_FILE[vi]) + "\"," +
+                       "\"rule\":\""     + _ndjson_escape(V_RULE[vi]) + "\"," +
+                       "\"row\":"        + to_string(V_ROW[vi]) + "," +
+                       "\"col\":"        + to_string(V_COL[vi]) + "," +
+                       "\"severity\":\"" + _ndjson_escape(V_SEV[vi]) + "\"," +
+                       "\"text\":\""     + _ndjson_escape(V_TEXT[vi]) + "\"}"
+            println(line)
+        } else {
+            if !QUIET {
+                // human-readable: file:row:col severity rule  `text`
+                // ts rows are 0-indexed → convert to 1-indexed for editor jumpiness.
+                println("    " + V_FILE[vi] + ":" + to_string(V_ROW[vi] + 1) + ":" +
+                        to_string(V_COL[vi] + 1) + " " + V_SEV[vi] + " " + V_RULE[vi] +
+                        "  `" + V_TEXT[vi] + "`")
+            }
+        }
+        vi = vi + 1
+    }
+    fi = fi + 1
+}
+
+let total_viol = len(V_FILE)
+
+// ── sentinel ───────────────────────────────────────────────────────
+let mut verdict = "PASS"
+if total_err > 0 { verdict = "FAIL" }
+
+let mut rules_str = "none"
+if len(rule_set) > 0 {
+    rules_str = ""
+    let mut ri = 0
+    while ri < len(rule_set) {
+        if ri > 0 { rules_str = rules_str + "," }
+        rules_str = rules_str + rule_set[ri]
+        ri = ri + 1
+    }
+}
+
+let sentinel = "__NEXUS_CHECK_HEXA_LINT__ " + verdict +
+               " files=" + to_string(len(files)) +
+               " violations=" + to_string(total_viol) +
+               " errors=" + to_string(total_err) +
+               " warnings=" + to_string(total_warn) +
+               " rules=" + rules_str
+println(sentinel)
+
+if total_err > 0 { exit(2) }   // @allow-silent-exit verdict propagation

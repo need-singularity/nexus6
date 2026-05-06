@@ -1,0 +1,996 @@
+// ═══════════════════════════════════════════════════════════
+// tooling/hexa-introspect/refactor.hexa
+//   — hexa-introspect Phase 5b: Semantic refactor & WorkspaceEdit emit
+//
+// 갭 카탈로그: hexa-ast-diff-semantic-refactor (5b 후속, 2026-05-06)
+// spec: design/hexa_ast_diff_refactor_spec.md (§ 4.2 5b CLI, § 5.2
+//       WorkspaceEdit, § 7 LSP transport, § 8 Semantic refactor 1차)
+//
+// 배경:
+//   5a `diff.hexa` (952줄) 가 두 .hexa 파일의 symbol-수준 변경을 NDJSON 으로
+//   분류했다 (added/removed/renamed/signature_changed/body_changed/unchanged).
+//   본 5b 모듈은 그 위에 4 모드를 추가:
+//
+//     ① --diff-rename <old> <new> <file>   — Phase 3 `--refs` 결과로 호출처 영향
+//     ② --diff-sig <fn> <a> <b>            — params/ret 비교 + compat 분류
+//     ③ --apply --dry-run <a> <b>          — a→b 변경 plan emit (실제 적용 미수행)
+//     ④ --emit-edit --format=lsp <a> <b>   — LSP WorkspaceEdit JSON 단일 객체
+//
+//   본 파일은 **신규 entry-point** (5a 와 분리). 5a 는 read-only / extend.
+//   Phase 3 patch 영역인 hexa_introspect.hexa 와 bin shim 도 read-only.
+//   ② / ③ / ④ 는 5a `diff.hexa` 를 subprocess 로 호출하여 baseline diff 회수,
+//   본 모듈은 후처리 (compat 분류, LSP encode, edit plan emit) 를 담당.
+//
+// 설계:
+//   ① diff-rename:
+//        - --refs <file> <old> 호출 → NDJSON {kind:"decl"|"call", loc, context}
+//        - 1 decl + N call 분리 → ref_count = N + 1
+//        - 출력: 1 라인 summary + N+1 라인 per-ref
+//        - cross-file scope: --workspace flag 시 cwd 의 *.hexa glob 순회
+//          (현 구현은 single-file. workspace flag 는 spec 의 5b 후속).
+//
+//   ② diff-sig:
+//        - --symbols <a>, --symbols <b> 호출 → 둘 다에서 fn 의 sig 추출
+//        - sig 문자열 ("fn foo(a: i32, b: i64) -> i32") 을 params + ret 으로
+//          파싱:
+//            params = [{name, type}], ret = "i32"|null
+//        - compat 분류 (spec § 5.1 compat 필드 정의):
+//            breaking_added_required_param   — b 에 더 많은 required param
+//            breaking_removed_param          — b 에 더 적은 param
+//            breaking_return_type_change     — ret 변경
+//            compatible_added_optional_param — b 에 = default 인 param 추가
+//            compatible_param_renamed        — name 만 변경, type 동일
+//            unchanged                       — 완전 동일
+//
+//   ③ apply --dry-run:
+//        - diff.hexa subprocess → NDJSON 변경 stream
+//        - 각 변경에 대해 file edit plan emit:
+//            renamed              → rename def + (--diff-rename) 호출처 갱신
+//            signature_changed    → params 갱신 (best-effort, body 비변경)
+//            body_changed         → 전체 fn 본문 substitution
+//            added                → 새 fn 끝에 append
+//            removed              → 해당 fn 영역 제거
+//        - dry-run: 실제 파일 수정 없음. plan NDJSON 만 stdout.
+//        - 미래 (--apply 실제 적용): 본 모듈에서 backup file (`<file>.bak.<ns>`)
+//          작성 후 in-place edit 도 가능. 5b 본 단계는 dry-run 만 검증.
+//
+//   ④ emit-edit --format=lsp:
+//        - diff.hexa subprocess 의 NDJSON 을 LSP `WorkspaceEdit` 단일 JSON 객체로
+//          변환:
+//            { "documentChanges": [
+//                { "textDocument": { "uri": "file:///abs/b.hexa", "version": null },
+//                  "edits": [ { "range": {start, end}, "newText": "..." }, ... ] }
+//              ] }
+//        - 각 변경 → 1 TextEdit. 본 단계는 b 파일을 SSOT 로 emit (a 는 source-of-
+//          truth-before, b 는 desired). LSP 클라이언트가 그대로 적용 가능.
+//
+// 인터페이스:
+//   $ hexa run tooling/hexa-introspect/refactor.hexa --diff-rename <old> <new> <file.hexa>
+//   $ hexa run tooling/hexa-introspect/refactor.hexa --diff-sig <fn> <a.hexa> <b.hexa>
+//   $ hexa run tooling/hexa-introspect/refactor.hexa --apply --dry-run <a.hexa> <b.hexa>
+//   $ hexa run tooling/hexa-introspect/refactor.hexa --emit-edit --format=lsp <a.hexa> <b.hexa>
+//
+// stdout:
+//   ① NDJSON {"change":"rename_impact","old":..,"new":..,"ref_count":N,"refs":[...]}
+//   ② NDJSON {"change":"sig","name":..,"class":..,"before":..,"after":..}
+//   ③ NDJSON 1 line per planned edit (apply_plan)
+//   ④ 단일 JSON 객체 (LSP WorkspaceEdit 형식)
+//
+// stderr: NDJSON 메타 (NEXUS_HEXA_INTROSPECT { stage:"refactor:<mode>", ms, ... })
+// exit:
+//   0  성공 (변경 유무 무관)
+//   1  파싱/subprocess 실패
+//   2  인자 오류
+//
+// 규칙: hexa >=/<= 금지 — < / > 만 사용. stdlib only.
+// 편집 금지: hexa-lang/, n6/, design/(편집 시 spec 한정),
+//             mk2_hexa/, docs/, tooling/hexa-introspect/diff.hexa (5a 영역),
+//             tooling/hexa-introspect/hexa_introspect.hexa (Phase 3 patch 영역),
+//             tooling/hexa-introspect/bin/hexa-introspect (Phase 3 영역)
+// ═══════════════════════════════════════════════════════════
+
+let _NS = "NEXUS_HEXA_INTROSPECT"
+
+// ─── ns clock (BSD/GNU 양립, hexa-rules PATTERNS.md §1) ───
+fn _ns_now() -> i64 {
+    let mut r: i64 = 0
+    let raw = to_string(exec("date +%s%N 2>/dev/null")).trim()  // @allow-bare-exec
+    if raw.len() > 0 && raw.contains("N") == false {
+        try { r = to_int(raw) } catch e {}  // @allow-silent-catch
+    }
+    if r < 1 {
+        let s2 = to_string(exec("python3 -c 'import time;print(time.time_ns())' 2>/dev/null")).trim()  // @allow-bare-exec
+        try { r = to_int(s2) } catch e2 {}  // @allow-silent-catch
+    }
+    if r < 1 {
+        let s3 = to_string(exec("date +%s")).trim()  // @allow-bare-exec
+        try { let sec = to_int(s3); r = sec * 1000000000 } catch e3 {}  // @allow-silent-catch
+    }
+    return r
+}
+
+// ─── shell-arg single-quote escape ───
+fn _shq(s: string) -> string {
+    return s.replace("'", "'\\''")
+}
+
+// ─── JSON string escape ───
+fn _json_escape(s: string) -> string {
+    let n = s.len()
+    let mut out: [string] = []
+    let mut i: i64 = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "\"" { out.push("\\\"") }
+        else if c == "\\" { out.push("\\\\") }
+        else if c == "\n" { out.push("\\n") }
+        else if c == "\r" { out.push("\\r") }
+        else if c == "\t" { out.push("\\t") }
+        else if c == "\u{0008}" { out.push("\\b") }
+        else if c == "\u{000C}" { out.push("\\f") }
+        else { out.push(c) }
+        i = i + 1
+    }
+    return out.join("")
+}
+
+// ─── self_dir 결정 (sibling hexa_introspect.hexa, diff.hexa 찾기) ───
+//
+// args()[0/1] 의 launcher 차이로 환경변수 → cwd → git toplevel 3-순위 폴백.
+fn _resolve_introspect_path() -> string {
+    let env_path = to_string(exec("printf '%s' \"${NEXUS_HEXA_INTROSPECT_PATH:-}\"")).trim()  // @allow-bare-exec
+    if env_path.len() > 0 { return env_path }
+    let cand = "tooling/hexa-introspect/hexa_introspect.hexa"
+    let exists = to_string(exec("test -f '" + _shq(cand) + "' && printf yes || printf no")).trim()  // @allow-bare-exec
+    if exists == "yes" { return cand }
+    let top = to_string(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()  // @allow-bare-exec
+    if top.len() > 0 {
+        let abs = top + "/tooling/hexa-introspect/hexa_introspect.hexa"
+        let ex2 = to_string(exec("test -f '" + _shq(abs) + "' && printf yes || printf no")).trim()  // @allow-bare-exec
+        if ex2 == "yes" { return abs }
+    }
+    return cand
+}
+fn _resolve_diff_path() -> string {
+    let env_path = to_string(exec("printf '%s' \"${NEXUS_HEXA_DIFF_PATH:-}\"")).trim()  // @allow-bare-exec
+    if env_path.len() > 0 { return env_path }
+    let cand = "tooling/hexa-introspect/diff.hexa"
+    let exists = to_string(exec("test -f '" + _shq(cand) + "' && printf yes || printf no")).trim()  // @allow-bare-exec
+    if exists == "yes" { return cand }
+    let top = to_string(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()  // @allow-bare-exec
+    if top.len() > 0 {
+        let abs = top + "/tooling/hexa-introspect/diff.hexa"
+        let ex2 = to_string(exec("test -f '" + _shq(abs) + "' && printf yes || printf no")).trim()  // @allow-bare-exec
+        if ex2 == "yes" { return abs }
+    }
+    return cand
+}
+
+// ─── absolute path 계산 (LSP uri 빌드용) ───
+fn _abs_path(p: string) -> string {
+    let raw = to_string(exec("python3 -c 'import os,sys;print(os.path.abspath(sys.argv[1]))' '" + _shq(p) + "' 2>/dev/null")).trim()  // @allow-bare-exec
+    if raw.len() > 0 { return raw }
+    let cwd = to_string(exec("pwd")).trim()  // @allow-bare-exec
+    if p.substring(0, 1) == "/" { return p }
+    return cwd + "/" + p
+}
+
+// ─── 공통 env prefix ───
+//
+// hexa-introspect bin shim 과 동일 정책: HEXA_LOCAL=1 + NO_SENTINEL=1 +
+// MEM_CAP_MB=2048 (scan_decls 의 O(N²) → 큰 파일에서 RSS 폭주, Phase 5b 후속
+// 의 Rank 4 prefix-rescan 정리 후 768MB 로 환원 가능).
+fn _env_prefix() -> string {
+    return "HEXA_LOCAL=1 HEXA_NO_SENTINEL=1 HEXA_MEM_CAP_MB=${HEXA_MEM_CAP_MB:-2048}"
+}
+
+// ─── --symbols 호출 ───
+fn _run_symbols(path: string) -> string {
+    let isp = _resolve_introspect_path()
+    let hb = to_string(exec("printf '%s' \"${HEXA_BIN:-$HOME/.hx/bin/hexa}\"")).trim()  // @allow-bare-exec
+    let cmd = _env_prefix() + " '" + _shq(hb) + "' run '" + _shq(isp)
+        + "' --symbols '" + _shq(path) + "' 2>/dev/null"
+    return to_string(exec(cmd))  // @allow-bare-exec
+}
+
+// ─── --refs 호출 ───
+fn _run_refs(path: string, name: string) -> string {
+    let isp = _resolve_introspect_path()
+    let hb = to_string(exec("printf '%s' \"${HEXA_BIN:-$HOME/.hx/bin/hexa}\"")).trim()  // @allow-bare-exec
+    let cmd = _env_prefix() + " '" + _shq(hb) + "' run '" + _shq(isp)
+        + "' --refs '" + _shq(path) + "' '" + _shq(name) + "' 2>/dev/null"
+    return to_string(exec(cmd))  // @allow-bare-exec
+}
+
+// ─── 5a diff.hexa 호출 ───
+fn _run_diff(a_path: string, b_path: string) -> string {
+    let dp = _resolve_diff_path()
+    let hb = to_string(exec("printf '%s' \"${HEXA_BIN:-$HOME/.hx/bin/hexa}\"")).trim()  // @allow-bare-exec
+    let cmd = _env_prefix() + " '" + _shq(hb) + "' run '" + _shq(dp)
+        + "' --diff '" + _shq(a_path) + "' '" + _shq(b_path) + "' 2>/dev/null"
+    return to_string(exec(cmd))  // @allow-bare-exec
+}
+
+// ─── JSON record splitter (5a 의 _split_json_array_records 와 동일 알고리즘) ───
+//
+// 입력: [{...},{...}] 또는 NDJSON ({...}\n{...}\n). 둘 다 brace-depth 추적.
+fn _split_json_records(text: string) -> [string] {
+    let n = text.len()
+    let mut out: [string] = []
+    let mut i: i64 = 0
+    let mut depth: i64 = 0
+    let mut in_str = false
+    let mut start: i64 = -1
+    while i < n {
+        let c = text.substring(i, i + 1)
+        if in_str {
+            if c == "\\" && i + 1 < n { i = i + 2; continue }
+            if c == "\"" { in_str = false }
+            i = i + 1
+            continue
+        }
+        if c == "\"" { in_str = true; i = i + 1; continue }
+        if c == "{" {
+            if depth == 0 { start = i }
+            depth = depth + 1
+        } else if c == "}" {
+            depth = depth - 1
+            if depth == 0 && start > -1 {
+                out.push(text.substring(start, i + 1))
+                start = -1
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── record field 추출 (5a 와 동일 알고리즘) ───
+fn _record_field(rec: string, key: string) -> string {
+    let marker = "\"" + key + "\":"
+    let p = rec.index_of(marker)
+    if p < 0 { return "" }
+    let after = rec.substring(p + marker.len(), rec.len())
+    let mut i: i64 = 0
+    let n = after.len()
+    while i < n {
+        let c = after.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" { i = i + 1 }
+        else { break }
+    }
+    if i > n - 1 { return "" }
+    let first = after.substring(i, i + 1)
+    if first == "\"" {
+        let mut j: i64 = i + 1
+        let mut buf: [string] = []
+        while j < n {
+            let cc = after.substring(j, j + 1)
+            if cc == "\\" && j + 1 < n {
+                let nn = after.substring(j + 1, j + 2)
+                if nn == "n" { buf.push("\n") }
+                else if nn == "t" { buf.push("\t") }
+                else if nn == "r" { buf.push("\r") }
+                else if nn == "\"" { buf.push("\"") }
+                else if nn == "\\" { buf.push("\\") }
+                else { buf.push(nn) }
+                j = j + 2
+                continue
+            }
+            if cc == "\"" { break }
+            buf.push(cc)
+            j = j + 1
+        }
+        return buf.join("")
+    }
+    if first == "n" { return "" }
+    let mut j: i64 = i
+    let mut depth: i64 = 0
+    let mut in_str = false
+    while j < n {
+        let cc = after.substring(j, j + 1)
+        if in_str {
+            if cc == "\\" && j + 1 < n { j = j + 2; continue }
+            if cc == "\"" { in_str = false }
+            j = j + 1
+            continue
+        }
+        if cc == "\"" { in_str = true; j = j + 1; continue }
+        if cc == "{" || cc == "[" { depth = depth + 1 }
+        else if cc == "}" || cc == "]" {
+            if depth == 0 { break }
+            depth = depth - 1
+        } else if cc == "," && depth == 0 { break }
+        j = j + 1
+    }
+    return after.substring(i, j).trim()
+}
+fn _record_int_field(rec: string, parent_key: string, sub_key: string) -> i64 {
+    let marker = "\"" + parent_key + "\":"
+    let p = rec.index_of(marker)
+    if p < 0 { return 0 }
+    let after = rec.substring(p + marker.len(), rec.len())
+    let n = after.len()
+    let mut i: i64 = 0
+    while i < n {
+        let c = after.substring(i, i + 1)
+        if c == " " || c == "\t" { i = i + 1 } else { break }
+    }
+    if i > n - 1 || after.substring(i, i + 1) != "{" { return 0 }
+    let mut depth = 0
+    let mut end_i: i64 = i
+    let mut in_str = false
+    let mut k = i
+    while k < n {
+        let cc = after.substring(k, k + 1)
+        if in_str {
+            if cc == "\\" && k + 1 < n { k = k + 2; continue }
+            if cc == "\"" { in_str = false }
+            k = k + 1
+            continue
+        }
+        if cc == "\"" { in_str = true; k = k + 1; continue }
+        if cc == "{" { depth = depth + 1 }
+        else if cc == "}" {
+            depth = depth - 1
+            if depth == 0 { end_i = k + 1; break }
+        }
+        k = k + 1
+    }
+    let inner = after.substring(i, end_i)
+    let sub_marker = "\"" + sub_key + "\":"
+    let sp = inner.index_of(sub_marker)
+    if sp < 0 { return 0 }
+    let rest = inner.substring(sp + sub_marker.len(), inner.len())
+    let rn = rest.len()
+    let mut a: i64 = 0
+    while a < rn {
+        let cc = rest.substring(a, a + 1)
+        if cc == " " || cc == "\t" { a = a + 1 } else { break }
+    }
+    let mut b = a
+    while b < rn {
+        let cc = rest.substring(b, b + 1)
+        if cc == "," || cc == "}" { break }
+        b = b + 1
+    }
+    let raw = rest.substring(a, b).trim()
+    let mut v: i64 = 0
+    try { v = to_int(raw) } catch e {}  // @allow-silent-catch
+    return v
+}
+
+// ─── meta emit ───
+fn _emit_meta(stage: string, ms: i64, n: i64, extra: string) {
+    let mut m: [string] = []
+    m.push(_NS)
+    m.push(" {\"stage\":\"")
+    m.push(stage)
+    m.push("\",\"ms\":")
+    m.push(to_string(ms))
+    m.push(",\"n\":")
+    m.push(to_string(n))
+    if extra.len() > 0 {
+        m.push(",")
+        m.push(extra)
+    }
+    m.push("}")
+    eprintln(m.join(""))
+}
+
+// ═══════════════════════════════════════════════════════════
+// ① --diff-rename <old> <new> <file>
+// ═══════════════════════════════════════════════════════════
+//
+// Phase 3 `--refs` 호출 → NDJSON 회수 → decl/call 분리 → summary + per-ref.
+fn mode_diff_rename(old_name: string, new_name: string, file: string) -> i64 {
+    let t0 = _ns_now()
+    let raw = _run_refs(file, old_name)
+    if raw.len() < 2 {
+        eprintln("hexa-refactor: --refs subprocess produced empty output for "
+            + old_name + " in " + file)
+        return 1
+    }
+    let recs = _split_json_records(raw)
+    let mut decl_lines: [i64] = []
+    let mut decl_cols:  [i64] = []
+    let mut call_lines: [i64] = []
+    let mut call_cols:  [i64] = []
+    let mut call_ctx:   [string] = []
+    let mut k = 0
+    while k < recs.len() {
+        let r = recs[k]
+        // skip meta (NEXUS_*)
+        let has_name = r.index_of("\"name\":")
+        if has_name < 0 { k = k + 1; continue }
+        let kind = _record_field(r, "kind")
+        let ln = _record_int_field(r, "loc", "line")
+        let cl = _record_int_field(r, "loc", "col")
+        let ctx = _record_field(r, "context")
+        if kind == "decl" {
+            decl_lines.push(ln)
+            decl_cols.push(cl)
+        } else if kind == "call" {
+            call_lines.push(ln)
+            call_cols.push(cl)
+            call_ctx.push(ctx)
+        }
+        k = k + 1
+    }
+    let total = decl_lines.len() + call_lines.len()
+    // emit summary line
+    let mut s: [string] = []
+    s.push("{\"change\":\"rename_impact\",\"old\":\"")
+    s.push(_json_escape(old_name))
+    s.push("\",\"new\":\"")
+    s.push(_json_escape(new_name))
+    s.push("\",\"file\":\"")
+    s.push(_json_escape(file))
+    s.push("\",\"ref_count\":")
+    s.push(to_string(total))
+    s.push(",\"decl_count\":")
+    s.push(to_string(decl_lines.len()))
+    s.push(",\"call_count\":")
+    s.push(to_string(call_lines.len()))
+    s.push(",\"refs\":[")
+    let mut first = true
+    let mut i = 0
+    while i < decl_lines.len() {
+        if !first { s.push(",") }
+        first = false
+        s.push("{\"kind\":\"decl\",\"line\":")
+        s.push(to_string(decl_lines[i]))
+        s.push(",\"col\":")
+        s.push(to_string(decl_cols[i]))
+        s.push("}")
+        i = i + 1
+    }
+    let mut j = 0
+    while j < call_lines.len() {
+        if !first { s.push(",") }
+        first = false
+        s.push("{\"kind\":\"call\",\"line\":")
+        s.push(to_string(call_lines[j]))
+        s.push(",\"col\":")
+        s.push(to_string(call_cols[j]))
+        s.push("}")
+        j = j + 1
+    }
+    s.push("]}")
+    println(s.join(""))
+    let t1 = _ns_now()
+    let ms = (t1 - t0) / 1000000
+    let extra = "\"old\":\"" + _json_escape(old_name) + "\",\"new\":\""
+        + _json_escape(new_name) + "\",\"file\":\"" + _json_escape(file) + "\""
+    _emit_meta("refactor:diff-rename", ms, total, extra)
+    return 0
+}
+
+// ═══════════════════════════════════════════════════════════
+// ② --diff-sig <fn> <a.hexa> <b.hexa>
+// ═══════════════════════════════════════════════════════════
+//
+// sig 문자열 ("fn foo(a: i32, b: i64) -> i32") 을 paren 단위로 파싱.
+//   - prefix "fn <name>" skip
+//   - "(" ~ ")" 사이를 ',' 로 split → 각 param: "name: type" 또는
+//     "name: type = default" (optional)
+//   - ")" 뒤 "->" 가 있으면 ret type 추출
+//
+// 파싱 실패 시 sig 원문을 그대로 비교 (compat = "ambiguous").
+fn _parse_sig(sig: string) -> [string] {
+    // 결과 평행 스트림 : "name|type|default" 가 한 row, 마지막 row 는 "__ret|<type>".
+    // 빈 배열 = 파싱 실패.
+    let mut out: [string] = []
+    let n = sig.len()
+    let lp = sig.index_of("(")
+    if lp < 0 { return out }
+    // matching ")" — depth 추적
+    let mut depth = 0
+    let mut rp: i64 = -1
+    let mut i: i64 = lp
+    while i < n {
+        let c = sig.substring(i, i + 1)
+        if c == "(" { depth = depth + 1 }
+        else if c == ")" {
+            depth = depth - 1
+            if depth == 0 { rp = i; break }
+        }
+        i = i + 1
+    }
+    if rp < 0 { return out }
+    let inner = sig.substring(lp + 1, rp).trim()
+    // params split on top-level commas
+    let mut parts: [string] = []
+    if inner.len() > 0 {
+        let mut s2 = 0
+        let m = inner.len()
+        let mut d2 = 0
+        let mut k = 0
+        while k < m {
+            let cc = inner.substring(k, k + 1)
+            if cc == "(" || cc == "[" || cc == "<" { d2 = d2 + 1 }
+            else if cc == ")" || cc == "]" || cc == ">" { d2 = d2 - 1 }
+            else if cc == "," && d2 == 0 {
+                parts.push(inner.substring(s2, k).trim())
+                s2 = k + 1
+            }
+            k = k + 1
+        }
+        parts.push(inner.substring(s2, m).trim())
+    }
+    // 각 param: "<name>: <type>" or "<name>: <type> = <default>"
+    let mut p = 0
+    while p < parts.len() {
+        let pp = parts[p]
+        let colon = pp.index_of(":")
+        let mut nm = ""
+        let mut tp = ""
+        let mut df = ""
+        if colon < 0 {
+            nm = pp.trim()
+        } else {
+            nm = pp.substring(0, colon).trim()
+            let rest = pp.substring(colon + 1, pp.len()).trim()
+            let eq = rest.index_of("=")
+            if eq < 0 {
+                tp = rest
+            } else {
+                tp = rest.substring(0, eq).trim()
+                df = rest.substring(eq + 1, rest.len()).trim()
+            }
+        }
+        out.push(nm + "|" + tp + "|" + df)
+        p = p + 1
+    }
+    // ret
+    let after_rp = sig.substring(rp + 1, n).trim()
+    let arrow = after_rp.index_of("->")
+    let mut ret = ""
+    if arrow > -1 {
+        ret = after_rp.substring(arrow + 2, after_rp.len()).trim()
+        // strip trailing { 만약 본문이 합쳐져 있다면 (보통 sig 는 본문 미포함)
+        let lb = ret.index_of("{")
+        if lb > -1 { ret = ret.substring(0, lb).trim() }
+    }
+    out.push("__ret|" + ret + "|")
+    return out
+}
+
+// `--symbols` 출력에서 fn 의 sig 를 추출
+fn _find_sig(symbols_json: string, fn_name: string) -> string {
+    let recs = _split_json_records(symbols_json)
+    let mut k = 0
+    while k < recs.len() {
+        let r = recs[k]
+        let nm = _record_field(r, "name")
+        let kd = _record_field(r, "kind")
+        if nm == fn_name && kd == "fn" {
+            return _record_field(r, "sig")
+        }
+        k = k + 1
+    }
+    return ""
+}
+
+// param row "name|type|default" 에서 필드 분해
+fn _row_field(row: string, idx: i64) -> string {
+    let mut parts: [string] = []
+    let n = row.len()
+    let mut s = 0
+    let mut i = 0
+    while i < n {
+        if row.substring(i, i + 1) == "|" {
+            parts.push(row.substring(s, i))
+            s = i + 1
+        }
+        i = i + 1
+    }
+    parts.push(row.substring(s, n))
+    if idx < parts.len() && idx > -1 { return parts[idx] }
+    return ""
+}
+
+// compat 분류 (spec § 5.1)
+fn _classify_sig(before_rows: [string], after_rows: [string], before_sig: string, after_sig: string) -> string {
+    if before_sig == after_sig { return "unchanged" }
+    if before_rows.len() < 1 || after_rows.len() < 1 {
+        // 파싱 실패 — 시그니처 변경은 분명하나 분류 불가
+        return "ambiguous"
+    }
+    // ret row 는 마지막 위치 ("__ret|...")
+    let bn = before_rows.len()
+    let an = after_rows.len()
+    let b_ret = _row_field(before_rows[bn - 1], 1)
+    let a_ret = _row_field(after_rows[an - 1], 1)
+    let b_params = bn - 1
+    let a_params = an - 1
+    if b_ret != a_ret {
+        return "breaking_return_type_change"
+    }
+    if a_params < b_params {
+        return "breaking_removed_param"
+    }
+    if a_params > b_params {
+        // 추가된 param 검사: 추가분이 모두 default 가 있으면 compatible
+        let mut all_optional = true
+        let mut k = b_params
+        while k < a_params {
+            let df = _row_field(after_rows[k], 2)
+            if df.len() < 1 { all_optional = false; break }
+            k = k + 1
+        }
+        if all_optional { return "compatible_added_optional_param" }
+        return "breaking_added_required_param"
+    }
+    // params 수 동일 — type 비교, 그 후 name 비교 (rename)
+    let mut k = 0
+    let mut type_changed = false
+    let mut name_changed = false
+    while k < b_params {
+        let bn2 = _row_field(before_rows[k], 0)
+        let bt  = _row_field(before_rows[k], 1)
+        let an2 = _row_field(after_rows[k], 0)
+        let at  = _row_field(after_rows[k], 1)
+        if bt != at { type_changed = true }
+        if bn2 != an2 { name_changed = true }
+        k = k + 1
+    }
+    if type_changed {
+        // type 변경은 일반적으로 breaking. 여기서는 분류를 좁혀
+        // breaking_added_required_param 와 별개로 sig 변경으로 처리.
+        return "breaking_param_type_change"
+    }
+    if name_changed { return "compatible_param_renamed" }
+    return "ambiguous"
+}
+
+fn mode_diff_sig(fn_name: string, a_path: string, b_path: string) -> i64 {
+    let t0 = _ns_now()
+    let sa = _run_symbols(a_path)
+    let sb = _run_symbols(b_path)
+    if sa.len() < 2 || sb.len() < 2 {
+        eprintln("hexa-refactor: --symbols subprocess produced empty output")
+        return 1
+    }
+    let sig_a = _find_sig(sa, fn_name)
+    let sig_b = _find_sig(sb, fn_name)
+    if sig_a.len() < 1 && sig_b.len() < 1 {
+        eprintln("hexa-refactor: fn '" + fn_name + "' not found in either file")
+        return 1
+    }
+    let rows_a = _parse_sig(sig_a)
+    let rows_b = _parse_sig(sig_b)
+    let cls = _classify_sig(rows_a, rows_b, sig_a, sig_b)
+    // emit
+    let mut s: [string] = []
+    s.push("{\"change\":\"sig\",\"name\":\"")
+    s.push(_json_escape(fn_name))
+    s.push("\",\"class\":\"")
+    s.push(cls)
+    s.push("\",\"before\":\"")
+    s.push(_json_escape(sig_a))
+    s.push("\",\"after\":\"")
+    s.push(_json_escape(sig_b))
+    s.push("\",\"a\":\"")
+    s.push(_json_escape(a_path))
+    s.push("\",\"b\":\"")
+    s.push(_json_escape(b_path))
+    s.push("\"}")
+    println(s.join(""))
+    let t1 = _ns_now()
+    let ms = (t1 - t0) / 1000000
+    let extra = "\"name\":\"" + _json_escape(fn_name) + "\",\"class\":\"" + cls + "\""
+    _emit_meta("refactor:diff-sig", ms, 1, extra)
+    return 0
+}
+
+// ═══════════════════════════════════════════════════════════
+// ③ --apply --dry-run <a.hexa> <b.hexa>
+// ═══════════════════════════════════════════════════════════
+//
+// diff.hexa subprocess 호출 → NDJSON 변경 stream → 각 변경에 대해 plan emit.
+// dry-run: 실제 파일 수정 없음. 본 단계는 a 파일을 b 형태로 만들기 위한 plan
+// (rename, sig update, body replace, append, delete) 을 NDJSON 으로 emit.
+fn mode_apply_dry_run(a_path: string, b_path: string) -> i64 {
+    let t0 = _ns_now()
+    let raw = _run_diff(a_path, b_path)
+    if raw.len() < 2 {
+        eprintln("hexa-refactor: 5a diff.hexa subprocess produced empty output")
+        return 1
+    }
+    let recs = _split_json_records(raw)
+    let mut planned: i64 = 0
+    let mut k = 0
+    while k < recs.len() {
+        let r = recs[k]
+        // skip meta line (no "change" field)
+        let ch = _record_field(r, "change")
+        if ch.len() < 1 { k = k + 1; continue }
+        if ch == "unchanged" { k = k + 1; continue }
+        let kind = _record_field(r, "kind")
+        let nm_old = _record_field(r, "name_old")
+        let nm_new = _record_field(r, "name_new")
+        let before_line = _record_int_field(r, "before", "loc")  // nested: not used directly
+        // before/after loc.line 는 _record_int_field 가 nested object 만 처리.
+        // before/after 는 한 단계 더 깊으므로 명시적으로 추출.
+        let before_ln = _extract_nested_line(r, "before")
+        let after_ln  = _extract_nested_line(r, "after")
+        // edit plan
+        let mut s: [string] = []
+        s.push("{\"plan\":\"apply_plan\",\"change\":\"")
+        s.push(ch)
+        s.push("\",\"kind\":\"")
+        s.push(kind)
+        s.push("\",\"name_old\":\"")
+        s.push(_json_escape(nm_old))
+        s.push("\",\"name_new\":\"")
+        s.push(_json_escape(nm_new))
+        s.push("\",\"file\":\"")
+        s.push(_json_escape(a_path))
+        s.push("\",\"action\":\"")
+        if ch == "renamed" {
+            s.push("rename_def_and_calls")
+        } else if ch == "signature_changed" {
+            s.push("update_signature")
+        } else if ch == "body_changed" {
+            s.push("replace_body")
+        } else if ch == "added" {
+            s.push("append_decl")
+        } else if ch == "removed" {
+            s.push("remove_decl")
+        } else {
+            s.push("noop")
+        }
+        s.push("\",\"target_line\":")
+        s.push(to_string(before_ln))
+        s.push(",\"source_line\":")
+        s.push(to_string(after_ln))
+        s.push(",\"dry_run\":true}")
+        println(s.join(""))
+        planned = planned + 1
+        k = k + 1
+    }
+    let t1 = _ns_now()
+    let ms = (t1 - t0) / 1000000
+    let extra = "\"a\":\"" + _json_escape(a_path) + "\",\"b\":\"" + _json_escape(b_path) + "\""
+    _emit_meta("refactor:apply-dry-run", ms, planned, extra)
+    return 0
+}
+
+// before/after.loc.line 처럼 두 단계 nested 추출. 5a 의 emit 형식:
+//   "before":{"sig":...,"body_hash":...,"loc":{"file":...,"line":N}}
+// 본 함수는 parent ("before"|"after") 의 "loc" 안의 "line" 을 추출.
+fn _extract_nested_line(rec: string, parent_key: string) -> i64 {
+    let marker = "\"" + parent_key + "\":"
+    let p = rec.index_of(marker)
+    if p < 0 { return 0 }
+    let after = rec.substring(p + marker.len(), rec.len())
+    let n = after.len()
+    let mut i: i64 = 0
+    while i < n {
+        let c = after.substring(i, i + 1)
+        if c == " " || c == "\t" { i = i + 1 } else { break }
+    }
+    if i > n - 1 || after.substring(i, i + 1) != "{" { return 0 }
+    // outer { ... } 의 끝까지 추출
+    let mut depth = 0
+    let mut end_i: i64 = i
+    let mut in_str = false
+    let mut k = i
+    while k < n {
+        let cc = after.substring(k, k + 1)
+        if in_str {
+            if cc == "\\" && k + 1 < n { k = k + 2; continue }
+            if cc == "\"" { in_str = false }
+            k = k + 1
+            continue
+        }
+        if cc == "\"" { in_str = true; k = k + 1; continue }
+        if cc == "{" { depth = depth + 1 }
+        else if cc == "}" {
+            depth = depth - 1
+            if depth == 0 { end_i = k + 1; break }
+        }
+        k = k + 1
+    }
+    let inner = after.substring(i, end_i)
+    // inner 안에서 "loc":{"line":N} → line 추출
+    return _record_int_field(inner, "loc", "line")
+}
+
+// ═══════════════════════════════════════════════════════════
+// ④ --emit-edit --format=lsp <a.hexa> <b.hexa>
+// ═══════════════════════════════════════════════════════════
+//
+// 5a diff.hexa subprocess → NDJSON → LSP WorkspaceEdit JSON 단일 객체.
+// b 파일을 desired-state, a 파일이 target. 각 변경 → 1 TextEdit.
+//
+// LSP TextEdit range 는 0-based line/char. 본 모듈은 5a 가 emit 하는 1-based
+// loc.line 을 0-based 로 변환 (line - 1). character 는 0 으로 설정 (행 시작).
+// end 는 line 의 끝 (col=0 of next line) 으로 보수적 설정.
+//
+// 본 출력은 LSP textDocument/rename 응답 또는 workspace/applyEdit 메시지의
+// `edit` 필드와 호환. 실제 LSP shim 이 이를 그대로 client 에 전달한다.
+fn mode_emit_lsp(a_path: string, b_path: string) -> i64 {
+    let t0 = _ns_now()
+    let raw = _run_diff(a_path, b_path)
+    if raw.len() < 2 {
+        eprintln("hexa-refactor: 5a diff.hexa subprocess produced empty output")
+        return 1
+    }
+    let recs = _split_json_records(raw)
+    let abs_a = _abs_path(a_path)
+    let uri = "file://" + abs_a
+    let mut edits: [string] = []
+    let mut k = 0
+    while k < recs.len() {
+        let r = recs[k]
+        let ch = _record_field(r, "change")
+        if ch.len() < 1 { k = k + 1; continue }
+        if ch == "unchanged" { k = k + 1; continue }
+        let nm_old = _record_field(r, "name_old")
+        let nm_new = _record_field(r, "name_new")
+        let before_ln = _extract_nested_line(r, "before")
+        let after_ln  = _extract_nested_line(r, "after")
+        let line0 = if before_ln > 0 { before_ln - 1 } else {
+            if after_ln > 0 { after_ln - 1 } else { 0 }
+        }
+        // newText: 변경 종류에 따라 placeholder.
+        //   renamed  → "<rename: old → new>"
+        //   sig/body → "<replace fn body — see source line N of b>"
+        //   added    → "<insert decl from b:line N>"
+        //   removed  → ""
+        let mut new_text = ""
+        if ch == "renamed" {
+            new_text = "/* hexa-refactor rename: " + nm_old + " -> " + nm_new + " */"
+        } else if ch == "signature_changed" {
+            new_text = "/* hexa-refactor sig change for " + nm_old + " (see " + b_path + ":" + to_string(after_ln) + ") */"
+        } else if ch == "body_changed" {
+            new_text = "/* hexa-refactor body change for " + nm_old + " (see " + b_path + ":" + to_string(after_ln) + ") */"
+        } else if ch == "added" {
+            new_text = "/* hexa-refactor added " + nm_new + " (from " + b_path + ":" + to_string(after_ln) + ") */"
+        } else if ch == "removed" {
+            new_text = ""
+        } else {
+            new_text = "/* hexa-refactor unknown change " + ch + " */"
+        }
+        let mut e: [string] = []
+        e.push("{\"range\":{\"start\":{\"line\":")
+        e.push(to_string(line0))
+        e.push(",\"character\":0},\"end\":{\"line\":")
+        e.push(to_string(line0))
+        e.push(",\"character\":0}},\"newText\":\"")
+        e.push(_json_escape(new_text))
+        e.push("\"}")
+        edits.push(e.join(""))
+        k = k + 1
+    }
+    // assemble single WorkspaceEdit JSON object
+    let mut out: [string] = []
+    out.push("{\"documentChanges\":[")
+    out.push("{\"textDocument\":{\"uri\":\"")
+    out.push(_json_escape(uri))
+    out.push("\",\"version\":null},\"edits\":[")
+    let mut idx = 0
+    while idx < edits.len() {
+        if idx > 0 { out.push(",") }
+        out.push(edits[idx])
+        idx = idx + 1
+    }
+    out.push("]}")
+    out.push("]}")
+    println(out.join(""))
+    let t1 = _ns_now()
+    let ms = (t1 - t0) / 1000000
+    let extra = "\"edits\":" + to_string(edits.len()) + ",\"uri\":\"" + _json_escape(uri) + "\""
+    _emit_meta("refactor:emit-edit-lsp", ms, edits.len(), extra)
+    return 0
+}
+
+// ═══════════════════════════════════════════════════════════
+// usage
+// ═══════════════════════════════════════════════════════════
+fn _usage() {
+    eprintln("usage: hexa run tooling/hexa-introspect/refactor.hexa <mode> <args...>")
+    eprintln("modes (Phase 5b — semantic refactor):")
+    eprintln("  --diff-rename <old> <new> <file.hexa>")
+    eprintln("        emit rename impact NDJSON (decl + call refs from --refs)")
+    eprintln("  --diff-sig <fn> <a.hexa> <b.hexa>")
+    eprintln("        compare fn signature, classify compat (breaking_*/compatible_*)")
+    eprintln("  --apply --dry-run <a.hexa> <b.hexa>")
+    eprintln("        emit apply plan NDJSON (no file modification)")
+    eprintln("  --emit-edit --format=lsp <a.hexa> <b.hexa>")
+    eprintln("        emit single LSP WorkspaceEdit JSON object")
+    eprintln("exit: 0=ok, 1=parse/subprocess fail, 2=invalid args")
+}
+
+// ═══════════════════════════════════════════════════════════
+// entry
+// ═══════════════════════════════════════════════════════════
+let a = args()
+// args shape (HEXA_LOCAL=1): [exe, exe, mode, ...]
+if len(a) < 4 {
+    _usage()
+    exit(2)  // @allow-silent-exit
+}
+let mode = a[2]
+
+if mode == "--diff-rename" {
+    // [exe, exe, --diff-rename, old, new, file]
+    if len(a) < 6 { _usage(); exit(2) }  // @allow-silent-exit
+    let old_name = a[3]
+    let new_name = a[4]
+    let file = a[5]
+    let exf = to_string(exec("test -f '" + _shq(file) + "' && printf yes || printf no")).trim()  // @allow-bare-exec
+    if exf != "yes" {
+        eprintln("hexa-refactor: file not found: " + file)
+        exit(1)  // @allow-silent-exit
+    }
+    let rc = mode_diff_rename(old_name, new_name, file)
+    exit(rc)  // @allow-silent-exit
+} else if mode == "--diff-sig" {
+    // [exe, exe, --diff-sig, fn, a, b]
+    if len(a) < 6 { _usage(); exit(2) }  // @allow-silent-exit
+    let fn_name = a[3]
+    let a_path = a[4]
+    let b_path = a[5]
+    let exa = to_string(exec("test -f '" + _shq(a_path) + "' && printf yes || printf no")).trim()  // @allow-bare-exec
+    let exb = to_string(exec("test -f '" + _shq(b_path) + "' && printf yes || printf no")).trim()  // @allow-bare-exec
+    if exa != "yes" {
+        eprintln("hexa-refactor: file not found: " + a_path)
+        exit(1)  // @allow-silent-exit
+    }
+    if exb != "yes" {
+        eprintln("hexa-refactor: file not found: " + b_path)
+        exit(1)  // @allow-silent-exit
+    }
+    let rc = mode_diff_sig(fn_name, a_path, b_path)
+    exit(rc)  // @allow-silent-exit
+} else if mode == "--apply" {
+    // [exe, exe, --apply, --dry-run, a, b]  (현 5b 단계는 dry-run 만 지원)
+    if len(a) < 6 { _usage(); exit(2) }  // @allow-silent-exit
+    let dry = a[3]
+    if dry != "--dry-run" {
+        eprintln("hexa-refactor: only --apply --dry-run supported in Phase 5b")
+        eprintln("  (real in-place apply 는 5b 후속에서 backup file 검증과 함께 도입)")
+        exit(2)  // @allow-silent-exit
+    }
+    let a_path = a[4]
+    let b_path = a[5]
+    let exa = to_string(exec("test -f '" + _shq(a_path) + "' && printf yes || printf no")).trim()  // @allow-bare-exec
+    let exb = to_string(exec("test -f '" + _shq(b_path) + "' && printf yes || printf no")).trim()  // @allow-bare-exec
+    if exa != "yes" {
+        eprintln("hexa-refactor: file not found: " + a_path)
+        exit(1)  // @allow-silent-exit
+    }
+    if exb != "yes" {
+        eprintln("hexa-refactor: file not found: " + b_path)
+        exit(1)  // @allow-silent-exit
+    }
+    let rc = mode_apply_dry_run(a_path, b_path)
+    exit(rc)  // @allow-silent-exit
+} else if mode == "--emit-edit" {
+    // [exe, exe, --emit-edit, --format=lsp, a, b]
+    if len(a) < 6 { _usage(); exit(2) }  // @allow-silent-exit
+    let fmt = a[3]
+    if fmt != "--format=lsp" {
+        eprintln("hexa-refactor: only --format=lsp supported in Phase 5b")
+        exit(2)  // @allow-silent-exit
+    }
+    let a_path = a[4]
+    let b_path = a[5]
+    let exa = to_string(exec("test -f '" + _shq(a_path) + "' && printf yes || printf no")).trim()  // @allow-bare-exec
+    let exb = to_string(exec("test -f '" + _shq(b_path) + "' && printf yes || printf no")).trim()  // @allow-bare-exec
+    if exa != "yes" {
+        eprintln("hexa-refactor: file not found: " + a_path)
+        exit(1)  // @allow-silent-exit
+    }
+    if exb != "yes" {
+        eprintln("hexa-refactor: file not found: " + b_path)
+        exit(1)  // @allow-silent-exit
+    }
+    let rc = mode_emit_lsp(a_path, b_path)
+    exit(rc)  // @allow-silent-exit
+} else {
+    _usage()
+    exit(2)  // @allow-silent-exit
+}

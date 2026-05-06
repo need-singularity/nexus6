@@ -1,0 +1,356 @@
+// ═══════════════════════════════════════════════════════════
+// tooling/atlas-validator/atlas_validate.hexa — atlas.n6 schema validator
+//
+// 배경:
+//   atlas.n6 (14,609 records, 43,387 lines) 은 nexus 의 KB 기반.
+//   현재 _guarded_append_atlas() 가 write-time schema 가드를 수행하지만
+//   read-time / standalone audit 도구는 부재. 본 파일은 별도 read-only
+//   감사 도구 (mk2 atlas validate subcommand 등록 후속 — spec md 참조).
+//
+//   정책: atlas.n6 은 read-only. 본 도구는 절대 데이터를 수정하지 않는다.
+//
+// 설계:
+//   - awk 1-pass 로 라인 iterate (BSD/GNU 양립)
+//   - 각 @-record 에 대해 6 룰 검증:
+//      R1 type whitelist  (@P/C/L/F/R/S/X/?)
+//      R2 separator       (':: <domain> [grade]' 패턴 존재)
+//      R3 grade format    ([NN], [NN*!?], [d.r], [d.r*!?])
+//      R4 id syntax       ([A-Za-z0-9_-]+)
+//      R5 domain non-empty
+//      R6 line-length sanity (UTF-8 byte 길이 < 4096)
+//   - duplicate detection: 동일 id + 다른 RHS expr 카운트 (warning)
+//   - violation 마다 NDJSON 1라인 stdout
+//   - 최종 요약 NDJSON __ATLAS_VALIDATE__ stderr+stdout
+//
+// 출력:
+//   stdout: NDJSON per-violation
+//     {"line":N,"type":"R<n>","id":"...","detail":"..."}
+//   stdout: 최종 요약 마커
+//     __ATLAS_VALIDATE__ {"total":N,"errors":E,"warnings":W,"duration_ms":D,"path":"..."}
+//   stderr: NEXUS_ATLAS_VALIDATE NDJSON meta (stage breakdown)
+//
+// CLI:
+//   hexa run tooling/atlas-validator/atlas_validate.hexa
+//   hexa run tooling/atlas-validator/atlas_validate.hexa --strict
+//   hexa run tooling/atlas-validator/atlas_validate.hexa --path n6/atlas.n6
+//   hexa run tooling/atlas-validator/atlas_validate.hexa --quiet         (요약만)
+//
+// exit code:
+//   0 — errors == 0 (warnings 무관, --strict 면 warnings == 0 도 필요)
+//   1 — errors > 0 또는 (--strict && warnings > 0)
+//   2 — usage error (atlas.n6 부재 등)
+//
+// 규칙: hexa >=/<= 금지 — < / > 만 사용. stdlib only.
+// 편집 금지: n6/atlas.n6 (read-only), n6/atlas_query.hexa,
+//   mk2_hexa/mk2/src/atlas/{lookup,hypothesis,recall,distribution,mod}.hexa,
+//   mk2_hexa/mk2/src/main.hexa, docs/mk2/{01-architecture,07-atlas-recall,README}.md.
+// ═══════════════════════════════════════════════════════════
+
+let _DEFAULT_PATH    = "n6/atlas.n6"
+let _AWK_SCRIPT_PATH = "/tmp/atlas_validate.awk"
+let _DUP_AWK_PATH    = "/tmp/atlas_validate_dup.awk"
+
+// ─── ns clock (PATTERNS.md §1 SSOT) ───
+fn _ns_now() -> i64 {
+    let mut r: i64 = 0
+    let raw = to_string(exec("date +%s%N 2>/dev/null")).trim()  // @allow-bare-exec
+    if raw.len() > 0 && raw.contains("N") == false {
+        try { r = to_int(raw) } catch e {}  // @allow-silent-catch
+    }
+    if r < 1 {
+        let s2 = to_string(exec("python3 -c 'import time;print(time.time_ns())' 2>/dev/null")).trim()  // @allow-bare-exec
+        try { r = to_int(s2) } catch e2 {}  // @allow-silent-catch
+    }
+    if r < 1 {
+        let s3 = to_string(exec("date +%s")).trim()  // @allow-bare-exec
+        try { let sec = to_int(s3); r = sec * 1000000000 } catch e3 {}  // @allow-silent-catch
+    }
+    return r
+}
+
+// ─── shell-arg single-quote escape (PATTERNS.md §3) ───
+fn _shq(s: string) -> string {
+    return s.replace("'", "'\\''")
+}
+
+// ═══════════════════════════════════════════════════════════
+//  awk script writer — main schema check (R1..R6)
+//  출력: NDJSON per-violation, 1줄 = 1 위반 또는 요약 라인
+//    {"line":N,"sev":"error|warning","rule":"R1","id":"...","detail":"..."}
+//  최종 라인:
+//    __SUMMARY__ total=<N> errors=<E> warnings=<W>
+// ═══════════════════════════════════════════════════════════
+fn _write_main_awk() -> bool {
+    let mut p: [string] = []
+    p.push("function streq(a,b){ return length(a)==length(b) && index(a,b)==1 } ")
+    // BSD-awk safe escape — JSON string with quote+backslash escaping
+    p.push("function jesc(s,    r,i,c){ ")
+    p.push("  r=\"\"; ")
+    p.push("  for(i=1;i<=length(s);i++){ ")
+    p.push("    c=substr(s,i,1); ")
+    p.push("    if(c==\"\\\\\") r=r \"\\\\\\\\\"; ")
+    p.push("    else if(c==\"\\\"\") r=r \"\\\\\\\"\"; ")
+    p.push("    else if(c==\"\\t\") r=r \"\\\\t\"; ")
+    p.push("    else if(c==\"\\n\") r=r \"\\\\n\"; ")
+    p.push("    else r=r c; ")
+    p.push("  } ")
+    p.push("  return r ")
+    p.push("} ")
+    p.push("function emit(line, sev, rule, id, detail){ ")
+    p.push("  printf \"{\\\"line\\\":%d,\\\"sev\\\":\\\"%s\\\",\\\"rule\\\":\\\"%s\\\",\\\"id\\\":\\\"%s\\\",\\\"detail\\\":\\\"%s\\\"}\\n\", ")
+    p.push("    line, sev, rule, jesc(id), jesc(detail); ")
+    p.push("  if(sev==\"error\") errs++; else warns++ ")
+    p.push("} ")
+    p.push("BEGIN{ ")
+    p.push("  total=0; errs=0; warns=0; ")
+    // valid v1 types (no @M, @T — those are v2 only)
+    p.push("  vtypes[\"P\"]=1; vtypes[\"C\"]=1; vtypes[\"L\"]=1; vtypes[\"F\"]=1; ")
+    p.push("  vtypes[\"R\"]=1; vtypes[\"S\"]=1; vtypes[\"X\"]=1; vtypes[\"?\"]=1; ")
+    p.push("} ")
+    p.push("/^@/ { ")
+    p.push("  total++; ")
+    p.push("  raw=$0; ")
+    // R6: line-length sanity
+    p.push("  if(length(raw) > 4095){ emit(NR, \"warning\", \"R6\", \"\", \"line_too_long_\" length(raw)) } ")
+    // R1: type token — first char(s) after '@'
+    p.push("  ttok=\"\"; ")
+    p.push("  if(match(raw, /^@[A-Z?]+/)){ ttok=substr(raw, RSTART+1, RLENGTH-1) } ")
+    p.push("  if(ttok==\"\"){ emit(NR, \"error\", \"R1\", \"\", \"no_type_token\"); next } ")
+    p.push("  if(!(ttok in vtypes)){ emit(NR, \"warning\", \"R1\", \"\", \"unknown_type_@\" ttok) } ")
+    // R4: id token — alphanumeric+underscore+hyphen+colon allowed
+    p.push("  rest=substr(raw, length(ttok)+2); ")
+    p.push("  sub(/^[ \\t]+/, \"\", rest); ")
+    p.push("  id=\"\"; ")
+    p.push("  if(match(rest, /^[A-Za-z0-9_:.\\-]+/)){ id=substr(rest, 1, RLENGTH) } ")
+    p.push("  if(id==\"\"){ emit(NR, \"error\", \"R4\", \"\", \"no_id_token\"); next } ")
+    // R2: '::' separator must exist
+    p.push("  scolon=index(raw, \"::\"); ")
+    p.push("  if(scolon==0){ emit(NR, \"error\", \"R2\", id, \"missing_::_separator\"); next } ")
+    // R5: domain — text between '::' and '[' non-empty
+    p.push("  after_sep=substr(raw, scolon+2); ")
+    p.push("  bidx=index(after_sep, \"[\"); ")
+    p.push("  if(bidx==0){ emit(NR, \"error\", \"R3\", id, \"missing_grade_bracket\"); next } ")
+    p.push("  dom=substr(after_sep, 1, bidx-1); ")
+    p.push("  sub(/^[ \\t]+/, \"\", dom); sub(/[ \\t]+$/, \"\", dom); ")
+    p.push("  if(dom==\"\"){ emit(NR, \"error\", \"R5\", id, \"empty_domain\") } ")
+    // R3: grade format — [<digits>(.<digits>)?[*!?]?] or with extra trailing tokens
+    p.push("  gtail=substr(after_sep, bidx); ")
+    p.push("  cidx=index(gtail, \"]\"); ")
+    p.push("  if(cidx==0){ emit(NR, \"error\", \"R3\", id, \"unclosed_grade_bracket\"); next } ")
+    p.push("  gtok=substr(gtail, 2, cidx-2); ")
+    // strict regex: digits(.digits)?modifier? where modifier ∈ [*!?]+
+    p.push("  if(gtok !~ /^[0-9]+(\\.[0-9]+)?[*!?]*$/){ ")
+    // accept extended: [N*MOD] composite modifier strings used by topo entries
+    p.push("    if(gtok !~ /^[0-9]+[A-Za-z_]+$/ && gtok !~ /^[0-9]+(\\.[0-9]+)?[*!?]+[A-Za-z_]+$/){ ")
+    p.push("      emit(NR, \"warning\", \"R3\", id, \"nonstd_grade_\" jesc(gtok)) ")
+    p.push("    } ")
+    p.push("  } ")
+    p.push("} ")
+    p.push("END{ printf \"__SUMMARY__ total=%d errors=%d warnings=%d\\n\", total, errs, warns } ")
+    let src = p.join("")
+    try { write_file(_AWK_SCRIPT_PATH, src) } catch e { return false }  // @allow-silent-catch
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════
+//  awk script writer — duplicate id detection (warning level)
+//  같은 id 가 N 회 등장하면 N>1 일 때 warning emit (첫 등장 라인)
+// ═══════════════════════════════════════════════════════════
+fn _write_dup_awk() -> bool {
+    let mut p: [string] = []
+    p.push("function jesc(s,    r,i,c){ ")
+    p.push("  r=\"\"; for(i=1;i<=length(s);i++){ c=substr(s,i,1); ")
+    p.push("    if(c==\"\\\\\") r=r \"\\\\\\\\\"; else if(c==\"\\\"\") r=r \"\\\\\\\"\"; else r=r c ")
+    p.push("  } return r ")
+    p.push("} ")
+    p.push("/^@/ { ")
+    p.push("  raw=$0; ")
+    p.push("  if(match(raw, /^@[A-Z?]+/)){ tlen=RLENGTH; rest=substr(raw, tlen+2) } else next; ")
+    p.push("  sub(/^[ \\t]+/, \"\", rest); ")
+    p.push("  id=\"\"; if(match(rest, /^[A-Za-z0-9_:.\\-]+/)){ id=substr(rest, 1, RLENGTH) } ")
+    p.push("  if(id==\"\") next; ")
+    // capture rhs after '='
+    p.push("  eq=index(rest, \"=\"); ")
+    p.push("  scolon=index(rest, \"::\"); ")
+    p.push("  rhs=\"\"; ")
+    p.push("  if(eq>0 && (scolon==0 || eq<scolon)){ ")
+    p.push("    rhs_end=(scolon>0 ? scolon : length(rest)+1); ")
+    p.push("    rhs=substr(rest, eq+1, rhs_end-eq-1); ")
+    p.push("    sub(/^[ \\t]+/, \"\", rhs); sub(/[ \\t]+$/, \"\", rhs) ")
+    p.push("  } ")
+    p.push("  cnt[id]++; ")
+    p.push("  if(cnt[id]==1){ first_line[id]=NR; first_rhs[id]=rhs } ")
+    p.push("  else { ")
+    p.push("    if(rhs!=\"\" && first_rhs[id]!=\"\" && rhs!=first_rhs[id]){ ")
+    p.push("      printf \"{\\\"line\\\":%d,\\\"sev\\\":\\\"warning\\\",\\\"rule\\\":\\\"D1\\\",\\\"id\\\":\\\"%s\\\",\\\"detail\\\":\\\"dup_conflict_first@%d\\\"}\\n\", ")
+    p.push("        NR, jesc(id), first_line[id]; ")
+    p.push("      conflicts++ ")
+    p.push("    } ")
+    p.push("  } ")
+    p.push("} ")
+    p.push("END{ ")
+    p.push("  dups=0; for(k in cnt) if(cnt[k]>1) dups++; ")
+    p.push("  printf \"__DUPSUMMARY__ unique=%d dup_ids=%d conflicts=%d\\n\", length(cnt), dups, conflicts+0 ")
+    p.push("} ")
+    let src = p.join("")
+    try { write_file(_DUP_AWK_PATH, src) } catch e { return false }  // @allow-silent-catch
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════
+//  parse summary line "__SUMMARY__ total=N errors=E warnings=W"
+// ═══════════════════════════════════════════════════════════
+fn _extract_kv(s: string, key: string) -> i64 {
+    let pat = key + "="
+    let i = s.index_of(pat)
+    if i < 0 { return -1 }
+    let tail = s.substring(i + len(pat), len(s))
+    let mut end = 0
+    let n = len(tail)
+    while end < n {
+        let c = tail.substring(end, end + 1)
+        if c == " " || c == "\n" || c == "\t" { break }
+        end = end + 1
+    }
+    let num = tail.substring(0, end)
+    let mut r: i64 = 0
+    try { r = to_int(num) } catch e {}  // @allow-silent-catch
+    return r
+}
+
+// ═══════════════════════════════════════════════════════════
+//  CLI
+// ═══════════════════════════════════════════════════════════
+let a = args()
+let mut path = _DEFAULT_PATH
+let mut strict = false
+let mut quiet = false
+
+let mut i: i64 = 2
+while i < len(a) {
+    let arg = a[i]
+    if arg == "--strict" { strict = true }
+    else if arg == "--quiet" { quiet = true }
+    else if arg == "--path" {
+        if i + 1 < len(a) { path = a[i + 1]; i = i + 1 }
+    }
+    else if arg == "--help" || arg == "-h" {
+        println("usage: hexa run tooling/atlas-validator/atlas_validate.hexa [--path PATH] [--strict] [--quiet]")
+        println("  validates n6 schema (R1..R6 + duplicate id detection)")
+        println("  exit 0 = ok, 1 = violations, 2 = usage error")
+        exit(0)
+    }
+    i = i + 1
+}
+
+// existence check
+let exists_raw = to_string(exec("test -f '" + _shq(path) + "' && echo Y || echo N")).trim()  // @allow-bare-exec
+if exists_raw != "Y" {
+    println("atlas_validate: file not found: " + path)
+    exit(2)  // @allow-silent-exit
+}
+
+let t0 = _ns_now()
+
+if _write_main_awk() == false {
+    println("atlas_validate: cannot write awk script")
+    exit(2)  // @allow-silent-exit
+}
+if _write_dup_awk() == false {
+    println("atlas_validate: cannot write dup awk script")
+    exit(2)  // @allow-silent-exit
+}
+
+// run main awk — LANG=C/LC_ALL=C 강제 (BSD-awk UTF-8 abort 회피, GOTCHAS.md §1)
+let cmd1 = "LANG=C LC_ALL=C awk -f '" + _AWK_SCRIPT_PATH + "' '" + _shq(path) + "' 2>/dev/null"
+let out1 = to_string(exec(cmd1))  // @allow-bare-exec
+
+// run duplicate check (UTF-8 emoji-laden lines 통과)
+let cmd2 = "LANG=C LC_ALL=C awk -f '" + _DUP_AWK_PATH + "' '" + _shq(path) + "' 2>/dev/null"
+let out2 = to_string(exec(cmd2))  // @allow-bare-exec
+
+let t1 = _ns_now()
+let dur_ms = (t1 - t0) / 1000000
+
+// parse summaries
+let mut total: i64 = 0
+let mut errs: i64 = 0
+let mut warns: i64 = 0
+let mut unique_ids: i64 = 0
+let mut dup_ids: i64 = 0
+let mut conflicts: i64 = 0
+
+let s_idx = out1.index_of("__SUMMARY__")
+let mut violations_out = ""
+if s_idx > -1 {
+    violations_out = out1.substring(0, s_idx)
+    let summary = out1.substring(s_idx, len(out1))
+    total = _extract_kv(summary, "total")
+    errs = _extract_kv(summary, "errors")
+    warns = _extract_kv(summary, "warnings")
+} else {
+    violations_out = out1
+}
+
+let d_idx = out2.index_of("__DUPSUMMARY__")
+let mut dup_violations = ""
+if d_idx > -1 {
+    dup_violations = out2.substring(0, d_idx)
+    let dsum = out2.substring(d_idx, len(out2))
+    unique_ids = _extract_kv(dsum, "unique")
+    dup_ids = _extract_kv(dsum, "dup_ids")
+    conflicts = _extract_kv(dsum, "conflicts")
+} else {
+    dup_violations = out2
+}
+warns = warns + conflicts
+
+// emit per-violation NDJSON unless --quiet
+if quiet == false {
+    if violations_out.len() > 0 { print(violations_out) }
+    if dup_violations.len() > 0 { print(dup_violations) }
+}
+
+// final summary
+let mut ms: [string] = []
+ms.push("__ATLAS_VALIDATE__ {\"path\":\"")
+ms.push(path)
+ms.push("\",\"total\":")
+ms.push(to_string(total))
+ms.push(",\"errors\":")
+ms.push(to_string(errs))
+ms.push(",\"warnings\":")
+ms.push(to_string(warns))
+ms.push(",\"unique_ids\":")
+ms.push(to_string(unique_ids))
+ms.push(",\"dup_ids\":")
+ms.push(to_string(dup_ids))
+ms.push(",\"dup_conflicts\":")
+ms.push(to_string(conflicts))
+ms.push(",\"strict\":")
+ms.push(if strict { "true" } else { "false" })
+ms.push(",\"duration_ms\":")
+ms.push(to_string(dur_ms))
+ms.push("}")
+let summary_line = ms.join("")
+println(summary_line)
+
+// stderr meta
+let mut meta: [string] = []
+meta.push("NEXUS_ATLAS_VALIDATE {\"path\":\"")
+meta.push(path)
+meta.push("\",\"total\":")
+meta.push(to_string(total))
+meta.push(",\"errors\":")
+meta.push(to_string(errs))
+meta.push(",\"warnings\":")
+meta.push(to_string(warns))
+meta.push(",\"duration_ms\":")
+meta.push(to_string(dur_ms))
+meta.push("}")
+eprintln(meta.join(""))
+
+let mut rc: i64 = 0
+if errs > 0 { rc = 1 }
+if strict && warns > 0 { rc = 1 }
+exit(rc)  // @allow-silent-exit

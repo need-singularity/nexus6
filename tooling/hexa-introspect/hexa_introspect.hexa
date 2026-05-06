@@ -1,0 +1,1768 @@
+// ═══════════════════════════════════════════════════════════
+// tooling/hexa-introspect/hexa_introspect.hexa
+//   — `hexa --ast` / `hexa --symbols` / `hexa --check` external wrapper
+//     (Phase 1 + Phase 2)
+//
+// 갭 카탈로그: hexa-cli-introspection (Rank 3)
+// spec: design/hexa_cli_introspection_spec.md (§ 2.1, 2.2 Phase 1 + 2.3 Phase 2)
+//
+// 배경:
+//   hexa 컴파일러 내부 (self/parser.hexa) 의 AST 노드 (#{ "kind":..., ... })
+//   는 line/col 정보를 미포함 — Token 단계에서만 line/col 이 추적됨. Phase 1
+//   에서 컴파일러 본체 패치를 피하려고, 본 wrapper 가 source 를 자체 스캔
+//   (state-machine: brace depth + string/comment guard) 하여 top-level decl
+//   의 위치 정보를 회복한 뒤 spec §2.1 / §2.2 의 JSON 스키마로 출력한다.
+//
+//   Phase 2 (`--check`) 는 같은 string/comment guard 를 재사용하여 atlas 갭
+//   카탈로그의 6 룰 (HX001 banned-gte / HX002 bare-exec / HX003 silent-catch
+//   / HX004 awk-utf8-eq / HX005 rc-trailer-missing / HX006 argv-slice-bare)
+//   을 라인 단위로 검출하고 NDJSON 으로 1줄/위반 emit 한다.
+//
+// 설계:
+//   1) read_file → src
+//   2) line-by-line scan, 토큰 시작 라인/컬럼 캡처
+//   3) brace_depth==0 시 등장하는 키워드 (fn|let|const|import|use|struct|
+//      enum|trait|impl|pub|@) 을 decl 시작점으로 판정
+//   4) decl 본문 끝은 (a) `{` 매칭 닫힘 또는 (b) 다음 top-level decl 직전
+//      또는 (c) EOF
+//   5) `--ast` → { type: "Program", file, body: [AstNode], errors, ast_version }
+//      `--symbols` → [Symbol]   (source order)
+//
+// 인터페이스: 본 파일을 직접 hexa run 으로 호출
+//   $ hexa run tooling/hexa-introspect/hexa_introspect.hexa --ast <file.hexa>
+//   $ hexa run tooling/hexa-introspect/hexa_introspect.hexa --symbols <file.hexa>
+//
+// stdout: JSON (single object for --ast, JSON array for --symbols)
+// stderr: NDJSON 메타 (NEXUS_HEXA_INTROSPECT { stage, ms, decls })
+// exit: 0=ok, 1=invalid-args, 2=file-unreadable
+//
+// 규칙: hexa >=/<= 금지 — < / > 만 사용. stdlib only.
+// 편집 금지: hexa-lang/, n6/, design/, mk2_hexa/, docs/
+// ═══════════════════════════════════════════════════════════
+
+let _AST_VERSION = "0.1.0-phase1"
+let _NS = "NEXUS_HEXA_INTROSPECT"
+
+// ─── ns clock (BSD/GNU 양립, hexa-rules PATTERNS.md §1) ───
+fn _ns_now() -> i64 {
+    let mut r: i64 = 0
+    let raw = to_string(exec("date +%s%N 2>/dev/null")).trim()  // @allow-bare-exec
+    if raw.len() > 0 && raw.contains("N") == false {
+        try { r = to_int(raw) } catch e {}  // @allow-silent-catch
+    }
+    if r < 1 {
+        let s2 = to_string(exec("python3 -c 'import time;print(time.time_ns())' 2>/dev/null")).trim()  // @allow-bare-exec
+        try { r = to_int(s2) } catch e2 {}  // @allow-silent-catch
+    }
+    if r < 1 {
+        let s3 = to_string(exec("date +%s")).trim()  // @allow-bare-exec
+        try { let sec = to_int(s3); r = sec * 1000000000 } catch e3 {}  // @allow-silent-catch
+    }
+    return r
+}
+
+// ─── stderr NDJSON meta ───
+fn _emit_meta(stage: string, ms: i64, decls: i64, file: string) {
+    let mut m: [string] = []
+    m.push(_NS)
+    m.push(" {\"stage\":\"")
+    m.push(stage)
+    m.push("\",\"ms\":")
+    m.push(to_string(ms))
+    m.push(",\"decls\":")
+    m.push(to_string(decls))
+    m.push(",\"file\":\"")
+    m.push(_json_escape(file))
+    m.push("\"}")
+    eprintln(m.join(""))
+}
+
+// ─── JSON string escape (lsp.hexa::escape_json_str 참고) ───
+fn _json_escape(s: string) -> string {
+    let n = s.len()
+    let mut out: [string] = []
+    let mut i: i64 = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "\"" { out.push("\\\"") }
+        else if c == "\\" { out.push("\\\\") }
+        else if c == "\n" { out.push("\\n") }
+        else if c == "\r" { out.push("\\r") }
+        else if c == "\t" { out.push("\\t") }
+        else if c == "\u{0008}" { out.push("\\b") }
+        else if c == "\u{000C}" { out.push("\\f") }
+        else { out.push(c) }
+        i = i + 1
+    }
+    return out.join("")
+}
+
+// ─── 문자 분류 헬퍼 (lexer.hexa:is_keyword 와 정합) ───
+fn _is_alpha(c: string) -> bool {
+    return (c == "a" || c == "b" || c == "c" || c == "d" || c == "e"
+        || c == "f" || c == "g" || c == "h" || c == "i" || c == "j"
+        || c == "k" || c == "l" || c == "m" || c == "n" || c == "o"
+        || c == "p" || c == "q" || c == "r" || c == "s" || c == "t"
+        || c == "u" || c == "v" || c == "w" || c == "x" || c == "y" || c == "z"
+        || c == "A" || c == "B" || c == "C" || c == "D" || c == "E"
+        || c == "F" || c == "G" || c == "H" || c == "I" || c == "J"
+        || c == "K" || c == "L" || c == "M" || c == "N" || c == "O"
+        || c == "P" || c == "Q" || c == "R" || c == "S" || c == "T"
+        || c == "U" || c == "V" || c == "W" || c == "X" || c == "Y" || c == "Z"
+        || c == "_")
+}
+fn _is_digit(c: string) -> bool {
+    return (c == "0" || c == "1" || c == "2" || c == "3" || c == "4"
+        || c == "5" || c == "6" || c == "7" || c == "8" || c == "9")
+}
+fn _is_ident_part(c: string) -> bool {
+    return _is_alpha(c) || _is_digit(c)
+}
+fn _is_ws(c: string) -> bool {
+    return c == " " || c == "\t" || c == "\r"
+}
+
+// ─── decl-keyword set (top-level only) ───
+//
+// kind → AST/Symbol 매핑:
+//   fn      → FnDecl / fn
+//   let     → LetStmt / let         (mut 도 같이 처리)
+//   const   → ConstStmt / const
+//   static  → StaticStmt / const    (visibility 별도)
+//   import  → ImportDecl / import
+//   use     → ImportDecl / import
+//   struct  → StructDecl / type
+//   enum    → EnumDecl / type
+//   trait   → TraitDecl / type
+//   impl    → ImplBlock / type
+//   type    → TypeAliasDecl / type
+fn _kw_to_kind(kw: string) -> string {
+    if kw == "fn" { return "FnDecl" }
+    if kw == "let" { return "LetStmt" }
+    if kw == "const" { return "ConstStmt" }
+    if kw == "static" { return "StaticStmt" }
+    if kw == "import" { return "ImportDecl" }
+    if kw == "use" { return "ImportDecl" }
+    if kw == "struct" { return "StructDecl" }
+    if kw == "enum" { return "EnumDecl" }
+    if kw == "trait" { return "TraitDecl" }
+    if kw == "impl" { return "ImplBlock" }
+    if kw == "type" { return "TypeAliasDecl" }
+    return ""
+}
+fn _kind_to_sym(kind: string) -> string {
+    if kind == "FnDecl" { return "fn" }
+    if kind == "LetStmt" { return "let" }
+    if kind == "ConstStmt" { return "const" }
+    if kind == "StaticStmt" { return "const" }
+    if kind == "ImportDecl" { return "import" }
+    if kind == "StructDecl" { return "type" }
+    if kind == "EnumDecl" { return "type" }
+    if kind == "TraitDecl" { return "type" }
+    if kind == "ImplBlock" { return "type" }
+    if kind == "TypeAliasDecl" { return "type" }
+    return "let"
+}
+
+// ─── 핵심 스캐너 ─────────────────────────────────────────
+//
+// 출력: 평행 배열 형태의 decl 목록.
+//   names[i]    — 식별자 (impl 의 경우 target 이름; import 의 경우 path)
+//   kinds[i]    — AST kind 문자열 ("FnDecl" 등)
+//   start_lines[i], start_cols[i]  — 1-based 시작 위치 (키워드 시작점)
+//   end_lines[i], end_cols[i]      — 1-based 종료 위치 (decl 끝, EOL 또는 `}`)
+//   type_strs[i] — 추출된 타입 (fn return / let type, 없으면 "")
+//   sigs[i]     — 함수의 경우 "fn name(p:T, ...) -> R" (없으면 "")
+//   visibilities[i] — "pub" 또는 "priv"
+//   docs[i]     — 직전 `///` 또는 `//` 코멘트 (없으면 "")
+//
+// state machine:
+//   - in_block_comment (depth)
+//   - in_line_comment  (until newline)
+//   - in_string        (track delim and escape)
+//   - brace_depth      (only emit decl when 0)
+//
+// fn 의 시그너처 추출: `fn` 이후 1줄 안에서 `(` 부터 매칭 `)` 까지 + 선택
+// `-> Type` 까지를 collect. 줄바꿈을 만나면 string-builder 에 그대로 쌓음
+// (multi-line params).
+//
+// 헤더 파일 (`/// ` 또는 `// `) 코멘트는 직전-N 라인에서 보존.
+
+// ─── 사전 계산: 각 라인의 시작 offset 배열 ────────
+// `line_starts[k]` = 1-based 라인 k 의 첫 byte 의 0-based offset.
+// `line_starts[0]` 은 sentinel (사용 안함).
+// `_off_to_lc(line_starts, off)` 는 (line, col) 1-based 를 i64 2-tuple
+// 로 반환 — 본 wrapper 는 record `#{"line":..., "col":...}` 로 표현.
+fn _build_line_starts(src: string) -> [i64] {
+    let mut starts: [i64] = []
+    starts.push(0)   // sentinel (1-based 인덱싱)
+    starts.push(0)   // line 1 시작
+    let n = src.len()
+    let mut i: i64 = 0
+    while i < n {
+        if src.substring(i, i + 1) == "\n" {
+            starts.push(i + 1)
+        }
+        i = i + 1
+    }
+    return starts
+}
+
+fn _off_line(line_starts: [i64], off: i64) -> i64 {
+    // 이진 탐색: line_starts[L] <= off < line_starts[L+1]
+    let nl = len(line_starts)
+    let mut lo: i64 = 1
+    let mut hi: i64 = nl - 1
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2
+        if line_starts[mid] > off { hi = mid - 1 }
+        else { lo = mid }
+    }
+    return lo
+}
+
+fn _off_col(line_starts: [i64], line: i64, off: i64) -> i64 {
+    return off - line_starts[line] + 1
+}
+
+fn scan_decls(src: string) -> [string] {
+    // 결과 누적용. 각 decl 은 #{ kind, name, start_line, start_col, end_line,
+    // end_col, type, sig, visibility, doc } 형태로 array 에 push.
+    let mut decls: [string] = []  // 사실상 [Record] (hexa runtime: array of any)
+    let n = src.len()
+    let line_starts = _build_line_starts(src)
+
+    let mut line: i64 = 1
+    let mut col: i64 = 1
+    let mut i: i64 = 0
+    let mut brace_depth: i64 = 0
+    let mut paren_depth: i64 = 0
+    let mut bracket_depth: i64 = 0
+    let mut block_cmt: i64 = 0           // depth (nested)
+    let mut in_line_cmt: bool = false
+    let mut in_str: bool = false
+    let mut str_delim: string = ""
+    let mut last_doc: string = ""        // 직전 라인의 // 또는 /// 코멘트
+    let mut pending_doc: [string] = []   // 직전 연속 코멘트 라인 누적
+
+    while i < n {
+        let c = src.substring(i, i + 1)
+        let c2 = if i + 1 < n { src.substring(i + 1, i + 2) } else { "" }
+
+        // ─── 줄바꿈 처리 ─────────────────────
+        if c == "\n" {
+            // 라인 코멘트 종료
+            if in_line_cmt {
+                in_line_cmt = false
+                // pending_doc 누적된 직전 코멘트 그대로 유지
+            }
+            line = line + 1
+            col = 1
+            i = i + 1
+            continue
+        }
+
+        // ─── 블록 코멘트 진행 ───────────────
+        if block_cmt > 0 {
+            if c == "*" && c2 == "/" {
+                block_cmt = block_cmt - 1
+                i = i + 2
+                col = col + 2
+                continue
+            }
+            if c == "/" && c2 == "*" {
+                block_cmt = block_cmt + 1
+                i = i + 2
+                col = col + 2
+                continue
+            }
+            i = i + 1
+            col = col + 1
+            continue
+        }
+
+        // ─── 라인 코멘트 진행 ───────────────
+        if in_line_cmt {
+            i = i + 1
+            col = col + 1
+            continue
+        }
+
+        // ─── 문자열 진행 ─────────────────────
+        if in_str {
+            if c == "\\" && i + 1 < n {
+                // escape 1글자 skip
+                i = i + 2
+                col = col + 2
+                continue
+            }
+            if c == str_delim {
+                in_str = false
+                str_delim = ""
+                i = i + 1
+                col = col + 1
+                continue
+            }
+            i = i + 1
+            col = col + 1
+            continue
+        }
+
+        // ─── 문자열 시작 ─────────────────────
+        if c == "\"" {
+            in_str = true
+            str_delim = "\""
+            i = i + 1
+            col = col + 1
+            continue
+        }
+
+        // ─── 코멘트 시작 ─────────────────────
+        if c == "/" && c2 == "/" {
+            // 직전 doc 누적: 코멘트의 끝까지 읽어 pending_doc 에 push.
+            // /// 또는 //! prefix 만 doc 으로 취급 (일반 // 는 무시).
+            let mut j: i64 = i + 2
+            while j < n && src.substring(j, j + 1) != "\n" { j = j + 1 }
+            let body = src.substring(i + 2, j)
+            // 첫 글자가 '/' 또는 '!' 면 doc.
+            let first = if body.len() > 0 { body.substring(0, 1) } else { "" }
+            if first == "/" || first == "!" {
+                let trimmed = body.substring(1, body.len()).trim()
+                pending_doc.push(trimmed)
+            } else {
+                // 일반 코멘트: doc 누적 reset (decl 과 분리)
+                if pending_doc.len() > 0 { pending_doc = [] }
+            }
+            in_line_cmt = true
+            // 진행은 c == "\n" 처리에서 종결
+            i = j
+            col = col + (j - i)  // 사실상 무시 (newline 에서 col=1 reset)
+            continue
+        }
+        if c == "/" && c2 == "*" {
+            block_cmt = 1
+            i = i + 2
+            col = col + 2
+            continue
+        }
+
+        // ─── brace / paren / bracket depth ───
+        if c == "{" {
+            brace_depth = brace_depth + 1
+            i = i + 1
+            col = col + 1
+            continue
+        }
+        if c == "}" {
+            brace_depth = brace_depth - 1
+            if brace_depth < 0 { brace_depth = 0 }
+            i = i + 1
+            col = col + 1
+            continue
+        }
+        if c == "(" {
+            paren_depth = paren_depth + 1
+            i = i + 1
+            col = col + 1
+            continue
+        }
+        if c == ")" {
+            paren_depth = paren_depth - 1
+            if paren_depth < 0 { paren_depth = 0 }
+            i = i + 1
+            col = col + 1
+            continue
+        }
+        if c == "[" {
+            bracket_depth = bracket_depth + 1
+            i = i + 1
+            col = col + 1
+            continue
+        }
+        if c == "]" {
+            bracket_depth = bracket_depth - 1
+            if bracket_depth < 0 { bracket_depth = 0 }
+            i = i + 1
+            col = col + 1
+            continue
+        }
+
+        // ─── 식별자/키워드 토큰 ──────────────
+        if _is_alpha(c) {
+            let tok_start = i
+            let tok_line = line
+            let tok_col = col
+            let mut j: i64 = i
+            while j < n && _is_ident_part(src.substring(j, j + 1)) { j = j + 1 }
+            let word = src.substring(tok_start, j)
+
+            // top-level decl 만 처리 (brace 안쪽은 무시)
+            if brace_depth == 0 {
+                // 'pub' prefix → visibility 표시 + 다음 키워드까지 진행
+                let mut visibility = "priv"
+                let mut effective_word = word
+                let mut effective_start_line = tok_line
+                let mut effective_start_col = tok_col
+                let mut k_after = j
+
+                if word == "pub" {
+                    visibility = "pub"
+                    // pub 직후의 공백/줄바꿈만 skip (간단 — 첫 비-WS 가 키워드 후보).
+                    let mut k = j
+                    while k < n {
+                        let cc = src.substring(k, k + 1)
+                        if _is_ws(cc) || cc == "\n" { k = k + 1 }
+                        else { break }
+                    }
+                    if k < n && _is_alpha(src.substring(k, k + 1)) {
+                        let kk_start = k
+                        let mut kk = k
+                        while kk < n && _is_ident_part(src.substring(kk, kk + 1)) { kk = kk + 1 }
+                        effective_word = src.substring(kk_start, kk)
+                        k_after = kk
+                    } else {
+                        // pub 후 키워드 못 찾음 — skip 토큰
+                        i = j
+                        col = col + (j - tok_start)
+                        continue
+                    }
+                }
+
+                let kind = _kw_to_kind(effective_word)
+                if kind != "" {
+                    // decl 시작 발견. 이름/시그/타입 추출 + end 위치 결정.
+                    // ─── 이름 추출 ───
+                    // 다음 식별자 (단, ImplBlock 은 트레이트/타깃 형태 유의).
+                    let mut name = ""
+                    let mut sig = ""
+                    let mut type_str = ""
+                    let mut p = k_after
+                    let mut p_line = tok_line
+                    // skip ws / newlines
+                    while p < n {
+                        let cc = src.substring(p, p + 1)
+                        if cc == " " || cc == "\t" || cc == "\r" { p = p + 1 }
+                        else if cc == "\n" { p_line = p_line + 1; p = p + 1 }
+                        else { p = p; break }
+                    }
+                    // mut keyword 처리 (let mut name)
+                    if effective_word == "let" && p + 3 < n {
+                        let look = src.substring(p, p + 3)
+                        let after = if p + 3 < n { src.substring(p + 3, p + 4) } else { "" }
+                        if look == "mut" && (_is_ws(after) || after == "\n") {
+                            p = p + 3
+                            while p < n && (_is_ws(src.substring(p, p + 1)) || src.substring(p, p + 1) == "\n") { p = p + 1 }
+                        }
+                    }
+                    if p < n && _is_alpha(src.substring(p, p + 1)) {
+                        let nm_start = p
+                        while p < n && _is_ident_part(src.substring(p, p + 1)) { p = p + 1 }
+                        name = src.substring(nm_start, p)
+                    } else if effective_word == "import" || effective_word == "use" {
+                        // 'use foo::bar' 또는 'import "path"' — 다음 토큰까지 그대로
+                        let nm_start = p
+                        while p < n {
+                            let cc = src.substring(p, p + 1)
+                            if cc == "\n" || cc == ";" { break }
+                            p = p + 1
+                        }
+                        name = src.substring(nm_start, p).trim()
+                    }
+
+                    // ─── fn 시그니처 추출 ───
+                    if kind == "FnDecl" {
+                        // p 이후 첫 '(' 부터 매칭 ')' + optional `-> Type` 까지.
+                        let mut q = p
+                        // skip type-params <...>
+                        while q < n && src.substring(q, q + 1) != "(" && src.substring(q, q + 1) != "{" && src.substring(q, q + 1) != "\n" { q = q + 1 }
+                        if q < n && src.substring(q, q + 1) == "(" {
+                            let mut depth = 0
+                            let pq_start = q
+                            let mut qq = q
+                            while qq < n {
+                                let cc = src.substring(qq, qq + 1)
+                                if cc == "(" { depth = depth + 1 }
+                                else if cc == ")" {
+                                    depth = depth - 1
+                                    if depth == 0 { qq = qq + 1; break }
+                                }
+                                qq = qq + 1
+                            }
+                            let params_raw = src.substring(pq_start, qq).replace("\n", " ").trim()
+                            // -> ReturnType 추출
+                            let mut r_qq = qq
+                            while r_qq < n && _is_ws(src.substring(r_qq, r_qq + 1)) { r_qq = r_qq + 1 }
+                            let mut ret_type = ""
+                            if r_qq + 1 < n && src.substring(r_qq, r_qq + 1) == "-" && src.substring(r_qq + 1, r_qq + 2) == ">" {
+                                let rt_start = r_qq + 2
+                                let mut rt_end = rt_start
+                                while rt_end < n {
+                                    let cc = src.substring(rt_end, rt_end + 1)
+                                    if cc == "{" || cc == "\n" { break }
+                                    rt_end = rt_end + 1
+                                }
+                                ret_type = src.substring(rt_start, rt_end).trim()
+                            }
+                            type_str = ret_type
+                            let mut sb: [string] = []
+                            sb.push("fn ")
+                            sb.push(name)
+                            sb.push(params_raw)
+                            if ret_type.len() > 0 {
+                                sb.push(" -> ")
+                                sb.push(ret_type)
+                            }
+                            sig = sb.join("")
+                        }
+                    }
+
+                    // ─── let/const 타입 어노테이션 추출 ───
+                    if kind == "LetStmt" || kind == "ConstStmt" || kind == "StaticStmt" {
+                        // name 이후 첫 ':' 가 있으면 그 다음부터 '=' 또는 '\n' 직전까지가 타입.
+                        let mut q = p
+                        while q < n {
+                            let cc = src.substring(q, q + 1)
+                            if cc == ":" {
+                                let ts = q + 1
+                                let mut te = ts
+                                while te < n {
+                                    let dc = src.substring(te, te + 1)
+                                    if dc == "=" || dc == "\n" { break }
+                                    te = te + 1
+                                }
+                                type_str = src.substring(ts, te).trim()
+                                q = te
+                                break
+                            }
+                            if cc == "=" || cc == "\n" { break }
+                            q = q + 1
+                        }
+                    }
+
+                    // ─── end 위치 결정 ───
+                    // (a) fn / struct / enum / trait / impl: 매칭되는 `}` 까지
+                    // (b) let / const / import / use: 줄 끝 (newline) 또는 ';'
+                    let mut end_line = tok_line
+                    let mut end_col = tok_col
+                    let mut end_idx = i
+
+                    let is_block_decl = (kind == "FnDecl" || kind == "StructDecl"
+                        || kind == "EnumDecl" || kind == "TraitDecl"
+                        || kind == "ImplBlock")
+
+                    if is_block_decl {
+                        // 첫 '{' 까지 진행 후 매칭 '}' 찾기.
+                        // 안전 디폴트: 매칭 실패 시 end_idx 가 i 로 남아 무한루프 →
+                        // 명시적으로 EOF 로 초기화.
+                        end_idx = n
+                        let mut q = p
+                        let mut q_line = tok_line
+                        let mut q_col = tok_col
+                        // 라인/컬럼은 정확히 추적 — 토큰 후 위치부터 계산
+                        // 단순화: 토큰 시작 이후의 텍스트를 다시 스캔하며 line/col 을 계산.
+                        // 효율을 위해 추정 — 매칭 '{}' 계산 시 line counter 를 동시에 갱신.
+                        let mut found_brace = false
+                        let mut depth = 0
+                        let mut local_line = tok_line
+                        let mut local_col = tok_col + 0
+                        // 토큰 이후의 line/col 은 line_starts 룩업으로 O(log N).
+                        local_line = _off_line(line_starts, p)
+                        local_col = _off_col(line_starts, local_line, p)
+                        q = p
+                        while q < n {
+                            let cc = src.substring(q, q + 1)
+                            if cc == "{" {
+                                depth = depth + 1
+                                found_brace = true
+                            } else if cc == "}" {
+                                depth = depth - 1
+                                if depth == 0 && found_brace {
+                                    end_line = local_line
+                                    end_col = local_col + 1
+                                    end_idx = q + 1
+                                    q = q + 1
+                                    break
+                                }
+                            } else if cc == "\n" {
+                                local_line = local_line + 1
+                                local_col = 1
+                                q = q + 1
+                                continue
+                            }
+                            local_col = local_col + 1
+                            q = q + 1
+                        }
+                        if !found_brace {
+                            // 본문 없음 (예: trait Foo;) — 줄 끝까지
+                            end_line = local_line
+                            end_col = local_col
+                            end_idx = q
+                        }
+                    } else {
+                        // 줄 끝까지 (단순 statement decl) — line_starts 룩업.
+                        end_idx = n  // 디폴트: EOF
+                        let mut q = p
+                        let mut local_line = _off_line(line_starts, p)
+                        let mut local_col = _off_col(line_starts, local_line, p)
+                        // 단순 decl 도 RHS 가 다중라인일 수 있음 → ()/[]/{} balance 0,
+                        // string/comment 외부에서 newline 만나면 종료.
+                        let mut q_paren = 0
+                        let mut q_brack = 0
+                        let mut q_brace = 0
+                        let mut q_in_str = false
+                        let mut q_str_delim = ""
+                        while q < n {
+                            let cc = src.substring(q, q + 1)
+                            let cc2 = if q + 1 < n { src.substring(q + 1, q + 2) } else { "" }
+                            if q_in_str {
+                                if cc == "\\" && q + 1 < n {
+                                    q = q + 2; local_col = local_col + 2
+                                    continue
+                                }
+                                if cc == q_str_delim {
+                                    q_in_str = false; q_str_delim = ""
+                                }
+                                if cc == "\n" { local_line = local_line + 1; local_col = 1 }
+                                else { local_col = local_col + 1 }
+                                q = q + 1
+                                continue
+                            }
+                            if cc == "\"" {
+                                q_in_str = true; q_str_delim = "\""
+                                local_col = local_col + 1
+                                q = q + 1
+                                continue
+                            }
+                            if cc == "(" { q_paren = q_paren + 1 }
+                            else if cc == ")" { q_paren = q_paren - 1 }
+                            else if cc == "[" { q_brack = q_brack + 1 }
+                            else if cc == "]" { q_brack = q_brack - 1 }
+                            else if cc == "{" { q_brace = q_brace + 1 }
+                            else if cc == "}" { q_brace = q_brace - 1 }
+                            if cc == "\n" {
+                                if q_paren == 0 && q_brack == 0 && q_brace == 0 {
+                                    end_line = local_line
+                                    end_col = local_col
+                                    end_idx = q
+                                    q = q + 1
+                                    break
+                                }
+                                local_line = local_line + 1
+                                local_col = 1
+                                q = q + 1
+                                continue
+                            }
+                            local_col = local_col + 1
+                            q = q + 1
+                        }
+                        if q > n - 1 && end_idx == i {
+                            end_line = local_line
+                            end_col = local_col
+                            end_idx = q
+                        }
+                    }
+
+                    // ─── doc 정합 ───
+                    let mut doc_str = ""
+                    if pending_doc.len() > 0 {
+                        doc_str = pending_doc.join("\n")
+                        pending_doc = []
+                    }
+
+                    // ─── decl 누적 ───
+                    // 필드명 'type' 은 hexa 예약어 — 'typ' 사용.
+                    let rec = #{
+                        "kind": kind,
+                        "name": name,
+                        "start_line": tok_line,
+                        "start_col": tok_col,
+                        "end_line": end_line,
+                        "end_col": end_col,
+                        "typ": type_str,
+                        "sig": sig,
+                        "visibility": visibility,
+                        "doc": doc_str
+                    }
+                    decls.push(rec)
+
+                    // 외부 i/line/col 을 end_idx 에 정합 — line_starts 룩업.
+                    // 안전: end_idx <= tok_start 이면 (스캐너 버그) 강제로 1 증가.
+                    if end_idx < tok_start + 1 { end_idx = tok_start + 1 }
+                    line = _off_line(line_starts, end_idx)
+                    col = _off_col(line_starts, line, end_idx)
+                    i = end_idx
+                    // pending_doc 은 위에서 reset.
+                    continue
+                }
+            }
+
+            // 토큰을 통과 (식별자가 키워드 아님)
+            i = j
+            col = col + (j - tok_start)
+            continue
+        }
+
+        // 식별자도 아니고 위에 매칭되지 않은 임의 문자
+        i = i + 1
+        col = col + 1
+    }
+
+    return decls
+}
+
+// ─── Decl record → AST JSON ─────────────────────────────
+fn decls_to_ast(file: string, decls: [string]) -> string {
+    let mut sb: [string] = []
+    sb.push("{\"type\":\"Program\",\"file\":\"")
+    sb.push(_json_escape(file))
+    sb.push("\",\"ast_version\":\"")
+    sb.push(_AST_VERSION)
+    sb.push("\",\"body\":[")
+    let mut i = 0
+    while i < decls.len() {
+        let d = decls[i]
+        if i > 0 { sb.push(",") }
+        sb.push("{\"kind\":\"")
+        sb.push(_json_escape(to_string(d.kind)))
+        sb.push("\",\"name\":\"")
+        sb.push(_json_escape(to_string(d.name)))
+        sb.push("\",\"loc\":{\"start\":{\"line\":")
+        sb.push(to_string(d.start_line))
+        sb.push(",\"col\":")
+        sb.push(to_string(d.start_col))
+        sb.push("},\"end\":{\"line\":")
+        sb.push(to_string(d.end_line))
+        sb.push(",\"col\":")
+        sb.push(to_string(d.end_col))
+        sb.push("}},\"visibility\":\"")
+        sb.push(_json_escape(to_string(d.visibility)))
+        sb.push("\",\"type\":")
+        let t = to_string(d.typ)
+        if t.len() > 0 {
+            sb.push("\"")
+            sb.push(_json_escape(t))
+            sb.push("\"")
+        } else {
+            sb.push("null")
+        }
+        sb.push(",\"sig\":")
+        let g = to_string(d.sig)
+        if g.len() > 0 {
+            sb.push("\"")
+            sb.push(_json_escape(g))
+            sb.push("\"")
+        } else {
+            sb.push("null")
+        }
+        sb.push(",\"doc\":")
+        let dd = to_string(d.doc)
+        if dd.len() > 0 {
+            sb.push("\"")
+            sb.push(_json_escape(dd))
+            sb.push("\"")
+        } else {
+            sb.push("null")
+        }
+        sb.push("}")
+        i = i + 1
+    }
+    sb.push("],\"errors\":[]}")
+    return sb.join("")
+}
+
+// ─── Decl record → Symbol JSON ──────────────────────────
+fn decls_to_symbols(file: string, decls: [string]) -> string {
+    let mut sb: [string] = []
+    sb.push("[")
+    let mut i = 0
+    while i < decls.len() {
+        let d = decls[i]
+        if i > 0 { sb.push(",") }
+        sb.push("{\"name\":\"")
+        sb.push(_json_escape(to_string(d.name)))
+        sb.push("\",\"kind\":\"")
+        sb.push(_json_escape(_kind_to_sym(to_string(d.kind))))
+        sb.push("\",\"loc\":{\"line\":")
+        sb.push(to_string(d.start_line))
+        sb.push(",\"col\":")
+        sb.push(to_string(d.start_col))
+        sb.push("},\"end_loc\":{\"line\":")
+        sb.push(to_string(d.end_line))
+        sb.push(",\"col\":")
+        sb.push(to_string(d.end_col))
+        sb.push("},\"type\":")
+        let t = to_string(d.typ)
+        if t.len() > 0 {
+            sb.push("\"")
+            sb.push(_json_escape(t))
+            sb.push("\"")
+        } else {
+            sb.push("null")
+        }
+        sb.push(",\"visibility\":\"")
+        sb.push(_json_escape(to_string(d.visibility)))
+        sb.push("\",\"parent\":null,\"doc\":")
+        let dd = to_string(d.doc)
+        if dd.len() > 0 {
+            sb.push("\"")
+            sb.push(_json_escape(dd))
+            sb.push("\"")
+        } else {
+            sb.push("null")
+        }
+        sb.push(",\"sig\":")
+        let g = to_string(d.sig)
+        if g.len() > 0 {
+            sb.push("\"")
+            sb.push(_json_escape(g))
+            sb.push("\"")
+        } else {
+            sb.push("null")
+        }
+        sb.push(",\"file\":\"")
+        sb.push(_json_escape(file))
+        sb.push("\"}")
+        i = i + 1
+    }
+    sb.push("]")
+    return sb.join("")
+}
+
+// ═══════════════════════════════════════════════════════════
+// Phase 3 — `--refs` / `--hover`  (spec § 2.4 / § 2.5)
+// ═══════════════════════════════════════════════════════════
+
+// ─── Phase 3: decl-keyword sniffing ────────────────────────
+fn _is_decl_kw(w: string) -> bool {
+    if w == "pub" { return true }
+    return _kw_to_kind(w) != ""
+}
+
+// 토큰 직전의 (공백/개행 무시) 가장 가까운 식별자가 decl 키워드인지 검사.
+// `target_start` 는 식별자 토큰의 시작 offset.
+fn _prev_word_is_decl_kw(src: string, target_start: i64) -> bool {
+    let mut k = target_start - 1
+    // skip whitespace + newline
+    while k > -1 {
+        let c = src.substring(k, k + 1)
+        if c == " " || c == "\t" || c == "\r" || c == "\n" { k = k - 1 }
+        else { break }
+    }
+    if k < 0 { return false }
+    // identifier characters backward
+    let e = k + 1
+    let mut s = k
+    while s > -1 {
+        let c = src.substring(s, s + 1)
+        if _is_ident_part(c) { s = s - 1 }
+        else { break }
+    }
+    let word = src.substring(s + 1, e)
+    return _is_decl_kw(word)
+}
+
+// 토큰 종료 직후 첫 비공백/비개행 글자.
+fn _next_non_ws_char(src: string, after: i64) -> string {
+    let n = src.len()
+    let mut k = after
+    while k < n {
+        let c = src.substring(k, k + 1)
+        if c == " " || c == "\t" || c == "\r" { k = k + 1 }
+        else { return c }
+    }
+    return ""
+}
+
+// 라인 텍스트 추출 (1-based line, no trailing \n).
+fn _line_text(src: string, line_starts: [i64], line: i64) -> string {
+    let nl = len(line_starts)
+    if line < 1 { return "" }
+    if line + 1 > nl - 1 {
+        // 마지막 라인 (sentinel 없음): line_starts[line] .. EOF
+        return src.substring(line_starts[line], src.len())
+    }
+    let s = line_starts[line]
+    let e = line_starts[line + 1] - 1   // \n 제외
+    if e < s { return "" }
+    return src.substring(s, e)
+}
+
+// ─── Phase 3: scan_refs ────────────────────────────────────
+//
+// scan_decls 와 동일한 state machine — string/comment/brace 가드 동일.
+// 차이: target 식별자 토큰이 등장할 때마다 누적 + decl|call|reference 분류.
+fn scan_refs(src: string, target: string) -> [string] {
+    let mut refs: [string] = []
+    let n = src.len()
+    let line_starts = _build_line_starts(src)
+
+    let mut line: i64 = 1
+    let mut col: i64 = 1
+    let mut i: i64 = 0
+    let mut brace_depth: i64 = 0
+    let mut block_cmt: i64 = 0
+    let mut in_line_cmt: bool = false
+    let mut in_str: bool = false
+    let mut str_delim: string = ""
+
+    while i < n {
+        let c = src.substring(i, i + 1)
+        let c2 = if i + 1 < n { src.substring(i + 1, i + 2) } else { "" }
+
+        if c == "\n" {
+            if in_line_cmt { in_line_cmt = false }
+            line = line + 1; col = 1; i = i + 1; continue
+        }
+        if block_cmt > 0 {
+            if c == "*" && c2 == "/" { block_cmt = block_cmt - 1; i = i + 2; col = col + 2; continue }
+            if c == "/" && c2 == "*" { block_cmt = block_cmt + 1; i = i + 2; col = col + 2; continue }
+            i = i + 1; col = col + 1; continue
+        }
+        if in_line_cmt { i = i + 1; col = col + 1; continue }
+        if in_str {
+            if c == "\\" && i + 1 < n { i = i + 2; col = col + 2; continue }
+            if c == str_delim { in_str = false; str_delim = "" }
+            i = i + 1; col = col + 1; continue
+        }
+        if c == "\"" { in_str = true; str_delim = "\""; i = i + 1; col = col + 1; continue }
+        if c == "/" && c2 == "/" {
+            in_line_cmt = true
+            // skip ahead to newline (newline branch resets)
+            let mut j = i + 2
+            while j < n && src.substring(j, j + 1) != "\n" { j = j + 1 }
+            col = col + (j - i); i = j; continue
+        }
+        if c == "/" && c2 == "*" { block_cmt = 1; i = i + 2; col = col + 2; continue }
+        if c == "{" { brace_depth = brace_depth + 1; i = i + 1; col = col + 1; continue }
+        if c == "}" {
+            brace_depth = brace_depth - 1
+            if brace_depth < 0 { brace_depth = 0 }
+            i = i + 1; col = col + 1; continue
+        }
+
+        if _is_alpha(c) {
+            let tok_start = i
+            let tok_line = line
+            let tok_col = col
+            let mut j = i
+            while j < n && _is_ident_part(src.substring(j, j + 1)) { j = j + 1 }
+            let word = src.substring(tok_start, j)
+
+            if word == target {
+                // 분류
+                let mut kind = "reference"
+                let prev_decl = _prev_word_is_decl_kw(src, tok_start)
+                if prev_decl && brace_depth == 0 { kind = "decl" }
+                else {
+                    let nxt = _next_non_ws_char(src, j)
+                    if nxt == "(" { kind = "call" }
+                }
+                let end_col = tok_col + (j - tok_start)
+                let ctx = _line_text(src, line_starts, tok_line).trim()
+                let rec = #{
+                    "name": word,
+                    "line": tok_line,
+                    "col": tok_col,
+                    "end_line": tok_line,
+                    "end_col": end_col,
+                    "kind": kind,
+                    "context": ctx
+                }
+                refs.push(rec)
+            }
+
+            col = col + (j - tok_start); i = j; continue
+        }
+
+        i = i + 1; col = col + 1
+    }
+    return refs
+}
+
+// ─── Phase 3: refs → NDJSON ────────────────────────────────
+fn refs_to_ndjson(file: string, refs: [string]) -> string {
+    let mut sb: [string] = []
+    let mut i = 0
+    while i < refs.len() {
+        let r = refs[i]
+        sb.push("{\"name\":\"")
+        sb.push(_json_escape(to_string(r.name)))
+        sb.push("\",\"loc\":{\"line\":")
+        sb.push(to_string(r.line))
+        sb.push(",\"col\":")
+        sb.push(to_string(r.col))
+        sb.push("},\"end_loc\":{\"line\":")
+        sb.push(to_string(r.end_line))
+        sb.push(",\"col\":")
+        sb.push(to_string(r.end_col))
+        sb.push("},\"kind\":\"")
+        sb.push(_json_escape(to_string(r.kind)))
+        sb.push("\",\"context\":\"")
+        sb.push(_json_escape(to_string(r.context)))
+        sb.push("\",\"file\":\"")
+        sb.push(_json_escape(file))
+        sb.push("\"}\n")
+        i = i + 1
+    }
+    return sb.join("")
+}
+
+// ─── Phase 3: pick_token_at (line:col → identifier) ────────
+//
+// 반환: #{ name, start_line, start_col, end_line, end_col } 또는 빈 record.
+// "빈 토큰" 표시: name == ""
+fn pick_token_at(src: string, line_starts: [i64], line: i64, col: i64) -> string {
+    let empty = #{ "name": "", "start_line": 0, "start_col": 0, "end_line": 0, "end_col": 0 }
+    let nl = len(line_starts)
+    if line < 1 { return empty }
+    // 마지막 라인 (sentinel 미포함) 도 허용. line_starts 는 0..nl-1 인덱스.
+    if line > nl - 1 { return empty }
+    let row = _line_text(src, line_starts, line)
+    let rn = row.len()
+    if col < 1 || col > rn { return empty }
+    // col 은 1-based — index = col - 1
+    let mut s = col - 1
+    // 만약 col 위치 char 가 식별자 아니면 좌측으로 한 칸 백오프
+    let here = row.substring(s, s + 1)
+    if _is_ident_part(here) == false {
+        // 좌측 한 글자 백오프 (예: "fn _ns_now()" 의 "(" 위치 → "_ns_now" 끝과 인접)
+        if s > 0 && _is_ident_part(row.substring(s - 1, s)) { s = s - 1 }
+        else { return empty }
+    }
+    // 좌측 확장
+    let mut a = s
+    while a > 0 && _is_ident_part(row.substring(a - 1, a)) { a = a - 1 }
+    // 우측 확장
+    let mut b = s + 1
+    while b < rn && _is_ident_part(row.substring(b, b + 1)) { b = b + 1 }
+    let name = row.substring(a, b)
+    if name.len() < 1 { return empty }
+    // 식별자가 숫자로 시작하면 토큰 아님
+    if _is_digit(name.substring(0, 1)) { return empty }
+    let rec = #{
+        "name": name,
+        "start_line": line, "start_col": a + 1,
+        "end_line": line,   "end_col": b + 1
+    }
+    return rec
+}
+
+// ─── Phase 3: hover JSON ───────────────────────────────────
+fn hover_to_json(file: string, decl: string) -> string {
+    // decl 은 scan_decls 의 record (또는 빈 record — name == "")
+    let nm = to_string(decl.name)
+    if nm.len() < 1 { return "{}" }
+    let mut sb: [string] = []
+    sb.push("{\"name\":\"")
+    sb.push(_json_escape(nm))
+    sb.push("\",\"kind\":\"")
+    sb.push(_json_escape(_kind_to_sym(to_string(decl.kind))))
+    sb.push("\",\"sig\":")
+    let g = to_string(decl.sig)
+    if g.len() > 0 { sb.push("\""); sb.push(_json_escape(g)); sb.push("\"") } else { sb.push("null") }
+    sb.push(",\"type\":")
+    let t = to_string(decl.typ)
+    if t.len() > 0 { sb.push("\""); sb.push(_json_escape(t)); sb.push("\"") } else { sb.push("null") }
+    sb.push(",\"loc\":{\"line\":")
+    sb.push(to_string(decl.start_line))
+    sb.push(",\"col\":")
+    sb.push(to_string(decl.start_col))
+    sb.push("},\"end_loc\":{\"line\":")
+    sb.push(to_string(decl.end_line))
+    sb.push(",\"col\":")
+    sb.push(to_string(decl.end_col))
+    sb.push("},\"visibility\":\"")
+    sb.push(_json_escape(to_string(decl.visibility)))
+    sb.push("\",\"doc\":")
+    let dd = to_string(decl.doc)
+    if dd.len() > 0 { sb.push("\""); sb.push(_json_escape(dd)); sb.push("\"") } else { sb.push("null") }
+    sb.push(",\"file\":\"")
+    sb.push(_json_escape(file))
+    sb.push("\"}")
+    return sb.join("")
+}
+
+// ═══════════════════════════════════════════════════════════
+// Phase 2 — `--check` (lint 룰 6개)
+// ═══════════════════════════════════════════════════════════
+//
+// 룰 식별자 (spec § 2.3 / § 7 갭 매핑):
+//   HX001-banned-gte         error    `>=` / `<=` 사용 금지
+//   HX002-bare-exec          error    정책 주석 없는 `exec(...)` 호출
+//   HX003-silent-catch       warning  빈 `catch e {}` 의 silent swallow
+//   HX004-awk-utf8-eq        warning  awk script 안의 UTF-8 `==` collapse 위험
+//   HX005-rc-trailer-missing hint     `exec("hexa run ...")` 후 `__RC=` 미파싱
+//   HX006-argv-slice-bare    hint     `args()[N]` 직접 인덱스
+//
+// per-line escape 어노테이션 (rule-id-suffix 일관):
+//   // @allow-banned-gte           (HX001)  + 호환: // @allow-relop-banned
+//   // @allow-bare-exec            (HX002)
+//   // @allow-silent-catch         (HX003)
+//   // @allow-awk-utf8-eq          (HX004)
+//   // @allow-rc-trailer-missing   (HX005)
+//   // @allow-argv-slice-bare      (HX006)
+//
+// per-file escape (head 30 lines): // @allow-<suffix>-file
+//
+// NDJSON 출력 (1줄/위반):
+//   {"rule":"HX001","severity":"error","loc":{"line":34,"col":15},
+//    "msg":"`>=` is banned in hexa-lang; use `<` instead","file":"..."}
+//
+// stderr meta:
+//   NEXUS_HEXA_INTROSPECT {"stage":"check","ms":N,"violations":N,"file":"..."}
+//
+// exit code:
+//   기본: 항상 0 (정보성).  `--strict` 옵션 시 위반 1+ → exit 1.
+
+// ─── 라인 분리 (newline-aware) ───────────────────────────
+fn _split_lines(src: string) -> [string] {
+    let mut lines: [string] = []
+    let n = src.len()
+    let mut start: i64 = 0
+    let mut i: i64 = 0
+    while i < n {
+        if src.substring(i, i + 1) == "\n" {
+            lines.push(src.substring(start, i))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < n { lines.push(src.substring(start, n)) }
+    else if start == n { lines.push("") }
+    return lines
+}
+
+// ─── 1라인 stripper: 문자열 → 공백, 라인 코멘트 → 잘라냄 ───
+//
+// 결과: 코드 영역만 (주석/문자열은 공백 placeholder). escape 주석 검출은
+// 원본 라인 (raw_line) 에서 직접 substring 으로 한다.
+//
+// 블록 코멘트 (`/* ... */`) 는 단일 라인 내에서만 처리 (다중 라인 블록
+// 코멘트는 본 룰셋의 false-positive 영향이 미미하여 보류).
+fn _strip_line(raw_line: string) -> string {
+    let n = raw_line.len()
+    let mut out: [string] = []
+    let mut i: i64 = 0
+    let mut in_str: bool = false
+    let mut str_delim: string = ""
+    while i < n {
+        let c = raw_line.substring(i, i + 1)
+        let c2 = if i + 1 < n { raw_line.substring(i + 1, i + 2) } else { "" }
+        if in_str {
+            if c == "\\" && i + 1 < n {
+                out.push("  ")
+                i = i + 2
+                continue
+            }
+            if c == str_delim {
+                in_str = false
+                str_delim = ""
+                out.push(c)  // 닫는 따옴표는 보존 (구문 경계)
+                i = i + 1
+                continue
+            }
+            out.push(" ")
+            i = i + 1
+            continue
+        }
+        // 코드 컨텍스트
+        if c == "/" && c2 == "/" {
+            // 라인 코멘트 — 나머지 잘라냄
+            break
+        }
+        if c == "/" && c2 == "*" {
+            // 블록 코멘트 (단일 라인) — 닫힘까지 공백
+            let mut j: i64 = i + 2
+            while j + 1 < n {
+                if raw_line.substring(j, j + 1) == "*" && raw_line.substring(j + 1, j + 2) == "/" {
+                    j = j + 2
+                    break
+                }
+                j = j + 1
+            }
+            // 잘라낸 영역 길이만큼 공백
+            let mut k = i
+            while k < j { out.push(" "); k = k + 1 }
+            i = j
+            continue
+        }
+        if c == "\"" {
+            in_str = true
+            str_delim = "\""
+            out.push(c)
+            i = i + 1
+            continue
+        }
+        out.push(c)
+        i = i + 1
+    }
+    return out.join("")
+}
+
+// ─── 1라인: 라인 코멘트만 잘라내고 문자열 보존 ───────────
+//
+// HX004 / HX005 처럼 string-literal 내부의 `==` / `hexa run` 을 감지해야
+// 하는 룰을 위해 별도 헬퍼: `//` 바깥 위치만 truncate.
+fn _strip_comment_keep_string(raw_line: string) -> string {
+    let n = raw_line.len()
+    let mut i: i64 = 0
+    let mut in_str: bool = false
+    let mut str_delim: string = ""
+    while i < n {
+        let c = raw_line.substring(i, i + 1)
+        let c2 = if i + 1 < n { raw_line.substring(i + 1, i + 2) } else { "" }
+        if in_str {
+            if c == "\\" && i + 1 < n { i = i + 2; continue }
+            if c == str_delim { in_str = false; str_delim = "" }
+            i = i + 1
+            continue
+        }
+        if c == "/" && c2 == "/" {
+            return raw_line.substring(0, i)
+        }
+        if c == "\"" {
+            in_str = true
+            str_delim = "\""
+            i = i + 1
+            continue
+        }
+        i = i + 1
+    }
+    return raw_line
+}
+
+// ─── escape 검출 (per-line) ──────────────────────────────
+fn _has_line_escape(raw_line: string, suffix: string) -> bool {
+    // 호환: HX001 은 기존 hive lint 의 `@allow-relop-banned` 도 인정
+    if raw_line.contains("@allow-" + suffix) { return true }
+    if suffix == "banned-gte" && raw_line.contains("@allow-relop-banned") { return true }
+    return false
+}
+
+// ─── escape 검출 (per-file, head 30 lines) ──────────────
+fn _has_file_escape(lines: [string], suffix: string) -> bool {
+    let nh = if lines.len() < 30 { lines.len() } else { 30 }
+    let mut i = 0
+    while i < nh {
+        let l = lines[i]
+        if l.contains("@allow-" + suffix + "-file") { return true }
+        if suffix == "banned-gte" && l.contains("@allow-relop-banned-file") { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── 위반 1건 NDJSON emit ───────────────────────────────
+fn _emit_diag(rule: string, severity: string, file: string,
+              line: i64, col: i64, msg: string) {
+    let mut sb: [string] = []
+    sb.push("{\"rule\":\"")
+    sb.push(rule)
+    sb.push("\",\"severity\":\"")
+    sb.push(severity)
+    sb.push("\",\"loc\":{\"line\":")
+    sb.push(to_string(line))
+    sb.push(",\"col\":")
+    sb.push(to_string(col))
+    sb.push("},\"msg\":\"")
+    sb.push(_json_escape(msg))
+    sb.push("\",\"file\":\"")
+    sb.push(_json_escape(file))
+    sb.push("\"}")
+    println(sb.join(""))
+}
+
+// ─── 비-ASCII 바이트 검출 (4-byte UTF-8 휴리스틱) ────────
+//
+// hexa runtime 의 string.substring(i, i+1) 는 UTF-8 문자 단위가 아닌
+// byte 단위로 동작할 수 있어 (BSD-awk 함정과 동형 위험), len 카운트를
+// codepoint 가 아니라 byte 라고 가정하고 high-bit (0x80+) 가 등장하는
+// 첫 위치를 찾는다. 발견 시 true.
+fn _has_non_ascii(line: string) -> bool {
+    let n = line.len()
+    let mut i: i64 = 0
+    while i < n {
+        let c = line.substring(i, i + 1)
+        // ASCII printable + control 만 codepoint < 128. 그 외는 multibyte 시작.
+        // hexa string compare 는 byte-aware 이므로 ASCII 7-bit set 와 다른 모든
+        // 1-byte 토큰을 non-ASCII 로 취급. 보수적이지만 awk 의 emoji/Korean
+        // 등 4-byte sequence 검출엔 충분.
+        if c != " " && c != "\t" && c != "\r" {
+            // 빠른 ASCII 화이트리스트 검사 (printable 대표 33–126 + 일부 기호)
+            let is_ascii = (
+                _is_alpha(c) || _is_digit(c)
+                || c == "!" || c == "\"" || c == "#" || c == "$" || c == "%"
+                || c == "&" || c == "'" || c == "(" || c == ")" || c == "*"
+                || c == "+" || c == "," || c == "-" || c == "." || c == "/"
+                || c == ":" || c == ";" || c == "<" || c == "=" || c == ">"
+                || c == "?" || c == "@" || c == "[" || c == "\\" || c == "]"
+                || c == "^" || c == "_" || c == "`" || c == "{" || c == "|"
+                || c == "}" || c == "~"
+            )
+            if !is_ascii { return true }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── 핵심 룰 엔진 ────────────────────────────────────────
+//
+// 입력: src (전체 파일), file (절대/상대 경로 — diagnostic loc.file)
+// 출력: i64 위반 갯수. 부수효과: stdout 으로 NDJSON 1줄/위반.
+//
+// 라인 단위 패스 + 이웃 라인 lookahead (HX005 만):
+//   1) 모든 라인을 _strip_line 으로 active code 추출
+//   2) 각 룰을 active code 위에서 substring 매칭 (HX004/HX005 는 raw)
+//   3) per-line / per-file escape 가 있으면 skip
+fn scan_violations(src: string, file: string) -> i64 {
+    let lines = _split_lines(src)
+    let nl = lines.len()
+
+    // active code (stripped) 사전 계산
+    let mut actives: [string] = []
+    let mut i: i64 = 0
+    while i < nl {
+        actives.push(_strip_line(lines[i]))
+        i = i + 1
+    }
+
+    // file-level escape 캐시
+    let f_gte    = _has_file_escape(lines, "banned-gte")
+    let f_exec   = _has_file_escape(lines, "bare-exec")
+    let f_catch  = _has_file_escape(lines, "silent-catch")
+    let f_awk    = _has_file_escape(lines, "awk-utf8-eq")
+    let f_rc     = _has_file_escape(lines, "rc-trailer-missing")
+    let f_argv   = _has_file_escape(lines, "argv-slice-bare")
+
+    let mut total: i64 = 0
+    let mut li: i64 = 0
+    while li < nl {
+        let raw = lines[li]
+        let act = actives[li]
+        let line_no = li + 1
+
+        // ─── HX001-banned-gte ───────────────────────────
+        if !f_gte && !_has_line_escape(raw, "banned-gte") {
+            // active 영역에서 `>=` 또는 `<=` 첫 위치
+            let p_gte = act.index_of(">=")
+            let p_lte = act.index_of("<=")
+            let mut p: i64 = -1
+            let mut tok = ""
+            if p_gte > -1 && (p_lte < 0 || p_gte < p_lte) {
+                p = p_gte; tok = ">="
+            } else if p_lte > -1 {
+                p = p_lte; tok = "<="
+            }
+            if p > -1 {
+                let alt = if tok == ">=" { "`>` only" } else { "`<` only" }
+                _emit_diag("HX001", "error", file, line_no, p + 1,
+                    "`" + tok + "` is banned in hexa-lang; use " + alt
+                    + " (per-line escape: `// @allow-banned-gte`)")
+                total = total + 1
+            }
+        }
+
+        // ─── HX002-bare-exec ────────────────────────────
+        // multi-line exec(...) 호출의 경우 정책 주석이 닫는 `)` 라인에 붙는
+        // 사례가 있어 (예: n6/atlas_query.hexa:126-127), exec( 위치부터
+        // 매칭 `)` 라인까지의 모든 라인 raw 에서 `@allow-bare-exec` 검색.
+        if !f_exec {
+            // 토큰 경계 검사: act 안에서 `exec(` 위치를 찾되, 직전이
+            // identifier 일부면 (예: my_exec()) skip.
+            let mut from: i64 = 0
+            let mut found_p: i64 = -1
+            while from < act.len() {
+                let p = act.substring(from, act.len()).index_of("exec(")
+                if p < 0 { break }
+                let abs = from + p
+                // 직전 char 가 ident-part 면 skip
+                let prev = if abs > 0 { act.substring(abs - 1, abs) } else { " " }
+                if !_is_ident_part(prev) {
+                    found_p = abs
+                    break
+                }
+                from = abs + 5
+            }
+            if found_p > -1 {
+                // 매칭 `)` 까지 라인 범위 결정 (단일/멀티라인). 닫힘 위치는
+                // raw 의 paren-depth 카운터로 추적 (string-aware: actives 사용).
+                let mut depth: i64 = 0
+                let mut close_line: i64 = li
+                let mut k = li
+                let mut started = false
+                while k < nl {
+                    let ak = if k == li { act } else { actives[k] }
+                    let mut idx: i64 = if k == li { found_p } else { 0 }
+                    let aklen = ak.len()
+                    while idx < aklen {
+                        let ch = ak.substring(idx, idx + 1)
+                        if ch == "(" { depth = depth + 1; started = true }
+                        else if ch == ")" {
+                            depth = depth - 1
+                            if started && depth == 0 {
+                                close_line = k
+                                idx = aklen
+                                break
+                            }
+                        }
+                        idx = idx + 1
+                    }
+                    if started && depth == 0 { break }
+                    k = k + 1
+                }
+                // 호출 영역 내 어떤 라인에라도 escape 가 있으면 ok.
+                let mut has_esc = false
+                let mut kk = li
+                while kk < close_line + 1 {
+                    if _has_line_escape(lines[kk], "bare-exec") { has_esc = true; break }
+                    kk = kk + 1
+                }
+                if !has_esc {
+                    _emit_diag("HX002", "error", file, line_no, found_p + 1,
+                        "bare `exec(...)` requires explicit policy comment "
+                        + "`// @allow-bare-exec` on this line "
+                        + "(or any line of multi-line exec call)")
+                    total = total + 1
+                }
+            }
+        }
+
+        // ─── HX003-silent-catch ─────────────────────────
+        // 패턴: `catch <ident> {}` 또는 `catch _ {}` (공백 허용)
+        // 토큰 경계: catch 앞이 ident-part 면 skip (예: re_catch).
+        if !f_catch && !_has_line_escape(raw, "silent-catch") {
+            let mut from: i64 = 0
+            let mut hit_col: i64 = -1
+            while from < act.len() {
+                let p = act.substring(from, act.len()).index_of("catch")
+                if p < 0 { break }
+                let abs = from + p
+                let prev = if abs > 0 { act.substring(abs - 1, abs) } else { " " }
+                let after = if abs + 5 < act.len() { act.substring(abs + 5, abs + 6) } else { " " }
+                if !_is_ident_part(prev) && !_is_ident_part(after) {
+                    // catch 직후 공백 + ident + 공백 + {} 패턴 매칭
+                    let mut q: i64 = abs + 5
+                    // skip ws
+                    while q < act.len() && _is_ws(act.substring(q, q + 1)) { q = q + 1 }
+                    // ident 또는 _
+                    let mut id_end = q
+                    while id_end < act.len() && _is_ident_part(act.substring(id_end, id_end + 1)) {
+                        id_end = id_end + 1
+                    }
+                    if id_end > q {
+                        let mut r: i64 = id_end
+                        while r < act.len() && _is_ws(act.substring(r, r + 1)) { r = r + 1 }
+                        if r < act.len() && act.substring(r, r + 1) == "{" {
+                            // {} 사이는 공백만? (단일 라인 빈 catch)
+                            let mut s: i64 = r + 1
+                            while s < act.len() && _is_ws(act.substring(s, s + 1)) { s = s + 1 }
+                            if s < act.len() && act.substring(s, s + 1) == "}" {
+                                hit_col = abs + 1
+                                break
+                            }
+                        }
+                    }
+                }
+                from = abs + 5
+            }
+            if hit_col > -1 {
+                _emit_diag("HX003", "warning", file, line_no, hit_col,
+                    "empty `catch e {}` swallows error silently; "
+                    + "add explicit handler or per-line escape "
+                    + "`// @allow-silent-catch`")
+                total = total + 1
+            }
+        }
+
+        // ─── HX004-awk-utf8-eq ──────────────────────────
+        // 휴리스틱: 라인의 *코멘트 외부* 영역에 `==` + non-ASCII 바이트 +
+        // 인접 ±10 라인 안에 `awk` 토큰 등장 시 경고. 한국어 코멘트의
+        // 단순 인용 (// awk default FS: $2 == ...) 은 false positive 이므로
+        // raw 가 아닌 _strip_comment_keep_string 결과로 검사.
+        if !f_awk && !_has_line_escape(raw, "awk-utf8-eq") {
+            let nc = _strip_comment_keep_string(raw)
+            if nc.contains("==") && _has_non_ascii(nc) {
+                // 인접 ±10 라인 awk 검사 (current 포함)
+                let lo = if li > 10 { li - 10 } else { 0 }
+                let hi = if li + 10 < nl { li + 10 } else { nl - 1 }
+                let mut k = lo
+                let mut awk_seen = false
+                while k < hi + 1 {
+                    // awk 토큰 자체도 코멘트 외부에서만 인정
+                    let nck = _strip_comment_keep_string(lines[k])
+                    if nck.contains("awk") {
+                        awk_seen = true
+                        break
+                    }
+                    k = k + 1
+                }
+                if awk_seen {
+                    let p_eq = nc.index_of("==")
+                    _emit_diag("HX004", "warning", file, line_no, p_eq + 1,
+                        "BSD awk collapses 4-byte UTF-8 `==` comparisons "
+                        + "to 0; use `streq(a,b) = length(a)==length(b) "
+                        + "&& index(a,b)==1` helper instead "
+                        + "(per-line escape: `// @allow-awk-utf8-eq`)")
+                    total = total + 1
+                }
+            }
+        }
+
+        // ─── HX005-rc-trailer-missing ───────────────────
+        // raw 안에 `exec(` AND `hexa run` (string literal) → 동일 함수 / 동일
+        // 5-라인 lookahead 안에 `__RC=` 부재 시 hint. 함수 경계는 column-1 의
+        // `}` 또는 새 top-level decl (`fn` / `pub fn` 시작) 으로 판정하여
+        // 인접 ok-케이스 함수의 `__RC=` 가 false-negative 를 만들지 않게 함.
+        // 또한 self-line 에 `__RC=` 가 같이 있으면 ok (compound exec).
+        if !f_rc && !_has_line_escape(raw, "rc-trailer-missing") {
+            let ncr = _strip_comment_keep_string(raw)
+            if ncr.contains("exec(") && ncr.contains("hexa run") {  // @allow-rc-trailer-missing
+                let hi = if li + 5 < nl { li + 5 } else { nl - 1 }
+                let mut k = li
+                let mut rc_seen = false
+                while k < hi + 1 {
+                    let lk = lines[k]
+                    if lk.contains("__RC=") {
+                        rc_seen = true
+                        break
+                    }
+                    // 함수 경계: column-1 `}` (보존: `}` 시작 직후 line)
+                    // 또는 새 fn/struct 등의 top-level decl 시작.
+                    if k > li {
+                        let trimmed = lk.trim()
+                        let starts_close = lk.len() > 0 && lk.substring(0, 1) == "}"
+                        let starts_fn = trimmed.index_of("fn ") == 0
+                            || trimmed.index_of("pub fn ") == 0
+                        if starts_close || starts_fn { break }
+                    }
+                    k = k + 1
+                }
+                if !rc_seen {
+                    let p_ex = ncr.index_of("exec(")
+                    _emit_diag("HX005", "hint", file, line_no, p_ex + 1,
+                        "`exec(\"hexa run ...\")` without `__RC=$?` "
+                        + "trailer parse — child exit code is lost; "
+                        + "append `; echo \"__RC=$?\"` and parse "
+                        + "(per-line escape: `// @allow-rc-trailer-missing`)")
+                    total = total + 1
+                }
+            }
+        }
+
+        // ─── HX006-argv-slice-bare ──────────────────────
+        // active 안에 `args()[` 토큰 시퀀스. 단순 `args()` 호출 후 변수
+        // 저장은 OK — `args()` 직후 `[` 만 패턴.
+        if !f_argv && !_has_line_escape(raw, "argv-slice-bare") {
+            let p_a = act.index_of("args()[")
+            if p_a > -1 {
+                _emit_diag("HX006", "hint", file, line_no, p_a + 1,
+                    "`args()[N]` direct index — store `let a = args()` "
+                    + "first then index `a[N]` (HEXA_LOCAL=1 shape: "
+                    + "[exe, exe, user_arg_1, ...] — user args at a[2]+) "
+                    + "(per-line escape: `// @allow-argv-slice-bare`)")
+                total = total + 1
+            }
+        }
+
+        li = li + 1
+    }
+    return total
+}
+
+// ─── usage / entry ───
+fn _usage() {
+    eprintln("usage: hexa run tooling/hexa-introspect/hexa_introspect.hexa <mode> <file.hexa>")
+    eprintln("modes:")
+    eprintln("  --ast               emit Program AST JSON (Phase 1 spec § 2.1)")
+    eprintln("  --symbols           emit Symbol array JSON (Phase 1 spec § 2.2)")
+    eprintln("  --check             emit lint NDJSON (Phase 2 spec § 2.3, 6 rules)")
+    eprintln("  --check --strict    same, exit 1 if any violation")
+    eprintln("  --refs <file.hexa> <symbol>          emit NDJSON refs (Phase 3 spec § 2.4)")
+    eprintln("  --hover <file.hexa> <line>:<col>     emit single hover JSON (Phase 3 spec § 2.5)")
+    eprintln("  --diff <a.hexa> <b.hexa>             emit symbol-table hash diff NDJSON (Phase 5a; delegates to diff.hexa)")
+    eprintln("exit: 0=ok (or violations w/o --strict), 1=invalid-args/strict-violations, 2=file-unreadable")
+}
+
+let a = args()
+// args shape: [exe, exe, mode, file, [opts...]]  (HEXA_LOCAL=1) — hexa-rules R6
+if len(a) < 4 {
+    _usage()
+    exit(1)  // @allow-silent-exit
+}
+
+let mode = a[2]
+
+if mode != "--ast" && mode != "--symbols" && mode != "--check"
+    && mode != "--refs" && mode != "--hover" && mode != "--diff" {
+    _usage()
+    exit(1)  // @allow-silent-exit
+}
+
+// `--diff` dispatch — delegates to sibling `diff.hexa` (Phase 5a SSOT).
+// 본 wrapper 는 dispatch 만 — 알고리즘은 diff.hexa 가 단독 보유.
+if mode == "--diff" {
+    if len(a) < 5 {
+        _usage()
+        exit(1)  // @allow-silent-exit
+    }
+    let a_path = a[3]
+    let b_path = a[4]
+    let mut diff_path = "tooling/hexa-introspect/diff.hexa"
+    let exists = to_string(exec("test -f '" + diff_path.replace("'", "'\\''")
+        + "' && printf yes || printf no")).trim()  // @allow-bare-exec
+    if exists != "yes" {
+        let top = to_string(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()  // @allow-bare-exec
+        if top.len() > 0 { diff_path = top + "/tooling/hexa-introspect/diff.hexa" }
+    }
+    let hb = to_string(exec("printf '%s' \"${HEXA_BIN:-$HOME/.hx/bin/hexa}\"")).trim()  // @allow-bare-exec
+    let cmd = "HEXA_LOCAL=1 HEXA_NO_SENTINEL=1 '"
+        + hb.replace("'", "'\\''") + "' run '"
+        + diff_path.replace("'", "'\\''") + "' --diff '"
+        + a_path.replace("'", "'\\''") + "' '"
+        + b_path.replace("'", "'\\''") + "'; echo \"__RC=$?\""
+    let out = to_string(exec(cmd))  // @allow-bare-exec
+    let rc_at = out.index_of("__RC=")
+    let mut rc: i64 = 1
+    if rc_at > -1 {
+        let tail = out.substring(rc_at + 5, out.len()).trim()
+        try { rc = to_int(tail) } catch e {}  // @allow-silent-catch
+    }
+    let payload = if rc_at > -1 { out.substring(0, rc_at) } else { out }
+    print(payload)
+    exit(rc)  // @allow-silent-exit
+}
+
+// `--check` 는 file 위치가 동일하지만 그 뒤로 `--strict` 또는 vice-versa.
+// 받아들이는 형식:
+//   --check <file.hexa>
+//   --check <file.hexa> --strict
+//   --check --strict <file.hexa>
+let mut file = ""
+let mut strict: bool = false
+if mode == "--check" {
+    let mut k: i64 = 3
+    while k < len(a) {
+        let tok = a[k]
+        if tok == "--strict" { strict = true }
+        else if file == "" { file = tok }
+        k = k + 1
+    }
+    if file == "" {
+        _usage()
+        exit(1)  // @allow-silent-exit
+    }
+} else {
+    file = a[3]
+}
+
+// 파일 읽기 — 실패 시 exit 2.
+// hexa runtime: `read_file` 가 누락 파일에 대해 throw 하지 않고 ""를 반환하는
+// 케이스가 있어 (atlas_query.hexa § _bucket_csv 패턴) shell-precheck 로 가드.
+let exists_chk = to_string(exec("test -f '" + file.replace("'", "'\\''") + "' && printf yes || printf no")).trim()  // @allow-bare-exec
+if exists_chk != "yes" {
+    eprintln("hexa-introspect: file not found or not regular file: " + file)
+    exit(2)  // @allow-silent-exit
+}
+let mut src = ""
+try {
+    src = read_file(file)
+} catch e {
+    eprintln("hexa-introspect: cannot read file: " + file)
+    eprintln("  reason: " + to_string(e))
+    exit(2)  // @allow-silent-exit
+}
+
+if mode == "--check" {
+    let t0c = _ns_now()
+    let nv = scan_violations(src, file)
+    let t1c = _ns_now()
+    let msc = (t1c - t0c) / 1000000
+    // stderr meta
+    let mut m: [string] = []
+    m.push(_NS)
+    m.push(" {\"stage\":\"check\",\"ms\":")
+    m.push(to_string(msc))
+    m.push(",\"violations\":")
+    m.push(to_string(nv))
+    m.push(",\"file\":\"")
+    m.push(_json_escape(file))
+    m.push("\"}")
+    eprintln(m.join(""))
+    if strict && nv > 0 {
+        exit(1)  // @allow-silent-exit
+    }
+    exit(0)  // @allow-silent-exit
+}
+
+let t0 = _ns_now()
+let decls = scan_decls(src)
+let t1 = _ns_now()
+let ms = (t1 - t0) / 1000000
+
+if mode == "--ast" {
+    println(decls_to_ast(file, decls))
+    _emit_meta("complete", ms, decls.len(), file)
+} else if mode == "--symbols" {
+    println(decls_to_symbols(file, decls))
+    _emit_meta("complete", ms, decls.len(), file)
+} else if mode == "--refs" {
+    if len(a) < 5 {
+        eprintln("hexa-introspect: --refs requires <symbol>"); _usage(); exit(1)  // @allow-silent-exit
+    }
+    let target = a[4]
+    let refs = scan_refs(src, target)
+    let t2 = _ns_now()
+    let out = refs_to_ndjson(file, refs)
+    if out.len() > 0 { print(out) }   // NDJSON: trailing \n included per line
+    _emit_meta("refs", (t2 - t0) / 1000000, refs.len(), file)
+} else if mode == "--hover" {
+    if len(a) < 5 {
+        eprintln("hexa-introspect: --hover requires <line>:<col>"); _usage(); exit(1)  // @allow-silent-exit
+    }
+    let lc = a[4]
+    let parts = lc.split(":")
+    if parts.len() < 2 {
+        eprintln("hexa-introspect: --hover expects <line>:<col>"); _usage(); exit(1)  // @allow-silent-exit
+    }
+    let mut hl: i64 = 0
+    let mut hc: i64 = 0
+    try { hl = to_int(parts[0]) } catch e {}  // @allow-silent-catch
+    try { hc = to_int(parts[1]) } catch e2 {}  // @allow-silent-catch
+    let line_starts = _build_line_starts(src)
+    let mut tok = pick_token_at(src, line_starts, hl, hc)
+    // 토큰이 decl 키워드 (fn/let/pub/struct/...) 면 같은 라인에서 첫 비-키워드 식별자로 fallback.
+    if to_string(tok.name).len() > 0 && _is_decl_kw(to_string(tok.name)) {
+        let row = _line_text(src, line_starts, hl)
+        let rn = row.len()
+        let mut p: i64 = 0
+        let mut found_name = ""
+        let mut found_col: i64 = 0
+        while p < rn {
+            let ch = row.substring(p, p + 1)
+            if _is_alpha(ch) {
+                let q0 = p
+                while p < rn && _is_ident_part(row.substring(p, p + 1)) { p = p + 1 }
+                let w = row.substring(q0, p)
+                if _is_decl_kw(w) == false { found_name = w; found_col = q0 + 1; break }
+            } else { p = p + 1 }
+        }
+        if found_name.len() > 0 {
+            tok = #{ "name": found_name, "start_line": hl, "start_col": found_col,
+                     "end_line": hl, "end_col": found_col + found_name.len() }
+        }
+    }
+    let mut hit = #{ "name":"", "kind":"", "start_line":0, "start_col":0,
+                     "end_line":0, "end_col":0, "typ":"", "sig":"",
+                     "visibility":"priv", "doc":"" }
+    if to_string(tok.name).len() > 0 {
+        let mut k = 0
+        while k < decls.len() {
+            if to_string(decls[k].name) == to_string(tok.name) { hit = decls[k]; break }
+            k = k + 1
+        }
+    }
+    println(hover_to_json(file, hit))
+    let hits = if to_string(hit.name).len() > 0 { 1 } else { 0 }
+    _emit_meta("hover", (_ns_now() - t0) / 1000000, hits, file)
+}

@@ -1,0 +1,1515 @@
+// ═══════════════════════════════════════════════════════════
+// tooling/hexa-introspect/gumtree.hexa
+//   — hexa-introspect Phase 5c: GumTree tree-edit distance + advanced refactor
+//
+// 갭 카탈로그: hexa-ast-diff-semantic-refactor (5c, 2026-05-06)
+// spec: design/hexa_ast_diff_refactor_spec.md
+//   § 8.2 (5c 후속: extract/inline/move),
+//   § 9.1 (5c 백로그: GumTree 알고리즘),
+//   § 10.1 (Semantic merge — 5c 의 자매 후속)
+//
+// 배경:
+//   5a `diff.hexa` (952줄, symbol-table hash diff, single-file) +
+//   5b `refactor.hexa` (~990줄, --diff-rename/--diff-sig/--apply --dry-run/
+//   --emit-edit --format=lsp) 까지로 symbol 단위 변경 분류와 호출처 자동
+//   갱신은 가능. 그러나 spec § 8.2 의 4 advanced refactor (Extract/Inline/
+//   Move/Type widening) 와 § 9.1 의 GumTree (Falleri et al. 2014) 기반
+//   tree-edit distance 는 모두 5c 백로그였다.
+//
+//   본 모듈은 5c 의 4 모드를 추가:
+//     ① --diff-tree <a.hexa> <b.hexa>          — GumTree top-down + bottom-up
+//                                                (5a symbol-hash 보다 정밀, fn
+//                                                 본문 변경의 sub-symbol 단위
+//                                                 매칭/insert/delete/update/move)
+//     ② --extract <file> <sl> <el> <new_fn>    — line range → 새 fn 추출
+//                                                (자유변수 = identifier scan,
+//                                                 advanced = capture/escape 추적)
+//     ③ --inline <file> <fn>                   — fn 본문을 호출처에 삽입,
+//                                                fn 정의 삭제 plan
+//     ④ --move <fn> <a.hexa> <b.hexa>          — fn 을 다른 파일로 이동 +
+//                                                호출처 import 갱신 plan
+//
+//   본 파일은 **신규 entry-point** (5a/5b 와 분리, 충돌 회피).
+//   ② / ③ / ④ 는 5a `diff.hexa` 의 헬퍼와 같은 root-level subprocess 호출
+//   (`hexa-introspect --symbols`) 를 사용. dispatch 통합은 별도 patch md
+//   (Phase 3 머지 후) 로 분리.
+//
+// 설계 (구현 vs 설계 표시):
+//
+//   ① --diff-tree:  **구현 완료**
+//     - tree 표현: 각 .hexa 파일 → root(file) → top-level decls (fn/let/struct/
+//       enum/const) → fn 의 경우 body 의 statement-line 을 children 으로.
+//     - statement type: "return"|"let"|"const"|"if"|"while"|"match"|"try"|
+//       "for"|"break"|"continue"|"call"|"comment"|"block_open"|"block_close"|
+//       "expr". (line-prefix 휴리스틱.)
+//     - GumTree top-down: type+hash 동일 노드 + 부분트리 height ≥ 2 우선 매칭.
+//     - GumTree bottom-up: 매칭 안 된 노드 사이의 dice coefficient
+//       = 2|matched_descendants| / (|desc_a| + |desc_b|). dice ≥ 0.50 이면 매칭.
+//     - emit NDJSON: {action:"match"|"insert"|"delete"|"update"|"move",
+//                     a_id, b_id, type, label_old, label_new, line_a, line_b}
+//     - 시간 복잡도: 두 패스 모두 O(N×M) worst (best-effort). atlas 5 모듈
+//       (decl ~30, sub-stmt ~300) 에서 충분히 < 5s.
+//
+//   ② --extract:  **부분 구현**
+//     - 입력 line range 로부터 enclosing fn 식별 (--symbols 의 loc/end_loc 비교).
+//     - 추출 대상 = src[sl..el] 의 normalized text.
+//     - 자유변수 = 추출 영역의 identifier 토큰 - 추출 영역에서 새로 선언된
+//       이름 (let/const/mut). **단순 token-set 차분** — 진짜 scope 추적은 미구현.
+//     - emit plan NDJSON:
+//         {plan:"extract_def",  fn:<new_fn>, params:[<free_vars>], body:<...>}
+//         {plan:"extract_call", file:<f>, sl:<sl>, el:<el>,
+//                                args:[<free_vars>], replace_with:"<new_fn>(...)"}
+//     - 한계 (advanced): closure capture 분석, return type 추론, 다중 return-
+//       path 분기, mut 인자/borrow 시맨틱 → spec § 8.2 위험도 "medium" 그대로.
+//
+//   ③ --inline:  **부분 구현**
+//     - 대상 fn body 를 --symbols + 본 모듈의 _slice_lines 로 추출.
+//     - body 의 `return X` → `X` (마지막 한 표현식만), 그 외는 그대로 inline.
+//     - 호출처 검색: regex `<fn>\s*\(` 로 lexical scan (단일 파일).
+//     - 인자 substitution: param 이름 (sig 파싱) → 실제 호출 인자 1:1.
+//       **lexical 치환** — name shadowing 회피 안 됨, side-effect 인자도 그대로
+//       eager 평가 가정. 진짜 inline 은 alpha-rename + let-binding 도입 필요.
+//     - emit plan NDJSON:
+//         {plan:"inline_call", file:<f>, line:<L>, replace_with:<inlined>}
+//         {plan:"inline_remove_def", file:<f>, sl:<sl>, el:<el>, fn:<name>}
+//
+//   ④ --move:  **구현 (호출처 import 갱신 = 설계 only)**
+//     - 대상 fn 을 a 에서 추출 (--symbols + slice).
+//     - emit plan NDJSON:
+//         {plan:"move_remove", file:<a>, sl:<sl>, el:<el>, fn:<name>}
+//         {plan:"move_insert", file:<b>, at_eof:true, content:<fn_text>}
+//     - import 갱신: 호출처를 grep 으로 식별만 — 실제 use/import 문 추가는
+//       hexa 의 모듈 시스템이 path 기반 (use ./atlas/lookup) 이므로 호출처
+//       파일 상단의 use 라인 패치는 spec § 4.2 (5b) 의 workspace edit 으로
+//       위임 (본 모듈은 reference-list 만 emit).
+//
+// 인터페이스:
+//   $ hexa run tooling/hexa-introspect/gumtree.hexa --diff-tree <a.hexa> <b.hexa>
+//   $ hexa run tooling/hexa-introspect/gumtree.hexa --extract <file.hexa> <sl> <el> <new_fn>
+//   $ hexa run tooling/hexa-introspect/gumtree.hexa --inline <file.hexa> <fn>
+//   $ hexa run tooling/hexa-introspect/gumtree.hexa --move <fn> <a.hexa> <b.hexa>
+//
+// stdout: NDJSON (1 line per node-action 또는 plan)
+// stderr: NDJSON 메타 (NEXUS_HEXA_INTROSPECT { stage:"<mode>", ms, ... })
+// exit:
+//   0  성공 (plan emit 만, 적용 X)
+//   1  파싱/subprocess 실패
+//   2  인자 오류
+//
+// 규칙: hexa >=/<= 금지 — < / > 만. stdlib only. shasum/FNV-1a 폴백 패턴 동일.
+// 편집 금지: hexa-lang/, n6/, design/ (본 spec 갱신은 별도 단계),
+//             mk2_hexa/, docs/, tooling/hexa-introspect/{hexa_introspect.hexa,
+//             diff.hexa, refactor.hexa, bin/}.
+// ═══════════════════════════════════════════════════════════
+
+let _NS = "NEXUS_HEXA_INTROSPECT"
+let _DICE_MATCH_PCT: i64 = 50          // 0.50 × 100 (정수산) — bottom-up dice 임계값
+// MIN_HEIGHT 임계값은 GumTree 의 top-down 단계 ambiguity 회피용이지만, 본
+// 구현의 hash 가 type+name+sig+body 4-키 합성이라 leaf 수준에서도 안전 매칭
+// 가능 → 임계값 1 (모든 노드) 사용. 별도 상수 도입 없음.
+
+// ─── ns clock (BSD/GNU 양립) ───
+fn _ns_now() -> i64 {
+    let mut r: i64 = 0
+    let raw = to_string(exec("date +%s%N 2>/dev/null")).trim()  // @allow-bare-exec
+    if raw.len() > 0 && raw.contains("N") == false {
+        try { r = to_int(raw) } catch e {}  // @allow-silent-catch
+    }
+    if r < 1 {
+        let s2 = to_string(exec("python3 -c 'import time;print(time.time_ns())' 2>/dev/null")).trim()  // @allow-bare-exec
+        try { r = to_int(s2) } catch e2 {}  // @allow-silent-catch
+    }
+    if r < 1 {
+        let s3 = to_string(exec("date +%s")).trim()  // @allow-bare-exec
+        try { let sec = to_int(s3); r = sec * 1000000000 } catch e3 {}  // @allow-silent-catch
+    }
+    return r
+}
+
+// ─── shell-arg single-quote escape ───
+fn _shq(s: string) -> string {
+    return s.replace("'", "'\\''")
+}
+
+// ─── JSON string escape ───
+fn _json_escape(s: string) -> string {
+    let n = s.len()
+    let mut out: [string] = []
+    let mut i: i64 = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "\"" { out.push("\\\"") }
+        else if c == "\\" { out.push("\\\\") }
+        else if c == "\n" { out.push("\\n") }
+        else if c == "\r" { out.push("\\r") }
+        else if c == "\t" { out.push("\\t") }
+        else if c == "\u{0008}" { out.push("\\b") }
+        else if c == "\u{000C}" { out.push("\\f") }
+        else { out.push(c) }
+        i = i + 1
+    }
+    return out.join("")
+}
+
+// ─── identifier helpers ───
+fn _is_alpha(c: string) -> bool {
+    return (c == "a" || c == "b" || c == "c" || c == "d" || c == "e"
+        || c == "f" || c == "g" || c == "h" || c == "i" || c == "j"
+        || c == "k" || c == "l" || c == "m" || c == "n" || c == "o"
+        || c == "p" || c == "q" || c == "r" || c == "s" || c == "t"
+        || c == "u" || c == "v" || c == "w" || c == "x" || c == "y" || c == "z"
+        || c == "A" || c == "B" || c == "C" || c == "D" || c == "E"
+        || c == "F" || c == "G" || c == "H" || c == "I" || c == "J"
+        || c == "K" || c == "L" || c == "M" || c == "N" || c == "O"
+        || c == "P" || c == "Q" || c == "R" || c == "S" || c == "T"
+        || c == "U" || c == "V" || c == "W" || c == "X" || c == "Y" || c == "Z"
+        || c == "_")
+}
+fn _is_digit(c: string) -> bool {
+    return (c == "0" || c == "1" || c == "2" || c == "3" || c == "4"
+        || c == "5" || c == "6" || c == "7" || c == "8" || c == "9")
+}
+fn _is_ident(c: string) -> bool { return _is_alpha(c) || _is_digit(c) }
+
+// ─── self_dir 결정 (bin shim 위치에서 hexa_introspect.hexa 찾기) ───
+fn _resolve_introspect_path() -> string {
+    let env_path = to_string(exec("printf '%s' \"${NEXUS_HEXA_INTROSPECT_PATH:-}\"")).trim()  // @allow-bare-exec
+    if env_path.len() > 0 { return env_path }
+    let cand = "tooling/hexa-introspect/hexa_introspect.hexa"
+    let exists = to_string(exec("test -f '" + _shq(cand) + "' && printf yes || printf no")).trim()  // @allow-bare-exec
+    if exists == "yes" { return cand }
+    let top = to_string(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()  // @allow-bare-exec
+    if top.len() > 0 {
+        let abs = top + "/tooling/hexa-introspect/hexa_introspect.hexa"
+        let ex2 = to_string(exec("test -f '" + _shq(abs) + "' && printf yes || printf no")).trim()  // @allow-bare-exec
+        if ex2 == "yes" { return abs }
+    }
+    return cand
+}
+
+// ─── --symbols subprocess ───
+fn _run_symbols(path: string) -> string {
+    let isp = _resolve_introspect_path()
+    let hb = to_string(exec("printf '%s' \"${HEXA_BIN:-$HOME/.hx/bin/hexa}\"")).trim()  // @allow-bare-exec
+    let cmd = "HEXA_LOCAL=1 HEXA_NO_SENTINEL=1 '" + _shq(hb) + "' run '" + _shq(isp)
+        + "' --symbols '" + _shq(path) + "' 2>/dev/null"
+    return to_string(exec(cmd))  // @allow-bare-exec
+}
+
+// ─── JSON array record splitter (diff.hexa 와 동일 패턴) ───
+fn _split_json_array_records(json: string) -> [string] {
+    let trimmed = json.trim()
+    if trimmed.len() < 2 { return [] }
+    let mut out: [string] = []
+    let n = trimmed.len()
+    let mut i: i64 = 0
+    let mut depth: i64 = 0
+    let mut in_str: bool = false
+    let mut start: i64 = -1
+    while i < n {
+        let c = trimmed.substring(i, i + 1)
+        if in_str {
+            if c == "\\" && i + 1 < n { i = i + 2; continue }
+            if c == "\"" { in_str = false }
+            i = i + 1
+            continue
+        }
+        if c == "\"" { in_str = true; i = i + 1; continue }
+        if c == "{" {
+            if depth == 0 { start = i }
+            depth = depth + 1
+        } else if c == "}" {
+            depth = depth - 1
+            if depth == 0 && start > -1 {
+                out.push(trimmed.substring(start, i + 1))
+                start = -1
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _record_field(rec: string, key: string) -> string {
+    let marker = "\"" + key + "\":"
+    let p = rec.index_of(marker)
+    if p < 0 { return "" }
+    let after = rec.substring(p + marker.len(), rec.len())
+    let mut i: i64 = 0
+    let n = after.len()
+    while i < n {
+        let c = after.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" { i = i + 1 }
+        else { break }
+    }
+    if i > n - 1 { return "" }
+    let first = after.substring(i, i + 1)
+    if first == "\"" {
+        let mut j: i64 = i + 1
+        let mut buf: [string] = []
+        while j < n {
+            let cc = after.substring(j, j + 1)
+            if cc == "\\" && j + 1 < n {
+                let nn = after.substring(j + 1, j + 2)
+                if nn == "n" { buf.push("\n") }
+                else if nn == "t" { buf.push("\t") }
+                else if nn == "r" { buf.push("\r") }
+                else if nn == "\"" { buf.push("\"") }
+                else if nn == "\\" { buf.push("\\") }
+                else { buf.push(nn) }
+                j = j + 2
+                continue
+            }
+            if cc == "\"" { break }
+            buf.push(cc)
+            j = j + 1
+        }
+        return buf.join("")
+    }
+    if first == "n" { return "" }
+    let mut j: i64 = i
+    let mut depth: i64 = 0
+    let mut in_str = false
+    while j < n {
+        let cc = after.substring(j, j + 1)
+        if in_str {
+            if cc == "\\" && j + 1 < n { j = j + 2; continue }
+            if cc == "\"" { in_str = false }
+            j = j + 1
+            continue
+        }
+        if cc == "\"" { in_str = true; j = j + 1; continue }
+        if cc == "{" || cc == "[" { depth = depth + 1 }
+        else if cc == "}" || cc == "]" {
+            if depth == 0 { break }
+            depth = depth - 1
+        } else if cc == "," && depth == 0 { break }
+        j = j + 1
+    }
+    return after.substring(i, j).trim()
+}
+
+fn _record_int_field(rec: string, parent_key: string, sub_key: string) -> i64 {
+    let marker = "\"" + parent_key + "\":"
+    let p = rec.index_of(marker)
+    if p < 0 { return 0 }
+    let after = rec.substring(p + marker.len(), rec.len())
+    let n = after.len()
+    let mut i: i64 = 0
+    while i < n {
+        let c = after.substring(i, i + 1)
+        if c == " " || c == "\t" { i = i + 1 } else { break }
+    }
+    if i > n - 1 || after.substring(i, i + 1) != "{" { return 0 }
+    let mut depth = 0
+    let mut end_i: i64 = i
+    let mut in_str = false
+    let mut k = i
+    while k < n {
+        let cc = after.substring(k, k + 1)
+        if in_str {
+            if cc == "\\" && k + 1 < n { k = k + 2; continue }
+            if cc == "\"" { in_str = false }
+            k = k + 1
+            continue
+        }
+        if cc == "\"" { in_str = true; k = k + 1; continue }
+        if cc == "{" { depth = depth + 1 }
+        else if cc == "}" {
+            depth = depth - 1
+            if depth == 0 { end_i = k + 1; break }
+        }
+        k = k + 1
+    }
+    let inner = after.substring(i, end_i)
+    let sub_marker = "\"" + sub_key + "\":"
+    let sp = inner.index_of(sub_marker)
+    if sp < 0 { return 0 }
+    let rest = inner.substring(sp + sub_marker.len(), inner.len())
+    let rn = rest.len()
+    let mut a: i64 = 0
+    while a < rn {
+        let cc = rest.substring(a, a + 1)
+        if cc == " " || cc == "\t" { a = a + 1 } else { break }
+    }
+    let mut b = a
+    while b < rn {
+        let cc = rest.substring(b, b + 1)
+        if cc == "," || cc == "}" { break }
+        b = b + 1
+    }
+    let raw = rest.substring(a, b).trim()
+    let mut v: i64 = 0
+    try { v = to_int(raw) } catch e {}  // @allow-silent-catch
+    return v
+}
+
+// ─── source slice [sl..el] (1-based, inclusive) ───
+fn _slice_lines(src: string, sl: i64, el: i64) -> string {
+    let n = src.len()
+    let mut line: i64 = 1
+    let mut i: i64 = 0
+    let mut out_start: i64 = -1
+    let mut out_end: i64 = n
+    while i < n {
+        if line == sl && out_start < 0 { out_start = i }
+        if line == el + 1 { out_end = i; break }
+        if src.substring(i, i + 1) == "\n" { line = line + 1 }
+        i = i + 1
+    }
+    if out_start < 0 { return "" }
+    return src.substring(out_start, out_end)
+}
+
+// ─── body normalize (주석/whitespace strip, diff.hexa 와 동일 룰) ───
+fn _normalize_body(s: string) -> string {
+    let n = s.len()
+    let mut out: [string] = []
+    let mut i: i64 = 0
+    let mut in_str = false
+    let mut str_delim = ""
+    let mut prev_was_space = false
+    while i < n {
+        let c = s.substring(i, i + 1)
+        let c2 = if i + 1 < n { s.substring(i + 1, i + 2) } else { "" }
+        if in_str {
+            if c == "\\" && i + 1 < n {
+                out.push(c); out.push(c2); i = i + 2
+                prev_was_space = false; continue
+            }
+            if c == str_delim {
+                in_str = false; out.push(c); str_delim = ""; i = i + 1
+                prev_was_space = false; continue
+            }
+            out.push(c); i = i + 1; prev_was_space = false; continue
+        }
+        if c == "/" && c2 == "/" {
+            let mut j = i + 2
+            while j < n && s.substring(j, j + 1) != "\n" { j = j + 1 }
+            i = j; continue
+        }
+        if c == "/" && c2 == "*" {
+            let mut j = i + 2
+            while j + 1 < n {
+                if s.substring(j, j + 1) == "*" && s.substring(j + 1, j + 2) == "/" {
+                    j = j + 2; break
+                }
+                j = j + 1
+            }
+            i = j; continue
+        }
+        if c == "\"" {
+            in_str = true; str_delim = "\""; out.push(c); i = i + 1
+            prev_was_space = false; continue
+        }
+        if c == " " || c == "\t" || c == "\r" || c == "\n" {
+            if !prev_was_space { out.push(" "); prev_was_space = true }
+            i = i + 1; continue
+        }
+        out.push(c); prev_was_space = false; i = i + 1
+    }
+    return out.join("").trim()
+}
+
+// ─── hash: shasum 우선, FNV-1a 폴백 ───
+fn _hash_str(s: string) -> string {
+    if s.len() < 1 { return "0000000000000000" }
+    let tmp = "/tmp/hexa_gumtree_" + to_string(_ns_now()) + ".txt"
+    let mut wrote = false
+    try { write_file(tmp, s); wrote = true } catch e {}  // @allow-silent-catch
+    if wrote {
+        let raw = to_string(exec("shasum -a 1 < '" + _shq(tmp) + "' 2>/dev/null | awk '{print $1}'")).trim()  // @allow-bare-exec
+        try { let _ = exec("rm -f '" + _shq(tmp) + "'") } catch e2 {}  // @allow-silent-catch @allow-bare-exec @allow-rc-trailer-missing
+        if raw.len() > 15 { return raw.substring(0, 16) }
+    }
+    // FNV-1a 32-bit 폴백
+    let mut h: i64 = 2166136261
+    let nb = s.len()
+    let mut i: i64 = 0
+    while i < nb {
+        let c = s.substring(i, i + 1)
+        let ov = _ord_byte(c)
+        h = h ^ ov
+        h = (h * 16777619)
+        h = h & 4294967295
+        i = i + 1
+    }
+    return _to_hex8(h)
+}
+fn _ord_byte(c: string) -> i64 {
+    if c.len() < 1 { return 0 }
+    let alphas = "abcdefghijklmnopqrstuvwxyz"
+    let upcase = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    let digits = "0123456789"
+    let symbol = " !\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
+    let pa = alphas.index_of(c)
+    if pa > -1 { return 97 + pa }
+    let pu = upcase.index_of(c)
+    if pu > -1 { return 65 + pu }
+    let pd = digits.index_of(c)
+    if pd > -1 { return 48 + pd }
+    let ps = symbol.index_of(c)
+    if ps > -1 { return 32 + ps }
+    if c == "\n" { return 10 }
+    if c == "\t" { return 9 }
+    if c == "\r" { return 13 }
+    return 0
+}
+fn _to_hex8(n: i64) -> string {
+    let hexd = "0123456789abcdef"
+    let mut out: [string] = []
+    let mut k = 7
+    while k > -1 {
+        let nibble = (n / _pow16(k)) & 15
+        out.push(hexd.substring(nibble, nibble + 1))
+        k = k - 1
+    }
+    return out.join("")
+}
+fn _pow16(p: i64) -> i64 {
+    let mut r: i64 = 1
+    let mut i = 0
+    while i < p { r = r * 16; i = i + 1 }
+    return r
+}
+
+// ─── identifier 토큰 추출 (free-var 분석 / sub-stmt 휴리스틱) ───
+fn _tokens_of(s: string) -> [string] {
+    let mut out: [string] = []
+    let n = s.len()
+    let mut i: i64 = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if _is_alpha(c) {
+            let st = i
+            while i < n && _is_ident(s.substring(i, i + 1)) { i = i + 1 }
+            out.push(s.substring(st, i))
+            continue
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _unique_tokens(xs: [string]) -> [string] {
+    let mut out: [string] = []
+    let mut i = 0
+    while i < xs.len() {
+        let v = xs[i]
+        let mut found = false
+        let mut j = 0
+        while j < out.len() {
+            if out[j] == v { found = true; break }
+            j = j + 1
+        }
+        if !found { out.push(v) }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── reserved keyword set (free-var 후보에서 제외) ───
+fn _is_reserved(s: string) -> bool {
+    return s == "fn" || s == "let" || s == "const" || s == "mut"
+        || s == "if" || s == "else" || s == "while" || s == "for"
+        || s == "return" || s == "break" || s == "continue"
+        || s == "true" || s == "false" || s == "null"
+        || s == "in" || s == "match" || s == "try" || s == "catch"
+        || s == "pub" || s == "priv" || s == "struct" || s == "enum"
+        || s == "use" || s == "as" || s == "i64" || s == "i32"
+        || s == "string" || s == "bool" || s == "f64"
+}
+
+// ═══════════════════════════════════════════════════════════
+// Tree representation (GumTree node)
+//
+// 평행 배열로 노드를 저장:
+//   ids[i]        — 0-based 정수 id
+//   parents[i]    — 부모 id (-1=root)
+//   types[i]      — "file"|"fn"|"let"|"const"|"struct"|"enum"|"return"|
+//                   "if"|"while"|"match"|"try"|"for"|"call"|"comment"|"expr"
+//   labels[i]     — 노드의 식별 라벨 (fn 의 경우 name, let 은 name, expr 은
+//                   normalize 된 텍스트 prefix 80자)
+//   hashes[i]     — 노드 hash (subtree 동일성)
+//   heights[i]    — subtree height (leaf=1)
+//   first_lines[i]— 1-based 시작 라인
+//   last_lines[i] — 1-based 마지막 라인
+// ═══════════════════════════════════════════════════════════
+
+// statement type 분류 — line 의 첫 키워드
+fn _classify_stmt_line(line: string) -> string {
+    let s = line.trim()
+    if s.len() < 1 { return "blank" }
+    if s.starts_with("//") { return "comment" }
+    if s.starts_with("/*") { return "comment" }
+    if s.starts_with("return ") || s == "return" { return "return" }
+    if s.starts_with("let ") { return "let" }
+    if s.starts_with("const ") { return "const" }
+    if s.starts_with("if ") || s.starts_with("if(") { return "if" }
+    if s.starts_with("else") { return "else" }
+    if s.starts_with("while ") || s.starts_with("while(") { return "while" }
+    if s.starts_with("for ") { return "for" }
+    if s.starts_with("match ") { return "match" }
+    if s.starts_with("try") { return "try" }
+    if s.starts_with("catch") { return "catch" }
+    if s.starts_with("break") { return "break" }
+    if s.starts_with("continue") { return "continue" }
+    if s == "}" || s == "}," { return "block_close" }
+    if s == "{" { return "block_open" }
+    // call vs expr — 단순히 fn(... 패턴 보유 여부로 분기
+    let n = s.len()
+    let mut i: i64 = 0
+    while i < n && _is_alpha(s.substring(i, i + 1)) { i = i + 1 }
+    if i > 0 && i < n && s.substring(i, i + 1) == "(" { return "call" }
+    return "expr"
+}
+
+// ─── 트리 빌드: 한 파일 ───
+//
+// names/kinds/start_lines/end_lines (--symbols 결과) + src 로 각 fn 의 body 를
+// statement-line 단위 children 으로 등록.
+//
+// 매개변수가 너무 많아 `[]` 배열 6개를 ref 처럼 mut 인자로 못 쓰는 hexa
+// 한계를 우회 — 본 함수는 인플레이스 push 가 아닌 **평행 배열 다중 반환 식**
+// 으로 작성. 결과 tuple 을 흉내내기 위해 배열을 string 으로 직렬화 한 뒤 호출
+// 측에서 split 하지 않고, **caller 가 자체적으로 mut 평행 배열을 갖고 본
+// 함수가 직접 수정하는 식** 으로 갈 수도 있지만 hexa 의 array-by-reference
+// 의미가 보장되지 않으므로 본 모듈은 **단일 함수 안에서 트리 전체를 빌드**
+// 한다 (build_tree_inline 패턴).
+//
+// 반환: 직렬화된 트리 NDJSON (각 라인 1 노드, key-only).
+fn _build_tree(path: string, src: string, recs: [string]) -> [string] {
+    let mut nodes: [string] = []   // 각 element = JSON serialized node
+    // root node 0 = "file" — label/hash 는 파일 경로에 의존하지 않는 stable 값
+    // (그렇지 않으면 a/b 경로가 다른 두 파일을 비교할 때 root 자체가 mismatch).
+    let root_label = "<root>"
+    let root_hash = _hash_str("file:root")
+    nodes.push(_node_json(0, -1, "file", root_label, root_hash, 0, 1, 1))
+    let mut next_id: i64 = 1
+    let mut idx = 0
+    while idx < recs.len() {
+        let r = recs[idx]
+        let nm = _record_field(r, "name")
+        let kd = _record_field(r, "kind")
+        let sg = _record_field(r, "sig")
+        let sl = _record_int_field(r, "loc", "line")
+        let el = _record_int_field(r, "end_loc", "line")
+        let body_raw = _slice_lines(src, sl, el)
+        let body_norm = _normalize_body(body_raw)
+        let h = _hash_str(kd + ":" + nm + ":" + sg + ":" + body_norm)
+        let parent_id: i64 = 0
+        let my_id = next_id
+        next_id = next_id + 1
+        // 부모 placeholder push (children push 전에 내 슬롯 확보)
+        nodes.push(_node_json(my_id, parent_id, kd, nm, h, 1, sl, el))
+        // 자식 (fn 본문 statement-line) — fn 만 children 등록
+        let mut child_count: i64 = 0
+        if kd == "fn" {
+            // body 의 첫 `{` 위치 찾기 (이전 라인의 sig + def 라인 skip)
+            let body_start_line = _find_body_start_line(src, sl)
+            let cur_line = body_start_line
+            // 각 line 을 node 화: type = stmt, label = trimmed text prefix 80
+            // 라인 끝까지 순회: el (end_loc.line) 까지
+            let mut ln: i64 = cur_line
+            while ln < el + 1 {
+                let line_text = _slice_lines(src, ln, ln)
+                let t = _classify_stmt_line(line_text)
+                if t != "blank" {
+                    let trimmed = line_text.trim()
+                    let lab = if trimmed.len() < 81 { trimmed } else { trimmed.substring(0, 80) }
+                    let nh = _hash_str(t + ":" + _normalize_body(line_text))
+                    nodes.push(_node_json(next_id, my_id, t, lab, nh, 1, ln, ln))
+                    next_id = next_id + 1
+                    child_count = child_count + 1
+                }
+                ln = ln + 1
+            }
+        }
+        let height: i64 = if child_count > 0 { 2 } else { 1 }
+        // 부모 노드 height 정정 (in-place 인덱스 갱신)
+        nodes[my_id] = _node_json(my_id, parent_id, kd, nm, h, height, sl, el)
+        idx = idx + 1
+    }
+    return nodes
+}
+
+// fn 의 body { 가 시작되는 라인 추정 — sig 라인 다음 또는 같은 라인.
+fn _find_body_start_line(src: string, sl: i64) -> i64 {
+    // 단순: sl 라인 자체를 본 뒤 `{` 가 있으면 sl, 아니면 sl+1.
+    let line1 = _slice_lines(src, sl, sl)
+    if line1.contains("{") { return sl + 1 }
+    return sl + 1
+}
+
+fn _node_json(id: i64, parent: i64, ntype: string, label: string,
+              hash: string, height: i64, sl: i64, el: i64) -> string {
+    let mut sb: [string] = []
+    sb.push("{\"id\":"); sb.push(to_string(id))
+    sb.push(",\"parent\":"); sb.push(to_string(parent))
+    sb.push(",\"type\":\""); sb.push(_json_escape(ntype))
+    sb.push("\",\"label\":\""); sb.push(_json_escape(label))
+    sb.push("\",\"hash\":\""); sb.push(hash)
+    sb.push("\",\"height\":"); sb.push(to_string(height))
+    sb.push(",\"sl\":"); sb.push(to_string(sl))
+    sb.push(",\"el\":"); sb.push(to_string(el))
+    sb.push("}")
+    return sb.join("")
+}
+
+// ─── node 필드 추출 ───
+fn _node_field_str(n: string, key: string) -> string {
+    return _record_field(n, key)
+}
+fn _node_field_int(n: string, key: string) -> i64 {
+    let raw = _record_field(n, key)
+    if raw.len() < 1 { return 0 }
+    let mut v: i64 = 0
+    try { v = to_int(raw) } catch e {}  // @allow-silent-catch
+    return v
+}
+
+// 부모 id 를 얻기 위해 마지막 노드까지 순회 (작은 트리, O(N))
+fn _children_of(nodes: [string], parent_id: i64) -> [i64] {
+    let mut out: [i64] = []
+    let mut i = 0
+    while i < nodes.len() {
+        let p = _node_field_int(nodes[i], "parent")
+        if p == parent_id {
+            let id = _node_field_int(nodes[i], "id")
+            out.push(id)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// dice coefficient: 두 노드의 "이미 매칭된 descendants" 가 얼마나 일치하는지.
+// 정수 % 단위 (× 100).
+fn _dice_pct(desc_a: [i64], desc_b: [i64], a_to_b: [i64]) -> i64 {
+    if desc_a.len() < 1 && desc_b.len() < 1 { return 0 }
+    let mut common: i64 = 0
+    let mut i = 0
+    while i < desc_a.len() {
+        let aid = desc_a[i]
+        // a_to_b[aid] 가 desc_b 안에 있으면 common++
+        if aid < a_to_b.len() {
+            let bid = a_to_b[aid]
+            if bid > -1 {
+                let mut k = 0
+                while k < desc_b.len() {
+                    if desc_b[k] == bid { common = common + 1; break }
+                    k = k + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    let total = desc_a.len() + desc_b.len()
+    if total < 1 { return 0 }
+    return (200 * common) / total
+}
+
+// 한 노드의 모든 descendants id 모음 (자기 자신 제외)
+fn _descendants(nodes: [string], root_id: i64) -> [i64] {
+    let mut out: [i64] = []
+    let mut stack: [i64] = []
+    stack.push(root_id)
+    while stack.len() > 0 {
+        let cur = stack[stack.len() - 1]
+        // pop
+        let mut new_stack: [i64] = []
+        let mut k = 0
+        while k < stack.len() - 1 { new_stack.push(stack[k]); k = k + 1 }
+        stack = new_stack
+        let kids = _children_of(nodes, cur)
+        let mut j = 0
+        while j < kids.len() {
+            out.push(kids[j])
+            stack.push(kids[j])
+            j = j + 1
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════
+// MODE ① --diff-tree (GumTree)
+// ═══════════════════════════════════════════════════════════
+fn _mode_diff_tree(a_path: string, b_path: string) {
+    let t0 = _ns_now()
+    let exa = to_string(exec("test -f '" + _shq(a_path) + "' && printf yes || printf no")).trim()  // @allow-bare-exec
+    let exb = to_string(exec("test -f '" + _shq(b_path) + "' && printf yes || printf no")).trim()  // @allow-bare-exec
+    if exa != "yes" {
+        eprintln("hexa-gumtree: file not found: " + a_path)
+        exit(1)  // @allow-silent-exit
+    }
+    if exb != "yes" {
+        eprintln("hexa-gumtree: file not found: " + b_path)
+        exit(1)  // @allow-silent-exit
+    }
+
+    let sa_json = _run_symbols(a_path)
+    let sb_json = _run_symbols(b_path)
+    if sa_json.len() < 2 || sb_json.len() < 2 {
+        eprintln("hexa-gumtree: --symbols subprocess produced empty output")
+        exit(1)  // @allow-silent-exit
+    }
+    let recs_a = _split_json_array_records(sa_json)
+    let recs_b = _split_json_array_records(sb_json)
+    let src_a = read_file(a_path)
+    let src_b = read_file(b_path)
+
+    let nodes_a = _build_tree(a_path, src_a, recs_a)
+    let nodes_b = _build_tree(b_path, src_b, recs_b)
+
+    // a_to_b[i] = matched b id (-1 = unmatched)
+    let mut a_to_b: [i64] = []
+    let mut b_used: [bool] = []
+    let mut i = 0
+    while i < nodes_a.len() { a_to_b.push(-1); i = i + 1 }
+    i = 0
+    while i < nodes_b.len() { b_used.push(false); i = i + 1 }
+
+    // ─── PASS 1: Top-down — type+hash 동일 매칭 ───
+    // greedy: a 노드 순회 → b 의 첫 type+hash 일치 unmatched 후보 매칭.
+    // (GumTree 의 minHeight 임계값은 ambiguity 방지용이지만, 본 구현의 hash 는
+    //  type+name+sig+body 4-키 합성이므로 leaf 도 안전하게 매칭 가능.)
+    i = 0
+    while i < nodes_a.len() {
+        let na = nodes_a[i]
+        let ha = _node_field_str(na, "hash")
+        let ta = _node_field_str(na, "type")
+        let mut j = 0
+        while j < nodes_b.len() {
+            if !b_used[j] {
+                let nb = nodes_b[j]
+                if _node_field_str(nb, "hash") == ha && _node_field_str(nb, "type") == ta {
+                    a_to_b[i] = j
+                    b_used[j] = true
+                    break
+                }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    // 매칭된 부모의 children 도 자동으로 매칭 — 부분트리가 완전 일치할 때
+    // (hash 동일이면 children 도 완전 동일 가정 → 같은 순서로 매칭)
+    i = 0
+    while i < nodes_a.len() {
+        if a_to_b[i] > -1 {
+            let kids_a = _children_of(nodes_a, _node_field_int(nodes_a[i], "id"))
+            let kids_b = _children_of(nodes_b, _node_field_int(nodes_b[a_to_b[i]], "id"))
+            if kids_a.len() == kids_b.len() {
+                let mut k = 0
+                while k < kids_a.len() {
+                    let aid = kids_a[k]
+                    let bid = kids_b[k]
+                    if aid < a_to_b.len() && a_to_b[aid] < 0 && !b_used[bid] {
+                        // hash 동일성 체크
+                        let ha2 = _node_field_str(nodes_a[aid], "hash")
+                        let hb2 = _node_field_str(nodes_b[bid], "hash")
+                        if ha2 == hb2 {
+                            a_to_b[aid] = bid
+                            b_used[bid] = true
+                        }
+                    }
+                    k = k + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+
+    // ─── PASS 2: Bottom-up — dice coefficient ≥ DICE_MATCH_PCT ───
+    // 매칭 안 된 a 부모 → b 부모의 children 매칭 비율로 dice 계산.
+    // 순회 순서: a 의 부모 노드부터 (parent != -1).
+    i = 0
+    while i < nodes_a.len() {
+        if a_to_b[i] < 0 {
+            let na = nodes_a[i]
+            let ta = _node_field_str(na, "type")
+            let desc_a = _descendants(nodes_a, _node_field_int(na, "id"))
+            // b 후보 — 같은 type 인 unmatched
+            let mut best_j: i64 = -1
+            let mut best_pct: i64 = -1
+            let mut j = 0
+            while j < nodes_b.len() {
+                if !b_used[j] {
+                    let nb = nodes_b[j]
+                    if _node_field_str(nb, "type") == ta {
+                        let desc_b = _descendants(nodes_b, _node_field_int(nb, "id"))
+                        let pct = _dice_pct(desc_a, desc_b, a_to_b)
+                        if pct > best_pct { best_pct = pct; best_j = j }
+                    }
+                }
+                j = j + 1
+            }
+            if best_j > -1 && best_pct > _DICE_MATCH_PCT - 1 {
+                a_to_b[i] = best_j
+                b_used[best_j] = true
+            }
+        }
+        i = i + 1
+    }
+
+    // ─── PASS 3: 매칭된 부모의 unmatched children 을 type 일치로 update 매칭 ───
+    // GumTree 의 "edit script" 단계 근사 — leaf 의 hash 만 다른 경우 (예: bar
+    // 의 `return x+y` → `return x`) 을 delete+insert 가 아닌 update 1건으로
+    // 표현. 부모가 매칭되어 있어야 적용 (lexical noise 회피).
+    i = 0
+    while i < nodes_a.len() {
+        if a_to_b[i] < 0 {
+            let na = nodes_a[i]
+            let parent_a = _node_field_int(na, "parent")
+            if parent_a > -1 && parent_a < a_to_b.len() && a_to_b[parent_a] > -1 {
+                let mapped_parent = a_to_b[parent_a]
+                let ta = _node_field_str(na, "type")
+                // b 의 같은 부모의 unmatched 자식 중 type 일치
+                let mut j = 0
+                while j < nodes_b.len() {
+                    if !b_used[j] {
+                        let nb = nodes_b[j]
+                        if _node_field_int(nb, "parent") == mapped_parent
+                            && _node_field_str(nb, "type") == ta {
+                            a_to_b[i] = j
+                            b_used[j] = true
+                            break
+                        }
+                    }
+                    j = j + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+
+    // ─── EMIT ───
+    let mut actions: i64 = 0
+    let mut updates: i64 = 0
+    let mut moves: i64 = 0
+    let mut matches: i64 = 0
+    let mut deletes: i64 = 0
+    let mut inserts: i64 = 0
+
+    i = 0
+    while i < nodes_a.len() {
+        let na = nodes_a[i]
+        let aid = _node_field_int(na, "id")
+        let ta = _node_field_str(na, "type")
+        let la = _node_field_str(na, "label")
+        let lna = _node_field_int(na, "sl")
+        if a_to_b[i] > -1 {
+            let bid = _node_field_int(nodes_b[a_to_b[i]], "id")
+            let lb = _node_field_str(nodes_b[a_to_b[i]], "label")
+            let lnb = _node_field_int(nodes_b[a_to_b[i]], "sl")
+            let parent_a = _node_field_int(na, "parent")
+            let parent_b = _node_field_int(nodes_b[a_to_b[i]], "parent")
+            // 라벨 동일 + 부모 매칭 일치 → match
+            // 라벨 다름 → update
+            // 부모 매칭이 다른 부모 (또는 a 의 부모가 b 안에서 다른 것에 매칭됨) → move
+            let mut action = "match"
+            if la != lb { action = "update" }
+            if parent_a > -1 && parent_a < a_to_b.len() {
+                let mapped_parent = a_to_b[parent_a]
+                if mapped_parent > -1 && mapped_parent != parent_b { action = "move" }
+            }
+            _emit_tree_action(action, aid, bid, ta, la, lb, lna, lnb, a_path, b_path)
+            actions = actions + 1
+            if action == "match" { matches = matches + 1 }
+            else if action == "update" { updates = updates + 1 }
+            else if action == "move" { moves = moves + 1 }
+        } else {
+            _emit_tree_action("delete", aid, -1, ta, la, "", lna, 0, a_path, b_path)
+            actions = actions + 1
+            deletes = deletes + 1
+        }
+        i = i + 1
+    }
+
+    let mut k = 0
+    while k < nodes_b.len() {
+        if !b_used[k] {
+            let nb = nodes_b[k]
+            let bid = _node_field_int(nb, "id")
+            let tb = _node_field_str(nb, "type")
+            let lb = _node_field_str(nb, "label")
+            let lnb = _node_field_int(nb, "sl")
+            _emit_tree_action("insert", -1, bid, tb, "", lb, 0, lnb, a_path, b_path)
+            actions = actions + 1
+            inserts = inserts + 1
+        }
+        k = k + 1
+    }
+
+    let t1 = _ns_now()
+    let ms = (t1 - t0) / 1000000
+    let mut m: [string] = []
+    m.push(_NS); m.push(" {\"stage\":\"diff_tree\"")
+    m.push(",\"ms\":"); m.push(to_string(ms))
+    m.push(",\"nodes_a\":"); m.push(to_string(nodes_a.len()))
+    m.push(",\"nodes_b\":"); m.push(to_string(nodes_b.len()))
+    m.push(",\"matches\":"); m.push(to_string(matches))
+    m.push(",\"updates\":"); m.push(to_string(updates))
+    m.push(",\"moves\":"); m.push(to_string(moves))
+    m.push(",\"deletes\":"); m.push(to_string(deletes))
+    m.push(",\"inserts\":"); m.push(to_string(inserts))
+    m.push(",\"a\":\""); m.push(_json_escape(a_path))
+    m.push("\",\"b\":\""); m.push(_json_escape(b_path))
+    m.push("\"}")
+    eprintln(m.join(""))
+}
+
+fn _emit_tree_action(action: string, aid: i64, bid: i64, ntype: string,
+                     la: string, lb: string, lna: i64, lnb: i64,
+                     a_path: string, b_path: string) {
+    let mut sb: [string] = []
+    sb.push("{\"action\":\""); sb.push(action)
+    sb.push("\",\"a_id\":"); sb.push(to_string(aid))
+    sb.push(",\"b_id\":"); sb.push(to_string(bid))
+    sb.push(",\"type\":\""); sb.push(_json_escape(ntype))
+    sb.push("\",\"label_old\":\""); sb.push(_json_escape(la))
+    sb.push("\",\"label_new\":\""); sb.push(_json_escape(lb))
+    sb.push("\",\"line_a\":"); sb.push(to_string(lna))
+    sb.push(",\"line_b\":"); sb.push(to_string(lnb))
+    sb.push(",\"file_a\":\""); sb.push(_json_escape(a_path))
+    sb.push("\",\"file_b\":\""); sb.push(_json_escape(b_path))
+    sb.push("\"}")
+    println(sb.join(""))
+}
+
+// ═══════════════════════════════════════════════════════════
+// MODE ② --extract <file> <sl> <el> <new_fn>
+// ═══════════════════════════════════════════════════════════
+fn _mode_extract(path: string, sl_str: string, el_str: string, new_fn: string) {
+    let t0 = _ns_now()
+    let mut sl: i64 = 0
+    let mut el: i64 = 0
+    try { sl = to_int(sl_str) } catch e {}  // @allow-silent-catch
+    try { el = to_int(el_str) } catch e2 {}  // @allow-silent-catch
+    if sl < 1 || el < sl {
+        eprintln("hexa-gumtree: invalid line range " + sl_str + ".." + el_str)
+        exit(2)  // @allow-silent-exit
+    }
+    let exa = to_string(exec("test -f '" + _shq(path) + "' && printf yes || printf no")).trim()  // @allow-bare-exec
+    if exa != "yes" {
+        eprintln("hexa-gumtree: file not found: " + path)
+        exit(1)  // @allow-silent-exit
+    }
+    let src = read_file(path)
+    let region = _slice_lines(src, sl, el)
+    if region.len() < 1 {
+        eprintln("hexa-gumtree: empty region " + sl_str + ".." + el_str)
+        exit(1)  // @allow-silent-exit
+    }
+
+    // free-var 분석 (단순 token-set 차분):
+    //   free = identifiers(region) - declared_in_region - reserved - literals
+    let toks = _unique_tokens(_tokens_of(region))
+    let mut declared: [string] = []
+    // declared 추출 — `let X` / `const X` / `mut X` / `fn X` 라인 기반
+    let nlines = _lines_count(region)
+    let mut ln: i64 = 1
+    while ln < nlines + 1 {
+        let line = _slice_lines(region, ln, ln).trim()
+        let dn = _decl_name_of(line)
+        if dn.len() > 0 { declared.push(dn) }
+        ln = ln + 1
+    }
+    // 또한 enclosing fn 의 params (free-var 후보 필터링) — --symbols 회수
+    let sj = _run_symbols(path)
+    let recs = _split_json_array_records(sj)
+    let mut enc_params: [string] = []
+    let mut enc_fn_name: string = ""
+    let mut idx = 0
+    while idx < recs.len() {
+        let r = recs[idx]
+        let kd = _record_field(r, "kind")
+        if kd == "fn" {
+            let fsl = _record_int_field(r, "loc", "line")
+            let fel = _record_int_field(r, "end_loc", "line")
+            if fsl < sl + 1 && fel > el - 1 {
+                enc_fn_name = _record_field(r, "name")
+                enc_params = _parse_param_names(_record_field(r, "sig"))
+                break
+            }
+        }
+        idx = idx + 1
+    }
+    // free var 후보 = toks - declared - reserved - 숫자/리터럴 토큰
+    let mut free: [string] = []
+    let mut t = 0
+    while t < toks.len() {
+        let v = toks[t]
+        if !_is_reserved(v) && !_in(declared, v) && _is_alpha(v.substring(0, 1)) {
+            free.push(v)
+        }
+        t = t + 1
+    }
+    // free 중 enclosing fn 의 param 또는 다른 사용된 변수만 진짜 free-var.
+    // 본 단계는 enc_params 와 declared 외부의 식별자 모두를 candidates 로 emit.
+
+    // emit plan ① extract_def — 새 fn 정의 (params = free)
+    let mut fn_text_sb: [string] = []
+    fn_text_sb.push("fn "); fn_text_sb.push(new_fn); fn_text_sb.push("(")
+    let mut p = 0
+    while p < free.len() {
+        if p > 0 { fn_text_sb.push(", ") }
+        fn_text_sb.push(free[p])
+        // 타입 추론 미구현 — 기본 i64 (designed_only marker)
+        fn_text_sb.push(": i64")
+        p = p + 1
+    }
+    fn_text_sb.push(") {\n"); fn_text_sb.push(region.trim()); fn_text_sb.push("\n}")
+    let fn_text = fn_text_sb.join("")
+
+    let mut plan1: [string] = []
+    plan1.push("{\"plan\":\"extract_def\",\"fn\":\"")
+    plan1.push(_json_escape(new_fn))
+    plan1.push("\",\"file\":\""); plan1.push(_json_escape(path))
+    plan1.push("\",\"params\":["); plan1.push(_json_array_str(free))
+    plan1.push("],\"enclosing_fn\":\""); plan1.push(_json_escape(enc_fn_name))
+    plan1.push("\",\"body\":\""); plan1.push(_json_escape(fn_text))
+    plan1.push("\",\"caveat\":\"types_default_i64;capture_naive;return_inferred_unit\"}")
+    println(plan1.join(""))
+
+    // emit plan ② extract_call — 원래 영역을 호출로 대체
+    let mut call_args_sb: [string] = []
+    let mut q = 0
+    while q < free.len() {
+        if q > 0 { call_args_sb.push(", ") }
+        call_args_sb.push(free[q])
+        q = q + 1
+    }
+    let call_text = new_fn + "(" + call_args_sb.join("") + ")"
+    let mut plan2: [string] = []
+    plan2.push("{\"plan\":\"extract_call\",\"file\":\"")
+    plan2.push(_json_escape(path)); plan2.push("\",\"sl\":")
+    plan2.push(to_string(sl)); plan2.push(",\"el\":")
+    plan2.push(to_string(el)); plan2.push(",\"replace_with\":\"")
+    plan2.push(_json_escape(call_text)); plan2.push("\"}")
+    println(plan2.join(""))
+
+    let t1 = _ns_now()
+    let ms = (t1 - t0) / 1000000
+    let mut m: [string] = []
+    m.push(_NS); m.push(" {\"stage\":\"extract\"")
+    m.push(",\"ms\":"); m.push(to_string(ms))
+    m.push(",\"file\":\""); m.push(_json_escape(path))
+    m.push("\",\"sl\":"); m.push(to_string(sl))
+    m.push(",\"el\":"); m.push(to_string(el))
+    m.push(",\"new_fn\":\""); m.push(_json_escape(new_fn))
+    m.push("\",\"free_vars\":"); m.push(to_string(free.len()))
+    m.push(",\"enclosing_fn\":\""); m.push(_json_escape(enc_fn_name))
+    m.push("\"}")
+    eprintln(m.join(""))
+}
+
+fn _lines_count(s: string) -> i64 {
+    let n = s.len()
+    let mut c: i64 = 1
+    let mut i: i64 = 0
+    while i < n {
+        if s.substring(i, i + 1) == "\n" { c = c + 1 }
+        i = i + 1
+    }
+    return c
+}
+
+fn _decl_name_of(line: string) -> string {
+    let s = line.trim()
+    let mut start: i64 = -1
+    if s.starts_with("let mut ") { start = 8 }
+    else if s.starts_with("let ") { start = 4 }
+    else if s.starts_with("const ") { start = 6 }
+    else if s.starts_with("mut ") { start = 4 }
+    else if s.starts_with("fn ") { start = 3 }
+    if start < 0 { return "" }
+    let n = s.len()
+    let mut i = start
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if !_is_ident(c) { break }
+        i = i + 1
+    }
+    if i > start { return s.substring(start, i) }
+    return ""
+}
+
+fn _in(xs: [string], v: string) -> bool {
+    let mut i = 0
+    while i < xs.len() {
+        if xs[i] == v { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _json_array_str(xs: [string]) -> string {
+    let mut sb: [string] = []
+    let mut i = 0
+    while i < xs.len() {
+        if i > 0 { sb.push(",") }
+        sb.push("\""); sb.push(_json_escape(xs[i])); sb.push("\"")
+        i = i + 1
+    }
+    return sb.join("")
+}
+
+// "fn foo(a: i32, b: i64) -> i32" → ["a","b"]
+fn _parse_param_names(sig: string) -> [string] {
+    let mut out: [string] = []
+    let lp = sig.index_of("(")
+    let rp = sig.index_of(")")
+    if lp < 0 || rp < 0 || rp < lp { return out }
+    let inner = sig.substring(lp + 1, rp)
+    if inner.trim().len() < 1 { return out }
+    let parts = inner.split(",")
+    let mut i = 0
+    while i < parts.len() {
+        let p = parts[i].trim()
+        let cp = p.index_of(":")
+        let nm = if cp > -1 { p.substring(0, cp).trim() } else { p }
+        if nm.len() > 0 { out.push(nm) }
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════
+// MODE ③ --inline <file> <fn>
+// ═══════════════════════════════════════════════════════════
+fn _mode_inline(path: string, fn_name: string) {
+    let t0 = _ns_now()
+    let exa = to_string(exec("test -f '" + _shq(path) + "' && printf yes || printf no")).trim()  // @allow-bare-exec
+    if exa != "yes" {
+        eprintln("hexa-gumtree: file not found: " + path)
+        exit(1)  // @allow-silent-exit
+    }
+    let sj = _run_symbols(path)
+    let recs = _split_json_array_records(sj)
+    let src = read_file(path)
+    let mut found_sl: i64 = 0
+    let mut found_el: i64 = 0
+    let mut found_sig: string = ""
+    let mut idx = 0
+    while idx < recs.len() {
+        let r = recs[idx]
+        if _record_field(r, "kind") == "fn" && _record_field(r, "name") == fn_name {
+            found_sl = _record_int_field(r, "loc", "line")
+            found_el = _record_int_field(r, "end_loc", "line")
+            found_sig = _record_field(r, "sig")
+            break
+        }
+        idx = idx + 1
+    }
+    if found_sl < 1 {
+        eprintln("hexa-gumtree: fn not found: " + fn_name + " in " + path)
+        exit(1)  // @allow-silent-exit
+    }
+    let body_raw = _slice_lines(src, found_sl, found_el)
+    // body { 안쪽만 추출 — 첫 `{` 다음부터 마지막 `}` 직전
+    let lb = body_raw.index_of("{")
+    let body_inner = if lb > -1 {
+        let rest = body_raw.substring(lb + 1, body_raw.len())
+        // 마지막 } 위치 (rstrip)
+        let nrb = rest.len()
+        let mut k = nrb - 1
+        while k > -1 && rest.substring(k, k + 1) != "}" { k = k - 1 }
+        if k > 0 { rest.substring(0, k) } else { rest }
+    } else { body_raw }
+    let body_norm = body_inner.trim()
+    let params = _parse_param_names(found_sig)
+
+    // 호출처 검색 (lexical) — `<fn_name>\s*\(`
+    // 단순화: 각 line 에 `<fn_name>(` 또는 `<fn_name> (` 가 있으면 후보.
+    let nlines = _lines_count(src)
+    let mut call_lines: [i64] = []
+    let mut ln: i64 = 1
+    while ln < nlines + 1 {
+        let line = _slice_lines(src, ln, ln)
+        // skip self def line
+        if ln < found_sl + 1 && ln > found_sl - 1 { ln = ln + 1; continue }
+        if line.contains(fn_name + "(") || line.contains(fn_name + " (") {
+            // exclude if inside a comment line (best-effort)
+            let trimmed = line.trim()
+            if !trimmed.starts_with("//") {
+                // exclude self-def: fn name 정의 자체
+                if !line.contains("fn " + fn_name) {
+                    call_lines.push(ln)
+                }
+            }
+        }
+        ln = ln + 1
+    }
+
+    // emit per-call inline plan + remove def plan
+    let mut count = 0
+    let mut c = 0
+    while c < call_lines.len() {
+        let cl = call_lines[c]
+        let line_text = _slice_lines(src, cl, cl)
+        // 인자 추출 — `<fn_name>(...)` 구간 내부
+        let p_start = line_text.index_of(fn_name + "(")
+        let mut args_str: string = ""
+        if p_start > -1 {
+            let after_paren = line_text.substring(p_start + fn_name.len() + 1, line_text.len())
+            // 매칭 `)` 위치
+            let n2 = after_paren.len()
+            let mut depth = 0
+            let mut q: i64 = 0
+            let mut in_str = false
+            let mut str_d = ""
+            while q < n2 {
+                let cc = after_paren.substring(q, q + 1)
+                if in_str {
+                    if cc == "\\" && q + 1 < n2 { q = q + 2; continue }
+                    if cc == str_d { in_str = false; str_d = "" }
+                    q = q + 1; continue
+                }
+                if cc == "\"" { in_str = true; str_d = "\""; q = q + 1; continue }
+                if cc == "(" { depth = depth + 1 }
+                else if cc == ")" {
+                    if depth == 0 { break }
+                    depth = depth - 1
+                }
+                q = q + 1
+            }
+            args_str = after_paren.substring(0, q)
+        }
+        let arg_parts = _split_top_level_args(args_str)
+        // body_norm 의 마지막 `return X` → expression X 만 추출 (인라인 식)
+        let mut expr_body = body_norm.trim()
+        let rp = expr_body.index_of("return ")
+        if rp > -1 {
+            expr_body = expr_body.substring(rp + 7, expr_body.len()).trim()
+        }
+        // 본문에 param 이름 → 실제 인자로 1:1 substitute (lexical)
+        let mut inlined_expr = expr_body
+        let mut p = 0
+        while p < params.len() && p < arg_parts.len() {
+            // word-boundary 보정 — 단순 replace 로는 over-replace 가능 (예:
+            // param "a" 가 변수 "abc" 안에서 매칭). 본 단계는 lexical 한계
+            // 명시 — caveat 필드로 emit.
+            inlined_expr = inlined_expr.replace(params[p], arg_parts[p].trim())
+            p = p + 1
+        }
+        // call-site 의 `<fn_name>(args)` 부분만 inlined_expr 로 치환,
+        // 주변 `let y =`, `return ` 등 컨텍스트 보존
+        let call_pat = fn_name + "(" + args_str + ")"
+        let new_line = line_text.replace(call_pat, inlined_expr).trim()
+        let mut sb: [string] = []
+        sb.push("{\"plan\":\"inline_call\",\"file\":\"")
+        sb.push(_json_escape(path))
+        sb.push("\",\"line\":"); sb.push(to_string(cl))
+        sb.push(",\"fn\":\""); sb.push(_json_escape(fn_name))
+        sb.push("\",\"original\":\""); sb.push(_json_escape(line_text.trim()))
+        sb.push("\",\"replace_with\":\""); sb.push(_json_escape(new_line))
+        sb.push("\",\"caveat\":\"lexical_subst;no_alpha_rename;single_return_unwrapped\"}")
+        println(sb.join(""))
+        count = count + 1
+        c = c + 1
+    }
+
+    let mut sb2: [string] = []
+    sb2.push("{\"plan\":\"inline_remove_def\",\"file\":\"")
+    sb2.push(_json_escape(path))
+    sb2.push("\",\"sl\":"); sb2.push(to_string(found_sl))
+    sb2.push(",\"el\":"); sb2.push(to_string(found_el))
+    sb2.push(",\"fn\":\""); sb2.push(_json_escape(fn_name))
+    sb2.push("\"}")
+    println(sb2.join(""))
+
+    let t1 = _ns_now()
+    let ms = (t1 - t0) / 1000000
+    let mut m: [string] = []
+    m.push(_NS); m.push(" {\"stage\":\"inline\"")
+    m.push(",\"ms\":"); m.push(to_string(ms))
+    m.push(",\"file\":\""); m.push(_json_escape(path))
+    m.push("\",\"fn\":\""); m.push(_json_escape(fn_name))
+    m.push("\",\"call_sites\":"); m.push(to_string(count))
+    m.push("}")
+    eprintln(m.join(""))
+}
+
+// args_str 의 top-level `,` 로 split — nested () 무시
+fn _split_top_level_args(s: string) -> [string] {
+    let mut out: [string] = []
+    let n = s.len()
+    if n < 1 { return out }
+    let mut i: i64 = 0
+    let mut depth: i64 = 0
+    let mut start: i64 = 0
+    let mut in_str = false
+    let mut str_d = ""
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if in_str {
+            if c == "\\" && i + 1 < n { i = i + 2; continue }
+            if c == str_d { in_str = false; str_d = "" }
+            i = i + 1; continue
+        }
+        if c == "\"" { in_str = true; str_d = "\""; i = i + 1; continue }
+        if c == "(" || c == "[" || c == "{" { depth = depth + 1 }
+        else if c == ")" || c == "]" || c == "}" { depth = depth - 1 }
+        else if c == "," && depth == 0 {
+            out.push(s.substring(start, i))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    out.push(s.substring(start, n))
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════
+// MODE ④ --move <fn> <a.hexa> <b.hexa>
+// ═══════════════════════════════════════════════════════════
+fn _mode_move(fn_name: string, a_path: string, b_path: string) {
+    let t0 = _ns_now()
+    let exa = to_string(exec("test -f '" + _shq(a_path) + "' && printf yes || printf no")).trim()  // @allow-bare-exec
+    if exa != "yes" {
+        eprintln("hexa-gumtree: file not found: " + a_path)
+        exit(1)  // @allow-silent-exit
+    }
+    // b_path 가 파일이 아니면 새로 만들 plan
+    let exb = to_string(exec("test -f '" + _shq(b_path) + "' && printf yes || printf no")).trim()  // @allow-bare-exec
+    let sj = _run_symbols(a_path)
+    let recs = _split_json_array_records(sj)
+    let src_a = read_file(a_path)
+    let mut sl: i64 = 0
+    let mut el: i64 = 0
+    let mut idx = 0
+    while idx < recs.len() {
+        let r = recs[idx]
+        if _record_field(r, "kind") == "fn" && _record_field(r, "name") == fn_name {
+            sl = _record_int_field(r, "loc", "line")
+            el = _record_int_field(r, "end_loc", "line")
+            break
+        }
+        idx = idx + 1
+    }
+    if sl < 1 {
+        eprintln("hexa-gumtree: fn not found: " + fn_name + " in " + a_path)
+        exit(1)  // @allow-silent-exit
+    }
+    let fn_text = _slice_lines(src_a, sl, el).trim()
+
+    // emit plan ① move_remove from a
+    let mut sb1: [string] = []
+    sb1.push("{\"plan\":\"move_remove\",\"file\":\"")
+    sb1.push(_json_escape(a_path))
+    sb1.push("\",\"sl\":"); sb1.push(to_string(sl))
+    sb1.push(",\"el\":"); sb1.push(to_string(el))
+    sb1.push(",\"fn\":\""); sb1.push(_json_escape(fn_name))
+    sb1.push("\"}")
+    println(sb1.join(""))
+
+    // emit plan ② move_insert into b (EOF append)
+    let mut sb2: [string] = []
+    sb2.push("{\"plan\":\"move_insert\",\"file\":\"")
+    sb2.push(_json_escape(b_path))
+    sb2.push("\",\"at_eof\":")
+    sb2.push(if exb == "yes" { "true" } else { "true" })
+    sb2.push(",\"create_file\":")
+    sb2.push(if exb == "yes" { "false" } else { "true" })
+    sb2.push(",\"fn\":\""); sb2.push(_json_escape(fn_name))
+    sb2.push("\",\"content\":\""); sb2.push(_json_escape(fn_text))
+    sb2.push("\"}")
+    println(sb2.join(""))
+
+    // emit plan ③ caller-import-update — 호출처를 a 의 형제 디렉토리에서
+    // grep 으로 식별 (best-effort) → list 만 emit. 실제 use 라인 추가는 5b
+    // workspace edit 로 위임 (designed_only).
+    let dir_of_a = _dirname(a_path)
+    let grep_cmd = "grep -l -F '" + _shq(fn_name + "(") + "' '" + _shq(dir_of_a) + "'/*.hexa 2>/dev/null"
+    let grep_out = to_string(exec(grep_cmd))  // @allow-bare-exec
+    let lines = grep_out.split("\n")
+    let mut callers: [string] = []
+    let mut k = 0
+    while k < lines.len() {
+        let lln = lines[k].trim()
+        // intra-file callers 도 emit (이전 fn def 라인이 grep 매칭된 경우는
+        // best-effort 로 그대로 reference 카운트에 포함). b_path 는 이동 대상
+        // 자체이므로 제외.
+        if lln.len() > 0 && lln != b_path { callers.push(lln) }
+        k = k + 1
+    }
+    let mut sb3: [string] = []
+    sb3.push("{\"plan\":\"move_caller_import\",\"fn\":\"")
+    sb3.push(_json_escape(fn_name))
+    sb3.push("\",\"new_module\":\""); sb3.push(_json_escape(b_path))
+    sb3.push("\",\"callers\":[")
+    let mut q = 0
+    while q < callers.len() {
+        if q > 0 { sb3.push(",") }
+        sb3.push("\""); sb3.push(_json_escape(callers[q])); sb3.push("\"")
+        q = q + 1
+    }
+    sb3.push("],\"caveat\":\"caller_import_designed_only;5b_workspace_edit_responsibility\"}")
+    println(sb3.join(""))
+
+    let t1 = _ns_now()
+    let ms = (t1 - t0) / 1000000
+    let mut m: [string] = []
+    m.push(_NS); m.push(" {\"stage\":\"move\"")
+    m.push(",\"ms\":"); m.push(to_string(ms))
+    m.push(",\"fn\":\""); m.push(_json_escape(fn_name))
+    m.push("\",\"a\":\""); m.push(_json_escape(a_path))
+    m.push("\",\"b\":\""); m.push(_json_escape(b_path))
+    m.push("\",\"callers\":"); m.push(to_string(callers.len()))
+    m.push("}")
+    eprintln(m.join(""))
+}
+
+fn _dirname(p: string) -> string {
+    let n = p.len()
+    let mut i = n - 1
+    while i > -1 {
+        if p.substring(i, i + 1) == "/" { return p.substring(0, i) }
+        i = i - 1
+    }
+    return "."
+}
+
+// ─── usage ───
+fn _usage() {
+    eprintln("usage:")
+    eprintln("  hexa run gumtree.hexa --diff-tree <a.hexa> <b.hexa>")
+    eprintln("  hexa run gumtree.hexa --extract <file.hexa> <sl> <el> <new_fn>")
+    eprintln("  hexa run gumtree.hexa --inline <file.hexa> <fn>")
+    eprintln("  hexa run gumtree.hexa --move <fn> <a.hexa> <b.hexa>")
+    eprintln("Phase 5c — GumTree tree-edit + advanced refactor (extract/inline/move).")
+    eprintln("output: NDJSON, exit: 0=ok, 1=parse/subprocess fail, 2=invalid args")
+}
+
+// ═══════════════════════════════════════════════════════════
+// entry
+// ═══════════════════════════════════════════════════════════
+let a = args()
+// args shape: [exe, exe, mode, ...] (HEXA_LOCAL=1)
+if len(a) < 4 {
+    _usage()
+    exit(2)  // @allow-silent-exit
+}
+let mode = a[2]
+
+if mode == "--diff-tree" {
+    if len(a) < 5 { _usage(); exit(2) }  // @allow-silent-exit
+    _mode_diff_tree(a[3], a[4])
+} else if mode == "--extract" {
+    if len(a) < 7 { _usage(); exit(2) }  // @allow-silent-exit
+    _mode_extract(a[3], a[4], a[5], a[6])
+} else if mode == "--inline" {
+    if len(a) < 5 { _usage(); exit(2) }  // @allow-silent-exit
+    _mode_inline(a[3], a[4])
+} else if mode == "--move" {
+    if len(a) < 6 { _usage(); exit(2) }  // @allow-silent-exit
+    _mode_move(a[3], a[4], a[5])
+} else {
+    _usage()
+    exit(2)  // @allow-silent-exit
+}
+
+exit(0)  // @allow-silent-exit

@@ -1,0 +1,952 @@
+// ═══════════════════════════════════════════════════════════
+// tooling/hexa-introspect/diff.hexa
+//   — hexa-introspect Phase 5a: Symbol-table hash diff (single-file)
+//
+// 갭 카탈로그: hexa-ast-diff-semantic-refactor (NEW, 2026-05-06)
+// spec: design/hexa_ast_diff_refactor_spec.md (§ 3.2 symbol-hash O(n) algorithm,
+//       § 5 NDJSON 스키마, § 4.1 CLI shape)
+//
+// 배경:
+//   spec § 3 의 5a 단계는 두 .hexa 파일의 symbol 수준 변경을 5종 change_kind
+//   (added / removed / renamed / signature_changed / body_changed / unchanged) 로
+//   정형화. 텍스트 diff 가 누락하는 rename / sig change 의도를 명시화한다.
+//
+//   본 파일은 **독립 실행 가능한 신규 모듈** — Phase 3 patch 적용 에이전트가
+//   hexa_introspect.hexa 의 dispatch 분기를 수정 중이므로 충돌을 피하려고
+//   별도 entry-point 로 작성. dispatch 통합은 PHASE5A_DISPATCH_PATCH.md 참조.
+//
+// 설계:
+//   1) 두 파일 각각에 대해 `hexa-introspect --symbols` subprocess 호출 →
+//      JSON array stdout 회수.
+//   2) JSON 을 awk RS=`}` 로 record 분리 후 line-regex 로
+//      {name, kind, sig, start_line, end_line} 5필드 파싱.
+//   3) 각 symbol 의 body_hash = src.substring(start..end) 의 정규화 hash:
+//        - 주석 제거 (line // 와 block /* ... */)
+//        - 연속 공백/탭/개행 → 단일 space
+//        - 문자열 리터럴 보존 (변경 감지용)
+//        - shasum (BSD/GNU) 으로 16-hex SHA-1 prefix 추출
+//      → shasum 미가용 시 FNV-1a 32-bit polyfill 폴백 (8-hex).
+//   4) symbol-hash diff 알고리즘 (spec § 3.2):
+//        for s in Sa:
+//          if s.name in Sb:                     - sig+body 비교
+//             body 동일 → unchanged
+//             body 만 변경 → body_changed
+//             sig 만 변경 → signature_changed
+//          else:                                - rename heuristic
+//             Sb 에서 body_hash 동일한 후보 검색 → renamed
+//             또는 Jaccard token sim ≥ 0.85 → renamed
+//             아니면 removed
+//        Sb 잔여 → added
+//
+// 인터페이스:
+//   $ hexa run tooling/hexa-introspect/diff.hexa --diff <a.hexa> <b.hexa>
+//
+//   옵션:
+//     --semantic-only      loc 변경 무시 (기본)  [현 시점 기본 동작]
+//     --include-body       body 의 before/after hash 도 emit (기본 ON)
+//
+// stdout: NDJSON (1 line / change)
+//   {"change":"renamed","name_old":"_ns_now","name_new":"_clock_ns",
+//    "before":{"sig":"...","body_hash":"abc123","loc":{"line":47,"col":1}},
+//    "after":{"sig":"...","body_hash":"abc123","loc":{"line":52,"col":1}},
+//    "reason":"body_hash_match"}
+// stderr: NDJSON 메타 (NEXUS_HEXA_INTROSPECT { stage:"diff", ms, changes, a, b })
+// exit:
+//   0  diff 성공 (변경 유무 무관)
+//   1  파싱/subprocess 실패
+//   2  인자 오류
+//
+// 규칙: hexa >=/<= 금지 — < / > 만 사용. stdlib only.
+// 편집 금지: hexa-lang/, n6/, design/, mk2_hexa/, docs/,
+//             tooling/hexa-introspect/hexa_introspect.hexa (Phase 3 patch 영역),
+//             tooling/hexa-introspect/bin/hexa-introspect (Phase 3 영역)
+// ═══════════════════════════════════════════════════════════
+
+let _NS = "NEXUS_HEXA_INTROSPECT"
+let _RENAME_JACCARD_THRESHOLD_PCT: i64 = 85   // 0.85 × 100 (정수산)
+
+// ─── ns clock (BSD/GNU 양립, hexa-rules PATTERNS.md §1) ───
+fn _ns_now() -> i64 {
+    let mut r: i64 = 0
+    let raw = to_string(exec("date +%s%N 2>/dev/null")).trim()  // @allow-bare-exec
+    if raw.len() > 0 && raw.contains("N") == false {
+        try { r = to_int(raw) } catch e {}  // @allow-silent-catch
+    }
+    if r < 1 {
+        let s2 = to_string(exec("python3 -c 'import time;print(time.time_ns())' 2>/dev/null")).trim()  // @allow-bare-exec
+        try { r = to_int(s2) } catch e2 {}  // @allow-silent-catch
+    }
+    if r < 1 {
+        let s3 = to_string(exec("date +%s")).trim()  // @allow-bare-exec
+        try { let sec = to_int(s3); r = sec * 1000000000 } catch e3 {}  // @allow-silent-catch
+    }
+    return r
+}
+
+// ─── shell-arg single-quote escape (PATTERNS.md §3) ───
+fn _shq(s: string) -> string {
+    return s.replace("'", "'\\''")
+}
+
+// ─── JSON string escape (출력용) ───
+fn _json_escape(s: string) -> string {
+    let n = s.len()
+    let mut out: [string] = []
+    let mut i: i64 = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "\"" { out.push("\\\"") }
+        else if c == "\\" { out.push("\\\\") }
+        else if c == "\n" { out.push("\\n") }
+        else if c == "\r" { out.push("\\r") }
+        else if c == "\t" { out.push("\\t") }
+        else if c == "\u{0008}" { out.push("\\b") }
+        else if c == "\u{000C}" { out.push("\\f") }
+        else { out.push(c) }
+        i = i + 1
+    }
+    return out.join("")
+}
+
+// ─── identifier helpers (Jaccard tokenizer 용) ───
+fn _is_alpha(c: string) -> bool {
+    return (c == "a" || c == "b" || c == "c" || c == "d" || c == "e"
+        || c == "f" || c == "g" || c == "h" || c == "i" || c == "j"
+        || c == "k" || c == "l" || c == "m" || c == "n" || c == "o"
+        || c == "p" || c == "q" || c == "r" || c == "s" || c == "t"
+        || c == "u" || c == "v" || c == "w" || c == "x" || c == "y" || c == "z"
+        || c == "A" || c == "B" || c == "C" || c == "D" || c == "E"
+        || c == "F" || c == "G" || c == "H" || c == "I" || c == "J"
+        || c == "K" || c == "L" || c == "M" || c == "N" || c == "O"
+        || c == "P" || c == "Q" || c == "R" || c == "S" || c == "T"
+        || c == "U" || c == "V" || c == "W" || c == "X" || c == "Y" || c == "Z"
+        || c == "_")
+}
+fn _is_digit(c: string) -> bool {
+    return (c == "0" || c == "1" || c == "2" || c == "3" || c == "4"
+        || c == "5" || c == "6" || c == "7" || c == "8" || c == "9")
+}
+fn _is_ident(c: string) -> bool { return _is_alpha(c) || _is_digit(c) }
+
+// ─── self_dir 결정 (bin shim 위치에서 hexa_introspect.hexa 찾기) ───
+//
+// args()[0/1] 은 hexa run 의 launcher script 가 hexa-lang launcher 에 따라
+// 달라질 수 있으므로 NEXUS_HEXA_INTROSPECT_DIR 환경변수가 있으면 그걸 우선
+// 사용하고, 없으면 본 파일의 위치를 기준으로 sibling 인 hexa_introspect.hexa
+// 를 호출한다 (scripts/bin/hexa_remote 와 같은 패턴).
+fn _resolve_introspect_path() -> string {
+    // 1순위: 환경변수
+    let env_path = to_string(exec("printf '%s' \"${NEXUS_HEXA_INTROSPECT_PATH:-}\"")).trim()  // @allow-bare-exec
+    if env_path.len() > 0 { return env_path }
+    // 2순위: nexus root 검색 — 현 cwd 기준 tooling/hexa-introspect/hexa_introspect.hexa
+    let cand = "tooling/hexa-introspect/hexa_introspect.hexa"
+    let exists = to_string(exec("test -f '" + _shq(cand) + "' && printf yes || printf no")).trim()  // @allow-bare-exec
+    if exists == "yes" { return cand }
+    // 3순위: 절대경로 — git toplevel 추적
+    let top = to_string(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()  // @allow-bare-exec
+    if top.len() > 0 {
+        let abs = top + "/tooling/hexa-introspect/hexa_introspect.hexa"
+        let ex2 = to_string(exec("test -f '" + _shq(abs) + "' && printf yes || printf no")).trim()  // @allow-bare-exec
+        if ex2 == "yes" { return abs }
+    }
+    return cand
+}
+
+// ─── --symbols subprocess 호출 ───
+//
+// hexa-introspect --symbols <file> 을 직접 호출 (bin shim 우회). HEXA_BIN
+// 환경변수가 있으면 사용, 없으면 ~/.hx/bin/hexa.
+fn _run_symbols(path: string) -> string {
+    let isp = _resolve_introspect_path()
+    // HEXA_LOCAL=1 / HEXA_NO_SENTINEL=1 강제 (bin shim 의 정책 동일)
+    let hb = to_string(exec("printf '%s' \"${HEXA_BIN:-$HOME/.hx/bin/hexa}\"")).trim()  // @allow-bare-exec
+    let cmd = "HEXA_LOCAL=1 HEXA_NO_SENTINEL=1 '" + _shq(hb) + "' run '" + _shq(isp)
+        + "' --symbols '" + _shq(path) + "' 2>/dev/null"
+    return to_string(exec(cmd))  // @allow-bare-exec
+}
+
+// ─── 매우 간이한 JSON 배열 record 파서 ───────────────────
+//
+// `--symbols` 출력은 single-line JSON array. 각 record:
+//   {"name":"X","kind":"Y","loc":{"line":L,"col":C},"end_loc":{"line":L2,"col":C2},
+//    "type":...,"visibility":"...","parent":null,"doc":...,"sig":...,"file":"..."}
+//
+// 본 파서는 awk 가 아닌 hexa 직접 substring 으로 record 분리. JSON 의 brace
+// depth 추적 + string 보존. 각 record 안에서 `"key":` 패턴을 line-regex 풍
+// 으로 검색.
+//
+// 결과: 평행 배열
+//   names[i], kinds[i], sigs[i], start_lines[i], end_lines[i], start_cols[i]
+fn _split_json_array_records(json: string) -> [string] {
+    // strip leading/trailing brackets/space
+    let trimmed = json.trim()
+    if trimmed.len() < 2 { return [] }
+    // [ ... , ... ] 형태 가정; record 는 top-level { ... }.
+    let mut out: [string] = []
+    let n = trimmed.len()
+    let mut i: i64 = 0
+    let mut depth: i64 = 0
+    let mut in_str: bool = false
+    let mut start: i64 = -1
+    while i < n {
+        let c = trimmed.substring(i, i + 1)
+        if in_str {
+            if c == "\\" && i + 1 < n {
+                i = i + 2
+                continue
+            }
+            if c == "\"" { in_str = false }
+            i = i + 1
+            continue
+        }
+        if c == "\"" { in_str = true; i = i + 1; continue }
+        if c == "{" {
+            if depth == 0 { start = i }
+            depth = depth + 1
+        } else if c == "}" {
+            depth = depth - 1
+            if depth == 0 && start > -1 {
+                out.push(trimmed.substring(start, i + 1))
+                start = -1
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// record 안에서 "key":<value> 의 string value 를 추출. value 가 null 이면 "".
+// 매우 단순: `"<key>":` 위치 → 다음 비공백 토큰. 문자열은 "..." 로 양 끝
+// 닫힘. 숫자/null 도 다음 `,` 또는 `}` 까지.
+fn _record_field(rec: string, key: string) -> string {
+    let marker = "\"" + key + "\":"
+    let p = rec.index_of(marker)
+    if p < 0 { return "" }
+    let after = rec.substring(p + marker.len(), rec.len())
+    // skip leading ws
+    let mut i: i64 = 0
+    let n = after.len()
+    while i < n {
+        let c = after.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" { i = i + 1 }
+        else { break }
+    }
+    if i > n - 1 { return "" }
+    let first = after.substring(i, i + 1)
+    if first == "\"" {
+        // 문자열 — 닫는 " 까지, escape 인식
+        let mut j: i64 = i + 1
+        let mut buf: [string] = []
+        while j < n {
+            let cc = after.substring(j, j + 1)
+            if cc == "\\" && j + 1 < n {
+                let nn = after.substring(j + 1, j + 2)
+                if nn == "n" { buf.push("\n") }
+                else if nn == "t" { buf.push("\t") }
+                else if nn == "r" { buf.push("\r") }
+                else if nn == "\"" { buf.push("\"") }
+                else if nn == "\\" { buf.push("\\") }
+                else { buf.push(nn) }
+                j = j + 2
+                continue
+            }
+            if cc == "\"" { break }
+            buf.push(cc)
+            j = j + 1
+        }
+        return buf.join("")
+    }
+    if first == "n" {
+        // null
+        return ""
+    }
+    // 숫자 또는 객체 — , 또는 } 직전까지 (객체는 brace depth 맞춰서)
+    let mut j: i64 = i
+    let mut depth: i64 = 0
+    let mut in_str = false
+    while j < n {
+        let cc = after.substring(j, j + 1)
+        if in_str {
+            if cc == "\\" && j + 1 < n { j = j + 2; continue }
+            if cc == "\"" { in_str = false }
+            j = j + 1
+            continue
+        }
+        if cc == "\"" { in_str = true; j = j + 1; continue }
+        if cc == "{" || cc == "[" { depth = depth + 1 }
+        else if cc == "}" || cc == "]" {
+            if depth == 0 { break }
+            depth = depth - 1
+        } else if cc == "," && depth == 0 { break }
+        j = j + 1
+    }
+    return after.substring(i, j).trim()
+}
+
+// loc/end_loc 처럼 nested {"line":N,"col":M} 의 line 추출
+fn _record_int_field(rec: string, parent_key: string, sub_key: string) -> i64 {
+    // 1) parent_key 위치 → 그 뒤의 { ... } 안에서 sub_key 검색
+    let marker = "\"" + parent_key + "\":"
+    let p = rec.index_of(marker)
+    if p < 0 { return 0 }
+    let after = rec.substring(p + marker.len(), rec.len())
+    // 닫는 } 까지가 nested object 영역
+    let n = after.len()
+    let mut i: i64 = 0
+    while i < n {
+        let c = after.substring(i, i + 1)
+        if c == " " || c == "\t" { i = i + 1 } else { break }
+    }
+    if i > n - 1 || after.substring(i, i + 1) != "{" { return 0 }
+    let mut depth = 0
+    let mut end_i: i64 = i
+    let mut in_str = false
+    let mut k = i
+    while k < n {
+        let cc = after.substring(k, k + 1)
+        if in_str {
+            if cc == "\\" && k + 1 < n { k = k + 2; continue }
+            if cc == "\"" { in_str = false }
+            k = k + 1
+            continue
+        }
+        if cc == "\"" { in_str = true; k = k + 1; continue }
+        if cc == "{" { depth = depth + 1 }
+        else if cc == "}" {
+            depth = depth - 1
+            if depth == 0 { end_i = k + 1; break }
+        }
+        k = k + 1
+    }
+    let inner = after.substring(i, end_i)
+    let sub_marker = "\"" + sub_key + "\":"
+    let sp = inner.index_of(sub_marker)
+    if sp < 0 { return 0 }
+    let rest = inner.substring(sp + sub_marker.len(), inner.len())
+    // 숫자 추출: 첫 비공백 부터 , 또는 } 직전
+    let rn = rest.len()
+    let mut a: i64 = 0
+    while a < rn {
+        let cc = rest.substring(a, a + 1)
+        if cc == " " || cc == "\t" { a = a + 1 } else { break }
+    }
+    let mut b = a
+    while b < rn {
+        let cc = rest.substring(b, b + 1)
+        if cc == "," || cc == "}" { break }
+        b = b + 1
+    }
+    let raw = rest.substring(a, b).trim()
+    let mut v: i64 = 0
+    try { v = to_int(raw) } catch e {}  // @allow-silent-catch
+    return v
+}
+
+// ─── body 정규화 (주석/whitespace strip + signature strip) ───
+//
+// 입력: 원본 substring (decl 의 start ~ end). hexa source 의 문자열/주석을
+// 인식하여:
+//   - 함수의 signature ("fn name(params) -> Ret") 부분 strip — body_hash 는
+//     본문만 식별해야 rename heuristic 이 작동 (spec § 3.2: name/sig 별도 키).
+//   - // 라인 코멘트 → 제거
+//   - /* ... */ 블록 코멘트 → 제거
+//   - 연속 whitespace (space/tab/newline) → 단일 space 로 collapse
+//   - 문자열 리터럴 ("...") 은 보존 (escape 도 보존)
+//
+// kind="fn" 일 때 첫 `{` 부터 매칭 `}` 까지만 추출. 다른 kind 는 전체.
+fn _strip_fn_signature(s: string, kind: string) -> string {
+    if kind != "fn" { return s }
+    // 첫 `{` 위치 (string/comment 외부) 까지 skip
+    let n = s.len()
+    let mut i: i64 = 0
+    let mut in_str = false
+    let mut str_delim = ""
+    while i < n {
+        let c = s.substring(i, i + 1)
+        let c2 = if i + 1 < n { s.substring(i + 1, i + 2) } else { "" }
+        if in_str {
+            if c == "\\" && i + 1 < n { i = i + 2; continue }
+            if c == str_delim { in_str = false; str_delim = "" }
+            i = i + 1
+            continue
+        }
+        if c == "/" && c2 == "/" {
+            // 라인 코멘트 skip
+            while i < n && s.substring(i, i + 1) != "\n" { i = i + 1 }
+            continue
+        }
+        if c == "/" && c2 == "*" {
+            i = i + 2
+            while i + 1 < n {
+                if s.substring(i, i + 1) == "*" && s.substring(i + 1, i + 2) == "/" {
+                    i = i + 2
+                    break
+                }
+                i = i + 1
+            }
+            continue
+        }
+        if c == "\"" { in_str = true; str_delim = "\""; i = i + 1; continue }
+        if c == "{" { return s.substring(i, n) }
+        i = i + 1
+    }
+    return s
+}
+fn _normalize_body(s: string) -> string {
+    let n = s.len()
+    let mut out: [string] = []
+    let mut i: i64 = 0
+    let mut in_str = false
+    let mut str_delim = ""
+    let mut prev_was_space = false
+    while i < n {
+        let c = s.substring(i, i + 1)
+        let c2 = if i + 1 < n { s.substring(i + 1, i + 2) } else { "" }
+        if in_str {
+            if c == "\\" && i + 1 < n {
+                out.push(c)
+                out.push(c2)
+                i = i + 2
+                prev_was_space = false
+                continue
+            }
+            if c == str_delim {
+                in_str = false
+                out.push(c)
+                str_delim = ""
+                i = i + 1
+                prev_was_space = false
+                continue
+            }
+            out.push(c)
+            i = i + 1
+            prev_was_space = false
+            continue
+        }
+        // 라인 코멘트
+        if c == "/" && c2 == "/" {
+            // 다음 \n 까지 skip
+            let mut j = i + 2
+            while j < n && s.substring(j, j + 1) != "\n" { j = j + 1 }
+            i = j
+            continue
+        }
+        // 블록 코멘트 (단순 — non-nested)
+        if c == "/" && c2 == "*" {
+            let mut j = i + 2
+            while j + 1 < n {
+                if s.substring(j, j + 1) == "*" && s.substring(j + 1, j + 2) == "/" {
+                    j = j + 2
+                    break
+                }
+                j = j + 1
+            }
+            i = j
+            continue
+        }
+        // 문자열 시작
+        if c == "\"" {
+            in_str = true
+            str_delim = "\""
+            out.push(c)
+            i = i + 1
+            prev_was_space = false
+            continue
+        }
+        // whitespace collapse
+        if c == " " || c == "\t" || c == "\r" || c == "\n" {
+            if !prev_was_space {
+                out.push(" ")
+                prev_was_space = true
+            }
+            i = i + 1
+            continue
+        }
+        out.push(c)
+        prev_was_space = false
+        i = i + 1
+    }
+    return out.join("").trim()
+}
+
+// ─── hash: shasum 우선, FNV-1a 32-bit 폴백 ───
+//
+// stdlib hash/sha256 부재 → shell shasum 으로 SHA-1 계산. 없는 환경 (예:
+// minimal docker) 에서는 본 폴백 hash 가 동작. 둘 다 32-byte 미만이라 spec
+// 의 "16-hex SHA-1 prefix" (§ 5.1 SigOrBody.body_hash) 와 호환.
+fn _hash_body(s: string) -> string {
+    if s.len() < 1 { return "0000000000000000" }
+    // shasum: BSD `shasum -a 1` (= SHA-1, 40 hex). 표준 input 으로 stdin 사용.
+    // 작은 hexa string (10K bytes) 정도까지는 echo `''` 로 직접 전달.
+    // 매우 긴 body 는 /tmp 임시파일 우회 (안전성 우선).
+    let tmp = "/tmp/hexa_diff_body_" + to_string(_ns_now()) + ".txt"
+    let mut wrote = false
+    try {
+        write_file(tmp, s)
+        wrote = true
+    } catch e {}  // @allow-silent-catch
+    if wrote {
+        let raw = to_string(exec("shasum -a 1 < '" + _shq(tmp) + "' 2>/dev/null | awk '{print $1}'")).trim()  // @allow-bare-exec
+        try { let _ = exec("rm -f '" + _shq(tmp) + "'") } catch e2 {}  // @allow-silent-catch @allow-bare-exec @allow-rc-trailer-missing
+        if raw.len() > 15 {
+            return raw.substring(0, 16)
+        }
+    }
+    // FNV-1a 32-bit 폴백 — 8 hex
+    let mut h: i64 = 2166136261
+    let nb = s.len()
+    let mut i: i64 = 0
+    while i < nb {
+        let c = s.substring(i, i + 1)
+        // codepoint 의 단일 byte 로서 ord 를 추정 — hexa 는 substring(i,i+1) 이
+        // 1-byte 단위. ord 헬퍼 부재 → ascii 표 룩업으로 우회.
+        let ov = _ord_byte(c)
+        h = h ^ ov
+        h = (h * 16777619)
+        // 32-bit truncation: i64 mask
+        h = h & 4294967295
+        i = i + 1
+    }
+    return _to_hex8(h)
+}
+
+// ASCII 인쇄 가능 문자 + 일부 control. UTF-8 multi-byte 는 단일 byte 로 분해
+// 되어 알 수 없는 char → 0 으로 처리해도 hash collision 영향은 미미 (rename
+// 후보 검출은 어차피 jaccard 폴백).
+fn _ord_byte(c: string) -> i64 {
+    if c.len() < 1 { return 0 }
+    // 명시적 ASCII 룩업 — 32..126 + 일부 control
+    let alphas = "abcdefghijklmnopqrstuvwxyz"
+    let upcase = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    let digits = "0123456789"
+    let symbol = " !\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
+    // hexa 의 string.index_of 는 byte 인덱스.
+    let pa = alphas.index_of(c)
+    if pa > -1 { return 97 + pa }
+    let pu = upcase.index_of(c)
+    if pu > -1 { return 65 + pu }
+    let pd = digits.index_of(c)
+    if pd > -1 { return 48 + pd }
+    let ps = symbol.index_of(c)
+    if ps > -1 { return 32 + ps }
+    if c == "\n" { return 10 }
+    if c == "\t" { return 9 }
+    if c == "\r" { return 13 }
+    return 0
+}
+fn _to_hex8(n: i64) -> string {
+    let hexd = "0123456789abcdef"
+    let mut out: [string] = []
+    let mut k = 7
+    while k > -1 {
+        let nibble = (n / _pow16(k)) & 15
+        out.push(hexd.substring(nibble, nibble + 1))
+        k = k - 1
+    }
+    return out.join("")
+}
+fn _pow16(p: i64) -> i64 {
+    let mut r: i64 = 1
+    let mut i = 0
+    while i < p { r = r * 16; i = i + 1 }
+    return r
+}
+
+// ─── Jaccard token similarity (rename heuristic 보강) ───
+//
+// 두 body 의 identifier-set 을 추출 (영숫자/_) 후 |A∩B| / |A∪B| × 100.
+// O(n×m) but body 는 보통 < 200 토큰 → < 1ms.
+fn _tokens_of(s: string) -> [string] {
+    let mut out: [string] = []
+    let n = s.len()
+    let mut i: i64 = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if _is_alpha(c) {
+            let st = i
+            while i < n && _is_ident(s.substring(i, i + 1)) { i = i + 1 }
+            out.push(s.substring(st, i))
+            continue
+        }
+        i = i + 1
+    }
+    return out
+}
+fn _unique(xs: [string]) -> [string] {
+    let mut out: [string] = []
+    let mut i = 0
+    while i < xs.len() {
+        let v = xs[i]
+        let mut found = false
+        let mut j = 0
+        while j < out.len() {
+            if out[j] == v { found = true; break }
+            j = j + 1
+        }
+        if !found { out.push(v) }
+        i = i + 1
+    }
+    return out
+}
+fn _jaccard_pct(a: [string], b: [string]) -> i64 {
+    let ua = _unique(a)
+    let ub = _unique(b)
+    if ua.len() < 1 && ub.len() < 1 { return 100 }
+    if ua.len() < 1 || ub.len() < 1 { return 0 }
+    // intersection
+    let mut inter: i64 = 0
+    let mut i = 0
+    while i < ua.len() {
+        let v = ua[i]
+        let mut j = 0
+        while j < ub.len() {
+            if ub[j] == v { inter = inter + 1; break }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let union = ua.len() + ub.len() - inter
+    if union < 1 { return 0 }
+    return (inter * 100) / union
+}
+
+// ─── source 의 [start_line, end_line] 영역 추출 (1-based, inclusive) ───
+fn _slice_lines(src: string, sl: i64, el: i64) -> string {
+    let n = src.len()
+    let mut line: i64 = 1
+    let mut i: i64 = 0
+    let mut out_start: i64 = -1
+    let mut out_end: i64 = n
+    while i < n {
+        if line == sl && out_start < 0 { out_start = i }
+        if line == el + 1 { out_end = i; break }
+        if src.substring(i, i + 1) == "\n" { line = line + 1 }
+        i = i + 1
+    }
+    if out_start < 0 { return "" }
+    return src.substring(out_start, out_end)
+}
+
+// ─── change emission ───
+fn _emit_change(change: string, name_old: string, name_new: string,
+                kind: string, reason: string,
+                before_sig: string, before_hash: string, before_line: i64,
+                after_sig: string, after_hash: string, after_line: i64,
+                a_path: string, b_path: string) {
+    let mut sb: [string] = []
+    sb.push("{\"change\":\"")
+    sb.push(change)
+    sb.push("\",\"kind\":\"")
+    sb.push(kind)
+    sb.push("\",\"name_old\":\"")
+    sb.push(_json_escape(name_old))
+    sb.push("\",\"name_new\":\"")
+    sb.push(_json_escape(name_new))
+    sb.push("\"")
+    if reason.len() > 0 {
+        sb.push(",\"reason\":\"")
+        sb.push(_json_escape(reason))
+        sb.push("\"")
+    }
+    if before_line > 0 || before_sig.len() > 0 || before_hash.len() > 0 {
+        sb.push(",\"before\":{\"sig\":")
+        if before_sig.len() > 0 {
+            sb.push("\"")
+            sb.push(_json_escape(before_sig))
+            sb.push("\"")
+        } else { sb.push("null") }
+        sb.push(",\"body_hash\":\"")
+        sb.push(before_hash)
+        sb.push("\",\"loc\":{\"file\":\"")
+        sb.push(_json_escape(a_path))
+        sb.push("\",\"line\":")
+        sb.push(to_string(before_line))
+        sb.push("}}")
+    }
+    if after_line > 0 || after_sig.len() > 0 || after_hash.len() > 0 {
+        sb.push(",\"after\":{\"sig\":")
+        if after_sig.len() > 0 {
+            sb.push("\"")
+            sb.push(_json_escape(after_sig))
+            sb.push("\"")
+        } else { sb.push("null") }
+        sb.push(",\"body_hash\":\"")
+        sb.push(after_hash)
+        sb.push("\",\"loc\":{\"file\":\"")
+        sb.push(_json_escape(b_path))
+        sb.push("\",\"line\":")
+        sb.push(to_string(after_line))
+        sb.push("}}")
+    }
+    sb.push("}")
+    println(sb.join(""))
+}
+
+// ─── meta ───
+fn _emit_meta(stage: string, ms: i64, changes: i64, a: string, b: string) {
+    let mut m: [string] = []
+    m.push(_NS)
+    m.push(" {\"stage\":\"")
+    m.push(stage)
+    m.push("\",\"ms\":")
+    m.push(to_string(ms))
+    m.push(",\"changes\":")
+    m.push(to_string(changes))
+    m.push(",\"a\":\"")
+    m.push(_json_escape(a))
+    m.push("\",\"b\":\"")
+    m.push(_json_escape(b))
+    m.push("\"}")
+    eprintln(m.join(""))
+}
+
+// ─── usage ───
+fn _usage() {
+    eprintln("usage: hexa run tooling/hexa-introspect/diff.hexa --diff <a.hexa> <b.hexa>")
+    eprintln("  Phase 5a — symbol-table hash diff (single-file).")
+    eprintln("  output: NDJSON, 1 line per change (added/removed/renamed/")
+    eprintln("          signature_changed/body_changed)")
+    eprintln("  exit:   0=ok, 1=parse/subprocess fail, 2=invalid args")
+}
+
+// ═══════════════════════════════════════════════════════════
+// entry
+// ═══════════════════════════════════════════════════════════
+let a = args()
+// args shape: [exe, exe, mode, a.hexa, b.hexa] (HEXA_LOCAL=1)
+if len(a) < 5 {
+    _usage()
+    exit(2)  // @allow-silent-exit
+}
+let mode = a[2]
+if mode != "--diff" {
+    _usage()
+    exit(2)  // @allow-silent-exit
+}
+let a_path = a[3]
+let b_path = a[4]
+
+let exa = to_string(exec("test -f '" + _shq(a_path) + "' && printf yes || printf no")).trim()  // @allow-bare-exec
+let exb = to_string(exec("test -f '" + _shq(b_path) + "' && printf yes || printf no")).trim()  // @allow-bare-exec
+if exa != "yes" {
+    eprintln("hexa-diff: file not found: " + a_path)
+    exit(1)  // @allow-silent-exit
+}
+if exb != "yes" {
+    eprintln("hexa-diff: file not found: " + b_path)
+    exit(1)  // @allow-silent-exit
+}
+
+let t0 = _ns_now()
+
+// 1) symbols 추출 (subprocess × 2)
+let sa_json = _run_symbols(a_path)
+let sb_json = _run_symbols(b_path)
+
+if sa_json.len() < 2 || sb_json.len() < 2 {
+    eprintln("hexa-diff: --symbols subprocess produced empty output")
+    eprintln("  a: " + a_path + " (" + to_string(sa_json.len()) + " bytes)")
+    eprintln("  b: " + b_path + " (" + to_string(sb_json.len()) + " bytes)")
+    exit(1)  // @allow-silent-exit
+}
+
+let recs_a = _split_json_array_records(sa_json)
+let recs_b = _split_json_array_records(sb_json)
+
+// 2) 두 파일의 source 읽기 — body slice 용
+let src_a = read_file(a_path)
+let src_b = read_file(b_path)
+
+// 3) 평행 배열 빌드 (Sa / Sb)
+let mut a_names: [string] = []
+let mut a_kinds: [string] = []
+let mut a_sigs:  [string] = []
+let mut a_lines: [i64]    = []
+let mut a_endlines: [i64] = []
+let mut a_hashes: [string] = []
+let mut a_bodies: [string] = []   // 정규화 후 body (jaccard 용)
+let mut a_used:  [bool]   = []
+
+let mut idx: i64 = 0
+while idx < recs_a.len() {
+    let r = recs_a[idx]
+    let nm = _record_field(r, "name")
+    let kd = _record_field(r, "kind")
+    let sg = _record_field(r, "sig")
+    let sl = _record_int_field(r, "loc", "line")
+    let el = _record_int_field(r, "end_loc", "line")
+    let body_raw = _slice_lines(src_a, sl, el)
+    let body_stripped = _strip_fn_signature(body_raw, kd)
+    let body_norm = _normalize_body(body_stripped)
+    let h = _hash_body(body_norm)
+    a_names.push(nm)
+    a_kinds.push(kd)
+    a_sigs.push(sg)
+    a_lines.push(sl)
+    a_endlines.push(el)
+    a_hashes.push(h)
+    a_bodies.push(body_norm)
+    a_used.push(false)
+    idx = idx + 1
+}
+
+let mut b_names: [string] = []
+let mut b_kinds: [string] = []
+let mut b_sigs:  [string] = []
+let mut b_lines: [i64]    = []
+let mut b_endlines: [i64] = []
+let mut b_hashes: [string] = []
+let mut b_bodies: [string] = []
+let mut b_used:  [bool]   = []
+
+idx = 0
+while idx < recs_b.len() {
+    let r = recs_b[idx]
+    let nm = _record_field(r, "name")
+    let kd = _record_field(r, "kind")
+    let sg = _record_field(r, "sig")
+    let sl = _record_int_field(r, "loc", "line")
+    let el = _record_int_field(r, "end_loc", "line")
+    let body_raw = _slice_lines(src_b, sl, el)
+    let body_stripped = _strip_fn_signature(body_raw, kd)
+    let body_norm = _normalize_body(body_stripped)
+    let h = _hash_body(body_norm)
+    b_names.push(nm)
+    b_kinds.push(kd)
+    b_sigs.push(sg)
+    b_lines.push(sl)
+    b_endlines.push(el)
+    b_hashes.push(h)
+    b_bodies.push(body_norm)
+    b_used.push(false)
+    idx = idx + 1
+}
+
+// 4) 매칭 알고리즘 (spec § 3.2)
+let mut changes: i64 = 0
+
+// pass 1: name × kind 일치 매칭
+let mut i = 0
+while i < a_names.len() {
+    let nm = a_names[i]
+    let kd = a_kinds[i]
+    let mut j = 0
+    let mut matched: i64 = -1
+    while j < b_names.len() {
+        if !b_used[j] && b_names[j] == nm && b_kinds[j] == kd {
+            matched = j
+            break
+        }
+        j = j + 1
+    }
+    if matched > -1 {
+        let bj: i64 = matched
+        a_used[i] = true
+        b_used[bj] = true
+        let same_sig  = a_sigs[i] == b_sigs[bj]
+        let same_body = a_hashes[i] == b_hashes[bj]
+        if same_sig && same_body {
+            // unchanged — emit only if include_body 이지만 spec § 3.2 는 emit
+            // (verbose). NDJSON consumer 가 grep 필터 가능하도록 emit.
+            _emit_change("unchanged", nm, nm, kd, "",
+                a_sigs[i], a_hashes[i], a_lines[i],
+                b_sigs[bj], b_hashes[bj], b_lines[bj],
+                a_path, b_path)
+            changes = changes + 1
+        } else if same_sig {
+            _emit_change("body_changed", nm, nm, kd, "sig_match_body_diff",
+                a_sigs[i], a_hashes[i], a_lines[i],
+                b_sigs[bj], b_hashes[bj], b_lines[bj],
+                a_path, b_path)
+            changes = changes + 1
+        } else if same_body {
+            _emit_change("signature_changed", nm, nm, kd, "body_match_sig_diff",
+                a_sigs[i], a_hashes[i], a_lines[i],
+                b_sigs[bj], b_hashes[bj], b_lines[bj],
+                a_path, b_path)
+            changes = changes + 1
+        } else {
+            // sig + body 모두 변경 — sig 우선 분류 (sig 가 ABI 보강 신호)
+            _emit_change("signature_changed", nm, nm, kd, "sig_and_body_diff",
+                a_sigs[i], a_hashes[i], a_lines[i],
+                b_sigs[bj], b_hashes[bj], b_lines[bj],
+                a_path, b_path)
+            changes = changes + 1
+        }
+    }
+    i = i + 1
+}
+
+// pass 2: 이름 매칭 안 된 a 항목들 — rename 후보 / removed 판정
+i = 0
+while i < a_names.len() {
+    if a_used[i] { i = i + 1; continue }
+    let nm = a_names[i]
+    let kd = a_kinds[i]
+    let h  = a_hashes[i]
+    // rename heuristic-1: 동일 kind + body_hash 일치
+    let mut cand: i64 = -1
+    let mut reason = ""
+    let mut j = 0
+    while j < b_names.len() {
+        if !b_used[j] && b_kinds[j] == kd && b_hashes[j] == h {
+            cand = j
+            reason = "body_hash_match"
+            break
+        }
+        j = j + 1
+    }
+    // rename heuristic-2: Jaccard ≥ 85
+    if cand < 0 {
+        let toks_a = _tokens_of(a_bodies[i])
+        let mut best_j: i64 = -1
+        let mut best_pct: i64 = -1
+        let mut k2 = 0
+        while k2 < b_names.len() {
+            if !b_used[k2] && b_kinds[k2] == kd {
+                let toks_b = _tokens_of(b_bodies[k2])
+                let pct = _jaccard_pct(toks_a, toks_b)
+                if pct > best_pct { best_pct = pct; best_j = k2 }
+            }
+            k2 = k2 + 1
+        }
+        if best_j > -1 && best_pct > _RENAME_JACCARD_THRESHOLD_PCT - 1 {
+            cand = best_j
+            reason = "jaccard_pct_" + to_string(best_pct)
+        }
+    }
+    if cand > -1 {
+        a_used[i] = true
+        b_used[cand] = true
+        _emit_change("renamed", nm, b_names[cand], kd, reason,
+            a_sigs[i], a_hashes[i], a_lines[i],
+            b_sigs[cand], b_hashes[cand], b_lines[cand],
+            a_path, b_path)
+        changes = changes + 1
+    } else {
+        _emit_change("removed", nm, "", kd, "no_match",
+            a_sigs[i], a_hashes[i], a_lines[i],
+            "", "", 0,
+            a_path, b_path)
+        changes = changes + 1
+    }
+    i = i + 1
+}
+
+// pass 3: 매칭 안 된 b 잔여 → added
+let mut k3 = 0
+while k3 < b_names.len() {
+    if !b_used[k3] {
+        _emit_change("added", "", b_names[k3], b_kinds[k3], "no_match",
+            "", "", 0,
+            b_sigs[k3], b_hashes[k3], b_lines[k3],
+            a_path, b_path)
+        changes = changes + 1
+    }
+    k3 = k3 + 1
+}
+
+let t1 = _ns_now()
+let ms = (t1 - t0) / 1000000
+_emit_meta("diff", ms, changes, a_path, b_path)
+exit(0)  // @allow-silent-exit
