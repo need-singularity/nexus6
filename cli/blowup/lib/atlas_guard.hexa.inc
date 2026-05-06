@@ -24,7 +24,10 @@ fn _valid_atlas_line(line: string) -> bool {
 
 // v2 continuation row 감지 — `<key>=...` or `<key> = ...` 형태 + 허용 key whitelist.
 fn _is_v2_continuation_key(t: string) -> bool {
-    let keys = ["lhs", "rhs", "delta", "z", "witness", "note", "if_true", "if_false", "test", "deadline", "cite", "vintage", "uncertainty", "status", "risks", "contrast", "source", "frame", "scale"]
+    // axis-M (2026-05-06): unit + external-anchor primitives — see
+    // atlas.append.atlas-self-arch-axis-m-unit-anchor-2026-05-06.n6 §2/§7
+    // K_core 22 → 24 (ceiling 30, headroom 6 for axis-N+)
+    let keys = ["lhs", "rhs", "delta", "z", "witness", "note", "if_true", "if_false", "test", "deadline", "cite", "vintage", "uncertainty", "status", "risks", "contrast", "source", "frame", "scale", "unit", "anchor"]
     for k in keys {
         if t.starts_with(k + "=") { return true }
         if t.starts_with(k + " =") { return true }
