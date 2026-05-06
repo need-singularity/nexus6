@@ -451,3 +451,6 @@ grep -nE '^\s*"kind":\s*"[A-Z][A-Za-z]+"' /Users/ghost/core/hexa-lang/self/parse
 | 2026-05-06 | 초안 — Phase 4-LSP 우선 권고. Phase 4-Native 백로그. |
 | 2026-05-06 | § 7.2 추가 — Phase 4-LSP land. lsp.hexa 792→1247줄. hover/definition/rename 구현 + 검증 (ASCII 소스). \uXXXX 디코드는 후속. |
 | 2026-05-06 | 잔여 후속 1/3 완료 — `\uXXXX` BMP decode (`json_get_string`) +31줄 (lsp.hexa 792→823). initialize 회귀 0. workspace rename / find_all_occurrences perf 는 후속. |
+| 2026-05-06 | Phase 4-LSP 풀구현 land — handle_definition/hover/rename 본문 채움 + word_at_position/find_symbol/find_all_occurrences 신규 (lsp.hexa 823→991). hexa parse OK, initialize 회귀 0. 작은 파일 검증 OK. |
+| 2026-05-06 | find_all perf 측정 — 40KB lsp.hexa 호출 30s+ ceiling. 원인: hexa runtime substring/index_of O(n) → outer loop O(n²). 알고리즘 재작성 (single-pass + line/col tracking) 효과 0 — 병목은 runtime layer. 갭 카탈로그 신규 항목 `hexa-runtime-substring-perf` 등재. |
+| 2026-05-06 | Workspace rename status — current handle_rename single-file 작동. cross-file workspace rename 은 (1) directory glob enum (2) per-file find_all_occurrences (3) WorkspaceEdit aggregation 필요. (2) 가 runtime substring 한계 위에 N배 누적 → 비실용적. **runtime perf 해소 후 wiring** (백로그). |
