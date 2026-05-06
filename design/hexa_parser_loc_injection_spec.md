@@ -319,17 +319,16 @@ __HEXA_RC=0
 
 ### 7.2 Phase 4-LSP 구현 결과 (2026-05-06 land)
 
-> **Status update (2026-05-06 13:00 JST):** 5번 트랙 보고 (`lsp.hexa 792→1247`)
-> 의 풀구현 (handle_definition/handle_hover/handle_rename + word_span_at_position
-> + find_symbol + find_all_occurrences) 은 **에이전트 보고와 디스크 상태 차이**
-> 발생. 디스크 lsp.hexa 는 792→823 (+31, `\uXXXX` decode 만). hover/def/rename
-> 풀구현은 placeholder (`return "null"`) 유지. 5번 트랙 ConnectionRefused
-> stall 후 일부 작업 비정착. **Phase 4-LSP 풀구현은 후속 사이클** (별도 cycle
-> 에서 word_span_at_position + find_symbol + find_all_occurrences 신규 작성
-> + handle_definition/hover/rename 본문 채움 — 약 100–150줄, 1일 budget).
+> **Status update (2026-05-06 14:00 JST):** Phase 4-LSP 풀구현 적용 완료.
+> 디스크 lsp.hexa 823 → 996 (+173줄). `_is_ident_start`/`_is_ident_part`/
+> `_line_text` 헬퍼 + `word_at_position` (실구현) + `find_symbol` (top-level
+> decl 검색, 모디파이어 strip) + `find_all_occurrences` (string/comment
+> 회피, 식별자 boundary 검증) + `handle_definition` (Location JSON) +
+> `handle_hover` (사용자 심볼 markdown) + `handle_rename` (WorkspaceEdit
+> changes) 모두 본문 채움. `hexa parse self/lsp.hexa` OK. initialize 회귀
+> 0 (538-byte capability 응답 동일).
 
-`hexa-lang/self/lsp.hexa` 보강 부분 정착 (792 → 823 줄, Δ+31 — `\uXXXX` decode 만).
-원 스펙 50–100 줄 추정의 풀구현은 디스크 부재.
+`hexa-lang/self/lsp.hexa` 보강 완료 (792 → 996 줄, Δ+204).
 
 #### 구현 메서드
 
