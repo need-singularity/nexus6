@@ -444,3 +444,24 @@ mk2_hexa/mk2/src/atlas/mod.hexa) 도중 발견된 hexa-lang stdlib/언어 gap
 - spec: `design/mk2_atlas_smoke_ci_integration_spec.md`
 - 옵션 A (git pre-push) + C (hive hook-bind PostToolUse) 추천
 - 현 상태: **옵션 A 적용 완료** — `tooling/smoke/git_pre_push_hook.sh` 작성. 사용자가 `ln -sf ../../tooling/smoke/git_pre_push_hook.sh .git/hooks/pre-push` 으로 활성화. 옵션 C (hook-bind PostToolUse) 후속.
+
+### NEW: hexa-runtime-substring-perf (2026-05-06)
+
+`source.substring(a, b)` 가 매 호출마다 O(n) byte copy → 단일 소스 다중
+검색 시 O(n²) 누적. 40KB 파일 (lsp.hexa) 의 `find_all_occurrences("to_string")`
+호출 시 30s+ 소요 (단일 매칭 기능적 검증은 작은 파일 OK).
+
+**impact**: hexa-introspect Phase 5b/5c 의 atlas pair scan, lsp.hexa
+rename, AST diff body_hash 정규화 등이 큰 파일에서 실용 불가.
+
+**workaround**:
+- 작은 파일 (<5KB) 한정 사용
+- batch 처리 시 split 후 line-level scan (cache lines once)
+- AST 기반 outline 추출 (tree-sitter / introspect --symbols) 후 target line 만 scan
+
+**proposed runtime API**:
+- C-side substring view (zero-copy slice, COW on mutation)
+- `string.find_all_iter(needle: string) -> iterator<int>` intrinsic (Boyer-Moore)
+- `string.byte_at(i: int) -> int` constant-time access (현재 `chars()[i]` 가 O(n))
+
+**estimated effort**: 1–2일 (hexa-lang/self/runtime.c string ops 재작성).
