@@ -447,9 +447,18 @@ mk2_hexa/mk2/src/atlas/mod.hexa) 도중 발견된 hexa-lang stdlib/언어 gap
 
 ### NEW: hexa-runtime-substring-perf (2026-05-06)
 
-`source.substring(a, b)` 가 매 호출마다 O(n) byte copy → 단일 소스 다중
-검색 시 O(n²) 누적. 40KB 파일 (lsp.hexa) 의 `find_all_occurrences("to_string")`
-호출 시 30s+ 소요 (단일 매칭 기능적 검증은 작은 파일 OK).
+> **STATUS UPDATE 2026-05-06 18:00:** root cause 재분류. find_all_occurrences
+> 2-pass strstr 알고리즘 O(n+occs) 적용 후에도 30s+ 측정. 별도 cold-start 측정
+> = 517ms (bare `hexa run hello.hexa`). 즉 30s+ 의 dominant cost 는
+> `use lsp` 키워드의 992-line lsp.hexa module 파싱+top-level 실행 — 이는
+> **module-import-system** 갭 (이미 카탈로그 #1 항목). substring perf 는 부차.
+>
+> 실제 LSP 서버 모드 (`hexa lsp` daemon) 는 module 1회 load 후 다중 요청 서빙
+> → perf 자연 amortize. find_all_occurrences 자체는 알고리즘 + char_code_at
+> 빌트인 사용으로 적정 복잡도.
+
+`source.substring(a, b)` 가 매 호출마다 O(n) byte copy 가 부차 우려, 단
+별도 cold-start 측정으로 root cause 가 module load 임 확인.
 
 **impact**: hexa-introspect Phase 5b/5c 의 atlas pair scan, lsp.hexa
 rename, AST diff body_hash 정규화 등이 큰 파일에서 실용 불가.
