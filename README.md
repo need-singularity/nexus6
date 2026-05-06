@@ -222,7 +222,34 @@ nexus dispatch  # multi-project cross-pollination
 
 ## Links
 
-**[🗺️ 3D Reality Map](https://need-singularity.github.io/nexus/)** · **[🔴 Live roadmap](https://need-singularity.github.io/nexus/roadmap/#nexus)** · **[Papers](https://need-singularity.github.io/papers/)** · **[Atlas](https://need-singularity.github.io/TECS-L/atlas/)**
+**[🌐 atlas.n6 3D map](https://need-singularity.github.io/nexus/atlas3d.html)** · **[🗺️ 3D Reality Map](https://need-singularity.github.io/nexus/)** · **[🔴 Live roadmap](https://need-singularity.github.io/nexus/roadmap/#nexus)** · **[Papers](https://need-singularity.github.io/papers/)** · **[Atlas](https://need-singularity.github.io/TECS-L/atlas/)**
+
+### atlas.n6 3D map — zero-conversion direct viewer
+
+Browser fetches `n6/atlas.n6` directly (mirrored to `docs/atlas.n6` on Pages deploy) and parses it client-side — **no JSON build step**.
+
+- 5-layer color stratification (L0 foundations → L4 cosmic), golden-spiral layout per layer with hubs centered
+- Toggles: per-layer visibility · edges · **hub-100** (top centrality) · **phase47** (cross-domain @S bridges) · **theorem** (R29 Foundation Isomorphism — atlas 7 primitives ↔ meta 7 reflections + 7 isomorphism rays)
+- DSL search: `L:0 dom:foundation hub>5 t:p` (also accepts substring fallback)
+- Diff overlay: `bin/atlas3d diff <ref> <ref>` emits `docs/atlas3d/diff.json`; viewer highlights added @-nodes in cyan
+- Sparkline of daily events from `atlas.n6.events.jsonl`
+
+#### CLI quickstart
+
+```bash
+bin/atlas3d publish      # symlink atlas.n6 + manifest, optional commit
+bin/atlas3d serve        # http://127.0.0.1:8080/atlas3d.html
+bin/atlas3d watch        # mtime → manifest refresh
+bin/atlas3d snapshot     # docs/atlas3d/coords.json (deterministic 3D positions)
+bin/atlas3d overlay      # docs/atlas3d/overlays/ (hub_centrality + phase4x)
+bin/atlas3d theorem      # R29 + R31 visual-proof JSON
+bin/atlas3d tail         # events.jsonl → daily-bucket timeline
+bin/atlas3d query 'L:0 t:p hub>5' --limit 20
+bin/atlas3d diff HEAD~10 HEAD
+bin/atlas3d audit        # node/edge/orphan counts
+```
+
+`bin/atlas3d publish` is idempotent: re-run anytime atlas.n6 changes; GitHub Actions (`.github/workflows/pages.yml`) materializes the symlink on deploy and republishes Pages.
 
 ---
 

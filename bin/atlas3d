@@ -1,0 +1,562 @@
+#!/usr/bin/env python3
+# atlas3d — atlas.n6 → docs/atlas3d/ 직접 발행 CLI (Pages 자동 deploy)
+#
+# 핵심: 변환 0. atlas.n6 자체를 docs/ 에 mirror, viewer 가 client-side 로 파싱.
+# 사이드카 (overlay/theorem/timeline/coords) 는 작은 JSON 으로 별도 emit.
+#
+# subcommands:
+#   publish      docs/atlas.n6 symlink 보장 + manifest emit + (옵션) git commit
+#   serve        docs/ 로컬 http.server
+#   watch        atlas.n6 mtime → manifest 갱신
+#   shard        domain 별 chunked text emit (M2)
+#   snapshot     deterministic 3D 좌표 사이드카 emit (M2)
+#   overlay      hub_centrality + phase4x → overlays/ (M3)
+#   theorem      R29/R31 proof JSON (M4)
+#   tail         events.jsonl → timeline.json (M5)
+#   query        DSL 필터 (M6)
+#   diff         git ref↔ref @-node delta (M6)
+#   audit        무결성 체크
+#
+# atlas.n6 문법 (atlas.n6 헤더 발췌):
+#   @P|@C|@L|@F|@R|@S|@X|@? id = expr :: domain [grade]
+#     <- depends_on / -> derives / => application
+#     == equivalent / ~> converges_to / |> verified_by
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+ATLAS = ROOT / "n6" / "atlas.n6"
+DOCS = ROOT / "docs"
+ATLAS_MIRROR = DOCS / "atlas.n6"
+ATLAS3D_DIR = DOCS / "atlas3d"
+MANIFEST = ATLAS3D_DIR / "manifest.json"
+
+DOMAIN_LAYER = {
+    "absolute": 0, "algebra": 0, "axiom_combo": 0, "foundation": 0,
+    "geometry": 0, "mathematics": 0, "meta": 0, "nuclear": 0,
+    "number_theory": 0, "particle": 0, "quark": 0, "sub_quark": 0,
+    "topology": 0,
+    "anatomy": 1, "architecture": 1, "atmospheric_physics": 1,
+    "atom": 1, "bond": 1, "chemistry": 1, "cryptography": 1, "physics": 1,
+    "bio": 2, "bio_hiv": 2, "biology": 2, "consciousness": 2,
+    "genetic": 2, "genetics_applied": 2, "material": 2, "molecule": 2,
+    "celestial": 4, "convergence": 4, "cosmological": 4, "cosmology": 4,
+    "galactic": 4, "multiversal": 4,
+}
+LAYER_DEFAULT = 3
+LAYER_NAMES = [
+    "L0 foundations/particles", "L1 atoms/laws", "L2 molecules/bio",
+    "L3 domains", "L4 cosmic",
+]
+TYPE_CHARS = "PCLFRSX?"
+NODE_RE = re.compile(
+    r"^@(?P<t>[" + TYPE_CHARS + r"])\s+(?P<id>\S+)"
+    r"(?:\s*=\s*(?P<expr>.*?))?"
+    r"\s*::\s*(?P<dom>\S+)"
+    r"\s*\[(?P<grade>[^\]]+)\]\s*$"
+)
+ARROW_RE = re.compile(r"^\s+(?P<arrow>(<-|->|=>|==|~>))\s+(?P<rhs>.+)$")
+
+
+def parse_atlas(text):
+    nodes, seen = [], {}
+    edges_pending, cur = [], None
+    for raw in text.splitlines():
+        m = NODE_RE.match(raw)
+        if m:
+            nid = m.group("id")
+            if nid in seen:
+                cur = nid
+                continue
+            expr = (m.group("expr") or "").strip().strip('"').strip("'")
+            node = {
+                "i": len(nodes),
+                "id": nid,
+                "t": m.group("t").lower(),
+                "dom": m.group("dom"),
+                "g": m.group("grade"),
+                "l": DOMAIN_LAYER.get(m.group("dom"), LAYER_DEFAULT),
+                "e": expr,
+                "d": 0,
+            }
+            seen[nid] = node["i"]
+            nodes.append(node)
+            cur = nid
+            continue
+        am = ARROW_RE.match(raw)
+        if am and cur is not None:
+            arrow = am.group("arrow")
+            rhs = am.group("rhs").strip()
+            if rhs.startswith(('"', "'", "#")):
+                continue
+            for tok in rhs.split(","):
+                t = re.split(r"[\s(=]", tok.strip(), maxsplit=1)[0].strip()
+                if not t or t in {".", "...", "—"}:
+                    continue
+                if arrow == "<-":
+                    edges_pending.append((t, cur))
+                else:
+                    edges_pending.append((cur, t))
+    edges = []
+    for s, d in edges_pending:
+        si, di = seen.get(s), seen.get(d)
+        if si is None or di is None or si == di:
+            continue
+        edges.append((si, di))
+    edges = list(dict.fromkeys(edges))
+    for s, d in edges:
+        nodes[s]["d"] += 1
+        nodes[d]["d"] += 1
+    return nodes, edges
+
+
+def ensure_mirror():
+    """docs/atlas.n6 가 atlas.n6 를 가리키는 symlink 인지 보장."""
+    DOCS.mkdir(parents=True, exist_ok=True)
+    target = Path("..") / "n6" / "atlas.n6"
+    if ATLAS_MIRROR.is_symlink():
+        cur = os.readlink(str(ATLAS_MIRROR))
+        if cur == str(target):
+            return False  # 이미 OK
+        ATLAS_MIRROR.unlink()
+    elif ATLAS_MIRROR.exists():
+        ATLAS_MIRROR.unlink()
+    os.symlink(str(target), str(ATLAS_MIRROR))
+    return True  # 갱신
+
+
+def write_manifest():
+    if not ATLAS.exists():
+        die(f"atlas not found: {ATLAS}")
+    ATLAS3D_DIR.mkdir(parents=True, exist_ok=True)
+    st = ATLAS.stat()
+    payload = {
+        "generated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "source": "atlas.n6",
+        "atlas_url": "../atlas.n6",
+        "size_bytes": st.st_size,
+        "mtime": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "layers": LAYER_NAMES,
+        "domain_layer": DOMAIN_LAYER,
+        "layer_default": LAYER_DEFAULT,
+        "version": "v2-direct",
+    }
+    MANIFEST.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+    return payload
+
+
+def cmd_publish(args):
+    changed = ensure_mirror()
+    payload = write_manifest()
+    print(
+        f"atlas3d publish: mirror {'updated' if changed else 'OK'} · "
+        f"{payload['size_bytes']/1024:.1f}KB · manifest → {MANIFEST.relative_to(ROOT)}"
+    )
+    if args.no_commit:
+        return 0
+    rel_paths = [
+        str(ATLAS_MIRROR.relative_to(ROOT)),
+        str(MANIFEST.relative_to(ROOT)),
+    ]
+    diff = subprocess.run(["git", "-C", str(ROOT), "diff", "--quiet", "--", *rel_paths]).returncode
+    untracked = subprocess.run(
+        ["git", "-C", str(ROOT), "ls-files", "--others", "--exclude-standard", "--", *rel_paths],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    if diff == 0 and not untracked:
+        print("atlas3d publish: no changes to commit")
+        return 0
+    if args.dry_run:
+        print("atlas3d publish: --dry-run; skipping commit")
+        return 0
+    msg = args.message or f"atlas3d: refresh ({datetime.now().strftime('%Y-%m-%d %H:%M')})"
+    subprocess.run(["git", "-C", str(ROOT), "add", *rel_paths], check=True)
+    subprocess.run(["git", "-C", str(ROOT), "commit", "-m", msg], check=True)
+    print("atlas3d publish: committed")
+    return 0
+
+
+def cmd_serve(args):
+    import http.server
+    import socketserver
+
+    ensure_mirror()
+    write_manifest()
+    os.chdir(DOCS)
+    port = args.port
+
+    class H(http.server.SimpleHTTPRequestHandler):
+        def log_message(self, fmt, *a):
+            sys.stderr.write(f"[serve] {fmt % a}\n")
+        def end_headers(self):
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            super().end_headers()
+
+    with socketserver.TCPServer(("127.0.0.1", port), H) as httpd:
+        print(f"atlas3d serve: http://127.0.0.1:{port}/atlas3d.html")
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("\natlas3d serve: stopped")
+    return 0
+
+
+def cmd_watch(args):
+    last = 0.0
+    print(f"atlas3d watch: {ATLAS} → {MANIFEST}")
+    while True:
+        try:
+            mt = ATLAS.stat().st_mtime
+        except FileNotFoundError:
+            time.sleep(1)
+            continue
+        if mt > last:
+            last = mt
+            ensure_mirror()
+            write_manifest()
+            print(f"  ↻ {datetime.now().strftime('%H:%M:%S')} manifest refreshed")
+        time.sleep(args.interval)
+
+
+def cmd_shard(args):
+    """Domain 별 atlas.n6 텍스트 분할 — viewer lazy-load 옵션."""
+    if not ATLAS.exists():
+        die(f"atlas not found: {ATLAS}")
+    out_dir = ATLAS3D_DIR / "shards"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    nodes, _ = parse_atlas(ATLAS.read_text(errors="replace"))
+    by_layer = {}
+    for n in nodes:
+        by_layer.setdefault(n["l"], []).append(n["id"])
+    manifest = {"generated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "layers": {}}
+    for l, ids in by_layer.items():
+        p = out_dir / f"L{l}_ids.json"
+        p.write_text(json.dumps(ids, separators=(",", ":")))
+        manifest["layers"][f"L{l}"] = {"ids_file": f"shards/L{l}_ids.json", "count": len(ids)}
+    (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    print(f"atlas3d shard: {len(by_layer)} layer-id files → {out_dir.relative_to(ROOT)}")
+    return 0
+
+
+def cmd_snapshot(args):
+    """Deterministic 3D 좌표 사이드카 — golden-angle spiral per layer (viewer inline 로직과 동일)."""
+    import math
+    nodes, _ = parse_atlas(ATLAS.read_text(errors="replace"))
+    LAYER_Y = [0, 55, 110, 170, 240]
+    LAYER_R = [75, 95, 115, 140, 85]
+    GOLDEN = 2.399963229728653  # ≈ π * (3 - √5)
+    by_layer = {}
+    for nd in nodes:
+        by_layer.setdefault(nd["l"], []).append(nd)
+    pos_by_idx = [None] * len(nodes)
+    for l, arr in by_layer.items():
+        arr.sort(key=lambda x: -x["d"])
+        N = len(arr)
+        if N == 0:
+            continue
+        R = LAYER_R[l] if 0 <= l < 5 else LAYER_R[-1]
+        Y = LAYER_Y[l] if 0 <= l < 5 else LAYER_Y[-1]
+        for i, nd in enumerate(arr):
+            frac = i / max(N - 1, 1)
+            r = R * math.sqrt(0.04 + 0.96 * frac)
+            theta = i * GOLDEN
+            pos_by_idx[nd["i"]] = [
+                round(math.cos(theta) * r, 2),
+                round(Y, 2),
+                round(math.sin(theta) * r, 2),
+            ]
+    out = ATLAS3D_DIR / "coords.json"
+    ATLAS3D_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "generated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "kind": "golden-spiral-by-layer",
+        "layer_y": LAYER_Y, "layer_r": LAYER_R,
+        "ids": [nd["id"] for nd in nodes],
+        "xyz": pos_by_idx,
+    }
+    out.write_text(json.dumps(payload, separators=(",", ":")))
+    print(f"atlas3d snapshot: {len(nodes)} pos → {out.relative_to(ROOT)} ({out.stat().st_size/1024:.1f}KB)")
+    return 0
+
+
+def cmd_overlay(args):
+    out_dir = ATLAS3D_DIR / "overlays"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    overlays = {"generated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "items": {}}
+
+    # hub_centrality: TSV → JSON list (full top-100, not just top10_preview)
+    tsv = ROOT / "n6" / "atlas.n6.hub_centrality_top100"
+    if tsv.exists():
+        rows = []
+        cols = None
+        for line in tsv.read_text().splitlines():
+            if not line.strip() or line.startswith("#"):
+                if line.startswith("# rank"):
+                    cols = line[2:].split("\t")
+                continue
+            parts = line.split("\t")
+            if cols and len(parts) == len(cols):
+                row = {c: parts[i] for i, c in enumerate(cols)}
+                # numeric cast
+                for k in ("rank", "degree", "domain_reach", "neighbor_count"):
+                    if k in row:
+                        try: row[k] = int(row[k])
+                        except ValueError: pass
+                for k in ("c_b", "integrated_score"):
+                    if k in row:
+                        try: row[k] = float(row[k])
+                        except ValueError: pass
+                rows.append(row)
+        hub_payload = {
+            "kind": "hub_centrality_top100",
+            "source": str(tsv.relative_to(ROOT)),
+            "count": len(rows),
+            "rows": rows,
+        }
+        (out_dir / "hub_centrality.json").write_text(json.dumps(hub_payload, indent=2, ensure_ascii=False))
+        overlays["items"]["hub_centrality"] = {
+            "file": "overlays/hub_centrality.json", "count": len(rows),
+        }
+
+    # phase 4x: extract only valid JSON lines (skip comment headers)
+    for phase in (45, 46, 47, 48):
+        for kind in ("nodes", "bridges"):
+            src = ROOT / "n6" / f"atlas_phase{phase}_canonical_{kind}.jsonl"
+            if not src.exists():
+                continue
+            valid = []
+            for line in src.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                try:
+                    valid.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+            if not valid:
+                continue
+            out_file = out_dir / f"phase{phase}_{kind}.json"
+            out_file.write_text(json.dumps(valid, separators=(",", ":")))
+            overlays["items"][f"phase{phase}_{kind}"] = {
+                "file": f"overlays/phase{phase}_{kind}.json", "count": len(valid),
+            }
+
+    (out_dir / "manifest.json").write_text(json.dumps(overlays, indent=2))
+    print(f"atlas3d overlay: {len(overlays['items'])} item(s) → {out_dir.relative_to(ROOT)}")
+    return 0
+
+
+def cmd_theorem(args):
+    out = ATLAS3D_DIR / "theorems.json"
+    ATLAS3D_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "generated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "theorems": [
+            {
+                "id": "foundation-isomorphism", "round": "R29",
+                "name": "Meta-Atlas Foundation Isomorphism",
+                "atlas_primitives": ["n", "sigma", "tau", "phi", "sopfr", "J2", "mu", "M3"],
+                "meta_reflections": [
+                    "axes_count", "depth_levels", "gamma_triggers",
+                    "beta_rows", "sigma_count", "tau_count", "mu_count",
+                ],
+                "irreducible_root": "n", "rays": 7,
+            },
+            {
+                "id": "three-level-projection", "round": "R31",
+                "name": "Three-Level Foundation Projection",
+                "source": "atlas",
+                "targets": [
+                    {"name": "psi_projections", "count": 82, "role": "consciousness"},
+                    {"name": "meta_reflections", "count": 7, "role": "observability"},
+                ],
+                "relation": "peer-cousins",
+            },
+        ],
+    }
+    out.write_text(json.dumps(payload, indent=2))
+    print(f"atlas3d theorem: {len(payload['theorems'])} → {out.relative_to(ROOT)}")
+    return 0
+
+
+def cmd_tail(args):
+    src = ROOT / "n6" / "atlas.n6.events.jsonl"
+    if not src.exists():
+        die(f"events not found: {src}")
+    out = ATLAS3D_DIR / "timeline.json"
+    ATLAS3D_DIR.mkdir(parents=True, exist_ok=True)
+    buckets, n = {}, 0
+    with src.open() as f:
+        for line in f:
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            ts = ev.get("ts")
+            if not ts:
+                continue
+            try:
+                day = datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d")
+            except (TypeError, ValueError):
+                continue
+            buckets[day] = buckets.get(day, 0) + 1
+            n += 1
+    payload = {
+        "generated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "source": str(src.relative_to(ROOT)),
+        "events_total": n,
+        "buckets_by_day": dict(sorted(buckets.items())),
+    }
+    out.write_text(json.dumps(payload, indent=2))
+    print(f"atlas3d tail: {n} events / {len(buckets)} days → {out.relative_to(ROOT)}")
+    return 0
+
+
+def cmd_query(args):
+    nodes, _ = parse_atlas(ATLAS.read_text(errors="replace"))
+    preds = parse_dsl(args.expr)
+    matched = [n for n in nodes if all(p(n) for p in preds)]
+    if args.json:
+        json.dump(matched, sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+    else:
+        print(f"# {len(matched)} match(es) for: {args.expr}")
+        for n in matched[:args.limit]:
+            print(f"  L{n['l']} {n['t']} {n['id']:40s} dom={n['dom']:20s} g={n['g']:5s} d={n['d']}")
+        if len(matched) > args.limit:
+            print(f"  ... +{len(matched) - args.limit} more (use --limit)")
+    return 0
+
+
+def parse_dsl(expr):
+    preds = []
+    for tok in expr.split():
+        m = re.match(r"^(L|dom|t|g|hub|d|id):(.+)$", tok)
+        m2 = re.match(r"^(hub|d)([<>]=?)(\d+)$", tok)
+        if m:
+            k, v = m.group(1), m.group(2)
+            if k == "L": preds.append(lambda n, v=int(v): n.get("l") == v)
+            elif k == "dom": preds.append(lambda n, v=v: n.get("dom") == v)
+            elif k == "t": preds.append(lambda n, v=v: n.get("t") == v)
+            elif k == "g": preds.append(lambda n, v=v: n.get("g") == v)
+            elif k in ("hub", "d"): preds.append(lambda n, v=int(v): n.get("d", 0) >= v)
+            elif k == "id": preds.append(lambda n, v=v: v in n.get("id", ""))
+        elif m2:
+            k, op, v = m2.group(1), m2.group(2), int(m2.group(3))
+            ops = {"<": (lambda a, b: a < b), "<=": (lambda a, b: a <= b),
+                   ">": (lambda a, b: a > b), ">=": (lambda a, b: a >= b)}
+            preds.append(lambda n, op=ops[op], v=v: op(n.get("d", 0), v))
+        else:
+            preds.append(lambda n, t=tok: t in n.get("id", ""))
+    return preds
+
+
+def cmd_diff(args):
+    a, b = args.a, args.b
+    def at(ref):
+        out = subprocess.run(
+            ["git", "-C", str(ROOT), "show", f"{ref}:n6/atlas.n6"],
+            capture_output=True,
+        )
+        if out.returncode != 0:
+            die(f"git show failed for {ref}: {out.stderr.decode('utf-8', errors='replace')}")
+        return out.stdout.decode("utf-8", errors="replace")
+    ids_a = set(re.findall(r"^@[" + TYPE_CHARS + r"]\s+(\S+)", at(a), re.M))
+    ids_b = set(re.findall(r"^@[" + TYPE_CHARS + r"]\s+(\S+)", at(b), re.M))
+    added, removed = sorted(ids_b - ids_a), sorted(ids_a - ids_b)
+    out = ATLAS3D_DIR / "diff.json"
+    ATLAS3D_DIR.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps({
+        "a": a, "b": b, "added": added, "removed": removed,
+        "added_count": len(added), "removed_count": len(removed),
+        "generated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }, indent=2, ensure_ascii=False))
+    print(f"atlas3d diff: +{len(added)} -{len(removed)} → {out.relative_to(ROOT)}")
+    return 0
+
+
+def cmd_audit(args):
+    if not ATLAS.exists():
+        die(f"atlas not found: {ATLAS}")
+    nodes, edges = parse_atlas(ATLAS.read_text(errors="replace"))
+    n = len(nodes); e = len(edges)
+    by_layer = {}
+    for nd in nodes:
+        by_layer[nd["l"]] = by_layer.get(nd["l"], 0) + 1
+    orphans = [nd for nd in nodes if nd["d"] == 0]
+    print(f"atlas3d audit: nodes={n} edges={e}")
+    print(f"  by layer: {dict(sorted(by_layer.items()))}")
+    print(f"  orphans (degree=0): {len(orphans)} ({100*len(orphans)/max(n,1):.1f}%)")
+    return 0
+
+
+def die(msg):
+    print(f"atlas3d: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def main():
+    p = argparse.ArgumentParser(prog="atlas3d", description="atlas.n6 → docs/atlas3d publishing CLI (zero-conversion)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    pp = sub.add_parser("publish", help="docs/atlas.n6 mirror + manifest + (optional) commit")
+    pp.add_argument("--message", "-m")
+    pp.add_argument("--no-commit", action="store_true")
+    pp.add_argument("--dry-run", action="store_true")
+    pp.set_defaults(fn=cmd_publish)
+
+    pb = sub.add_parser("build", help="alias for publish --no-commit")
+    pb.set_defaults(fn=lambda a: cmd_publish(argparse.Namespace(message=None, no_commit=True, dry_run=False)))
+
+    ps = sub.add_parser("serve", help="docs/ 로컬 서빙")
+    ps.add_argument("--port", type=int, default=8080)
+    ps.set_defaults(fn=cmd_serve)
+
+    pw = sub.add_parser("watch", help="atlas.n6 mtime → manifest 갱신")
+    pw.add_argument("--interval", type=float, default=2.0)
+    pw.set_defaults(fn=cmd_watch)
+
+    psh = sub.add_parser("shard", help="layer 별 id 리스트 사이드카")
+    psh.set_defaults(fn=cmd_shard)
+
+    psn = sub.add_parser("snapshot", help="deterministic 3D 좌표 사이드카")
+    psn.add_argument("--seed", type=int, default=42)
+    psn.add_argument("--iters", type=int, default=60)
+    psn.set_defaults(fn=cmd_snapshot)
+
+    po = sub.add_parser("overlay", help="hub_centrality + phase4x → overlays/")
+    po.set_defaults(fn=cmd_overlay)
+
+    pt = sub.add_parser("theorem", help="R29 + R31 proof JSON")
+    pt.set_defaults(fn=cmd_theorem)
+
+    pl = sub.add_parser("tail", help="events.jsonl → timeline.json")
+    pl.set_defaults(fn=cmd_tail)
+
+    pq = sub.add_parser("query", help="DSL 쿼리 (dom: L: t: hub> 등)")
+    pq.add_argument("expr")
+    pq.add_argument("--json", action="store_true")
+    pq.add_argument("--limit", type=int, default=50)
+    pq.set_defaults(fn=cmd_query)
+
+    pd = sub.add_parser("diff", help="git ref↔ref @-node delta")
+    pd.add_argument("a"); pd.add_argument("b")
+    pd.set_defaults(fn=cmd_diff)
+
+    pa = sub.add_parser("audit", help="무결성 체크")
+    pa.set_defaults(fn=cmd_audit)
+
+    args = p.parse_args()
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)
