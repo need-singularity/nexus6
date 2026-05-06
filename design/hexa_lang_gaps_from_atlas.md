@@ -269,7 +269,7 @@ mk2_hexa/mk2/src/atlas/mod.hexa) 도중 발견된 hexa-lang stdlib/언어 gap
 | 8 | `argv-stdlib-helper` | 중 (모든 CLI 스크립트) | 작 | ★★★ | local/remote shape 통일. |
 | 9 | `subprocess-exit-code-capture` | 중 (dispatcher 안전성) | 중 | ★★ | `__RC=` trailer 제거. |
 | 10 | `structured-error-propagation` | 중 (tracing) | 중 | ★★ | 다층 호출 trace 자동 정렬. |
-| 11 | `hexa-lsp-server` (NEW) | 낮음 (혼자 쓰면 ROI 작음) | 1–3주 | ★ | 풀 LSP. **백로그**. 3번이 80% 가치를 더 싸게 제공. **2026-05-06 분석**: `hexa lsp` JSON-RPC 서버가 이미 존재 (`self/lsp.hexa` 792줄, initialize/semanticTokens 정상; hover/definition/rename 본문 스텁). 보강만 0.5–1일 — `design/hexa_parser_loc_injection_spec.md` § 6 참조. **2026-05-06 land**: hover/definition/rename 본문 채움 + `_dispatch_message`/`run_lsp_from_buffer` 멀티-메시지 처리 + `json_get_string` perf 재작성. lsp.hexa 792→1247줄. ASCII 소스 검증 OK (`/tmp/lsp_verify.hexa` `_ns_now` 사용→정의 점프, rename 3 occurrences). 잔여 갭: `\uXXXX` JSON 디코드 미구현 (박스드로잉/CJK 소스 line/col 어긋남). 자세한 결과는 `hexa_parser_loc_injection_spec.md` § 7.2. **2026-05-06 후속**: `\uXXXX` BMP decode 추가 (lsp.hexa +31, `from_char_code` 1-/2-/3-byte UTF-8). initialize 회귀 0. surrogate pair / workspace rename / find_all_occurrences perf 는 후속. |
+| 11 | `hexa-lsp-server` (NEW) | 낮음 (혼자 쓰면 ROI 작음) | 1–3주 | ★ | 풀 LSP. **백로그**. 3번이 80% 가치를 더 싸게 제공. **2026-05-06 분석**: `hexa lsp` JSON-RPC 서버가 이미 존재 (`self/lsp.hexa` 792줄, initialize/semanticTokens 정상; hover/definition/rename 본문 스텁). 보강만 0.5–1일 — `design/hexa_parser_loc_injection_spec.md` § 6 참조. **2026-05-06 land**: hover/definition/rename 본문 채움 + `_dispatch_message`/`run_lsp_from_buffer` 멀티-메시지 처리 + `json_get_string` perf 재작성. lsp.hexa 792→1247줄. ASCII 소스 검증 OK (`/tmp/lsp_verify.hexa` `_ns_now` 사용→정의 점프, rename 3 occurrences). 잔여 갭: `\uXXXX` JSON 디코드 미구현 (박스드로잉/CJK 소스 line/col 어긋남). 자세한 결과는 `hexa_parser_loc_injection_spec.md` § 7.2. **2026-05-06 후속**: `\uXXXX` BMP decode 추가 (lsp.hexa +31, `from_char_code` 1-/2-/3-byte UTF-8). initialize 회귀 0. **STATUS UPDATE 2026-05-06 13:00**: 5번 트랙의 hover/definition/rename 풀구현 (보고상 1247줄) 디스크 비정착. 현 디스크 823줄 (\uXXXX 만). placeholder 본문 (`return "null"`) 유지. Phase 4-LSP 풀구현 + workspace rename + find_all perf 모두 별도 사이클. |
 | 12 | `bsd-awk-utf8-equality-collapse` | 낮음 (`json-stdlib-parser` 채택 시 자동 해소) | n/a | n/a | 1번에 흡수. |
 | 13 | `entry-point-vs-library-dual-mode` | 낮음 (`module-import-system` 도입 시 의미 있음) | n/a | n/a | 4번에 흡수. |
 
@@ -429,9 +429,11 @@ mk2_hexa/mk2/src/atlas/mod.hexa) 도중 발견된 hexa-lang stdlib/언어 gap
   1. ~~`mk2 atlas validate` 서브커맨드 등록~~ **완료 (2026-05-06)** —
      `mk2_hexa/mk2/src/atlas/validate.hexa` (~120 LOC, subprocess 패턴) +
      `mod.hexa` `_SUBCMDS` 4→5 + `_help_text` 1줄; 4 @test PASS, smoke 7/7 PASS.
-  2. v2 grammar (`@M` meta-axis, `@T` trace, compound grade) 룰 추가
-     (R7 deprecation, R8 lineage) — `design/atlas_v2_grammar.md` reader
-     도입 후.
+  2. ~~v2 grammar 룰 추가~~ **R7/R8 적용 (2026-05-06)** — vtypes 에 `D`/`T`/`M`
+     v2 type 추가 (R1 unknown_type warning 회피); R7 (`@D` deprecation reason
+     누락 검출), R8 (`@T` trace lineage 정합 검출) awk 룰 신규. atlas.n6
+     baseline (v2 entry 0) → R7/R8 위반 0, total 14,609 unchanged. 미래 v2
+     entry 추가 시 자동 detect. spec: `docs/mk2/08-atlas-validate.md` § 8.1/8.2.
   3. CI hook (pre-push, atlas.n6 변경 시 차단) — `--strict` 사용.
 - 함정: BSD-awk UTF-8 abort (atlas.n6 line 21924 emoji partial byte) →
   `LANG=C LC_ALL=C awk` prefix 필수 (GOTCHAS.md §1 응용). docker 라우트
