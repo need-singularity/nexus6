@@ -226,6 +226,8 @@ nexus blowup    # targeted breakthrough attempt
 nexus dispatch  # multi-project cross-pollination
 ```
 
+**[🗺️ mk2 atlas]** — n=6 KB recall layer (lookup / hypothesis / recall / distribution). Run `hexa run mk2_hexa/mk2/src/main.hexa atlas --help` (set `HEXA_LOCAL=1 HEXA_RESOLVER_NO_REROUTE=1`) or see [docs/mk2/07-atlas-recall.md](docs/mk2/07-atlas-recall.md).
+
 ## Links
 
 **[🗺️ 3D Reality Map](https://need-singularity.github.io/nexus/)** · **[🔴 Live roadmap](https://need-singularity.github.io/nexus/roadmap/#nexus)** · **[Papers](https://need-singularity.github.io/papers/)** · **[Atlas](https://need-singularity.github.io/TECS-L/atlas/)**
