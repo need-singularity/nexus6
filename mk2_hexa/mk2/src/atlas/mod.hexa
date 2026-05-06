@@ -1,0 +1,206 @@
+// ═══════════════════════════════════════════════════════════
+// mk2_hexa/mk2/src/atlas/mod.hexa — atlas KB recall router
+//
+// 책임 범위:
+//   `mk2 atlas <subcmd> [args...]` 디스패치만.
+//   subcmd ∈ {lookup, hypothesis, recall, distribution}.
+//   각 subcmd 모듈은 독립 .hexa 파일이며 `fn run(args:[string])->i32`
+//   인터페이스 (계약). hexa-lang 이 module import 부재이므로
+//   서브프로세스 (`hexa run <path> -- <args>`) 로 호출하고 exit code 를
+//   stdout 마커 `__RC=N` 으로 받아 부모에 그대로 전파한다.
+//
+// 동시성 주의:
+//   본 파일은 dispatch 만 작성. `atlas/{lookup,hypothesis,recall,
+//   distribution}.hexa` 는 다른 에이전트 소유 — 본 파일에서 읽거나
+//   수정하지 않으며, 인터페이스 계약만 신뢰한다.
+//
+// 출력 규약:
+//   · stdout : 각 모듈이 출력하는 데이터 라인 (그대로 forward)
+//   · stderr : NDJSON meta `NEXUS_MK2_ATLAS_DISPATCH {...}` 1 줄
+//   · exit   : 0 = ok, 1 = err, 2 = usage
+//
+// 호출 예:
+//   mk2 atlas lookup <prefix>
+//   mk2 atlas hypothesis <topic>
+//   mk2 atlas recall <query>
+//   mk2 atlas distribution <namespace>
+// ═══════════════════════════════════════════════════════════
+
+let _MODULE_ROOT = "mk2_hexa/mk2/src/atlas"
+
+let _SUBCMDS: [string] = ["lookup", "hypothesis", "recall", "distribution", "validate"]
+
+fn _is_known_subcmd(s: string) -> bool {
+    let n = len(_SUBCMDS)
+    let mut i: i64 = 0
+    while i < n {
+        if _SUBCMDS[i] == s { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _help_text() -> string {
+    let mut p: [string] = []
+    p.push("usage: mk2 atlas <subcommand> [args...]\n")
+    p.push("\n")
+    p.push("subcommands:\n")
+    p.push("  lookup       <prefix>     atlas.n6 prefix recall (3-stage bloom→predict→cold)\n")
+    p.push("  hypothesis   <topic>      hypothesis enumeration over recalled set\n")
+    p.push("  recall       <query>      composite recall (lookup+rank+top-k)\n")
+    p.push("  distribution <namespace>  distribution stats (entries/freq/coverage)\n")
+    p.push("  validate     [path]       atlas.n6 schema validation (R1-R6 + D1)\n")
+    p.push("\n")
+    p.push("options:\n")
+    p.push("  -h, --help               show this help\n")
+    p.push("\n")
+    p.push("examples:\n")
+    p.push("  mk2 atlas lookup math_lattice\n")
+    p.push("  mk2 atlas recall \"euler product\" --top 10\n")
+    p.push("  mk2 atlas distribution physics\n")
+    return p.join("")
+}
+
+// ─── meta emit (NDJSON, stderr) ───
+fn _emit_meta(sub: string, rc: i64, dur_us: i64) -> void {
+    let mut m: [string] = []
+    m.push("NEXUS_MK2_ATLAS_DISPATCH {\"subcmd\":\"")
+    m.push(sub)
+    m.push("\",\"rc\":")
+    m.push(to_string(rc))
+    m.push(",\"duration_us\":")
+    m.push(to_string(dur_us))
+    m.push("}")
+    eprintln(m.join(""))
+}
+
+// ─── ns clock (n6/atlas_query.hexa SSOT 동형, BSD/GNU 양립) ───
+fn _ns_now() -> i64 {
+    let mut r: i64 = 0
+    let raw = to_string(exec("date +%s%N 2>/dev/null")).trim()  // @allow-bare-exec
+    if raw.len() > 0 && raw.contains("N") == false {
+        try { r = to_int(raw) } catch e {}  // @allow-silent-catch
+    }
+    if r < 1 {
+        let s2 = to_string(exec("python3 -c 'import time;print(time.time_ns())' 2>/dev/null")).trim()  // @allow-bare-exec
+        try { r = to_int(s2) } catch e2 {}  // @allow-silent-catch
+    }
+    if r < 1 {
+        let s3 = to_string(exec("date +%s")).trim()  // @allow-bare-exec
+        try { let sec = to_int(s3); r = sec * 1000000000 } catch e3 {}  // @allow-silent-catch
+    }
+    return r
+}
+
+// ─── shell-quote (single-quote 안전) ───
+fn _shq(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+// ─── 서브프로세스 호출 (hexa-lang gap: module import 부재) ───
+//   stdout 은 그대로 부모에 forward, exit code 는 `; echo "__RC=$?"`
+//   trailer 로 캡처. trailer 가 없으면 보수적으로 1 반환.
+//
+//   resolver-env sticky prefix (Track 2 / Rollout 2026-05-06):
+//     자식 sh 가 PATH-resolve 로 `~/.hx/bin/hexa` shim 을 호출할 때
+//     라우팅 결정이 매번 재평가되어 30s+ hang (SSH probe / docker
+//     daemon) 발생할 수 있음. parent 이 이미 한 번 결정한 라우팅을
+//     자식 resolver 가 재사용하도록 세 env 를 자동 부착:
+//       · HEXA_LOCAL=1                 (Mac-local bypass; resolver L143)
+//       · HEXA_RESOLVER_NO_REROUTE=1   (one-hop guard;   resolver L119)
+//       · HEXA_RESOLVER_INHERIT_ENV=1  (Track 1 opt-in;  resolver L122)
+//     `${VAR:-1}` 패턴: 호출자가 명시적으로 0 으로 끄려 하면 그 값을
+//     우선. 기본은 1 (sticky). 회귀 0: caller 가 모두 미설정이어도
+//     parent 이 이미 라우팅을 끝낸 상태이므로 child 가 동일 결정을
+//     재사용하는 것이 의미상 안전. spec:
+//     `design/hexa_resolver_env_propagation_spec.md` § "Rollout (Track 2)".
+fn _exec_module(sub: string, rest: [string]) -> i64 {
+    let path = _MODULE_ROOT + "/" + sub + ".hexa"
+    let mut cmd: [string] = []
+    // sticky env prefix — child resolver 가 parent 라우팅 결정을 재사용
+    cmd.push("HEXA_LOCAL=${HEXA_LOCAL:-1} ")
+    cmd.push("HEXA_RESOLVER_NO_REROUTE=${HEXA_RESOLVER_NO_REROUTE:-1} ")
+    cmd.push("HEXA_RESOLVER_INHERIT_ENV=${HEXA_RESOLVER_INHERIT_ENV:-1} ")
+    cmd.push("hexa run ")
+    cmd.push(_shq(path))
+    let nr = len(rest)
+    let mut i: i64 = 0
+    while i < nr {
+        cmd.push(" ")
+        cmd.push(_shq(rest[i]))
+        i = i + 1
+    }
+    cmd.push("; echo \"__RC=$?\"")
+    let raw = to_string(exec(cmd.join("")))   // @allow-bare-exec @resolver-bypass(reason="self-spawn dispatcher; sticky env prefix above keeps child resolver on parent's routing decision — see spec § Track 2")
+    // trailer 추출
+    let marker = "__RC="
+    let idx = raw.index_of(marker)
+    if idx < 0 {
+        // trailer 누락 → 모듈 출력은 그대로 출력하고 1 반환
+        if raw != "" { print(raw) }
+        return 1
+    }
+    let body = raw.substring(0, idx)
+    let tail = raw.substring(idx + len(marker), len(raw)).trim()
+    if body != "" { print(body) }
+    let mut rc: i64 = 1
+    try { rc = to_int(tail) } catch e {}   // @allow-silent-catch
+    return rc
+}
+
+// ═══════════════════════════════════════════════════════════
+//  dispatch — main.hexa 가 호출하는 entrypoint
+//    argv[0] = "atlas" (이미 main 에서 검증됨, 본 함수에서 재확인 X)
+//    argv[1] = subcommand (또는 -h/--help)
+//    argv[2..] = subcommand args
+// ═══════════════════════════════════════════════════════════
+fn dispatch(argv: [string]) -> i64 {
+    let n = len(argv)
+    // argv[0] should be "atlas"; help/empty handling:
+    if n < 2 {
+        println(_help_text())
+        _emit_meta("(none)", 2, 0)
+        return 2
+    }
+    let sub = argv[1]
+    if sub == "-h" || sub == "--help" {
+        println(_help_text())
+        _emit_meta("--help", 0, 0)
+        return 0
+    }
+    if !_is_known_subcmd(sub) {
+        eprintln("mk2 atlas: unknown subcommand '" + sub + "'")
+        eprintln(_help_text())
+        _emit_meta(sub, 2, 0)
+        return 2
+    }
+    // subcommand-specific args (atlas, sub 제외 후 나머지)
+    let mut rest: [string] = []
+    let mut i: i64 = 2
+    while i < n {
+        rest.push(argv[i])
+        i = i + 1
+    }
+    let t0 = _ns_now()
+    let rc = _exec_module(sub, rest)
+    let t1 = _ns_now()
+    _emit_meta(sub, rc, (t1 - t0) / 1000)
+    return rc
+}
+
+// ═══════════════════════════════════════════════════════════
+//  CLI entry — `hexa run atlas/mod.hexa atlas <subcmd> ...`
+//  (hexa-lang module-import 부재로 main.hexa 가 본 파일을 서브프로세스
+//  로 호출. import 도입 시 본 블록은 제거하고 dispatch() 만 export.)
+// ═══════════════════════════════════════════════════════════
+let _a = args()
+let _na = len(_a)
+let mut _user: [string] = []
+let mut _k: i64 = 2
+while _k < _na {
+    _user.push(_a[_k])
+    _k = _k + 1
+}
+let _rc = dispatch(_user)
+exit(_rc)  // @allow-silent-exit — top-level dispatch propagation
+

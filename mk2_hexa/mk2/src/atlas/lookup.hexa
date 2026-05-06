@@ -1,0 +1,419 @@
+// ═══════════════════════════════════════════════════════════
+// atlas/lookup.hexa — constant token → atlas.n6 KB recall layer
+//
+// Subcommand: mk2 atlas lookup <constant>
+//
+// 동작:
+//   1) `hexa run n6/atlas_query.hexa query <constant>` 호출 → entry lines
+//   2) 매칭 0건 → grep -F fallback (atlas_query 의 prefix 인덱스가
+//      coverage 부족하므로 cold scan 으로 확실하게 보충)
+//   3) 매칭 결과 사람 가독 포맷 (총 건수, 섹터 분포 top, AI 분포 top, top 5 entries)
+//   4) 알려진 상수 (10–15개 핵심) 메타 헤더 첨부 (공식, 관측값, 오차, 섹터)
+//
+// 인터페이스: fn run(args: [string]) -> i32   (0=ok, 1=err)
+// stdout: human-readable header + sector/AI distribution + top entries
+// stderr: NDJSON {"stage":"...","duration_ms":N,"matches":N}
+//
+// 규칙: hexa `>=`/`<=` 금지 — `<` / `>` 만 사용. stdlib only.
+// 편집 금지: n6/atlas_query.hexa, n6/atlas.n6, mk2_hexa/mk2/src/main.hexa,
+//          기타 atlas/* 모듈.
+// ═══════════════════════════════════════════════════════════
+
+let _ATLAS_PATH = "n6/atlas.n6"
+let _ATLAS_QUERY_HEXA = "n6/atlas_query.hexa"
+
+// ─── ns clock (BSD/GNU date 양립, recall.hexa 와 동형) ───
+fn _ns_now() -> i64 {
+    let mut r: i64 = 0
+    let raw = to_string(exec("date +%s%N 2>/dev/null")).trim()  // @allow-bare-exec
+    if raw.len() > 0 && raw.contains("N") == false {
+        try { r = to_int(raw) } catch e {}  // @allow-silent-catch
+    }
+    if r < 1 {
+        let s2 = to_string(exec("python3 -c 'import time;print(time.time_ns())' 2>/dev/null")).trim()  // @allow-bare-exec
+        try { r = to_int(s2) } catch e2 {}  // @allow-silent-catch
+    }
+    if r < 1 {
+        let s3 = to_string(exec("date +%s")).trim()  // @allow-bare-exec
+        try { let sec = to_int(s3); r = sec * 1000000000 } catch e3 {}  // @allow-silent-catch
+    }
+    return r
+}
+
+// ─── shell-escape: only allow alnum + underscore + dash + dot in token ───
+fn _safe_token(s: string) -> bool {
+    let n = s.len()
+    if n < 1 { return false }
+    if n > 128 { return false }
+    let mut i: i64 = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        let isd = c == "0" || c == "1" || c == "2" || c == "3" || c == "4"
+            || c == "5" || c == "6" || c == "7" || c == "8" || c == "9"
+        let isl = c == "a" || c == "b" || c == "c" || c == "d" || c == "e"
+            || c == "f" || c == "g" || c == "h" || c == "i" || c == "j"
+            || c == "k" || c == "l" || c == "m" || c == "n" || c == "o"
+            || c == "p" || c == "q" || c == "r" || c == "s" || c == "t"
+            || c == "u" || c == "v" || c == "w" || c == "x" || c == "y" || c == "z"
+        let isu = c == "A" || c == "B" || c == "C" || c == "D" || c == "E"
+            || c == "F" || c == "G" || c == "H" || c == "I" || c == "J"
+            || c == "K" || c == "L" || c == "M" || c == "N" || c == "O"
+            || c == "P" || c == "Q" || c == "R" || c == "S" || c == "T"
+            || c == "U" || c == "V" || c == "W" || c == "X" || c == "Y" || c == "Z"
+        let isp = c == "_" || c == "-" || c == "."
+        if !(isd || isl || isu || isp) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// ─── 알려진 상수 메타 표 (Section 3.1/3.2/3.3) ───
+// row format: [name, formula, observed, n6_value, err_pct, ai, sector]
+fn _known_count() -> i64 { return 13 }
+
+fn _known_at(idx: i64) -> [string] {
+    let mut r: [string] = []
+    if idx == 0 {
+        r.push("alpha_inv");        r.push("sigma^2 - M3 + phi/(sigma*sopfr)")
+        r.push("137.036");          r.push("137.0333")
+        r.push("0.002");            r.push("(2,0)"); r.push("quantum")
+    } else if idx == 1 {
+        r.push("mp_me");            r.push("n*pi^5 = 6*pi^5")
+        r.push("1836.153");         r.push("1836.118")
+        r.push("0.002");            r.push("(2,0)"); r.push("strong")
+    } else if idx == 2 {
+        r.push("n_s");              r.push("1 - sopfr/(n*J2) = 139/144")
+        r.push("0.9649");           r.push("0.9653")
+        r.push("0.04");             r.push("(2,0)"); r.push("cosmology")
+    } else if idx == 3 {
+        r.push("BAO_rs");           r.push("sigma^2 + sigma/tau = 147")
+        r.push("147.09");           r.push("147")
+        r.push("0.06");             r.push("(1,8)"); r.push("cosmology")
+    } else if idx == 4 {
+        r.push("sin2_theta_W");     r.push("euler_ratio({2,3,5,7}) = 8/35")
+        r.push("0.231");            r.push("0.2286")
+        r.push("1.1");              r.push("(2,0)"); r.push("electroweak")
+    } else if idx == 5 {
+        r.push("Y_p");              r.push("euler_ratio({2,3,5,13}) = 16/65")
+        r.push("0.245");            r.push("0.2462")
+        r.push("0.5");              r.push("(2,0)"); r.push("primordial")
+    } else if idx == 6 {
+        r.push("Omega_m");          r.push("phi/n = 1/3")
+        r.push("0.3153");           r.push("0.3333")
+        r.push("5.7");              r.push("(2,0)"); r.push("cosmology")
+    } else if idx == 7 {
+        r.push("Omega_Lambda");     r.push("tau/n = 2/3")
+        r.push("0.6847");           r.push("0.6667")
+        r.push("2.6");              r.push("(2,0)"); r.push("cosmology")
+    } else if idx == 8 {
+        r.push("Omega_DM");         r.push("euler_ratio({2,3,5}) = 4/15")
+        r.push("0.266");            r.push("0.2667")
+        r.push("0.3");              r.push("(2,0)"); r.push("cosmology")
+    } else if idx == 9 {
+        r.push("Omega_b");          r.push("1 - 4/15 - 24/35 = 1/21")
+        r.push("0.0493");           r.push("0.0476")
+        r.push("3.4");              r.push("(2,0)"); r.push("cosmology")
+    } else if idx == 10 {
+        r.push("Hubble_tension");   r.push("n = 6")
+        r.push("6 km/s/Mpc");       r.push("6")
+        r.push("0.0");              r.push("(2,0)"); r.push("cosmology")
+    } else if idx == 11 {
+        r.push("sigma");            r.push("divisor_sum(6)")
+        r.push("12");               r.push("12")
+        r.push("0.0");              r.push("(0,8)"); r.push("foundation")
+    } else if idx == 12 {
+        r.push("phi");              r.push("euler_totient(6)")
+        r.push("2");                r.push("2")
+        r.push("0.0");              r.push("(0,8)"); r.push("foundation")
+    } else {
+        r.push(""); r.push(""); r.push(""); r.push(""); r.push(""); r.push(""); r.push("")
+    }
+    return r
+}
+
+fn _find_known(name: string) -> i64 {
+    let mut k: i64 = 0
+    let kn = _known_count()
+    while k < kn {
+        let row = _known_at(k)
+        if row[0] == name { return k }
+        k = k + 1
+    }
+    return -1
+}
+
+// ─── stage 1: atlas_query.hexa wrapper ───
+fn _query_lines(token: string) -> [string] {
+    let mut out: [string] = []
+    if !file_exists(_ATLAS_QUERY_HEXA) { return out }
+    let cmd = "hexa run " + _ATLAS_QUERY_HEXA + " query '" + token + "' 2>/dev/null"
+    let mut raw = ""
+    try { raw = to_string(exec(cmd)) } catch e { return out }   // @allow-silent-catch @allow-bare-exec
+    if raw == "" { return out }
+    let lines = raw.split("\n")
+    let nl = len(lines)
+    let mut j: i64 = 0
+    while j < nl {
+        let ln = lines[j]
+        if ln != "" { out.push(ln) }
+        j = j + 1
+    }
+    return out
+}
+
+// ─── stage 2: grep fallback ───
+// `grep -F "<token>" n6/atlas.n6 | head -200`
+fn _grep_lines(token: string) -> [string] {
+    let mut out: [string] = []
+    if !file_exists(_ATLAS_PATH) { return out }
+    // safe-token caller pre-validated → token is shell-safe within single quotes
+    let cmd = "grep -F -- '" + token + "' '" + _ATLAS_PATH + "' 2>/dev/null | head -200"
+    let mut raw = ""
+    try { raw = to_string(exec(cmd)) } catch e { return out }   // @allow-silent-catch @allow-bare-exec
+    if raw == "" { return out }
+    let lines = raw.split("\n")
+    let nl = len(lines)
+    let mut j: i64 = 0
+    while j < nl {
+        let ln = lines[j]
+        if ln != "" { out.push(ln) }
+        j = j + 1
+    }
+    return out
+}
+
+// ─── distribution helpers ───
+// extract sector ("foundation", "cosmology", ...) from "... :: <sector> [..]"
+fn _extract_sector(line: string) -> string {
+    let marker = ":: "
+    let p = line.index_of(marker)
+    if p < 0 { return "" }
+    let rest = line.substring(p + 3, line.len()).trim()
+    // sector ends at first whitespace or '['
+    let sp = rest.index_of(" ")
+    let br = rest.index_of("[")
+    let mut cut = rest.len()
+    if sp > -1 && sp < cut { cut = sp }
+    if br > -1 && br < cut { cut = br }
+    return rest.substring(0, cut).trim()
+}
+
+// AI ranking string: lines with " [AI=(d,r)]" form, or "[d*]" / "[d*!]" tail.
+// Prefix tag also encodes type: @P / @C / @L / @T … return "" if none found.
+fn _extract_ai_tag(line: string) -> string {
+    // find last "[" .. "]"
+    let lb = line.last_index_of("[")
+    if lb < 0 { return "" }
+    let rb = line.index_of("]", lb)
+    if rb < 0 { return "" }
+    return line.substring(lb, rb + 1)
+}
+
+// extract leading "@X" record-type tag (@P/@C/@L/@T/@A/@D ...).
+fn _extract_type_tag(line: string) -> string {
+    if line.len() < 2 { return "" }
+    let head = line.substring(0, 1)
+    if head != "@" { return "" }
+    let sp = line.index_of(" ")
+    if sp < 1 { return "" }
+    return line.substring(0, sp)
+}
+
+// ─── small key-count map via parallel arrays ───
+fn _bump(keys: [string], counts: [i64], k: string) {
+    if k == "" { return }
+    let n = len(keys)
+    let mut i: i64 = 0
+    while i < n {
+        if keys[i] == k {
+            counts[i] = counts[i] + 1
+            return
+        }
+        i = i + 1
+    }
+    keys.push(k)
+    counts.push(1)
+}
+
+// emit "k:v" sorted desc by v, top max_k entries; comma-joined string
+fn _topk_csv(keys: [string], counts: [i64], max_k: i64) -> string {
+    let n = len(keys)
+    if n < 1 { return "(none)" }
+    // selection sort top-k (small n expected)
+    let mut idxs: [i64] = []
+    let mut z: i64 = 0
+    while z < n { idxs.push(z); z = z + 1 }
+    let mut limit = max_k
+    if limit > n { limit = n }
+    let mut p: i64 = 0
+    while p < limit {
+        let mut best = p
+        let mut q = p + 1
+        while q < n {
+            if counts[idxs[q]] > counts[idxs[best]] { best = q }
+            q = q + 1
+        }
+        if best != p {
+            let t = idxs[p]; idxs[p] = idxs[best]; idxs[best] = t
+        }
+        p = p + 1
+    }
+    let mut parts: [string] = []
+    let mut k: i64 = 0
+    while k < limit {
+        let i = idxs[k]
+        parts.push(keys[i] + ":" + to_string(counts[i]))
+        k = k + 1
+    }
+    return parts.join(", ")
+}
+
+// truncate long line for top-5 listing
+fn _trunc(s: string, max: i64) -> string {
+    if s.len() < max + 1 { return s }
+    return s.substring(0, max - 3) + "..."
+}
+
+// ─── main run() ───
+fn run(args: [string]) -> i32 {
+    let t0 = _ns_now()
+
+    // strip leading "lookup" keyword if present
+    let mut pos: [string] = []
+    let mut i: i64 = 0
+    let na = len(args)
+    while i < na {
+        let a = args[i]
+        if a == "lookup" {
+            // skip
+        } else {
+            pos.push(a)
+        }
+        i = i + 1
+    }
+
+    if len(pos) < 1 {
+        println("usage: mk2 atlas lookup <constant>")
+        return 1
+    }
+
+    let token = pos[0].trim()
+    if !_safe_token(token) {
+        println("error: invalid token '" + token + "' (allowed: alnum + _ - .)")
+        return 1
+    }
+
+    // ── known-constant header ──
+    let kidx = _find_known(token)
+    if kidx > -1 {
+        let row = _known_at(kidx)
+        println("name:     " + row[0])
+        println("formula:  " + row[1])
+        println("observed: " + row[2])
+        println("n6_value: " + row[3] + "   err=" + row[4] + "%")
+        println("AI:       " + row[5] + "      sector=" + row[6])
+        println("---")
+    }
+
+    // ── stage 1: atlas_query.hexa ──
+    let mut stage = "query"
+    let mut lines = _query_lines(token)
+
+    // ── stage 2: grep fallback if 0 matches ──
+    if len(lines) < 1 {
+        stage = "grep_fallback"
+        lines = _grep_lines(token)
+    }
+
+    let total = len(lines)
+
+    // ── distributions ──
+    let mut sec_keys: [string] = []
+    let mut sec_counts: [i64] = []
+    let mut ai_keys: [string] = []
+    let mut ai_counts: [i64] = []
+    let mut typ_keys: [string] = []
+    let mut typ_counts: [i64] = []
+
+    let mut j: i64 = 0
+    while j < total {
+        let ln = lines[j]
+        _bump(sec_keys, sec_counts, _extract_sector(ln))
+        _bump(ai_keys, ai_counts, _extract_ai_tag(ln))
+        _bump(typ_keys, typ_counts, _extract_type_tag(ln))
+        j = j + 1
+    }
+
+    // ── render summary ──
+    println("token:    " + token)
+    println("matches:  " + to_string(total) + "   (stage: " + stage + ")")
+    if total > 0 {
+        println("sectors:  " + _topk_csv(sec_keys, sec_counts, 5))
+        println("AI tags:  " + _topk_csv(ai_keys, ai_counts, 5))
+        println("rec_type: " + _topk_csv(typ_keys, typ_counts, 5))
+        println("---")
+        println("top 5 entries:")
+        let mut k: i64 = 0
+        let mut limit: i64 = 5
+        if limit > total { limit = total }
+        while k < limit {
+            println("  " + _trunc(lines[k], 160))
+            k = k + 1
+        }
+    } else {
+        println("(no entries)")
+    }
+
+    // ── stderr meta ──
+    let t1 = _ns_now()
+    let dur_ms = (t1 - t0) / 1000000
+    let mut meta: [string] = []
+    meta.push("{\"stage\":\"")
+    meta.push(stage)
+    meta.push("\",\"duration_ms\":")
+    meta.push(to_string(dur_ms))
+    meta.push(",\"matches\":")
+    meta.push(to_string(total))
+    meta.push(",\"token\":\"")
+    meta.push(token)
+    meta.push("\"}")
+    eprintln(meta.join(""))
+
+    return 0
+}
+
+// ═══════════════════════════════════════════════════════════
+//  CLI entry — `hexa run lookup.hexa <constant>` standalone
+//  (args() shape varies by route: local-docker = ["hexa","run",path,...],
+//   hexa_remote = [path,...] or similar — skip any leading arg that
+//   matches "hexa", "run", or ends with ".hexa")
+// ═══════════════════════════════════════════════════════════
+// NOTE: hexa-lang `continue` inside nested `if` falls through (bug);
+// we use explicit if/else laddering instead. Filter:
+//   - skip launcher tokens "hexa" / "run" / "hexa_real"
+//   - skip paths (contains '/') or .hexa files until first user arg
+//   - then push everything (including args that happen to look like paths)
+let _argv = args()
+let mut _passthrough: [string] = []
+let mut _i: i64 = 0
+let _na = len(_argv)
+let mut _seen_user_arg = false
+while _i < _na {
+    let _a = _argv[_i]
+    let _al = _a.len()
+    let _is_launcher = _a == "hexa" || _a == "run" || _a == "hexa_real"
+    let _ends_hexa = _al > 5 && _a.substring(_al - 5, _al) == ".hexa"
+    let _has_slash = _a.index_of("/") > -1
+    let _looks_like_prefix = _is_launcher || _ends_hexa || _has_slash
+    if _seen_user_arg {
+        _passthrough.push(_a)
+    } else if _looks_like_prefix {
+        // skip — still in launcher prefix
+    } else {
+        _seen_user_arg = true
+        _passthrough.push(_a)
+    }
+    _i = _i + 1
+}
+let _rc = run(_passthrough)
+exit(_rc)   // @allow-silent-exit

@@ -1,0 +1,181 @@
+// ═══════════════════════════════════════════════════════════
+// mk2_hexa/mk2/src/main.hexa — top-level CLI dispatcher
+//
+// 책임:
+//   `mk2 <command> [args...]` 진입점.
+//   command ∈ {classify, lattice, sector, atlas, --help, -h}.
+//   atlas 는 `mk2 atlas <subcmd>` 4-way 라우터 (atlas/mod.hexa).
+//   classify/lattice/sector 는 다른 단계에서 구현 — 현재는 stub.
+//
+// hexa-lang gap (design/hexa_lang_gaps_from_atlas.md 참조):
+//   - module import 부재 → atlas/mod.hexa 호출은 서브프로세스
+//     (`hexa run mk2_hexa/mk2/src/atlas/mod.hexa ...`) 로 분리.
+//     stdout 은 forward, exit code 는 `__RC=$?` trailer 로 회수.
+//
+// resolver-env sticky prefix (Track 2 / Rollout FU-4 — 2026-05-06):
+//   `_invoke_atlas` 이 빌드하는 shell 명령 prefix 에 세 env 자동 부착.
+//   parent (본 main) → child (atlas/mod.hexa) hop 도 mod.hexa 의
+//   parent → grandchild hop 과 동일 sticky 패턴 적용. 호출자가
+//   env 미설정으로 들어와도 child resolver 가 30s+ hang (SSH probe /
+//   docker daemon) 없이 즉시 short-circuit. `${VAR:-1}` 패턴 → caller
+//   가 명시적으로 0 으로 끄면 그 값을 우선. 회귀 0. 상세:
+//   `design/hexa_resolver_env_propagation_spec.md` § 7 (Rollout FU-4).
+//
+// 출력 규약:
+//   · stdout : 하위 명령의 데이터 출력
+//   · stderr : NDJSON meta `NEXUS_MK2_DISPATCH {...}` 1 줄
+//   · exit   : 0 = ok, 1 = err (subcmd stub/unknown), 2 = usage/help
+//
+// 사용 예:
+//   hexa run mk2_hexa/mk2/src/main.hexa --help
+//   hexa run mk2_hexa/mk2/src/main.hexa atlas lookup math_lattice
+//   hexa run mk2_hexa/mk2/src/main.hexa atlas recall "euler product"
+// ═══════════════════════════════════════════════════════════
+
+let _ATLAS_MOD = "mk2_hexa/mk2/src/atlas/mod.hexa"
+
+let _COMMANDS: [string] = ["classify", "lattice", "sector", "atlas"]
+
+fn _help_text() -> string {
+    let mut p: [string] = []
+    p.push("usage: mk2 <command> [args...]\n")
+    p.push("\n")
+    p.push("commands:\n")
+    p.push("  classify  <value>           prime-set + sector classify           (stub)\n")
+    p.push("  lattice   <ps>              divisibility lattice query             (stub)\n")
+    p.push("  sector    <name>            sector registry lookup                 (stub)\n")
+    p.push("  atlas     <subcommand>      atlas KB recall layer\n")
+    p.push("              lookup        | hypothesis | recall | distribution | validate\n")
+    p.push("\n")
+    p.push("options:\n")
+    p.push("  -h, --help                  show this help\n")
+    p.push("\n")
+    p.push("examples:\n")
+    p.push("  mk2 --help\n")
+    p.push("  mk2 atlas --help\n")
+    p.push("  mk2 atlas lookup math_lattice\n")
+    p.push("  mk2 atlas recall \"euler product\" --top 10\n")
+    p.push("  mk2 atlas distribution physics\n")
+    return p.join("")
+}
+
+fn _emit_meta(cmd: string, rc: i64, dur_us: i64) -> void {
+    let mut m: [string] = []
+    m.push("NEXUS_MK2_DISPATCH {\"command\":\"")
+    m.push(cmd)
+    m.push("\",\"rc\":")
+    m.push(to_string(rc))
+    m.push(",\"duration_us\":")
+    m.push(to_string(dur_us))
+    m.push("}")
+    eprintln(m.join(""))
+}
+
+// ─── ns clock (n6/atlas_query.hexa SSOT 동형) ───
+fn _ns_now() -> i64 {
+    let mut r: i64 = 0
+    let raw = to_string(exec("date +%s%N 2>/dev/null")).trim()  // @allow-bare-exec
+    if raw.len() > 0 && raw.contains("N") == false {
+        try { r = to_int(raw) } catch e {}  // @allow-silent-catch
+    }
+    if r <= 0 {
+        let s2 = to_string(exec("python3 -c 'import time;print(time.time_ns())' 2>/dev/null")).trim()  // @allow-bare-exec
+        try { r = to_int(s2) } catch e2 {}  // @allow-silent-catch
+    }
+    if r <= 0 {
+        let s3 = to_string(exec("date +%s")).trim()  // @allow-bare-exec
+        try { let sec = to_int(s3); r = sec * 1000000000 } catch e3 {}  // @allow-silent-catch
+    }
+    return r
+}
+
+fn _shq(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+// ─── atlas/mod.hexa 호출 (서브프로세스, exit code __RC trailer 로 회수) ───
+//   forward args: caller 에게 전달된 argv 의 "atlas" 위치부터 끝까지.
+//   atlas/mod.hexa 의 dispatch() 는 argv[0]="atlas" 를 기대.
+fn _invoke_atlas(forward: [string]) -> i64 {
+    let mut cmd: [string] = []
+    // sticky env prefix — child resolver 가 parent 라우팅 결정을 재사용
+    // (FU-4 Rollout 2026-05-06; mod.hexa::_exec_module 과 동형 패턴)
+    cmd.push("HEXA_LOCAL=${HEXA_LOCAL:-1} ")
+    cmd.push("HEXA_RESOLVER_NO_REROUTE=${HEXA_RESOLVER_NO_REROUTE:-1} ")
+    cmd.push("HEXA_RESOLVER_INHERIT_ENV=${HEXA_RESOLVER_INHERIT_ENV:-1} ")
+    cmd.push("hexa run ")
+    cmd.push(_shq(_ATLAS_MOD))
+    let n = len(forward)
+    let mut i: i64 = 0
+    while i < n {
+        cmd.push(" ")
+        cmd.push(_shq(forward[i]))
+        i = i + 1
+    }
+    cmd.push("; echo \"__RC=$?\"")
+    let raw = to_string(exec(cmd.join("")))   // @allow-bare-exec @resolver-bypass(reason="self-spawn dispatcher; sticky env prefix above keeps child resolver on parent's routing decision — see spec § 7 Rollout FU-4")
+    let marker = "__RC="
+    let idx = raw.index_of(marker)
+    if idx < 0 {
+        if raw != "" { print(raw) }
+        return 1
+    }
+    let body = raw.substring(0, idx)
+    let tail = raw.substring(idx + len(marker), len(raw)).trim()
+    if body != "" { print(body) }
+    let mut rc: i64 = 1
+    try { rc = to_int(tail) } catch e {}   // @allow-silent-catch
+    return rc
+}
+
+// ═══════════════════════════════════════════════════════════
+//  argv 파싱 — hexa local 실행 시 args() 는
+//    [exe, exe, <user-arg-1>, <user-arg-2>, ...] 형태.
+//  앞 두 개를 스킵하면 user 인자 시퀀스가 된다.
+//  (참고: n6/atlas_query.hexa 도 동일한 a[2..] 슬라이싱.)
+// ═══════════════════════════════════════════════════════════
+let _a = args()
+let _na = len(_a)
+let mut _user: [string] = []
+let mut _k: i64 = 2
+while _k < _na {
+    _user.push(_a[_k])
+    _k = _k + 1
+}
+
+let _nu = len(_user)
+
+if _nu == 0 {
+    eprintln("mk2: no command given")
+    eprintln(_help_text())
+    _emit_meta("(none)", 2, 0)
+    exit(1)   // @allow-silent-exit  (per spec: 인자 없음 → exit 1)
+}
+
+let _cmd = _user[0]
+
+if _cmd == "-h" || _cmd == "--help" {
+    println(_help_text())
+    _emit_meta("--help", 0, 0)
+    exit(0)
+}
+
+if _cmd == "atlas" {
+    // forward: ["atlas", subcmd, ...]
+    let _t0 = _ns_now()
+    let _rc = _invoke_atlas(_user)
+    let _t1 = _ns_now()
+    _emit_meta("atlas", _rc, (_t1 - _t0) / 1000)
+    exit(_rc)
+}
+
+if _cmd == "classify" || _cmd == "lattice" || _cmd == "sector" {
+    eprintln("mk2: '" + _cmd + "' not implemented yet (stub)")
+    _emit_meta(_cmd, 1, 0)
+    exit(1)   // @allow-silent-exit
+}
+
+eprintln("mk2: unknown command '" + _cmd + "'")
+eprintln(_help_text())
+_emit_meta(_cmd, 2, 0)
+exit(1)   // @allow-silent-exit  (unknown 도 1 — usage 는 stderr 로 분리)

@@ -27,7 +27,7 @@ nexus check [domain flags] [sub flags] [--quiet] [--json]
 
 수학/물리/의식/Φ/현상학/법칙/무결성/메타 등 13 분야 검증을 단일 진입점으로. 각 분야 backend 가 sentinel 로 결과를 보고하면 router 가 집계해 메타 sentinel 출력. 분야 매트릭스는 `core, module, ai-native doc` 재귀 3-tier 와 Tarski strict hierarchy (`n6/docs/meta_atlas_recursive.md`) 를 준수.
 
-## Domain matrix (13)
+## Domain matrix (14)
 
 | 옵션 | 분야 | 출처 / 상태 |
 |---|---|---|
@@ -44,6 +44,7 @@ nexus check [domain flags] [sub flags] [--quiet] [--json]
 | `--law` | 법칙/수렴 | ANIMA consciousness_laws 흡수 예정 |
 | `--integrity` | 무결성 | ANIMA cert_gate/nexus_gate 흡수 예정 |
 | `--meta` | 메타 | n6 honesty_triad + atlas_drift, stub |
+| `--hexalint` | hexa-lint | tree-sitter-hexa lints.scm AST 룰 (relop/exec/catch/exit) ✅ |
 
 ANIMA 흡수 정책: 정적 검증 ~15-18개 → `tool/check_<domain>.hexa` 로 이관 (별도 PR).
 

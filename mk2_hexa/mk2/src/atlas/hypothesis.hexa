@@ -1,0 +1,235 @@
+// ═══════════════════════════════════════════════════════════
+// mk2_hexa/mk2/src/atlas/hypothesis.hexa — atlas KB hypothesis recall
+//
+// 배경 (mk2 5병렬 작업, 모듈 #2):
+//   `mk2 atlas hypothesis <selector>` 서브커맨드 구현.
+//   데이터 소스: discovery/math_atlas.json (700 가설, v1.1 schema)
+//
+// 설계 (2026-05-06 파일럿 패치 — gap #1 `json-stdlib-parser`):
+//   hexa-lang runtime 빌트인 `json_parse(text)` + `read_file(path)` 사용.
+//   기존 awk RS="    }" 블록 분리 + BSD-awk emoji 회피용 streq() 코드
+//   ~80 줄 제거. 본 모듈은 in-process 파싱 → awk fork 0회, 디스크
+//   임시 awk 스크립트 (/tmp/mk2_atlas_hypothesis.awk) 작성 0회.
+//
+//   기존 awk 경로 measurement (smoke 4, 캐시 워밍 후):
+//     stage:grade duration_ms=430, 매칭 1건
+//   재작성 후 expected: ~50ms (read_file + json_parse + linear scan)
+//
+//   BSD-awk UTF-8 4-byte emoji equality collapse 도 자동 해소 —
+//   hexa native string `==` 는 byte-correct.
+//
+// 인터페이스 계약:
+//   fn run(args: [string]) -> i32   // 0=ok, 1=err
+//   stdout = 가설 메타 (id, grade, domain, title) — 1가설=1줄 TSV
+//   stderr = NDJSON meta {"stage":..., "duration_ms":N, "matches":N, "filter":...}
+//
+// hexa 룰:
+//   `>=` / `<=` 금지 — 본 파일은 `<` / `>` 만 사용.
+//   stdlib only, Rust-free, python 미사용. exec() 0 회 (ns clock 제외).
+//
+// CLI 셀렉터:
+//   <id>            : 정확한 가설 ID 매칭 (예: SEDI:H-AF-009)
+//   --grade=<X>     : 등급 필터 (예: --grade=🟥★★★★, --grade=🟧)
+//   --domain=<X>    : 도메인 필터 (예: --domain=AF)
+//   --list          : 전체 700건 요약 (id + grade + domain)
+//
+// 편집 금지: discovery/math_atlas.json (다른 에이전트 영역, 데이터 SSOT).
+// ═══════════════════════════════════════════════════════════
+
+let _DATA_PATH = "discovery/math_atlas.json"
+
+// ─── ns clock (BSD/GNU 양립, 3-stage fallback) ───
+fn _ns_now() -> i64 {
+    let mut r: i64 = 0
+    let raw = to_string(exec("date +%s%N 2>/dev/null")).trim()  // @allow-bare-exec
+    if raw.len() > 0 && raw.contains("N") == false {
+        try { r = to_int(raw) } catch e {}  // @allow-silent-catch
+    }
+    if r < 1 {
+        let s2 = to_string(exec("python3 -c 'import time;print(time.time_ns())' 2>/dev/null")).trim()  // @allow-bare-exec
+        try { r = to_int(s2) } catch e2 {}  // @allow-silent-catch
+    }
+    if r < 1 {
+        let s3 = to_string(exec("date +%s")).trim()  // @allow-bare-exec
+        try { let sec = to_int(s3); r = sec * 1000000000 } catch e3 {}  // @allow-silent-catch
+    }
+    return r
+}
+
+// ─── safe string field reader for a hypothesis map ───
+//   missing key 또는 non-string 이면 "" 반환.
+fn _str_field(h, key: string) -> string {
+    if !has_key(h, key) { return "" }
+    let v = h[key]
+    if type_of(v) != "string" { return "" }
+    return to_string(v)
+}
+
+// ─── filter mode 결정: returns (mode, filt, label) ───
+//   mode ∈ {"id", "grade", "domain", "list"}
+fn _decode_selector(sel: string) -> [string] {
+    let mut r: [string] = []
+    if sel == "--list" {
+        r.push("list"); r.push(""); r.push("--list")
+    } else if sel.starts_with("--grade=") {
+        r.push("grade"); r.push(sel.substring(8, len(sel))); r.push(sel)
+    } else if sel.starts_with("--domain=") {
+        r.push("domain"); r.push(sel.substring(9, len(sel))); r.push(sel)
+    } else if sel.starts_with("--") {
+        r.push("err"); r.push(""); r.push("unknown flag: " + sel)
+    } else {
+        r.push("id"); r.push(sel); r.push("id=" + sel)
+    }
+    return r
+}
+
+// ─── filter+render: returns matched lines ───
+//   hypotheses 배열을 선형 스캔, mode 별 정확 매칭으로 TSV emit.
+//   native string `==` 사용 (BSD-awk emoji bug 무관).
+fn _filter_hypotheses(hyps, mode: string, filt: string) -> [string] {
+    let mut out: [string] = []
+    let n = len(hyps)
+    let mut i: i64 = 0
+    while i < n {
+        let h = hyps[i]
+        if type_of(h) != "map" { i = i + 1; continue }
+        let id     = _str_field(h, "id")
+        let title  = _str_field(h, "title")
+        let grade  = _str_field(h, "grade")
+        let domain = _str_field(h, "domain")
+        if id == "" { i = i + 1; continue }
+        let mut keep = false
+        if mode == "list" {
+            keep = true
+        } else if mode == "id" && id == filt {
+            keep = true
+        } else if mode == "grade" && grade == filt {
+            keep = true
+        } else if mode == "domain" && domain == filt {
+            keep = true
+        }
+        if keep {
+            let mut row: [string] = []
+            row.push(id)
+            row.push("\t")
+            row.push(grade)
+            row.push("\t")
+            row.push(domain)
+            row.push("\t")
+            row.push(title)
+            out.push(row.join(""))
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── NDJSON meta emit on stderr ───
+fn _emit_meta(stage: string, duration_ms: i64, matches: i64, filter_label: string) {
+    let mut m: [string] = []
+    m.push("{\"stage\":\"")
+    m.push(stage)
+    m.push("\",\"duration_ms\":")
+    m.push(to_string(duration_ms))
+    m.push(",\"matches\":")
+    m.push(to_string(matches))
+    m.push(",\"filter\":\"")
+    m.push(filter_label.replace("\"", "\\\""))
+    m.push("\"}")
+    eprintln(m.join(""))
+}
+
+// ─── 결과 출력 (stdout) ───
+fn _print_lines(lines: [string]) {
+    let n = len(lines)
+    let mut i: i64 = 0
+    while i < n {
+        println(lines[i])
+        i = i + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+// 모듈 엔트리 — main.hexa / atlas/mod.hexa 가 호출 (현재는 stand-alone 실행만)
+// ═══════════════════════════════════════════════════════════
+fn run(argv: [string]) -> i32 {
+    if len(argv) < 1 {
+        eprintln("usage: mk2 atlas hypothesis <id|--grade=X|--domain=X|--list>")
+        return 1
+    }
+    let sel = argv[0]
+    let t0 = _ns_now()
+
+    let dec = _decode_selector(sel)
+    let mode = dec[0]
+    let filt = dec[1]
+    let label = dec[2]
+
+    if mode == "err" {
+        eprintln("mk2_atlas_hypothesis: " + label)
+        return 1
+    }
+
+    if !file_exists(_DATA_PATH) {
+        eprintln("mk2_atlas_hypothesis: data missing: " + _DATA_PATH)
+        return 1
+    }
+
+    let txt = read_file(_DATA_PATH)
+    if len(txt) < 1 {
+        eprintln("mk2_atlas_hypothesis: empty data file: " + _DATA_PATH)
+        return 1
+    }
+
+    let obj = json_parse(txt)
+    if type_of(obj) != "map" {
+        eprintln("mk2_atlas_hypothesis: top-level JSON not an object")
+        return 1
+    }
+    if !has_key(obj, "hypotheses") {
+        eprintln("mk2_atlas_hypothesis: missing 'hypotheses' key in JSON root")
+        return 1
+    }
+    let hyps = obj["hypotheses"]
+    if type_of(hyps) != "array" {
+        eprintln("mk2_atlas_hypothesis: 'hypotheses' is not an array")
+        return 1
+    }
+
+    let lines = _filter_hypotheses(hyps, mode, filt)
+    let t1 = _ns_now()
+    let dur_ms = (t1 - t0) / 1000000
+
+    _print_lines(lines)
+    _emit_meta(mode, dur_ms, len(lines), label)
+    return 0
+}
+
+// ─── stand-alone 진입점 ───
+// 호출 패턴 1 (직접 실행):  hexa run mk2_hexa/mk2/src/atlas/hypothesis.hexa <selector>
+// 호출 패턴 2 (mk2 dispatch): hexa run ... mk2 atlas hypothesis <selector>
+let _a = args()
+let mut _argv: [string] = []
+let mut _k: i64 = 2
+// dispatcher 친화: argv 의 "atlas hypothesis" 토큰이 앞에 있으면 스킵.
+while _k < len(_a) {
+    let tok = _a[_k]
+    let skip_atlas = _k == 2 && tok == "atlas"
+    let skip_hypo = tok == "hypothesis" && len(_argv) == 0
+    if skip_atlas {
+        // skip
+    } else if skip_hypo {
+        // skip
+    } else {
+        _argv.push(tok)
+    }
+    _k = _k + 1
+}
+
+if len(_argv) < 1 {
+    eprintln("usage: hexa run mk2_hexa/mk2/src/atlas/hypothesis.hexa <id|--grade=X|--domain=X|--list>")
+    exit(1)   // @allow-silent-exit
+}
+
+let _rc = run(_argv)
+exit(_rc)   // @allow-silent-exit

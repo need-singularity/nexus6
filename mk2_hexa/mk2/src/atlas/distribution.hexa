@@ -1,0 +1,527 @@
+// ═══════════════════════════════════════════════════════════
+// atlas/distribution.hexa — atlas axis count distributions
+//
+// Subcommand: mk2 atlas distribution [--by sector|ai|grade|constant] [--top=N]
+//
+// Axes:
+//   sector   — atlas.n6 의 `:: <sector>` 필드 카운트 (default; raw sector tokens)
+//   ai       — discovery/alien/alien_index_records.jsonl 의 (d,r) 페어 카운트
+//   grade    — discovery/math_atlas.json 의 `grade` 분포 (null=⬜ 표기)
+//   constant — atlas.n6 의 `@<T> <name>` 상수명 빈도 (top N, 기본 20)
+//
+// 인터페이스: fn run(args: [string]) -> i32   (0=ok, 1=err)
+// stdout: human-readable rank/count/pct table
+// stderr: NDJSON {"stage":"distribution","duration_ms":N,"axis":..,"total":N}
+//
+// 전략:
+//   sector / constant 축 — `read_file` + `#{}` 맵 리터럴로 in-process
+//     집계 (atlas.n6 1-pass). 이전 awk 서브프로세스 (~1.7s) 우회.
+//     map 빌트인 (`m.has`, `m[k]`, `m.keys()`, `m.values()`) 활용.
+//   grade / ai 축 — 입력 파일이 작아 (≤ 350KB) 기존 awk 파이프라인 유지.
+//     하지만 in-process 집계로 통일하여 _total_for 의 2번째 스캔 제거.
+// 규칙: hexa `>=`/`<=` 금지 — `<` / `>` 만 사용. stdlib only.
+// hashmap 빌트인 — `#{}` 맵 리터럴, `m.has(k)`, `m[k]`, `m.keys()`,
+//   `m.values()` 는 hexa 런타임 빌트인. 별도 stdlib import 불필요.
+//   참고: `self/stdlib/map.hexa` (편의 래퍼만 제공).
+// ═══════════════════════════════════════════════════════════
+
+let _ATLAS_PATH    = "n6/atlas.n6"
+let _ATLAS_PATH_2  = "shared/n6/atlas.n6"        // fallback when running from monorepo
+let _MATH_ATLAS    = "discovery/math_atlas.json"
+let _MATH_ATLAS_2  = "shared/discovery/math_atlas.json"
+let _AI_RECORDS    = "discovery/alien/alien_index_records.jsonl"
+let _AI_RECORDS_2  = "shared/discovery/alien/alien_index_records.jsonl"
+
+// ─── ns clock (recall.hexa 와 동일 SSOT) ───
+fn _ns_now() -> i64 {
+    let mut r: i64 = 0
+    let raw = to_string(exec("date +%s%N 2>/dev/null")).trim()  // @allow-bare-exec
+    if raw.len() > 0 && raw.contains("N") == false {
+        try { r = to_int(raw) } catch e {}  // @allow-silent-catch
+    }
+    if r < 1 {
+        let s2 = to_string(exec("python3 -c 'import time;print(time.time_ns())' 2>/dev/null")).trim()  // @allow-bare-exec
+        try { r = to_int(s2) } catch e2 {}  // @allow-silent-catch
+    }
+    if r < 1 {
+        let s3 = to_string(exec("date +%s")).trim()  // @allow-bare-exec
+        try { let sec = to_int(s3); r = sec * 1000000000 } catch e3 {}  // @allow-silent-catch
+    }
+    return r
+}
+
+fn _resolve(prim: string, fallback: string) -> string {
+    if file_exists(prim) { return prim }
+    if file_exists(fallback) { return fallback }
+    return prim
+}
+
+// ─── @[A-Z?] 라인 인식 헬퍼 (sector/constant 축 공용) ───
+// awk 정규식 `^@[A-Z?]` 와 동일 의미. hexa 런타임에 정규식이 없어
+// 첫 두 문자 직접 검사. 13/14k 라인 hot loop 의 inner branch.
+fn _is_atlas_decl(ln: string) -> bool {
+    let n = ln.len()
+    if n < 3 { return false }
+    if ln.substring(0, 1) != "@" { return false }
+    let c = ln.substring(1, 2)
+    if c == "?" { return true }
+    // uppercase A..Z (ASCII single-byte each)
+    return c == "A" || c == "B" || c == "C" || c == "D" || c == "E"
+        || c == "F" || c == "G" || c == "H" || c == "I" || c == "J"
+        || c == "K" || c == "L" || c == "M" || c == "N" || c == "O"
+        || c == "P" || c == "Q" || c == "R" || c == "S" || c == "T"
+        || c == "U" || c == "V" || c == "W" || c == "X" || c == "Y"
+        || c == "Z"
+}
+
+// ─── map 빌트인 → 정렬용 평행 배열 변환 ───
+// `_render_table` 가 평행 배열 [string] + [i64] 시그니처를 요구해서
+// 집계가 끝난 `#{}` map 을 keys/values 배열로 평탄화.
+fn _flatten_map(m, keys: [string], counts: [i64]) {
+    let ks = m.keys()
+    let vs = m.values()
+    let n = len(ks)
+    let mut i: i64 = 0
+    while i < n {
+        keys.push(ks[i])
+        counts.push(vs[i])
+        i = i + 1
+    }
+}
+
+// ─── parse "rank count pct" lines from awk output ───
+// awk emits: "<count>\t<key>" lines, sorted desc; we render.
+fn _render_table(axis: string, keys: [string], counts: [i64], total: i64, top_n: i64) {
+    let n = len(keys)
+    // sort by count desc via index array (selection sort — n is small for axis tables)
+    let mut idxs: [i64] = []
+    let mut z: i64 = 0
+    while z < n {
+        idxs.push(z)
+        z = z + 1
+    }
+    let mut p: i64 = 0
+    let mut limit = top_n
+    if limit < 1 { limit = n }
+    if limit > n { limit = n }
+    while p < limit {
+        let mut best = p
+        let mut q = p + 1
+        while q < n {
+            if counts[idxs[q]] > counts[idxs[best]] { best = q }
+            q = q + 1
+        }
+        if best != p {
+            let tmp = idxs[p]
+            idxs[p] = idxs[best]
+            idxs[best] = tmp
+        }
+        p = p + 1
+    }
+
+    // header
+    println("axis: " + axis + "  total: " + _commify(total))
+    println("rank  key                              count       pct")
+    let mut r: i64 = 0
+    while r < limit {
+        let ci = idxs[r]
+        let key = keys[ci]
+        let cnt = counts[ci]
+        let pct = if total > 0 {
+            (to_float(cnt) * 100.0) / to_float(total)
+        } else { 0.0 }
+        let rank_s = _pad_left(to_string(r + 1), 4)
+        let key_s = _pad_right(key, 32)
+        let cnt_s = _pad_left(_commify(cnt), 10)
+        let pct_s = _fmt_pct(pct)
+        println(rank_s + "  " + key_s + " " + cnt_s + "  " + pct_s)
+        r = r + 1
+    }
+}
+
+fn _commify(n: i64) -> string {
+    let s = to_string(n)
+    let mut neg = false
+    let mut body = s
+    if s.len() > 0 && s.substring(0, 1) == "-" {
+        neg = true
+        body = s.substring(1, s.len())
+    }
+    let m = body.len()
+    if m < 4 { return s }
+    let mut out: [string] = []
+    let mut i: i64 = 0
+    while i < m {
+        out.push(body.substring(i, i + 1))
+        i = i + 1
+    }
+    // insert commas every 3 from right
+    let mut acc: [string] = []
+    let mut k: i64 = m - 1
+    let mut step: i64 = 0
+    while k > -1 {
+        acc.push(out[k])
+        step = step + 1
+        if step == 3 && k > 0 {
+            acc.push(",")
+            step = 0
+        }
+        k = k - 1
+    }
+    // reverse
+    let mut rev: [string] = []
+    let na = len(acc)
+    let mut j: i64 = na - 1
+    while j > -1 {
+        rev.push(acc[j])
+        j = j - 1
+    }
+    let body_c = rev.join("")
+    if neg { return "-" + body_c }
+    return body_c
+}
+
+fn _pad_left(s: string, w: i64) -> string {
+    let n = s.len()
+    if n > w - 1 { return s }
+    let mut pad: [string] = []
+    let mut i: i64 = 0
+    while i < w - n {
+        pad.push(" ")
+        i = i + 1
+    }
+    return pad.join("") + s
+}
+
+fn _pad_right(s: string, w: i64) -> string {
+    let n = s.len()
+    if n > w - 1 { return s }
+    let mut pad: [string] = []
+    let mut i: i64 = 0
+    while i < w - n {
+        pad.push(" ")
+        i = i + 1
+    }
+    return s + pad.join("")
+}
+
+fn _fmt_pct(p: f64) -> string {
+    // 1 decimal place, no trailing format helper assumed
+    let scaled = p * 10.0
+    let rounded = if scaled < 0.0 {
+        to_int(scaled - 0.5)
+    } else {
+        to_int(scaled + 0.5)
+    }
+    let whole = rounded / 10
+    let frac = rounded % 10
+    let mut frac_s = to_string(frac)
+    if frac < 0 { frac_s = to_string(0 - frac) }
+    let whole_s = to_string(whole)
+    return whole_s + "." + frac_s + "%"
+}
+
+// ─── axis: sector ───
+// atlas.n6 line shape: `@<T> <id> = ... :: <sector> [grade]`
+// 빌트인 `#{}` 맵으로 in-process 집계 (이전 awk 서브프로세스 대체).
+// out_total 에 총 카운트 1-element push (run() 의 NDJSON meta 용).
+fn _by_sector(top_n: i64, out_total: [i64]) -> i32 {
+    let path = _resolve(_ATLAS_PATH, _ATLAS_PATH_2)
+    if !file_exists(path) {
+        eprintln("error: atlas.n6 not found (tried " + _ATLAS_PATH + ", " + _ATLAS_PATH_2 + ")")
+        out_total.push(0)
+        return 1
+    }
+    let raw = read_file(path)
+    let lines = raw.split("\n")
+    let n = len(lines)
+    let mut counts = #{}
+    let mut total: i64 = 0
+    let mut i: i64 = 0
+    while i < n {
+        let ln = lines[i]
+        if _is_atlas_decl(ln) {
+            let sep = ln.index_of("::")
+            if sep > 0 {
+                let after = ln.substring(sep + 2, ln.len())
+                let bk = after.index_of("[")
+                let mut sect = after
+                if bk > -1 { sect = after.substring(0, bk) }
+                sect = sect.trim()
+                let sl = sect.len()
+                if sl > 0 && sl < 60 {
+                    let cur = if counts.has(sect) { counts[sect] } else { 0 }
+                    counts[sect] = cur + 1
+                    total = total + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    out_total.push(total)
+    if total < 1 {
+        println("axis: sector  total: 0")
+        return 1
+    }
+    let mut keys: [string] = []
+    let mut vals: [i64] = []
+    _flatten_map(counts, keys, vals)
+    _render_table("sector", keys, vals, total, top_n)
+    return 0
+}
+
+// ─── axis: grade ───
+// math_atlas.json: extract every `"grade":` value (string|null|integer).
+// `grep -oE` 로 후보 토큰만 stdout 으로 받고, 정규화 + 집계는 hexa 빌트인
+// 맵으로 in-process 처리 (이전 sed | awk 파이프라인 대체).
+fn _by_grade(top_n: i64, out_total: [i64]) -> i32 {
+    let path = _resolve(_MATH_ATLAS, _MATH_ATLAS_2)
+    if !file_exists(path) {
+        eprintln("error: math_atlas.json not found (tried " + _MATH_ATLAS + ", " + _MATH_ATLAS_2 + ")")
+        out_total.push(0)
+        return 1
+    }
+    let cmd = "LC_ALL=C grep -oE '\"grade\":[^,}]*' '" + path + "' 2>/dev/null"
+    let raw = to_string(exec(cmd))   // @allow-bare-exec
+    let lines = raw.split("\n")
+    let n = len(lines)
+    let mut counts = #{}
+    let mut total: i64 = 0
+    let mut i: i64 = 0
+    while i < n {
+        let mut ln = lines[i].trim()
+        if ln.len() > 0 {
+            // strip leading `"grade":` and surrounding whitespace
+            let pfx = "\"grade\":"
+            if ln.index_of(pfx) == 0 {
+                ln = ln.substring(pfx.len(), ln.len()).trim()
+            }
+            // strip surrounding double-quotes if present
+            let lnlen = ln.len()
+            if lnlen > 1 && ln.substring(0, 1) == "\"" && ln.substring(lnlen - 1, lnlen) == "\"" {
+                ln = ln.substring(1, lnlen - 1)
+            }
+            // null → (none)
+            if ln == "null" { ln = "(none)" }
+            if ln.len() > 0 {
+                let cur = if counts.has(ln) { counts[ln] } else { 0 }
+                counts[ln] = cur + 1
+                total = total + 1
+            }
+        }
+        i = i + 1
+    }
+    out_total.push(total)
+    if total < 1 {
+        println("axis: grade  total: 0")
+        return 1
+    }
+    let mut keys: [string] = []
+    let mut vals: [i64] = []
+    _flatten_map(counts, keys, vals)
+    _render_table("grade", keys, vals, total, top_n)
+    return 0
+}
+
+// ─── axis: ai (alien index d,r) ───
+// jsonl records carry `"current": {"d": N, "r": M}`; extract pair.
+// awk 의 정규식 매칭은 awk 에 위임하되, 집계만 hexa 맵 빌트인으로 이관.
+// awk 가 한 라인에 `(d,r)` key 만 echo, hexa 가 in-process 카운트.
+fn _by_ai(top_n: i64, out_total: [i64]) -> i32 {
+    let path = _resolve(_AI_RECORDS, _AI_RECORDS_2)
+    if !file_exists(path) {
+        eprintln("error: alien_index_records.jsonl not found (tried " + _AI_RECORDS + ", " + _AI_RECORDS_2 + ")")
+        out_total.push(0)
+        return 1
+    }
+    let cmd = "LC_ALL=C awk '"
+        + "{"
+        + "  line=$0;"
+        + "  cs=index(line,\"\\\"current\\\"\"); if (cs<1) next;"
+        + "  rest=substr(line,cs);"
+        + "  d=-1; r=-1;"
+        + "  if (match(rest,/\"d\":[ ]*-?[0-9]+/)) { s=substr(rest,RSTART,RLENGTH); sub(/\"d\":[ ]*/,\"\",s); d=s+0 }"
+        + "  if (match(rest,/\"r\":[ ]*-?[0-9]+/)) { s=substr(rest,RSTART,RLENGTH); sub(/\"r\":[ ]*/,\"\",s); r=s+0 }"
+        + "  if (d>-1 && r>-1) print \"(\" d \",\" r \")\""
+        + "}' '" + path + "' 2>/dev/null"
+    let raw = to_string(exec(cmd))   // @allow-bare-exec
+    let lines = raw.split("\n")
+    let n = len(lines)
+    let mut counts = #{}
+    let mut total: i64 = 0
+    let mut i: i64 = 0
+    while i < n {
+        let key = lines[i].trim()
+        if key.len() > 0 {
+            let cur = if counts.has(key) { counts[key] } else { 0 }
+            counts[key] = cur + 1
+            total = total + 1
+        }
+        i = i + 1
+    }
+    out_total.push(total)
+    if total < 1 {
+        println("axis: ai  total: 0")
+        return 1
+    }
+    let mut keys: [string] = []
+    let mut vals: [i64] = []
+    _flatten_map(counts, keys, vals)
+    _render_table("ai", keys, vals, total, top_n)
+    return 0
+}
+
+// ─── axis: constant (constant name frequency) ───
+// atlas.n6: `@<T> <name> = ...`. <name> 토큰은 첫 공백까지. `topo-` prefix
+// 제외 (docs §1.1). hexa 빌트인 맵으로 1-pass in-process 집계.
+fn _by_constant(top_n: i64, out_total: [i64]) -> i32 {
+    let path = _resolve(_ATLAS_PATH, _ATLAS_PATH_2)
+    if !file_exists(path) {
+        eprintln("error: atlas.n6 not found")
+        out_total.push(0)
+        return 1
+    }
+    let raw = read_file(path)
+    let lines = raw.split("\n")
+    let n = len(lines)
+    let mut counts = #{}
+    let mut total: i64 = 0
+    let mut i: i64 = 0
+    while i < n {
+        let ln = lines[i]
+        if _is_atlas_decl(ln) {
+            // awk default FS: $2 == 첫 공백 다음 토큰. 라인 형식
+            // `@T <name> = ...` 이므로 첫 공백 + 두 번째 공백 사이.
+            let sp1 = ln.index_of(" ")
+            if sp1 > 0 {
+                let rest = ln.substring(sp1 + 1, ln.len())
+                // skip extra leading spaces (none expected, but defensive)
+                let rl = rest.len()
+                let mut name = rest
+                let sp2 = rest.index_of(" ")
+                if sp2 > 0 { name = rest.substring(0, sp2) }
+                let nl = name.len()
+                if nl > 0 {
+                    let mut skip = false
+                    if nl > 4 && name.substring(0, 5) == "topo-" { skip = true }
+                    if !skip {
+                        let cur = if counts.has(name) { counts[name] } else { 0 }
+                        counts[name] = cur + 1
+                        total = total + 1
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    out_total.push(total)
+    if total < 1 {
+        println("axis: constant  total: 0")
+        return 1
+    }
+    let mut keys: [string] = []
+    let mut vals: [i64] = []
+    _flatten_map(counts, keys, vals)
+    _render_table("constant", keys, vals, total, top_n)
+    return 0
+}
+
+// ─── arg parsing ───
+fn _parse_top_kv(s: string) -> i64 {
+    let mut n: i64 = 0
+    let eq = s.index_of("=")
+    if eq > 0 {
+        let tail = s.substring(eq + 1, s.len())
+        try { n = to_int(tail.trim()) } catch e {}  // @allow-silent-catch
+    }
+    return n
+}
+
+// ─── public entry ───
+fn run(args: [string]) -> i32 {
+    let t0 = _ns_now()
+
+    let mut by: string = "sector"
+    let mut top_n: i64 = 0       // 0 = axis default
+    let mut i: i64 = 0
+    let na = len(args)
+    while i < na {
+        let a = args[i]
+        if a == "distribution" {
+            // skip leading subcommand keyword
+        } else if a == "--by" {
+            i = i + 1
+            if i < na { by = args[i] }
+        } else if a.index_of("--by=") == 0 {
+            by = a.substring(5, a.len())
+        } else if a.index_of("--top=") == 0 {
+            let v = _parse_top_kv(a)
+            if v > 0 { top_n = v }
+        } else if a == "--top" {
+            i = i + 1
+            if i < na {
+                let mut t: i64 = 0
+                try { t = to_int(args[i]) } catch e {}  // @allow-silent-catch
+                if t > 0 { top_n = t }
+            }
+        }
+        i = i + 1
+    }
+
+    // axis-default top
+    let mut effective_top = top_n
+    if effective_top < 1 {
+        if by == "constant" { effective_top = 20 }
+        else if by == "ai"  { effective_top = 30 }
+        else { effective_top = 50 }
+    }
+
+    let mut rc: i32 = 0
+    // _by_<axis> 가 단일 패스에서 집계 후 out_total 에 push.
+    // 이전: 두 번째 awk 호출로 total 만 재계산 (스캔 중복) — 제거.
+    let mut out_total: [i64] = []
+    if by == "sector" {
+        rc = _by_sector(effective_top, out_total)
+    } else if by == "grade" {
+        rc = _by_grade(effective_top, out_total)
+    } else if by == "ai" {
+        rc = _by_ai(effective_top, out_total)
+    } else if by == "constant" {
+        rc = _by_constant(effective_top, out_total)
+    } else {
+        eprintln("error: unknown --by '" + by + "' (expected sector|ai|grade|constant)")
+        rc = 1
+    }
+    let total_rendered: i64 = if len(out_total) > 0 { out_total[0] } else { 0 }
+
+    let t1 = _ns_now()
+    let dur_ms = (t1 - t0) / 1000000
+    let mut meta: [string] = []
+    meta.push("{\"stage\":\"distribution\",\"duration_ms\":")
+    meta.push(to_string(dur_ms))
+    meta.push(",\"axis\":\"")
+    meta.push(by)
+    meta.push("\",\"total\":")
+    meta.push(to_string(total_rendered))
+    meta.push("}")
+    eprintln(meta.join(""))
+    return rc
+}
+
+// (이전: `_total_for(axis)` 함수가 두 번째 awk 패스로 total 을 재계산.
+//  hashmap-stdlib 패치 후 `_by_<axis>` 가 1-pass 에서 out_total 에 push
+//  하므로 제거됨. NDJSON `total` 필드는 동일 의미 유지.)
+
+// ═══════════════════════════════════════════════════════════
+//  CLI entry — `hexa run distribution.hexa [--by X] [--top=N]`
+// ═══════════════════════════════════════════════════════════
+let _argv = args()
+let mut _passthrough: [string] = []
+let mut _i: i64 = 2   // skip "hexa" and script path
+let _na = len(_argv)
+while _i < _na {
+    _passthrough.push(_argv[_i])
+    _i = _i + 1
+}
+let _rc = run(_passthrough)
+exit(_rc)   // @allow-silent-exit

@@ -5,6 +5,10 @@
 1. **[00-vision.md](00-vision.md)** — Why mk2, what it solves, success criteria
 2. **[01-architecture.md](01-architecture.md)** — Module design, data flow, interfaces
 3. **[02-phases.md](02-phases.md)** — Phased rollout plan, risks, DoD
+4. **[04-roadmap.md](04-roadmap.md)** — Phase-level roadmap and milestones
+5. **[05-n6-data-atlas.md](05-n6-data-atlas.md)** — n6 atlas data model
+6. **[06-cross-project-model.md](06-cross-project-model.md)** — Cross-project model
+7. **[07-atlas-recall.md](07-atlas-recall.md)** — `mk2 atlas <subcmd>` recall layer (4-way)
 
 ## Related
 

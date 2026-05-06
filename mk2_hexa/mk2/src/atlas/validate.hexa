@@ -1,0 +1,230 @@
+// ═══════════════════════════════════════════════════════════
+// mk2_hexa/mk2/src/atlas/validate.hexa — atlas.n6 schema validator
+//
+// 책임 범위:
+//   `mk2 atlas validate [path] [--strict] [--quiet]` 디스패치 만.
+//   실제 룰 엔진 (R1..R6 + D1) 은 standalone tool
+//   `tooling/atlas-validator/atlas_validate.hexa` (다른 에이전트
+//   소유 / 본 파일 read-only 참조). 본 모듈은 그것을 서브프로세스
+//   호출하고 stdout 을 forward, exit code 를 `__RC=$?` trailer 로
+//   회수, 마지막 `__ATLAS_VALIDATE__` summary 라인에서
+//   total/errors/warnings/duration_ms 를 회수해 본 모듈 고유의
+//   stderr meta `NEXUS_MK2_ATLAS_VALIDATE` NDJSON 1라인을 emit.
+//
+// 설계 (subprocess 패턴):
+//   - hexa-lang module-import 부재 (gap: module-import-system) →
+//     fork+JIT init 비용 있음 (subprocess pattern, GOTCHAS.md §8).
+//     본 모듈은 router (~120 LOC) 로 keep, 룰 엔진 single-source-of-truth
+//     은 standalone tool 에 잔존.
+//   - sticky resolver env prefix 부착: `${VAR:-1}` — caller override 우선.
+//
+// 인터페이스: fn run(args: [string]) -> i32   (0=ok, 1=err, 2=usage)
+// stdout: standalone tool 의 NDJSON violations + __ATLAS_VALIDATE__ summary
+//   (forward as-is; quiet 모드 선택 지원)
+// stderr: NDJSON `NEXUS_MK2_ATLAS_VALIDATE
+//   {"path":"...","stage":"validate","total":N,"errors":E,"warnings":W,"duration_ms":D}`
+//
+// CLI:
+//   mk2 atlas validate                          # default: n6/atlas.n6
+//   mk2 atlas validate n6/atlas.n6              # explicit path
+//   mk2 atlas validate --path n6/atlas.n6
+//   mk2 atlas validate --strict                 # warnings 도 fail
+//   mk2 atlas validate --quiet                  # summary 만
+//
+// 규칙: hexa >=/<= 금지 — < / > 만 사용. stdlib only.
+// 편집 금지: tooling/atlas-validator/atlas_validate.hexa (읽기/호출만),
+//          n6/atlas.n6, mk2_hexa/mk2/src/atlas/{lookup,hypothesis,
+//          recall,distribution,mod}.hexa, mk2_hexa/mk2/src/main.hexa.
+// ═══════════════════════════════════════════════════════════
+
+let _STANDALONE_PATH = "tooling/atlas-validator/atlas_validate.hexa"
+let _DEFAULT_DATA    = "n6/atlas.n6"
+
+// ─── ns clock (PATTERNS.md §1 SSOT, BSD/GNU 양립) ───
+fn _ns_now() -> i64 {
+    let mut r: i64 = 0
+    let raw = to_string(exec("date +%s%N 2>/dev/null")).trim()  // @allow-bare-exec
+    if raw.len() > 0 && raw.contains("N") == false {
+        try { r = to_int(raw) } catch e {}  // @allow-silent-catch
+    }
+    if r < 1 {
+        let s2 = to_string(exec("python3 -c 'import time;print(time.time_ns())' 2>/dev/null")).trim()  // @allow-bare-exec
+        try { r = to_int(s2) } catch e2 {}  // @allow-silent-catch
+    }
+    if r < 1 {
+        let s3 = to_string(exec("date +%s")).trim()  // @allow-bare-exec
+        try { let sec = to_int(s3); r = sec * 1000000000 } catch e3 {}  // @allow-silent-catch
+    }
+    return r
+}
+
+// ─── shell-quote (single-quote 안전, PATTERNS.md §3) ───
+fn _shq(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+// ─── extract integer value for "<key>":N from NDJSON-ish string ───
+fn _extract_kv_int(s: string, key: string) -> i64 {
+    let pat = "\"" + key + "\":"
+    let i = s.index_of(pat)
+    if i < 0 { return -1 }
+    let tail = s.substring(i + len(pat), len(s))
+    let mut end = 0
+    let n = len(tail)
+    let mut digits: [string] = []
+    while end < n {
+        let c = tail.substring(end, end + 1)
+        let isd = c == "0" || c == "1" || c == "2" || c == "3" || c == "4"
+            || c == "5" || c == "6" || c == "7" || c == "8" || c == "9"
+        if !isd { end = n }
+        else { digits.push(c); end = end + 1 }
+    }
+    if len(digits) < 1 { return -1 }
+    let mut r: i64 = -1
+    try { r = to_int(digits.join("")) } catch e {}  // @allow-silent-catch
+    return r
+}
+
+// ─── NDJSON meta emit (stderr, NEXUS_MK2_ATLAS_VALIDATE) ───
+fn _emit_meta(path: string, total: i64, errs: i64, warns: i64, dur_ms: i64) -> void {
+    let mut m: [string] = []
+    m.push("NEXUS_MK2_ATLAS_VALIDATE {\"stage\":\"validate\",\"path\":\"")
+    m.push(path)
+    m.push("\",\"total\":")
+    m.push(to_string(total))
+    m.push(",\"errors\":")
+    m.push(to_string(errs))
+    m.push(",\"warnings\":")
+    m.push(to_string(warns))
+    m.push(",\"duration_ms\":")
+    m.push(to_string(dur_ms))
+    m.push("}")
+    eprintln(m.join(""))
+}
+
+fn _help_text() -> string {
+    let mut p: [string] = []
+    p.push("usage: mk2 atlas validate [path] [--strict] [--quiet]\n")
+    p.push("\n")
+    p.push("validates n6 schema (R1..R6 + D1 duplicate-id detection).\n")
+    p.push("delegates to tooling/atlas-validator/atlas_validate.hexa.\n")
+    p.push("\n")
+    p.push("arguments:\n")
+    p.push("  path           atlas.n6 path (default: n6/atlas.n6)\n")
+    p.push("\n")
+    p.push("options:\n")
+    p.push("  --path PATH    explicit path (alternative to positional)\n")
+    p.push("  --strict       warnings 도 fail (rc=1)\n")
+    p.push("  --quiet        per-violation NDJSON 억제 — summary 만\n")
+    p.push("  -h, --help     show this help\n")
+    p.push("\n")
+    p.push("exit code: 0=ok, 1=violations, 2=usage error\n")
+    return p.join("")
+}
+
+// ═══════════════════════════════════════════════════════════
+//  run — 라우터 entrypoint (mk2 atlas mod.hexa 가 호출하는 계약)
+//    args = ["<path-or-flag>", ...]   (atlas/validate 토큰 제거 후)
+// ═══════════════════════════════════════════════════════════
+fn run(args: [string]) -> i32 {
+    let n = len(args)
+    let mut path = _DEFAULT_DATA
+    let mut strict = false
+    let mut quiet = false
+    let mut explicit_path = false
+
+    let mut i: i64 = 0
+    while i < n {
+        let a = args[i]
+        if a == "-h" || a == "--help" {
+            println(_help_text())
+            return 0
+        }
+        else if a == "--strict" { strict = true }
+        else if a == "--quiet"  { quiet = true }
+        else if a == "--path" {
+            if i + 1 < n { path = args[i + 1]; explicit_path = true; i = i + 1 }
+            else {
+                eprintln("mk2 atlas validate: --path requires argument")
+                return 2
+            }
+        }
+        else if a.len() > 0 && a.substring(0, 1) != "-" {
+            // positional path
+            if explicit_path == false { path = a; explicit_path = true }
+        }
+        i = i + 1
+    }
+
+    // build subprocess command
+    let mut cmd: [string] = []
+    // sticky env prefix — child resolver 가 parent 라우팅 결정을 재사용
+    cmd.push("HEXA_LOCAL=${HEXA_LOCAL:-1} ")
+    cmd.push("HEXA_RESOLVER_NO_REROUTE=${HEXA_RESOLVER_NO_REROUTE:-1} ")
+    cmd.push("HEXA_RESOLVER_INHERIT_ENV=${HEXA_RESOLVER_INHERIT_ENV:-1} ")
+    cmd.push("hexa run ")
+    cmd.push(_shq(_STANDALONE_PATH))
+    cmd.push(" --path ")
+    cmd.push(_shq(path))
+    if strict { cmd.push(" --strict") }
+    if quiet  { cmd.push(" --quiet") }
+    cmd.push("; echo \"__RC=$?\"")
+
+    let t0 = _ns_now()
+    let raw = to_string(exec(cmd.join("")))   // @allow-bare-exec @resolver-bypass(reason="self-spawn dispatcher; sticky env prefix above keeps child resolver on parent's routing decision — see spec § Track 2")
+    let t1 = _ns_now()
+    let dur_ms = (t1 - t0) / 1000000
+
+    // recover trailer rc
+    let marker = "__RC="
+    let idx = raw.index_of(marker)
+    let mut rc: i64 = 1
+    let mut body = ""
+    if idx < 0 {
+        body = raw
+    } else {
+        body = raw.substring(0, idx)
+        let tail = raw.substring(idx + len(marker), len(raw)).trim()
+        try { rc = to_int(tail) } catch e {}  // @allow-silent-catch
+    }
+
+    // forward stdout body as-is
+    if body != "" { print(body) }
+
+    // parse summary line `__ATLAS_VALIDATE__ {"path":"...","total":N,"errors":E,"warnings":W,...}`
+    let mut total: i64 = 0
+    let mut errs: i64 = 0
+    let mut warns: i64 = 0
+    let s_idx = body.index_of("__ATLAS_VALIDATE__")
+    if s_idx > -1 {
+        let summary = body.substring(s_idx, len(body))
+        let v_total = _extract_kv_int(summary, "total")
+        let v_errs  = _extract_kv_int(summary, "errors")
+        let v_warns = _extract_kv_int(summary, "warnings")
+        if v_total > -1 { total = v_total }
+        if v_errs  > -1 { errs  = v_errs }
+        if v_warns > -1 { warns = v_warns }
+    }
+
+    _emit_meta(path, total, errs, warns, dur_ms)
+    return rc
+}
+
+// ═══════════════════════════════════════════════════════════
+//  CLI entry — `hexa run validate.hexa <args>` (standalone or dispatch)
+//  args() shape (local mode, GOTCHAS.md §3):
+//    [exe, exe, user_arg_1, user_arg_2, ...] → 사용자 인자는 a[2..].
+//  본 모듈은 path argument 가 '/' 를 포함할 수 있으므로
+//  lookup.hexa 식 contains-slash 필터 사용 불가. main.hexa /
+//  standalone atlas_validate.hexa 와 동일하게 a[2..] 절단.
+// ═══════════════════════════════════════════════════════════
+let _argv = args()
+let mut _passthrough: [string] = []
+let mut _i: i64 = 2
+let _na = len(_argv)
+while _i < _na {
+    _passthrough.push(_argv[_i])
+    _i = _i + 1
+}
+let _rc = run(_passthrough)
+exit(_rc)   // @allow-silent-exit

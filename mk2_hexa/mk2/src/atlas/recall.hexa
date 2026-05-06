@@ -1,0 +1,487 @@
+// ═══════════════════════════════════════════════════════════
+// atlas/recall.hexa — value → n=6 closed-algebra best match
+//
+// Subcommand: mk2 atlas recall <value> [--sector X] [--top=N]
+//
+// 동작:
+//   1) 알려진 12개 매핑 (Section 3.1/3.2/3.3) 직접 매치 (1% 이내 우선)
+//   2) euler_ratio(P), 1−euler_ratio(P) — P ⊆ {2,3,5,7,11,13,17,19} (256개)
+//   3) 분모 ≤ 200 까지 best rational 근사 (Stern-Brocot 직접 search)
+//   4) --sector 필터: cosmology/quantum/electroweak/primordial/strong
+//   5) --top=N (default 3)
+//
+// 인터페이스: fn run(args: [string]) -> i32   (0=ok, 1=err)
+// stdout: human-readable best match
+// stderr: NDJSON {"stage":"recall","duration_ms":N,"value":X,"best_err":Y}
+//
+// 규칙: hexa `>=`/`<=` 금지 — `<` / `>` 만 사용. stdlib only.
+// ═══════════════════════════════════════════════════════════
+
+// ─── ns clock ───
+fn _ns_now() -> i64 {
+    let mut r: i64 = 0
+    let raw = to_string(exec("date +%s%N 2>/dev/null")).trim()  // @allow-bare-exec
+    if raw.len() > 0 && raw.contains("N") == false {
+        try { r = to_int(raw) } catch e {}  // @allow-silent-catch
+    }
+    if r < 1 {
+        let s2 = to_string(exec("python3 -c 'import time;print(time.time_ns())' 2>/dev/null")).trim()  // @allow-bare-exec
+        try { r = to_int(s2) } catch e2 {}  // @allow-silent-catch
+    }
+    if r < 1 {
+        let s3 = to_string(exec("date +%s")).trim()  // @allow-bare-exec
+        try { let sec = to_int(s3); r = sec * 1000000000 } catch e3 {}  // @allow-silent-catch
+    }
+    return r
+}
+
+// ─── helpers ───
+fn _abs_f64(x: f64) -> f64 {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn _abs_i64(x: i64) -> i64 {
+    if x < 0 { return 0 - x }
+    return x
+}
+
+fn _gcd(a: i64, b: i64) -> i64 {
+    let mut x = _abs_i64(a)
+    let mut y = _abs_i64(b)
+    while y > 0 {
+        let t = x % y
+        x = y
+        y = t
+    }
+    if x < 1 { return 1 }
+    return x
+}
+
+// relative error abs((a-b)/b), with safe denominator
+fn _rel_err(a: f64, b: f64) -> f64 {
+    let denom = _abs_f64(b)
+    if denom < 0.0000000001 { return _abs_f64(a - b) }
+    return _abs_f64(a - b) / denom
+}
+
+// ─── known mapping table (12 entries) ───
+// fields parallel arrays: name, sector, num, den, ref_value, formula, prime_csv
+let _PRIMES: [i64] = [2, 3, 5, 7, 11, 13, 17, 19]
+
+fn _known_count() -> i64 { return 12 }
+
+// returns one of the 12 known mappings as a struct-like tuple via parallel string
+// idx 0..11 — values picked so caller can format human output
+// For simplicity we route through a single dispatcher returning a 7-tuple as [string]
+//   [name, sector, num_str, den_str, ref_val_str, formula, prime_csv]
+fn _known_at(idx: i64) -> [string] {
+    let mut r: [string] = []
+    if idx == 0 {
+        r.push("sin2_theta_W"); r.push("electroweak"); r.push("8"); r.push("35")
+        r.push("0.231"); r.push("euler_ratio({2,3,5,7})"); r.push("2,3,5,7")
+    } else if idx == 1 {
+        r.push("Y_p"); r.push("primordial"); r.push("16"); r.push("65")
+        r.push("0.245"); r.push("euler_ratio({2,3,5,13})"); r.push("2,3,5,13")
+    } else if idx == 2 {
+        r.push("Omega_DM"); r.push("cosmology"); r.push("4"); r.push("15")
+        r.push("0.266"); r.push("euler_ratio({2,3,5})"); r.push("2,3,5")
+    } else if idx == 3 {
+        r.push("Omega_b"); r.push("cosmology"); r.push("1"); r.push("21")
+        r.push("0.0493"); r.push("1 - 4/15 - 24/35 = 1/21"); r.push("3,7")
+    } else if idx == 4 {
+        r.push("alpha_inv"); r.push("quantum"); r.push("0"); r.push("0")
+        r.push("137.036"); r.push("sigma^2 - M3 + phi/(sigma*sopfr) = 137.0333"); r.push("")
+    } else if idx == 5 {
+        r.push("mp_me"); r.push("strong"); r.push("0"); r.push("0")
+        r.push("1836.153"); r.push("6*pi^5 = 1836.118"); r.push("")
+    } else if idx == 6 {
+        r.push("n_s"); r.push("cosmology"); r.push("139"); r.push("144")
+        r.push("0.9649"); r.push("1 - sopfr/(n*J2) = 139/144"); r.push("")
+    } else if idx == 7 {
+        r.push("BAO_r_s"); r.push("cosmology"); r.push("147"); r.push("1")
+        r.push("147.09"); r.push("sigma^2 + sigma/tau = 147"); r.push("")
+    } else if idx == 8 {
+        r.push("Omega_m"); r.push("cosmology"); r.push("1"); r.push("3")
+        r.push("0.3153"); r.push("phi/n = 1/3"); r.push("3")
+    } else if idx == 9 {
+        r.push("Omega_Lambda"); r.push("cosmology"); r.push("2"); r.push("3")
+        r.push("0.6847"); r.push("tau/n = 2/3"); r.push("3")
+    } else if idx == 10 {
+        r.push("Hubble_tension"); r.push("cosmology"); r.push("6"); r.push("1")
+        r.push("6"); r.push("n = 6"); r.push("2,3")
+    } else if idx == 11 {
+        r.push("inflation_e_folds"); r.push("cosmology"); r.push("60"); r.push("1")
+        r.push("60"); r.push("sigma * sopfr = 60"); r.push("2,3,5")
+    } else {
+        r.push(""); r.push(""); r.push("0"); r.push("0"); r.push("0"); r.push(""); r.push("")
+    }
+    return r
+}
+
+fn _known_ref_val(idx: i64) -> f64 {
+    let row = _known_at(idx)
+    let mut v: f64 = 0.0
+    try { v = to_float(row[4]) } catch e {}  // @allow-silent-catch
+    return v
+}
+
+// ─── euler_ratio for prime subset given by 8-bit mask ───
+// Uses rational arithmetic to keep exactness up to 1/(2*3*5*7*11*13*17*19) bits
+fn _euler_ratio_mask(mask: i64) -> [i64] {
+    // returns [num, den] reduced
+    let mut num: i64 = 1
+    let mut den: i64 = 1
+    let mut bit: i64 = 0
+    while bit < 8 {
+        let one: i64 = 1
+        let probe: i64 = one << bit
+        if (mask & probe) != 0 {
+            let p = _PRIMES[bit]
+            // multiply by (p-1)/p
+            num = num * (p - 1)
+            den = den * p
+            let g = _gcd(num, den)
+            num = num / g
+            den = den / g
+        }
+        bit = bit + 1
+    }
+    let mut out: [i64] = []
+    out.push(num)
+    out.push(den)
+    return out
+}
+
+fn _rat_to_f64(num: i64, den: i64) -> f64 {
+    if den == 0 { return 0.0 }
+    return to_float(num) / to_float(den)
+}
+
+// build human prime-set CSV from mask, e.g. "2,3,5,7"
+fn _mask_csv(mask: i64) -> string {
+    let mut parts: [string] = []
+    let mut bit: i64 = 0
+    while bit < 8 {
+        let one: i64 = 1
+        let probe: i64 = one << bit
+        if (mask & probe) != 0 {
+            parts.push(to_string(_PRIMES[bit]))
+        }
+        bit = bit + 1
+    }
+    if len(parts) < 1 { return "{}" }
+    return "{" + parts.join(",") + "}"
+}
+
+// ─── continued-fraction / Stern-Brocot best rational for value v with den ≤ max_den ───
+// Direct search: scan denominators 1..max_den, num = round(v*den)
+fn _best_rational(v: f64, max_den: i64) -> [i64] {
+    // returns [num, den]
+    let mut best_num: i64 = 0
+    let mut best_den: i64 = 1
+    let mut best_err: f64 = _abs_f64(v)  // num=0/den=1
+    let mut d: i64 = 1
+    while d < max_den + 1 {
+        let approx = v * to_float(d)
+        let mut n: i64 = 0
+        if approx < 0.0 {
+            n = to_int(approx - 0.5)
+        } else {
+            n = to_int(approx + 0.5)
+        }
+        let g = _gcd(n, d)
+        let nn = if g > 0 { n / g } else { n }
+        let dd = if g > 0 { d / g } else { d }
+        let val = _rat_to_f64(nn, dd)
+        let err = _abs_f64(val - v)
+        if err < best_err {
+            best_err = err
+            best_num = nn
+            best_den = dd
+        }
+        d = d + 1
+    }
+    let mut out: [i64] = []
+    out.push(best_num)
+    out.push(best_den)
+    return out
+}
+
+// ─── candidate type encoding ───
+// We accumulate candidates as parallel arrays so we can sort by error.
+// A candidate row: [label, formula, num, den, val, err]
+// stored as separate arrays for index stability.
+
+fn _push_cand(labels: [string], formulas: [string], nums: [i64], dens: [i64],
+              vals: [f64], errs: [f64],
+              label: string, formula: string, n: i64, d: i64, val: f64, err: f64) {
+    labels.push(label)
+    formulas.push(formula)
+    nums.push(n)
+    dens.push(d)
+    vals.push(val)
+    errs.push(err)
+}
+
+// ─── arg parsing ───
+fn _parse_top(s: string) -> i64 {
+    // expects "--top=N" or "--top N"
+    let mut n: i64 = 3
+    let eq = s.index_of("=")
+    if eq > 0 {
+        let tail = s.substring(eq + 1, len(s))
+        try { n = to_int(tail.trim()) } catch e {}  // @allow-silent-catch
+    }
+    if n < 1 { n = 3 }
+    return n
+}
+
+// CLI run entry — caller passes the full argv (program path at [0])
+// but for this module we accept any leading args; we only care about positionals
+// after our keyword "recall" (when chained from main), or we accept directly.
+fn run(args: [string]) -> i32 {
+    let t0 = _ns_now()
+
+    // strip leading "recall" keyword if present
+    let mut pos: [string] = []
+    let mut sector: string = ""
+    let mut top_n: i64 = 3
+    let mut i: i64 = 0
+    let na = len(args)
+    while i < na {
+        let a = args[i]
+        if a == "recall" {
+            // skip
+        } else if a == "--sector" {
+            i = i + 1
+            if i < na { sector = args[i] }
+        } else if a.index_of("--sector=") == 0 {
+            sector = a.substring(9, len(a))
+        } else if a.index_of("--top=") == 0 {
+            top_n = _parse_top(a)
+        } else if a == "--top" {
+            i = i + 1
+            if i < na {
+                let mut t: i64 = 3
+                try { t = to_int(args[i]) } catch e {}  // @allow-silent-catch
+                if t < 1 { t = 3 }
+                top_n = t
+            }
+        } else {
+            pos.push(a)
+        }
+        i = i + 1
+    }
+
+    if len(pos) < 1 {
+        println("usage: mk2 atlas recall <value> [--sector X] [--top=N]")
+        return 1
+    }
+
+    let value_str = pos[0]
+    let mut value: f64 = 0.0
+    let mut parse_ok = true
+    try { value = to_float(value_str.trim()) } catch e { parse_ok = false }  // @allow-silent-catch
+    if parse_ok == false {
+        println("error: cannot parse value '" + value_str + "' as float")
+        return 1
+    }
+
+    // ── candidate accumulator ──
+    let mut labels: [string] = []
+    let mut formulas: [string] = []
+    let mut nums: [i64] = []
+    let mut dens: [i64] = []
+    let mut vals: [f64] = []
+    let mut errs: [f64] = []
+
+    // ── stage 1: known mappings (1% threshold preferred) ──
+    let mut sector_hint: string = ""
+    let mut k: i64 = 0
+    while k < _known_count() {
+        let row = _known_at(k)
+        let kname = row[0]
+        let ksect = row[1]
+        let kref = _known_ref_val(k)
+        let err = _rel_err(value, kref)
+        // sector filter
+        let pass_sector = if sector == "" { true } else { ksect == sector }
+        if pass_sector {
+            let mut knum: i64 = 0
+            let mut kden: i64 = 1
+            try { knum = to_int(row[2]) } catch e1 {}  // @allow-silent-catch
+            try { kden = to_int(row[3]) } catch e2 {}  // @allow-silent-catch
+            let label = "known:" + kname + "[" + ksect + "]"
+            _push_cand(labels, formulas, nums, dens, vals, errs,
+                       label, row[5], knum, kden, kref, err)
+            if err < 0.01 && sector_hint == "" {
+                sector_hint = ksect
+            }
+        }
+        k = k + 1
+    }
+
+    // ── stage 2: euler_ratio search over 256 subsets ──
+    // skip if sector filter is set (known mappings carry sector info)
+    if sector == "" {
+        let mut mask: i64 = 1   // skip mask=0 (empty product = 1)
+        while mask < 256 {
+            let pair = _euler_ratio_mask(mask)
+            let nu = pair[0]
+            let de = pair[1]
+            let v = _rat_to_f64(nu, de)
+            let e = _rel_err(value, v)
+            let csv = _mask_csv(mask)
+            _push_cand(labels, formulas, nums, dens, vals, errs,
+                       "euler_ratio(" + csv + ")",
+                       "prod(1-1/p) over " + csv, nu, de, v, e)
+            // 1 − euler_ratio
+            // (den - num) / den
+            let nu2 = de - nu
+            let de2 = de
+            let g2 = _gcd(nu2, de2)
+            let nu2r = if g2 > 0 { nu2 / g2 } else { nu2 }
+            let de2r = if g2 > 0 { de2 / g2 } else { de2 }
+            let v2 = _rat_to_f64(nu2r, de2r)
+            let e2 = _rel_err(value, v2)
+            _push_cand(labels, formulas, nums, dens, vals, errs,
+                       "1-euler_ratio(" + csv + ")",
+                       "1 - prod(1-1/p) over " + csv, nu2r, de2r, v2, e2)
+            mask = mask + 1
+        }
+
+        // ── stage 3: best rational with den ≤ 200 ──
+        let br = _best_rational(value, 200)
+        let bn = br[0]
+        let bd = br[1]
+        let bv = _rat_to_f64(bn, bd)
+        let be = _rel_err(value, bv)
+        _push_cand(labels, formulas, nums, dens, vals, errs,
+                   "rational(den<=200)", "Stern-Brocot search den<=200",
+                   bn, bd, bv, be)
+    }
+
+    // ── sort candidates by err (insertion sort — small N expected for top, but full N up to ~525) ──
+    // Use a simple selection-sort over indices to extract top_n
+    let total = len(errs)
+    if total < 1 {
+        println("value: " + value_str + " (no candidates)")
+        let t1 = _ns_now()
+        let dur_ms = (t1 - t0) / 1000000
+        eprintln("{\"stage\":\"recall\",\"duration_ms\":" + to_string(dur_ms)
+            + ",\"value\":" + value_str + ",\"best_err\":-1}")
+        return 0
+    }
+
+    let mut idxs: [i64] = []
+    let mut zz: i64 = 0
+    while zz < total {
+        idxs.push(zz)
+        zz = zz + 1
+    }
+
+    // selection sort — pick top_n smallest by err
+    let mut limit = top_n
+    if limit > total { limit = total }
+    let mut p: i64 = 0
+    while p < limit {
+        let mut best_j = p
+        let mut q = p + 1
+        while q < total {
+            if errs[idxs[q]] < errs[idxs[best_j]] {
+                best_j = q
+            }
+            q = q + 1
+        }
+        if best_j != p {
+            let tmp = idxs[p]
+            idxs[p] = idxs[best_j]
+            idxs[best_j] = tmp
+        }
+        p = p + 1
+    }
+
+    // ── render ──
+    let best_idx = idxs[0]
+    let best_err_pct = errs[best_idx] * 100.0
+
+    let mut hint_line = "value: " + value_str
+    if sector != "" {
+        hint_line = hint_line + " (sector filter: " + sector + ")"
+    } else if sector_hint != "" {
+        hint_line = hint_line + " (sector hint: " + sector_hint + ")"
+    }
+    println(hint_line)
+
+    // best line
+    let best_label = labels[best_idx]
+    let best_formula = formulas[best_idx]
+    let best_num = nums[best_idx]
+    let best_den = dens[best_idx]
+    let best_val = vals[best_idx]
+    let mut best_line = "best:  " + best_label + " = "
+    if best_den == 1 {
+        best_line = best_line + to_string(best_num)
+    } else if best_den == 0 {
+        best_line = best_line + best_formula
+    } else {
+        best_line = best_line + to_string(best_num) + "/" + to_string(best_den)
+    }
+    best_line = best_line + " = " + to_string(best_val) + "  err=" + to_string(best_err_pct) + "%"
+    if best_label.index_of("known:") == 0 {
+        // known match → annotate formula
+        best_line = best_line + "   [" + best_formula + "]"
+    }
+    println(best_line)
+
+    // alternates
+    let mut a_idx: i64 = 1
+    while a_idx < limit {
+        let ci = idxs[a_idx]
+        let cl = labels[ci]
+        let cn = nums[ci]
+        let cd = dens[ci]
+        let cv = vals[ci]
+        let ce = errs[ci] * 100.0
+        let mut alt = "alt " + to_string(a_idx) + ": " + cl + " = "
+        if cd == 1 {
+            alt = alt + to_string(cn)
+        } else if cd == 0 {
+            alt = alt + formulas[ci]
+        } else {
+            alt = alt + to_string(cn) + "/" + to_string(cd)
+        }
+        alt = alt + " = " + to_string(cv) + "  err=" + to_string(ce) + "%"
+        println(alt)
+        a_idx = a_idx + 1
+    }
+
+    let t1 = _ns_now()
+    let dur_ms = (t1 - t0) / 1000000
+    let mut meta: [string] = []
+    meta.push("{\"stage\":\"recall\",\"duration_ms\":")
+    meta.push(to_string(dur_ms))
+    meta.push(",\"value\":")
+    meta.push(value_str)
+    meta.push(",\"best_err\":")
+    meta.push(to_string(errs[best_idx]))
+    meta.push("}")
+    eprintln(meta.join(""))
+
+    return 0
+}
+
+// ═══════════════════════════════════════════════════════════
+//  CLI entry — when run standalone via `hexa run recall.hexa <value> ...`
+// ═══════════════════════════════════════════════════════════
+let _argv = args()
+let mut _passthrough: [string] = []
+let mut _i: i64 = 2   // skip "hexa" and script path
+let _na = len(_argv)
+while _i < _na {
+    _passthrough.push(_argv[_i])
+    _i = _i + 1
+}
+let _rc = run(_passthrough)
+exit(_rc)   // @allow-silent-exit

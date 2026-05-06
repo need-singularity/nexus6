@@ -3,10 +3,10 @@
 ## Module diagram
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                  nexus CLI                         │
-│  mk2 classify | mk2 lattice | mk2 sector            │
-└─────────────────┬───────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                          nexus CLI                              │
+│  mk2 classify | mk2 lattice | mk2 sector | mk2 atlas <subcmd>    │
+└─────────────────┬────────────────────────────────────────────────┘
                   │
         ┌─────────▼─────────┐
         │  mk2::classify     │  score = 0.5·kw + 0.3·val + 0.2·ps
@@ -129,6 +129,59 @@ user_value (f64)
 - `classify_v2(value, text, sector_hint) → ClassifyResult` (v2, keyword+value+ps)
 - `rationalize(x, max_den) → Option<Rational>` (continued fractions)
 - `find_best_euler_match(value, prime_set) → (Option<(PrimeSet, Rational, f64)>, quality)`
+
+### `mk2::atlas` — KB recall layer (top-level subdispatch)
+
+`mk2 atlas <subcmd>` 는 atlas KB (atlas.n6 + 파생 인덱스) 에 대한
+recall 레이어. main.hexa 의 top-level command 분기가 본 라우터로
+forward 하며, 라우터는 4 개 서브모듈로 다시 분기한다.
+
+```
+mk2 atlas <subcmd> [args...]
+   │
+   ├─ lookup        prefix → atlas.n6 entry list (3-stage: bloom→predict→cold)
+   ├─ hypothesis    topic → enumerated hypotheses over recalled set
+   ├─ recall        composite query → ranked top-k entries
+   └─ distribution  namespace → entry/freq/coverage stats
+```
+
+소유 파일:
+
+- `mk2_hexa/mk2/src/main.hexa` — top-level dispatcher (atlas/classify/lattice/sector)
+- `mk2_hexa/mk2/src/atlas/mod.hexa` — atlas 4-way subrouter
+- `mk2_hexa/mk2/src/atlas/lookup.hexa` — `fn run(args:[string]) -> i32`
+- `mk2_hexa/mk2/src/atlas/hypothesis.hexa` — `fn run(args:[string]) -> i32`
+- `mk2_hexa/mk2/src/atlas/recall.hexa` — `fn run(args:[string]) -> i32`
+- `mk2_hexa/mk2/src/atlas/distribution.hexa` — `fn run(args:[string]) -> i32`
+
+호출 규약:
+
+- 인터페이스: 각 서브모듈 `fn run(args:[string]) -> i32` (0=ok, 1=err, 2=usage)
+- 호출 방식: hexa-lang module-import 부재 → 서브프로세스
+  (`hexa run <path> <args>; echo __RC=$?`) + stdout marker 로 exit code 회수.
+  ~50ms/call 오버헤드 (`design/hexa_lang_gaps_from_atlas.md` 참조).
+- meta: stderr NDJSON 한 줄
+  - main: `NEXUS_MK2_DISPATCH {"command":..., "rc":..., "duration_us":...}`
+  - atlas router: `NEXUS_MK2_ATLAS_DISPATCH {"subcmd":..., "rc":..., "duration_us":...}`
+- exit 코드: 0=ok, 1=err 또는 인자 없음, 2=usage/unknown subcommand.
+
+사용 예:
+
+```
+mk2 atlas lookup math_lattice
+mk2 atlas hypothesis "euler product"
+mk2 atlas recall "smooth ring" --top 10
+mk2 atlas distribution physics
+mk2 atlas --help
+```
+
+데이터 SSOT 는 `n6/atlas.n6` (수정 금지). `lookup` 은 `n6/atlas_query.hexa`
+의 3-stage (bloom → predict → cold mmap) 와 동일한 cold-start 경로를
+재사용/래핑하는 것이 권장 (다른 에이전트 소유 영역).
+
+상세 사용법, NDJSON meta 스키마, smoke 측정치, 파일럿 패치 결과:
+[`07-atlas-recall.md`](07-atlas-recall.md). hive 차원 진입점:
+[`../hive/atlas-recall.md`](../hive/atlas-recall.md).
 
 ### `mk2::lattice`
 
