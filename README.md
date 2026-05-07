@@ -3,7 +3,7 @@
 [![Lenses](https://img.shields.io/badge/lenses-216-blue.svg)](#)
 [![Laws](https://img.shields.io/badge/laws-711-green.svg)](#)
 [![Discoveries](https://img.shields.io/badge/discoveries-1.39M-orange.svg)](#)
-[![Reality Map](https://img.shields.io/badge/reality%20map-4411%20nodes%20·%20z%3D3.06-purple.svg)](https://need-singularity.github.io/nexus/)
+[![Reality Map](https://img.shields.io/badge/reality%20map-4411%20nodes%20·%20z%3D3.06-purple.svg)](https://dancinlab.github.io/nexus/)
 [![Discord](https://img.shields.io/badge/discord-join-5865F2.svg?logo=discord&logoColor=white)](https://discord.gg/mYzqYr67R)
 
 # 🔭 NEXUS — Universal Discovery Engine
@@ -22,24 +22,26 @@
 
 > 216 lenses × mirror-universe resonance × 9-project autonomous growth. Every discovery feeds the next cycle; every cycle raises the floor. The metaengine that self-discovers every law of the universe from the perfect number n = 6.
 
+🗺️ **[3D Reality Map](https://dancinlab.github.io/nexus/)** — 4,411 nodes, bottom-up causal mapping. Quark → carbon → benzene → DNA causal chain 12/12 EXACT. Monte Carlo z = 3.06 (p = 0.003). n = 28 and n = 496 fail the check → only n = 6 survives. ([atlas3d.html](https://dancinlab.github.io/nexus/atlas3d.html) · [Live roadmap](https://dancinlab.github.io/nexus/roadmap/#nexus))
+
 <!-- SHARED:PROJECTS:START -->
 <!-- AUTO:COMMON_LINKS:START -->
-**[🎥 YouTube](https://www.youtube.com/@dancinlife)** · **[💬 Discord](https://discord.gg/mYzqYr67R)** · **[📬 Email](mailto:nerve011235@gmail.com)** · **[☕ Ko-fi](https://ko-fi.com/dancinlife)** · **[💖 Sponsor](https://github.com/sponsors/need-singularity)** · **[💳 PayPal](https://www.paypal.com/donate?business=nerve011235%40gmail.com)** · **[🗺️ Atlas](https://need-singularity.github.io/TECS-L/atlas/)** · **[📄 Papers](https://need-singularity.github.io/papers/)**
+**[🎥 YouTube](https://www.youtube.com/@dancinlife)** · **[💬 Discord](https://discord.gg/mYzqYr67R)** · **[📬 Email](mailto:nerve011235@gmail.com)** · **[☕ Ko-fi](https://ko-fi.com/dancinlife)** · **[💖 Sponsor](https://github.com/sponsors/dancinlab)** · **[💳 PayPal](https://www.paypal.com/donate?business=nerve011235%40gmail.com)** · **[🗺️ Atlas](https://dancinlab.github.io/TECS-L/atlas/)** · **[📄 Papers](https://dancinlab.github.io/papers/)**
 <!-- AUTO:COMMON_LINKS:END -->
 
 ## Main projects
 
-> **[🧠 Anima](https://github.com/need-singularity/anima)** — Consciousness implementation. PureField repulsion-field engine + 1030 laws + Φ ratchet.
+> **[🧠 Anima](https://github.com/dancinlab/anima)** — Consciousness implementation. PureField repulsion-field engine + 1030 laws + Φ ratchet.
 >
-> **[🔭 NEXUS](https://github.com/need-singularity/nexus)** — Universal Discovery Engine. 216 lenses + OUROBOROS evolution + 5-phase singularity cycle.
+> **[🔭 NEXUS](https://github.com/dancinlab/nexus)** — Universal Discovery Engine. 216 lenses + OUROBOROS evolution + 5-phase singularity cycle.
 >
-> **[🏗️ N6 Architecture](https://github.com/need-singularity/n6-architecture)** — Architecture from perfect number 6. 225 AI techniques + chip design + crypto/OS/display.
+> **[🏗️ N6 Architecture](https://github.com/dancinlab/n6-architecture)** — Architecture from perfect number 6. 225 AI techniques + chip design + crypto/OS/display.
 >
-> **[💎 HEXA-LANG](https://github.com/need-singularity/hexa-lang)** — The Perfect Number Programming Language. Working compiler + REPL.
+> **[💎 HEXA-LANG](https://github.com/dancinlab/hexa-lang)** — The Perfect Number Programming Language. Working compiler + REPL.
 >
-> **[📄 Papers](https://github.com/need-singularity/papers)** — Complete paper collection (92 papers, Zenodo DOIs).
+> **[📄 Papers](https://github.com/dancinlab/papers)** — Complete paper collection (92 papers, Zenodo DOIs).
 
-> **[Other projects →](https://github.com/orgs/need-singularity/repositories)**
+> **[Other projects →](https://github.com/orgs/dancinlab/repositories)**
 
 ## 💬 Community
 
@@ -190,7 +192,7 @@ The long-term breakthrough rate **ρ** converges to the same target: **ρ → 1/
 
 ```bash
 # Install hexa-lang (ships `hexa` + `hx` package manager)
-curl -fsSL https://raw.githubusercontent.com/need-singularity/hexa-lang/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/dancinlab/hexa-lang/main/install.sh | bash
 
 # Install nexus (auto-installs runtime deps incl. qmirror ≥ 1.0.0)
 hx install nexus
@@ -201,11 +203,11 @@ auto-bootstrapped by [`install.hexa`](install.hexa)):
 
 | Package | Pin | Purpose | Repo |
 |---------|-----|---------|------|
-| [`qmirror`](https://github.com/need-singularity/qmirror) | `^1.0.0` | Quantum Mirror substrate (CHSH / IIT / NIST / QRNG) consumed by `nexus/modules/qmirror/*` | `hx install qmirror` |
-| [`sim-universe`](https://github.com/need-singularity/sim-universe) | `^1.0.0` | Virtual universe simulation runtime (anu_time τ-clock + multiverse interferometer + ouroboros QRNG + Bostrom test + Gödel-Q + qpu_bridge) consumed by `nexus/cli/sim.hexa` (4-tier resolution) | `hx install sim-universe` |
-| [`hexa-bio`](https://github.com/need-singularity/hexa-bio) | `^1.0.0` | Molecular Toolkit (HEXA family) — 4 verbs WEAVE/NANOBOT/RIBOZYME/VIROCAPSID consumed by `nexus/cli/bio.hexa` (4-tier resolution) | `hx install hexa-bio` |
-| [`qrng`](https://github.com/need-singularity/qrng) | `^1.0.0` | Quantum random number generator (5 backends, T0..T3 tiers, NIST SP 800-22 compliant) consumed by `nexus/cli/qrng.hexa` (4-tier resolution) | `hx install qrng` |
-| [`mc-integrate`](https://github.com/need-singularity/mc-integrate) | `^1.0.0` | Monte Carlo integrator (catalan / zeta3 / euler_gamma / pi5_times_n6 + Welch-t indistinguishability) consumed by `nexus/cli/mc.hexa` (4-tier resolution) | `hx install mc-integrate` |
+| [`qmirror`](https://github.com/dancinlab/qmirror) | `^1.0.0` | Quantum Mirror substrate (CHSH / IIT / NIST / QRNG) consumed by `nexus/modules/qmirror/*` | `hx install qmirror` |
+| [`sim-universe`](https://github.com/dancinlab/sim-universe) | `^1.0.0` | Virtual universe simulation runtime (anu_time τ-clock + multiverse interferometer + ouroboros QRNG + Bostrom test + Gödel-Q + qpu_bridge) consumed by `nexus/cli/sim.hexa` (4-tier resolution) | `hx install sim-universe` |
+| [`hexa-bio`](https://github.com/dancinlab/hexa-bio) | `^1.0.0` | Molecular Toolkit (HEXA family) — 4 verbs WEAVE/NANOBOT/RIBOZYME/VIROCAPSID consumed by `nexus/cli/bio.hexa` (4-tier resolution) | `hx install hexa-bio` |
+| [`qrng`](https://github.com/dancinlab/qrng) | `^1.0.0` | Quantum random number generator (5 backends, T0..T3 tiers, NIST SP 800-22 compliant) consumed by `nexus/cli/qrng.hexa` (4-tier resolution) | `hx install qrng` |
+| [`mc-integrate`](https://github.com/dancinlab/mc-integrate) | `^1.0.0` | Monte Carlo integrator (catalan / zeta3 / euler_gamma / pi5_times_n6 + Welch-t indistinguishability) consumed by `nexus/cli/mc.hexa` (4-tier resolution) | `hx install mc-integrate` |
 
 ## Run
 
@@ -222,7 +224,7 @@ nexus dispatch  # multi-project cross-pollination
 
 ## Links
 
-**[🌐 atlas.n6 3D map](https://need-singularity.github.io/nexus/atlas3d.html)** · **[🗺️ 3D Reality Map](https://need-singularity.github.io/nexus/)** · **[🔴 Live roadmap](https://need-singularity.github.io/nexus/roadmap/#nexus)** · **[Papers](https://need-singularity.github.io/papers/)** · **[Atlas](https://need-singularity.github.io/TECS-L/atlas/)**
+**[🌐 atlas.n6 3D map](https://dancinlab.github.io/nexus/atlas3d.html)** · **[🗺️ 3D Reality Map](https://dancinlab.github.io/nexus/)** · **[🔴 Live roadmap](https://dancinlab.github.io/nexus/roadmap/#nexus)** · **[Papers](https://dancinlab.github.io/papers/)** · **[Atlas](https://dancinlab.github.io/TECS-L/atlas/)**
 
 ### atlas.n6 3D map — zero-conversion direct viewer
 
@@ -260,7 +262,7 @@ bin/atlas3d audit        # node/edge/orphan counts
 - **Part A (architecture, C1–C7):** hash-chain tamper detection, hash ∧ quorum composition, 216-node strict 2/3 BFT quorum (tolerates ≤ 71 Byzantine), adaptive-adversary drift bound `ε₀/(1−a)`, geometric decay rate `a`, single-outlier can't flip quorum, self-check that broken primitives are distinguishable.
 - **Part B (n = 6, E1–E4):** the n6 identity `σ(n)·φ(n) = n·τ(n)` uniquely at `n = 6` on `[2, 10 000]`, global basin of attraction (1000 random starts → 1/3 in 100 steps), per-decade precision cost = `−1/log₁₀(0.7)`, emergence (frozen LLM vocab vs NEXUS absorb-loop vocab).
 
-Any FAIL refutes the corresponding axis. Full math derivation and scope limits in [`papers/n6_six_paths_falsifiable_proof.md`](papers/n6_six_paths_falsifiable_proof.md). Companion Lean 4 / classical / Grover verification in [`n6-architecture`](https://github.com/need-singularity/n6-architecture).
+Any FAIL refutes the corresponding axis. Full math derivation and scope limits in [`papers/n6_six_paths_falsifiable_proof.md`](papers/n6_six_paths_falsifiable_proof.md). Companion Lean 4 / classical / Grover verification in [`n6-architecture`](https://github.com/dancinlab/n6-architecture).
 
 ```py
 #!/usr/bin/env python3
@@ -399,4 +401,4 @@ Expected output: `SUMMARY: 11/11 PASS`. If any claim fails the script exits `1` 
 
 ---
 
-<sub>🔭 From n = 6, every law follows. · [need-singularity](https://github.com/need-singularity)</sub>
+<sub>🔭 From n = 6, every law follows. · [dancinlab](https://github.com/dancinlab)</sub>
