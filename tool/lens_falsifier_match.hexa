@@ -1,0 +1,470 @@
+#!hexa strict
+// tool/lens_falsifier_match.hexa — nexus 216 lenses ↔ hexa-bio F-* falsifier matching subroutine.
+//
+// @tool(slug="lens_falsifier_match", desc="match a hexa-bio F-* falsifier to top-N nexus lenses by domain+axis keyword overlap; cross-evidence aggregation entry")
+// @usage(hexa run tool/lens_falsifier_match.hexa [--falsifier F-RB-4] [--axis ribozyme] [--outcome pass] [--top-n 5] [--selftest] [--emit] [--quiet])
+// @exit_codes(0=PASS, 1=usage/io, 2=match-empty when not selftest)
+// @sentinel(__NEXUS_LENS_MATCH__ <PASS|FAIL> falsifier=<F> top=<N> top1=<lens>:<score> emit=<0|1>)
+// @origin(hexa-bio docs/upstream_kick_proposals_2026_05_07.md §9.3 — proposal #8)
+// @abstraction(consumer-side cross-evidence aggregator — hexa-bio side reference impl exists; nexus side schema land + lens label vocab cross-link)
+// @paradigm(deterministic keyword-overlap scoring against lens header (도메인 + 검증 축) — no LLM judge, no probabilistic re-rank)
+// @raw9(pure hexa-native — exec used only for stdlib filesystem (awk/printf) and registry append; no python/scipy/etc)
+// @allow-bare-exec
+//
+// HOW IT WORKS
+//   1. resolve hexa-bio root (4-tier: $HEXA_BIO_ROOT > /Users/ghost/core/hexa-bio > $HOME/core/hexa-bio > skip)
+//   2. for input falsifier (F-*) derive a keyword/tag set from the axis prefix:
+//        F-RB-*       -> ribozyme + catalysis + RNA + 4-state + sigma=12 core
+//        F-VIROCAPSID-* -> virocapsid + cage + T-number + assembly + Caspar-Klug
+//        F-NB-*       -> nanobot + DNA-origami + actuation + work-per-cycle + J2
+//        F-WEAVE-*    -> weave + protein + bundle + Landauer + Pi-p2
+//        F-Q-*        -> quantum + VQE + Pauli + ansatz + chemistry
+//        F-TP5-*      -> weave + therapeutic + protein + bundle (TP5 = therapeutic-protein-5 axis)
+//        F-CYCLE*     -> meta + audit + verifier
+//        otherwise    -> fallback generic bio + n6
+//   3. scan nexus/lenses/*.hexa headers (line 1-5) for "도메인:" + "검증 축:" via one awk pass
+//   4. score each lens = (matched_tags_in_axis_text * 2) + (domain_class_match * 3)
+//   5. tie-break: lens-name token overlap with axis prefix
+//   6. top-N output + optional registry append (state/nexus_lens_match.jsonl, schema raw_77_nexus_lens_match_v0)
+//
+// CONTRACT (raw#10 honest c3)
+//   - keyword vocabulary is hand-curated, not learned. It is grounded in hexa-bio falsifier
+//     prefixes documented in /Users/ghost/core/hexa-bio/.roadmap.{ribozyme,virocapsid,nanobot,weave,quantum}.
+//   - lens header parsing is best-effort (depends on Korean comment convention "도메인:" / "검증 축:").
+//     Lenses missing the convention contribute zero domain-class points; axis-text scan still applies.
+//   - cross-evidence aggregation = list of top-N matched lenses; the *interpretation* of those matches
+//     (i.e. whether matched lens score implies real bio relevance) is an analyst-side step, not a verdict
+//     produced by this tool.
+//   - this tool is read-only against /Users/ghost/core/hexa-bio/state/discovery_absorption/registry.jsonl
+//     and against nexus/lenses/*.hexa. The only nexus-side write is appending registry rows to
+//     state/nexus_lens_match.jsonl when --emit is supplied.
+//
+// SELFTEST (5 falsifiers spanning all 5 hexa-bio verbs)
+//   F-RB-4 | F-VIROCAPSID-3 | F-NB-4 | F-TP5-b | F-Q-1
+//   each must produce >=1 matched lens with score > 0; PASS sentinel emitted.
+
+// ─── shared helpers ────────────────────────────────────────────────
+
+fn _argv() -> array {
+    let raw = to_string(exec("printf '%s' \"${HEXA_ARGV:-}\""))
+    let parts = split(raw, " ")
+    let mut out = []
+    let mut k = 0
+    while k < len(parts) { if len(parts[k]) > 0 { out.push(parts[k]) }; k = k + 1 }
+    return out
+}
+
+fn _has(a: array, f: string) -> bool {
+    let mut i = 0
+    while i < len(a) { if a[i] == f { return true }; i = i + 1 }
+    return false
+}
+
+fn _arg_value(a: array, f: string) -> string {
+    let mut i = 0
+    while i < len(a) {
+        if a[i] == f && (i + 1) < len(a) { return a[i + 1] }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _now_iso() -> string {
+    let r = exec("date -u +%Y-%m-%dT%H:%M:%SZ")
+    return to_string(r).trim()
+}
+
+fn _esc_json(s: string) -> string {
+    let mut r = s.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", " ")
+    r = r.replace("\t", " ")
+    r = r.replace("\r", "")
+    return r
+}
+
+fn _to_lower(s: string) -> string {
+    // hexa stdlib provides .to_lower() native method (cf. tool/evo_progress.hexa,
+    // tool/consensus_bt_gate.hexa). Avoids the per-record shell-out cost.
+    return s.to_lower()
+}
+
+// ─── 4-tier hexa-bio root resolver (mirrors tool/check_bio.hexa) ────
+
+let HOME = to_string(exec("printf '%s' \"$HOME\"")).trim()
+let BIO_ENV = to_string(exec("printf '%s' \"${HEXA_BIO_ROOT:-}\"")).trim()
+let MAC_ROOT = "/Users/ghost/core/hexa-bio"
+let HOME_ROOT = HOME + "/core/hexa-bio"
+
+fn _resolve_bio_root() -> string {
+    if len(BIO_ENV) > 0 {
+        let p = BIO_ENV + "/state/discovery_absorption/registry.jsonl"
+        if file_exists(p) { return BIO_ENV }
+    }
+    let mac_p = MAC_ROOT + "/state/discovery_absorption/registry.jsonl"
+    if file_exists(mac_p) { return MAC_ROOT }
+    let home_p = HOME_ROOT + "/state/discovery_absorption/registry.jsonl"
+    if file_exists(home_p) { return HOME_ROOT }
+    return ""
+}
+
+let BIO_ROOT = _resolve_bio_root()
+
+// ─── falsifier prefix → keyword/tag/domain-class derivation ────────
+// Five hexa-bio axes mapped to nexus lens vocabulary.
+// domain_classes: which "도메인:" labels the lens should contain to score.
+// axis_keywords: tokens to look for in "검증 축:" text or in lens-name itself.
+
+fn _classify_falsifier(fid: string) -> array {
+    // returns [domain_classes_csv, axis_keywords_csv, group_label]
+    let f = fid
+    if f.starts_with("F-RB-") || f == "F-RB" {
+        return [
+            "biology,chemistry,molecule,medicine,nutrition",
+            "rna,ribozyme,catalysis,catalytic,catalyst,enzyme,nucleotide,kinetic,kinetics,reaction,transition,activation,fold,folding,4-state,ladder,sigma,tau",
+            "ribozyme"
+        ]
+    }
+    if f.starts_with("F-VIROCAPSID-") {
+        return [
+            "biology,chemistry,molecule,physics,medicine",
+            "capsid,virus,viral,cage,assembly,t-number,caspar,klug,polyhedral,subunit,icosahedral,symmetry,protein,j2,vertex,trap,kinetic",
+            "virocapsid"
+        ]
+    }
+    if f.starts_with("F-NB-") {
+        return [
+            "biology,chemistry,molecule,physics,medicine,sports",
+            "nanobot,nanorobot,origami,dna,actuation,actuator,brownian,work,cycle,thermodynamics,landauer,kt,scaffold,mechanic,mechanics,j2,bayesian,corpus",
+            "nanobot"
+        ]
+    }
+    if f.starts_with("F-WEAVE-") || f.starts_with("F-CAGE-") || f.starts_with("F-TP5-") || f.starts_with("F-CYCLE24-WEAVE") {
+        return [
+            "biology,chemistry,molecule,medicine,physics",
+            "protein,bundle,fold,folding,strand,weave,landauer,kt,bayesian,posterior,assembly,structure,verifier,refold,cage,vertex,immunogenetic,therapeutic",
+            "weave"
+        ]
+    }
+    if f.starts_with("F-Q-") || f.starts_with("F-VQE") {
+        return [
+            "physics,chemistry,molecule,quantum",
+            "quantum,vqe,pauli,ansatz,hamiltonian,electron,molecular,spectroscopic,chemistry,h2,molecule,unitary,circuit,gate,wavefunction,energy",
+            "quantum"
+        ]
+    }
+    if f.starts_with("F-REGISTRY-") || f.starts_with("F-CYCLE") {
+        return [
+            "meta,computing",
+            "audit,registry,verifier,ledger,witness,consistency,integrity,absorb,absorption",
+            "meta"
+        ]
+    }
+    // fallback — treat as generic bio
+    return [
+        "biology,chemistry,molecule",
+        "n6,sigma,tau,phi,j2,catalysis,bio,molecule",
+        "generic"
+    ]
+}
+
+// ─── lens header scanner ────────────────────────────────────────────
+// One shell pass: for each lens file emit "name|domain|axis_text" (newline-delimited).
+// Falls back gracefully on missing fields.
+
+fn _scan_lenses(nexus_root: string) -> array {
+    let cmd =
+        "awk 'FNR==1{ name=FILENAME; sub(/.*\\//, \"\", name); sub(/\\.hexa$/, \"\", name); " +
+        "             dom=\"\"; ax=\"\"; } " +
+        "     FNR<=8 && /도메인:/ { line=$0; sub(/.*도메인:[[:space:]]*/, \"\", line); " +
+        "                            sub(/[[:space:]]*$/, \"\", line); dom=line; } " +
+        "     FNR<=8 && /검증 축:/ { line=$0; sub(/.*검증 축:[[:space:]]*/, \"\", line); " +
+        "                              sub(/[[:space:]]*$/, \"\", line); ax=line; } " +
+        "     FNR==8 { print name \"|\" dom \"|\" ax; nextfile }' " +
+        "     " + nexus_root + "/lenses/*.hexa 2>/dev/null"
+    let out = to_string(exec(cmd))
+    let lines = split(out, "\n")
+    let mut rec = []
+    let mut i = 0
+    while i < len(lines) {
+        let t = lines[i].trim()
+        if len(t) > 0 { rec.push(t) }
+        i = i + 1
+    }
+    return rec
+}
+
+// ─── scoring ────────────────────────────────────────────────────────
+
+fn _csv_to_array(s: string) -> array {
+    let parts = split(s, ",")
+    let mut out = []
+    let mut i = 0
+    while i < len(parts) {
+        let t = parts[i].trim()
+        if len(t) > 0 { out.push(t) }
+        i = i + 1
+    }
+    return out
+}
+
+fn _count_token_hits(haystack: string, tokens: array) -> int {
+    let h = haystack
+    let mut hits = 0
+    let mut i = 0
+    while i < len(tokens) {
+        let tok = tokens[i]
+        if len(tok) > 0 && h.index_of(tok) >= 0 { hits = hits + 1 }
+        i = i + 1
+    }
+    return hits
+}
+
+fn _score_lens(name: string, domain: string, axis_text: string,
+               domain_classes: array, axis_keywords: array,
+               group_label: string) -> int {
+    let name_lo = _to_lower(name)
+    let dom_lo = _to_lower(domain)
+    let axis_lo = _to_lower(axis_text)
+
+    // points: 3 per domain-class match (lens "도메인" contains a target class)
+    let dom_hits = _count_token_hits(dom_lo, domain_classes)
+    // points: 2 per axis-keyword match in 검증 축 text
+    let axis_hits = _count_token_hits(axis_lo, axis_keywords)
+    // bonus: 4 if lens name itself contains the group label (e.g. "ribozyme")
+    let mut name_bonus = 0
+    if name_lo.index_of(group_label) >= 0 { name_bonus = 4 }
+    // bonus: 1 per axis keyword found in name (limit 3)
+    let name_kw_hits = _count_token_hits(name_lo, axis_keywords)
+    let mut name_kw_capped = name_kw_hits
+    if name_kw_capped > 3 { name_kw_capped = 3 }
+
+    return dom_hits * 3 + axis_hits * 2 + name_bonus + name_kw_capped
+}
+
+// ─── top-N selection (insertion sort, small N) ──────────────────────
+
+fn _push_topn(top_names: array, top_scores: array, n_max: int,
+              cand_name: string, cand_score: int) -> array {
+    // returns flattened: [names_join, scores_join] via "|" delim — no nested array support guarantee
+    // implement with parallel arrays via mut closures via global state? hexa supports mut arrays in caller.
+    // Strategy: caller passes mut ref via return value of [names, scores] — hexa returns array-of-array.
+    let mut names = top_names
+    let mut scores = top_scores
+    if cand_score <= 0 { return [names, scores] }
+
+    // find insertion index
+    let mut ins = len(names)
+    let mut i = 0
+    while i < len(scores) {
+        if cand_score > scores[i] { ins = i; break }
+        i = i + 1
+    }
+    if ins >= n_max { return [names, scores] }
+
+    // insert
+    let mut new_names = []
+    let mut new_scores = []
+    let mut j = 0
+    while j < ins {
+        new_names.push(names[j])
+        new_scores.push(scores[j])
+        j = j + 1
+    }
+    new_names.push(cand_name)
+    new_scores.push(cand_score)
+    while j < len(names) && len(new_names) < n_max {
+        new_names.push(names[j])
+        new_scores.push(scores[j])
+        j = j + 1
+    }
+    return [new_names, new_scores]
+}
+
+// ─── public match function ──────────────────────────────────────────
+
+fn match_falsifier(fid: string, axis_hint: string, outcome: string,
+                   nexus_root: string, top_n: int) -> array {
+    // returns [names, scores, group_label, total_lenses_scanned, nonzero_count]
+    let cls = _classify_falsifier(fid)
+    let domain_classes = _csv_to_array(cls[0])
+    let axis_keywords = _csv_to_array(cls[1])
+    let group_label = cls[2]
+
+    // optionally augment axis_keywords with axis_hint tokens
+    let mut all_axis_kw = axis_keywords
+    if len(axis_hint) > 0 {
+        let extra = _csv_to_array(axis_hint.replace(" ", ","))
+        let mut k = 0
+        while k < len(extra) { all_axis_kw.push(_to_lower(extra[k])); k = k + 1 }
+    }
+
+    let lens_records = _scan_lenses(nexus_root)
+    let mut top_names = []
+    let mut top_scores = []
+    let mut nonzero = 0
+    let mut i = 0
+    while i < len(lens_records) {
+        let parts = split(lens_records[i], "|")
+        if len(parts) >= 3 {
+            let name = parts[0]
+            let domain = parts[1]
+            let axis = parts[2]
+            let s = _score_lens(name, domain, axis,
+                                domain_classes, all_axis_kw, group_label)
+            if s > 0 {
+                nonzero = nonzero + 1
+                let pushed = _push_topn(top_names, top_scores, top_n, name, s)
+                top_names = pushed[0]
+                top_scores = pushed[1]
+            }
+        }
+        i = i + 1
+    }
+
+    return [top_names, top_scores, [group_label], [len(lens_records)], [nonzero]]
+}
+
+// ─── registry append ────────────────────────────────────────────────
+
+let NEXUS_ROOT = to_string(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()
+let STATE_DIR = NEXUS_ROOT + "/state"
+let LENS_MATCH_JSONL = STATE_DIR + "/nexus_lens_match.jsonl"
+
+fn _emit_row(fid: string, outcome: string, group_label: string,
+             top_names: array, top_scores: array,
+             total_scanned: int, nonzero: int, axis_hint: string) {
+    let ts = _now_iso()
+    let mut tops = "["
+    let mut i = 0
+    while i < len(top_names) {
+        if i > 0 { tops = tops + "," }
+        tops = tops + "{\"lens\":\"" + _esc_json(top_names[i]) +
+               "\",\"score\":" + to_string(top_scores[i]) + "}"
+        i = i + 1
+    }
+    tops = tops + "]"
+
+    let row = "{\"schema\":\"raw_77_nexus_lens_match_v0\"," +
+              "\"ts\":\"" + ts + "\"," +
+              "\"falsifier\":\"" + _esc_json(fid) + "\"," +
+              "\"outcome\":\"" + _esc_json(outcome) + "\"," +
+              "\"axis_hint\":\"" + _esc_json(axis_hint) + "\"," +
+              "\"group_label\":\"" + _esc_json(group_label) + "\"," +
+              "\"top_n\":" + to_string(len(top_names)) + "," +
+              "\"top_lenses\":" + tops + "," +
+              "\"total_lenses_scanned\":" + to_string(total_scanned) + "," +
+              "\"nonzero_match_count\":" + to_string(nonzero) + "," +
+              "\"raw_47_cross_repo\":\"hexa-bio F-* axis -> nexus lens (header 도메인 + 검증 축 keyword overlap)\"," +
+              "\"raw_9_hexa_only\":\"pure hexa-native — only awk/printf shellouts via stdlib\"," +
+              "\"raw_77_append_only\":true," +
+              "\"raw_91_c3_disclose\":\"keyword vocab hand-curated; lens header parsing best-effort; aggregation = analyst-side cross-evidence list, not a verdict\"}"
+    let esc = row.replace("'", "'\\''")
+    let _ = exec("mkdir -p '" + STATE_DIR + "' 2>/dev/null")  // @allow-bare-exec
+    let _ = exec("printf '%s\\n' '" + esc + "' >> '" + LENS_MATCH_JSONL + "' 2>/dev/null")  // @allow-bare-exec
+}
+
+// ─── selftest ───────────────────────────────────────────────────────
+
+fn _run_selftest(nexus_root: string, emit: bool, quiet: bool) -> int {
+    let cases = ["F-RB-4", "F-VIROCAPSID-3", "F-NB-4", "F-TP5-b", "F-Q-1"]
+    let mut all_pass = true
+    let mut details = ""
+    let mut i = 0
+    while i < len(cases) {
+        let fid = cases[i]
+        let res = match_falsifier(fid, "", "selftest", nexus_root, 3)
+        let names = res[0]
+        let scores = res[1]
+        let group = res[2][0]
+        let total = res[3][0]
+        let nonzero = res[4][0]
+        let pass = (len(names) >= 1 && (len(scores) >= 1 && scores[0] > 0))
+        if !pass { all_pass = false }
+        if !quiet {
+            let mut top1 = "(none)"
+            let mut top1s = 0
+            if len(names) >= 1 { top1 = names[0]; top1s = scores[0] }
+            println("  " + fid + " group=" + group + " scanned=" +
+                    to_string(total) + " nonzero=" + to_string(nonzero) +
+                    " top1=" + top1 + ":" + to_string(top1s))
+        }
+        if emit {
+            _emit_row(fid, "selftest", group, names, scores, total, nonzero, "")
+        }
+        i = i + 1
+    }
+    if all_pass { return 0 }
+    return 1
+}
+
+// ─── main ───────────────────────────────────────────────────────────
+
+let ARGS = _argv()
+let QUIET = _has(ARGS, "--quiet")
+let SELFTEST = _has(ARGS, "--selftest")
+let EMIT = _has(ARGS, "--emit")
+let FALSIFIER = _arg_value(ARGS, "--falsifier")
+let AXIS_HINT = _arg_value(ARGS, "--axis")
+let OUTCOME = _arg_value(ARGS, "--outcome")
+let TOP_N_S = _arg_value(ARGS, "--top-n")
+let mut TOP_N = 5
+if len(TOP_N_S) > 0 { TOP_N = to_int(TOP_N_S) }
+
+if len(NEXUS_ROOT) == 0 {
+    println("__NEXUS_LENS_MATCH__ FAIL reason=nexus_root_unresolved")
+    exit(1)
+}
+
+if SELFTEST {
+    if !QUIET { println("[lens_falsifier_match] selftest 5 cases (F-RB-4, F-VIROCAPSID-3, F-NB-4, F-TP5-b, F-Q-1)") }
+    let rc = _run_selftest(NEXUS_ROOT, EMIT, QUIET)
+    if rc == 0 {
+        println("__NEXUS_LENS_MATCH__ PASS falsifier=selftest top=3 top1=selftest:5cases emit=" +
+                (if EMIT { "1" } else { "0" }))
+        exit(0)
+    } else {
+        println("__NEXUS_LENS_MATCH__ FAIL falsifier=selftest reason=case_match_empty")
+        exit(2)
+    }
+}
+
+if len(FALSIFIER) == 0 {
+    println("usage: hexa run tool/lens_falsifier_match.hexa --falsifier F-<axis>-<n> [--axis hint] [--outcome pass] [--top-n 5] [--emit] [--quiet]")
+    println("       or: hexa run tool/lens_falsifier_match.hexa --selftest [--emit] [--quiet]")
+    exit(1)
+}
+
+let res = match_falsifier(FALSIFIER, AXIS_HINT, OUTCOME, NEXUS_ROOT, TOP_N)
+let names = res[0]
+let scores = res[1]
+let group = res[2][0]
+let total = res[3][0]
+let nonzero = res[4][0]
+
+if !QUIET {
+    println("[lens_falsifier_match] falsifier=" + FALSIFIER + " group=" + group +
+            " scanned=" + to_string(total) + " nonzero=" + to_string(nonzero))
+    let mut i = 0
+    while i < len(names) {
+        println("  rank " + to_string(i + 1) + ": " + names[i] + " (score=" + to_string(scores[i]) + ")")
+        i = i + 1
+    }
+}
+
+if EMIT {
+    _emit_row(FALSIFIER, OUTCOME, group, names, scores, total, nonzero, AXIS_HINT)
+    if !QUIET { println("  emit -> " + LENS_MATCH_JSONL) }
+}
+
+if len(names) == 0 {
+    println("__NEXUS_LENS_MATCH__ FAIL falsifier=" + FALSIFIER + " top=0 top1=(none) emit=" +
+            (if EMIT { "1" } else { "0" }))
+    exit(2)
+}
+
+let top1 = names[0]
+let top1s = scores[0]
+println("__NEXUS_LENS_MATCH__ PASS falsifier=" + FALSIFIER + " top=" + to_string(len(names)) +
+        " top1=" + top1 + ":" + to_string(top1s) + " emit=" + (if EMIT { "1" } else { "0" }))
+exit(0)
