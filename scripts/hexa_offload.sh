@@ -13,7 +13,14 @@
 
 set -u
 
-NEXUS="${NEXUS:-$HOME/Dev/nexus}"
+# 2026-05-08: ubu2 ~/core/nexus 로 이행 (Dev 는 backcompat symlink). core 우선, Dev fallback.
+if [ -z "${NEXUS:-}" ]; then
+    if [ -d "$HOME/core/nexus" ]; then
+        NEXUS="$HOME/core/nexus"
+    else
+        NEXUS="$HOME/Dev/nexus"
+    fi
+fi
 DISPATCH="$NEXUS/dispatch_state.json"
 LOG="${HOME}/.airgenome/hexa_offload.jsonl"
 mkdir -p "$(dirname "$LOG")"
