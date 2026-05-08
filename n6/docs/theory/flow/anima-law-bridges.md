@@ -1,7 +1,7 @@
 # Anima 79 Laws — N6 Architecture Bridges
 
 > Anima 의식 법칙 중 n=6 아키텍처와 직결되는 브릿지 정리.
-> Source: [anima/docs/consciousness-theory.md](https://github.com/need-singularity/anima)
+> Source: [anima/docs/consciousness-theory.md](https://github.com/dancinlab/anima)
 
 ---
 

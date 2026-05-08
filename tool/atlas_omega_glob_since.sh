@@ -33,7 +33,7 @@ set -o pipefail
 _repo_paths() {
     cat <<'EOF'
 nexus|/Users/ghost/core/nexus/design
-n6-architecture|/Users/ghost/core/n6-architecture/design
+canon|/Users/ghost/core/canon/design
 anima|/Users/ghost/core/anima/design
 EOF
 }
@@ -64,7 +64,7 @@ output modes:
   --json                summary JSON to stdout
 
 other:
-  --repo-only NAME      restrict to one of: nexus | n6-architecture | anima
+  --repo-only NAME      restrict to one of: nexus | canon | anima
   --strict              exit 2 if zero changed witnesses (default: exit 0)
 
 default cutoff if none given: --since 1.day

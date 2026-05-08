@@ -16,7 +16,7 @@
 
 fn _vc_paths() -> map {
     let home = exec("printenv HOME").trim()
-    let shared = home + "/Dev/nexus/shared"
+    let shared = home + "/core/nexus/shared"
     let mut P = #{}
     P["src"] = shared + "/discovery/verified_constants.jsonl"
     P["idx"] = shared + "/discovery/verified_constants.idx.json"

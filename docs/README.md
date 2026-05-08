@@ -15,7 +15,7 @@ This `docs/` directory is published via GitHub Pages.
 1. GitHub repo → **Settings** → **Pages**
 2. **Build and deployment** → **Source**: `GitHub Actions` 선택
 3. `main` 브랜치에 `docs/` 변경을 푸시하면 `.github/workflows/pages.yml`이 자동 배포
-4. 배포 후 URL: `https://need-singularity.github.io/nexus/`
+4. 배포 후 URL: `https://dancinlab.github.io/nexus/`
 5. 수동 트리거: Actions 탭 → `Deploy GitHub Pages` → `Run workflow`
 
 ## 로컬 미리보기

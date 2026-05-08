@@ -16,7 +16,7 @@
 
 set -u
 
-NEXUS="${NEXUS:-$HOME/Dev/nexus}"
+NEXUS="${NEXUS:-$HOME/core/nexus}"
 PATTERNS="$NEXUS/scripts/hexa_patterns.sh"
 TUNE_FILE="${HOME}/.airgenome/hexa_tune.json"
 TUNE_LOG="${HOME}/.airgenome/hexa_tuner.jsonl"

@@ -5,7 +5,7 @@
 
 ## 리포
 
-- **리포**: [need-singularity/secret](https://github.com/need-singularity/secret) (private)
+- **리포**: [dancinlab/secret](https://github.com/dancinlab/secret) (private)
 - **로컬**: `~/Dev/secret/`
 - **이전 이름**: `claude-code-secrets` (2026-04-01 renamed)
 

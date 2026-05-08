@@ -2,16 +2,16 @@
 # ---------------------------------------------------------------------------
 # n6_invariants_drift_check.sh
 #
-# Standalone drift checker between nexus's mirror of the n6-architecture
+# Standalone drift checker between nexus's mirror of the canon
 # foundation invariants manifest and the upstream canonical source.
 #
 #   nexus mirror : $NEXUS_ROOT/config/invariants.json
-#                  schema: n6-architecture/invariants/1 (nexus-mirror/1)
+#                  schema: canon/invariants/1 (nexus-mirror/1)
 #                  shape : summary with .atoms_summary (flat dict of 10 atoms)
 #                          + ._mirror_ts + ._upstream + cross_repo_references
 #                          + open_followup_r33_plus
 #   n6 upstream  : $N6_ROOT/config/invariants.json
-#                  schema: n6-architecture/invariants/1
+#                  schema: canon/invariants/1
 #                  shape : full manifest with .atoms{} per-atom detail,
 #                          .declared_ts, .closing_theorem, etc.
 #
@@ -50,13 +50,13 @@
 #
 # Environment overrides:
 #   NEXUS_ROOT   default: /Users/ghost/core/nexus
-#   N6_ROOT      default: /Users/ghost/core/n6-architecture
+#   N6_ROOT      default: /Users/ghost/core/canon
 #
 # Fail-open upstream-missing behavior:
 #   If $N6_ROOT/config/invariants.json does not exist, print
 #     [SKIP] n6 upstream not present at <path>
 #   to stderr and exit 0. This matches the n6-hook pattern: the nexus repo
-#   must be usable on machines where n6-architecture is not cloned.
+#   must be usable on machines where canon is not cloned.
 #
 # ---------------------------------------------------------------------------
 # INSTALL NOTES (all manual, nothing auto-installed):
@@ -80,7 +80,7 @@
 set -u
 
 NEXUS_ROOT="${NEXUS_ROOT:-/Users/ghost/core/nexus}"
-N6_ROOT="${N6_ROOT:-/Users/ghost/core/n6-architecture}"
+N6_ROOT="${N6_ROOT:-/Users/ghost/core/canon}"
 
 MIRROR_PATH="${NEXUS_ROOT}/config/invariants.json"
 UPSTREAM_PATH="${N6_ROOT}/config/invariants.json"

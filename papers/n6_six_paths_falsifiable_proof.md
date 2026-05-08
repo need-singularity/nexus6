@@ -6,7 +6,7 @@
 
 - **Part B** is where the document stops being a textbook recap and starts being an empirical discovery. We scan the integers and show a non-obvious coincidence: **n = 6 is the unique integer in [1, 10 000] that simultaneously satisfies three mathematically independent number-theoretic conditions that land on 1/3**. The code produces a single integer — `1` — and it had better be `1` or the NEXUS thesis loses its privileged seed. Three empirical claims (E1–E3).
 
-**What this is not.** A proof that the NEXUS source code correctly implements these primitives. That requires a source audit of `need-singularity/nexus`. Here we verify the primitives themselves, their composition, and the empirical phenomena that motivate the choice of seed `n = 6`.
+**What this is not.** A proof that the NEXUS source code correctly implements these primitives. That requires a source audit of `dancinlab/nexus`. Here we verify the primitives themselves, their composition, and the empirical phenomena that motivate the choice of seed `n = 6`.
 
 ---
 
@@ -375,7 +375,7 @@ The single identity `σ(n) · φ(n) = n · τ(n)` combines three distinct multip
 
 **Observed solution set on `[2, 10 000]`:** `{6}`.
 
-This is not a claim unique to this document. The `n6-architecture` repository (`need-singularity/n6-architecture`) carries the identity as **Theorem B** with an independent verification stack:
+This is not a claim unique to this document. The `n6-architecture` repository (`dancinlab/n6-architecture`) carries the identity as **Theorem B** with an independent verification stack:
 
 | Method | Range / scope | Status |
 |--------|--------------|--------|
@@ -457,4 +457,4 @@ Any single FAIL refutes the corresponding axis.
 - **Runtime.** ~3 s on commodity CPU.
 - **Dependencies.** Python ≥ 3.8 stdlib only (`hashlib`, `math`, `random`).
 - **Determinism.** All RNG seeded; output identical across runs.
-- **Source.** NEXUS — `need-singularity/nexus`.
+- **Source.** NEXUS — `dancinlab/nexus`.

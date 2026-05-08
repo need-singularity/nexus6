@@ -45,7 +45,7 @@ SISTER_REPOS: list[str] = [
     "/Users/ghost/core/anima",
     "/Users/ghost/core/hexa-lang",
     "/Users/ghost/core/airgenome",
-    "/Users/ghost/core/n6-architecture",
+    "/Users/ghost/core/canon",
     "/Users/ghost/core/void",
 ]
 

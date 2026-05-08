@@ -9,7 +9,7 @@
 #   - exec 로 wrapper PID 가 그대로 binary PID 차지 → kill -0 검사가 binary 생사를 직접 봄
 #
 # 사용 (launchd plist ProgramArguments):
-#   <string>$HOME/Dev/nexus/tool/app_singleton_launch.sh</string> // @allow-devpath (plist 문서 예시)
+#   <string>$HOME/core/nexus/tool/app_singleton_launch.sh</string> // @allow-devpath (plist 문서 예시)
 #   <string><lock_name></string>
 #   <string><binary_absolute_path></string>
 

@@ -9,7 +9,7 @@
 # Watched roots (exclude rules mirror hexa_remote so the live tree matches):
 #   /Users/ghost/Dev/airgenome  → ubu:airgenome/
 #     exclude: archive/v1/, data/, __pycache__/, .git/, *.log, .DS_Store
-#   /Users/ghost/Dev/nexus      → ubu:Dev/nexus/
+#   /Users/ghost/core/nexus      → ubu:Dev/nexus/
 #     exclude: .git/, *.log, .DS_Store, .runtime/, shared/blowup/lens/
 #
 # Behaviour:
@@ -19,7 +19,7 @@
 #   - rsync / ssh failures log to stderr and continue (daemon never dies).
 #
 # Manual install (after review):
-#   cp /Users/ghost/Dev/nexus/tool/com.airgenome.hexa_remote_sync.plist \
+#   cp /Users/ghost/core/nexus/tool/com.airgenome.hexa_remote_sync.plist \
 #      ~/Library/LaunchAgents/
 #   launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.airgenome.hexa_remote_sync.plist
 #   launchctl enable     gui/$UID/com.airgenome.hexa_remote_sync
@@ -47,7 +47,7 @@ AIRGENOME_EXCLUDES=(
   --exclude=.DS_Store
 )
 
-NEXUS_LOCAL="/Users/ghost/Dev/nexus"
+NEXUS_LOCAL="/Users/ghost/core/nexus"
 NEXUS_REMOTE="Dev/nexus/"
 NEXUS_EXCLUDES=(
   --exclude=.git/

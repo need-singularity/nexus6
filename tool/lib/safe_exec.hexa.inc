@@ -15,7 +15,7 @@
 // ═══════════════════════════════════════════════════════════
 
 let _SE_HOME = env("HOME")
-let _SE_WRAPPER = _SE_HOME + "/Dev/nexus/tool/perl_timeout.sh"
+let _SE_WRAPPER = _SE_HOME + "/core/nexus/tool/perl_timeout.sh"
 
 // ─── void-safe string coercion (split/exec 결과 방어) ───
 fn _se_str(x) -> string {

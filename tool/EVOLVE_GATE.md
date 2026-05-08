@@ -69,14 +69,14 @@ python3 shared/tool/evolve_gate.py --project X --force
   <key>ProgramArguments</key>
   <array>
     <string>/usr/bin/python3</string>
-    <string>/Users/ghost/Dev/nexus/tool/evolve_gate.py</string>
+    <string>/Users/ghost/core/nexus/tool/evolve_gate.py</string>
   </array>
   <key>StartInterval</key>
   <integer>21600</integer>  <!-- 6시간마다 -->
   <key>StandardOutPath</key>
-  <string>/Users/ghost/Dev/nexus/tool/evolve_gate.stdout</string>
+  <string>/Users/ghost/core/nexus/tool/evolve_gate.stdout</string>
   <key>StandardErrorPath</key>
-  <string>/Users/ghost/Dev/nexus/tool/evolve_gate.stderr</string>
+  <string>/Users/ghost/core/nexus/tool/evolve_gate.stderr</string>
 </dict>
 </plist>
 ```
@@ -86,7 +86,7 @@ python3 shared/tool/evolve_gate.py --project X --force
 ### Linux cron (`crontab -e`)
 
 ```cron
-0 */6 * * * /usr/bin/python3 /Users/ghost/Dev/nexus/tool/evolve_gate.py >> /tmp/evolve_gate.log 2>&1
+0 */6 * * * /usr/bin/python3 /Users/ghost/core/nexus/tool/evolve_gate.py >> /tmp/evolve_gate.log 2>&1
 ```
 
 ## evolve_history.jsonl 포맷

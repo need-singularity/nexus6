@@ -16,7 +16,7 @@
 // ═══════════════════════════════════════════════════════════
 
 let _LK_HOME = env("HOME")
-let _LK_GATE = _LK_HOME + "/Dev/nexus/tool/lock_gate.sh"
+let _LK_GATE = _LK_HOME + "/core/nexus/tool/lock_gate.sh"
 
 // ─── void-safe string coercion ───
 fn _lk_str(x) -> string {

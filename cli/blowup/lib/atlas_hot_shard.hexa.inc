@@ -51,7 +51,7 @@ fn _shard_resolve_threshold() -> i64 {
     let mut thr: i64 = 100
     // (a) AB tuning config (존재할 때만)
     let mut tuning_path = ""
-    try { tuning_path = env("HOME") + "/Dev/nexus/config/n6_tuning.json" } catch e {}
+    try { tuning_path = env("HOME") + "/core/nexus/config/n6_tuning.json" } catch e {}
     if tuning_path != "" {
         let mut raw = ""
         try {

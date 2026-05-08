@@ -351,7 +351,7 @@ fn _deltalog_compact(atlas_path: string) -> i64 {
     // lock 제거
     try { exec("rm -f '" + lock_path + "' 2>/dev/null") } catch e {}
     // bucket index 재빌드 (best-effort)
-    let nexus_root_dir = _HOME + "/Dev/nexus"
+    let nexus_root_dir = _HOME + "/core/nexus"
     let scan_opt = nexus_root_dir + "/n6/atlas_scan_opt.hexa"
     if file_exists(scan_opt) {
         try { exec(_HEXA_BIN + " '" + scan_opt + "' build >/dev/null 2>&1") } catch e {}

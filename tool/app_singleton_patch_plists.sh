@@ -22,7 +22,7 @@ DEST="${2:-}"
     exit 2
 }
 
-WRAPPER="${NEXUS:-$HOME/Dev/nexus}/tool/app_singleton_launch.sh"
+WRAPPER="${NEXUS:-$HOME/core/nexus}/tool/app_singleton_launch.sh"
 [ -x "$WRAPPER" ] || {
     echo "fatal: wrapper not executable: $WRAPPER" >&2
     exit 2

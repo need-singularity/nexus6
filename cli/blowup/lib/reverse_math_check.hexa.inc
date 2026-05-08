@@ -46,7 +46,7 @@ fn _rm_has(hay: string, needle: string) -> bool {
 // [10*] / [11*] / [12*] 등급이면 TRUE 시그널, [9?] / [N?] 이면 UNKNOWN 시그널.
 fn _rm_atlas_known(prop: string) -> string {
     let home = exec("printenv HOME").trim()
-    let atlas = home + "/Dev/nexus/n6/atlas.n6"
+    let atlas = home + "/core/nexus/n6/atlas.n6"
     let exists = exec("test -f '" + atlas + "' && echo y || echo n").trim()
     if exists != "y" { return "MISS" }
 

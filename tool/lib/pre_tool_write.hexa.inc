@@ -329,7 +329,7 @@ fn check_lockdown_tier(tool: str, file_path: str) -> str {
     if file_path.len() == 0 { return "" }
     let h = env("HOME")
     let hexa = h + "/Dev/hexa-lang/hexa"
-    let gate = h + "/Dev/nexus/tool/lockdown_gate.hexa"
+    let gate = h + "/core/nexus/tool/lockdown_gate.hexa"
     let result = to_string(exec(hexa + " " + gate + " watch '" + file_path + "' 2>/dev/null")).trim()
     if result.starts_with("BLOCK") {
         return "REJECT: " + file_path + " — L0 보호 파일 (lockdown_gate watch). 사용자 명시 승인 필요"
@@ -344,8 +344,8 @@ fn check_session_lock(tool: str, file_path: str) -> str {
     if file_path.len() == 0 { return "" }
     if env("NEXUS_LOCK_OK") == "1" { return "" }
     let h = env("HOME")
-    let HEXA_BIN = h + "/Dev/nexus/bin/hexa"
-    let LOCK = h + "/Dev/nexus/tool/session_lock.hexa"
+    let HEXA_BIN = h + "/core/nexus/bin/hexa"
+    let LOCK = h + "/core/nexus/tool/session_lock.hexa"
     let area = to_string(exec(HEXA_BIN + " run " + LOCK + " derive '" + file_path + "' 2>/dev/null")).trim()
     if area == "" || area == "misc" { return "" }
     let out = to_string(exec(HEXA_BIN + " run " + LOCK + " acquire '" + area + "' 600 2>&1")).trim()
@@ -369,7 +369,7 @@ fn check_session_lock(tool: str, file_path: str) -> str {
 // jq 우선, grep fallback. 실패 시 빈 문자열.
 fn _annot_load_forbids() -> str {
     let h = env("HOME")
-    let rules = h + "/Dev/nexus/config/annot_rules.json"
+    let rules = h + "/core/nexus/config/annot_rules.json"
     let exists = to_string(exec("test -f '" + rules + "' && echo y || echo n")).trim()  // @allow-bare-exec
     if exists != "y" { return "" }
 

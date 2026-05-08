@@ -14,7 +14,7 @@ BRAIN_LOG="${LOG_DIR}/hexa_brain.jsonl"
 mkdir -p "$LOG_DIR"
 
 CLAUDE_BIN="${HEXA_BRAIN_CLAUDE:-$HOME/.local/bin/claude}"
-PROMPT_FILE="${NEXUS:-$HOME/Dev/nexus}/tool/hexa_brain_prompt.md"
+PROMPT_FILE="${NEXUS:-$HOME/core/nexus}/tool/hexa_brain_prompt.md"
 EFFORT="${HEXA_BRAIN_EFFORT:-low}"
 
 now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -121,7 +121,7 @@ if printf '%s' "$RESULT" | tail -1 | jq -e . >/dev/null 2>&1; then
     printf '{"ts":"%s","tier":2,"brain":%s}\n' "$(now_iso)" "$BRAIN_JSON" >> "$GUARD_LOG"
 
     # recommend 를 action queue 에 append (1h TTL dedup)
-    ACTIONS_BIN="${NEXUS:-$HOME/Dev/nexus}/scripts/hexa_actions.sh"
+    ACTIONS_BIN="${NEXUS:-$HOME/core/nexus}/scripts/hexa_actions.sh"
     if [[ -x "$ACTIONS_BIN" ]]; then
         printf '%s' "$BRAIN_JSON" | jq -r '.recommend[]? // empty' 2>/dev/null | \
         while IFS= read -r rec; do

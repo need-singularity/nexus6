@@ -3,7 +3,7 @@
 # 모든 tier 의 현황을 한 번에 보여줌.
 
 set -u
-NEXUS="${NEXUS:-$HOME/Dev/nexus}"
+NEXUS="${NEXUS:-$HOME/core/nexus}"
 LOG_DIR="${HOME}/.airgenome"
 
 printf '=== hexa-guard dashboard — %s ===\n\n' "$(date '+%Y-%m-%d %H:%M:%S')"

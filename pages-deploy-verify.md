@@ -10,16 +10,16 @@
 - .github/workflows/ 파일 수: 2
 
 ## GitHub Pages API
-- repos/need-singularity/nexus has_pages: true
-- repos/need-singularity/nexus/pages: 404 (사이트 없음)
+- repos/dancinlab/nexus has_pages: true
+- repos/dancinlab/nexus/pages: 404 (사이트 없음)
 
 ## URL 프로빙 (curl -L)
 | URL | HTTP |
 |---|---|
-| https://need-singularity.github.io/nexus/ | 200 |
-| https://need-singularity.github.io/nexus/index.html | 200 |
-| https://need-singularity.github.io/nexus/reality_map_3d.html | 404 |
-| https://need-singularity.github.io/nexus/reality_map_3d.html | 404 |
+| https://dancinlab.github.io/nexus/ | 200 |
+| https://dancinlab.github.io/nexus/index.html | 200 |
+| https://dancinlab.github.io/nexus/reality_map_3d.html | 404 |
+| https://dancinlab.github.io/nexus/reality_map_3d.html | 404 |
 
 ## 버전 격차
 - Target 요구: v6.0 / 276 노드

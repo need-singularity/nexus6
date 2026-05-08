@@ -18,7 +18,7 @@
 
 set -u
 
-NEXUS="${NEXUS:-$HOME/Dev/nexus}"
+NEXUS="${NEXUS:-$HOME/core/nexus}"
 DISPATCH="$NEXUS/dispatch_state.json"
 HUMAN=0
 [[ "${1:-}" == "--human" ]] && HUMAN=1

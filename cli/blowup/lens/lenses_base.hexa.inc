@@ -315,7 +315,7 @@ fn kv_lookup(data: list, key: string) -> float {
 
 fn load_n6_consts() -> list {
     let home = exec("printenv HOME")
-    let path = home + "/Dev/nexus/n6/n6_constants.jsonl"
+    let path = home + "/core/nexus/n6/n6_constants.jsonl"
     let raw = try { read_file(path) } catch e { return [#{}, [], []] }
     let lines = raw.split("\n")
     let mut names = []

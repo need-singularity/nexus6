@@ -14,7 +14,7 @@
 
 ## 📊 실시간 로드맵 뷰어
 
-**https://need-singularity.github.io/nexus/roadmap/#extreme**
+**https://dancinlab.github.io/nexus/roadmap/#extreme**
 
 - ⚡ **극한 탭 (최상위)** — ALM+CLM aggregate, critical path, options 88개 브레인스토밍
 - 🎯 ALM 단독 sub-tab — 4-5일 / $200-400
@@ -33,9 +33,9 @@
 | [`shared/roadmaps/clm_consciousness_standalone.json`](../roadmaps/clm_consciousness_standalone.json) | CLM from-scratch 7B + 의식 (52 options, 5 tracks) |
 
 GitHub raw (뷰어 페치 대상):
-- https://raw.githubusercontent.com/need-singularity/nexus/main/config/roadmaps/extreme.json
-- https://raw.githubusercontent.com/need-singularity/nexus/main/config/roadmaps/alm_consciousness_standalone.json
-- https://raw.githubusercontent.com/need-singularity/nexus/main/config/roadmaps/clm_consciousness_standalone.json
+- https://raw.githubusercontent.com/dancinlab/nexus/main/config/roadmaps/extreme.json
+- https://raw.githubusercontent.com/dancinlab/nexus/main/config/roadmaps/alm_consciousness_standalone.json
+- https://raw.githubusercontent.com/dancinlab/nexus/main/config/roadmaps/clm_consciousness_standalone.json
 
 ---
 

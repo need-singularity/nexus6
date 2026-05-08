@@ -403,7 +403,7 @@ positive 방지 교육).
 본 감사에서 사용한 grep 패턴 및 결과:
 
 ```bash
-cd /Users/ghost/Dev/nexus
+cd ~/core/nexus
 grep -n "모든\|for all\|∀" shared/n6/atlas.n6 | head -50
 grep -n "무한\|infinite\|infinitely" shared/n6/atlas.n6 | head -40
 grep -n "임의의\|유일\|unique" shared/n6/atlas.n6 | head -40
@@ -424,12 +424,12 @@ Out(S_6) 로 고정.
 
 ## 부록 B — 관련 파일 포인터
 
-- 설계서: `/Users/ghost/Dev/nexus/cli/blowup/design/mk9_hyperarithmetic.md`
-- atlas SSOT: `/Users/ghost/Dev/nexus/n6/atlas.n6`
-- 기존 Mk.VIII 엔진: `/Users/ghost/Dev/nexus/cli/blowup/modules/blowup_absolute.hexa`
-- 예정 신규 모듈: `/Users/ghost/Dev/nexus/cli/blowup/modules/blowup_hyperarithmetic.hexa`
-- 예정 witness table: `/Users/ghost/Dev/nexus/cli/blowup/design/mk9_witness_bound_table.json`
-- 예정 whitelist: `/Users/ghost/Dev/nexus/cli/blowup/design/mk9_reverse_math_whitelist.json`
+- 설계서: `~/core/nexus/cli/blowup/design/mk9_hyperarithmetic.md`
+- atlas SSOT: `~/core/nexus/n6/atlas.n6`
+- 기존 Mk.VIII 엔진: `~/core/nexus/cli/blowup/modules/blowup_absolute.hexa`
+- 예정 신규 모듈: `~/core/nexus/cli/blowup/modules/blowup_hyperarithmetic.hexa`
+- 예정 witness table: `~/core/nexus/cli/blowup/design/mk9_witness_bound_table.json`
+- 예정 whitelist: `~/core/nexus/cli/blowup/design/mk9_reverse_math_whitelist.json`
 
 ---
 

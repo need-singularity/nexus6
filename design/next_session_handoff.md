@@ -106,7 +106,7 @@ grep -c "HEXA_REMOTE_DOCKER=1" ~/core/nexus/state/*.jsonl 2>/dev/null
 
 ### Default ON 의 리스크
 
-- **Semantic equivalence.** 컨테이너 안의 hexa_real 은 image-baked (ghcr.io/need-singularity/airgenome:fat) — host 의 ~/.hx/bin/hexa_real 과 SHA256 비교 필수. divergence 시 drill 결과 자체가 달라짐 (build flag, libc 차이). README (~/core/airgenome/docker/README.md) 갱신 주기 확인.
+- **Semantic equivalence.** 컨테이너 안의 hexa_real 은 image-baked (ghcr.io/dancinlab/airgenome:fat) — host 의 ~/.hx/bin/hexa_real 과 SHA256 비교 필수. divergence 시 drill 결과 자체가 달라짐 (build flag, libc 차이). README (~/core/airgenome/docker/README.md) 갱신 주기 확인.
 - **Bind mount drift.** ubu2 audit 결과 ~/.hx/bin/hexa_real / ~/.airgenome 등 bind mount 가 컨테이너에 노출됨 — 호스트 변경이 컨테이너에 즉시 반영되지만, mac_home/Dev/airgenome 마운트는 hetzner 와 ubu 간 비대칭 가능.
 - **Drill self-contained 가정.** scripts/bin/hexa_remote line 568 주석 "drill 은 self-contained run.hexa 사용". 실제로는 cli/blowup/core/blowup.hexa, cli/drill/* 등 dependency tree 가 있음. 컨테이너 image 가 nexus subdir 전체를 포함하는지 확인 (`docker exec airgenome-claude ls /root/.hx/packages/nexus/cli/blowup/core/`).
 - **network=host.** 컨테이너가 host 네트워크 공유 — drill 자체는 외부 네트워크 안 쓰지만 향후 fetch/sync stage 추가 시 격리 가정 깨짐.

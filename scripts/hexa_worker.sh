@@ -14,7 +14,7 @@
 
 set -u
 
-NEXUS="${NEXUS:-$HOME/Dev/nexus}"
+NEXUS="${NEXUS:-$HOME/core/nexus}"
 Q="${HOME}/.airgenome/hexa_actions.jsonl"
 WORKER_LOG="${HOME}/.airgenome/hexa_worker.jsonl"
 ACTIONS_BIN="$NEXUS/scripts/hexa_actions.sh"

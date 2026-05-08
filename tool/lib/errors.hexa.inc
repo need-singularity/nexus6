@@ -14,7 +14,7 @@
 // ═══════════════════════════════════════════════════════════
 
 let _ERR_HOME = env("HOME")
-let _ERR_NEXUS = _ERR_HOME + "/Dev/nexus"
+let _ERR_NEXUS = _ERR_HOME + "/core/nexus"
 let _ERR_QUEUE = _ERR_NEXUS + "/tool/errors.jsonl"
 
 // ─── void-safe string coercion (split 결과/exec 결과 void 방어) ───
