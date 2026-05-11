@@ -29,6 +29,7 @@
 | 2 | 2026-05-11 | `techniques/` (68 AI 기법 × 8축) + `experiments/ai-efficiency/` | `93e6ef4c` | `hexa-codex` | 304 |
 | **3** | **2026-05-11** | **canon 인프라 24항목** | **`2ad85661`** | **`nexus/canon-infra/`** | **1,808** |
 | **4** | **2026-05-11** | **`theory/` (n=6 이론층) + `formal/lean4/`** | **`50e6f679`** | **`hexa-meta`** | **260** |
+| **5** | **2026-05-11** | **도메인-귀속 잔여** (chip-verify, hexa-weave proposals, LLM/AI reports, BT 14) | **`ceced262`** | **14 repos** (hexa-chip/bio/codex/cern/rtsc/fusion/cosmos/matter/arts/millennium/forge/meta/aura/senses + anima) | **112** |
 
 ---
 
@@ -184,7 +185,47 @@ cd ~/core/nexus/canon-infra/<same-path>
 
 ---
 
-## 7. 추가 이관 후보 (향후 Wave)
+## 7. Wave 5 — 도메인-귀속 잔여 분산 (✅ 완료, 2026-05-11)
+
+이전 세션 보고서에서 식별된 잔류 도메인-귀속 파일들이 Wave 5에서 자연 호스트로 분산되었다.
+
+### 7.0 Wave 5 실행 결과
+
+| Repo | Source | Count | Commit |
+|---|---|---:|---|
+| hexa-chip | chip-verify (27 chip-only) + samsung-foundry + chip-arch-guide | 29 | `3f2c2b7` |
+| anima | verify_anima_soc + consciousness-cluster-bt + consciousness-triple-fusion | 3 | `3c284ca2b` |
+| hexa-aura | verify_bci_6ch_n6 | 1 | `ed7eb16` |
+| hexa-senses | n6_speak integration bench + report | 2 | `2d10533` |
+| hexa-codex | 6 LLM/AI discovery reports | 6 | `baaef0e` |
+| hexa-bio | 57 hexa-weave proposals + bt-1387 + bt-1391 | 59 | `ab87022` |
+| hexa-cern | bt-1176 nuclear + bt-1386 standard-model | 2 | `b824962` |
+| hexa-rtsc | bt-1163-1168 superconductor-v5 | 1 | `2be4afb` |
+| hexa-fusion | bt-1169-1174 fusion-v5 | 1 | `ae2f6d9` |
+| hexa-cosmos | bt-1108 dimensional-perception | 1 | `668fc65` |
+| hexa-matter | bt-1388 ionic-octahedral | 1 | `692257e` |
+| hexa-arts | bt-1390 hsv-color-hexad | 1 | `da00292` |
+| hexa-millennium | bt-1392 millennium-7-breakthrough-ideas | 1 | `80a23e0` |
+| hexa-forge | forge-triple-fusion | 1 | `d603de4` |
+| hexa-meta | bt-1389 cube-octahedron-duality (math) | 1 | `7786f12` |
+| **합계** | — | **112** | canon `4eb869ad` |
+
+### 7.4 캐넌에 잔류 (분류 약함 또는 일반)
+
+다음 항목은 도메인-귀속이 약하거나 일반 메모로 판단되어 canon에 잔류:
+
+- `proposals/cat_litter_mk2_trial_2026_05_01.md`
+- `proposals/critical-mineral-conflict-arbitration_2026_05_06.md`
+- `proposals/kim-sangwook-quantum.md`
+- `proposals/own1-hard-english-only-translation-roadmap-2026-04-24.md`
+- `proposals/yoo-hyunjun-architecture.md`
+- `proposals/sod-youtube.md`
+- `proposals/south-africa-applied-tech.md`
+- `proposals/south-africa-tech-stack-2026-04-25.md`
+- `proposals/kolon-materials-z6.md` (calc 측 결정과 일치)
+- `reports/breakthroughs/bt-1175-water-treatment-2026-04-12.md` (hexa-earth 후보지만 보류)
+
+## 8. 이전 Wave 추가 후보 (보존)
 
 이전 세션 보고서에서 식별된 잔류 도메인-귀속 파일들 — 본 Wave에 포함되지 않음.
 
