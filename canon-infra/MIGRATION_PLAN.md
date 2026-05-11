@@ -30,6 +30,7 @@
 | **3** | **2026-05-11** | **canon 인프라 24항목** | **`2ad85661`** | **`nexus/canon-infra/`** | **1,808** |
 | **4** | **2026-05-11** | **`theory/` (n=6 이론층) + `formal/lean4/`** | **`50e6f679`** | **`hexa-meta`** | **260** |
 | **5** | **2026-05-11** | **도메인-귀속 잔여** (chip-verify, hexa-weave proposals, LLM/AI reports, BT 14) | **`ceced262`** | **14 repos** (hexa-chip/bio/codex/cern/rtsc/fusion/cosmos/matter/arts/millennium/forge/meta/aura/senses + anima) | **112** |
+| **6** | **2026-05-11** | **🪦 canon RETIRE — 잔여 자산 전체** (archive/docs/domains/experiments/lean4-n6/proposals/reports + 루트 docs) | **`4eb869ad`** | **`nexus/canon-infra/legacy-canon/`** | **964** |
 
 ---
 
@@ -327,7 +328,32 @@ canon 측에도 untracked 상태 그대로 잔존 (git이 추적하지 않음).
 
 ---
 
-## 10. canon 측 후속 변경 권장
+## 10. canon RETIRED — 최종 상태 (Wave 6, 2026-05-11)
+
+**Wave 6 (2026-05-11)**: canon 리포가 공식 폐기되었다.
+
+### 10.0 최종 상태
+
+| 항목 | Wave 6 직후 |
+|---|---|
+| canon 트랙드 파일 | **1** (`README.md` — retirement notice) + 13 dotfiles |
+| 마지막 SHA | `e417ea3e` |
+| 보관 위치 | `nexus/canon-infra/legacy-canon/` (964 files / 21 MB) |
+| 복구 방법 | canon git log (전체 히스토리 무손실) + legacy-canon 스냅샷 |
+
+### 10.1 Wave 6 이관 명세
+
+`git archive HEAD --` 를 사용해 트랙드 콘텐츠만 1:1 스냅샷:
+
+- `archive/` (7), `docs/` (9), `domains/` (14), `experiments/` (270),
+  `lean4-n6/` (45 .lean source — `.lake/` 빌드 1.5GB 제외),
+  `proposals/` (22), `reports/` (591)
+- 루트 docs (6): `README.md`(원본), `LICENSE`, `CITATION.cff`, `SECURITY.md`, `CONTRIBUTING.md`, `MOVED_TO_STANDALONES.md`
+- **총 964 files / 21 MB**
+
+신규 canon README.md는 retirement notice + migration map + SSOT 포인터로 재작성.
+
+### 10.2 (참고) Wave 4 이후 9축 상태
 
 Wave 4 이후 canon은 9축 중 **3축만 보유** (모두 연구 산출물):
 
