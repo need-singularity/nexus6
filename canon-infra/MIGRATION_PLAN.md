@@ -28,6 +28,7 @@
 | 1.5 | 2026-05-10 | `domains/` 299개 spec | `ded52144` | 32 standalones | 360 |
 | 2 | 2026-05-11 | `techniques/` (68 AI 기법 × 8축) + `experiments/ai-efficiency/` | `93e6ef4c` | `hexa-codex` | 304 |
 | **3** | **2026-05-11** | **canon 인프라 24항목** | **`2ad85661`** | **`nexus/canon-infra/`** | **1,808** |
+| **4** | **2026-05-11** | **`theory/` (n=6 이론층) + `formal/lean4/`** | **`50e6f679`** | **`hexa-meta`** | **260** |
 
 ---
 
@@ -109,11 +110,28 @@ cd ~/core/nexus/canon-infra/<same-path>
 
 ---
 
-## 6. theory/ 이관 검토 — 별도 계획
+## 6. theory/ 이관 — Wave 4 (✅ 완료, 2026-05-11)
 
-사용자 요청: theory/는 캐넌 SSOT지만 적합한 hexa-* 프로젝트가 있을 수 있음 → 검색 필요.
+사용자 결정: `hexa-meta`로 이관 (대안 신규 `hexa-theory` 미선택).
+완료 Commit: canon `ceced262` (MOVE) · hexa-meta `e954dbe` (import).
 
-### 6.1 검색 결과: **`hexa-meta`** 가 최적 호스트
+### 6.0 실행 결과 요약
+
+| 도착 (hexa-meta) | 출발 (canon) | 파일 수 |
+|---|---|---:|
+| `breakthroughs/` | `theory/breakthroughs/` | 6 |
+| `constants/` | `theory/constants/` | 5 |
+| `flow/` | `theory/flow/` | 4 |
+| `predictions/` | `theory/predictions/` | 117 |
+| `preprints/` | `theory/preprints/` | 1 |
+| `roadmap-v2/` | `theory/roadmap-v2/` | 65 |
+| `roadmap-v3/` | `theory/roadmap-v3/` | 3 |
+| `study/` | `theory/study/` | 48 |
+| `_theory_index.json` | `theory/_index.json` | 1 (이름 변경) |
+| `formal/lean4/` | `formal/lean4/` | 10 (`.olean` 제외) |
+| **합계** | — | **260** |
+
+### 6.1 (참고) 사전 검색 결과: **`hexa-meta`** 가 최적 호스트
 
 **근거** (`hexa-meta/README.md` 인용):
 > "🌀 hexa-meta — n=6 meta-theory · self-architecture · proof-cert · discovery tooling.
@@ -159,12 +177,10 @@ cd ~/core/nexus/canon-infra/<same-path>
 **추천**: `📐` (theory = 증명 + 정밀) 또는 `📜` (timeless 강조). hexa-meta가 이미
 `🌀` (ouroboros)을 사용하므로 시각적 구분 확보.
 
-### 6.3 권장 결론
+### 6.3 권장 결론 → 적용됨
 
-- **1차 권장**: theory/ + formal/lean4/ → `hexa-meta`로 통합 (이미 사촌 자산이 거주 중)
-- **2차 옵션**: theory/만 분리 → 신규 `hexa-theory` (📐 또는 📜) 생성
-
-선택은 사용자 결정.
+- ~~1차 권장~~ **선택 완료**: theory/ + formal/lean4/ → `hexa-meta`로 통합 (Wave 4)
+- 2차 옵션(신규 `hexa-theory`): 미선택
 
 ---
 
@@ -272,23 +288,26 @@ canon 측에도 untracked 상태 그대로 잔존 (git이 추적하지 않음).
 
 ## 10. canon 측 후속 변경 권장
 
-canon은 이제 다음 9축 중 5축만 보유:
+Wave 4 이후 canon은 9축 중 **3축만 보유** (모두 연구 산출물):
 
 | 축 (INDEX.json 기준) | 캐넌 잔존 | 이전됨 |
 |---|---|---|
-| theory | ✅ | (후속 `hexa-meta` 또는 `hexa-theory` 검토) |
+| theory | ❌ | `hexa-meta/{breakthroughs,constants,flow,predictions,preprints,roadmap-v2,roadmap-v3,study}/` (Wave 4) |
 | domains | 포인터만 | `hexa-*` family (Wave 1.5) |
-| bridge | ❌ | `nexus/canon-infra/bridge/` |
+| bridge | ❌ | `nexus/canon-infra/bridge/` (Wave 3) |
 | techniques | ❌ | `hexa-codex/techniques/` (Wave 2) |
-| experiments | ✅ (chip-verify 제외 권장) | `hexa-codex/experiments/ai-efficiency/` |
-| engine | ❌ | `nexus/canon-infra/engine/` |
+| experiments | ✅ (chip-verify 제외 권장) | `hexa-codex/experiments/ai-efficiency/` (Wave 2) |
+| engine | ❌ | `nexus/canon-infra/engine/` (Wave 3) |
 | papers | ❌ (비어있음) | `hexa-*` (Wave 1) |
 | reports | ✅ (일부 도메인-타이트 제외 권장) | — |
-| canonshared | ❌ | `nexus/canon-infra/canonshared/` |
+| canonshared | ❌ | `nexus/canon-infra/canonshared/` (Wave 3) |
 
-**INDEX.json 후속 작성 시** canon 측은 다음으로 축약 권장:
-- `theory/`, `experiments/`, `reports/`, `proposals/`, `data/`, `domains/(포인터)`,
-  `lean4-n6/(toolchain)`, `formal/`, `MOVED_TO_STANDALONES.md`
+**현재 canon 트랙드 트리** (Wave 4 직후):
+- 도트파일/설정: `.doc-rules.json`, `.githooks/`, `.github/`, `.gitignore`, `.hexa-init/`, `.loop`, `.own.cognitive`, `.own.group_p`, `.own.readme`, `.papers-cross-repo-lint-exempt`, `.playwright-mcp/`, `.readme-rules.json`, `.verify_cache.json`
+- 루트 docs: `README.md`, `LICENSE`, `CITATION.cff`, `SECURITY.md`, `CONTRIBUTING.md`, `MOVED_TO_STANDALONES.md`
+- 콘텐츠 7개: `archive/`, `docs/`, `domains/`(포인터), `experiments/`, `lean4-n6/`, `proposals/`, `reports/`
+
+**INDEX.json (canon측 신규 필요)**: 3축 모델로 재작성 권장 — experiments/reports/proposals + legacy(archive/docs/lean4-n6/domains-pointer).
 
 ---
 
