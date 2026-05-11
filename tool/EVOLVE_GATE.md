@@ -1,6 +1,6 @@
 # evolve_gate — 로드맵 자율 진화 엔진
 
-> roadmap 의 `vN → v(N+1)` 자율 승격. deferred=0 + planned=0 + R14 CLEAN + 정직성 invariant 충족 시 자동 승격 + 다음 버전 meta/phase 블록 auto-generate. millennium v2.3 → v3 수동 전환 pattern 을 모든 nexus 프로젝트 (nexus/anima/n6-architecture/hexa-lang/millennium) 로 일반화.
+> roadmap 의 `vN → v(N+1)` 자율 승격. deferred=0 + planned=0 + R14 CLEAN + 정직성 invariant 충족 시 자동 승격 + 다음 버전 meta/phase 블록 auto-generate. millennium v2.3 → v3 수동 전환 pattern 을 모든 nexus 프로젝트 (nexus/anima/canon/hexa-lang/millennium) 로 일반화.
 
 ## 사용
 
@@ -52,7 +52,7 @@ python3 shared/tool/evolve_gate.py --project X --force
 - millennium (E/T/M)
 - nexus (INFRA/GROWTH/META)
 - anima (PHI/DUAL_TRACK/CONSCIOUSNESS)
-- n6-architecture (TRACK_SCAN/TRACK_DSE/TRACK_META)
+- CANON (TRACK_SCAN/TRACK_DSE/TRACK_META)
 - hexa-lang (LANG/COMPILER/ECOSYSTEM)
 
 ## 주기 자동 실행 (cron 또는 launchd)

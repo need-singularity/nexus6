@@ -41,7 +41,7 @@
 |--------|-------------|----------|--------------|-------|
 | m3 (anima) | `e1066dcd` | F154-F160 | 6@T + 1@M | Löb gate (provability paradox closure) |
 | m5 (hexa-runtime) | `1b611443` | F161-F167 | 6@T + 1@M | Gentzen descent (ε_0 ordinal proof-theoretic bound) |
-| r4 (n6-architecture) | `1b611443` | F168-F174 | 6@T + 1@M | NFL geometric-mean (No-Free-Lunch invariant) |
+| r4 (CANON) | `1b611443` | F168-F174 | 6@T + 1@M | NFL geometric-mean (No-Free-Lunch invariant) |
 | r10 (cross_engine) | `1b611443` | F175-F178 | 2@T + 2@M | Löb + Gentzen-Feferman-Schütte |
 | r2 (atlas-A) | `fa6ec2ec` | F179-F181 | 1@T + 2@M | Bayesian eta admissibility |
 | r6 (atlas-B) | `fa6ec2ec` | F182-F183 | 1@T + 1@M | admissibility ordinal bounds |

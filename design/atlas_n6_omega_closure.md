@@ -1,14 +1,14 @@
 # atlas.n6 omega-style closure — abstraction-exhaustion 가이드
 
 작성: 2026-04-25 (post-canon, nxs-002 ack)
-대상 repo: n6-architecture (cross-repo proposal 경유 권장)
+대상 repo: CANON (cross-repo proposal 경유 권장)
 연결: nxs-20260424-002 (composite 0.83379 → 0.9 paper_trigger)
 
 ---
 
 ## 1. 동기
 
-nexus 의 사다리 (L1 smash → L_ω omega + L11 canon) 가 closure 도달함. 동일 패턴을 atlas.n6 (`~/core/n6-architecture/atlas/atlas.n6`, 21,800 lines / 9,624 entries) 에 적용해 「최종 물리적·수학적 추상화 한계점까지」 끌어올리는 것이 목표.
+nexus 의 사다리 (L1 smash → L_ω omega + L11 canon) 가 closure 도달함. 동일 패턴을 atlas.n6 (`~/core/canon/atlas/atlas.n6`, 21,800 lines / 9,624 entries) 에 적용해 「최종 물리적·수학적 추상화 한계점까지」 끌어올리는 것이 목표.
 
 n6 측에서 이미 진행 중인 Phase Omega Y9 closure (`theory/roadmap-v2/phase-omega-Y9-closure-v3-design.md`) 는 *honesty audit + v2 sealing + v3 design* 에 집중 — 본 가이드는 그 위에 「abstraction-exhaustion」 정량 layer 를 얹음.
 
@@ -88,12 +88,12 @@ nexus 측 손댈 영역 한정:
 - canon 의 seal_id 를 atlas snapshot 마커로 확장 (현재 skin/atlas_bytes/drill_total 만 봉인 — atlas.n6 hash 추가 후보)
 - 향후 작업 (drill 슬롯 free 후): atlas eig pipeline rebuild trigger
 
-**cross-repo 정책 준수:** atlas.n6 본체 직접 수정은 n6-architecture 측 작업. 본 nexus repo 는 도구 (사다리) + 진단 + proposal 만.
+**cross-repo 정책 준수:** atlas.n6 본체 직접 수정은 CANON 측 작업. 본 nexus repo 는 도구 (사다리) + 진단 + proposal 만.
 
 ## 7. 다음 액션
 
 1. 본 문서 commit (`design/atlas_n6_omega_closure.md`)
-2. n6-architecture proposal 제출 — abstraction-exhaustion track + 위 작업 풀 1~6
+2. CANON proposal 제출 — abstraction-exhaustion track + 위 작업 풀 1~6
 3. drill slot free 후 atlas eig pipeline rebuild 1회 (composite 재측정, sensitivity 1차 데이터)
 4. canon 의 seal_id 에 atlas hash 추가 (선택, 다음 commit) — 시점 비교 가능하게
 
@@ -101,6 +101,6 @@ nexus 측 손댈 영역 한정:
 
 참조:
 - nexus/design/abstraction_ceiling.md — nexus 사다리 정의 (L1~L_ω + L11 canon)
-- n6-architecture/atlas/atlas.n6 — 본체 (21,800 lines)
-- n6-architecture/theory/roadmap-v2/phase-omega-Y9-closure-v3-design.md — 기존 Phase Omega 진행
+- CANON/atlas/atlas.n6 — 본체 (21,800 lines)
+- CANON/theory/roadmap-v2/phase-omega-Y9-closure-v3-design.md — 기존 Phase Omega 진행
 - nexus/state/proposals/inventory.json — nxs-20260424-002 (in_progress, ack 2026-04-25)

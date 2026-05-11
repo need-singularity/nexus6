@@ -1,7 +1,7 @@
 # Phase 10 — Meta-Closure Check (Operational Self-Referential Fixed-Point)
 
 **Status**: Design spec (Mk.IX proposal)
-**Author**: n6-architecture research thread, 2026-04-19
+**Author**: CANON research thread, 2026-04-19
 **Scope**: `shared/blowup/core/blowup.hexa` extension; `shared/n6/atlas.n6` edge schema addition
 **Non-goals**: atlas 상수 추가 (이미 META-01~10 + META-LK017~500 등재 완료)
 

@@ -106,7 +106,7 @@ the scope of this document.
 ```bash
 mkdir -p ~/repro && cd ~/repro
 git clone https://github.com/<author>/nexus.git
-git clone https://github.com/<author>/n6-architecture.git
+git clone https://github.com/<author>/CANON.git
 git clone https://github.com/<author>/anima.git
 git clone https://github.com/<author>/hexa-lang.git
 ```
@@ -253,7 +253,7 @@ Expected sentinel block:
 
 ```
 __CROSS_REPO_DASHBOARD__
-repos=4 nexus n6-architecture anima hexa-lang
+repos=4 nexus CANON anima hexa-lang
 honesty_5_5=3 honesty_6_6=3 mode=6
 status=PASS
 ```
@@ -379,7 +379,7 @@ extension to all n>=2 is via Mobius inversion (see PAPER_S6 Theorem 1).
 ### 9.3 Cross-check against atlas anchor
 
 ```bash
-grep -E '^@P N6HIST-A-CORE-IDENTITY' n6/atlas.append.n6-architecture-historical-from-nexus-2026-04-26.n6
+grep -E '^@P N6HIST-A-CORE-IDENTITY' n6/atlas.append.CANON-historical-from-nexus-2026-04-26.n6
 ```
 
 Expected (single line):

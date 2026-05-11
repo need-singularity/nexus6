@@ -6,7 +6,7 @@ priority:
 
 hexa 경로:
   nexus            shared/blowup/**/*.hexa (R14 카테고리)
-  n6-architecture  shared/blowup/core/*.hexa
+  CANON  shared/blowup/core/*.hexa
   anima            shared/blowup/core/*.hexa
 
 판단:

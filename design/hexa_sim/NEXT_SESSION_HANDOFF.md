@@ -135,7 +135,7 @@ doc              — README 출력
 - nexus 95 facts (`atlas.append.nexus-historical-absorption-2026-04-26.n6`)
 - anima 75 facts (`atlas.append.anima-historical-from-nexus-2026-04-26.n6`)
 - hexa-lang 88 facts (`atlas.append.hexa-lang-historical-from-nexus-2026-04-26.n6`)
-- n6-architecture 51 entries (`atlas.append.n6-architecture-historical-from-nexus-2026-04-26.n6`)
+- CANON 51 entries (`atlas.append.CANON-historical-from-nexus-2026-04-26.n6`)
 
 ### 12 falsifier registry
 - F1-F5 self-seal (constants/alpha/byte-eq/oeis/counter)
@@ -163,7 +163,7 @@ doc              — README 출력
 | repo | Phase 3 supercycle (이전 보고) | dashboard (현 도구 실측, 더 정확) |
 |------|--------------------------------|-----------------------------------|
 | nexus | 5/5 REPO_INVARIANT | **5/5 REPO_INVARIANT** |
-| n6-architecture | 5/5 REPO_INVARIANT | 4/5 (e=FAIL: `.claude/agents/` 부재) |
+| CANON | 5/5 REPO_INVARIANT | 4/5 (e=FAIL: `.claude/agents/` 부재) |
 | anima | 4/5 PARTIAL | 3/5 (e + git log 부재) |
 | hexa-lang | (미측정) | 3/5 (atlas + LLM agents 부재) |
 

@@ -81,7 +81,7 @@
   │       - 핵심 상수 테이블 (EXACT만)                           │
   │       - "왜 n=6이 이 도메인에서 최적인가"                    │
   │                                                              │
-  │    3. DSE 최적 경로 (n6-architecture)                        │
+  │    3. DSE 최적 경로 (CANON)                        │
   │       - Pareto frontier 테이블                               │
   │       - 최적 설계 경로 (소재→공정→코어→칩→시스템)           │
   │       - Cross-DSE 교차 도메인 시너지                         │

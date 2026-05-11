@@ -7,7 +7,7 @@
 
 Registry **115 falsifiers** (이전 105 + F78-F80 + F126-F132 = +10). **5 user-go pending = 0**.
 **DEFENSE PARITY 강화**: R5 SSH **STUB → PREVENTIVE 활성화** (signed via `nexus@local`
-identity). Honesty triad mode-6: **3/3 → 3/4 6_6** (n6-architecture에 SECURITY.md 추가).
+identity). Honesty triad mode-6: **3/3 → 3/4 6_6** (CANON에 SECURITY.md 추가).
 xpoll convention violations 19 → 0 정리. cross-engine integration F126-F132
 promoted (m3/m5/r4/r10 anchors + F132 [11*REPO_INVARIANT] paper-grade meta-finding).
 Atlas: 10 → **11 shards** (cross-engine 신규) / 9165 unique tuples / 0 collisions.
@@ -28,7 +28,7 @@ hexa run tool/session_overview.hexa --quiet | tail -1
 | Falsifier registry | 105 | **115** (+10) |
 | Atlas shards | 10 | **11** (+1 cross-engine) |
 | Atlas entries | 9155 | **9165** (+10) |
-| Honesty 6/6 | 2 (nexus + anima) | **3** (+ n6-architecture) |
+| Honesty 6/6 | 2 (nexus + anima) | **3** (+ CANON) |
 | xpoll convention violations | 19 | **0** |
 | F46/F47 status | HIT-as-designed (cleanup-target) | **CLEAN** (cleanup completed) |
 | R5 SSH layer | STUB (skip-by-default) | **PREVENTIVE** (SIGNED + VERIFIED) |
@@ -134,7 +134,7 @@ __SESSION_OVERVIEW__ PASS defense=PASS falsifiers=115 bridges=16/0_tampered
 ## v4-window milestone
 
 - `368209c0` 5 user-go all-go 일괄 처리 (F78-F80 + F126-F132 + xpoll + R5 SSH)
-- `3f12168e` (n6-architecture) SECURITY.md 추가 (precondition (f) populate)
+- `3f12168e` (CANON) SECURITY.md 추가 (precondition (f) populate)
 - `a75b707f` post-all-go 정리 (atlas R5 chain 정합 + SECURITY_AUDIT R5 ACTIVATED 반영)
 - `1f0fb76d` HANDOFF_v4 작성
 - `6124c304` cross_repo_dashboard 자동 regen (n6-arch 6/6 반영)

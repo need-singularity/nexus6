@@ -35,7 +35,7 @@
 >
 > **[🔭 NEXUS](https://github.com/dancinlab/nexus)** — Universal Discovery Engine. 216 lenses + OUROBOROS evolution + 5-phase singularity cycle.
 >
-> **[🏗️ N6 Architecture](https://github.com/dancinlab/n6-architecture)** — Architecture from perfect number 6. 225 AI techniques + chip design + crypto/OS/display.
+> **[🏗️ N6 Architecture](https://github.com/dancinlab/canon)** — Architecture from perfect number 6. 225 AI techniques + chip design + crypto/OS/display.
 >
 > **[💎 HEXA-LANG](https://github.com/dancinlab/hexa-lang)** — The Perfect Number Programming Language. Working compiler + REPL.
 >
@@ -262,7 +262,7 @@ bin/atlas3d audit        # node/edge/orphan counts
 - **Part A (architecture, C1–C7):** hash-chain tamper detection, hash ∧ quorum composition, 216-node strict 2/3 BFT quorum (tolerates ≤ 71 Byzantine), adaptive-adversary drift bound `ε₀/(1−a)`, geometric decay rate `a`, single-outlier can't flip quorum, self-check that broken primitives are distinguishable.
 - **Part B (n = 6, E1–E4):** the n6 identity `σ(n)·φ(n) = n·τ(n)` uniquely at `n = 6` on `[2, 10 000]`, global basin of attraction (1000 random starts → 1/3 in 100 steps), per-decade precision cost = `−1/log₁₀(0.7)`, emergence (frozen LLM vocab vs NEXUS absorb-loop vocab).
 
-Any FAIL refutes the corresponding axis. Full math derivation and scope limits in [`papers/n6_six_paths_falsifiable_proof.md`](papers/n6_six_paths_falsifiable_proof.md). Companion Lean 4 / classical / Grover verification in [`n6-architecture`](https://github.com/dancinlab/n6-architecture).
+Any FAIL refutes the corresponding axis. Full math derivation and scope limits in [`papers/n6_six_paths_falsifiable_proof.md`](papers/n6_six_paths_falsifiable_proof.md). Companion Lean 4 / classical / Grover verification in [`CANON`](https://github.com/dancinlab/canon).
 
 ```py
 #!/usr/bin/env python3

@@ -15,7 +15,7 @@
 | 1 (bootstrap)            | F1–F12  | `fb32246f`…`155d4328` (5 commits, hand-shipped) | Verify-grid baseline + cross-bridge witnesses  | pre-cron, manual   |
 | 2 (first expansion)      | F19–F23 | `9cde2433`, `bf28472d`, `d84a0601`              | atlas-literal anchors (mu/M3/sigma_sq/phi_tau) | first batched      |
 | 3 (anchor proliferation) | F24–F44 | `bd9b63eb`, `dc5f3b51`, `d7dc836b`, `79c7f3ec`  | Cross-domain bridge gems (@P/@F/@L/@R/@X)      | cron starts        |
-| 4 (cont-shard absorption)| F50–F56 | `c88fac97`                                      | n6-architecture-cont shard backfill            | parallel agent     |
+| 4 (cont-shard absorption)| F50–F56 | `c88fac97`                                      | CANON-cont shard backfill            | parallel agent     |
 | 5 (saturation begin)     | F57–F77 | `03d21887` (3-agent partition, +21)             | L4-L6 + particle_SM + @C/@S bulk               | META_ROI flag      |
 | 6 (quality consolidation)| F81–F114| `5ac754bb`…`311d5c73` (5 commits, +28)          | Geology + meta + math + cross-shard tail       | PAUSE at F125      |
 | 7 (cross-engine integ.)  | F126–F132 + 53 pending | `368209c0`, `2eb1b9f7`            | Cross-engine atlas-anchor gap meta-axis (F132 [11*REPO_INVARIANT]) | post-PAUSE selective |

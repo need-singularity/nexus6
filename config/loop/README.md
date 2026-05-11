@@ -29,7 +29,7 @@ shared/config/loop/n6-arch.json ┘   (interval, max_cycles, domain)
 ├──────────┼──────────────────────────────────┼──────────┼───────────────┤
 │ anima    │ shared/config/loop/anima.json           │ 999s     │ consciousness │
 ├──────────┼──────────────────────────────────┼──────────┼───────────────┤
-│ n6-arch  │ shared/config/loop/n6-architecture.json │ 1800s    │ architecture  │
+│ n6-arch  │ shared/config/loop/CANON.json │ 1800s    │ architecture  │
 └──────────┴──────────────────────────────────┴──────────┴───────────────┘
 ```
 
@@ -113,7 +113,7 @@ shared/config/loop/n6-arch.json ┘   (interval, max_cycles, domain)
 
 ---
 
-## n6-architecture (🏗️ 시스템 설계)
+## CANON (🏗️ 시스템 설계)
 
 ```
 매 사이클 (30분 간격):

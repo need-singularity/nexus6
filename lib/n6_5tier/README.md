@@ -34,11 +34,11 @@ python -m n6_5tier.cli generate \
 
 # validate an existing domain .md
 python -m n6_5tier.cli validate \
-    ~/core/n6-architecture/domains/physics/cosmology/cosmology.md
+    ~/core/canon/domains/physics/cosmology/cosmology.md
 
 # walk a tree
 python -m n6_5tier.cli validate-dir \
-    ~/core/n6-architecture/domains/
+    ~/core/canon/domains/
 
 # run module self-test
 python -m n6_5tier.cli --self-test

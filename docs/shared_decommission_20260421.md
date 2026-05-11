@@ -14,17 +14,17 @@
 
 | 그룹 | 추정 크기 | 성격 | 이관 대상 |
 |------|----------|------|----------|
-| n6/ (atlas 계열) | 2~3M | canonical data | n6-architecture 소유 |
+| n6/ (atlas 계열) | 2~3M | canonical data | CANON 소유 |
 | harness/ | 수십 MB | roadmap DSL/runner | nexus (코드) + 별도 변환 트랙 |
-| discoveries/ | 다수 JSON | 과학적 산출물 | n6-architecture/discoveries |
+| discoveries/ | 다수 JSON | 과학적 산출물 | CANON/discoveries |
 | research/ | 다수 | 연구 로그 | nexus/research |
 | lenses/, rules/, hooks/, bin/, scripts/, lib/ | 레거시 | 중복 파편 | 폐기 |
 | .runtime/ | 변동 | 실행 상태 | nexus/.runtime 또는 tmp |
 
 ## 결정 사항
 
-1. **atlas.n6 canonical 위치: `~/core/n6-architecture/atlas/atlas.n6`**
-   - 소유 도메인은 n6-architecture (174 lens + BT + DSE 원산지)
+1. **atlas.n6 canonical 위치: `~/core/canon/atlas/atlas.n6`**
+   - 소유 도메인은 CANON (174 lens + BT + DSE 원산지)
    - 이전 임시 canonical 이었던 `~/core/data/n6/atlas.n6` 는 symlink backward compat 로 유지 (마이그레이션 후 제거 예정)
 2. **~/shared 백업 tarball: `~/etc/shared-backup-*.tar.gz`**
    - `~/core/.shared-backup-...` 은 core 내부 오염이므로 core 밖 `~/etc/` 로 이동 (raw#1 외부 공간 분리)
@@ -67,7 +67,7 @@
 |-----|------|----------|------|------|
 | raw#0 | ssot-roots | 현재 위반 | ~/shared 이중 SSOT | decommission 실행 |
 | raw#1 | chflags-uchg | 부분 위반 | shared/.raw-ref 잠금 해제 | tarball 후 잠금 이관 |
-| raw#5 | single-source-of-truth | 위반 | atlas.n6 이중 | n6-architecture 단일화 |
+| raw#5 | single-source-of-truth | 위반 | atlas.n6 이중 | CANON 단일화 |
 | raw#9 | hexa-only | OK | - | harness .json 변환은 별도 트랙 |
 | raw#11 | snake_case | OK | - | 유지 |
 | raw#13 | tree-structure | 경고 | shared/ 루트 폴더 잡식 | 도메인 분산 |
@@ -80,21 +80,21 @@
 
 | From (~/*) | To | 방식 |
 |-------------------|-----|------|
-| n6/atlas.n6 | ~/core/n6-architecture/atlas/atlas.n6 | mv + sha256 검증 |
-| n6/atlas.signals.n6 | ~/core/n6-architecture/atlas/atlas.signals.n6 | mv + sha256 검증 |
-| n6/atlas.live.json | ~/core/n6-architecture/atlas/ | mv |
-| discoveries/ | ~/core/n6-architecture/discoveries/ | mv + git add |
+| n6/atlas.n6 | ~/core/canon/atlas/atlas.n6 | mv + sha256 검증 |
+| n6/atlas.signals.n6 | ~/core/canon/atlas/atlas.signals.n6 | mv + sha256 검증 |
+| n6/atlas.live.json | ~/core/canon/atlas/ | mv |
+| discoveries/ | ~/core/canon/discoveries/ | mv + git add |
 | research/ | ~/core/nexus/research/ | mv + git add |
 | harness/ | ~/core/nexus/harness-legacy/ | 이관 후 .roadmap DSL 변환 (별도 트랙) |
 | bench/ | ~/core/nexus/bench/ | mv |
-| n6/ 기타 | ~/core/n6-architecture/ | mv |
+| n6/ 기타 | ~/core/canon/ | mv |
 | config/infrastructure.json | ~/core/nexus/config/ (유지) | 기존 심볼릭 해소 |
 | .runtime/ | ~/core/nexus/.runtime/ | mv, gitignore |
 
 ## 폐기 대상
 
 ### Tier 1 (즉시 삭제 후 tarball 만 보존)
-- `~/lenses/` (n6-architecture 에 원본 있음)
+- `~/lenses/` (CANON 에 원본 있음)
 - `~/rules/` (.raw 로 이미 흡수)
 - `~/hooks/` (.githooks 으로 이관 완료)
 - `~/bin/` (~/.hx/bin 로 이관 완료)
@@ -115,7 +115,7 @@
 | data | - | - | - | - | - | - | - | - | - | - | canonical sink (SSOT 예외) |
 | hexa-lang | 확인 | 확인 | 확인 | 확인 | 확인 | 확인 | 있음 | 있음 | docs/ | - | 자기참조 도구 |
 | hexa-os | 확인 | 확인 | 확인 | 확인 | 확인 | 확인 | 있음 | 있음 | docs/ | - | OS 레이어 |
-| n6-architecture | 확인 | 확인 | 확인 | 확인 | 확인 | 확인 | 있음 | 있음 | docs/ | - | 174 lens owner (atlas 신규 owner) |
+| CANON | 확인 | 확인 | 확인 | 확인 | 확인 | 확인 | 있음 | 있음 | docs/ | - | 174 lens owner (atlas 신규 owner) |
 | nexus | 확인 | 확인 | 확인 | 확인 | 확인 | 확인 | 있음 | 있음 | docs/ | cli/ | CLI 진입 |
 | papers | 확인 | 확인 | 확인 | 확인 | 확인 | 확인 | - | - | - | - | 논문 리포 |
 | void | - | - | - | - | - | - | - | - | - | - | scratch (SSOT 예외) |
@@ -125,10 +125,10 @@
 ## 실행 순서 (9 step)
 
 1. **사전 스냅샷**: `tar czf ~/etc/shared-backup-20260421-full.tar.gz ~/shared` (sha256 기록)
-2. **.workspace 업데이트 (dry-run)**: atlas source path → `../n6-architecture/atlas/atlas.n6`
-3. **atlas 이관**: `~/n6/atlas.n6` → `~/core/n6-architecture/atlas/atlas.n6` (same-fs mv, sha256 비교)
-4. **symlink 재연결**: `~/core/nexus/n6/atlas.n6` → `../../../n6-architecture/atlas/atlas.n6`, `~/core/hexa-lang/n6/atlas.n6` 도 동일
-5. **domain 이관**: discoveries → n6-architecture, research → nexus/research, bench → nexus/bench
+2. **.workspace 업데이트 (dry-run)**: atlas source path → `../canon/atlas/atlas.n6`
+3. **atlas 이관**: `~/n6/atlas.n6` → `~/core/canon/atlas/atlas.n6` (same-fs mv, sha256 비교)
+4. **symlink 재연결**: `~/core/nexus/n6/atlas.n6` → `../../../canon/atlas/atlas.n6`, `~/core/hexa-lang/n6/atlas.n6` 도 동일
+5. **domain 이관**: discoveries → CANON, research → nexus/research, bench → nexus/bench
 6. **harness 임시 이주**: shared/harness → nexus/harness-legacy (.roadmap 변환 트랙 ticket 발행)
 7. **Tier 1 폐기**: lenses/rules/hooks/bin/scripts/lib 삭제 (tarball 존재 검증 후)
 8. **.raw-audit 재앵커**: 9 프로젝트 모두 hash-chain head 갱신, raw#24 dry-run 통과 확인
@@ -172,17 +172,17 @@ resource atlas.n6
 
 # after
 resource atlas.n6
-  owner    n6-architecture
-  source   ../n6-architecture/atlas/atlas.n6
+  owner    CANON
+  source   ../canon/atlas/atlas.n6
   target   shared/n6/atlas.n6
 ```
 owner 변경이 핵심. workspace_sync 가 새 owner 로부터 상대경로를 재계산하도록 둠.
 
 ### Step 3: atlas mv (same-fs)
 ```
-mkdir -p ~/core/n6-architecture/atlas
-mv ~/n6/atlas.n6 ~/core/n6-architecture/atlas/atlas.n6
-mv ~/n6/atlas.signals.n6 ~/core/n6-architecture/atlas/atlas.signals.n6
+mkdir -p ~/core/canon/atlas
+mv ~/n6/atlas.n6 ~/core/canon/atlas/atlas.n6
+mv ~/n6/atlas.signals.n6 ~/core/canon/atlas/atlas.signals.n6
 # 사전/사후 sha256 비교
 ```
 사전 sha256 기록 파일 필수. inode 이동이라 atomic 이지만 rollback 위해 tarball 안에 원본 보존.
@@ -201,7 +201,7 @@ done
 대상 목록 확정 후 일괄 ln -sf 적용. 재연결 후 각 프로젝트 tool/ 에서 atlas 열기 테스트 1 회.
 
 ### Step 5~6: 도메인 이관
-- `mv ~/discoveries ~/core/n6-architecture/discoveries` 후 `git add` + 커밋 (n6-architecture)
+- `mv ~/discoveries ~/core/canon/discoveries` 후 `git add` + 커밋 (CANON)
 - `mv ~/research ~/core/nexus/research` 후 `git add` + 커밋 (nexus)
 - `mv ~/harness ~/core/nexus/harness-legacy` + 마커 파일 생성:
   ```
@@ -222,7 +222,7 @@ done
 
 ### Step 8: .raw-audit 재앵커 (9 프로젝트)
 ```
-for p in airgenome anima contact hexa-lang hexa-os n6-architecture nexus papers void; do
+for p in airgenome anima contact hexa-lang hexa-os CANON nexus papers void; do
   hexa ~/core/hexa-lang/tool/raw_audit.hexa --project ~/core/$p --reanchor-dry
 done
 ```
@@ -252,7 +252,7 @@ rm -rf ~/core/.shared-backup-20260421-022340  # core 내부 오염 정리
 
 ## 결정 이력
 
-- 2026-04-21: 이 문서 작성. 기존 atlas canonical `~/core/data/n6/atlas.n6` → n6-architecture 소유로 재결정. 관련 memory (project_atlas_ssot.md, project_core_workspace.md) 동시 갱신. 신규 memory `project_shared_decommission.md` 생성.
+- 2026-04-21: 이 문서 작성. 기존 atlas canonical `~/core/data/n6/atlas.n6` → CANON 소유로 재결정. 관련 memory (project_atlas_ssot.md, project_core_workspace.md) 동시 갱신. 신규 memory `project_shared_decommission.md` 생성.
 - 이 결정은 raw#0, raw#5, raw#13, raw#28 기준 평가 통과 (이중 SSOT 해소 + 도메인 소유 명확화).
 
 ## 참고

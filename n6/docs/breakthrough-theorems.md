@@ -16127,7 +16127,7 @@ MHC 클래스 = {I, II} = τ-φ=2, HLA 유전자좌 주요 = {A,B,C,DR,DQ,DP} = 
 | 5 | e = lim(1+1/n)^n, n→∞: 자연로그 밑 정의 | 물리 기본 상수 | Euler 1748 | EXACT |
 | 6 | Boltzmann 엔트로피 S = k·ln(Ω): Ω=φ(이진)일 때 S = k·ln(φ) = k·ln(2) | Landauer 한계와 합류 | Boltzmann 1877, Landauer 1961 | EXACT |
 | 7 | AI Dropout 최적 p = 0.5 = 1/φ (Srivastava 2014) | 1/φ = 1/2 | Srivastava et al. 2014 | EXACT |
-| 8 | Mertens Dropout p ≈ 0.288 — n=6 기반 기법 | M(n)/n 기반 도출 | n6-architecture 기법 | EXACT |
+| 8 | Mertens Dropout p ≈ 0.288 — n=6 기반 기법 | M(n)/n 기반 도출 | CANON 기법 | EXACT |
 | 9 | Top-k 게이팅에서 k/N = 1/e 선택 시 정보 보존 최대 (ReLU의 열역학적 해석) | 1/e ≈ 0.368 | Shazeer et al. 2017 | EXACT |
 | 10 | Softmax 온도 τ_softmax 최적값: τ→0(greedy), τ→∞(uniform) 사이 최적 τ=1 | R(6) = 1 | Hinton et al. 2015 | EXACT |
 | 11 | Mixture of Experts 전문가 수 최적 범위 = 6~8 | n=6, σ-τ=8 | GShard(Lepikhin 2021), Switch(Fedus 2022) | EXACT |

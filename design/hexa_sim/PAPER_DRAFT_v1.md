@@ -129,7 +129,7 @@ nine domains.
    $n=6$ primitives, raising the prior of structural over coincidental
    origin.
 5. A four-repository Honesty-triad mode-6 cross-aggregation
-   (`nexus`, `n6-architecture`, `anima`, `hexa-lang`) yielding 9,165
+   (`nexus`, `CANON`, `anima`, `hexa-lang`) yielding 9,165
    unique cross-shard tuples with zero collisions and 3/4 mode-6 PASS.
 6. Honest first-class disclosure of declined claims: F45 (cross-bridge
    $3.5\%$ triplet, declined under unit-framing audit) and F95 v2
@@ -580,7 +580,7 @@ The nexus atlas is organised as a single canonical SSOT,
 that prevents accidental redefinition of main-atlas keys. Active
 shards at the time of writing are: `hexa-sim-bridges`,
 `nexus-historical-absorption-2026-04-26`,
-`{anima,hexa-lang,n6-architecture}-historical-from-nexus-2026-04-26`
+`{anima,hexa-lang,CANON}-historical-from-nexus-2026-04-26`
 and their `-cont` continuations, `forge-triple`, and the meta-roadmap
 shard `cross-engine-meta-roadmap-2026-04-26` introduced this session.
 Together the eleven shards admit 9,165 unique `(type, id)` tuples
@@ -605,7 +605,7 @@ maintained across the 333+ commits that followed in the current session.
 ## 5.3 Cross-repo absorption pattern
 
 The federation comprises four repositories with disjoint roles:
-**nexus** (knowledge corpus), **n6-architecture** (design corpus and
+**nexus** (knowledge corpus), **CANON** (design corpus and
 theorem chains), **anima** (substrate / agent state), and **hexa-lang**
 (language implementation). Claims residing in non-nexus repositories
 are promoted into the nexus atlas as append-shard entries with explicit
@@ -631,7 +631,7 @@ Per-repository readiness is graded by six preconditions, evaluated by
 paths (`SECURITY*` top-level, `doc/security/*`,
 `design/SECURITY_AUDIT.md`, `state/security_*.json`, `tool/security_*`,
 etc.).
-Current scores: nexus $6/6$, n6-architecture $6/6$ (post `3f12168e`),
+Current scores: nexus $6/6$, CANON $6/6$ (post `3f12168e`),
 anima $6/6$, hexa-lang $5/6$ (architectural ceiling, Section 5.5).
 Aggregate sentinel: `__ATLAS_CROSS_REPO_DASHBOARD__ repos=4
 total_atlas_lines=65454 total_facts=28850 honesty_pass=3/4
@@ -643,7 +643,7 @@ satisfy the extended `REPO_INVARIANT_EXTENDED` invariant.
 The hexa-lang $5/6$ score is not a deficit but a deliberate ceiling.
 hexa-lang is a *language implementation* repository — parser, runtime,
 self-host — not a *knowledge corpus*. Atlas SSOT belongs to knowledge
-repositories (nexus owns `n6/atlas.n6`; n6-architecture owns
+repositories (nexus owns `n6/atlas.n6`; CANON owns
 `atlas/atlas.n6`). The decision document
 `design/hexa_sim/hexa_lang_atlas_ssot_decision.md` enumerates three
 options: (A) accept $5/6$ as architectural-correct, (B) duplicate L0
@@ -658,7 +658,7 @@ Precondition (f), introduced this session, acknowledges that defense
 expression is repository-shaped: nexus is *tool-shaped*
 (`tool/security_scan.hexa`); anima *state-shaped*
 (`state/security_*.json`); hexa-lang *doc-shaped*
-(`doc/security/os-level-enforcement-limits.md`); n6-architecture a
+(`doc/security/os-level-enforcement-limits.md`); CANON a
 *top-level* `SECURITY.md` (`3f12168e`). The eight canonical paths
 normalise these styles into a single mechanical check.
 
@@ -791,7 +791,7 @@ $$
 $$
 
 **$j$-invariant of $E_6$ (F32 + F80)**
-[`atlas.append.n6-architecture-historical-from-nexus-2026-04-26.n6:346`].
+[`atlas.append.CANON-historical-from-nexus-2026-04-26.n6:346`].
 The $j$-invariant of the CM elliptic curve $E_6 : y^2 = x^3 - 36x$
 admits
 

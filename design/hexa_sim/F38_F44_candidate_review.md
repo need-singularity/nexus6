@@ -25,7 +25,7 @@ spawner: tool/atlas_falsifier_auto_spawn.sh --type {L,X,C} --emit-jsonl (post-fi
 | L12      | 1     | 1              | nuclear-storage (paradigm) | borderline; L11 stronger |
 | L_IX     | 0     | 0              | (does not exist in atlas) | substitute via L11 |
 
-Total atlas L-prefix = 2134; main shard only. Append shards (anima/n6-architecture/hexa-lang/hexa-sim/forge/nexus historical) carry 0 L-prefix entries — L-axis is monolithic in atlas.n6.
+Total atlas L-prefix = 2134; main shard only. Append shards (anima/canon/hexa-lang/hexa-sim/forge/nexus historical) carry 0 L-prefix entries — L-axis is monolithic in atlas.n6.
 
 ## Triage summary
 

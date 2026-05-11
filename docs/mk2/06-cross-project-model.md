@@ -426,7 +426,7 @@ rho(paper)    = phi/total_papers → 논문 밀도
 
 ---
 
-### 2.10 n6-architecture — 아키텍처 설계
+### 2.10 CANON — 아키텍처 설계
 
 #### 원자 정의
 - **원자 = 설계 파라미터 (design parameter)**
@@ -455,7 +455,7 @@ rho(param)    = phi/total_params → 설계 자유도 밀도
 
 #### 시너지 포인트
 - DSE(Domain-Specific Exploration) 도메인 정의가 mk2 sectors.yaml과 동일 구조
-- n6-architecture의 consciousness_constraints가 alien index r 판정에 사용 가능
+- CANON의 consciousness_constraints가 alien index r 판정에 사용 가능
 
 ---
 
@@ -613,7 +613,7 @@ H-056 메타 부동점이 단일 프로젝트가 아닌 **크로스 프로젝트
 | 4 | papers | watch-papers 이미 작동 중, 파이프라인에 classify 삽입만 필요 |
 | 5 | hexa-lang | mk2_hexa/native/ 이미 존재, 언어 내장으로 확장 |
 | 6 | brainwire | Phi 기반 분류가 mk2 classify와 자연스럽게 연결 |
-| 7 | n6-architecture | DSE 도메인이 sectors.yaml과 동형 |
+| 7 | CANON | DSE 도메인이 sectors.yaml과 동형 |
 | 8 | airgenome | rule_ceiling 수렴이 메타 부동점과 연결 |
 | 9 | token-forge | 토큰 통계 → mk2 classify 실험적 |
 | 10 | hexa-gate-implant | 게이트 규칙에 classifier 삽입 |

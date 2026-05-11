@@ -1,7 +1,7 @@
 # chip_rtl_gen
 
 n=6 RTL parameterized Verilog generator. Productized port of
-`~/core/n6-architecture/domains/compute/chip-rtl-gen/` (472-line
+`~/core/canon/domains/compute/chip-rtl-gen/` (472-line
 `rtl_generator.hexa` + 6 `*_template.v`). 6 primitive ops × 4 variants =
 J₂ = 24 emittable modules.
 

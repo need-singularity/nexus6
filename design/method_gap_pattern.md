@@ -1,11 +1,11 @@
 # Cross-BT Method-Gap Pattern
 
-> Deployed 2026-04-25 from n6-architecture session.
+> Deployed 2026-04-25 from CANON session.
 > Source: `reports/sessions/omega-meta-prediction-cross-bt-method-gap-2026-04-25.md` + `omega-meta-prediction-bt541-method-gap-2026-04-25.md`.
 
 ## The pattern
 
-For each unresolved Millennium-grade conjecture analyzed in the n6-architecture session, a **method gap** structure was identified — a region where the conjecture lives that is unreachable by complementary technique families (Family A construction-side + Family B rigidity-side).
+For each unresolved Millennium-grade conjecture analyzed in the CANON session, a **method gap** structure was identified — a region where the conjecture lives that is unreachable by complementary technique families (Family A construction-side + Family B rigidity-side).
 
 ## 6/6 coverage
 

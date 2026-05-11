@@ -1,7 +1,7 @@
-# n6-architecture — AI-native Arithmetic Design Framework
+# CANON — AI-native Arithmetic Design Framework
 
 <!--
-# @convergence-meta project=n6-architecture updated=2026-04-08 strategy="ossified/stable/failed 수렴 추적"
+# @convergence-meta project=CANON updated=2026-04-08 strategy="ossified/stable/failed 수렴 추적"
 # @convergence state=ossified id=CORE_THEOREM value="σφ=nτ ⟺ n=6, 3개 독립 증명" threshold="반례 0 (10^8 탐색)"
 # @convergence state=ossified id=BT_380 value="380 돌파 정리 (BT-372~380 지질/기상/빙권/해양/대기화학/곡률/워프/추가차원/메타 추가)" threshold="전수 검증 + atlas 등록" note="2026-04-08 BT-343 → BT-380 확장, 각 BT n=6 수식 도출 + 검증예측 포함"
 # @convergence state=ossified id=AI_17_TECHNIQUES value="17 기법 실험 확정" threshold="71% FLOPs, 3x FFT, 67% param 등"
@@ -26,7 +26,7 @@
 -->
 
 commands: shared/config/commands.json — autonomous 블록으로 Claude Code가 작업 중 smash/free/todo/go/keep 자율 판단·실행
-rules: shared/rules/common.json (R0~R27) + shared/rules/n6-architecture.json (N61~N65)
+rules: shared/rules/common.json (R0~R27) + shared/rules/CANON.json (N61~N65)
 L0 Guard: `hexa $NEXUS/tool/lockdown_gate.hexa <verify|status|watch|repair|safe-merge|log>`
 
 atlas.n6 — 현실지도 SSOT:
@@ -63,11 +63,11 @@ NEXUS CLI: nexus {scan|verify|calc|dse|analyze|hexa|dashboard} <args>
 
 ref:
   rules     shared/rules/common.json                R0~R27
-  project   shared/rules/n6-architecture.json       N61~N65
+  project   shared/rules/CANON.json       N61~N65
   lock      shared/rules/lockdown.json              L0/L1/L2
   cdo       shared/rules/convergence_ops.json       CDO 수렴
   registry  shared/config/projects.json             7프로젝트
   cfg       shared/config/project_config.json
   core      shared/config/core.json
-  conv      shared/convergence/n6-architecture.json
+  conv      shared/convergence/CANON.json
   api       shared/CLAUDE.md

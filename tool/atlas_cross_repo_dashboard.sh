@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tool/atlas_cross_repo_dashboard.sh — Tier-2 i13 from improvement_ideas_omega_cycle (2026-04-26)
 #
-# 4-repo (nexus + n6-architecture + anima + hexa-lang) atlas state 통합 status dashboard
+# 4-repo (nexus + CANON + anima + hexa-lang) atlas state 통합 status dashboard
 # (markdown emit). Honesty triad 6 preconditions per-repo + atlas size + last commit.
 # self-host 회피 (bash + git, no hexa dep).
 #
@@ -42,7 +42,7 @@ done
 # all 4 repos). Achieves zero CC-CLI dependency for the honesty triad gate.
 REPOS=(
     "nexus|$HOME/core/nexus|n6/atlas.n6|.own"
-    "n6-architecture|$HOME/core/n6-architecture|atlas/atlas.n6|.own"
+    "CANON|$HOME/core/CANON|atlas/atlas.n6|.own"
     "anima|$HOME/core/anima|n6/atlas.n6|.own"
     "hexa-lang|$HOME/core/hexa-lang|n6/atlas.n6|.own"
 )

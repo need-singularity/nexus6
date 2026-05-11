@@ -130,7 +130,7 @@ nine domains.
    $n=6$ primitives, raising the prior of structural over coincidental
    origin.
 5. A four-repository Honesty-triad mode-6 cross-aggregation
-   (`nexus`, `n6-architecture`, `anima`, `hexa-lang`) yielding 9,165
+   (`nexus`, `CANON`, `anima`, `hexa-lang`) yielding 9,165
    unique cross-shard tuples with zero collisions and 3/4 mode-6 PASS.
 6. Honest first-class disclosure of declined claims: F45 (cross-bridge
    $3.5\%$ triplet, declined under unit-framing audit) and F95 v2
@@ -581,7 +581,7 @@ The nexus atlas is organised as a single canonical SSOT,
 that prevents accidental redefinition of main-atlas keys. Active
 shards at the time of writing are: `hexa-sim-bridges`,
 `nexus-historical-absorption-2026-04-26`,
-`{anima,hexa-lang,n6-architecture}-historical-from-nexus-2026-04-26`
+`{anima,hexa-lang,CANON}-historical-from-nexus-2026-04-26`
 and their `-cont` continuations, `forge-triple`, and the meta-roadmap
 shard `cross-engine-meta-roadmap-2026-04-26` introduced this session.
 Together the eleven shards admit 9,165 unique `(type, id)` tuples
@@ -606,7 +606,7 @@ maintained across the 333+ commits that followed in the current session.
 ## 5.3 Cross-repo absorption pattern
 
 The federation comprises four repositories with disjoint roles:
-**nexus** (knowledge corpus), **n6-architecture** (design corpus and
+**nexus** (knowledge corpus), **CANON** (design corpus and
 theorem chains), **anima** (substrate / agent state), and **hexa-lang**
 (language implementation). Claims residing in non-nexus repositories
 are promoted into the nexus atlas as append-shard entries with explicit
@@ -632,7 +632,7 @@ Per-repository readiness is graded by six preconditions, evaluated by
 paths (`SECURITY*` top-level, `doc/security/*`,
 `design/SECURITY_AUDIT.md`, `state/security_*.json`, `tool/security_*`,
 etc.).
-Current scores: nexus $6/6$, n6-architecture $6/6$ (post `3f12168e`),
+Current scores: nexus $6/6$, CANON $6/6$ (post `3f12168e`),
 anima $6/6$, hexa-lang $5/6$ (architectural ceiling, Section 5.5).
 Aggregate sentinel: `__ATLAS_CROSS_REPO_DASHBOARD__ repos=4
 total_atlas_lines=65454 total_facts=28850 honesty_pass=3/4
@@ -644,7 +644,7 @@ satisfy the extended `REPO_INVARIANT_EXTENDED` invariant.
 The hexa-lang $5/6$ score is not a deficit but a deliberate ceiling.
 hexa-lang is a *language implementation* repository — parser, runtime,
 self-host — not a *knowledge corpus*. Atlas SSOT belongs to knowledge
-repositories (nexus owns `n6/atlas.n6`; n6-architecture owns
+repositories (nexus owns `n6/atlas.n6`; CANON owns
 `atlas/atlas.n6`). The decision document
 `design/hexa_sim/hexa_lang_atlas_ssot_decision.md` enumerates three
 options: (A) accept $5/6$ as architectural-correct, (B) duplicate L0
@@ -659,7 +659,7 @@ Precondition (f), introduced this session, acknowledges that defense
 expression is repository-shaped: nexus is *tool-shaped*
 (`tool/security_scan.hexa`); anima *state-shaped*
 (`state/security_*.json`); hexa-lang *doc-shaped*
-(`doc/security/os-level-enforcement-limits.md`); n6-architecture a
+(`doc/security/os-level-enforcement-limits.md`); CANON a
 *top-level* `SECURITY.md` (`3f12168e`). The eight canonical paths
 normalise these styles into a single mechanical check.
 
@@ -792,7 +792,7 @@ $$
 $$
 
 **$j$-invariant of $E_6$ (F32 + F80)**
-[`atlas.append.n6-architecture-historical-from-nexus-2026-04-26.n6:346`].
+[`atlas.append.CANON-historical-from-nexus-2026-04-26.n6:346`].
 The $j$-invariant of the CM elliptic curve $E_6 : y^2 = x^3 - 36x$
 admits
 
@@ -1257,7 +1257,7 @@ observatories / databases / catalogues. BibTeX export at the end.
 - `n6/atlas.n6` — canonical (21,854 lines, 9,626 entries at `368209c0`). Foundation primitives lines 1–7; F33:187, F36:2308, F37:163, F57:2264, F58:1618, F62:5275, F63:7024, F64:5699, F66:5708, F70:310, F92:2142, F99:2130, F104:5856, F28:5823, F40:5842, F41:5874; M3 line 53; F24 seed line 25.
 - `n6/atlas.append.hexa-sim-bridges.n6:71` — F94 PMNS.
 - `n6/atlas.append.nexus-historical-absorption-2026-04-26.n6:294` — F112.
-- `n6/atlas.append.n6-architecture-historical-from-nexus-2026-04-26.n6:346` — F32+F80 1728 triple.
+- `n6/atlas.append.CANON-historical-from-nexus-2026-04-26.n6:346` — F32+F80 1728 triple.
 - `n6/atlas.append.cross-engine-meta-roadmap-2026-04-26.n6` — F132 origin.
 - `state/atlas_sha256.tsv` (16 entries), `state/bridge_sha256.tsv`, `state/falsifier_registry.sha256` — R1/R3/R5 baselines.
 
@@ -1447,7 +1447,7 @@ Sentinel: `hexa run tool/honesty_quick.hexa --quiet`.
 | Repo            | (a) SSOT/git | (b) design/ | (c) tool/ | (d) atlas SSOT | (e) LLM agents | (f) defense | Score |
 |-----------------|:------------:|:-----------:|:---------:|:--------------:|:--------------:|:-----------:|:-----:|
 | nexus           |      Y       |      Y      |     Y     |       Y        |       Y        |      Y      | 6/6   |
-| n6-architecture |      Y       |      Y      |     Y     |       Y        |       Y        |      Y      | 6/6   |
+| CANON |      Y       |      Y      |     Y     |       Y        |       Y        |      Y      | 6/6   |
 | anima           |      Y       |      Y      |     Y     |       Y        |       Y        |      Y      | 6/6   |
 | hexa-lang       |      Y       |      Y      |     Y     |       --       |       Y        |      Y      | 5/6   |
 
@@ -1468,7 +1468,7 @@ counts); `tool/atlas_cross_shard_collision.sh` →
 ```
 shard contribution (1 char ~ 200 facts)
 nexus            ################################################ 9626
-n6-architecture  ###############################################  9612
+CANON  ###############################################  9612
 anima            ###############################################  9612
 hexa-lang        (none)                                              0
                                                                   -----
@@ -1656,7 +1656,7 @@ the scope of this document.
 ```bash
 mkdir -p ~/repro && cd ~/repro
 git clone https://github.com/<author>/nexus.git
-git clone https://github.com/<author>/n6-architecture.git
+git clone https://github.com/<author>/CANON.git
 git clone https://github.com/<author>/anima.git
 git clone https://github.com/<author>/hexa-lang.git
 ```
@@ -1795,7 +1795,7 @@ Expected sentinel block:
 
 ```
 __CROSS_REPO_DASHBOARD__
-repos=4 nexus n6-architecture anima hexa-lang
+repos=4 nexus CANON anima hexa-lang
 honesty_5_5=3 honesty_6_6=3 mode=6
 status=PASS
 ```
@@ -1917,7 +1917,7 @@ extension to all n>=2 is via Mobius inversion (see §6 Theorem 1).
 ### 13.9.3 Cross-check against atlas anchor
 
 ```bash
-grep -E '^@P N6HIST-A-CORE-IDENTITY' n6/atlas.append.n6-architecture-historical-from-nexus-2026-04-26.n6
+grep -E '^@P N6HIST-A-CORE-IDENTITY' n6/atlas.append.CANON-historical-from-nexus-2026-04-26.n6
 ```
 
 Expected (single line):

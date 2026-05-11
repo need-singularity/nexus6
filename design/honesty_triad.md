@@ -1,7 +1,7 @@
 # Nexus Honesty Triad
 
-> Deployed 2026-04-25 from n6-architecture audit at:
-> `~/core/n6-architecture/reports/sessions/omega-audit-nexus-honesty-triad-portability-2026-04-25.md`
+> Deployed 2026-04-25 from CANON audit at:
+> `~/core/canon/reports/sessions/omega-audit-nexus-honesty-triad-portability-2026-04-25.md`
 
 ## Three constraints
 
@@ -43,7 +43,7 @@ Each session-agent prompt should include this preset (3 lines):
 ```
 
 ## Audit lineage
-This triad is verified by 3-of-3 KEEP_AS_IS audits in n6-architecture (2026-04-25):
+This triad is verified by 3-of-3 KEEP_AS_IS audits in CANON (2026-04-25):
 - `reports/sessions/omega-audit-constraint-honesty-counter-2026-04-25.md`
 - `reports/sessions/omega-audit-constraint-write-barrier-2026-04-25.md`
 - `reports/sessions/omega-audit-constraint-no-fabrication-2026-04-25.md`
@@ -53,7 +53,7 @@ Plus nexus-side cross-repo audit verified KEEP/KEEP_BUT_ADAPT verdicts at:
 
 ## hexa-lang exception (appended 2026-04-26, raw 77 audit-append-only)
 
-The 4-repo Honesty triad ω-cycle preconditions {a git-tracked SSOT, b design corpus, c tool ecosystem, d atlas SSOT, e LLM agents indicator} score nexus / n6-architecture / anima at 5/5. hexa-lang scores **4/5**, missing only (d).
+The 4-repo Honesty triad ω-cycle preconditions {a git-tracked SSOT, b design corpus, c tool ecosystem, d atlas SSOT, e LLM agents indicator} score nexus / CANON / anima at 5/5. hexa-lang scores **4/5**, missing only (d).
 
 **Decision: accept 4/5 as architectural ceiling — precondition (d) is N/A by role for hexa-lang.**
 

@@ -1,6 +1,6 @@
 # Progressive Deepening Methodology
 
-> Deployed 2026-04-25 from n6-architecture session.
+> Deployed 2026-04-25 from CANON session.
 > Source: `reports/sessions/omega-meta-synthesis-progressive-deepening-pattern-2026-04-25.md` + `omega-meta-cumulative-session-methodology-2026-04-25.md`.
 
 ## When to apply

@@ -51,7 +51,7 @@ commits=358+ hexa_tools=203+ omegas=74+ unique=PASS
 | Atlas shards | 16 / 16 PASS (0 tampered / 9174 unique / 0 collision) |
 | Defense parity | 9-cell matrix LIVE (R5 SSH PREVENTIVE 3-domain) |
 | R5 chain entries | 10 (atlas 8 + bridge 2 + falsifier 0) |
-| Honesty mode-6 | 3/3 6_6 (nexus / n6-architecture / anima; hexa-lang 5/6) |
+| Honesty mode-6 | 3/3 6_6 (nexus / CANON / anima; hexa-lang 5/6) |
 | Paper PAPER_DRAFT_v5 | **14,855 w / arXiv-submit-ready** |
 | License | **CC-BY-4.0** (paper-co-located; repo LICENSE = MIT for code) |
 | Figures rendered | Fig 1 (64,505 B SVG / 106,426 B PNG); Fig 4 (96,188 B SVG / 223,828 B PNG) |

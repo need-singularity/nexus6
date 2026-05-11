@@ -50,7 +50,7 @@
 |-------|---------|
 | Falsifier registry | 115 (no change; F133-F146 candidates SUGGEST, await user-go) |
 | Defense parity | 9-cell matrix LIVE (R5 chain×3 + R5 SSH×3 + R1×3) — no change |
-| Honesty mode-6 | 3/4 6/6 (nexus, anima, n6-architecture; hexa-lang 5/6 architectural ceiling) |
+| Honesty mode-6 | 3/4 6/6 (nexus, anima, CANON; hexa-lang 5/6 architectural ceiling) |
 | Paper draft | ✗ → **100% (8250 words / 16-17 pages arXiv-ready)** |
 | REPRODUCTION_PROTOCOL | ✗ → **718 lines / 14 stages** |
 | hexa-lang stdlib ω-cycle | ✗ → **첫 witness** (10 axes / 8 Tier-1 / F133-F139) |

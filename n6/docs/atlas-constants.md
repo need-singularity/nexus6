@@ -3321,7 +3321,7 @@ CO2 minimum separation energy (atmospheric): 19.4 kJ/mol = RT*ln(1/420ppm) — r
 ---
 
 *Last updated: 2026-04-04*
-*Source: n6-architecture project, 322+ domains, 1400+ graded hypotheses*
+*Source: CANON project, 322+ domains, 1400+ graded hypotheses*
 *Atlas entries: 1900+ registered rows (1400+ EXACT + 500+ CLOSE)*
 *Breakthrough Theorems: 173 (BT-1~173), 50+ Three-Star, 25+ Cross-Domain Bridges, 322+ domains*
 

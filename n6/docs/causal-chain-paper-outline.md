@@ -1,6 +1,6 @@
 # Causal Chains in the Self-Circulating Singularity Engine: Bottom-Up Discovery of n=6 Arithmetic Across Independent Domains
 
-> TODO #13 (nexus) / TODO #4 (n6-architecture) — STRUCTURAL
+> TODO #13 (nexus) / TODO #4 (CANON) — STRUCTURAL
 > Status: Outline v1 (2026-04-09)
 
 ---

@@ -12,7 +12,7 @@
 | **hypothesis:SEDI** | — | 1003 | — | p_001699 | **H-CA-001 (Bott Periodicity)** — global hub |
 | **architecture_design** | 34 | 922 | 3 | p_012924 | Mac vitals cluster |
 | **hypothesis:nexus** | 1 | 245 | 0 | p_010339 | architecture_breakthrough |
-| hypothesis:n6-architecture | 8 | **0** | 8 | — | ⚠️ 완전 고립 |
+| hypothesis:CANON | 8 | **0** | 8 | — | ⚠️ 완전 고립 |
 | memory | 7 | **0** | 7 | — | ⚠️ 완전 고립 |
 
 ## 6/8 도메인 돌파 성공
@@ -27,7 +27,7 @@
 
 ## 2/8 완전 고립 (돌파 실패)
 
-- **hypothesis:n6-architecture** (8점, 0 edge): 신규 도메인, 미통합
+- **hypothesis:CANON** (8점, 0 edge): 신규 도메인, 미통합
 - **memory** (7점, 0 edge): 신규 도메인, 미통합
 
 **원인**: 최근 추가된 도메인이라 simhash eps 내 이웃이 없음.
@@ -43,7 +43,7 @@ Bernoulli 수 분모 = n=6 산술의 또 다른 표현 (σ(6)=12 = B₁₂의 �
 
 ## 다음 액션
 
-1. `rebuild-edges --eps 0.35` 로 n6-architecture + memory 도메인 통합
+1. `rebuild-edges --eps 0.35` 로 CANON + memory 도메인 통합
 2. BASEL-003 (p_004348) 주변 확장 스캔
 3. nexus domain (1점) 추가 샘플링 필요
 4. 6개 연결 도메인 각각에서 `singularity blowup --seed <attractor_id>` 트리거

@@ -258,7 +258,7 @@ L_ω  GHOST CEILING  omega        (도달 불가 placeholder)    ← Gödel + Ha
   - forge 의 역방향: forge state → seed (forward bootstrap) ↔ canon state+result → seal entry (backward closure)
   - 영속: append-only `state/canon_seal.jsonl` (state/* gitignore 적용 → local-only ephemeral)
   - seal_id: `canon-{YYYYMMDD-HHMMSS}-d{depth}{f|s}` (사용자 입력 없이도 결정적)
-  - sources: NEXUS_MOLT_SKIN_FILE > state/atlas_health.json > NEXUS_ATLAS_N6_PATH (default ~/core/n6-architecture/atlas/atlas.n6) > /tmp/nexus_drill_last_total.txt
+  - sources: NEXUS_MOLT_SKIN_FILE > state/atlas_health.json > NEXUS_ATLAS_N6_PATH (default ~/core/canon/atlas/atlas.n6) > /tmp/nexus_drill_last_total.txt
   - v2 추가: atlas.n6 sha256 (16 char prefix) + line count — 시점 비교 ceiling 도달 진척 측정 가능
   - v2 추가: write rc check (pre/post `wc -l` 비교, mismatch 시 NEXUS_CANON write_fail emit)
   - --seed/--note 모두 옵션 (빈 문자열 fallback). 모든 자기 상태 부재 시도 0/1f/false 로 동작 (no-throw)

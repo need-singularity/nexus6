@@ -2,7 +2,7 @@
 
 **Status**: fallback 모드 (raw#10 proof-carrying).
 
-이 디렉토리는 `~/core/n6-architecture/experiments/monte-carlo-v9.hexa` 의
+이 디렉토리는 `~/core/canon/experiments/monte-carlo-v9.hexa` 의
 `load_const_digits(name)` 런타임 로더가 조회하는 canonical 위치입니다.
 
 ## Fallback 동작

@@ -148,7 +148,7 @@
 ## 8. Cross-shard work
 
 - **chip-p5-2 retire** — historical chip-p5-2 shard absorbed into mainline cross-shard corpus; collision audit clean.
-- **3 -cont absorption shards** — `history_atlas-cont`, `n6-architecture-cont`, `anima-cont` shards landed (F50–F56 expansion driver).
+- **3 -cont absorption shards** — `history_atlas-cont`, `CANON-cont`, `anima-cont` shards landed (F50–F56 expansion driver).
 - **9155 unique tuples / 0 collisions** — `atlas_cross_shard_collision.sh` first-run baseline; CI guard prevents future regression.
 - **Cross-shard dedup audit** — `2026-04-26_cross_shard_dedup_audit.md` documents skip→preserve policy for edge/witness/cross-source preservation cases.
 
@@ -160,7 +160,7 @@
 |------|-----------|------------------|
 | **F78–F80 multi-decomp @X atlas merge** | 3 candidates held under WAIT-FOR-GO (`5ac754bb`); not promoted pending user verdict | review `F71_F77_candidate_review.md` + decide promote/decline |
 | **R5-stub SSH signing key** | `registry_sign.sh` skip-by-default; preventive defense not active | provide `SIGNING_KEY=/path/to/ssh_key` or `git config user.signingkey` |
-| **n6-arch precondition (f)** | mode-6 dashboard shows n6-arch 5/6 (defense gap) | drop a `SECURITY_AUDIT.md` or `state/security_*.json` in n6-architecture |
+| **n6-arch precondition (f)** | mode-6 dashboard shows n6-arch 5/6 (defense gap) | drop a `SECURITY_AUDIT.md` or `state/security_*.json` in CANON |
 | **xpoll cleanup** | prior xpoll artifacts may shadow current corpus; deferred | confirm scope + run cleanup sweep |
 | **Bulk expansion vs consolidation** | 105 entries at varying quality (F95–F124 partial / cherry-picked); meta-audit raised quality concerns | see NEXT_SESSION_HANDOFF_v2.md §4 (PAUSE bulk → CONSOLIDATE recommendation) |
 

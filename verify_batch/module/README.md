@@ -1,7 +1,7 @@
 # nexus.modules.verify_batch
 
 Productized batch runner for `verify_*.hexa` files
-(originally `~/core/n6-architecture/experiments/run_verify_batch.hexa` +
+(originally `~/core/canon/experiments/run_verify_batch.hexa` +
 `run_verify_batch_cached.py`).
 
 ## API
@@ -10,7 +10,7 @@ Productized batch runner for `verify_*.hexa` files
 from nexus.modules.verify_batch import run
 
 report = run(
-    targets=["~/core/n6-architecture/experiments/"],
+    targets=["~/core/canon/experiments/"],
     cache_strategy="mtime",   # "mtime" | "full" | "dry"
 )
 print(report.to_dict())
@@ -27,7 +27,7 @@ pass_no_marker; non-zero -> fail; missing hexa CLI -> unrunnable.
 ## CLI
 
 ```sh
-python -m nexus.modules.verify_batch.cli --root ~/core/n6-architecture/experiments --dry
+python -m nexus.modules.verify_batch.cli --root ~/core/canon/experiments --dry
 python -m nexus.modules.verify_batch.cli --full --json
 ```
 

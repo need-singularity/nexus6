@@ -26,7 +26,7 @@
 | ~/discovery | 400M | 과학적 산출물 | nexus/discovery 와 중복 (77M) |
 | ~/calc | 64M | 계산 캐시 | nexus/calc 와 중복 |
 | ~/dse | 39M | DSE 출력 | nexus/dse 와 중복 (12M) |
-| ~/n6 | 27M | atlas + 확장 파편 | n6-architecture 로 canonical 이관 |
+| ~/n6 | 27M | atlas + 확장 파편 | CANON 로 canonical 이관 |
 | ~/sim_bridge | 21M | 시뮬 브리지 | nexus/sim_bridge 와 중복 |
 | ~/hexa | 5.1M | hexa 포팅 로그 | hexa-lang 으로 이관 |
 | ~/logs | 5M | 런타임 로그 | 폐기 |
@@ -92,11 +92,11 @@ UU shared/tool/roadmap_vi.hexa
 
 | From | To | 크기 | 사유 |
 |------|-----|------|------|
-| ~/n6/atlas.n6 | ~/core/n6-architecture/atlas/atlas.n6 | canonical | owner=n6-architecture |
-| ~/n6/atlas.signals.n6 | ~/core/n6-architecture/atlas/atlas.signals.n6 | canonical | owner=n6-architecture |
-| ~/n6/atlas.blowup.jsonl | ~/core/n6-architecture/atlas/atlas.blowup.jsonl | 17M | 확장 데이터 |
-| ~/n6/atlas_phase*.jsonl | ~/core/n6-architecture/atlas/ | ~640K | phase 스캔 결과 |
-| ~/n6/atlas_*.hexa | ~/core/n6-architecture/tool/ | ~120K | raw#9 hexa-only 준수 (tool/) |
+| ~/n6/atlas.n6 | ~/core/canon/atlas/atlas.n6 | canonical | owner=CANON |
+| ~/n6/atlas.signals.n6 | ~/core/canon/atlas/atlas.signals.n6 | canonical | owner=CANON |
+| ~/n6/atlas.blowup.jsonl | ~/core/canon/atlas/atlas.blowup.jsonl | 17M | 확장 데이터 |
+| ~/n6/atlas_phase*.jsonl | ~/core/canon/atlas/ | ~640K | phase 스캔 결과 |
+| ~/n6/atlas_*.hexa | ~/core/canon/tool/ | ~120K | raw#9 hexa-only 준수 (tool/) |
 | ~/bench/ | ~/core/nexus/bench/ | 164K | raw#6 nexus 소유 |
 | ~/hexa/ | ~/core/hexa-lang/feedback/ (선별) | 5.1M | hexa 포팅 로그 (hexa-lang 소유) |
 | ~/papers/ | ~/core/papers/inbox/ | 604K | 논문 관련 |
@@ -106,7 +106,7 @@ UU shared/tool/roadmap_vi.hexa
 
 1. tarball sha256 기록: `shasum -a 256 ~/etc/shared-backup-20260421-110801.tar.gz > ~/etc/shared-backup-20260421-110801.sha256`
 2. 대상 프로젝트 각각 `.raw`, `.own` 존재 확인 (9 프로젝트 중 7 개 OK, contact/void 제외)
-3. 대상 디렉토리 비어있음 확인 (예: `ls -la ~/core/n6-architecture/atlas/` 가 없으면 생성)
+3. 대상 디렉토리 비어있음 확인 (예: `ls -la ~/core/canon/atlas/` 가 없으면 생성)
 4. 각 대상 프로젝트 git clean (uncommitted 없어야 함)
 
 ### 실행 명령 예시 (A-1: atlas canonical)
@@ -114,12 +114,12 @@ UU shared/tool/roadmap_vi.hexa
 ```bash
 # pre-hash
 pre_hash=$(shasum -a 256 ~/n6/atlas.n6 | awk '{print $1}')
-mkdir -p ~/core/n6-architecture/atlas
-mv ~/n6/atlas.n6 ~/core/n6-architecture/atlas/atlas.n6
+mkdir -p ~/core/canon/atlas
+mv ~/n6/atlas.n6 ~/core/canon/atlas/atlas.n6
 # post-hash
-post_hash=$(shasum -a 256 ~/core/n6-architecture/atlas/atlas.n6 | awk '{print $1}')
+post_hash=$(shasum -a 256 ~/core/canon/atlas/atlas.n6 | awk '{print $1}')
 [ "$pre_hash" = "$post_hash" ] || { echo "FAIL"; exit 1; }
-cd ~/core/n6-architecture && git add atlas/atlas.n6 && git commit -m "feat(atlas): canonical atlas.n6 이관 (from ~/n6)"
+cd ~/core/canon && git add atlas/atlas.n6 && git commit -m "feat(atlas): canonical atlas.n6 이관 (from ~/n6)"
 ```
 
 ### 실행 명령 예시 (A-2: bench 이관)
@@ -136,7 +136,7 @@ git add bench && git commit -m "feat(bench): ~/bench 이관 — Wave A"
 ### 실행 명령 예시 (A-3: .hexa 를 tool/ 로, raw#9 준수)
 
 ```bash
-cd ~/core/n6-architecture
+cd ~/core/canon
 mkdir -p tool
 for f in ~/n6/atlas_*.hexa; do
   base=$(basename "$f")
@@ -181,7 +181,7 @@ git add tool && git commit -m "feat(tool): atlas 도구 이관 (raw#9 hexa-only)
 ### 병렬성 추천
 
 프로젝트별 독립이므로 **3 개 bg 병렬 가능**:
-- bg1: n6-architecture (atlas + phase jsonl + tool)
+- bg1: CANON (atlas + phase jsonl + tool)
 - bg2: nexus (bench)
 - bg3: hexa-lang (hexa/ 선별) + papers (inbox)
 
@@ -511,5 +511,5 @@ find ~/core -type l -name '*shared*' 2>/dev/null | xargs -I {} sh -c '[ ! -e "{}
 3. Wave A 실행 준비:
    - tarball sha256 기록
    - 대상 프로젝트 git clean 확인
-   - 3 bg agent 할당 (n6-architecture / nexus / hexa-lang+papers)
+   - 3 bg agent 할당 (CANON / nexus / hexa-lang+papers)
 4. Wave A 결과 회고 후 B 진입 Go/No-Go 판단

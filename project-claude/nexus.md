@@ -114,4 +114,4 @@ Session/research agents must follow `design/honesty_triad.md`. Three constraints
 1. Promotion-counter banner (nxs_promotion_count unchanged).
 2. Write-barrier on atlas/state/inventory listed paths.
 3. No-fabrication guard (UNKNOWN over invented).
-Lineage: `reports/sessions/omega-audit-nexus-honesty-triad-portability-2026-04-25.md` (n6-architecture-side audit, deployed via user authorization).
+Lineage: `reports/sessions/omega-audit-nexus-honesty-triad-portability-2026-04-25.md` (CANON-side audit, deployed via user authorization).

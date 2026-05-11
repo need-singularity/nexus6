@@ -55,7 +55,7 @@ observatories / databases / catalogues. BibTeX export at the end.
 - `n6/atlas.n6` — canonical (21,854 lines, 9,626 entries at `368209c0`). Foundation primitives lines 1–7; F33:187, F36:2308, F37:163, F57:2264, F58:1618, F62:5275, F63:7024, F64:5699, F66:5708, F70:310, F92:2142, F99:2130, F104:5856, F28:5823, F40:5842, F41:5874; M3 line 53; F24 seed line 25.
 - `n6/atlas.append.hexa-sim-bridges.n6:71` — F94 PMNS.
 - `n6/atlas.append.nexus-historical-absorption-2026-04-26.n6:294` — F112.
-- `n6/atlas.append.n6-architecture-historical-from-nexus-2026-04-26.n6:346` — F32+F80 1728 triple.
+- `n6/atlas.append.CANON-historical-from-nexus-2026-04-26.n6:346` — F32+F80 1728 triple.
 - `n6/atlas.append.cross-engine-meta-roadmap-2026-04-26.n6` — F132 origin.
 - `state/atlas_sha256.tsv` (16 entries), `state/bridge_sha256.tsv`, `state/falsifier_registry.sha256` — R1/R3/R5 baselines.
 

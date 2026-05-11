@@ -24,7 +24,7 @@ $$
 64 \;=\; 2^{n} \;=\; 4^{n/2} \;=\; \tau^{3}.
 $$
 
-**$j$-invariant of $E_6$ (F32 + F80)** [atlas.append.n6-architecture-historical-from-nexus-2026-04-26.n6:346].
+**$j$-invariant of $E_6$ (F32 + F80)** [atlas.append.CANON-historical-from-nexus-2026-04-26.n6:346].
 The $j$-invariant of the CM elliptic curve $E_6 : y^2 = x^3 - 36x$ admits
 $$
 1728 \;=\; \sigma^{3} \;=\; 576 \cdot 3 \;=\; J_2^{2}\cdot n/2,

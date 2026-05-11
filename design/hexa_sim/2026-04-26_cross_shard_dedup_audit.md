@@ -19,7 +19,7 @@
 | CONFLICT (different value) | **0** |
 | atlas-main re-definition by an append shard | **56** (all from `chip-p5-2.n6`, all benign) |
 
-**Headline:** zero value conflicts. The recent 4-shard historical absorption (anima / hexa-lang / nexus / n6-architecture) is **collision-free** vs main atlas and vs each other. The only cross-shard overlap is the legacy `atlas.append.chip-p5-2.n6` shard, which is **fully superseded** — every one of its 56 entries already exists verbatim in `atlas.n6`.
+**Headline:** zero value conflicts. The recent 4-shard historical absorption (anima / hexa-lang / nexus / CANON) is **collision-free** vs main atlas and vs each other. The only cross-shard overlap is the legacy `atlas.append.chip-p5-2.n6` shard, which is **fully superseded** — every one of its 56 entries already exists verbatim in `atlas.n6`.
 
 ---
 
@@ -32,7 +32,7 @@
 | `atlas.append.nexus-historical-absorption-2026-04-26.n6` | 95 | 0 |
 | `atlas.append.anima-historical-from-nexus-2026-04-26.n6` | 75 | 0 |
 | `atlas.append.hexa-lang-historical-from-nexus-2026-04-26.n6` | 88 | 0 |
-| `atlas.append.n6-architecture-historical-from-nexus-2026-04-26.n6` | 50 | 0 |
+| `atlas.append.CANON-historical-from-nexus-2026-04-26.n6` | 50 | 0 |
 | `atlas.append.chip-p5-2.n6` | 56 | **56 (100%)** |
 | `atlas.append.forge-triple.n6` | 3 | 0 |
 | **total raw rows** | **9,166** | — |
@@ -81,7 +81,7 @@ Family breakdown (all 56 are within these axes):
 
 ## Atlas-main conflicts
 
-**None.** The 4 historical-absorption append shards (anima / hexa-lang / nexus / n6-architecture) and the bridge shard (`hexa-sim-bridges`) **do not redefine any main-atlas entry**. The id-namespacing scheme used in the absorption cycle (e.g. `nexus-historical-...`, `anima-historical-...`) is working as designed.
+**None.** The 4 historical-absorption append shards (anima / hexa-lang / nexus / CANON) and the bridge shard (`hexa-sim-bridges`) **do not redefine any main-atlas entry**. The id-namespacing scheme used in the absorption cycle (e.g. `nexus-historical-...`, `anima-historical-...`) is working as designed.
 
 The 56 chip-p5-2 ↔ atlas.n6 collisions are **not redefinitions in the absorption sense** — they are residue from a 2025-12-era absorption (commit `842eb068 chore(shared-decommission P3.3-nexus)`) that copied SOC-* into main atlas without removing the source append shard. Both sides have remained byte-identical since.
 
@@ -118,7 +118,7 @@ Keep as-is. Both shards add net-new ids and have zero overlap.
 
 3. **`@R id:subkey` discipline.** The largest within-id sub-namespacing happens via `@R id:-suffix`. The audit treats `id:subkey` as a single token (correct per current grep), but if future tooling parses on `:`, it would mis-bucket. Document this in `~/core/nexus/design/atlas_dsl_v2.md` or the closest spec.
 
-4. **Promotion path for absorbed shards.** Once the 4 historical-absorption append shards (anima, hexa-lang, nexus, n6-architecture) are stable, consider merging them into `atlas.n6` (mirroring the chip-p5-2 pattern) — but only AFTER deciding whether to retain `atlas.append.*` as the canonical SSOT (in which case the chip-p5-2 case suggests the opposite migration — pull SOC-* OUT of atlas.n6 back into the append shard). This audit does not recommend a direction, only that the policy be explicit.
+4. **Promotion path for absorbed shards.** Once the 4 historical-absorption append shards (anima, hexa-lang, nexus, CANON) are stable, consider merging them into `atlas.n6` (mirroring the chip-p5-2 pattern) — but only AFTER deciding whether to retain `atlas.append.*` as the canonical SSOT (in which case the chip-p5-2 case suggests the opposite migration — pull SOC-* OUT of atlas.n6 back into the append shard). This audit does not recommend a direction, only that the policy be explicit.
 
 ---
 

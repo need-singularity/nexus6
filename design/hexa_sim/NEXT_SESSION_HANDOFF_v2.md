@@ -40,7 +40,7 @@ Expected sentinels: `__FALSIFIER_HEALTH__ ... CLEAN=103 HIT=2 TAMPERED=0`, `__BR
 |------|-----------|------------------|
 | **F78–F80 multi-decomp @X atlas merge** | 3 candidates held under WAIT-FOR-GO (commit `5ac754bb`); not promoted pending verdict on whether multi-decomp anchors should sit at `[10*]` or `[10*PASS_LITERATURE]` | review `F71_F77_candidate_review.md` + give explicit promote/decline |
 | **R5 SSH signing key authorization** | `registry_sign.sh` is skip-by-default (`__REGISTRY_SIGN__ SKIPPED reason=no_signing_key_configured`); preventive defense inactive until key provisioned | run `git config user.signingkey <key>` OR set `SIGNING_KEY=/path/to/ssh_key` env, then `bash tool/registry_sign.sh sign` |
-| **n6-arch precondition (f) populate** | mode-6 dashboard shows n6-arch 5/6 (only repo missing defense surface); fix unblocks honesty 4/4 mode-6 | drop one of: `SECURITY_AUDIT.md`, `doc/security/*.md`, `state/security_*.json`, or `tool/security_*.sh` in `~/core/n6-architecture/` |
+| **n6-arch precondition (f) populate** | mode-6 dashboard shows n6-arch 5/6 (only repo missing defense surface); fix unblocks honesty 4/4 mode-6 | drop one of: `SECURITY_AUDIT.md`, `doc/security/*.md`, `state/security_*.json`, or `tool/security_*.sh` in `~/core/canon/` |
 | **xpoll cleanup proceed?** | xpoll artifacts may shadow current corpus; cleanup scope not yet confirmed | confirm: nuke `xpoll/` dir? archive? leave? |
 | **Bulk expansion vs consolidation** | F95–F124 partial gap + meta-audit quality concerns (F108 [11!] sole strict-strict; many F100+ are heuristic-grade) | decide: continue ω-cycle expansion, or PAUSE → consolidate (see §4) |
 

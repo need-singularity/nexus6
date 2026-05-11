@@ -74,7 +74,7 @@ flowchart LR
 | Repo            | (a) SSOT/git | (b) design/ | (c) tool/ | (d) atlas SSOT | (e) LLM agents | (f) defense | Score |
 |-----------------|:------------:|:-----------:|:---------:|:--------------:|:--------------:|:-----------:|:-----:|
 | nexus           |      Y       |      Y      |     Y     |       Y        |       Y        |      Y      | 6/6   |
-| n6-architecture |      Y       |      Y      |     Y     |       Y        |       Y        |      Y      | 6/6   |
+| CANON |      Y       |      Y      |     Y     |       Y        |       Y        |      Y      | 6/6   |
 | anima           |      Y       |      Y      |     Y     |       Y        |       Y        |      Y      | 6/6   |
 | hexa-lang       |      Y       |      Y      |     Y     |       —        |       Y        |      Y      | 5/6   |
 
@@ -93,7 +93,7 @@ Aggregate: 4 repos / 65,454 atlas lines / 28,850 cumulative facts / **9,165 uniq
 ```
 shard contribution (1 char ~ 200 facts)
 nexus            ████████████████████████████████████████████████ 9626
-n6-architecture  ███████████████████████████████████████████████  9612
+CANON  ███████████████████████████████████████████████  9612
 anima            ███████████████████████████████████████████████  9612
 hexa-lang        (none)                                              0
                                                                   -----

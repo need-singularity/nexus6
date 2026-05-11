@@ -4,7 +4,7 @@ Python port of the 5-precondition **honesty triad linter** for n6 atlas
 shards, paper files, and code. Read-only; never modifies shards or atlas
 state.
 
-SSOT: `~/core/n6-architecture/scripts/quality/honesty_triad_linter.hexa`
+SSOT: `~/core/canon/scripts/quality/honesty_triad_linter.hexa`
 (see `state/crosscutting_module_proposals_2026-04-27.md` §D).
 
 ## Preconditions

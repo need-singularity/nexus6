@@ -76,7 +76,7 @@ Physical constants grouped by smallest prime set:
 - `scan-loop` (30min) — rotating nexus scan across 6 domains
 - `physics-fetch` (24h) — injects 28 CODATA constants
 - `airgenome` (60s) — Mac vitals in-process
-- `watch-papers` (5min) — n6-architecture paper generator
+- `watch-papers` (5min) — CANON paper generator
 
 **CLOSURE PIPELINE**:
 - `closure-sweep` (5min) — matches values against n=6 table

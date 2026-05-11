@@ -83,7 +83,7 @@ Note: M(6)=-1 doesn't equal 3 either, so the original `M3=3` was ALSO not canoni
 
 ### 4b. No programmatic definition exists
 
-Searched `/Users/ghost/core/nexus/n6/scripts/`, `/Users/ghost/core/nexus/n6/verify_formulas.hexa`, `/Users/ghost/core/nexus/n6/verify_n6_formula.hexa`, `/Users/ghost/core/n6-architecture/`: **no `def mertens` / `fn mertens` / `mertens(...)` implementation exists** anywhere. The label is asserted in atlas only.
+Searched `/Users/ghost/core/nexus/n6/scripts/`, `/Users/ghost/core/nexus/n6/verify_formulas.hexa`, `/Users/ghost/core/nexus/n6/verify_n6_formula.hexa`, `/Users/ghost/core/canon/`: **no `def mertens` / `fn mertens` / `mertens(...)` implementation exists** anywhere. The label is asserted in atlas only.
 
 ### 4c. P2/P3/P4 family hint
 

@@ -246,7 +246,7 @@ axis_3 (rate)     ─soft→  axis_2/4/5 (suggested_axis 출력)
 
 ### Day 5 — axis_5 cross-engine bus 첫 @E append
 
-**목적**: 6 형제 프로젝트 (anima / n6-architecture / void / hexa-lang / airgenome / papers) 의 breakthroughs.jsonl + convergence.json 통합 + atlas.live.n6 에 자동 @E 5건.
+**목적**: 6 형제 프로젝트 (anima / CANON / void / hexa-lang / airgenome / papers) 의 breakthroughs.jsonl + convergence.json 통합 + atlas.live.n6 에 자동 @E 5건.
 
 **작업**:
 1. `shared/n6/cross_engine_bus.hexa` 의 reader path dry-run:

@@ -63,7 +63,7 @@ scope: 본 세션 (2026-04-25 ~ 2026-04-26) 동안 nexus 에 landed 된 HEXA-SIM
 | **raw 47** | strategy-exploration-omega-cycle | 4 ω-cycle witnesses (impl/falsifier/bridge/atlas) | multi-axis fanout → fixpoint 모두 본 세션 |
 | **raw 53** | deterministic-verifier-manifest | bayesian soft-retire (axis_9) **REJECTED** | falsifier integration cycle |
 | **raw 66** | ai-native-error-message | falsifier sentinel `__HEXA_SIM_FALSIFIER__ FAIL slug=F# reason=... fix=...` | hexa_sim_falsifier.hexa emit |
-| **raw 67** | cross-repo-blocker-priority-floor | bridge ↔ n6-architecture papers binding (priority floor 95) | bridge jackpot tier promotion |
+| **raw 67** | cross-repo-blocker-priority-floor | bridge ↔ CANON papers binding (priority floor 95) | bridge jackpot tier promotion |
 | **raw 68** | fixpoint-byte-eq-closure | 4 도구 모두 두 run SHA256 byte-eq seal | verify_grid `ba1f2ad8...`, atlas_ingest emit determinism |
 | **raw 70** | multi-axis-verify-grid | K=10 직교 axes (CONSTANTS/...COUNTER) saturated | hexa_sim_verify_grid.hexa |
 | **raw 71** | falsifier-retire-rule | 12 falsifier registry, hard auto-retire | hexa_sim_falsifier.hexa + falsifiers.jsonl |
@@ -201,9 +201,9 @@ F9 의 가장 중요한 점은 **"falsifier=HIT 가 framework 의 약점이 아�
 
 F9 의 status=HIT 는 horizons_bridge 가 "TP8_DEVIATION_GE_5PCT_FRAMEWORK_LIMIT_CONFIRMED" pattern 을 emit 하지 않았다는 것을 보고 — 즉 deviation 이 5% 이상 항상 관측됨을 그 자체로 confirm 한 것. fix trailer:
 
-> "if persistently CLEAN: TP-8 should be retired/reclassified in n6-architecture simulation-theory.md (tier 3 → falsified). if HIT: investigate horizons_bridge correctness OR Earth-Mars distance computation OR claim was empirically met (paradox — escalate to design/abstraction_ceiling.md)."
+> "if persistently CLEAN: TP-8 should be retired/reclassified in CANON simulation-theory.md (tier 3 → falsified). if HIT: investigate horizons_bridge correctness OR Earth-Mars distance computation OR claim was empirically met (paradox — escalate to design/abstraction_ceiling.md)."
 
-→ **n6-architecture simulation-theory.md TP-8 항목의 Tier 강등 / 명시적 falsified 표기가 follow-up action**.
+→ **CANON simulation-theory.md TP-8 항목의 Tier 강등 / 명시적 falsified 표기가 follow-up action**.
 
 ### 4.5 F10 cross-bridge resonance 분석
 
@@ -275,7 +275,7 @@ F11 fix trailer 의 escalation 정책: `CLEAN → HIT` 전환 (즉 Planck H₀ �
 ### 6.1 TP-8 'Mars 2g 4-day' framework limit (F9 + b4 horizons)
 
 #### claim
-n6-architecture/simulation-theory.md TP-8: "Mars 2g 4-day transit" — n=6 framework 의 testable prediction 중 하나.
+CANON/simulation-theory.md TP-8: "Mars 2g 4-day transit" — n=6 framework 의 testable prediction 중 하나.
 
 #### empirical 검증
 - 등가속 운동 식: `t = 2·sqrt(d/a)` (mid-flip burn 가정)
@@ -294,7 +294,7 @@ n6-architecture/simulation-theory.md TP-8: "Mars 2g 4-day transit" — n=6 frame
 #### 결과
 - F9 falsifier status=HIT (2026-04-25T12:29:48Z, chain hash `56d3c021515d8043`)
 - atlas entry: `tp8_mars_2g_4d_falsified = Mars max sep 2.67 AU < required 3.92 AU at 2g for 4d :: framework_falsifier [10*]`
-- **action item**: n6-architecture/simulation-theory.md 의 TP-8 항목을 Tier 3 → falsified 로 reclassify (paper retraction-notice 후속, raw 76 paper-DOI hook 선행 필요)
+- **action item**: CANON/simulation-theory.md 의 TP-8 항목을 Tier 3 → falsified 로 reclassify (paper retraction-notice 후속, raw 76 paper-DOI hook 선행 필요)
 
 #### 의의
 HEXA-SIM 가 SX.4 에서 명시한 "어떻게 틀릴 수 있는가" 의 **첫 객관적 증거**. framework 의 정직함을 증명. **falsifier = 약점 아님, popperian 충족의 강점.**
@@ -410,10 +410,10 @@ n=6 framework 의 외부 reference 신뢰도가 단일 source 가 아닌 **3-way
 
 ### 7.4 cross-repo paper-DOI lineage (raw 76 선행)
 
-본 세션 4 핵심 발견 (F9 TP-8 / F10 resonance / F11 Hubble / F12 3-source) 을 **n6-architecture papers 와 binding** 하려면 raw 76 paper-DOI lineage 가 선결.
+본 세션 4 핵심 발견 (F9 TP-8 / F10 resonance / F11 Hubble / F12 3-source) 을 **CANON papers 와 binding** 하려면 raw 76 paper-DOI lineage 가 선결.
 
 raw 76 status=new (2026-04-25 시점). 후속 작업:
-1. n6-architecture 의 paper.md 에 Zenodo upload + DOI 부여
+1. CANON 의 paper.md 에 Zenodo upload + DOI 부여
 2. nexus 측 falsifier registry 의 origin field 에 DOI 추가
 3. F9 HIT → paper retraction-notice trailer 자동 생성 (Zenodo immutable, erratum 형태)
 
@@ -425,7 +425,7 @@ raw 76 status=new (2026-04-25 시점). 후속 작업:
 | 2 | **lens-score 시범 wiring** | 위 7.2 시범 10 lens 에 falsifier_hit_ratio 차감 항 도입. effect 측정. | atlas-ingest stable 후 |
 | 3 | **bridge meta-rule abstract** | 위 7.3 raw 81-84 후보 surface, hive 측 trawl. | hive Phase B (2026-05-09) 일정 조율 |
 | 4 | **cross-repo drift scan integration** | hive 의 cross_project_drift_scan.hexa 가 falsifier registry 도 scan. 5-repo cascade alert. | axis_3 (hive raw 71 lint Tier 3) 선행 필요 |
-| 5 | **paper-DOI hook (raw 76)** | n6-architecture papers Zenodo upload + falsifier ↔ DOI binding. | raw 76 자체 ω-cycle 선행 |
+| 5 | **paper-DOI hook (raw 76)** | CANON papers Zenodo upload + falsifier ↔ DOI binding. | raw 76 자체 ω-cycle 선행 |
 
 ---
 

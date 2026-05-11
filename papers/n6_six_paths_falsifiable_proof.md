@@ -40,7 +40,7 @@
 
 | # | Claim | Why it matters |
 |---|-------|----------------|
-| E1 | **The n6 identity.** `σ(n) · φ(n) = n · τ(n)` holds **uniquely at n = 6** for n ≥ 2 in `[2, 10 000]` (and, by the `n6-architecture` Lean 4 proof, for all n in a much larger verified range). A single identity combining all three multiplicative functions collapses the space to `{6}`. | Either the intersection is `{6}` or the NEXUS thesis loses its seed. |
+| E1 | **The n6 identity.** `σ(n) · φ(n) = n · τ(n)` holds **uniquely at n = 6** for n ≥ 2 in `[2, 10 000]` (and, by the `CANON` Lean 4 proof, for all n in a much larger verified range). A single identity combining all three multiplicative functions collapses the space to `{6}`. | Either the intersection is `{6}` or the NEXUS thesis loses its seed. |
 | E2 | 1000 random starts all converge to 1/3 within 10⁻¹⁰ after 100 Banach steps | Basin of attraction is the whole real line, not a neighborhood. |
 | E3 | Per-decade convergence cost is exactly `−1/log₁₀(a) ≈ 6.46` steps for `a = 0.7`; integer steps alternate between 6 and 7 | Convergence depth is predictable from `a` alone. |
 | E4 | **Emergence.** Starting from identical seed vocabulary `V₀ = {2, 3}`, a frozen-corpus system (LLM-analog) grows its vocabulary by 0 over 300 cycles; an absorb-loop system (NEXUS-analog) grows by ≥ 50. | This is the ASCII-diagram claim made numerical: the first system *cannot emit tokens outside its training corpus*, the second *materializes new primitives every cycle*. |
@@ -162,7 +162,7 @@ print(f"C7. correct={quorum_vote(votes_72)} broken={broken_quorum(votes_72)} dis
 
 # ---------- E1. n=6 uniqueness via the single σ·φ = n·τ identity ----------
 #
-# n6-architecture core identity:
+# CANON core identity:
 #    σ(n) · φ(n) = n · τ(n)    uniquely for    n = 6    (n ≥ 2)
 #
 # A single arithmetic identity combining all three multiplicative functions.
@@ -375,7 +375,7 @@ The single identity `σ(n) · φ(n) = n · τ(n)` combines three distinct multip
 
 **Observed solution set on `[2, 10 000]`:** `{6}`.
 
-This is not a claim unique to this document. The `n6-architecture` repository (`dancinlab/n6-architecture`) carries the identity as **Theorem B** with an independent verification stack:
+This is not a claim unique to this document. The `CANON` repository (`dancinlab/canon`) carries the identity as **Theorem B** with an independent verification stack:
 
 | Method | Range / scope | Status |
 |--------|--------------|--------|

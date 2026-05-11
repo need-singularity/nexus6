@@ -1,7 +1,7 @@
 # New-Domain ω-Cycle Scout — read-only inventory across 4 repos
 
 **Date**: 2026-04-26
-**Scope**: nexus / n6-architecture / anima / hexa-lang
+**Scope**: nexus / CANON / anima / hexa-lang
 **Method**: read-only `ls`/`find`/`grep` walk + structural density count
 **Companion**: META_OMEGA_CYCLE_ROI.md (recommends paper-draft as next axis)
 **Constraint**: identify candidates, do **not** displace META_ROI's recommendation
@@ -10,7 +10,7 @@
 
 ## Executive
 
-Of the four repos, three host falsifier-able claim densities comparable to or exceeding hexa-sim's pre-cycle 0 baseline. **n6-architecture/theory** dominates raw claim count (113 prediction-hexas + 23 proof MDs + 98 catalog entries) but its claims are largely *number-theoretic identities already self-verified by their own .hexa harnesses* — low marginal value of an ω-cycle wrapper. **hexa-lang/stdlib + gate** offers the highest-leverage low-cost target: 1156 stdlib LoC + reserved-word + gate-enforcement surface with ~zero existing falsifier coverage, and direct cross-link to hexa-sim's anchor-grep methodology. **anima-engines** has 164 phi-engine .hexa files but they are *narrative/descriptive scaffolds* without measurement contracts — high cold-start cost. Net: hexa-lang stdlib is the only domain where a hexa-sim-pattern ω-cycle would close a real gap; n6 and anima are better served by their *existing* in-repo verifier patterns than by a sibling registry. **The honest read is paper-draft remains the higher-ROI axis** — the scout exists for cron-pattern continuity, not because a comparable target was found.
+Of the four repos, three host falsifier-able claim densities comparable to or exceeding hexa-sim's pre-cycle 0 baseline. **CANON/theory** dominates raw claim count (113 prediction-hexas + 23 proof MDs + 98 catalog entries) but its claims are largely *number-theoretic identities already self-verified by their own .hexa harnesses* — low marginal value of an ω-cycle wrapper. **hexa-lang/stdlib + gate** offers the highest-leverage low-cost target: 1156 stdlib LoC + reserved-word + gate-enforcement surface with ~zero existing falsifier coverage, and direct cross-link to hexa-sim's anchor-grep methodology. **anima-engines** has 164 phi-engine .hexa files but they are *narrative/descriptive scaffolds* without measurement contracts — high cold-start cost. Net: hexa-lang stdlib is the only domain where a hexa-sim-pattern ω-cycle would close a real gap; n6 and anima are better served by their *existing* in-repo verifier patterns than by a sibling registry. **The honest read is paper-draft remains the higher-ROI axis** — the scout exists for cron-pattern continuity, not because a comparable target was found.
 
 ---
 
@@ -49,7 +49,7 @@ Of the four repos, three host falsifier-able claim densities comparable to or ex
 - **Audience value**: HIGH — Mk-XI is the load-bearing claim of anima; defense-layer for it is the highest-leverage anima axis.
 - **Risk**: V3 metric was already FALSIFIED (commit c369b375); the predicate set may be in flux. Verify raw#12 still frozen before firing.
 
-### #3 — **n6-architecture/theory cross-prediction triangulation audit** — ROI: MEDIUM
+### #3 — **CANON/theory cross-prediction triangulation audit** — ROI: MEDIUM
 - **Rationale**: 113 verify_*.hexa each self-prints PASS/FAIL but there is **no cross-prediction registry** that detects (a) two predictions claiming contradictory derivations of the same constant, (b) silent SSOT drift (e.g. sigma=12 hardcoded in some, derived in others), or (c) verify-hexas that print PASS on stdout but exit 0 on assertion failure. Cold-start 3-4h (need to scrape all 113, build claim->derivation map, check coverage). Bridge to hexa-sim is medium — would feed into hexa-sim's CONSTANTS axis directly.
 - **Audience value**: medium — surfaces a real drift detection gap; not paper-grade alone.
 - **Risk**: 113 files is a lot of bulk; quality_audit_v2 PAUSE pattern likely to fire mid-cycle. Constrain scope to the 8 base_constants from `_catalog.json` to stay disciplined.

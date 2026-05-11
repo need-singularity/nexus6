@@ -2,7 +2,7 @@
 
 > **Last updated**: 2026-04-26 · **Counts**: 17 ω-cycle witnesses · 4 candidate reviews · 4 audits · 2 decisions · 2 session docs · 1 synthesis · 1 dashboard · 1 audit script · 2 JSONL registries (42 falsifiers / 3 history)
 >
-> **Charter** (preserved from 2026-04-25 origin): HEXA-SIM tests the hypothesis that the perfect number **n=6** (σ=12, τ=4, φ=2, sopfr=5) is a structural anchor across 7 independent physics frameworks (SE(3), Bostrom, Planck cells, Lloyd bound, α⁻¹, string D, Calabi-Yau). This directory is the **Ω-cycle witness corpus + falsifier registry + audit trail** for that program. Full paper-grade exposition lives in [`SYNTHESIS_2026-04-26.md`](SYNTHESIS_2026-04-26.md); upstream source: [n6-architecture/.../simulation-theory.md](https://github.com/dancinlab/n6-architecture/blob/main/domains/physics/simulation-theory/simulation-theory.md).
+> **Charter** (preserved from 2026-04-25 origin): HEXA-SIM tests the hypothesis that the perfect number **n=6** (σ=12, τ=4, φ=2, sopfr=5) is a structural anchor across 7 independent physics frameworks (SE(3), Bostrom, Planck cells, Lloyd bound, α⁻¹, string D, Calabi-Yau). This directory is the **Ω-cycle witness corpus + falsifier registry + audit trail** for that program. Full paper-grade exposition lives in [`SYNTHESIS_2026-04-26.md`](SYNTHESIS_2026-04-26.md); upstream source: [CANON/.../simulation-theory.md](https://github.com/dancinlab/canon/blob/main/domains/physics/simulation-theory/simulation-theory.md).
 
 ---
 

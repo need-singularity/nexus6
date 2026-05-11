@@ -112,5 +112,5 @@ print(f"Singularity: {'★' if result.singularity_reached else '·'}")
 | brainwire | neuroscience | neurons, connections, phi |
 | hexa-lang | programming_language | keywords, tests, coverage |
 | papers | publication | papers, citations, doi_count |
-| n6-architecture | architecture | modules, tests, dse_domains |
+| CANON | architecture | modules, tests, dse_domains |
 | fathom | terminal | features, plugins, ui_files |

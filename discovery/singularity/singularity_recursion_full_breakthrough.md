@@ -13,7 +13,7 @@
 | hypothesis:anima | 1045 | 1187 | 1.1× ↑ |
 | hypothesis:nexus | 245 | 1111 | 4.5× ↑ |
 | architecture_design | 922 | 1071 | 1.2× ↑ |
-| **hypothesis:n6-architecture** | **0 (고립)** | **28** | 🆕 연결 |
+| **hypothesis:CANON** | **0 (고립)** | **28** | 🆕 연결 |
 | **memory** | **0 (고립)** | **37** | 🆕 연결 |
 
 ## 🆕 새 Attractor (eps=0.35에서 출현)
@@ -24,7 +24,7 @@
 - 자동 발견 루프가 찾은 상수비
 
 ### 2. H-OUROBOROS-1 (p_005567, deg=28)
-- 도메인: hypothesis:n6-architecture (신규 연결)
+- 도메인: hypothesis:CANON (신규 연결)
 - 자기유사 프랙탈 구조 가설
 - 위상 철학의 seed
 
@@ -56,5 +56,5 @@ eps=0.35 기준 새 임계값:
 
 1. 새 edges 기반 dense_core/leaves 재생성
 2. p_003257 ↔ p_001699 의미적 거리 확인 (두 hub 관계)
-3. n6-architecture 도메인 확장 (H-OUROBOROS-1 seed blowup)
+3. CANON 도메인 확장 (H-OUROBOROS-1 seed blowup)
 4. memory 도메인 완전 연결 (1개 여전히 고립)

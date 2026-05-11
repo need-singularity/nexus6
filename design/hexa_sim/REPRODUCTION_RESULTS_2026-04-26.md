@@ -40,7 +40,7 @@ The protocol §13 table was frozen at an earlier registry snapshot. Current stat
 | atlas tuples | 9165 | **9174** | +9 facts ingested |
 | ledger atlas entries | 3 | **8** | +5 R5 rotations recorded |
 | ledger bridge entries | 2 | 2 | unchanged |
-| Honesty 6/6 repos | 3 | 3 | unchanged (nexus, n6-architecture, anima); hexa-lang remains 5/6 (precondition d gap) |
+| Honesty 6/6 repos | 3 | 3 | unchanged (nexus, CANON, anima); hexa-lang remains 5/6 (precondition d gap) |
 
 **No structural regressions**. All deltas are *additive* and the pass conditions (clean=total, conflict=0, broken_at=none) remain satisfied.
 

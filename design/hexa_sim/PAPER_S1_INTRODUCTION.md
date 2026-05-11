@@ -67,7 +67,7 @@ write-time (R1, §3). A registry sweep classifies every entry as `CLEAN`,
         $n=6$ primitives, raising the prior of structural over coincidental
         origin.
   \item A four-repository Honesty-triad mode-6 cross-aggregation
-        (\texttt{nexus}, \texttt{n6-architecture}, \texttt{anima},
+        (\texttt{nexus}, \texttt{CANON}, \texttt{anima},
         \texttt{hexa-lang}) yielding 9{,}165 unique cross-shard tuples with
         zero collisions and 3/4 mode-6 PASS.
   \item Honest first-class disclosure of declined claims: F45 (cross-bridge

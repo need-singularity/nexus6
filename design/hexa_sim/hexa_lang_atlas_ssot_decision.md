@@ -13,7 +13,7 @@ hexa-lang is a **language implementation** repo (parser, self-host, runtime), no
 | knowledge corpus (atlas) | nexus | `~/core/nexus/n6/atlas.n6` (1.5 MB, verified) |
 | cross-repo raw rules | hive | `~/core/hive/.raw` (1653 lines, verified) |
 | language L0 rules (parser-owner) | hexa-lang | `~/core/hexa-lang/.raw` (30 lines, scoped to self-host) |
-| design corpus | n6-architecture | (this repo) |
+| design corpus | CANON | (this repo) |
 | meta agents | anima | (this repo) |
 
 Refinement vs the original premise: hexa-lang **does** carry a `.raw` of its own — but it is a 30-line L0 parser-owner SSOT scoped to self-host invariants, not a cross-repo rule corpus. The knowledge-corpus role (atlas) genuinely has no place in a language repo.
@@ -61,7 +61,7 @@ head -10 ~/core/hexa-lang/tool/atlas_append_check.hexa
 | repo | a git-SSOT | b design corpus | c tool ecosystem | d atlas SSOT | e LLM agents | score |
 |------|-----------|-----------------|-------------------|--------------|--------------|-------|
 | nexus | yes | yes | yes | yes (atlas.n6) | yes | 5/5 |
-| n6-architecture | yes | yes | yes | yes | yes | 5/5 |
+| CANON | yes | yes | yes | yes | yes | 5/5 |
 | anima | yes | yes | yes | yes | yes | 5/5 |
 | hexa-lang | yes | yes | yes | **N/A by role** | yes | **4/4 effective** |
 

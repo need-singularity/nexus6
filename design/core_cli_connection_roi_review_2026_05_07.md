@@ -21,7 +21,7 @@ spec=`engine/nexus_cli_spec.json`) 에 추가 노출할 때의 가치 평가.
 | atlas / lens / discovery / drill / smash / gap / meta-closure / hyperarithmetic / thinking / free / absolute / roadmap / status / projects / promote / bus / version | nexus 내부 | nexus 자체 인지·메타 표면 |
 
 `spec.projects` enum (roadmap/atlas 등이 받는 enum):
-nexus, anima, n6-architecture, papers, hexa-lang, void, airgenome (7).
+nexus, anima, CANON, papers, hexa-lang, void, airgenome (7).
 
 ### 1.2 라우터는 있는데 spec drift 인 것
 

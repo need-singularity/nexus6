@@ -1,6 +1,6 @@
 # BT 수식 정합성 스캔 보고서
 
-- 대상: `n6-architecture/docs/breakthrough-theorems.md` (총 15,281 줄)
+- 대상: `CANON/docs/breakthrough-theorems.md` (총 15,281 줄)
 - 일자: 2026-04-08
 - 방법: n=6 기본 상수 사전 기반 정규식 스캔 + 의심 라인 수동 검증
 - 사용 상수 (n=6 고정):
