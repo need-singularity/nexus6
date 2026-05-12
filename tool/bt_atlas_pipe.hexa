@@ -101,6 +101,94 @@ fn _guarded_append_atlas(path: string, content: string) -> i64 {
     return rejected
 }
 
+// hexa-lang ATLAS_N6_RETIREMENT_PLAN §0c Phase 5 — emit shard, not main atlas.
+// 동작: (1) _guarded_append_atlas 와 같은 schema/dedup 가드를 atlas_path 에 대해
+// 적용 (transitional: dedup 은 main atlas.n6 grep 으로 계속 작동), (2) 그러나
+// 최종 write 는 atlas.append.bt-promote-<ts>-<slug>.n6 shard 로 redirect.
+// merger.hexa 가 다음 regen 에서 흡수 → embed 에 land. atlas.n6 본체 0 mutation.
+fn _emit_atlas_shard(atlas_path: string, content: string, slug: string) -> i64 {
+    if len(content) == 0 { return 0 }
+    let is_atlas = atlas_path.contains("atlas.n6")
+    let lines = content.split("\n")
+    let mut rejected: i64 = 0
+    let mut deduped: i64 = 0
+    let mut valid_lines = []
+    let mut valid_trimmed = []
+    let mut needs_dedup = []
+    let mut i: i64 = 0
+    while i < len(lines) {
+        let line = lines[i]
+        if !_valid_atlas_line(line) {
+            rejected = rejected + 1
+            i = i + 1
+            continue
+        }
+        let t = line.trim()
+        let do_dedup = is_atlas && len(t) > 0 && !t.starts_with("#")
+        valid_lines = valid_lines.push(line)
+        valid_trimmed = valid_trimmed.push(t)
+        needs_dedup = needs_dedup.push(do_dedup)
+        i = i + 1
+    }
+    let mut dup_set = #{}
+    let dedup_count: i64 = len(valid_lines)
+    let mut has_any_dedup = false
+    i = 0
+    while i < dedup_count {
+        if needs_dedup[i] { has_any_dedup = true }
+        i = i + 1
+    }
+    if has_any_dedup {
+        let _tmp = "/tmp/.atlas_pipe_dedup." + to_string(exec("echo $$").trim())
+        let mut patterns = []
+        i = 0
+        while i < dedup_count {
+            if needs_dedup[i] { patterns = patterns.push(valid_trimmed[i]) }
+            i = i + 1
+        }
+        try {
+            write_file(_tmp, "\n".join(patterns))
+            // Phase 5: dedup grep 도 기존 shard 들까지 함께 검사 (atlas.n6 grow
+            // 가 멈춰도 shard 누적분에서 dup 가능). shopt-less glob → ls + xargs.
+            let _shards = exec("ls " + _shq(SHARED + "/n6/atlas.append.bt-promote-") + "*.n6 2>/dev/null | tr '\\n' ' '").trim()
+            let _all_paths = _shq(atlas_path) + " " + _shards
+            let found_raw = exec("grep -Fxf " + _shq(_tmp) + " " + _all_paths + " 2>/dev/null || true")
+            let found_lines = found_raw.split("\n")
+            for fl in found_lines {
+                let ft = fl.trim()
+                if len(ft) > 0 { dup_set[ft] = true }
+            }
+        } catch e {}
+        try { exec("rm -f " + _shq(_tmp) + " 2>/dev/null") } catch e {}
+    }
+    let mut clean_parts = []
+    i = 0
+    while i < dedup_count {
+        if needs_dedup[i] {
+            let t = valid_trimmed[i]
+            let mut is_dup = false
+            try { is_dup = dup_set[t] == true } catch e {}
+            if is_dup { deduped = deduped + 1; i = i + 1; continue }
+        }
+        clean_parts = clean_parts.push(valid_lines[i])
+        i = i + 1
+    }
+    if rejected > 0 { println("  [schema guard] rejected " + to_string(rejected) + " invalid lines -> shard for " + slug) }
+    if deduped > 0 { println("  [dedup guard] skipped " + to_string(deduped) + " duplicate lines -> shard for " + slug) }
+    if len(clean_parts) > 0 {
+        let mut clean = "\n".join(clean_parts)
+        if !clean.ends_with("\n") { clean = clean + "\n" }
+        let ts = exec("date +%s").trim()
+        let safe_slug = slug.replace("/", "_").replace(" ", "_")
+        let shard_dir = SHARED + "/n6"
+        let shard_path = shard_dir + "/atlas.append.bt-promote-" + ts + "-" + safe_slug + ".n6"
+        let header = "// shard — bt_atlas_pipe promotion\n// emitter: bt_atlas_pipe.hexa\n// slug: " + slug + "\n// timestamp_unix: " + ts + "\n"
+        let shard_content = header + "\n" + clean + "\n// EOF — bt_atlas_pipe promotion\n"
+        try { write_file(shard_path, shard_content); println("  shard: " + shard_path) } catch e { println("  shard write error"); rejected = rejected + 1 }
+    }
+    return rejected
+}
+
 // ─── helpers ───
 fn _str(x) -> string {
     let t = type_of(x)
@@ -436,7 +524,12 @@ fn cmd_promote(dry_run: bool) {
         // B1-fix sweep: replace nested-if + continue with if/else (interpreter quirk) — cmd_promote
         let mut promoted_this = false
         if !dry_run {
-            let rej = _guarded_append_atlas(ATLAS_PATH, atlas_line)
+            // hexa-lang ATLAS_N6_RETIREMENT_PLAN §0c Phase 5:
+            // _guarded_append_atlas(ATLAS_PATH, ...) → _emit_atlas_shard(ATLAS_PATH, ..., slug).
+            // schema + dedup 가드는 동일 (atlas.n6 + 기존 bt-promote shard 들 grep);
+            // 다만 최종 write 가 atlas.n6 본체가 아니라 shard 파일로.
+            let slug = ev.candidate_id + "-" + ev.domain + "-" + ev.name
+            let rej = _emit_atlas_shard(ATLAS_PATH, atlas_line, slug)
             if rej > 0 {
                 println("    WARN: schema guard rejected " + to_string(rej) + " lines")
                 log_pipe_event(ev.candidate_id, ev.domain, ev.name, ev.value,
