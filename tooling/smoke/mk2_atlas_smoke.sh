@@ -1,20 +1,24 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════
-# tooling/smoke/mk2_atlas_smoke.sh — mk2 atlas dispatcher 7-case smoke
+# tooling/smoke/mk2_atlas_smoke.sh — mk2 atlas dispatcher 6-case smoke
 #
-# 검증 7 케이스 (5 subcommands + 2 help):
+# 검증 6 케이스 (4 subcommands + 2 help):
 #   1) main --help
 #   2) atlas --help
 #   3) atlas lookup alpha_inv
 #   4) atlas hypothesis --grade=🟥★★★★
 #   5) atlas recall 0.231
 #   6) atlas distribution --by sector
-#   7) atlas validate n6/atlas.n6 --quiet           ← NEW (FU-2 통합)
+#
+# Note (§0c Phase 8): the previous case 7 (`atlas validate n6/atlas.n6 --quiet`)
+# was dropped after atlas.n6 was retired — the file no longer exists, so the
+# case would always fail. Validate is still wired in the dispatcher and can be
+# pointed at any atlas.append.*.n6 shard if needed.
 #
 # 환경: HEXA_LOCAL=1 HEXA_RESOLVER_NO_REROUTE=1 강제 (운영 SSOT —
 # docs/mk2/07-atlas-recall.md § 운영 가이드).
 #
-# 출력: 각 케이스마다 PASS/FAIL + duration, 마지막에 7/7 요약.
+# 출력: 각 케이스마다 PASS/FAIL + duration, 마지막에 6/6 요약.
 # Exit: 0 = all PASS, 1 = any FAIL.
 # ═══════════════════════════════════════════════════════════
 
@@ -36,7 +40,6 @@ CMDS=(
   "atlas hypothesis --grade=🟥★★★★"
   "atlas recall 0.231"
   "atlas distribution --by sector"
-  "atlas validate n6/atlas.n6 --quiet"
 )
 
 PASS=0
@@ -57,7 +60,7 @@ for i in "${!CMDS[@]}"; do
   end_ns=$(python3 -c 'import time;print(time.time_ns())' 2>/dev/null || echo 0)
   ms=$(( (end_ns - start_ns) / 1000000 ))
 
-  # all cases expected exit 0 (validate w/o --strict on clean atlas.n6 is errors=0)
+  # all cases expected exit 0 (help + 4 read-only subcommands; no file-deps)
   if [ "$rc" -eq 0 ]; then
     printf "PASS (rc=0, %dms)\n" "$ms"
     PASS=$((PASS + 1))

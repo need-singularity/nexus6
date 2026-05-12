@@ -226,7 +226,7 @@ nexus dispatch  # multi-project cross-pollination
 
 ### atlas.n6 3D map — zero-conversion direct viewer
 
-Browser fetches `n6/atlas.n6` directly (mirrored to `docs/atlas.n6` on Pages deploy) and parses it client-side — **no JSON build step**.
+Browser fetches `docs/_mirror_atlas.n6` (April snapshot — `n6/atlas.n6` itself was retired in §0c Phase 8; new facts ship as `atlas.append.*.n6` shards) and parses it client-side — **no JSON build step**.
 
 - 5-layer color stratification (L0 foundations → L4 cosmic), golden-spiral layout per layer with hubs centered
 - Toggles: per-layer visibility · edges · **hub-100** (top centrality) · **phase47** (cross-domain @S bridges) · **theorem** (R29 Foundation Isomorphism — atlas 7 primitives ↔ meta 7 reflections + 7 isomorphism rays)
