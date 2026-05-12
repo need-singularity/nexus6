@@ -69,7 +69,7 @@ discipline). in-tree import 금지, subprocess CLI only.
 
 | project | qmirror | qrng | sim | anima | brain | subproc | 등급 |
 |---|---|---|---|---|---|---|---|
-| orpheus       | 80  | 27 | 0 | 7   | 0   | 65 | S |
+| forge       | 80  | 27 | 0 | 7   | 0   | 65 | S |
 | hexa-brain    | 5   | 0  | 1 | 430 | 344 | 55 | S (anima 의 짝) |
 | anima-agent   | 3   | 0  | 3 | 51  | 4   | 22 | A |
 | airgenome     | 0   | 0  | 0 | 70  | 0   | 37 | A |
@@ -91,7 +91,7 @@ discipline). in-tree import 금지, subprocess CLI only.
 | 프로젝트 | 주제 한 줄 | ROI |
 |---|---|---|
 | qrng           | 양자 RNG 5-backend provider (mock/curby/anu/nist/hardware) | **高** |
-| orpheus        | closure cond 검증 + wraith 암호 handoff 게이트 | **高** |
+| forge        | closure cond 검증 + wraith 암호 handoff 게이트 | **高** |
 | anima-agent    | IIT Φ-driven 자율 에이전트 (cli/mcp/channel/autonomy) | **高** |
 | hexa-bio       | 리보자임·캡시드·나노봇·VQE 분자 실험 | **高** |
 | hexa-brain     | 신경 substrate / EEG 마커 / OpenBCI | **高** |
@@ -122,7 +122,7 @@ discipline). in-tree import 금지, subprocess CLI only.
 ### 4.1 高 등급 ROI 순위 (신규 후보 9 개)
 
 1. **qrng** — 양자 비트, qmirror 의 자매. 외부 항상 가치
-2. **orpheus** — 검증 게이트, qmirror 와 동급
+2. **forge** — 검증 게이트, qmirror 와 동급
 3. **anima-agent** — Φ-driven 의식 측정, 시장 희소 표면
 4. **hexa-brain** — 신경 신호 입력, 다운스트림 트리거 풍부
 5. **hexa-bio** — 분자 실험 numerical (VQE 0.4 µHa)
@@ -153,7 +153,7 @@ CLI 표면:
    에서 동등하게 작동하는지 Welch-t 로 검증. 양자 RNG 의 *품질 게이트*.
    3 단(생산→검증→소비) 중 마지막 칸.
 2. **nexus 의존성 0 → 다중 소비자 허용**
-   nexus 에 묻혀있으면 hive/orpheus/hexa-bio/anima-agent 가 in-tree import
+   nexus 에 묻혀있으면 hive/forge/hexa-bio/anima-agent 가 in-tree import
    해야 함 (own 2 위반). standalone 이라 subprocess CLI 만으로 모두 소비.
 3. **결정론적 LCG 코어 → 재현성**
    LCG seed/state 가 mc-integrate 안에서 격리. 외부 소비자들이 자기 RNG
@@ -172,9 +172,9 @@ CLI 표면:
 1. **spec drift 픽스** — `nexus-cli --sync --apply` 로 bio/mc/qrng 를
    `engine/nexus_cli_spec.json` 에 등록. 라우터·dispatch 는 이미 존재.
    (가장 짧고 즉효)
-2. **`nexus orpheus` 라우터 추가** — `cli/sim.hexa` 65 라인 그대로 복사,
-   4-tier resolve 만 `ORPHEUS_ROOT` 로 교체. hexa-bio 의
-   `SISTER_REPOS` 에 orpheus 추가 → upstream_pulse_check 5-repo 확장.
+2. **`nexus forge` 라우터 추가** — `cli/sim.hexa` 65 라인 그대로 복사,
+   4-tier resolve 만 `FORGE_ROOT` 로 교체. hexa-bio 의
+   `SISTER_REPOS` 에 forge 추가 → upstream_pulse_check 5-repo 확장.
 3. **`nexus anima-agent` 라우터 추가** — 같은 패턴. MCP 서버 모드까지
    라우팅하면 가치 最高.
 4. (선택) **`nexus hexa-brain` 라우터** — anima-agent 와 짝.
@@ -186,11 +186,11 @@ CLI 표면:
 
 1. ROI 표는 *주제 한 줄* 만 본 평가. 실제 ROI 는 표면 안정성·테스트 커버리지
    ·다운스트림 소비자 수에 좌우되며 본 문서에 미반영.
-2. "高/中/低" 3 단계는 균등 간격 아님. 예: orpheus 의 高 와 hexa-millennium
+2. "高/中/低" 3 단계는 균등 간격 아님. 예: forge 의 高 와 hexa-millennium
    의 高 는 다운스트림 결합도가 다름.
 3. CLI 부재 후보 (hexa-cern·cosmos·rtsc·ufo 등 SPEC-only) 는 "CLI 가
    있다고 가정" 하에 평가. 구현 비용 미반영.
-4. 활용도 메트릭(§3)은 grep 카운트로 self-reference 포함. orpheus 의
+4. 활용도 메트릭(§3)은 grep 카운트로 self-reference 포함. forge 의
    qmirror=80, anima-agent 의 anima=51 등에는 self-ref 가 일부 섞임.
 5. `convergence` 는 nexus 내부 표면이라 "n/a" 처리했으나, 별도 노출
    가치(integration contracts read-only 인지) 는 추가 검토 가능.
